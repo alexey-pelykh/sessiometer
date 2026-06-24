@@ -1,0 +1,19 @@
+[package]
+name = "sessiometer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Manage multiple Claude Code accounts on macOS: poll per-account usage quota and swap the active credential out-of-band before exhaustion."
+repository = "https://github.com/alexey-pelykh/sessiometer"
+readme = "README.md"
+keywords = ["claude", "macos", "keychain", "quota", "cli"]
+categories = ["command-line-utilities"]
+publish = false
+
+[dependencies]
+libc = "0.2.186"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

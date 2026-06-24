@@ -1,0 +1,7 @@
+# cargo-deny — security-advisory baseline for CI (`cargo deny check advisories`).
+#
+# The Security.framework SDK ban is enforced separately and authoritatively by
+# scripts/check-no-security-framework.sh (issues #1 and #2).
+
+[advisories]
+yanked = "warn"
