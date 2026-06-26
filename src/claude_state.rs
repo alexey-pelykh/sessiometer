@@ -115,6 +115,49 @@ fn read_oauth_account_from(path: &Path) -> Result<OauthAccount> {
     OauthAccount::from_object(oauth)
 }
 
+/// Co-write `oauth` into `~/.claude.json` as its `oauthAccount`, preserving every
+/// other field and the file's existing permission mode.
+///
+/// The swap engine's honest-display co-write (#6): a field-preserving
+/// read-modify-write. The whole file is parsed into a `serde_json::Value`, **only**
+/// the `oauthAccount` key is replaced (or inserted, if absent), and the result is
+/// written back atomically through [`paths::write_preserving_mode`] (same-directory
+/// temp, `fsync`, `rename`, copied mode — never our `0600`, since this file is
+/// Claude Code's). Last-writer-wins is acceptable: the keychain token is the
+/// authoritative bearer, so a clobbered `oauthAccount` self-heals on the next
+/// reconcile.
+///
+/// Nothing here is printed — the file and `oauth` both carry the account's email;
+/// the parse-error path carries only a line/column, never the surrounding bytes
+/// (issue #15 redaction). Wired into the swap loop in #7.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn write_oauth_account(path: &Path, oauth: &OauthAccount) -> Result<()> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(Error::ClaudeStateNotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let mut root: Value = serde_json::from_slice(&bytes).map_err(parse_error)?;
+    // The root must be a JSON object to host `oauthAccount`. A non-object root is a
+    // corrupt/unexpected state file — there is no identity slot to write into.
+    let obj = root.as_object_mut().ok_or(Error::OauthAccountMissing)?;
+    // `oauth.raw_json()` is the canonical bytes of an already-validated object, so
+    // this parse cannot fail; `insert` replaces an existing `oauthAccount` or adds
+    // it, leaving every sibling key untouched.
+    let value: Value =
+        serde_json::from_slice(oauth.raw_json()).expect("oauthAccount raw JSON is always valid");
+    obj.insert("oauthAccount".to_owned(), value);
+    // Re-serialize the whole mutated document; serializing a parsed `Value` cannot
+    // fail. Field order may be normalized — semantically irrelevant for JSON, and
+    // the AC requires preserving fields, not their order.
+    let serialized = serde_json::to_vec(&root).expect("serializing a parsed JSON value");
+    paths::write_preserving_mode(path, &serialized)
+}
+
 /// Extract a required string field, mapping absence (or a non-string value) to
 /// the typed field-missing error — never echoing the value (issue #15).
 fn string_field(value: &Value, field: &'static str) -> Result<String> {
@@ -252,6 +295,97 @@ mod tests {
         assert!(matches!(
             read_oauth_account_from(&path),
             Err(Error::OauthAccountMissing)
+        ));
+    }
+
+    // --- write_oauth_account (the swap co-write, #6) ---
+
+    #[test]
+    fn write_oauth_account_replaces_only_the_oauth_block_and_preserves_other_fields() {
+        let (_dir, path) = write_temp(CLAUDE_JSON);
+        let incoming = OauthAccount::from_object_bytes(
+            br#"{"accountUuid":"22222222-2222-2222-2222-222222222222","emailAddress":"new@example.com"}"#,
+        )
+        .unwrap();
+
+        write_oauth_account(&path, &incoming).unwrap();
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // The oauthAccount block is now the incoming account's…
+        assert_eq!(
+            v["oauthAccount"]["accountUuid"],
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(v["oauthAccount"]["emailAddress"], "new@example.com");
+        // …the whole block was REPLACED (not merged), so the old account's
+        // displayName/organizationName are gone…
+        assert!(v["oauthAccount"].get("displayName").is_none());
+        assert!(v["oauthAccount"].get("organizationName").is_none());
+        // …and every UNRELATED top-level field is preserved verbatim.
+        assert_eq!(v["numStartups"], 42);
+        assert!(v["projects"].is_object());
+    }
+
+    #[test]
+    fn write_oauth_account_preserves_the_files_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = write_temp(CLAUDE_JSON);
+        // Claude Code owns this file; give it a non-0600 mode and prove the
+        // co-write does NOT force 0600 (unlike `paths::write_private_file`).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let incoming = OauthAccount::from_object_bytes(br#"{"accountUuid":"u-2"}"#).unwrap();
+        write_oauth_account(&path, &incoming).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the co-write must preserve ~/.claude.json's mode, not force 0600"
+        );
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["oauthAccount"]["accountUuid"], "u-2");
+    }
+
+    #[test]
+    fn write_oauth_account_inserts_when_the_block_is_absent() {
+        let (_dir, path) = write_temp(r#"{"numStartups":1}"#);
+        let incoming = OauthAccount::from_object_bytes(br#"{"accountUuid":"u-new"}"#).unwrap();
+
+        write_oauth_account(&path, &incoming).unwrap();
+
+        let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["oauthAccount"]["accountUuid"], "u-new");
+        assert_eq!(v["numStartups"], 1);
+    }
+
+    #[test]
+    fn write_oauth_account_reports_not_found_for_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        let incoming = OauthAccount::from_object_bytes(br#"{"accountUuid":"u-2"}"#).unwrap();
+        assert!(matches!(
+            write_oauth_account(&path, &incoming),
+            Err(Error::ClaudeStateNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn write_oauth_account_rejects_a_non_object_root() {
+        let (_dir, path) = write_temp("[1,2,3]");
+        let incoming = OauthAccount::from_object_bytes(br#"{"accountUuid":"u"}"#).unwrap();
+        assert!(matches!(
+            write_oauth_account(&path, &incoming),
+            Err(Error::OauthAccountMissing)
+        ));
+    }
+
+    #[test]
+    fn write_oauth_account_reports_parse_error_for_malformed_json() {
+        let (_dir, path) = write_temp("{ not json");
+        let incoming = OauthAccount::from_object_bytes(br#"{"accountUuid":"u"}"#).unwrap();
+        assert!(matches!(
+            write_oauth_account(&path, &incoming),
+            Err(Error::ClaudeStateParse { .. })
         ));
     }
 }
