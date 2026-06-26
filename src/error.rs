@@ -64,6 +64,16 @@ pub(crate) enum Error {
     #[error("no config file at {path} — run `sessiometer capture` to create one")]
     ConfigNotFound { path: PathBuf },
 
+    /// `sessiometer list` found no roster to show. A friendly, user-facing remap
+    /// of [`Error::ConfigNotFound`] for the read-only `list` view: an absent
+    /// config is the only real empty state (`capture` cannot persist a 0-account
+    /// roster — it fails the `1..=5` load validation), so this reads as "nothing
+    /// captured yet" instead of leaking the lower-level "file missing". A
+    /// malformed config is deliberately NOT remapped — it keeps surfacing as its
+    /// real [`Error::ConfigParse`] / [`Error::ConfigInvalid`]. Secret-free.
+    #[error("no accounts captured yet — run `sessiometer capture`")]
+    RosterEmpty,
+
     /// `config.toml` is not valid TOML, or a field has the wrong type. The
     /// wrapped message comes from the TOML parser; it is secret-free because the
     /// config file holds no secrets — only labels, account UUIDs, stash names
