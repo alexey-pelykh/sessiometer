@@ -35,6 +35,30 @@ pub(crate) enum Error {
     #[error("directory {0} is not owned by the current user")]
     ForeignOwnership(PathBuf),
 
+    /// No `Claude Code-credentials` item is present in the keychain — an account
+    /// must be captured before it can be read or swapped.
+    #[error("no Claude Code credential found in the keychain (capture an account first)")]
+    CredentialNotFound,
+
+    /// More than one `Claude Code-credentials` item is present, so the active
+    /// account is ambiguous. The resolve step refuses to guess (issue #2).
+    #[error(
+        "ambiguous keychain: {count} `Claude Code-credentials` items found (expected exactly one)"
+    )]
+    CredentialAmbiguous { count: usize },
+
+    /// The keychain is locked: `security` exited 36 (`errSecInteractionNotAllowed`)
+    /// during `{op}`. Detection only — wait/backoff handling lives in #13.
+    #[error("keychain is locked (security exit 36) during {op}")]
+    KeychainLocked { op: &'static str },
+
+    /// A `security` CLI keychain operation failed for another reason. `op` is the
+    /// operation (`"resolve"` / `"read"` / `"write"`) and `code` is the exit
+    /// status (`-1` if signal-terminated). Deliberately carries neither secret
+    /// material nor raw CLI output.
+    #[error("keychain {op} via `security` failed (exit status {code})")]
+    Keychain { op: &'static str, code: i32 },
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

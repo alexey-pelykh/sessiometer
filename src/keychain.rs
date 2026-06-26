@@ -3,36 +3,82 @@
 
 //! The active Claude Code credential in the macOS login keychain.
 //!
-//! Scaffolding scope: the opaque [`Credential`] carrier and the
-//! [`CredentialStore`] seam. The real impl drives the `/usr/bin/security` CLI
-//! (never the Security.framework SDK — a CI guard enforces this) and lands in
-//! issue #2.
+//! Reads and rewrites the generic-password item whose service is
+//! `Claude Code-credentials` by driving the `/usr/bin/security` CLI — never the
+//! Security.framework SDK. Writing the item as our own code identity through the
+//! SDK would re-stamp its ACL partition list to our team id and evict the
+//! `apple-tool:` entry Claude Code's silent read relies on; the CLI write rides
+//! `apple-tool:` and preserves it. A CI guard
+//! (`scripts/check-no-security-framework.sh`) keeps the SDK out of the
+//! dependency graph.
+//!
+//! The mechanism and the facts this module depends on were verified empirically
+//! before implementation — see `build/version-compat.md` (the issue #16 ledger):
+//! the store is the legacy file-based `login.keychain-db`, every call pins that
+//! path explicitly (keeps the item on the classic-ACL path), and `add-generic-password -U`
+//! is an atomic in-place update (no rename window a concurrent reader could see
+//! a missing item through).
+//!
+//! Three operations:
+//!   - **resolve** — read back the item's `acct` attribute *as stored* (never
+//!     assume it equals `$USER`) and enforce uniqueness: zero matches →
+//!     [`Error::CredentialNotFound`], more than one → [`Error::CredentialAmbiguous`],
+//!     exactly one → that `acct`, pinned for later calls. Driven off
+//!     `security dump-keychain` (metadata only — no `-d`, so no secret data and
+//!     no prompt), handling both quoted-string and `0x`-hex attribute rendering.
+//!   - **read** — `find-generic-password -w -s <service> -a <resolved-acct> <keychain>`;
+//!     `-w` prints the secret with a single trailing newline, which [`finish_read`]
+//!     strips so a read→write round-trip is byte-exact.
+//!   - **write** — `add-generic-password -U -s <service> -a <resolved-acct> -w <blob> <keychain>`.
+
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use std::cell::RefCell;
 
+use tokio::process::Command;
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::error::{Error, Result};
+use crate::paths;
+
+/// Absolute path to the system `security` tool. Absolute (not bare `security`
+/// resolved through `$PATH`) so a hijacked `PATH` cannot substitute a different
+/// binary for this security-sensitive call.
+const SECURITY: &str = "/usr/bin/security";
+
+/// The generic-password service name Claude Code stores its credential under.
+const SERVICE: &str = "Claude Code-credentials";
 
 /// An opaque credential blob (the active account's OAuth tokens).
 ///
-/// Deliberately does **not** derive `Debug`: issue #2 wraps this in a
-/// zeroize-on-drop carrier, and no secret-bearing type may be printable.
-#[derive(Clone, PartialEq)]
-// Real construction lands with the keychain read (#2); for now only the
-// in-memory test fake builds one, so the bin target sees it as unconstructed.
-#[allow(dead_code)]
-pub(crate) struct Credential(Vec<u8>);
+/// The inner buffer is zeroized when the last owner is dropped, and the type
+/// deliberately does **not** derive `Debug`: no secret-bearing value may be
+/// printable. `PartialEq` is gated to tests — comparing secrets in production
+/// would invite a non-constant-time equality check.
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub(crate) struct Credential(Zeroizing<Vec<u8>>);
 
-#[allow(dead_code)]
 impl Credential {
     /// Wrap a raw credential blob.
     pub(crate) fn new(blob: Vec<u8>) -> Self {
-        Self(blob)
+        Self(Zeroizing::new(blob))
+    }
+
+    /// Borrow the raw blob bytes. Named to flag that the borrow exposes secret
+    /// material: keep its lifetime as short as possible and never log it.
+    fn expose(&self) -> &[u8] {
+        self.0.as_slice()
     }
 }
 
 /// Seam: reads/writes the active credential. The real impl drives the macOS
-/// `security` CLI (#2); the test impl is an in-memory cell.
+/// `security` CLI; the test impl is an in-memory cell.
 ///
 /// The daemon holds this seam but does not yet call it; the out-of-band swap
 /// engine (#6/#7) reads and rewrites the credential through it.
@@ -42,16 +88,244 @@ pub(crate) trait CredentialStore {
     async fn write(&self, credential: &Credential) -> Result<()>;
 }
 
-/// Real keychain-backed store. Behavior lands in issue #2.
-pub(crate) struct RealCredentialStore;
+/// Real keychain-backed store, driving `/usr/bin/security`.
+pub(crate) struct RealCredentialStore {
+    /// Keychain to operate on. `None` is production (the login keychain via
+    /// [`paths::login_keychain`]); `Some` pins a specific keychain file — used by
+    /// the round-trip test to drive the real CLI against a throwaway keychain
+    /// without touching the login keychain.
+    keychain: Option<PathBuf>,
+    /// The resolved `acct`, read back from the item once and pinned for all
+    /// later calls (issue #2 "resolve once at start").
+    acct: OnceLock<OsString>,
+}
+
+impl RealCredentialStore {
+    /// Production store, operating on the login keychain.
+    pub(crate) fn new() -> Self {
+        Self {
+            keychain: None,
+            acct: OnceLock::new(),
+        }
+    }
+
+    /// Store pinned to a specific keychain file.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_keychain(path: PathBuf) -> Self {
+        Self {
+            keychain: Some(path),
+            acct: OnceLock::new(),
+        }
+    }
+
+    /// The keychain path to pin on every call.
+    fn keychain_path(&self) -> Result<PathBuf> {
+        match &self.keychain {
+            Some(kc) => Ok(kc.clone()),
+            None => paths::login_keychain(),
+        }
+    }
+
+    /// The resolved `acct`, computed once and cached.
+    async fn acct(&self) -> Result<OsString> {
+        if let Some(acct) = self.acct.get() {
+            return Ok(acct.clone());
+        }
+        let resolved = self.resolve().await?;
+        // A concurrent caller may have set it first; the value is identical, so
+        // ignore the `Err` and read the stored one back.
+        let _ = self.acct.set(resolved);
+        Ok(self.acct.get().expect("just set").clone())
+    }
+
+    /// Read back the item's `acct` attribute as stored, enforcing uniqueness.
+    /// Uses `dump-keychain` (metadata only — no `-d`, so it works even on a
+    /// locked keychain and never decrypts secret data) rather than the issue's
+    /// literal `find-generic-password -s`: the latter returns only the first
+    /// match, so it cannot detect the >1 (ambiguous) case the uniqueness rule
+    /// requires.
+    async fn resolve(&self) -> Result<OsString> {
+        let keychain = self.keychain_path()?;
+        let output = Command::new(SECURITY)
+            .arg("dump-keychain")
+            .arg(&keychain)
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(keychain_error(
+                "resolve",
+                output.status.code().unwrap_or(-1),
+            ));
+        }
+        // The dump is metadata text (attribute names + quoted/hex values), not
+        // secret data; lossy decode is safe and never touches a token.
+        parse_resolve(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+/// `find-generic-password` arguments (after the program name): read the secret
+/// of the resolved item, pinning both `-a <acct>` and the keychain path.
+fn read_args(acct: &OsStr, keychain: &Path) -> Vec<OsString> {
+    vec![
+        "find-generic-password".into(),
+        "-w".into(),
+        "-s".into(),
+        SERVICE.into(),
+        "-a".into(),
+        acct.to_owned(),
+        keychain.as_os_str().to_owned(),
+    ]
+}
+
+/// `add-generic-password` arguments (after the program name). `-U` makes it an
+/// atomic in-place update of the resolved item; the blob is passed as a single
+/// argument verbatim — this matches the empirically validated write path
+/// (`build/version-compat.md`). NOTE: the blob is briefly visible in this
+/// process's argv (accepted residual risk for 0.1.0 per issue #2 — there is no
+/// stdin path for `-w`; never log the argv).
+fn write_args(acct: &OsStr, keychain: &Path, blob: &[u8]) -> Vec<OsString> {
+    vec![
+        "add-generic-password".into(),
+        "-U".into(),
+        "-s".into(),
+        SERVICE.into(),
+        "-a".into(),
+        acct.to_owned(),
+        "-w".into(),
+        OsStr::from_bytes(blob).to_owned(),
+        keychain.as_os_str().to_owned(),
+    ]
+}
+
+/// Map a non-zero `security` exit `code` to a typed error. `36` is
+/// `errSecInteractionNotAllowed` (locked keychain); `44` is item-not-found.
+fn keychain_error(op: &'static str, code: i32) -> Error {
+    match code {
+        36 => Error::KeychainLocked { op },
+        44 => Error::CredentialNotFound,
+        _ => Error::Keychain { op, code },
+    }
+}
+
+/// Turn a `find-generic-password -w` result into a [`Credential`], stripping the
+/// single trailing newline `-w` appends so a read→write round-trip is byte-exact.
+/// On failure the buffer is wiped and a typed error returned (never the output,
+/// which could hold partial secret bytes).
+fn finish_read(mut stdout: Vec<u8>, success: bool, code: i32) -> Result<Credential> {
+    if !success {
+        stdout.zeroize();
+        return Err(keychain_error("read", code));
+    }
+    if stdout.last() == Some(&b'\n') {
+        stdout.pop();
+    }
+    Ok(Credential::new(stdout))
+}
+
+/// Turn an `add-generic-password` result into `Ok(())` or a typed keychain error.
+fn finish_write(success: bool, code: i32) -> Result<()> {
+    if success {
+        Ok(())
+    } else {
+        Err(keychain_error("write", code))
+    }
+}
+
+/// Decode a dumped attribute value (the text after `<blob>=`): a quoted string,
+/// a `0x`-hex blob, or `<NULL>`. Returns the raw bytes.
+fn decode_attr_value(rest: &str) -> Option<Vec<u8>> {
+    let rest = rest.trim();
+    if let Some(after) = rest.strip_prefix('"') {
+        // Quoted: bytes up to the final quote on the line.
+        after.rfind('"').map(|end| after.as_bytes()[..end].to_vec())
+    } else if let Some(hex) = rest.strip_prefix("0x") {
+        let digits: Vec<u8> = hex.bytes().take_while(|b| b.is_ascii_hexdigit()).collect();
+        if digits.is_empty() || !digits.len().is_multiple_of(2) {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(digits.len() / 2);
+        for pair in digits.chunks_exact(2) {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            bytes.push((hi * 16 + lo) as u8);
+        }
+        Some(bytes)
+    } else if rest == "<NULL>" {
+        Some(Vec::new())
+    } else {
+        None
+    }
+}
+
+/// Find attribute `name` (e.g. `acct`, `svce`) within one dumped item block and
+/// decode its value.
+fn block_attr(block: &str, name: &str) -> Option<Vec<u8>> {
+    let needle = format!("\"{name}\"<blob>=");
+    block
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(needle.as_str()))
+        .and_then(decode_attr_value)
+}
+
+/// Parse `security dump-keychain` output: find every generic-password item whose
+/// service is `Claude Code-credentials`, then enforce uniqueness — 0 → not found,
+/// >1 → ambiguous, exactly 1 → that item's `acct`.
+fn parse_resolve(dump: &str) -> Result<OsString> {
+    // One entry per service-matching item (its `acct`, if present). Count ALL
+    // matches — including any with an absent `acct` — so a malformed item can
+    // never mask an ambiguity by going uncounted.
+    let mut matches: Vec<Option<Vec<u8>>> = Vec::new();
+    // Each item block begins with a `keychain: "<path>"` header line.
+    for block in dump.split("\nkeychain: ") {
+        if !block.contains("class: \"genp\"") {
+            continue;
+        }
+        if block_attr(block, "svce").as_deref() == Some(SERVICE.as_bytes()) {
+            matches.push(block_attr(block, "acct"));
+        }
+    }
+    match matches.len() {
+        0 => Err(Error::CredentialNotFound),
+        // Exactly one item, but a usable `acct` is required to address it; a
+        // service-match with no `acct` is unusable (treated as not found).
+        1 => matches
+            .pop()
+            .unwrap()
+            .map(OsString::from_vec)
+            .ok_or(Error::CredentialNotFound),
+        n => Err(Error::CredentialAmbiguous { count: n }),
+    }
+}
 
 impl CredentialStore for RealCredentialStore {
     async fn read(&self) -> Result<Credential> {
-        Err(Error::Unimplemented("keychain read (#2)"))
+        let acct = self.acct().await?;
+        let keychain = self.keychain_path()?;
+        let output = Command::new(SECURITY)
+            .args(read_args(&acct, &keychain))
+            // Non-interactive: a child read can never block on our stdin. (The
+            // daemon-context no-prompt / exit-36-on-lock guarantee is #13's
+            // scope — `security` may still raise a GUI dialog in a UI session.)
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        finish_read(
+            output.stdout,
+            output.status.success(),
+            output.status.code().unwrap_or(-1),
+        )
     }
 
-    async fn write(&self, _credential: &Credential) -> Result<()> {
-        Err(Error::Unimplemented("keychain write (#2)"))
+    async fn write(&self, credential: &Credential) -> Result<()> {
+        let acct = self.acct().await?;
+        let keychain = self.keychain_path()?;
+        let output = Command::new(SECURITY)
+            .args(write_args(&acct, &keychain, credential.expose()))
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
 }
 
@@ -88,6 +362,193 @@ impl CredentialStore for FakeCredentialStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn read_args_pin_service_acct_and_keychain() {
+        let kc = Path::new("/tmp/login.keychain-db");
+        assert_eq!(
+            read_args(OsStr::new("alice"), kc),
+            vec![
+                OsString::from("find-generic-password"),
+                OsString::from("-w"),
+                OsString::from("-s"),
+                OsString::from(SERVICE),
+                OsString::from("-a"),
+                OsString::from("alice"),
+                kc.as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn write_args_match_the_validated_command() {
+        let kc = Path::new("/tmp/login.keychain-db");
+        assert_eq!(
+            write_args(OsStr::new("alice"), kc, b"the-token"),
+            vec![
+                OsString::from("add-generic-password"),
+                OsString::from("-U"),
+                OsString::from("-s"),
+                OsString::from(SERVICE),
+                OsString::from("-a"),
+                OsString::from("alice"),
+                OsString::from("-w"),
+                OsString::from("the-token"),
+                kc.as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn finish_read_strips_one_trailing_newline() {
+        let cred = finish_read(b"a-token\n".to_vec(), true, 0).unwrap();
+        assert_eq!(cred.expose(), b"a-token");
+    }
+
+    #[test]
+    fn finish_read_keeps_bytes_without_a_trailing_newline() {
+        let cred = finish_read(b"a-token".to_vec(), true, 0).unwrap();
+        assert_eq!(cred.expose(), b"a-token");
+    }
+
+    #[test]
+    fn finish_read_strips_only_one_of_several_trailing_newlines() {
+        // `-w` appends exactly one newline; an embedded trailing newline in the
+        // stored secret must be preserved.
+        let cred = finish_read(b"a\n\n".to_vec(), true, 0).unwrap();
+        assert_eq!(cred.expose(), b"a\n");
+    }
+
+    #[test]
+    fn finish_read_classifies_failure_codes() {
+        // Matched on the `Result` directly: `Credential` has no `Debug`, so
+        // `.unwrap_err()` would not compile — the no-secret-is-printable
+        // invariant doing its job.
+        assert!(matches!(
+            finish_read(Vec::new(), false, 44),
+            Err(Error::CredentialNotFound)
+        ));
+        assert!(matches!(
+            finish_read(Vec::new(), false, 36),
+            Err(Error::KeychainLocked { op: "read" })
+        ));
+        assert!(matches!(
+            finish_read(Vec::new(), false, 1),
+            Err(Error::Keychain {
+                op: "read",
+                code: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn finish_write_maps_success_and_failure() {
+        assert!(finish_write(true, 0).is_ok());
+        assert!(matches!(
+            finish_write(false, 1),
+            Err(Error::Keychain {
+                op: "write",
+                code: 1
+            })
+        ));
+        assert!(matches!(
+            finish_write(false, 36),
+            Err(Error::KeychainLocked { op: "write" })
+        ));
+    }
+
+    #[test]
+    fn decode_attr_value_handles_quoted_hex_and_null() {
+        assert_eq!(
+            decode_attr_value("\"alexey-pelykh\"").unwrap(),
+            b"alexey-pelykh"
+        );
+        // 0x616c696365 == "alice"
+        assert_eq!(decode_attr_value("0x616C696365").unwrap(), b"alice");
+        assert_eq!(decode_attr_value("<NULL>").unwrap(), b"");
+        assert!(decode_attr_value("0xZZ").is_none());
+    }
+
+    const ONE_MATCH: &str = r#"keychain: "/tmp/x.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials"
+    "acct"<blob>="alexey-pelykh"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    "acct"<blob>="someone"
+    "svce"<blob>="Some Other Service"
+"#;
+
+    #[test]
+    fn parse_resolve_returns_the_unique_acct() {
+        assert_eq!(
+            parse_resolve(ONE_MATCH).unwrap(),
+            OsString::from("alexey-pelykh")
+        );
+    }
+
+    #[test]
+    fn parse_resolve_decodes_a_hex_acct() {
+        let dump = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>=0x616C696365
+    "svce"<blob>="Claude Code-credentials"
+"#;
+        assert_eq!(parse_resolve(dump).unwrap(), OsString::from("alice"));
+    }
+
+    #[test]
+    fn parse_resolve_reports_not_found_when_absent() {
+        let dump = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="someone"
+    "svce"<blob>="Some Other Service"
+"#;
+        assert!(matches!(
+            parse_resolve(dump),
+            Err(Error::CredentialNotFound)
+        ));
+    }
+
+    #[test]
+    fn parse_resolve_reports_ambiguous_on_duplicates() {
+        let dump = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="acct-one"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="acct-two"
+    "svce"<blob>="Claude Code-credentials"
+"#;
+        assert!(matches!(
+            parse_resolve(dump),
+            Err(Error::CredentialAmbiguous { count: 2 })
+        ));
+    }
+
+    #[test]
+    fn parse_resolve_counts_an_acctless_match_so_it_cannot_mask_ambiguity() {
+        // One service match has no `acct`; it must still be counted, so the pair
+        // is reported ambiguous rather than the acct-bearing one winning.
+        let dump = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="acct-two"
+    "svce"<blob>="Claude Code-credentials"
+"#;
+        assert!(matches!(
+            parse_resolve(dump),
+            Err(Error::CredentialAmbiguous { count: 2 })
+        ));
+    }
+
     #[tokio::test]
     async fn fake_store_round_trips() {
         let store = FakeCredentialStore::empty();
@@ -97,9 +558,111 @@ mod tests {
         assert!(store.read().await.unwrap() == cred);
     }
 
-    #[tokio::test]
-    async fn real_store_reports_unimplemented() {
-        let result = RealCredentialStore.read().await;
-        assert!(matches!(result, Err(Error::Unimplemented(_))));
+    /// Drives the real `security` CLI end-to-end against a throwaway keychain
+    /// (created, used, and deleted here) — never the login keychain. macOS-only:
+    /// `/usr/bin/security` is the system under test.
+    #[cfg(target_os = "macos")]
+    mod real_cli {
+        use super::*;
+        use std::process::Command as StdCommand;
+
+        /// Make + unlock a throwaway keychain; return its path (kept alive by the
+        /// returned tempdir guard).
+        fn fresh_keychain() -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let kc = dir.path().join("test.keychain-db");
+            assert!(StdCommand::new(SECURITY)
+                .args(["create-keychain", "-p", ""])
+                .arg(&kc)
+                .status()
+                .expect("spawn create-keychain")
+                .success());
+            assert!(StdCommand::new(SECURITY)
+                .args(["unlock-keychain", "-p", ""])
+                .arg(&kc)
+                .status()
+                .expect("spawn unlock-keychain")
+                .success());
+            (dir, kc)
+        }
+
+        /// Seed a `Claude Code-credentials` item with a chosen `acct`/secret,
+        /// simulating Claude Code's `/login` (or #4 capture).
+        fn seed(kc: &Path, acct: &str, secret: &str) {
+            assert!(StdCommand::new(SECURITY)
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    acct,
+                    "-w",
+                    secret
+                ])
+                .arg(kc)
+                .status()
+                .expect("spawn add-generic-password")
+                .success());
+        }
+
+        fn delete(kc: &Path) {
+            let _ = StdCommand::new(SECURITY)
+                .arg("delete-keychain")
+                .arg(kc)
+                .status();
+        }
+
+        #[tokio::test]
+        async fn resolves_stored_acct_then_round_trips_in_place() {
+            let (_dir, kc) = fresh_keychain();
+            // Deliberately NOT the macOS username, to prove resolve reads the
+            // STORED acct rather than guessing `$USER`/`getpwuid`.
+            seed(&kc, "sessiometer-roundtrip-acct", "initial-token");
+
+            let store = RealCredentialStore::for_keychain(kc.clone());
+
+            // Read resolves the stored acct and returns the seeded secret.
+            let got = store.read().await.expect("read seeded credential");
+            assert_eq!(got.expose(), b"initial-token");
+
+            // In-place update via `-U`.
+            let updated = Credential::new(b"updated-token-value".to_vec());
+            store
+                .write(&updated)
+                .await
+                .expect("write updated credential");
+
+            // Re-reading succeeds AND returns the new value. A successful read
+            // here also proves the write was in place: resolve enforces
+            // uniqueness, so if `-U` had created a second item (the bug a
+            // `getpwuid` guess would cause, since the seeded acct differs), this
+            // read would fail `CredentialAmbiguous`.
+            let reread = store.read().await.expect("re-read updated credential");
+            assert_eq!(reread.expose(), b"updated-token-value");
+
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn read_reports_not_found_on_empty_keychain() {
+            let (_dir, kc) = fresh_keychain();
+            let store = RealCredentialStore::for_keychain(kc.clone());
+            assert!(matches!(store.read().await, Err(Error::CredentialNotFound)));
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn read_reports_ambiguous_with_two_items() {
+            let (_dir, kc) = fresh_keychain();
+            seed(&kc, "acct-one", "token-one");
+            seed(&kc, "acct-two", "token-two");
+            let store = RealCredentialStore::for_keychain(kc.clone());
+            assert!(matches!(
+                store.read().await,
+                Err(Error::CredentialAmbiguous { count: 2 })
+            ));
+            delete(&kc);
+        }
     }
 }

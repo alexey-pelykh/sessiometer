@@ -2,8 +2,12 @@
 
 The acceptance record for issue [#16](https://github.com/alexey-pelykh/sessiometer/issues/16): a
 one-time empirical verification of the macOS credential mechanism, run **before** the swap engine
-(#6) is built. Procedure: **[`keychain-swap-guide.md`](./keychain-swap-guide.md)** (driven by
-**[`h3-r1.sh`](./h3-r1.sh)**). Two accounts used below as **A** (primary) and **B** (secondary).
+(#6) is built. The verification was originally driven by a bash harness + runbook; now that the
+read/write primitives are ported to Rust and test-covered
+([#2](https://github.com/alexey-pelykh/sessiometer/issues/2), `src/keychain.rs`), that harness has
+been **retired** — its findings are permanently captured here, and the automated re-verification
+path is the `security`-CLI round-trip test in `src/keychain.rs`. Two accounts used below as **A**
+(primary) and **B** (secondary).
 
 ## Environment
 
