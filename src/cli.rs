@@ -26,7 +26,12 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
         Some(cmd) => {
             let name = cmd.to_string_lossy();
             match name.as_ref() {
-                "capture" => capture().await,
+                "capture" => {
+                    // Optional positional label; the remainder (if any) is ignored,
+                    // matching the other subcommands.
+                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
+                    crate::capture::capture(label).await
+                }
                 "run" => run().await,
                 "status" => status().await,
                 "list" => list().await,
@@ -48,17 +53,12 @@ fn print_usage() {
          sessiometer <COMMAND>\n\
          \n\
          COMMANDS:\n    \
-         capture    Stash the current account's credential\n    \
+         capture [<label>]    Stash the active account into the rotation\n    \
          run        Run the foreground daemon (poll + swap)\n    \
          status     Show the roster and the last swap\n    \
          list       List captured accounts\n    \
          --help     Print this help"
     );
-}
-
-/// Stash the active account's credential. Lands in issue #4.
-async fn capture() -> Result<()> {
-    Err(Error::Unimplemented("account capture (#4)"))
 }
 
 /// Foreground daemon: poll usage and swap before exhaustion.

@@ -9,6 +9,8 @@
 //! of each subsystem is filled in by later work items (see the module docs and
 //! the `0.1.0` milestone issues).
 
+mod capture;
+mod claude_state;
 mod cli;
 mod config;
 mod daemon;
@@ -16,6 +18,7 @@ mod error;
 mod keychain;
 mod observability;
 mod paths;
+mod stash;
 mod swap;
 mod usage;
 

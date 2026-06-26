@@ -39,6 +39,11 @@ const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
 
+/// Maximum accounts the roster may hold (the rotation size). The single source
+/// of truth for this bound — `capture` (#4) reads it to cap new captures and to
+/// render its "N of {MAX_ACCOUNTS}" confirmation.
+pub(crate) const MAX_ACCOUNTS: usize = 5;
+
 /// One captured account in the roster. Keyed by non-secret fields only.
 ///
 /// The fields beyond the uniqueness keys are read by the write path
@@ -197,9 +202,9 @@ impl Config {
             monitor_401_n: t.monitor_401_n as u8,
         };
 
-        if !(1..=5).contains(&raw.account.len()) {
+        if !(1..=MAX_ACCOUNTS).contains(&raw.account.len()) {
             return Err(Error::ConfigInvalid(format!(
-                "roster must have 1..=5 accounts, got {}",
+                "roster must have 1..={MAX_ACCOUNTS} accounts, got {}",
                 raw.account.len()
             )));
         }

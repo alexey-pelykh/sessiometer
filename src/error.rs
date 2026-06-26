@@ -85,6 +85,57 @@ pub(crate) enum Error {
     #[error("invalid config: session_floor ({floor}) must not exceed session_trigger ({trigger})")]
     ConfigFloorAboveTrigger { floor: i64, trigger: i64 },
 
+    /// Claude Code's state file (`~/.claude.json`) does not exist — Claude Code
+    /// has not run / no account is logged in, so there is nothing to capture.
+    /// Carries the path (a filesystem location, never a secret).
+    #[error("no Claude Code state at {path} — log in with `claude` first")]
+    ClaudeStateNotFound { path: PathBuf },
+
+    /// `~/.claude.json` is not valid JSON. Only the parser's `line`/`column` are
+    /// carried — never the surrounding bytes, which include the account's
+    /// `oauthAccount` identity block (issue #15 redaction).
+    #[error(
+        "malformed Claude Code state (~/.claude.json): JSON error at line {line} column {column}"
+    )]
+    ClaudeStateParse { line: usize, column: usize },
+
+    /// `~/.claude.json` has no `oauthAccount` object — Claude Code is installed
+    /// but no account is logged in, so there is no identity to record.
+    #[error("no account is logged in to Claude Code (~/.claude.json has no oauthAccount)")]
+    OauthAccountMissing,
+
+    /// The logged-in account's `oauthAccount` is missing a required field (e.g.
+    /// `accountUuid`, the roster key). `field` is a static field name, never a
+    /// value (issue #15 redaction).
+    #[error("the logged-in account is missing its `{field}` — cannot key the roster")]
+    OauthAccountFieldMissing { field: &'static str },
+
+    /// The rotation is already full and the active account is not one of its
+    /// members, so it cannot be added. Re-capture an existing member to refresh
+    /// it instead. Carries only the limit (an integer, never a secret).
+    #[error(
+        "rotation is full ({max} accounts): re-capture one already in rotation, \
+         or remove one before capturing a new account"
+    )]
+    RotationFull { max: usize },
+
+    /// A new account was captured without an explicit label. A new account must
+    /// be named by the operator (there is deliberately no server-provided
+    /// fallback: `displayName` can collide across accounts and `emailAddress` is
+    /// redacted, issue #15). Re-capturing an existing account keeps its label, so
+    /// this fires only for a brand-new account. Secret-free.
+    #[error("a label is required for a new account: pass `sessiometer capture <label>`")]
+    LabelRequired,
+
+    /// A per-account stash is missing one or both of its keychain items
+    /// (credential / oauthAccount), so the account cannot be restored. Carries
+    /// the `service` (the `Sessiometer/acct-N` stash name — a config value, never
+    /// a secret). Surfaced by the swap engine (#6) reading a target's stash.
+    #[error(
+        "stash `{service}` is incomplete or absent (re-run `sessiometer capture` for this account)"
+    )]
+    StashIncomplete { service: String },
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
