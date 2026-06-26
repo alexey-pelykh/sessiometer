@@ -77,6 +77,21 @@ impl Credential {
     pub(crate) fn expose(&self) -> &[u8] {
         self.0.as_slice()
     }
+
+    /// Whether two credential blobs are byte-identical.
+    ///
+    /// Named to flag that it reads both secrets. The swap engine (#6) uses it for
+    /// the post-swap re-read — comparing the re-read canonical item against the
+    /// token it just wrote, to detect whether a third writer (a concurrent
+    /// `/login` or a token refresh) changed it in between. Both operands are
+    /// already held in this process, so a non-constant-time comparison leaks
+    /// nothing a holder of both does not already have — unlike a
+    /// secret-vs-attacker-guess check, where constant time matters (the reason a
+    /// production [`Credential`] deliberately has no `PartialEq`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn matches(&self, other: &Credential) -> bool {
+        self.0.as_slice() == other.0.as_slice()
+    }
 }
 
 /// Seam: reads/writes the active credential. The real impl drives the macOS
@@ -558,6 +573,15 @@ class: "genp"
         store.write(&cred).await.unwrap();
         // `Credential` has no `Debug`, so compare with `==` rather than `assert_eq!`.
         assert!(store.read().await.unwrap() == cred);
+    }
+
+    #[test]
+    fn credential_matches_compares_blob_bytes() {
+        let a = Credential::new(b"same-token".to_vec());
+        let same = Credential::new(b"same-token".to_vec());
+        let different = Credential::new(b"other-token".to_vec());
+        assert!(a.matches(&same));
+        assert!(!a.matches(&different));
     }
 
     /// Drives the real `security` CLI end-to-end against a throwaway keychain

@@ -163,6 +163,51 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Atomically (over)write an **existing** `path` with `contents`, preserving its
+/// current permission mode rather than forcing `0600`.
+///
+/// Same atomic shape as [`write_private_file`] — a same-directory `<path>.tmp`,
+/// `fsync`, then `rename` over `path`, so a concurrent reader never observes a
+/// half-written file — but for a file whose permission policy is **not ours to
+/// set**. The swap engine (#6) co-writes the `oauthAccount` block into
+/// `~/.claude.json`, a file owned by Claude Code; the existing file's mode is
+/// copied onto the replacement so the co-write never widens (nor narrows) the
+/// user's chosen permissions. `path` must already exist — its mode is the very
+/// thing being preserved, so an absent file is an error, never a silent create at
+/// our default mode. Wired into the swap loop in #7 (via [`crate::claude_state`]).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> {
+    // The existing file's permission bits (including any setuid/setgid/sticky),
+    // copied verbatim onto the replacement. Reading metadata first also surfaces
+    // an absent file here rather than fabricating one at `FILE_MODE`.
+    let mode = fs::metadata(path)?.permissions().mode() & 0o7777;
+
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    // A stale temp from a prior crashed write would make `create_new` fail; remove
+    // it best-effort so we always start from a fresh file.
+    let _ = fs::remove_file(&tmp);
+    {
+        // Created `0600` so the temp is never *more* permissive than the file it
+        // replaces while it is being written; the source mode is copied on just
+        // before the rename.
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(FILE_MODE)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.set_permissions(Permissions::from_mode(mode))?;
+        // Durable (data + the copied mode) before the rename, so a crash can't
+        // leave a truncated file in place of the old one.
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +284,52 @@ mod tests {
         let meta = fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, FILE_MODE);
         assert_eq!(fs::read(&path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn write_preserving_mode_keeps_an_existing_non_0600_mode() {
+        // The co-write target (~/.claude.json) is Claude Code's; a non-0600 mode
+        // must survive the co-write — the opposite of `write_private_file`, which
+        // forces 0600 on our own files.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+
+        write_preserving_mode(&path, b"new-contents").unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o644,
+            "must preserve the existing mode, not force 0600"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new-contents");
+        // No temp file left behind.
+        assert!(!tmp.path().join("state.json.tmp").exists());
+    }
+
+    #[test]
+    fn write_preserving_mode_keeps_a_0600_mode_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+
+        write_preserving_mode(&path, b"new").unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn write_preserving_mode_requires_an_existing_file() {
+        // The mode being preserved is the existing file's, so an absent file is an
+        // error — never a silent create at our default mode.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("absent.json");
+        assert!(write_preserving_mode(&path, b"x").is_err());
+        assert!(!path.exists());
     }
 }
