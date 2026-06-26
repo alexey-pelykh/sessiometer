@@ -12,6 +12,7 @@
 
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
+use std::io::Write;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -76,6 +77,12 @@ pub(crate) fn config_dir() -> Result<PathBuf> {
     ))
 }
 
+/// The config file: `<config_dir>/config.toml` — the daemon's source of truth
+/// (roster + tunables), read at start and written by `capture` (issue #3).
+pub(crate) fn config_file() -> Result<PathBuf> {
+    Ok(config_dir()?.join("config.toml"))
+}
+
 /// The log directory: `~/Library/Logs/sessiometer`.
 pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Logs").join(APP))
@@ -113,6 +120,38 @@ pub(crate) fn create_private_file(path: &Path) -> Result<File> {
         .mode(FILE_MODE)
         .open(path)?;
     Ok(file)
+}
+
+/// Atomically (over)write `path` with `contents`, leaving it `0600`.
+///
+/// Writes a sibling `<path>.tmp` (created fresh `0600`), `fsync`s it, then
+/// renames it over `path`. The rename is atomic within the directory, so a
+/// concurrent reader (the daemon loading config) never observes a half-written
+/// file, and `path` ends up `0600` regardless of any prior mode — unlike
+/// [`create_private_file`], whose mode applies only on creation. The parent
+/// directory must already exist and be private (caller runs
+/// [`ensure_private_dir`] first).
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    // A stale temp from a prior crashed write would make `create_new` fail;
+    // remove it best-effort so we always start from a fresh `0600` file.
+    let _ = fs::remove_file(&tmp);
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(FILE_MODE)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        // Durable before the rename, so a crash can't leave an empty config in
+        // place of the old one.
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -162,5 +201,34 @@ mod tests {
 
         let meta = fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, FILE_MODE);
+    }
+
+    #[test]
+    fn write_private_file_writes_contents_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        write_private_file(&path, b"hello = 1\n").unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, FILE_MODE);
+        assert_eq!(fs::read(&path).unwrap(), b"hello = 1\n");
+        // No temp file left behind.
+        assert!(!tmp.path().join("config.toml.tmp").exists());
+    }
+
+    #[test]
+    fn write_private_file_overwrites_and_stays_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        write_private_file(&path, b"first").unwrap();
+        // Loosen the mode to prove the second write re-tightens it (the rename
+        // installs the fresh 0600 temp, regardless of the old file's mode).
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, b"second").unwrap();
+
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, FILE_MODE);
+        assert_eq!(fs::read(&path).unwrap(), b"second");
     }
 }

@@ -67,11 +67,11 @@ async fn capture() -> Result<()> {
 /// The subsystems behind the seams are stubbed until their issues land, so in
 /// the current scaffold the first poll returns an `Unimplemented` error.
 async fn run() -> Result<()> {
-    // `load` is a stub today (returns `Unimplemented`), so `default` is the
-    // intended fallback. When #3 lands real loading, keep `default` only for
-    // the "no config file" case and surface real I/O / parse errors instead of
-    // swallowing them here.
-    let config = Config::load().unwrap_or_default();
+    // Load the real config (roster + tunables) and surface any I/O / parse /
+    // validation error: a malformed or absent config is fatal, not silently
+    // replaced by defaults (issue #3). The roster itself is wired into the swap
+    // engine in #6 / #7; here we consume the tunables the loop already needs.
+    let config = Config::load()?;
 
     paths::ensure_private_dir(&paths::config_dir()?)?;
     paths::ensure_private_dir(&paths::logs_dir()?)?;
@@ -80,8 +80,8 @@ async fn run() -> Result<()> {
     let mut daemon = Daemon::new(
         RealUsageSource,
         RealCredentialStore::new(),
-        RealClock::new(config.poll_interval),
-        config.swap_threshold,
+        RealClock::new(config.poll_interval()),
+        config.swap_threshold(),
     );
 
     loop {
