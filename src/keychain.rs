@@ -72,7 +72,9 @@ impl Credential {
 
     /// Borrow the raw blob bytes. Named to flag that the borrow exposes secret
     /// material: keep its lifetime as short as possible and never log it.
-    fn expose(&self) -> &[u8] {
+    /// Crate-visible because the per-account stash (issue #4) and the swap engine
+    /// (#6) must move the blob between the canonical item and the stash items.
+    pub(crate) fn expose(&self) -> &[u8] {
         self.0.as_slice()
     }
 }

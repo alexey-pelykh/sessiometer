@@ -1,0 +1,257 @@
+// Copyright (c) 2026 Oleksii PELYKH
+// SPDX-License-Identifier: MIT
+
+//! Claude Code's per-user state file, `~/.claude.json`.
+//!
+//! Holds the active account's `oauthAccount` identity block — the second half of
+//! an account's credential. The first half is the keychain token (see
+//! [`crate::keychain`]); issue #16/R1 established that an account is *both* parts,
+//! so [`capture`](crate::capture) records this block alongside the token and the
+//! swap engine (#6) restores both when rotating an account in.
+//!
+//! Only the `oauthAccount` object is read; the rest of the (large) file is
+//! ignored. The object is preserved as its canonical JSON bytes so it can be
+//! written back on restore, and its `accountUuid` (the roster key) is extracted
+//! for the roster. No other field is lifted out: the account is identified by
+//! `accountUuid` plus the operator-chosen label — never `displayName` (which two
+//! distinct accounts can share — `build/version-compat.md`) or `emailAddress`.
+//!
+//! Nothing here is printed: `oauthAccount` carries the account's email address,
+//! which must never reach an output channel — only the operator-facing *label*
+//! identifies an account (issue #15 redaction). Even the JSON-parse error path
+//! carries only a line/column, never the surrounding bytes.
+
+use std::io::ErrorKind;
+use std::path::Path;
+
+use serde_json::Value;
+
+use crate::error::{Error, Result};
+use crate::paths;
+
+/// The `oauthAccount` identity block recorded for a captured account.
+///
+/// `Clone` (not `Copy`) and intentionally no `Debug`: while not a bearer secret
+/// like [`crate::keychain::Credential`], it carries the account's email address,
+/// so it must not be casually printable.
+#[derive(Clone)]
+pub(crate) struct OauthAccount {
+    /// The object's canonical JSON bytes, re-serialized from the parsed value
+    /// (semantically equivalent to the source, not byte-for-byte the original
+    /// file bytes), preserved for restore (#6).
+    raw: Vec<u8>,
+    /// `accountUuid` — the stable per-account identifier and roster key.
+    ///
+    /// Deliberately the *only* field extracted: the account is keyed and
+    /// displayed by `accountUuid` + the operator's label, never by `displayName`
+    /// (two distinct accounts can share a display name — `build/version-compat.md`)
+    /// or `emailAddress` (issue #15 redaction).
+    account_uuid: String,
+}
+
+impl OauthAccount {
+    /// The account's stable identifier (`oauthAccount.accountUuid`); the roster
+    /// key and the basis for idempotent re-capture.
+    pub(crate) fn account_uuid(&self) -> &str {
+        &self.account_uuid
+    }
+
+    /// The canonical JSON bytes of the `oauthAccount` object, for stashing.
+    pub(crate) fn raw_json(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Build from the bytes of a serialized `oauthAccount` *object* (not the
+    /// whole file). Reconstructs a stashed identity on read-back (#6).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_object_bytes(bytes: &[u8]) -> Result<Self> {
+        let value: Value = serde_json::from_slice(bytes).map_err(parse_error)?;
+        Self::from_object(value)
+    }
+
+    /// Build from an already-parsed `oauthAccount` value: require it be an object
+    /// with a non-empty `accountUuid`, then re-serialize to canonical bytes.
+    fn from_object(value: Value) -> Result<Self> {
+        if !value.is_object() {
+            return Err(Error::OauthAccountMissing);
+        }
+        let account_uuid = string_field(&value, "accountUuid")?;
+        if account_uuid.trim().is_empty() {
+            return Err(Error::OauthAccountFieldMissing {
+                field: "accountUuid",
+            });
+        }
+        // Re-serialize the validated object to canonical bytes. `to_vec` on a
+        // parsed `Value` (finite numbers, string keys) cannot fail. serde_json's
+        // default `Map` is ordered, so this is deterministic across round-trips.
+        let raw = serde_json::to_vec(&value).expect("serializing a parsed JSON value");
+        Ok(Self { raw, account_uuid })
+    }
+}
+
+/// Read `~/.claude.json` and extract the active account's `oauthAccount` block.
+pub(crate) fn read_oauth_account() -> Result<OauthAccount> {
+    read_oauth_account_from(&paths::claude_json()?)
+}
+
+/// [`read_oauth_account`] against an explicit path — the injectable seam, so the
+/// not-found / malformed / no-account branches are testable without touching the
+/// real `~/.claude.json`.
+fn read_oauth_account_from(path: &Path) -> Result<OauthAccount> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(Error::ClaudeStateNotFound {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+    let root: Value = serde_json::from_slice(&bytes).map_err(parse_error)?;
+    let oauth = root
+        .get("oauthAccount")
+        .cloned()
+        .ok_or(Error::OauthAccountMissing)?;
+    OauthAccount::from_object(oauth)
+}
+
+/// Extract a required string field, mapping absence (or a non-string value) to
+/// the typed field-missing error — never echoing the value (issue #15).
+fn string_field(value: &Value, field: &'static str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(Error::OauthAccountFieldMissing { field })
+}
+
+/// Map a `serde_json` error to the secret-free [`Error::ClaudeStateParse`],
+/// carrying only its line/column — never the surrounding bytes, which hold the
+/// account's identity block (issue #15 redaction).
+fn parse_error(err: serde_json::Error) -> Error {
+    Error::ClaudeStateParse {
+        line: err.line(),
+        column: err.column(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A representative `~/.claude.json` fragment: the `oauthAccount` object plus
+    /// unrelated top-level keys that must be ignored.
+    const CLAUDE_JSON: &str = r#"{
+        "numStartups": 42,
+        "oauthAccount": {
+            "accountUuid": "11111111-1111-1111-1111-111111111111",
+            "emailAddress": "person@example.com",
+            "displayName": "Work Account",
+            "organizationName": "Acme"
+        },
+        "projects": {}
+    }"#;
+
+    fn write_temp(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn extracts_uuid_ignoring_other_keys() {
+        let (_dir, path) = write_temp(CLAUDE_JSON);
+        let oauth = read_oauth_account_from(&path).unwrap();
+        assert_eq!(oauth.account_uuid(), "11111111-1111-1111-1111-111111111111");
+    }
+
+    #[test]
+    fn raw_json_round_trips_through_object_bytes() {
+        let (_dir, path) = write_temp(CLAUDE_JSON);
+        let oauth = read_oauth_account_from(&path).unwrap();
+        // The stash stores raw_json(); read-back reconstructs an equivalent
+        // OauthAccount with identical canonical bytes (deterministic ordering).
+        let reread = OauthAccount::from_object_bytes(oauth.raw_json()).unwrap();
+        assert_eq!(reread.raw_json(), oauth.raw_json());
+        assert_eq!(reread.account_uuid(), oauth.account_uuid());
+        // The preserved object still carries the (never-printed) email for #6.
+        let value: Value = serde_json::from_slice(oauth.raw_json()).unwrap();
+        assert_eq!(value["emailAddress"], "person@example.com");
+    }
+
+    #[test]
+    fn an_account_without_a_display_name_still_extracts() {
+        // Only `accountUuid` is required; `displayName` is never used, so its
+        // absence must not block capture (guards against re-introducing a
+        // displayName dependency — `build/version-compat.md`).
+        let json = r#"{"oauthAccount":{"accountUuid":"u-1"}}"#;
+        let (_dir, path) = write_temp(json);
+        let oauth = read_oauth_account_from(&path).unwrap();
+        assert_eq!(oauth.account_uuid(), "u-1");
+    }
+
+    #[test]
+    fn missing_file_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        assert!(matches!(
+            read_oauth_account_from(&path),
+            Err(Error::ClaudeStateNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_json_reports_line_and_column_only() {
+        let (_dir, path) = write_temp("{ not json");
+        // Note: `OauthAccount` has no `Debug` (it carries the email), so the Ok
+        // arm cannot format the value — assert the variant directly instead.
+        match read_oauth_account_from(&path) {
+            Err(Error::ClaudeStateParse { line, column }) => {
+                assert!(line >= 1 && column >= 1);
+            }
+            Err(other) => panic!("expected ClaudeStateParse, got {other:?}"),
+            Ok(_) => panic!("expected ClaudeStateParse, got Ok"),
+        }
+    }
+
+    #[test]
+    fn no_oauth_account_object_is_missing() {
+        let (_dir, path) = write_temp(r#"{"numStartups": 1}"#);
+        assert!(matches!(
+            read_oauth_account_from(&path),
+            Err(Error::OauthAccountMissing)
+        ));
+    }
+
+    #[test]
+    fn oauth_account_without_uuid_is_field_missing() {
+        let (_dir, path) = write_temp(r#"{"oauthAccount":{"displayName":"x"}}"#);
+        assert!(matches!(
+            read_oauth_account_from(&path),
+            Err(Error::OauthAccountFieldMissing {
+                field: "accountUuid"
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_uuid_is_field_missing() {
+        let (_dir, path) = write_temp(r#"{"oauthAccount":{"accountUuid":"   "}}"#);
+        assert!(matches!(
+            read_oauth_account_from(&path),
+            Err(Error::OauthAccountFieldMissing {
+                field: "accountUuid"
+            })
+        ));
+    }
+
+    #[test]
+    fn non_object_oauth_account_is_missing() {
+        let (_dir, path) = write_temp(r#"{"oauthAccount":"not-an-object"}"#);
+        assert!(matches!(
+            read_oauth_account_from(&path),
+            Err(Error::OauthAccountMissing)
+        ));
+    }
+}

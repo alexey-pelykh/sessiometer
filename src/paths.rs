@@ -88,6 +88,15 @@ pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Logs").join(APP))
 }
 
+/// Claude Code's per-user state file: `~/.claude.json`.
+///
+/// Holds the active account's `oauthAccount` identity block, which `capture`
+/// (issue #4) records alongside the keychain credential. Resolved from the
+/// password database like every other path here — never from `$HOME`.
+pub(crate) fn claude_json() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude.json"))
+}
+
 /// The login keychain file: `~/Library/Keychains/login.keychain-db`.
 ///
 /// Where Claude Code stores its `Claude Code-credentials` item (the legacy
