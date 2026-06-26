@@ -136,6 +136,61 @@ pub(crate) enum Error {
     )]
     StashIncomplete { service: String },
 
+    // --- Usage polling (issue #5) ---------------------------------------------
+    //
+    // The HTTP outcome taxonomy for the read-only usage poll, as typed errors so
+    // the poll loop (#7) and the 401 monitor (#13) can route each runtime state.
+    // All are secret-free: the usage response carries only percentages / reset
+    // timestamps (no token, no email), and these variants deliberately echo none
+    // of the body — only a structural hint or the HTTP status code.
+    /// The stored credential blob has no usable OAuth access token (no
+    /// `claudeAiOauth.accessToken`), so there is no bearer to poll with. A
+    /// capture/setup problem, not a transient one. Carries nothing — never the
+    /// blob bytes (issue #15 redaction).
+    #[error("the stored credential has no usable OAuth access token (re-capture this account)")]
+    UsageTokenUnreadable,
+
+    /// The poll did not complete: a `5xx` server error, or — when `status` is
+    /// `0` — `curl` returned no HTTP response at all (DNS / connection / TLS /
+    /// timeout). Transient by the taxonomy (5xx / network): back off and skip the
+    /// cycle, never swap on missing data.
+    #[error("usage poll did not complete (HTTP status {status}; 0 means no HTTP response)")]
+    UsageTransient { status: u16 },
+
+    /// The usage endpoint rate-limited the poll (`HTTP 429`). Back off, log, skip
+    /// the cycle — never swap on a throttled (missing) reading.
+    #[error("usage poll was rate-limited (HTTP {status})")]
+    UsageRateLimited { status: u16 },
+
+    /// A non-401, non-403 `4xx` other than 429 (e.g. `400` / `404` / `422`). Like
+    /// 429 on the monitor path (design G4): back off, log, skip — never swap on a
+    /// rejected reading. `status` preserves the actual code for the log.
+    #[error("usage poll rejected (HTTP {status})")]
+    UsageRejected { status: u16 },
+
+    /// The stored access token was rejected with `HTTP 401` (and the consecutive
+    /// count has not yet reached `monitor_401_n`). A transient 401 → back off and
+    /// log; the re-stash trigger is a separate seam fired at the Nth consecutive
+    /// 401 (issue #13 / #6). The poller never self-refreshes a token.
+    #[error("usage poll unauthorized (HTTP 401) — the stored token was rejected")]
+    UsageUnauthorized,
+
+    /// The token authenticated but lacks the usage scope (`HTTP 403`) — the
+    /// hallmark of a non-interactive setup token. Surfaced **distinctly** from a
+    /// 401 (issue #5 acceptance): the fix is a fully-scoped re-capture, not a
+    /// re-stash/retry.
+    #[error(
+        "usage poll forbidden (HTTP 403) — the stored token lacks the usage scope \
+         (re-capture this account with an interactive login)"
+    )]
+    UsageScopeMissing,
+
+    /// The poll returned `200` but the body could not be parsed into both quota
+    /// dimensions. The wrapped message is a structural hint (a field/shape name)
+    /// — never any response bytes. Treated like missing data: skip, never swap.
+    #[error("malformed usage response: {0}")]
+    UsageParse(String),
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
