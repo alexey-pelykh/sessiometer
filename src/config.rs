@@ -79,8 +79,8 @@ pub(crate) struct Tunables {
     /// (`50..=99`).
     pub(crate) session_trigger: u8,
     /// Consecutive 401s before an account is treated as rejected (`1..=20`).
-    /// Consumed by the 401 monitor (#13).
-    #[allow(dead_code)]
+    /// Consumed by the usage poller's 401 monitor (#5); the re-stash it triggers
+    /// lands in #13 / #6.
     pub(crate) monitor_401_n: u8,
 }
 

@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
 use crate::observability::EventLog;
 use crate::paths;
-use crate::usage::RealUsageSource;
+use crate::usage::{CurlTransport, NoopReStashTrigger, RealUsageSource};
 
 /// Parse `argv` and run the requested subcommand.
 pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
@@ -77,8 +77,17 @@ async fn run() -> Result<()> {
     paths::ensure_private_dir(&paths::logs_dir()?)?;
     let mut log = EventLog::open()?;
 
+    // The usage poller reads the active account's bearer from the canonical
+    // keychain item and polls behind its own transport seam; per-account polling
+    // across the roster is the swap engine's job (#6 / #7), which constructs
+    // stash-backed sources. The re-stash trigger is a no-op here — acting on a
+    // rejected token lands in #13 / #6.
     let mut daemon = Daemon::new(
-        RealUsageSource,
+        RealUsageSource::new(
+            CurlTransport::new(RealCredentialStore::new()),
+            NoopReStashTrigger,
+            config.tunables.monitor_401_n,
+        ),
         RealCredentialStore::new(),
         RealClock::new(config.poll_interval()),
         config.swap_threshold(),
