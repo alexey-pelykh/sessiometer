@@ -59,6 +59,32 @@ pub(crate) enum Error {
     #[error("keychain {op} via `security` failed (exit status {code})")]
     Keychain { op: &'static str, code: i32 },
 
+    /// No `config.toml` exists yet at the expected path. Carries the path (a
+    /// filesystem location, never a secret) so the message can name it.
+    #[error("no config file at {path} — run `sessiometer capture` to create one")]
+    ConfigNotFound { path: PathBuf },
+
+    /// `config.toml` is not valid TOML, or a field has the wrong type. The
+    /// wrapped message comes from the TOML parser; it is secret-free because the
+    /// config file holds no secrets — only labels, account UUIDs, stash names
+    /// and integer tunables (issue #15).
+    #[error("malformed config: {0}")]
+    ConfigParse(String),
+
+    /// A config value is out of range, or the roster is malformed (wrong size,
+    /// duplicate `account_uuid`/`stash`, or an empty field). Carries a precise,
+    /// secret-free message naming the offending field.
+    #[error("invalid config: {0}")]
+    ConfigInvalid(String),
+
+    /// The cross-field rule failed: `session_floor` exceeds `session_trigger`
+    /// (no account could ever become a swap target, since the floor a candidate
+    /// must sit below is itself above the trigger). A distinct variant from
+    /// [`Error::ConfigInvalid`] so this case can be matched specifically
+    /// (issue #3).
+    #[error("invalid config: session_floor ({floor}) must not exceed session_trigger ({trigger})")]
+    ConfigFloorAboveTrigger { floor: i64, trigger: i64 },
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

@@ -12,8 +12,10 @@ publish = false
 
 [dependencies]
 libc = "0.2.186"
+serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "macros", "time", "process"] }
+toml = "1.1.2"
 zeroize = "1.9.0"
 
 [dev-dependencies]
