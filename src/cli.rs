@@ -79,7 +79,7 @@ async fn run() -> Result<()> {
 
     let mut daemon = Daemon::new(
         RealUsageSource,
-        RealCredentialStore,
+        RealCredentialStore::new(),
         RealClock::new(config.poll_interval),
         config.swap_threshold,
     );

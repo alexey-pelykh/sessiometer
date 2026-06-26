@@ -81,6 +81,16 @@ pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Logs").join(APP))
 }
 
+/// The login keychain file: `~/Library/Keychains/login.keychain-db`.
+///
+/// Where Claude Code stores its `Claude Code-credentials` item (the legacy
+/// file-based keychain, confirmed in `build/version-compat.md`). Every keychain
+/// operation pins this path explicitly via the `security` CLI — it keeps the
+/// item on the classic-ACL path (issue #2).
+pub(crate) fn login_keychain() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library/Keychains/login.keychain-db"))
+}
+
 /// Create `path` (and any missing parents) `0700` and assert it is owned by the
 /// current uid. Idempotent: if the directory already exists it re-tightens the
 /// mode and re-checks ownership.
