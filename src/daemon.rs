@@ -37,9 +37,11 @@
 //!   *between* ticks, so an in-flight swap always runs to completion (#6 is
 //!   no-half-swap): complete-or-abort, never a torn swap.
 //!
-//! Sibling work this leaves as seams: the cooldown *policy* (anti-oscillation, #10),
-//! the all-exhausted terminal state ([`TickAction::NoViableTarget`], #11), and the
-//! structured `status` event-log / `last_swap` fields (#9).
+//! The minimal `last_swap` shown by `status` (the handle swapped to + a relative
+//! age) is surfaced here (#8). Sibling work this leaves as seams: the cooldown
+//! *policy* (anti-oscillation, #10), the all-exhausted terminal state
+//! ([`TickAction::NoViableTarget`], #11), and the structured swap-history
+//! event-log (#9).
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -277,6 +279,10 @@ impl InstanceLock {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StatusSnapshot {
     pub(crate) accounts: Vec<AccountReading>,
+    /// The most recent swap as of this cycle (issue #8), or `None` until the
+    /// first. Already projected to a relative age; [`status_response`] copies it
+    /// straight onto the wire.
+    pub(crate) last_swap: Option<LastSwapLine>,
 }
 
 /// One account's latest reading.
@@ -287,23 +293,41 @@ pub(crate) struct AccountReading {
     pub(crate) usage: Option<Usage>,
 }
 
-/// The control socket's `status` reply — handles + percentages only (issue #15).
-/// The `last_swap` field and the event-log view are #9.
-#[derive(Serialize)]
-struct StatusResponse {
-    accounts: Vec<AccountStatusLine>,
+/// The control socket's `status` reply — handles + percentages + a minimal
+/// `last_swap`, and nothing else (issue #15: never a token or email). Derives
+/// both `Serialize` (the daemon writes it) and `Deserialize` (the `status` client
+/// reads it), so this one definition is the whole wire contract. The richer
+/// swap-history event-log view is #9.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct StatusResponse {
+    pub(crate) accounts: Vec<AccountStatusLine>,
+    /// The most recent swap, or `null` if none has happened this run.
+    pub(crate) last_swap: Option<LastSwapLine>,
 }
 
-#[derive(Serialize)]
-struct AccountStatusLine {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct AccountStatusLine {
     /// The operator-chosen handle (label) — never the email (issue #15).
-    label: String,
-    active: bool,
+    pub(crate) label: String,
+    pub(crate) active: bool,
     /// Last-polled session-window usage percent (`0..=100`); `null` if the last
     /// poll for this account failed (never a fabricated `0`).
-    session_pct: Option<u8>,
+    pub(crate) session_pct: Option<u8>,
     /// Last-polled weekly-window usage percent (`0..=100`).
-    weekly_pct: Option<u8>,
+    pub(crate) weekly_pct: Option<u8>,
+}
+
+/// The minimal `last_swap` shown by `status` (issue #8): the handle swapped TO
+/// and a relative age (`secs_ago`, computed as of the last poll). Non-secret by
+/// construction — a label + an integer, never a token or email (issue #15). The
+/// swap *history* (richer records) is #9. One serializable type for both
+/// [`StatusSnapshot`] (built each cycle) and [`StatusResponse`] (the wire).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LastSwapLine {
+    /// The label of the account swapped TO — never the email (issue #15).
+    pub(crate) to: String,
+    /// Whole seconds since the swap completed, as of the last poll.
+    pub(crate) secs_ago: u64,
 }
 
 /// The `{"cmd": "..."}` control request.
@@ -326,6 +350,9 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
             })
             .collect(),
+        // Already computed (a label + a relative age) at snapshot build; copy it
+        // to the wire (issue #8).
+        last_swap: snapshot.last_swap.clone(),
     }
 }
 
@@ -398,6 +425,19 @@ pub(crate) struct TickOutcome {
     pub(crate) snapshot: StatusSnapshot,
 }
 
+/// The last swap the loop performed: the handle swapped TO and when. One record
+/// serves two readers — the cooldown floor (its `at`) and the `status` display
+/// (#8, projected to a [`LastSwapLine`] at snapshot time).
+#[derive(Debug, Clone)]
+struct LastSwap {
+    /// Label of the account swapped TO (non-secret; issue #15).
+    to: String,
+    /// When the swap completed — monotonic, so it is both the cooldown floor and
+    /// the base for the `status` "seconds ago". Process-local: never serialized
+    /// directly (an [`Instant`] is meaningless across the socket).
+    at: Instant,
+}
+
 /// Per-loop decision state carried across polls.
 #[derive(Default)]
 struct DecisionState {
@@ -406,11 +446,12 @@ struct DecisionState {
     /// Roster index of the active account, resolved once and updated on each
     /// swap. `None` until first resolved (then the loop polls but never swaps).
     active: Option<usize>,
-    /// When the last swap completed — the cooldown seam (#10). The minimal #7
-    /// guard refuses an immediate re-swap within `cooldown`; the directional
-    /// anti-oscillation policy (avoiding A→B→A thrash, using `cooldown_secs`)
-    /// lands in #10.
-    last_swap_at: Option<Instant>,
+    /// The last swap performed, or `None` until the first. Drives both the
+    /// post-swap cooldown floor (the #10 seam — the minimal #7 guard refuses an
+    /// immediate re-swap within `cooldown`; the directional anti-oscillation
+    /// policy using `cooldown_secs` lands in #10) and the minimal `last_swap`
+    /// shown by `status` (#8).
+    last_swap: Option<LastSwap>,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -552,7 +593,7 @@ where
         }
 
         let action = self.decide_action(at, active, &readings).await;
-        let snapshot = self.snapshot(active, &readings);
+        let snapshot = self.snapshot(at, active, &readings);
         TickOutcome {
             tick,
             at,
@@ -585,8 +626,8 @@ where
         }
         // Over the trigger. Minimal cooldown floor (the #10 seam): refuse an
         // immediate re-swap within `cooldown` of the last one.
-        if let Some(last) = self.state.last_swap_at {
-            if at.saturating_duration_since(last) < self.cooldown {
+        if let Some(last) = &self.state.last_swap {
+            if at.saturating_duration_since(last.at) < self.cooldown {
                 return TickAction::SkippedCooldown;
             }
         }
@@ -611,7 +652,12 @@ where
         {
             Ok(_report) => {
                 self.state.active = Some(target_idx);
-                self.state.last_swap_at = Some(at);
+                // Record the swap for the cooldown floor and the `status` display
+                // (#8); `at` is the monotonic instant, the label is non-secret (#15).
+                self.state.last_swap = Some(LastSwap {
+                    to: self.roster[target_idx].label.clone(),
+                    at,
+                });
                 TickAction::Swapped {
                     from: active_idx,
                     to: target_idx,
@@ -622,7 +668,13 @@ where
     }
 
     /// Build the non-secret per-account snapshot for the event log and the socket.
-    fn snapshot(&self, active: Option<usize>, readings: &[Option<Usage>]) -> StatusSnapshot {
+    /// `at` (this cycle's instant) is the base for the `last_swap` relative age.
+    fn snapshot(
+        &self,
+        at: Instant,
+        active: Option<usize>,
+        readings: &[Option<Usage>],
+    ) -> StatusSnapshot {
         StatusSnapshot {
             accounts: self
                 .roster
@@ -634,6 +686,13 @@ where
                     usage: readings[i],
                 })
                 .collect(),
+            // Project the monotonic last-swap record to a relative age as of this
+            // cycle (issue #8); sourced from a label only, so no token/email can
+            // reach it (issue #15).
+            last_swap: self.state.last_swap.as_ref().map(|swap| LastSwapLine {
+                to: swap.to.clone(),
+                secs_ago: at.saturating_duration_since(swap.at).as_secs(),
+            }),
         }
     }
 
@@ -661,6 +720,31 @@ fn pick_target(active: usize, readings: &[Option<Usage>], floor: f64) -> Option<
                 .then(a.session.total_cmp(&b.session))
         })
         .map(|(i, _)| i)
+}
+
+/// The console line for a swap this cycle, or `None` for any non-swap outcome.
+/// Surfaced to the operator watching the foreground `run` (issue #8) — the file
+/// event log records every cycle separately. Sourced solely from labels, so it
+/// can never carry a token or email (issue #15).
+fn swap_report(outcome: &TickOutcome) -> Option<String> {
+    match outcome.action {
+        TickAction::Swapped { from, to } => Some(format!(
+            "swapped: {} → {}",
+            label_at(&outcome.snapshot, from),
+            label_at(&outcome.snapshot, to),
+        )),
+        _ => None,
+    }
+}
+
+/// The label of the roster account at `index` in `snapshot`, or `"?"` if out of
+/// range. A swap's indices are always valid, but the long-running daemon must
+/// never panic on a display path, so this stays total.
+fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
+    snapshot
+        .accounts
+        .get(index)
+        .map_or("?", |account| account.label.as_str())
 }
 
 /// Drive the poll loop until shutdown.
@@ -695,6 +779,12 @@ where
         // Best-effort logging: a log write failure must not kill the daemon.
         if let Err(err) = log.record(&outcome) {
             eprintln!("sessiometer: event log write failed: {err}");
+        }
+        // Echo a swap to the operator watching the foreground process (issue #8).
+        // The file event log (above) records every cycle; the console gets just
+        // swaps, sourced solely from labels (issue #15).
+        if let Some(report) = swap_report(&outcome) {
+            eprintln!("sessiometer: {report}");
         }
         // The snapshot the control socket answers from until the next poll.
         let snapshot = outcome.snapshot;
@@ -1059,6 +1149,8 @@ mod tests {
         let outcome = daemon.tick().await;
 
         assert_eq!(outcome.action, TickAction::Held);
+        // No swap has happened, so `status` would show `last swap: none`.
+        assert!(outcome.snapshot.last_swap.is_none());
         assert!(daemon
             .store
             .read()
@@ -1238,7 +1330,10 @@ mod tests {
         );
         // Simulate a swap that just happened: active A, last swap at "now".
         daemon.state.active = Some(0);
-        daemon.state.last_swap_at = Some(daemon.clock.now());
+        daemon.state.last_swap = Some(LastSwap {
+            to: "spare".to_owned(),
+            at: daemon.clock.now(),
+        });
         daemon.clock.advance(Duration::from_secs(10)); // still within the 100s cooldown
 
         let outcome = daemon.tick().await;
@@ -1281,7 +1376,10 @@ mod tests {
             &tun,
         );
         daemon.state.active = Some(0);
-        daemon.state.last_swap_at = Some(daemon.clock.now());
+        daemon.state.last_swap = Some(LastSwap {
+            to: "spare".to_owned(),
+            at: daemon.clock.now(),
+        });
         daemon.clock.advance(Duration::from_secs(150)); // past the 100s cooldown
 
         let outcome = daemon.tick().await;
@@ -1385,6 +1483,7 @@ mod tests {
                     usage: None,
                 },
             ],
+            last_swap: None,
         };
         let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
         assert!(json.contains("\"label\":\"work\""));
@@ -1393,6 +1492,8 @@ mod tests {
         assert!(json.contains("\"weekly_pct\":40"));
         // The unavailable account reports null, not a fabricated 0.
         assert!(json.contains("\"session_pct\":null"));
+        // No swap yet → the wire carries an explicit null, never a fabricated entry.
+        assert!(json.contains("\"last_swap\":null"));
         // Issue #15: the projection sources only labels + percentages, so neither
         // an email nor a token can ever reach the wire.
         assert!(!json.contains('@'));
@@ -1412,6 +1513,7 @@ mod tests {
                     weekly: 0.25,
                 }),
             }],
+            last_swap: None,
         };
         let (mut client, server) = tokio::io::duplex(1024);
         client.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
@@ -1447,6 +1549,105 @@ mod tests {
     #[test]
     fn control_reply_rejects_malformed_json() {
         assert!(control_reply("not json", &StatusSnapshot::default()).contains("malformed"));
+    }
+
+    // --- last_swap + swap report (issue #8) --------------------------------
+
+    #[test]
+    fn status_response_projects_a_present_last_swap_without_a_secret() {
+        let snapshot = StatusSnapshot {
+            accounts: vec![],
+            last_swap: Some(LastSwapLine {
+                to: "spare".to_owned(),
+                secs_ago: 125,
+            }),
+        };
+        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(json.contains("\"to\":\"spare\""), "got {json}");
+        assert!(json.contains("\"secs_ago\":125"), "got {json}");
+        // #15: a label + an integer only — never an email or token sigil.
+        assert!(!json.contains('@'));
+        assert!(!json.to_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn swap_report_renders_only_for_a_swap_outcome() {
+        let snapshot = StatusSnapshot {
+            accounts: vec![
+                AccountReading {
+                    label: "work".to_owned(),
+                    active: false,
+                    usage: None,
+                },
+                AccountReading {
+                    label: "spare".to_owned(),
+                    active: true,
+                    usage: None,
+                },
+            ],
+            last_swap: None,
+        };
+        let outcome = |action| TickOutcome {
+            tick: 1,
+            at: Instant::now(),
+            action,
+            snapshot: snapshot.clone(),
+        };
+        assert_eq!(
+            swap_report(&outcome(TickAction::Swapped { from: 0, to: 1 })).as_deref(),
+            Some("swapped: work → spare"),
+        );
+        assert_eq!(swap_report(&outcome(TickAction::Held)), None);
+        assert_eq!(swap_report(&outcome(TickAction::SkippedCooldown)), None);
+        assert_eq!(swap_report(&outcome(TickAction::NoViableTarget)), None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_last_swap_with_a_relative_age_after_a_swap() {
+        // Tick 1: A is over the trigger → swap to B; the snapshot reports the swap
+        // at age 0. Advance the clock; tick 2 holds (B is fresh) but the snapshot
+        // still reports the swap, now aged by the elapsed time.
+        let roster = vec![
+            account("u-A", "Sessiometer/acct-1", "work"),
+            account("u-B", "Sessiometer/acct-2", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/acct-1", b"A-token", "u-A"),
+            ("Sessiometer/acct-2", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // After the swap, B is active; keep B below the trigger so tick 2 holds.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::Swapped { from: 0, to: 1 });
+        let swap = first.snapshot.last_swap.expect("a swap was recorded");
+        assert_eq!(swap.to, "spare");
+        assert_eq!(swap.secs_ago, 0);
+
+        daemon.clock.advance(Duration::from_secs(125));
+        let second = daemon.tick().await;
+        assert_eq!(second.action, TickAction::Held);
+        let swap = second
+            .snapshot
+            .last_swap
+            .expect("the swap is still reported");
+        assert_eq!(swap.to, "spare");
+        assert_eq!(swap.secs_ago, 125);
     }
 
     // --- single-instance lock ----------------------------------------------

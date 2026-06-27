@@ -99,6 +99,7 @@ mod tests {
                         usage: None,
                     },
                 ],
+                last_swap: None,
             },
         })
         .unwrap();

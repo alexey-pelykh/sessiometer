@@ -209,6 +209,15 @@ pub(crate) enum Error {
     #[error("another sessiometer daemon is already running (the single-instance lock is held)")]
     AlreadyRunning,
 
+    // --- CLI status client (issue #8) ----------------------------------------
+    /// `sessiometer status` could not reach a running daemon: the control socket
+    /// is absent, or present but refusing connections (no live `run`). A friendly,
+    /// user-facing remap of the raw connect failure — the live counterpart to
+    /// [`Error::RosterEmpty`] for the offline `list` (#17) — that points the
+    /// operator at the next step instead of leaking a connection error. Secret-free.
+    #[error("daemon not running — start it with `sessiometer run`")]
+    DaemonNotRunning,
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

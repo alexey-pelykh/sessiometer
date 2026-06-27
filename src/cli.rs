@@ -3,17 +3,19 @@
 
 //! Command-line frontend.
 //!
-//! Scaffolding scope: subcommand dispatch and the wiring of the foreground
-//! `run` loop against the **real** seams. A real argument parser lands in issue
-//! #8; the live `status` view lands in #9.
+//! A hand-rolled subcommand dispatch (the handful of flag-less subcommands needs
+//! no parser dependency) over the **real** seams: `capture` (#4), the foreground
+//! `run` loop (#7), the live `status` control-socket client (#8), and the offline
+//! `list` roster view (#17).
 
 use std::path::Path;
 
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::{Account, Config, MAX_ACCOUNTS};
 use crate::daemon::{
-    run_loop, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown, UnixControl,
+    run_loop, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown, StatusResponse,
+    UnixControl,
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
@@ -144,9 +146,105 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
     Ok(UnixControl::new(listener))
 }
 
-/// Show the account roster and the last swap. Lands in issue #9.
+/// Show the active account, every account's usage, and the last swap (issue #8).
+///
+/// The **live** counterpart to the offline `list` (#17): a control-socket CLIENT.
+/// Connect to the running daemon's `0600` socket, ask for `status`, and pretty-
+/// print the reply. The socket exists only while `run` is live, so a failed
+/// connect is the friendly [`Error::DaemonNotRunning`] (exit non-zero), never a
+/// raw connection error — the live analog of `list`'s empty-state friendliness.
+/// The printer is sourced solely from the [`StatusResponse`], which carries
+/// handles + percentages + a swap age only (issue #15 redaction).
 async fn status() -> Result<()> {
-    Err(Error::Unimplemented("status (#9)"))
+    let response = query_status(&paths::control_socket()?).await?;
+    print!("{}", render_status(&response));
+    Ok(())
+}
+
+/// Connect to the daemon's control socket at `path`, request `status`, and parse
+/// the one-line reply. A connect failure that means "no daemon" — the socket is
+/// absent, or present but refusing — maps to the friendly [`Error::DaemonNotRunning`];
+/// any other connect error surfaces as itself.
+async fn query_status(path: &Path) -> Result<StatusResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let stream = match UnixStream::connect(path).await {
+        Ok(stream) => stream,
+        // No socket file, or a stale one with no listener → no live daemon.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(Error::DaemonNotRunning);
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+
+    // The same newline-delimited JSON the daemon's `serve_control` speaks: write
+    // one request line, read one reply line.
+    let mut buffered = tokio::io::BufReader::new(stream);
+    buffered.write_all(b"{\"cmd\":\"status\"}\n").await?;
+    buffered.flush().await?;
+    let mut line = String::new();
+    buffered.read_line(&mut line).await?;
+    serde_json::from_str(line.trim_end()).map_err(|err| Error::Io(std::io::Error::other(err)))
+}
+
+/// Render a [`StatusResponse`] as the text `status` prints. Pure (no clock, no
+/// I/O) so the response→text mapping is unit-testable. Sourced solely from the
+/// response's non-secret fields, so it can never print a token or email (issue #15).
+fn render_status(response: &StatusResponse) -> String {
+    let mut out = String::new();
+    for account in &response.accounts {
+        // `*` marks the active account (as the event log does); a leading space
+        // keeps the other labels aligned under it.
+        let marker = if account.active { "*" } else { " " };
+        out.push_str(&format!(
+            "{} {} · session {} · weekly {}\n",
+            marker,
+            account.label,
+            pct(account.session_pct),
+            pct(account.weekly_pct),
+        ));
+    }
+    out.push('\n');
+    match &response.last_swap {
+        Some(swap) => out.push_str(&format!(
+            "last swap: {} ({})\n",
+            swap.to,
+            humanize_secs(swap.secs_ago),
+        )),
+        None => out.push_str("last swap: none\n"),
+    }
+    out
+}
+
+/// A `0..=100` percent as `N%`, or `n/a` when the last poll for that account
+/// failed (never a fabricated `0`).
+fn pct(percent: Option<u8>) -> String {
+    match percent {
+        Some(percent) => format!("{percent}%"),
+        None => "n/a".to_owned(),
+    }
+}
+
+/// A whole-second age as a compact relative string, e.g. `90` → `1m ago`. Coarse
+/// by design — the minimal `last_swap` presentation for #8.
+fn humanize_secs(secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MINUTE {
+        format!("{secs}s ago")
+    } else if secs < HOUR {
+        format!("{}m ago", secs / MINUTE)
+    } else if secs < DAY {
+        format!("{}h ago", secs / HOUR)
+    } else {
+        format!("{}d ago", secs / DAY)
+    }
 }
 
 /// List captured accounts — the offline, read-only roster view (issue #17).
@@ -213,6 +311,7 @@ fn short_uuid(account_uuid: &str) -> &str {
 mod tests {
     use super::*;
     use crate::config::Tunables;
+    use crate::daemon::{AccountStatusLine, LastSwapLine};
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str, stash: &str) -> Account {
@@ -332,5 +431,137 @@ personal · 22222222 · Sessiometer/acct-2\n\
             !out.contains('@'),
             "list output must not contain an email: {out:?}"
         );
+    }
+
+    // --- status: response → text (issue #8) --------------------------------
+
+    fn status_line(
+        label: &str,
+        active: bool,
+        session: Option<u8>,
+        weekly: Option<u8>,
+    ) -> AccountStatusLine {
+        AccountStatusLine {
+            label: label.to_owned(),
+            active,
+            session_pct: session,
+            weekly_pct: weekly,
+        }
+    }
+
+    #[test]
+    fn render_status_shows_marker_quotas_and_a_present_last_swap() {
+        let response = StatusResponse {
+            accounts: vec![
+                status_line("work", true, Some(97), Some(40)),
+                status_line("spare", false, Some(10), Some(20)),
+                status_line("third", false, None, None),
+            ],
+            last_swap: Some(LastSwapLine {
+                to: "spare".to_owned(),
+                secs_ago: 125,
+            }),
+        };
+        let expected = concat!(
+            "* work · session 97% · weekly 40%\n",
+            "  spare · session 10% · weekly 20%\n",
+            "  third · session n/a · weekly n/a\n",
+            "\n",
+            "last swap: spare (2m ago)\n",
+        );
+        assert_eq!(render_status(&response), expected);
+    }
+
+    #[test]
+    fn render_status_shows_last_swap_none_before_any_swap() {
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25))],
+            last_swap: None,
+        };
+        let out = render_status(&response);
+        assert!(out.ends_with("last swap: none\n"), "got: {out:?}");
+    }
+
+    #[test]
+    fn render_status_never_carries_an_email_or_token_sigil() {
+        // #15: the printer sources only labels + percentages + a swap age, so a
+        // token / email can never reach the printed surface.
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25))],
+            last_swap: Some(LastSwapLine {
+                to: "spare".to_owned(),
+                secs_ago: 5,
+            }),
+        };
+        let out = render_status(&response);
+        assert!(
+            !out.contains('@'),
+            "status output must not contain an email: {out:?}"
+        );
+        assert!(!out.to_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn humanize_secs_uses_compact_units() {
+        assert_eq!(humanize_secs(0), "0s ago");
+        assert_eq!(humanize_secs(59), "59s ago");
+        assert_eq!(humanize_secs(60), "1m ago");
+        assert_eq!(humanize_secs(3599), "59m ago");
+        assert_eq!(humanize_secs(3600), "1h ago");
+        assert_eq!(humanize_secs(86_399), "23h ago");
+        assert_eq!(humanize_secs(86_400), "1d ago");
+    }
+
+    #[tokio::test]
+    async fn query_status_is_friendly_when_no_daemon_is_listening() {
+        // The socket exists only while `run` is live; an absent one is the
+        // friendly empty state, not a raw connection error (the live analog of
+        // `list`'s RosterEmpty, issue #17).
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock"); // never bound
+        let err = query_status(&socket).await.expect_err("no daemon → error");
+        assert!(matches!(err, Error::DaemonNotRunning), "got {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "daemon not running — start it with `sessiometer run`"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_status_round_trips_over_a_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25))],
+            last_swap: Some(LastSwapLine {
+                to: "spare".to_owned(),
+                secs_ago: 120,
+            }),
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+
+        // Server side: accept one connection, expect the status request, reply once.
+        let server = async {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut buffered = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            buffered.read_line(&mut request).await.unwrap();
+            assert_eq!(request.trim_end(), r#"{"cmd":"status"}"#);
+            buffered.write_all(wire.as_bytes()).await.unwrap();
+            buffered.write_all(b"\n").await.unwrap();
+            buffered.flush().await.unwrap();
+        };
+
+        let (_, parsed) = tokio::join!(server, query_status(&path));
+        let parsed = parsed.expect("a live socket round-trips");
+        assert_eq!(parsed.accounts.len(), 1);
+        assert_eq!(parsed.accounts[0].label, "work");
+        assert_eq!(parsed.accounts[0].session_pct, Some(50));
+        let swap = parsed.last_swap.expect("last_swap present");
+        assert_eq!(swap.to, "spare");
+        assert_eq!(swap.secs_ago, 120);
     }
 }
