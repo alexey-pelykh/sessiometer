@@ -201,7 +201,49 @@ pub(crate) enum Error {
     #[error("malformed usage response: {0}")]
     UsageParse(String),
 
+    // --- Daemon lifecycle (issue #7) -----------------------------------------
+    /// Another `sessiometer` daemon already holds the single-instance lock, so
+    /// this `run` must not start a second poll loop. Maps to process exit code
+    /// `3` (see [`Error::exit_code`]) so a supervisor can tell "already running"
+    /// apart from a generic failure. Secret-free.
+    #[error("another sessiometer daemon is already running (the single-instance lock is held)")]
+    AlreadyRunning,
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl Error {
+    /// The process exit code for this error.
+    ///
+    /// A held single-instance lock exits `3` ([`Error::AlreadyRunning`], issue
+    /// #7) so a second `run` is distinguishable from a generic failure (`1`);
+    /// every other error is a generic failure. The mapping lives here so the
+    /// `main` exit-code branch (and any future supervisor) stays a thin lookup.
+    pub(crate) fn exit_code(&self) -> u8 {
+        match self {
+            Error::AlreadyRunning => 3,
+            _ => 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_running_exits_three_so_a_supervisor_can_tell_it_apart() {
+        // The "second `run` exits 3" acceptance (issue #7): a held single-instance
+        // lock maps to exit code 3, distinct from a generic failure.
+        assert_eq!(Error::AlreadyRunning.exit_code(), 3);
+    }
+
+    #[test]
+    fn every_other_error_is_a_generic_failure() {
+        assert_eq!(Error::CredentialNotFound.exit_code(), 1);
+        assert_eq!(Error::Unimplemented("x").exit_code(), 1);
+        assert_eq!(Error::Io(std::io::Error::other("boom")).exit_code(), 1);
+    }
 }

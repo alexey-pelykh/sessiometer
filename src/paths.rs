@@ -88,6 +88,37 @@ pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Logs").join(APP))
 }
 
+/// The native-local application-support directory, **always**
+/// `~/Library/Application Support/sessiometer` — even when `$XDG_CONFIG_HOME`
+/// redirects [`config_dir`].
+///
+/// The daemon's runtime files (the single-instance lock and the control socket)
+/// live here rather than under the XDG-overridable config dir so that a second
+/// `run` contends on the *same* lock regardless of a per-shell `XDG_CONFIG_HOME`
+/// — the lock's job is to serialize Sessiometer against itself on one machine,
+/// which an env-var-relative path would defeat (issue #7).
+pub(crate) fn support_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library/Application Support").join(APP))
+}
+
+/// The single-instance lock file: `<support_dir>/daemon.lock` (`0600`).
+///
+/// A kernel advisory `flock` is held on this for the daemon's whole lifetime; a
+/// second `run` fails to acquire it and exits `3` (issue #7). Native-local (via
+/// [`support_dir`]) so the contention is machine-global, not XDG-relative.
+pub(crate) fn daemon_lock() -> Result<PathBuf> {
+    Ok(support_dir()?.join("daemon.lock"))
+}
+
+/// The control socket: `<support_dir>/daemon.sock` (`0600`).
+///
+/// The newline-delimited-JSON Unix-domain control channel a running daemon
+/// serves `status` on (issue #7). Native-local (via [`support_dir`]) and a Unix
+/// domain socket — never a TCP port.
+pub(crate) fn control_socket() -> Result<PathBuf> {
+    Ok(support_dir()?.join("daemon.sock"))
+}
+
 /// Claude Code's per-user state file: `~/.claude.json`.
 ///
 /// Holds the active account's `oauthAccount` identity block, which `capture`
@@ -234,6 +265,24 @@ mod tests {
             got,
             PathBuf::from("/Users/x/Library/Application Support/sessiometer")
         );
+    }
+
+    #[test]
+    fn support_dir_is_native_local_application_support() {
+        // The daemon's lock/socket dir is always native-local — it reads no
+        // XDG override (unlike `config_dir`), so its tail is fixed.
+        let dir = support_dir().unwrap();
+        assert!(
+            dir.ends_with("Library/Application Support/sessiometer"),
+            "support_dir must be native-local, got {dir:?}"
+        );
+    }
+
+    #[test]
+    fn lock_and_socket_live_directly_under_support_dir() {
+        let support = support_dir().unwrap();
+        assert_eq!(daemon_lock().unwrap(), support.join("daemon.lock"));
+        assert_eq!(control_socket().unwrap(), support.join("daemon.sock"));
     }
 
     #[test]

@@ -492,27 +492,6 @@ fn resets_at_of(obj: &Value) -> Option<String> {
 }
 
 #[cfg(test)]
-pub(crate) struct FakeUsageSource {
-    reading: Usage,
-}
-
-#[cfg(test)]
-impl FakeUsageSource {
-    pub(crate) fn new(session: f64, weekly: f64) -> Self {
-        Self {
-            reading: Usage { session, weekly },
-        }
-    }
-}
-
-#[cfg(test)]
-impl UsageSource for FakeUsageSource {
-    async fn usage(&self) -> Result<Usage> {
-        Ok(self.reading)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
