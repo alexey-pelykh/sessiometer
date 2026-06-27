@@ -36,7 +36,9 @@ async fn main() -> ExitCode {
         Err(err) => {
             // `Error` never carries secret material, so this is safe to print.
             eprintln!("sessiometer: {err}");
-            ExitCode::FAILURE
+            // A held single-instance lock exits `3`; every other error exits `1`
+            // (issue #7, via `Error::exit_code`).
+            ExitCode::from(err.exit_code())
         }
     }
 }

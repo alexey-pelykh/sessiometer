@@ -7,13 +7,19 @@
 //! `run` loop against the **real** seams. A real argument parser lands in issue
 //! #8; the live `status` view lands in #9.
 
+use std::path::Path;
+
+use tokio::net::UnixListener;
+
 use crate::config::{Account, Config, MAX_ACCOUNTS};
-use crate::daemon::{Daemon, RealClock};
+use crate::daemon::{
+    run_loop, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown, UnixControl,
+};
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
 use crate::observability::EventLog;
 use crate::paths;
-use crate::usage::{CurlTransport, NoopReStashTrigger, RealUsageSource};
+use crate::stash::RealAccountStash;
 
 /// Parse `argv` and run the requested subcommand.
 pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
@@ -61,43 +67,81 @@ fn print_usage() {
     );
 }
 
-/// Foreground daemon: poll usage and swap before exhaustion.
+/// Foreground daemon: poll every account's usage and swap the active credential
+/// before exhaustion.
 ///
-/// Wires the **real** seams into the generic [`Daemon`] and drives the loop.
-/// The subsystems behind the seams are stubbed until their issues land, so in
-/// the current scaffold the first poll returns an `Unimplemented` error.
+/// Wires the **real** seams into the generic [`Daemon`] and drives [`run_loop`]
+/// until SIGINT / SIGTERM. Lifecycle order is load-bearing: take the
+/// single-instance lock FIRST (a second `run` exits `3` without disturbing the
+/// first), then bind the control socket, then run.
 async fn run() -> Result<()> {
-    // Load the real config (roster + tunables) and surface any I/O / parse /
-    // validation error: a malformed or absent config is fatal, not silently
-    // replaced by defaults (issue #3). The roster itself is wired into the swap
-    // engine in #6 / #7; here we consume the tunables the loop already needs.
+    // The native-local support dir holds both the lock and the socket; ensure it
+    // (0700) before either touches it.
+    paths::ensure_private_dir(&paths::support_dir()?)?;
+
+    // Single-instance lock FIRST: held for the process lifetime, released by the
+    // kernel on exit (`_lock` drop). A second `run` cannot acquire it and exits
+    // `3` (issue #7), without disturbing the running daemon.
+    let _lock = InstanceLock::acquire(&paths::daemon_lock()?)?;
+
+    // Load the real config (roster + tunables); a malformed or absent config is
+    // fatal, never silently replaced by defaults (issue #3).
     let config = Config::load()?;
 
     paths::ensure_private_dir(&paths::config_dir()?)?;
     paths::ensure_private_dir(&paths::logs_dir()?)?;
     let mut log = EventLog::open()?;
 
-    // The usage poller reads the active account's bearer from the canonical
-    // keychain item and polls behind its own transport seam; per-account polling
-    // across the roster is the swap engine's job (#6 / #7), which constructs
-    // stash-backed sources. The re-stash trigger is a no-op here — acting on a
-    // rejected token lands in #13 / #6.
-    let mut daemon = Daemon::new(
-        RealUsageSource::new(
-            CurlTransport::new(RealCredentialStore::new()),
-            NoopReStashTrigger,
-            config.tunables.monitor_401_n,
-        ),
-        RealCredentialStore::new(),
-        RealClock::new(config.poll_interval()),
-        config.swap_threshold(),
-    );
+    // Bind the 0600 control socket (status queries; issue #15: handles +
+    // percentages only). The lock above guarantees no live daemon owns a stale
+    // socket, so a leftover one is safe to remove and rebind.
+    let socket_path = paths::control_socket()?;
+    let control = bind_control_socket(&socket_path)?;
 
-    loop {
-        let outcome = daemon.tick().await?;
-        log.record(&outcome)?;
-        daemon.wait_for_next_poll().await;
+    // Build the daemon over the real seams: per-account polling (active via the
+    // canonical credential, others via their stash), the canonical store, the
+    // account stash, the real clock, and `~/.claude.json` for display reconcile.
+    let mut daemon = Daemon::new(
+        config.roster.clone(),
+        RealRosterPoller::new(config.tunables.monitor_401_n),
+        RealCredentialStore::new(),
+        RealAccountStash::new(),
+        RealClock::new(config.poll_interval()),
+        paths::claude_json()?,
+        &config.tunables,
+    );
+    let mut shutdown = RealShutdown::new()?;
+
+    eprintln!(
+        "sessiometer: daemon started (polling every {}s); Ctrl-C or SIGTERM to stop",
+        config.tunables.poll_secs,
+    );
+    let result = run_loop(&mut daemon, &mut log, &mut shutdown, &control).await;
+
+    // Best-effort cleanup: remove our socket on the way out (the lock releases
+    // when `_lock` drops at the end of this scope).
+    let _ = std::fs::remove_file(&socket_path);
+    result
+}
+
+/// Bind the `0600` Unix-domain control socket at `path`, removing any stale
+/// socket left by a previous run first (the single-instance lock guarantees no
+/// live daemon owns it). The enclosing support dir is `0700`, so the socket is
+/// owner-only-reachable even during the bind→chmod window.
+fn bind_control_socket(path: &Path) -> Result<UnixControl> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A leftover socket file makes `bind` fail with EADDRINUSE; the lock we hold
+    // means it cannot belong to a running daemon, so remove it. A genuinely
+    // absent file is not an error.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Io(err)),
     }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(UnixControl::new(listener))
 }
 
 /// Show the account roster and the last swap. Lands in issue #9.

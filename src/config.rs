@@ -155,6 +155,11 @@ impl Config {
 
     /// The usage fraction in `[0.0, 1.0]` at or above which the active account
     /// is considered exhausted — `session_trigger` as a fraction.
+    ///
+    /// The daemon derives its own trigger / floor / cooldown uniformly from
+    /// [`Tunables`] (issue #7), so this Config-level accessor is currently a
+    /// tested seam for the `status` view (#9) rather than the run loop.
+    #[allow(dead_code)]
     pub(crate) fn swap_threshold(&self) -> f64 {
         f64::from(self.tunables.session_trigger) / 100.0
     }
