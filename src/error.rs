@@ -139,7 +139,7 @@ pub(crate) enum Error {
 
     /// A per-account stash is missing one or both of its keychain items
     /// (credential / oauthAccount), so the account cannot be restored. Carries
-    /// the `service` (the `Sessiometer/acct-N` stash name — a config value, never
+    /// the `service` (the `Sessiometer/<account_uuid>` stash name — a config value, never
     /// a secret). Surfaced by the swap engine (#6) reading a target's stash.
     #[error(
         "stash `{service}` is incomplete or absent (re-run `sessiometer capture` for this account)"

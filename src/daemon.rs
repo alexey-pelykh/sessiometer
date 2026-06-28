@@ -1077,15 +1077,15 @@ mod tests {
     #[tokio::test]
     async fn tick_swaps_active_over_trigger_to_the_freshest_viable_target() {
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
-            account("u-C", "Sessiometer/acct-3", "third"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+            account("u-C", "Sessiometer/u-C", "third"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
-            ("Sessiometer/acct-3", b"C-token", "u-C"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1122,13 +1122,13 @@ mod tests {
     #[tokio::test]
     async fn tick_holds_when_active_is_below_the_trigger() {
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1164,13 +1164,13 @@ mod tests {
         // Active A's poll fails (transient); B is wide open. Must NOT swap on
         // missing active data.
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1201,9 +1201,9 @@ mod tests {
     async fn tick_skips_when_the_active_account_cannot_be_identified() {
         // Canonical token matches no stash, and ~/.claude.json shows an account
         // not in the roster → active unknown → poll-only, no swap.
-        let roster = vec![account("u-A", "Sessiometer/acct-1", "work")];
+        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
         let store = store_holding(b"unknown-token").await;
-        let stash = stash_with(&[("Sessiometer/acct-1", b"A-token", "u-A")]).await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-STRANGER");
         let poller = FakeRosterPoller::new().ok("u-A", 0.99, 0.99);
         let tun = tunables(95, 80, 0);
@@ -1229,13 +1229,13 @@ mod tests {
         // canonical matches NO stash. The `~/.claude.json` display (u-A, in the
         // roster) is the fallback that still identifies the active account.
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-drifted-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-stale-token", "u-A"), // no longer matches canonical
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-stale-token", "u-A"), // no longer matches canonical
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1265,13 +1265,13 @@ mod tests {
     #[tokio::test]
     async fn tick_reports_no_viable_target_when_every_other_account_is_over_the_floor() {
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1304,13 +1304,13 @@ mod tests {
     #[tokio::test]
     async fn an_over_trigger_active_within_the_cooldown_is_skipped() {
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1351,13 +1351,13 @@ mod tests {
     #[tokio::test]
     async fn an_over_trigger_active_past_the_cooldown_swaps() {
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1394,13 +1394,13 @@ mod tests {
         // Post-swap crash: canonical holds B's token, but the display still shows
         // A (the co-write never landed). Reconcile heals the display to B.
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"B-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A"); // stale display
@@ -1423,9 +1423,9 @@ mod tests {
     async fn reconcile_leaves_the_display_untouched_when_no_stash_matches() {
         // Normal restart: the active account's token has drifted (refreshed in
         // place), matching no stash. The display is already correct → untouched.
-        let roster = vec![account("u-A", "Sessiometer/acct-1", "work")];
+        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
         let store = store_holding(b"A-drifted-token").await;
-        let stash = stash_with(&[("Sessiometer/acct-1", b"A-old-token", "u-A")]).await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-old-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-A");
         let tun = tunables(95, 80, 0);
         let daemon: FakeDaemon = Daemon::new(
@@ -1444,9 +1444,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_is_a_noop_when_the_display_already_matches() {
-        let roster = vec![account("u-A", "Sessiometer/acct-1", "work")];
+        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
         let store = store_holding(b"A-token").await;
-        let stash = stash_with(&[("Sessiometer/acct-1", b"A-token", "u-A")]).await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-A");
         let tun = tunables(95, 80, 0);
         let daemon: FakeDaemon = Daemon::new(
@@ -1608,13 +1608,13 @@ mod tests {
         // at age 0. Advance the clock; tick 2 holds (B is fresh) but the snapshot
         // still reports the swap, now aged by the elapsed time.
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1680,13 +1680,13 @@ mod tests {
     #[tokio::test]
     async fn run_loop_ticks_deterministically_and_stops_on_shutdown() {
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
@@ -1723,13 +1723,13 @@ mod tests {
         // to completion inside `tick` (shutdown is only observed between ticks),
         // the post-loop state is coherent — no half-swap.
         let roster = vec![
-            account("u-A", "Sessiometer/acct-1", "work"),
-            account("u-B", "Sessiometer/acct-2", "spare"),
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
-            ("Sessiometer/acct-1", b"A-token", "u-A"),
-            ("Sessiometer/acct-2", b"B-token", "u-B"),
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
         ])
         .await;
         let (_dir, json) = claude_json("u-A");

@@ -56,7 +56,7 @@ pub(crate) struct Account {
     /// Stable per-account identifier (the Claude `account_uuid`); roster key.
     pub(crate) account_uuid: String,
     /// Keychain stash name the captured credential lives under
-    /// (`Sessiometer/acct-N`); roster key.
+    /// (`Sessiometer/<account_uuid>`); roster key.
     pub(crate) stash: String,
     /// Human-readable label shown by `list` / `status`.
     pub(crate) label: String,
@@ -412,12 +412,12 @@ monitor_401_n = 5
 
 [[account]]
 account_uuid = "11111111-1111-1111-1111-111111111111"
-stash = "Sessiometer/acct-1"
+stash = "Sessiometer/11111111-1111-1111-1111-111111111111"
 label = "work"
 
 [[account]]
 account_uuid = "22222222-2222-2222-2222-222222222222"
-stash = "Sessiometer/acct-2"
+stash = "Sessiometer/22222222-2222-2222-2222-222222222222"
 label = "personal"
 "#;
 
@@ -428,7 +428,7 @@ label = "personal"
             "[tunables]\n{fragment}\n\
              [[account]]\n\
              account_uuid = \"u\"\n\
-             stash = \"Sessiometer/acct-1\"\n\
+             stash = \"Sessiometer/u\"\n\
              label = \"l\"\n"
         )
     }
@@ -448,14 +448,17 @@ label = "personal"
             }
         );
         assert_eq!(config.roster[0].label, "work");
-        assert_eq!(config.roster[1].stash, "Sessiometer/acct-2");
+        assert_eq!(
+            config.roster[1].stash,
+            "Sessiometer/22222222-2222-2222-2222-222222222222"
+        );
     }
 
     #[test]
     fn tunables_default_when_table_absent() {
         let toml = "[[account]]\n\
                     account_uuid = \"u\"\n\
-                    stash = \"Sessiometer/acct-1\"\n\
+                    stash = \"Sessiometer/u\"\n\
                     label = \"only\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
@@ -579,7 +582,7 @@ label = "personal"
     fn round_trips_a_label_that_needs_escaping() {
         let toml = "[[account]]\n\
                     account_uuid = \"u\"\n\
-                    stash = \"Sessiometer/acct-1\"\n\
+                    stash = \"Sessiometer/u\"\n\
                     label = \"tab\\there \\\"quote\\\" and \\\\ slash\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.roster[0].label, "tab\there \"quote\" and \\ slash");
