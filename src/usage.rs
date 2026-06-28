@@ -93,15 +93,17 @@ pub(crate) struct Usage {
 /// The full parse of a usage response: both dimensions plus each window's reset
 /// timestamp. [`Usage`] is the swap-decision projection of this; the reset
 /// timestamps are extracted here (issue #5 acceptance: "returns session%,
-/// account%, resets_at") and consumed by `status` (#9) and the cooldown /
-/// terminal logic (#10 / #11), which widen the seam when they need them.
+/// account%, resets_at") and consumed by the cooldown / all-exhausted terminal
+/// logic (#10 / #11), which widen the seam when they need them — the #9 event log
+/// already carries an `all_exhausted resets_at=` field awaiting that value.
 #[derive(Debug, Clone, PartialEq)]
 struct UsageReport {
     session: f64,
     weekly: f64,
     /// Raw `resets_at` of the session window, as the API rendered it (ISO string
     /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Surfaced to
-    /// #9 / #10 / #11, not the swap decision, hence unread here yet.
+    /// the cooldown / terminal logic (#10 / #11), not the swap decision, hence
+    /// unread here yet.
     #[allow(dead_code)]
     session_resets_at: Option<String>,
     /// Raw `resets_at` of the weekly window (see `session_resets_at`).
