@@ -58,14 +58,19 @@ use crate::usage::Usage;
 pub(crate) enum SwapDecision {
     /// Stay on the current account.
     Hold,
-    /// The active account crossed the usage threshold; the swap engine should
-    /// rotate to the next account.
+    /// One of the active account's usage dimensions reached its own trigger
+    /// (issue #41: session or weekly); the swap engine should rotate to the next
+    /// account.
     Swap,
 }
 
-/// Decide whether to swap, based on the worst-case usage dimension.
-pub(crate) fn decide(usage: &Usage, threshold: f64) -> SwapDecision {
-    if usage.max_ratio() >= threshold {
+/// Decide whether to swap: trigger when EITHER dimension reaches its OWN
+/// threshold (issue #41) — the active account's session usage at/above
+/// `session_threshold`, OR its weekly usage at/above the separate (typically
+/// higher) `weekly_threshold`. The two thresholds are independent: either
+/// crossing alone forces a swap-away, and neither subsumes the other.
+pub(crate) fn decide(usage: &Usage, session_threshold: f64, weekly_threshold: f64) -> SwapDecision {
+    if usage.session >= session_threshold || usage.weekly >= weekly_threshold {
         SwapDecision::Swap
     } else {
         SwapDecision::Hold
@@ -179,21 +184,49 @@ mod tests {
     use crate::stash::FakeAccountStash;
 
     #[test]
-    fn holds_below_threshold() {
+    fn holds_when_both_dimensions_are_below_their_thresholds() {
         let usage = Usage {
             session: 0.5,
             weekly: 0.5,
         };
-        assert_eq!(decide(&usage, 0.95), SwapDecision::Hold);
+        // Session below 0.95 AND weekly below 0.98 → hold.
+        assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Hold);
     }
 
     #[test]
-    fn swaps_at_threshold_boundary() {
+    fn swaps_when_session_reaches_its_threshold() {
+        // AC #1 (regression preserved): session at its threshold → swap, even
+        // with weekly far below its separate (higher) threshold.
         let usage = Usage {
             session: 0.95,
             weekly: 0.1,
         };
-        assert_eq!(decide(&usage, 0.95), SwapDecision::Swap);
+        assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Swap);
+    }
+
+    #[test]
+    fn swaps_when_weekly_reaches_its_threshold_while_session_is_below() {
+        // AC #2: weekly at its threshold while session sits below its own → swap.
+        let usage = Usage {
+            session: 0.50,
+            weekly: 0.98,
+        };
+        assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Swap);
+    }
+
+    #[test]
+    fn the_two_thresholds_gate_their_dimensions_independently() {
+        // AC #3: each dimension is gated by its OWN threshold. A weekly reading of
+        // 0.96 — between the two thresholds — does NOT trigger while the weekly
+        // threshold is the higher 0.98, but the SAME reading DOES trigger once the
+        // weekly threshold is lowered to 0.95. Session is held below its threshold
+        // throughout, isolating the weekly axis.
+        let usage = Usage {
+            session: 0.50,
+            weekly: 0.96,
+        };
+        assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Hold);
+        assert_eq!(decide(&usage, 0.95, 0.95), SwapDecision::Swap);
     }
 
     // --- the swap engine (#6) ---

@@ -41,6 +41,10 @@ const DEFAULT_POLL_JITTER_STDDEV: f64 = 30.0;
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// Default `session_trigger` percent.
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
+/// Default `weekly_trigger` percent — separate from and higher than
+/// `session_trigger` (issue #41): the weekly window is the longer, harder limit,
+/// so the active account is allowed closer to full on it before a swap-away.
+const DEFAULT_WEEKLY_TRIGGER: u8 = 98;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
 
@@ -85,6 +89,11 @@ pub(crate) struct Tunables {
     /// Swap *away* from the active account at or above this session percent
     /// (`50..=99`).
     pub(crate) session_trigger: u8,
+    /// Swap *away* from the active account at or above this WEEKLY percent
+    /// (`50..=99`) — the second, independent trigger dimension (issue #41).
+    /// Separate from `session_trigger` (no cross-field constraint), typically set
+    /// higher; the daemon swaps when EITHER dimension reaches its own trigger.
+    pub(crate) weekly_trigger: u8,
     /// Consecutive 401s before an account is treated as rejected (`1..=20`).
     /// Consumed by the usage poller's 401 monitor (#5); the re-stash it triggers
     /// lands in #13 / #6.
@@ -97,6 +106,11 @@ pub(crate) struct Tunables {
     /// base = `session_trigger`, no jitter unless configured. Drawn + clamped to
     /// `50..=99` each cycle, then divided by 100 for the swap decision.
     pub(crate) trigger_strategy: Strategy,
+    /// Weekly swap-away trigger timing strategy (issue #41), in the PERCENT
+    /// domain: base = `weekly_trigger`, no jitter unless configured. Drawn +
+    /// clamped to `50..=99` each cycle, then divided by 100 for the swap decision
+    /// — the weekly-dimension counterpart of `trigger_strategy`.
+    pub(crate) weekly_trigger_strategy: Strategy,
     /// Post-swap cooldown timing strategy (issue #38), in seconds: base =
     /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to `0..=3600`
     /// each cycle.
@@ -110,19 +124,21 @@ impl Default for Tunables {
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
             session_floor: None,
             session_trigger: DEFAULT_SESSION_TRIGGER,
+            weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
             monitor_401_n: DEFAULT_MONITOR_401_N,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
             },
             trigger_strategy: Strategy::fixed(f64::from(DEFAULT_SESSION_TRIGGER)),
+            weekly_trigger_strategy: Strategy::fixed(f64::from(DEFAULT_WEEKLY_TRIGGER)),
             cooldown_strategy: Strategy::fixed(DEFAULT_COOLDOWN_SECS as f64),
         }
     }
 }
 
 /// The default poll-interval jitter: normal, so polls decorrelate out of the box
-/// (issue #38). Trigger and cooldown default to [`Jitter::None`].
+/// (issue #38). Trigger, weekly trigger, and cooldown default to [`Jitter::None`].
 fn default_poll_jitter() -> Jitter {
     Jitter::Normal {
         stddev: DEFAULT_POLL_JITTER_STDDEV,
@@ -217,6 +233,11 @@ impl Config {
         let t = raw.tunables;
 
         range("session_trigger", t.session_trigger, 50, 99)?;
+        // The weekly trigger is independent of the session trigger (issue #41):
+        // its own 50..=99 bound, with NO cross-field rule — weekly may sit below
+        // session (an unusual but valid operator choice), so both are configurable
+        // independently (AC #3).
+        range("weekly_trigger", t.weekly_trigger, 50, 99)?;
         // session_floor is opt-in (#10): absent → None (the guard is off). When
         // present, its lower bound is 0 and its upper bound is session_trigger (a
         // higher floor could never admit a target), the latter a distinct
@@ -248,6 +269,8 @@ impl Config {
         // cooldown are fixed unless the operator configures a strategy.
         let poll_jitter = parse_jitter("poll", raw.jitter.poll, default_poll_jitter())?;
         let trigger_jitter = parse_jitter("trigger", raw.jitter.trigger, Jitter::None)?;
+        let weekly_trigger_jitter =
+            parse_jitter("weekly_trigger", raw.jitter.weekly_trigger, Jitter::None)?;
         let cooldown_jitter = parse_jitter("cooldown", raw.jitter.cooldown, Jitter::None)?;
 
         // Ranges are checked above, so these narrowing casts cannot truncate. The
@@ -258,6 +281,7 @@ impl Config {
             cooldown_secs: t.cooldown_secs as u64,
             session_floor,
             session_trigger: t.session_trigger as u8,
+            weekly_trigger: t.weekly_trigger as u8,
             monitor_401_n: t.monitor_401_n as u8,
             poll_strategy: Strategy {
                 base: t.poll_secs as f64,
@@ -266,6 +290,10 @@ impl Config {
             trigger_strategy: Strategy {
                 base: t.session_trigger as f64,
                 jitter: trigger_jitter,
+            },
+            weekly_trigger_strategy: Strategy {
+                base: t.weekly_trigger as f64,
+                jitter: weekly_trigger_jitter,
             },
             cooldown_strategy: Strategy {
                 base: t.cooldown_secs as f64,
@@ -358,6 +386,12 @@ impl Config {
             "# Swap AWAY from the active account at or above this session percent (50..=99).\n",
         );
         out.push_str(&format!("session_trigger = {}\n", t.session_trigger));
+        out.push_str(
+            "# Swap AWAY from the active account at or above this WEEKLY percent (50..=99).\n\
+             # Independent of session_trigger (typically higher): a swap fires when EITHER\n\
+             # dimension reaches its own trigger.\n",
+        );
+        out.push_str(&format!("weekly_trigger = {}\n", t.weekly_trigger));
         out.push_str("# Consecutive 401s before an account is treated as rejected (1..=20).\n");
         out.push_str(&format!("monitor_401_n = {}\n", t.monitor_401_n));
 
@@ -375,6 +409,10 @@ impl Config {
         out.push_str(&format!(
             "trigger = {}\n",
             render_jitter(&t.trigger_strategy.jitter)
+        ));
+        out.push_str(&format!(
+            "weekly_trigger = {}\n",
+            render_jitter(&t.weekly_trigger_strategy.jitter)
         ));
         out.push_str(&format!(
             "cooldown = {}\n",
@@ -542,6 +580,8 @@ struct RawTunables {
     session_floor: Option<i64>,
     #[serde(default = "default_session_trigger")]
     session_trigger: i64,
+    #[serde(default = "default_weekly_trigger")]
+    weekly_trigger: i64,
     #[serde(default = "default_monitor_401_n")]
     monitor_401_n: i64,
 }
@@ -553,6 +593,7 @@ impl Default for RawTunables {
             cooldown_secs: default_cooldown_secs(),
             session_floor: None,
             session_trigger: default_session_trigger(),
+            weekly_trigger: default_weekly_trigger(),
             monitor_401_n: default_monitor_401_n(),
         }
     }
@@ -566,6 +607,9 @@ fn default_cooldown_secs() -> i64 {
 }
 fn default_session_trigger() -> i64 {
     i64::from(DEFAULT_SESSION_TRIGGER)
+}
+fn default_weekly_trigger() -> i64 {
+    i64::from(DEFAULT_WEEKLY_TRIGGER)
 }
 fn default_monitor_401_n() -> i64 {
     i64::from(DEFAULT_MONITOR_401_N)
@@ -581,6 +625,8 @@ struct RawJitter {
     poll: Option<RawJitterSpec>,
     #[serde(default)]
     trigger: Option<RawJitterSpec>,
+    #[serde(default)]
+    weekly_trigger: Option<RawJitterSpec>,
     #[serde(default)]
     cooldown: Option<RawJitterSpec>,
 }
@@ -610,6 +656,7 @@ poll_secs = 30
 cooldown_secs = 45
 session_floor = 70
 session_trigger = 90
+weekly_trigger = 97
 monitor_401_n = 5
 
 [[account]]
@@ -646,14 +693,17 @@ label = "personal"
                 cooldown_secs: 45,
                 session_floor: Some(70),
                 session_trigger: 90,
+                weekly_trigger: 97,
                 monitor_401_n: 5,
                 // No [jitter] table in VALID → default strategies: poll jitters
-                // normally (base from poll_secs), trigger/cooldown are fixed.
+                // normally (base from poll_secs), trigger/weekly_trigger/cooldown
+                // are fixed at their respective bases.
                 poll_strategy: Strategy {
                     base: 30.0,
                     jitter: default_poll_jitter(),
                 },
                 trigger_strategy: Strategy::fixed(90.0),
+                weekly_trigger_strategy: Strategy::fixed(97.0),
                 cooldown_strategy: Strategy::fixed(45.0),
             }
         );
@@ -705,6 +755,53 @@ label = "personal"
                 "session_trigger = {trigger} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_out_of_range_weekly_trigger() {
+        // #41: the weekly trigger carries the same 50..=99 bound as the session one.
+        for trigger in ["49", "100", "120"] {
+            let toml = with_tunables(&format!("weekly_trigger = {trigger}"));
+            assert!(
+                matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
+                "weekly_trigger = {trigger} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn session_and_weekly_triggers_are_independently_configurable() {
+        // AC #3: the two triggers are set independently — there is NO cross-field
+        // rule, so weekly may even sit BELOW session (unlike session_floor, which
+        // is capped at session_trigger).
+        let t = Config::parse(&with_tunables("session_trigger = 90\nweekly_trigger = 99"))
+            .unwrap()
+            .tunables;
+        assert_eq!(t.session_trigger, 90);
+        assert_eq!(t.weekly_trigger, 99);
+        assert_eq!(t.trigger_strategy.base, 90.0);
+        assert_eq!(t.weekly_trigger_strategy.base, 99.0);
+
+        // weekly BELOW session is accepted (no floor-style cross-field constraint).
+        let inverted = Config::parse(&with_tunables("session_trigger = 95\nweekly_trigger = 60"))
+            .unwrap()
+            .tunables;
+        assert_eq!(inverted.session_trigger, 95);
+        assert_eq!(inverted.weekly_trigger, 60);
+    }
+
+    #[test]
+    fn weekly_trigger_defaults_higher_than_session_when_absent() {
+        // An absent weekly_trigger takes its (higher-than-session) default.
+        let t = Config::parse(&with_tunables("session_trigger = 95"))
+            .unwrap()
+            .tunables;
+        assert_eq!(t.weekly_trigger, DEFAULT_WEEKLY_TRIGGER);
+        assert!(t.weekly_trigger > t.session_trigger);
+        assert_eq!(
+            t.weekly_trigger_strategy.base,
+            f64::from(DEFAULT_WEEKLY_TRIGGER)
+        );
     }
 
     #[test]
@@ -832,9 +929,9 @@ label = "personal"
 
     #[test]
     fn poll_jitter_defaults_to_normal_trigger_and_cooldown_stay_fixed() {
-        // AC: poll interval uses normal jitter by default; trigger and cooldown
-        // are fixed unless the operator configures a strategy. Bases mirror the
-        // validated scalar tunables.
+        // AC: poll interval uses normal jitter by default; trigger, weekly_trigger
+        // and cooldown are fixed unless the operator configures a strategy. Bases
+        // mirror the validated scalar tunables.
         let t = Config::parse(VALID).unwrap().tunables;
         assert_eq!(
             t.poll_strategy.jitter,
@@ -843,9 +940,11 @@ label = "personal"
             }
         );
         assert_eq!(t.trigger_strategy.jitter, Jitter::None);
+        assert_eq!(t.weekly_trigger_strategy.jitter, Jitter::None);
         assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
         assert_eq!(t.poll_strategy.base, 30.0);
         assert_eq!(t.trigger_strategy.base, 90.0);
+        assert_eq!(t.weekly_trigger_strategy.base, 97.0);
         assert_eq!(t.cooldown_strategy.base, 45.0);
     }
 
@@ -867,11 +966,16 @@ label = "personal"
         let toml = with_jitter(
             "poll = { kind = \"normal\", stddev = 25.0 }\n\
              trigger = { kind = \"uniform\", spread = 2.5 }\n\
+             weekly_trigger = { kind = \"normal\", stddev = 1.0 }\n\
              cooldown = { kind = \"none\" }",
         );
         let t = Config::parse(&toml).unwrap().tunables;
         assert_eq!(t.poll_strategy.jitter, Jitter::Normal { stddev: 25.0 });
         assert_eq!(t.trigger_strategy.jitter, Jitter::Uniform { spread: 2.5 });
+        assert_eq!(
+            t.weekly_trigger_strategy.jitter,
+            Jitter::Normal { stddev: 1.0 }
+        );
         assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
     }
 
@@ -907,8 +1011,9 @@ label = "personal"
             )),
             Err(Error::ConfigParse(_))
         ));
-        // …and so is an unrecognized tunable name. `weekly` is NOT a jitter
-        // tunable in this slice (issue #38 applies to poll/trigger/cooldown).
+        // …and so is an unrecognized tunable name. The jitter tunables are
+        // poll/trigger/weekly_trigger/cooldown (issue #41 added weekly_trigger); a
+        // bare `weekly` (≠ the actual `weekly_trigger` key) is still unknown.
         assert!(matches!(
             Config::parse(&with_jitter("weekly = { kind = \"none\" }")),
             Err(Error::ConfigParse(_))
@@ -920,6 +1025,7 @@ label = "personal"
         let toml = with_jitter(
             "poll = { kind = \"uniform\", spread = 12.5 }\n\
              trigger = { kind = \"normal\", stddev = 1.5 }\n\
+             weekly_trigger = { kind = \"uniform\", spread = 0.5 }\n\
              cooldown = { kind = \"none\" }",
         );
         let original = Config::parse(&toml).unwrap();
@@ -931,7 +1037,7 @@ label = "personal"
     fn rendered_config_documents_the_jitter_table() {
         let text = Config::parse(VALID).unwrap().render();
         assert!(text.contains("[jitter]"));
-        for key in ["poll", "trigger", "cooldown"] {
+        for key in ["poll", "trigger", "weekly_trigger", "cooldown"] {
             assert!(
                 text.contains(key),
                 "rendered config must mention jitter.{key}"
@@ -966,6 +1072,7 @@ label = "personal"
             "cooldown_secs",
             "session_floor",
             "session_trigger",
+            "weekly_trigger",
             "monitor_401_n",
         ] {
             assert!(text.contains(key), "rendered config must mention {key}");
@@ -994,6 +1101,8 @@ label = "personal"
         for fragment in [
             "session_trigger = 50\nsession_floor = 0",
             "session_trigger = 99\nsession_floor = 99", // floor == trigger is allowed
+            "weekly_trigger = 50",
+            "weekly_trigger = 99",
             "poll_secs = 5",
             "poll_secs = 3600",
             "cooldown_secs = 0",
