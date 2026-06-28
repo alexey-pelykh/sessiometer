@@ -33,7 +33,7 @@
 //! and prints.
 
 use crate::claude_state::{read_oauth_account, OauthAccount};
-use crate::config::{Account, Config, Tunables, MAX_ACCOUNTS};
+use crate::config::{Account, Config, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
@@ -163,10 +163,9 @@ fn plan_capture(
         return Ok((existing.stash.clone(), CaptureOutcome::Refreshed));
     }
 
-    // New account: the rotation must have room, and an explicit label is required.
-    if roster.len() >= MAX_ACCOUNTS {
-        return Err(Error::RotationFull { max: MAX_ACCOUNTS });
-    }
+    // New account: an explicit label is required. There is no roster ceiling
+    // (#35) — the operator captures as many accounts as they choose, so a new
+    // account is always appended (never rejected for being "one too many").
     let label = provided.ok_or(Error::LabelRequired)?.to_owned();
     // Key the stash by the immutable, server-assigned account_uuid — not a
     // positional slot. The keychain service accepts the uuid (hex + hyphens)
@@ -185,7 +184,8 @@ fn plan_capture(
 fn confirmation(outcome: CaptureOutcome, label: &str, count: usize) -> String {
     match outcome {
         CaptureOutcome::Captured => {
-            format!("Captured \"{label}\" (account {count} of {MAX_ACCOUNTS} in rotation).")
+            // No fixed "of N" denominator (#35) — report the running count only.
+            format!("Captured \"{label}\" (now {count} in rotation).")
         }
         CaptureOutcome::Refreshed => {
             format!("Refreshed \"{label}\" (still {count} in rotation).")
@@ -303,25 +303,30 @@ mod tests {
     }
 
     #[test]
-    fn a_full_rotation_rejects_a_new_account() {
-        let mut roster: Vec<Account> = (1..=MAX_ACCOUNTS)
+    fn capturing_beyond_the_former_cap_succeeds() {
+        // #35: there is no roster ceiling — a 6th (and beyond) new account is
+        // appended, not rejected.
+        let mut roster: Vec<Account> = (1..=5)
             .map(|i| account(&format!("u-{i}"), &format!("Sessiometer/u-{i}"), "l"))
             .collect();
-        assert!(matches!(
-            plan_capture(&mut roster, "u-new", Some("x")),
-            Err(Error::RotationFull { max: 5 })
-        ));
-        // …but a full rotation still allows refreshing a member.
-        assert!(plan_capture(&mut roster, "u-1", None).is_ok());
+        let (stash, outcome) = plan_capture(&mut roster, "u-6", Some("sixth")).unwrap();
+        assert_eq!(stash, "Sessiometer/u-6");
+        assert_eq!(outcome, CaptureOutcome::Captured);
+        assert_eq!(roster.len(), 6);
+        // …and a 7th continues to append.
+        plan_capture(&mut roster, "u-7", Some("seventh")).unwrap();
+        assert_eq!(roster.len(), 7);
     }
 
     // --- confirmation (exact AC strings) ---
 
     #[test]
     fn confirmation_lines_match_the_acceptance_criteria() {
+        // #35: no fixed "of N" denominator — the captured line carries the running
+        // count only. A count of 6 (past the former cap) is an ordinary capture.
         assert_eq!(
-            confirmation(CaptureOutcome::Captured, "work", 3),
-            "Captured \"work\" (account 3 of 5 in rotation)."
+            confirmation(CaptureOutcome::Captured, "work", 6),
+            "Captured \"work\" (now 6 in rotation)."
         );
         assert_eq!(
             confirmation(CaptureOutcome::Refreshed, "personal", 2),
