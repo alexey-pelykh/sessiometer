@@ -36,12 +36,30 @@
 //! token is the authoritative bearer, so a clobbered `oauthAccount` self-heals on
 //! the next reconcile (last-writer-wins).
 //!
+//! ## Mid-turn correctness (issue #12)
+//!
+//! Because the target app re-reads the canonical credential **per request**, a swap
+//! that lands mid-turn must present a clean cut: the next request picks up the
+//! incoming account, the in-flight request is unaffected, and no reader ever
+//! observes a torn / half-written blob. That cut rests entirely on step 3's atomic
+//! `-U` canonical write ("old-or-new, never empty / torn"). The
+//! `tests::mid_turn_live` oracle demonstrates it against the real `security` CLI:
+//! a concurrent reader re-reading the canonical item across a forced swap sees the
+//! outgoing account, then the incoming one, and never anything in between. The
+//! remaining live-only tail — the in-flight request's at-most-one
+//! transparently-retried 401 — is the *target's* own retry, not ours, and stays a
+//! deferred manual check (below).
+//!
 //! ## Deferred live checks (need a live token; cannot run in CI)
 //!
-//! Two oracles need the real login keychain plus a live Claude token, so they are
+//! These oracles need the real login keychain plus a live Claude token, so they are
 //! verified manually rather than in CI (re-run on Claude Code auth bumps):
 //!   - the end-to-end LIVE oracle — after a swap, an *independent* usage read
 //!     reports the new account (the functional reroute actually took effect);
+//!   - the mid-turn live tail (#12) — a running session adopts the incoming account
+//!     on its next request, and the in-flight request absorbs at most one
+//!     transparently-retried 401; `tests::mid_turn_live` proves the
+//!     credential-cut half in CI, this is the target-behaviour half;
 //!   - the `apple-tool:`-ride version check — the CLI write still rides the
 //!     `apple-tool:` ACL entry on the current Claude Code version (#2).
 
@@ -588,5 +606,230 @@ mod tests {
         assert_eq!(a.credential.expose(), b"A-stash-token");
         // The canonical item is likewise untouched.
         assert!(store.read().await.unwrap().matches(&cred(b"A-token")));
+    }
+
+    /// The mid-turn swap-correctness oracle (issue #12), driven end-to-end against
+    /// the real `/usr/bin/security` CLI on a throwaway keychain — never the login
+    /// keychain. macOS-only: the property rests on `security -U`'s atomic in-place
+    /// update (`build/version-compat.md`), so the real CLI is the system under
+    /// test (the same reason [`crate::keychain`]'s round-trip lives behind this cfg).
+    ///
+    /// Models the scenario the issue names: the target app (Claude Code) re-reads
+    /// the canonical credential **per request**, so a swap that lands mid-turn must
+    /// present a clean cut — a concurrent reader sees the outgoing account, then the
+    /// incoming account, and never a torn / empty / half-written blob in between.
+    /// The fully-live tail (the in-flight request's at-most-one transparently-retried
+    /// 401, which is the *target's* retry, not ours) needs a live Claude token and
+    /// stays a deferred manual oracle — see the module docs.
+    #[cfg(target_os = "macos")]
+    mod mid_turn_live {
+        use super::*;
+
+        use std::process::Command as StdCommand;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use crate::keychain::RealCredentialStore;
+        use crate::stash::RealAccountStash;
+
+        /// Claude Code's well-known generic-password service for the canonical
+        /// credential (mirrors the private `keychain::SERVICE`; hard-coded here
+        /// because the test seeds the item the way `/login` would).
+        const CANONICAL_SERVICE: &str = "Claude Code-credentials";
+        /// A canonical `acct` deliberately unlike `$USER`, so the store resolves the
+        /// STORED acct rather than guessing — the same point `keychain`'s round-trip
+        /// test makes.
+        const CANONICAL_ACCT: &str = "sessiometer-midturn-acct";
+
+        /// Make + unlock a throwaway keychain; the returned tempdir guard keeps it
+        /// alive. Mirrors `keychain::tests::real_cli::fresh_keychain`.
+        fn fresh_keychain() -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let kc = dir.path().join("test.keychain-db");
+            assert!(StdCommand::new("/usr/bin/security")
+                .args(["create-keychain", "-p", ""])
+                .arg(&kc)
+                .status()
+                .expect("spawn create-keychain")
+                .success());
+            assert!(StdCommand::new("/usr/bin/security")
+                .args(["unlock-keychain", "-p", ""])
+                .arg(&kc)
+                .status()
+                .expect("spawn unlock-keychain")
+                .success());
+            (dir, kc)
+        }
+
+        /// Seed the canonical `Claude Code-credentials` item, simulating `/login`.
+        fn seed_canonical(kc: &Path, secret: &str) {
+            assert!(StdCommand::new("/usr/bin/security")
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-s",
+                    CANONICAL_SERVICE,
+                    "-a",
+                    CANONICAL_ACCT,
+                    "-w",
+                    secret,
+                ])
+                .arg(kc)
+                .status()
+                .expect("spawn add-generic-password")
+                .success());
+        }
+
+        fn delete_keychain(kc: &Path) {
+            let _ = StdCommand::new("/usr/bin/security")
+                .arg("delete-keychain")
+                .arg(kc)
+                .status();
+        }
+
+        /// AC (#12): a scripted long-running request + a forced mid-request swap →
+        /// the request completes AND the next request reports the new account.
+        ///
+        /// The "long-running request" is a reader re-reading the canonical item in a
+        /// tight loop (the target's per-request read); the "forced mid-request swap"
+        /// is the real [`swap`] rotating A → B underneath it. The reader runs as its
+        /// own task so its `security` reads genuinely race the swap's `security`
+        /// write on the shared keychain.
+        #[tokio::test]
+        async fn a_long_running_request_completes_and_the_next_request_reports_the_new_account() {
+            // Seed the canonical item to A and stash both A and B — the state capture
+            // (#4) plus a prior `/login` would leave behind.
+            let (_dir, kc) = fresh_keychain();
+            seed_canonical(&kc, "A-token");
+            let stash = RealAccountStash::for_keychain(kc.clone());
+            stash
+                .write(ACCT_A, &stashed(b"A-token", "u-A"))
+                .await
+                .unwrap();
+            stash
+                .write(ACCT_B, &stashed(b"B-token", "u-B"))
+                .await
+                .unwrap();
+            let (_json_dir, json) = claude_json("u-A", 0o600);
+
+            // `saw_a` gates the swap until the request has actually read the OUTGOING
+            // account at least once (so the record spans the cut, not just lands on
+            // B); `swap_done` lets the reader stop once it observes the new account
+            // after the swap has returned.
+            let saw_a = Arc::new(AtomicBool::new(false));
+            let swap_done = Arc::new(AtomicBool::new(false));
+
+            let reader = {
+                let kc = kc.clone();
+                let saw_a = Arc::clone(&saw_a);
+                let swap_done = Arc::clone(&swap_done);
+                tokio::spawn(async move {
+                    let store = RealCredentialStore::for_keychain(kc);
+                    let mut seen: Vec<Vec<u8>> = Vec::new();
+                    // Reads that found the canonical item ABSENT (errSecItemNotFound,
+                    // code 44 → `CredentialNotFound`). The atomic `-U` write keeps the
+                    // item present at every instant, so this must stay zero — a
+                    // non-zero count is exactly the window a non-atomic delete-then-add
+                    // would open, which is asserted against below. Capturing it (rather
+                    // than discarding every error) is what makes "never torn / never
+                    // absent" falsifiable in CI, not merely observed.
+                    let mut absent_reads: u32 = 0;
+                    // A wall-clock backstop so a regression that never cuts over
+                    // FAILS the assertions below rather than hanging CI.
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while Instant::now() < deadline {
+                        match store.read().await {
+                            Ok(c) => {
+                                let blob = c.expose().to_vec();
+                                if blob.as_slice() == b"A-token" {
+                                    saw_a.store(true, Ordering::SeqCst);
+                                }
+                                let is_b = blob.as_slice() == b"B-token";
+                                seen.push(blob);
+                                if is_b && swap_done.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                            // The item was absent — the forbidden non-atomic window.
+                            Err(Error::CredentialNotFound) => absent_reads += 1,
+                            // Any other error is benign contention under the concurrent
+                            // write (a locked / busy keychain); the target would
+                            // transparently retry, so the loop retries too.
+                            Err(_) => {}
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    (seen, absent_reads)
+                })
+            };
+
+            // Hold the swap until the in-flight request has read A at least once.
+            let gate = Instant::now() + Duration::from_secs(10);
+            while !saw_a.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < gate,
+                    "the in-flight request never read the pre-swap account A"
+                );
+                tokio::task::yield_now().await;
+            }
+
+            // The forced mid-request swap.
+            let swap_store = RealCredentialStore::for_keychain(kc.clone());
+            let report = swap(&swap_store, &stash, ACCT_A, ACCT_B, &json)
+                .await
+                .unwrap();
+            swap_done.store(true, Ordering::SeqCst);
+
+            let (seen, absent_reads) = reader.await.expect("the reader task panicked");
+
+            // The canonical item was never absent mid-swap: the atomic `-U` write
+            // never opened a delete-then-add gap a per-request reader could fall
+            // through (which would surface as item-not-found).
+            assert_eq!(
+                absent_reads, 0,
+                "the canonical item went ABSENT mid-swap ({absent_reads}×) — the write was not atomic"
+            );
+            // The request completed: every observation is a COMPLETE, valid
+            // credential — exactly the outgoing or the incoming token, never empty /
+            // half-written / garbage. This is the atomic-`-U` guarantee in action.
+            for (i, blob) in seen.iter().enumerate() {
+                assert!(
+                    blob.as_slice() == b"A-token" || blob.as_slice() == b"B-token",
+                    "read #{i} saw a torn credential ({} bytes) — the swap was not atomic",
+                    blob.len()
+                );
+            }
+            // It genuinely spanned the swap: it read the outgoing account…
+            assert!(
+                seen.iter().any(|b| b.as_slice() == b"A-token"),
+                "never observed the pre-swap account A"
+            );
+            // …and the next request reports the new account.
+            assert!(
+                seen.last().is_some_and(|b| b.as_slice() == b"B-token"),
+                "the request did not end on the post-swap account B"
+            );
+            // The cut is clean and one-way: once B appears, A never returns.
+            let first_b = seen
+                .iter()
+                .position(|b| b.as_slice() == b"B-token")
+                .expect("never observed the post-swap account B");
+            assert!(
+                seen[first_b..].iter().all(|b| b.as_slice() == b"B-token"),
+                "the active credential flapped back to A after the cutover"
+            );
+
+            // An independent fresh read confirms the canonical reroute landed…
+            assert!(swap_store.read().await.unwrap().matches(&cred(b"B-token")));
+            assert!(report.canonical_confirmed);
+            // …and the OUTGOING account is unaffected: A's credential is preserved,
+            // intact and recoverable, in its own stash — the in-flight request that
+            // already read A can still complete against it.
+            let a = stash.read(ACCT_A).await.unwrap();
+            assert_eq!(a.credential.expose(), b"A-token");
+
+            delete_keychain(&kc);
+        }
     }
 }
