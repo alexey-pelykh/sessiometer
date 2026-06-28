@@ -27,9 +27,16 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::paths;
+use crate::timing::{Jitter, Strategy};
 
-/// Default seconds between usage polls.
-const DEFAULT_POLL_SECS: u64 = 60;
+/// Default seconds between usage polls. Issue #38 lengthened this from the
+/// original fixed 60 s to a longer base that the normal poll jitter then
+/// decorrelates across accounts/cycles.
+const DEFAULT_POLL_SECS: u64 = 300;
+/// Default standard deviation (seconds) of the poll interval's normal jitter —
+/// ~10% of [`DEFAULT_POLL_SECS`]. Poll is the one tunable that jitters by
+/// default (issue #38 AC: "poll interval uses a longer base + normal jitter").
+const DEFAULT_POLL_JITTER_STDDEV: f64 = 30.0;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// Default `session_floor` percent.
@@ -58,7 +65,11 @@ pub(crate) struct Account {
 }
 
 /// The daemon tunables, validated into their typed ranges.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived: the timing strategies (issue #38) carry
+/// `f64` magnitudes, so only `PartialEq` is available — sufficient for the tests'
+/// `assert_eq!` and for the render round-trip check.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Tunables {
     /// Seconds between usage polls (`5..=3600`).
     pub(crate) poll_secs: u64,
@@ -77,6 +88,18 @@ pub(crate) struct Tunables {
     /// Consumed by the usage poller's 401 monitor (#5); the re-stash it triggers
     /// lands in #13 / #6.
     pub(crate) monitor_401_n: u8,
+    /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
+    /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
+    /// cycle instead of sleeping a fixed interval.
+    pub(crate) poll_strategy: Strategy,
+    /// Swap-away trigger timing strategy (issue #38), in the PERCENT domain:
+    /// base = `session_trigger`, no jitter unless configured. Drawn + clamped to
+    /// `50..=99` each cycle, then divided by 100 for the swap decision.
+    pub(crate) trigger_strategy: Strategy,
+    /// Post-swap cooldown timing strategy (issue #38), in seconds: base =
+    /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to `0..=3600`
+    /// each cycle.
+    pub(crate) cooldown_strategy: Strategy,
 }
 
 impl Default for Tunables {
@@ -87,7 +110,21 @@ impl Default for Tunables {
             session_floor: DEFAULT_SESSION_FLOOR,
             session_trigger: DEFAULT_SESSION_TRIGGER,
             monitor_401_n: DEFAULT_MONITOR_401_N,
+            poll_strategy: Strategy {
+                base: DEFAULT_POLL_SECS as f64,
+                jitter: default_poll_jitter(),
+            },
+            trigger_strategy: Strategy::fixed(f64::from(DEFAULT_SESSION_TRIGGER)),
+            cooldown_strategy: Strategy::fixed(DEFAULT_COOLDOWN_SECS as f64),
         }
+    }
+}
+
+/// The default poll-interval jitter: normal, so polls decorrelate out of the box
+/// (issue #38). Trigger and cooldown default to [`Jitter::None`].
+fn default_poll_jitter() -> Jitter {
+    Jitter::Normal {
+        stddev: DEFAULT_POLL_JITTER_STDDEV,
     }
 }
 
@@ -144,7 +181,10 @@ impl Config {
         paths::write_private_file(&path, self.render().as_bytes())
     }
 
-    /// How long to wait between usage polls.
+    /// The base poll interval — the un-jittered `poll_secs`. The run loop now
+    /// draws a jittered interval each cycle from the poll strategy (issue #38),
+    /// so this is a tested accessor for the base rather than the live cadence.
+    #[allow(dead_code)]
     pub(crate) fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.tunables.poll_secs)
     }
@@ -194,13 +234,34 @@ impl Config {
         range("cooldown_secs", t.cooldown_secs, 0, 3600)?;
         range("monitor_401_n", t.monitor_401_n, 1, 20)?;
 
-        // Ranges are checked above, so these narrowing casts cannot truncate.
+        // Jitter specs (issue #38): each optional and validated to a clear load
+        // error (parse-or-error). Poll jitters normally by default; trigger and
+        // cooldown are fixed unless the operator configures a strategy.
+        let poll_jitter = parse_jitter("poll", raw.jitter.poll, default_poll_jitter())?;
+        let trigger_jitter = parse_jitter("trigger", raw.jitter.trigger, Jitter::None)?;
+        let cooldown_jitter = parse_jitter("cooldown", raw.jitter.cooldown, Jitter::None)?;
+
+        // Ranges are checked above, so these narrowing casts cannot truncate. The
+        // strategy bases are the same validated scalars (issue #38): the daemon
+        // draws + clamps from the strategy each cycle.
         let tunables = Tunables {
             poll_secs: t.poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
             session_floor: t.session_floor as u8,
             session_trigger: t.session_trigger as u8,
             monitor_401_n: t.monitor_401_n as u8,
+            poll_strategy: Strategy {
+                base: t.poll_secs as f64,
+                jitter: poll_jitter,
+            },
+            trigger_strategy: Strategy {
+                base: t.session_trigger as f64,
+                jitter: trigger_jitter,
+            },
+            cooldown_strategy: Strategy {
+                base: t.cooldown_secs as f64,
+                jitter: cooldown_jitter,
+            },
         };
 
         // The roster needs at least one account but has no fixed upper bound: the
@@ -287,6 +348,26 @@ impl Config {
         out.push_str("# Consecutive 401s before an account is treated as rejected (1..=20).\n");
         out.push_str(&format!("monitor_401_n = {}\n", t.monitor_401_n));
 
+        // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the
+        // tunable's valid range, to decorrelate polling/swaps across cycles.
+        out.push_str("\n[jitter]\n");
+        out.push_str(
+            "# Randomization drawn each cycle and clamped to the tunable's range.\n\
+             # kind = \"none\" | \"uniform\" (with `spread`) | \"normal\" (with `stddev`).\n",
+        );
+        out.push_str(&format!(
+            "poll = {}\n",
+            render_jitter(&t.poll_strategy.jitter)
+        ));
+        out.push_str(&format!(
+            "trigger = {}\n",
+            render_jitter(&t.trigger_strategy.jitter)
+        ));
+        out.push_str(&format!(
+            "cooldown = {}\n",
+            render_jitter(&t.cooldown_strategy.jitter)
+        ));
+
         for account in &self.roster {
             out.push_str("\n[[account]]\n");
             out.push_str(&format!(
@@ -308,6 +389,81 @@ fn range(field: &'static str, value: i64, lo: i64, hi: i64) -> Result<()> {
         Err(Error::ConfigInvalid(format!(
             "{field} must be in {lo}..={hi}, got {value}"
         )))
+    }
+}
+
+/// Validate one tunable's optional `[jitter]` spec into a [`Jitter`], or fail at
+/// load (issue #38 parse-or-error). `field` names the tunable in any error;
+/// `default` applies when the spec is absent. Enforces the `none|uniform|normal`
+/// vocabulary, the correct magnitude key per kind (`spread` for uniform, `stddev`
+/// for normal, none for `none`), and a non-negative, finite magnitude.
+fn parse_jitter(
+    field: &'static str,
+    spec: Option<RawJitterSpec>,
+    default: Jitter,
+) -> Result<Jitter> {
+    let Some(spec) = spec else {
+        return Ok(default);
+    };
+    match spec.kind.as_str() {
+        "none" => {
+            if spec.spread.is_some() || spec.stddev.is_some() {
+                return Err(Error::ConfigInvalid(format!(
+                    "{field} jitter \"none\" takes no magnitude (drop spread/stddev)"
+                )));
+            }
+            Ok(Jitter::None)
+        }
+        "uniform" => {
+            if spec.stddev.is_some() {
+                return Err(Error::ConfigInvalid(format!(
+                    "{field} jitter \"uniform\" takes `spread`, not `stddev`"
+                )));
+            }
+            let spread = spec.spread.ok_or_else(|| {
+                Error::ConfigInvalid(format!("{field} jitter \"uniform\" requires `spread`"))
+            })?;
+            non_negative(field, "spread", spread)?;
+            Ok(Jitter::Uniform { spread })
+        }
+        "normal" => {
+            if spec.spread.is_some() {
+                return Err(Error::ConfigInvalid(format!(
+                    "{field} jitter \"normal\" takes `stddev`, not `spread`"
+                )));
+            }
+            let stddev = spec.stddev.ok_or_else(|| {
+                Error::ConfigInvalid(format!("{field} jitter \"normal\" requires `stddev`"))
+            })?;
+            non_negative(field, "stddev", stddev)?;
+            Ok(Jitter::Normal { stddev })
+        }
+        other => Err(Error::ConfigInvalid(format!(
+            "{field} jitter kind must be none|uniform|normal, got \"{other}\""
+        ))),
+    }
+}
+
+/// Reject a negative or non-finite jitter magnitude, naming the field/param.
+fn non_negative(field: &str, param: &str, value: f64) -> Result<()> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(Error::ConfigInvalid(format!(
+            "{field} jitter {param} must be a non-negative number, got {value}"
+        )))
+    }
+}
+
+/// Render a [`Jitter`] as the inline TOML table [`RawJitterSpec`] parses back
+/// (issue #38). Magnitudes use the float-debug form so they always carry a
+/// decimal point and round-trip as TOML floats (never as integers).
+#[allow(dead_code)]
+fn render_jitter(jitter: &Jitter) -> String {
+    match jitter {
+        Jitter::None => "{ kind = \"none\" }".to_string(),
+        Jitter::Uniform { spread } => format!("{{ kind = \"uniform\", spread = {spread:?} }}"),
+        Jitter::Normal { stddev } => format!("{{ kind = \"normal\", stddev = {stddev:?} }}"),
     }
 }
 
@@ -349,6 +505,8 @@ struct RawConfig {
     account: Vec<RawAccount>,
     #[serde(default)]
     tunables: RawTunables,
+    #[serde(default)]
+    jitter: RawJitter,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +560,35 @@ fn default_monitor_401_n() -> i64 {
     i64::from(DEFAULT_MONITOR_401_N)
 }
 
+/// Permissive deserialization of the optional `[jitter]` table (issue #38): each
+/// tunable's spec is optional (absent → its default jitter). `deny_unknown_fields`
+/// rejects a stray tunable name as a parse error.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawJitter {
+    #[serde(default)]
+    poll: Option<RawJitterSpec>,
+    #[serde(default)]
+    trigger: Option<RawJitterSpec>,
+    #[serde(default)]
+    cooldown: Option<RawJitterSpec>,
+}
+
+/// One tunable's jitter spec: a `kind` plus its magnitude (`spread` for uniform,
+/// `stddev` for normal). Both magnitudes are kept optional and wide here so a
+/// kind/magnitude mismatch reaches [`parse_jitter`] as a clear domain error
+/// rather than a bare `serde` type error. Magnitudes are TOML floats (write a
+/// decimal, e.g. `spread = 2.0`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawJitterSpec {
+    kind: String,
+    #[serde(default)]
+    spread: Option<f64>,
+    #[serde(default)]
+    stddev: Option<f64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +636,14 @@ label = "personal"
                 session_floor: 70,
                 session_trigger: 90,
                 monitor_401_n: 5,
+                // No [jitter] table in VALID → default strategies: poll jitters
+                // normally (base from poll_secs), trigger/cooldown are fixed.
+                poll_strategy: Strategy {
+                    base: 30.0,
+                    jitter: default_poll_jitter(),
+                },
+                trigger_strategy: Strategy::fixed(90.0),
+                cooldown_strategy: Strategy::fixed(45.0),
             }
         );
         assert_eq!(config.roster[0].label, "work");
@@ -583,6 +778,133 @@ label = "personal"
         let reparsed = Config::parse(&original.render()).unwrap();
         assert_eq!(original.tunables, reparsed.tunables);
         assert_eq!(original.roster, reparsed.roster);
+    }
+
+    // --- timing jitter strategies (issue #38) ------------------------------
+
+    /// A minimal valid roster body with one account and the given `[jitter]`
+    /// fragment spliced in (the `[tunables]` table is absent → its defaults).
+    fn with_jitter(fragment: &str) -> String {
+        format!(
+            "[jitter]\n{fragment}\n\
+             [[account]]\n\
+             account_uuid = \"u\"\n\
+             stash = \"Sessiometer/u\"\n\
+             label = \"l\"\n"
+        )
+    }
+
+    #[test]
+    fn poll_jitter_defaults_to_normal_trigger_and_cooldown_stay_fixed() {
+        // AC: poll interval uses normal jitter by default; trigger and cooldown
+        // are fixed unless the operator configures a strategy. Bases mirror the
+        // validated scalar tunables.
+        let t = Config::parse(VALID).unwrap().tunables;
+        assert_eq!(
+            t.poll_strategy.jitter,
+            Jitter::Normal {
+                stddev: DEFAULT_POLL_JITTER_STDDEV
+            }
+        );
+        assert_eq!(t.trigger_strategy.jitter, Jitter::None);
+        assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
+        assert_eq!(t.poll_strategy.base, 30.0);
+        assert_eq!(t.trigger_strategy.base, 90.0);
+        assert_eq!(t.cooldown_strategy.base, 45.0);
+    }
+
+    #[test]
+    fn default_poll_base_is_longer_than_the_original_sixty_seconds() {
+        // AC: the poll interval moves to a LONGER base than the original fixed
+        // 60 s, with normal jitter.
+        let t = Tunables::default();
+        assert!(
+            t.poll_secs > 60,
+            "default poll base must exceed the old 60 s"
+        );
+        assert_eq!(t.poll_strategy.base, t.poll_secs as f64);
+        assert!(matches!(t.poll_strategy.jitter, Jitter::Normal { .. }));
+    }
+
+    #[test]
+    fn parses_a_full_jitter_table() {
+        let toml = with_jitter(
+            "poll = { kind = \"normal\", stddev = 25.0 }\n\
+             trigger = { kind = \"uniform\", spread = 2.5 }\n\
+             cooldown = { kind = \"none\" }",
+        );
+        let t = Config::parse(&toml).unwrap().tunables;
+        assert_eq!(t.poll_strategy.jitter, Jitter::Normal { stddev: 25.0 });
+        assert_eq!(t.trigger_strategy.jitter, Jitter::Uniform { spread: 2.5 });
+        assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
+    }
+
+    #[test]
+    fn rejects_every_malformed_jitter_spec() {
+        // parse-or-error: each malformed spec is rejected at load.
+        for fragment in [
+            "poll = { kind = \"gaussian\", stddev = 1.0 }", // unknown kind
+            "poll = { kind = \"normal\", stddev = -1.0 }",  // negative magnitude
+            "poll = { kind = \"uniform\", spread = -0.1 }", // negative magnitude
+            "poll = { kind = \"normal\", spread = 1.0 }",   // wrong key for kind
+            "poll = { kind = \"uniform\", stddev = 1.0 }",  // wrong key for kind
+            "poll = { kind = \"none\", stddev = 1.0 }",     // none takes no magnitude
+            "poll = { kind = \"normal\" }",                 // missing magnitude
+            "poll = { kind = \"uniform\" }",                // missing magnitude
+        ] {
+            assert!(
+                matches!(
+                    Config::parse(&with_jitter(fragment)),
+                    Err(Error::ConfigInvalid(_))
+                ),
+                "jitter spec should be rejected: {fragment}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_jitter_field_or_tunable() {
+        // deny_unknown_fields: a stray key in a spec is a parse error…
+        assert!(matches!(
+            Config::parse(&with_jitter(
+                "poll = { kind = \"normal\", stddev = 1.0, bogus = 2.0 }"
+            )),
+            Err(Error::ConfigParse(_))
+        ));
+        // …and so is an unrecognized tunable name. `weekly` is NOT a jitter
+        // tunable in this slice (issue #38 applies to poll/trigger/cooldown).
+        assert!(matches!(
+            Config::parse(&with_jitter("weekly = { kind = \"none\" }")),
+            Err(Error::ConfigParse(_))
+        ));
+    }
+
+    #[test]
+    fn round_trips_a_configured_jitter_table() {
+        let toml = with_jitter(
+            "poll = { kind = \"uniform\", spread = 12.5 }\n\
+             trigger = { kind = \"normal\", stddev = 1.5 }\n\
+             cooldown = { kind = \"none\" }",
+        );
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.tunables, reparsed.tunables);
+    }
+
+    #[test]
+    fn rendered_config_documents_the_jitter_table() {
+        let text = Config::parse(VALID).unwrap().render();
+        assert!(text.contains("[jitter]"));
+        for key in ["poll", "trigger", "cooldown"] {
+            assert!(
+                text.contains(key),
+                "rendered config must mention jitter.{key}"
+            );
+        }
+        // The default poll jitter renders as a normal strategy with a decimal
+        // magnitude (so it re-parses as a TOML float).
+        assert!(text.contains("kind = \"normal\""));
+        assert!(text.contains("stddev = 30.0"));
     }
 
     #[test]

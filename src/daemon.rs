@@ -20,9 +20,18 @@
 //!    failed poll just drops that account from this cycle; the loop never swaps on
 //!    missing data.
 //! 3. **Decide and swap.** If the active account's worst dimension is at/above the
-//!    `session_trigger`, pick the freshest viable target (most account-dimension
+//!    swap-away trigger — drawn this cycle from its timing strategy and clamped to
+//!    range (issue #38) — pick the freshest viable target (most account-dimension
 //!    headroom, [`pick_target`]) and run the out-of-band [`swap::swap`]. A minimal
-//!    post-swap cooldown floor guards against an immediate re-swap (the #10 seam).
+//!    post-swap cooldown floor (also a per-cycle jittered draw) guards against an
+//!    immediate re-swap (the #10 seam).
+//!
+//! The trigger, the cooldown, and the inter-poll interval are each a
+//! [`Strategy`] (base + optional jitter, issue #38): a fresh value is drawn and
+//! clamped to the parameter's range every cycle through the [`SplitMix64`] seam,
+//! so polling/swaps decorrelate across accounts and cycles instead of running in
+//! lockstep. The seam is seeded from entropy in production and from a fixed seed
+//! in tests (`Daemon::with_seed`), keeping the draws deterministic under test.
 //!
 //! ## Lifecycle (the run loop, [`run_loop`])
 //!
@@ -58,25 +67,38 @@ use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::observability::EventLog;
 use crate::stash::{AccountStash, RealAccountStash};
 use crate::swap::{self, SwapDecision};
+use crate::timing::{SplitMix64, Strategy};
 use crate::usage::{CurlTransport, NoopReStashTrigger, RealUsageSource, Usage, UsageSource};
 
-/// Time seam: the daemon reads "now" and waits for the next poll through this,
-/// so a fake can drive time and make the loop run instantly in tests.
+/// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
+/// config's `session_trigger` range so a jittered draw can never escape it.
+const TRIGGER_PCT_LO: f64 = 50.0;
+const TRIGGER_PCT_HI: f64 = 99.0;
+/// Per-cycle clamp bounds for the cooldown draw, in seconds (config range).
+const COOLDOWN_SECS_LO: f64 = 0.0;
+const COOLDOWN_SECS_HI: f64 = 3600.0;
+/// Per-cycle clamp bounds for the poll-interval draw, in seconds (config range).
+const POLL_SECS_LO: f64 = 5.0;
+const POLL_SECS_HI: f64 = 3600.0;
+
+/// Time seam: the daemon reads "now" and sleeps until the next poll through
+/// this, so a fake can drive time and make the loop run instantly in tests.
 pub(crate) trait Clock {
     /// The current instant.
     fn now(&self) -> Instant;
-    /// Wait until the next poll is due.
-    async fn tick(&self);
+    /// Sleep for `interval` — the (jittered) wait until the next poll, computed
+    /// per cycle by the daemon (issue #38). The clock no longer owns the
+    /// interval; it just sleeps the duration it is handed.
+    async fn tick(&self, interval: Duration);
 }
 
-/// Real clock: monotonic `Instant::now` and a Tokio sleep between polls.
-pub(crate) struct RealClock {
-    interval: Duration,
-}
+/// Real clock: monotonic `Instant::now` and a Tokio sleep of the handed interval.
+#[derive(Default)]
+pub(crate) struct RealClock;
 
 impl RealClock {
-    pub(crate) fn new(interval: Duration) -> Self {
-        Self { interval }
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -85,8 +107,8 @@ impl Clock for RealClock {
         Instant::now()
     }
 
-    async fn tick(&self) {
-        tokio::time::sleep(self.interval).await;
+    async fn tick(&self, interval: Duration) {
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -462,14 +484,24 @@ pub(crate) struct Daemon<P, C, S, K> {
     stash: S,
     clock: K,
     claude_json: PathBuf,
-    /// Swap AWAY from the active account when its worst usage dimension is at or
-    /// above this fraction (`session_trigger / 100`).
-    session_trigger: f64,
+    /// Per-cycle swap-away trigger strategy (issue #38): drawn + clamped to
+    /// `50..=99` percent each cycle, then `/100` for the swap decision. Replaces
+    /// the former fixed `session_trigger` fraction.
+    trigger_strategy: Strategy,
     /// Only swap TO an account whose session usage is below this fraction
     /// (`session_floor / 100`).
     session_floor: f64,
-    /// The minimal post-swap cooldown floor (the #10 seam — see [`DecisionState`]).
-    cooldown: Duration,
+    /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
+    /// [`DecisionState`]): drawn + clamped to `0..=3600` s each cycle. Replaces
+    /// the former fixed `cooldown` duration.
+    cooldown_strategy: Strategy,
+    /// Per-cycle poll-interval strategy (issue #38): drawn + clamped to
+    /// `5..=3600` s each loop iteration by
+    /// [`next_poll_interval`](Self::next_poll_interval).
+    poll_strategy: Strategy,
+    /// Jitter RNG seam — process entropy in production, a fixed seed in tests
+    /// ([`with_seed`](Self::with_seed)) so per-cycle draws are deterministic.
+    rng: SplitMix64,
     state: DecisionState,
 }
 
@@ -496,11 +528,21 @@ where
             stash,
             clock,
             claude_json,
-            session_trigger: f64::from(tunables.session_trigger) / 100.0,
+            trigger_strategy: tunables.trigger_strategy,
             session_floor: f64::from(tunables.session_floor) / 100.0,
-            cooldown: Duration::from_secs(tunables.cooldown_secs),
+            cooldown_strategy: tunables.cooldown_strategy,
+            poll_strategy: tunables.poll_strategy,
+            rng: SplitMix64::from_entropy(),
             state: DecisionState::default(),
         }
+    }
+
+    /// Replace the jitter RNG with a deterministically-seeded one — the test seam
+    /// for reproducible per-cycle draws (issue #38 AC).
+    #[cfg(test)]
+    pub(crate) fn with_seed(mut self, seed: u64) -> Self {
+        self.rng = SplitMix64::new(seed);
+        self
     }
 
     /// Reconcile `~/.claude.json` to the canonical credential on startup.
@@ -620,14 +662,24 @@ where
         let Some(active_usage) = readings[active_idx] else {
             return TickAction::SkippedActiveUnavailable;
         };
-        // Below the swap-away trigger → hold.
-        if swap::decide(&active_usage, self.session_trigger) == SwapDecision::Hold {
+        // Draw this cycle's swap-away trigger (issue #38): jittered + clamped to
+        // 50..=99 percent, then to a fraction for the decision. Below it → hold.
+        let trigger = self
+            .trigger_strategy
+            .draw(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
+            / 100.0;
+        if swap::decide(&active_usage, trigger) == SwapDecision::Hold {
             return TickAction::Held;
         }
         // Over the trigger. Minimal cooldown floor (the #10 seam): refuse an
-        // immediate re-swap within `cooldown` of the last one.
+        // immediate re-swap within this cycle's (jittered) cooldown of the last.
+        let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
+            &mut self.rng,
+            COOLDOWN_SECS_LO,
+            COOLDOWN_SECS_HI,
+        ));
         if let Some(last) = &self.state.last_swap {
-            if at.saturating_duration_since(last.at) < self.cooldown {
+            if at.saturating_duration_since(last.at) < cooldown {
                 return TickAction::SkippedCooldown;
             }
         }
@@ -696,9 +748,21 @@ where
         }
     }
 
-    /// Wait until the next poll is due (delegates to the [`Clock`] seam).
-    pub(crate) async fn wait_for_next_poll(&self) {
-        self.clock.tick().await;
+    /// Draw this cycle's poll interval from the poll strategy (issue #38),
+    /// clamped to the valid `5..=3600` s range. The fixed (no-jitter) case
+    /// returns the base verbatim; deterministic under a seeded RNG.
+    pub(crate) fn next_poll_interval(&mut self) -> Duration {
+        Duration::from_secs_f64(
+            self.poll_strategy
+                .draw(&mut self.rng, POLL_SECS_LO, POLL_SECS_HI),
+        )
+    }
+
+    /// Sleep until the next poll is due — a freshly drawn, jittered interval
+    /// (issue #38) handed to the [`Clock`] seam.
+    pub(crate) async fn wait_for_next_poll(&mut self) {
+        let interval = self.next_poll_interval();
+        self.clock.tick(interval).await;
     }
 }
 
@@ -812,6 +876,7 @@ mod tests {
     use crate::config::Tunables;
     use crate::keychain::FakeCredentialStore;
     use crate::stash::{FakeAccountStash, StashedAccount};
+    use crate::timing::Jitter;
     use std::cell::Cell;
     use std::collections::HashMap;
 
@@ -844,7 +909,11 @@ mod tests {
         fn now(&self) -> Instant {
             self.now.get()
         }
-        async fn tick(&self) {
+        // Advances by its own `step`, independent of the daemon's drawn interval,
+        // so the existing run-loop/cooldown tests keep their deterministic
+        // cadence. The poll-interval jitter (issue #38) is covered directly via
+        // `Daemon::next_poll_interval`.
+        async fn tick(&self, _interval: Duration) {
             self.now.set(self.now.get() + self.step);
         }
     }
@@ -935,6 +1004,11 @@ mod tests {
             session_floor: floor,
             session_trigger: trigger,
             monitor_401_n: 3,
+            // Existing daemon tests exercise the fixed (no-jitter) path: each
+            // strategy draws its base verbatim, identical to the pre-#38 scalars.
+            poll_strategy: Strategy::fixed(60.0),
+            trigger_strategy: Strategy::fixed(f64::from(trigger)),
+            cooldown_strategy: Strategy::fixed(cooldown as f64),
         }
     }
 
@@ -1385,6 +1459,181 @@ mod tests {
         let outcome = daemon.tick().await;
 
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+    }
+
+    // --- timing jitter strategies (issue #38) ------------------------------
+
+    /// A minimal daemon over empty seams — enough to exercise the pure
+    /// `next_poll_interval` draw without any roster/poll/keychain setup.
+    fn poll_daemon(tun: &Tunables, seed: u64) -> FakeDaemon {
+        Daemon::new(
+            vec![],
+            FakeRosterPoller::new(),
+            FakeCredentialStore::empty(),
+            FakeAccountStash::empty(),
+            FakeClock::frozen(),
+            PathBuf::from("/nonexistent/.claude.json"),
+            tun,
+        )
+        .with_seed(seed)
+    }
+
+    #[test]
+    fn next_poll_interval_is_deterministic_and_stays_in_range() {
+        // AC: each cycle draws a jittered poll interval within the valid range,
+        // deterministic under an injected seed.
+        let mut tun = tunables(95, 80, 0);
+        tun.poll_strategy = Strategy {
+            base: 300.0,
+            jitter: Jitter::Normal { stddev: 80.0 },
+        };
+        let mut a = poll_daemon(&tun, 2024);
+        let mut b = poll_daemon(&tun, 2024);
+        let seq_a: Vec<f64> = (0..256)
+            .map(|_| a.next_poll_interval().as_secs_f64())
+            .collect();
+        let seq_b: Vec<f64> = (0..256)
+            .map(|_| b.next_poll_interval().as_secs_f64())
+            .collect();
+        assert_eq!(
+            seq_a, seq_b,
+            "same seed must replay the same poll intervals"
+        );
+        for s in &seq_a {
+            assert!(
+                (POLL_SECS_LO..=POLL_SECS_HI).contains(s),
+                "poll interval {s}s out of 5..=3600"
+            );
+        }
+        // The normal jitter actually moves the interval off the 300 s base.
+        assert!(seq_a.iter().any(|&s| (s - 300.0).abs() > 1.0));
+    }
+
+    #[test]
+    fn a_fixed_poll_strategy_draws_the_base_verbatim() {
+        // The no-jitter path is unchanged behavior: every draw is the base.
+        let tun = tunables(95, 80, 0); // poll_strategy = fixed(60.0)
+        let mut daemon = poll_daemon(&tun, 1);
+        for _ in 0..8 {
+            assert_eq!(daemon.next_poll_interval(), Duration::from_secs(60));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_jittered_trigger_is_deterministic_and_varies_the_swap_decision() {
+        // Active A sits at a fixed 60% session; a wide uniform trigger jitter
+        // spans the whole 50..=99 range, so some cycles draw a trigger ≤ 60
+        // (→ swap) and others > 60 (→ hold). Deterministic per seed, but VARYING
+        // across seeds — proof the trigger is drawn anew each cycle.
+        async fn action_for(seed: u64) -> TickAction {
+            let roster = vec![
+                account("u-A", "Sessiometer/u-A", "work"),
+                account("u-B", "Sessiometer/u-B", "spare"),
+            ];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+            ])
+            .await;
+            let (_dir, json) = claude_json("u-A");
+            let poller = FakeRosterPoller::new()
+                .ok("u-A", 0.60, 0.10)
+                .ok("u-B", 0.05, 0.05);
+            let mut tun = tunables(95, 80, 0);
+            tun.trigger_strategy = Strategy {
+                base: 95.0,
+                jitter: Jitter::Uniform { spread: 100.0 },
+            };
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                poller,
+                store,
+                stash,
+                FakeClock::frozen(),
+                json,
+                &tun,
+            )
+            .with_seed(seed);
+            daemon.tick().await.action
+        }
+        // Determinism: the same seed replays the same decision.
+        assert_eq!(action_for(11).await, action_for(11).await);
+        // Variation: across seeds the jittered trigger yields BOTH outcomes at
+        // the same fixed 60% usage.
+        let mut holds = 0;
+        let mut swaps = 0;
+        for seed in 0..48 {
+            match action_for(seed).await {
+                TickAction::Held => holds += 1,
+                TickAction::Swapped { from: 0, to: 1 } => swaps += 1,
+                other => panic!("unexpected action under seed {seed}: {other:?}"),
+            }
+        }
+        assert!(
+            holds > 0 && swaps > 0,
+            "jittered trigger should produce both holds ({holds}) and swaps ({swaps})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jittered_cooldown_is_deterministic_and_varies_the_skip() {
+        // Active A is over the (fixed) trigger with a swap 100 s ago; a wide
+        // uniform cooldown jitter around 100 s makes some cycles draw a cooldown
+        // below the 100 s elapsed (→ swap) and others above it (→ skip).
+        // Deterministic per seed, varying across seeds.
+        async fn action_for(seed: u64) -> TickAction {
+            let roster = vec![
+                account("u-A", "Sessiometer/u-A", "work"),
+                account("u-B", "Sessiometer/u-B", "spare"),
+            ];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+            ])
+            .await;
+            let (_dir, json) = claude_json("u-A");
+            let poller = FakeRosterPoller::new()
+                .ok("u-A", 0.97, 0.40)
+                .ok("u-B", 0.05, 0.05);
+            let mut tun = tunables(95, 80, 100);
+            tun.cooldown_strategy = Strategy {
+                base: 100.0,
+                jitter: Jitter::Uniform { spread: 200.0 },
+            };
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                poller,
+                store,
+                stash,
+                FakeClock::new(Duration::ZERO),
+                json,
+                &tun,
+            )
+            .with_seed(seed);
+            daemon.state.active = Some(0);
+            daemon.state.last_swap = Some(LastSwap {
+                to: "spare".to_owned(),
+                at: daemon.clock.now(),
+            });
+            daemon.clock.advance(Duration::from_secs(100));
+            daemon.tick().await.action
+        }
+        assert_eq!(action_for(5).await, action_for(5).await);
+        let mut skipped = 0;
+        let mut swapped = 0;
+        for seed in 0..48 {
+            match action_for(seed).await {
+                TickAction::SkippedCooldown => skipped += 1,
+                TickAction::Swapped { from: 0, to: 1 } => swapped += 1,
+                other => panic!("unexpected action under seed {seed}: {other:?}"),
+            }
+        }
+        assert!(
+            skipped > 0 && swapped > 0,
+            "jittered cooldown should produce both skips ({skipped}) and swaps ({swapped})"
+        );
     }
 
     // --- reconcile-on-start ------------------------------------------------
