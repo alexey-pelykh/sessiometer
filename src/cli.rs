@@ -12,7 +12,7 @@ use std::path::Path;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::config::{Account, Config, MAX_ACCOUNTS};
+use crate::config::{Account, Config};
 use crate::daemon::{
     run_loop, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown, StatusResponse,
     UnixControl,
@@ -274,8 +274,9 @@ fn view(loaded: Result<Config>) -> Result<String> {
     }
 }
 
-/// Render the roster as one `label · uuid · stash` row per account, then a
-/// `N of {MAX_ACCOUNTS} slots used` total.
+/// Render the roster as one `label · uuid · stash` row per account, then a bare
+/// `N account(s)` total. The roster has no fixed size (#35), so the total carries
+/// no "of N" denominator — just the count (pluralized for grammar).
 ///
 /// Sourced solely from each [`Account`]'s non-secret fields (label, short
 /// `account_uuid`, stash) — never a token or email (issue #15 redaction).
@@ -289,11 +290,9 @@ fn render_roster(roster: &[Account]) -> String {
             account.stash,
         ));
     }
-    out.push_str(&format!(
-        "\n{} of {} slots used\n",
-        roster.len(),
-        MAX_ACCOUNTS,
-    ));
+    let n = roster.len();
+    let noun = if n == 1 { "account" } else { "accounts" };
+    out.push_str(&format!("\n{n} {noun}\n"));
     out
 }
 
@@ -337,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_each_account_then_the_slot_total() {
+    fn renders_each_account_then_the_count_total() {
         let out = render_roster(&[
             acct(
                 "work",
@@ -355,18 +354,29 @@ mod tests {
             "work · 11111111 · Sessiometer/11111111-1111-1111-1111-111111111111\n\
 personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
 \n\
-2 of 5 slots used\n"
+2 accounts\n"
         );
     }
 
     #[test]
-    fn total_counts_against_max_accounts_not_just_listed_rows() {
-        let out = render_roster(&[acct(
-            "solo",
-            "abcdef00-0000-0000-0000-000000000000",
-            "Sessiometer/abcdef00-0000-0000-0000-000000000000",
-        )]);
-        assert!(out.ends_with("1 of 5 slots used\n"), "got: {out:?}");
+    fn total_is_a_bare_count_with_no_denominator_and_no_cap() {
+        // #35: the total is the row count alone — no "of N" denominator, and the
+        // roster can hold more than the former 5-account cap.
+        let roster: Vec<Account> = (0..6)
+            .map(|i| {
+                acct(
+                    &format!("l{i}"),
+                    &format!("0000000{i}-0000-0000-0000-000000000000"),
+                    &format!("Sessiometer/0000000{i}"),
+                )
+            })
+            .collect();
+        let out = render_roster(&roster);
+        assert!(out.ends_with("\n6 accounts\n"), "got: {out:?}");
+        assert!(
+            !out.contains("slots"),
+            "no 'slots used' denominator: {out:?}"
+        );
     }
 
     #[test]
@@ -391,9 +401,10 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
             "Sessiometer/11111111-aaaa",
         )]);
         let out = view(Ok(config)).expect("a present roster is not an error");
+        // A single-account roster reads "1 account" (singular), not "1 accounts".
         assert_eq!(
             out,
-            "work · 11111111 · Sessiometer/11111111-aaaa\n\n1 of 5 slots used\n"
+            "work · 11111111 · Sessiometer/11111111-aaaa\n\n1 account\n"
         );
     }
 

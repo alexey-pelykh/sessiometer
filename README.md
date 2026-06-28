@@ -34,6 +34,16 @@ sessiometer run
 sessiometer status
 ```
 
+## Roster size and poll cost
+
+There is **no fixed limit** on how many accounts the roster holds — capture as
+many as you want to rotate across. Be aware of the cost, though: the daemon polls
+each account independently, issuing **one `curl` usage request per roster account
+every `poll_secs`**. Per-tick work and outbound request volume therefore grow
+linearly with the roster size. `sessiometer` enforces no ceiling — size the
+roster to what your usage warrants, and if request volume becomes a concern,
+raise `poll_secs` or keep the roster smaller by choice.
+
 ## Build from source
 
 ```sh

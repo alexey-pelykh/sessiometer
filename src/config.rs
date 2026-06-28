@@ -39,11 +39,6 @@ const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
 
-/// Maximum accounts the roster may hold (the rotation size). The single source
-/// of truth for this bound — `capture` (#4) reads it to cap new captures and to
-/// render its "N of {MAX_ACCOUNTS}" confirmation.
-pub(crate) const MAX_ACCOUNTS: usize = 5;
-
 /// One captured account in the roster. Keyed by non-secret fields only.
 ///
 /// The fields beyond the uniqueness keys are read by the write path
@@ -99,8 +94,9 @@ impl Default for Tunables {
 /// The validated configuration: a non-empty roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
-    /// Captured accounts (`1..=5`, unique `account_uuid` + `stash`). Consumed by
-    /// the swap engine (#6 / #7) and by `list` / `status` (#17 / #9).
+    /// Captured accounts (at least one, unique `account_uuid` + `stash`; no fixed
+    /// upper bound — #35). Consumed by the swap engine (#6 / #7) and by `list` /
+    /// `status` (#17 / #9).
     #[allow(dead_code)]
     pub(crate) roster: Vec<Account>,
     /// Poll/swap tunables.
@@ -207,11 +203,19 @@ impl Config {
             monitor_401_n: t.monitor_401_n as u8,
         };
 
-        if !(1..=MAX_ACCOUNTS).contains(&raw.account.len()) {
-            return Err(Error::ConfigInvalid(format!(
-                "roster must have 1..={MAX_ACCOUNTS} accounts, got {}",
-                raw.account.len()
-            )));
+        // The roster needs at least one account but has no fixed upper bound: the
+        // operator rotates across as many accounts as they capture (#35). Only the
+        // lower bound is enforced; there is deliberately no ceiling.
+        //
+        // Poll-cost note (document, don't cap): the daemon polls every roster
+        // account with its own `curl` each `poll_secs` tick (see
+        // `daemon::Daemon::tick`), so a larger roster grows per-tick work and
+        // outbound request volume linearly. The operator self-limits by choice
+        // (smaller roster, or a larger `poll_secs`); the tool enforces no ceiling.
+        if raw.account.is_empty() {
+            return Err(Error::ConfigInvalid(
+                "roster must have at least one account".into(),
+            ));
         }
 
         let mut uuids = HashSet::new();
@@ -540,14 +544,17 @@ label = "personal"
     }
 
     #[test]
-    fn rejects_oversized_roster() {
+    fn accepts_a_roster_larger_than_the_former_five_cap() {
+        // #35: the roster has no fixed upper bound — a config well beyond the
+        // former 5-account cap loads and validates.
         let mut toml = String::new();
-        for i in 0..6 {
+        for i in 0..8 {
             toml.push_str(&format!(
                 "[[account]]\naccount_uuid = \"u{i}\"\nstash = \"s{i}\"\nlabel = \"l{i}\"\n"
             ));
         }
-        assert!(matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))));
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.roster.len(), 8);
     }
 
     #[test]

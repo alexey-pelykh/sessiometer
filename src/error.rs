@@ -67,7 +67,7 @@ pub(crate) enum Error {
     /// `sessiometer list` found no roster to show. A friendly, user-facing remap
     /// of [`Error::ConfigNotFound`] for the read-only `list` view: an absent
     /// config is the only real empty state (`capture` cannot persist a 0-account
-    /// roster — it fails the `1..=5` load validation), so this reads as "nothing
+    /// roster — it fails the `>= 1` load validation), so this reads as "nothing
     /// captured yet" instead of leaking the lower-level "file missing". A
     /// malformed config is deliberately NOT remapped — it keeps surfacing as its
     /// real [`Error::ConfigParse`] / [`Error::ConfigInvalid`]. Secret-free.
@@ -119,15 +119,6 @@ pub(crate) enum Error {
     /// value (issue #15 redaction).
     #[error("the logged-in account is missing its `{field}` — cannot key the roster")]
     OauthAccountFieldMissing { field: &'static str },
-
-    /// The rotation is already full and the active account is not one of its
-    /// members, so it cannot be added. Re-capture an existing member to refresh
-    /// it instead. Carries only the limit (an integer, never a secret).
-    #[error(
-        "rotation is full ({max} accounts): re-capture one already in rotation, \
-         or remove one before capturing a new account"
-    )]
-    RotationFull { max: usize },
 
     /// A new account was captured without an explicit label. A new account must
     /// be named by the operator (there is deliberately no server-provided
