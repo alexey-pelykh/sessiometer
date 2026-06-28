@@ -342,18 +342,18 @@ mod tests {
             acct(
                 "work",
                 "11111111-1111-1111-1111-111111111111",
-                "Sessiometer/acct-1",
+                "Sessiometer/11111111-1111-1111-1111-111111111111",
             ),
             acct(
                 "personal",
                 "22222222-2222-2222-2222-222222222222",
-                "Sessiometer/acct-2",
+                "Sessiometer/22222222-2222-2222-2222-222222222222",
             ),
         ]);
         assert_eq!(
             out,
-            "work · 11111111 · Sessiometer/acct-1\n\
-personal · 22222222 · Sessiometer/acct-2\n\
+            "work · 11111111 · Sessiometer/11111111-1111-1111-1111-111111111111\n\
+personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
 \n\
 2 of 5 slots used\n"
         );
@@ -364,7 +364,7 @@ personal · 22222222 · Sessiometer/acct-2\n\
         let out = render_roster(&[acct(
             "solo",
             "abcdef00-0000-0000-0000-000000000000",
-            "Sessiometer/acct-1",
+            "Sessiometer/abcdef00-0000-0000-0000-000000000000",
         )]);
         assert!(out.ends_with("1 of 5 slots used\n"), "got: {out:?}");
     }
@@ -385,11 +385,15 @@ personal · 22222222 · Sessiometer/acct-2\n\
 
     #[test]
     fn view_renders_a_present_roster() {
-        let config = config_with(vec![acct("work", "11111111-aaaa", "Sessiometer/acct-1")]);
+        let config = config_with(vec![acct(
+            "work",
+            "11111111-aaaa",
+            "Sessiometer/11111111-aaaa",
+        )]);
         let out = view(Ok(config)).expect("a present roster is not an error");
         assert_eq!(
             out,
-            "work · 11111111 · Sessiometer/acct-1\n\n1 of 5 slots used\n"
+            "work · 11111111 · Sessiometer/11111111-aaaa\n\n1 of 5 slots used\n"
         );
     }
 
@@ -425,7 +429,7 @@ personal · 22222222 · Sessiometer/acct-2\n\
         let out = render_roster(&[acct(
             "work",
             "11111111-1111-1111-1111-111111111111",
-            "Sessiometer/acct-1",
+            "Sessiometer/11111111-1111-1111-1111-111111111111",
         )]);
         assert!(
             !out.contains('@'),

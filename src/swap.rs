@@ -9,8 +9,8 @@
 //! rotates the active credential from one account to another. The poll→decision
 //! loop that calls them (#7), cooldown / terminal state (#10 / #11) and the
 //! Monitor-401 re-stash trigger (#13) wire this engine in; the engine itself is
-//! account-identity-agnostic, moving blobs between stash slots and the canonical
-//! keychain item addressed only by `Sessiometer/acct-N` stash-service name.
+//! account-identity-agnostic, moving blobs between stashes and the canonical
+//! keychain item addressed only by `Sessiometer/<account_uuid>` stash-service name.
 //!
 //! ## The swap sequence (outgoing A → incoming B, one tick, this order)
 //!
@@ -18,7 +18,7 @@
 //! functional reroute) then `~/.claude.json`'s `oauthAccount` (honest display) —
 //! to inherit its proven cross-session propagation (H2; `build/version-compat.md`):
 //!   1. read A's CURRENT (silently-refreshed) canonical blob;
-//!   2. **re-stash A** to its `Sessiometer/acct-N` slot BEFORE overwriting the
+//!   2. **re-stash A** to its `Sessiometer/<account_uuid>` stash BEFORE overwriting the
 //!      canonical item — the token-refresh-rotation drift guard (#6 added
 //!      acceptance). A's token has drifted (it refreshes in place while active),
 //!      so the fresh blob is re-stashed; its `oauthAccount` is display-only and
@@ -92,7 +92,7 @@ pub(crate) struct SwapReport {
 }
 
 /// Run one out-of-band swap, rotating the active credential from the outgoing
-/// account to the incoming account. Both are addressed by their `Sessiometer/acct-N`
+/// account to the incoming account. Both are addressed by their `Sessiometer/<account_uuid>`
 /// stash-service name; the engine is account-identity-agnostic (the daemon, #7,
 /// maps roster accounts to stash names and picks the pair).
 ///
@@ -198,8 +198,8 @@ mod tests {
 
     // --- the swap engine (#6) ---
 
-    const ACCT_A: &str = "Sessiometer/acct-A";
-    const ACCT_B: &str = "Sessiometer/acct-B";
+    const ACCT_A: &str = "Sessiometer/u-A";
+    const ACCT_B: &str = "Sessiometer/u-B";
 
     fn cred(blob: &[u8]) -> Credential {
         Credential::new(blob.to_vec())
@@ -365,7 +365,7 @@ mod tests {
         let log = log.borrow();
         let restash = log
             .iter()
-            .position(|e| e == "write-stash:Sessiometer/acct-A")
+            .position(|e| e == "write-stash:Sessiometer/u-A")
             .expect("the outgoing account was re-stashed");
         let write_incoming = log
             .iter()

@@ -4,7 +4,7 @@
 //! Per-account credential stash in the login keychain.
 //!
 //! Each captured account's restorable state lives under the keychain service
-//! named by its roster `stash` field (`Sessiometer/acct-N`), as two
+//! named by its roster `stash` field (`Sessiometer/<account_uuid>`), as two
 //! generic-password items distinguished by their `acct` attribute:
 //!   - `acct = "credential"` — the raw `Claude Code-credentials` blob, stored
 //!     byte-identical (it mirrors the canonical item, which issue #16/H1 verified
@@ -63,7 +63,7 @@ const ACCT_CREDENTIAL: &str = "credential";
 /// The `acct` attribute under which the `oauthAccount` JSON is stored.
 const ACCT_OAUTH: &str = "oauthAccount";
 
-/// Both halves of a captured account, as stashed under one `Sessiometer/acct-N`
+/// Both halves of a captured account, as stashed under one `Sessiometer/<account_uuid>`
 /// service. `Clone` so the in-memory test fake can hand back copies.
 #[derive(Clone)]
 pub(crate) struct StashedAccount {
@@ -358,12 +358,17 @@ mod tests {
     fn write_args_pin_service_acct_payload_and_keychain() {
         let kc = Path::new("/tmp/login.keychain-db");
         assert_eq!(
-            write_item_args("Sessiometer/acct-1", ACCT_CREDENTIAL, kc, b"blob"),
+            write_item_args(
+                "Sessiometer/11111111-1111-1111-1111-111111111111",
+                ACCT_CREDENTIAL,
+                kc,
+                b"blob"
+            ),
             vec![
                 OsString::from("add-generic-password"),
                 OsString::from("-U"),
                 OsString::from("-s"),
-                OsString::from("Sessiometer/acct-1"),
+                OsString::from("Sessiometer/11111111-1111-1111-1111-111111111111"),
                 OsString::from("-a"),
                 OsString::from("credential"),
                 OsString::from("-w"),
@@ -377,12 +382,16 @@ mod tests {
     fn read_args_pin_service_acct_and_keychain() {
         let kc = Path::new("/tmp/login.keychain-db");
         assert_eq!(
-            read_item_args("Sessiometer/acct-2", ACCT_OAUTH, kc),
+            read_item_args(
+                "Sessiometer/22222222-2222-2222-2222-222222222222",
+                ACCT_OAUTH,
+                kc
+            ),
             vec![
                 OsString::from("find-generic-password"),
                 OsString::from("-w"),
                 OsString::from("-s"),
-                OsString::from("Sessiometer/acct-2"),
+                OsString::from("Sessiometer/22222222-2222-2222-2222-222222222222"),
                 OsString::from("-a"),
                 OsString::from("oauthAccount"),
                 kc.as_os_str().to_owned(),
@@ -446,15 +455,23 @@ mod tests {
             credential: Credential::new(b"raw-token".to_vec()),
             oauth_account: OauthAccount::from_object_bytes(br#"{"accountUuid":"u-1"}"#).unwrap(),
         };
-        stash.write("Sessiometer/acct-1", &account).await.unwrap();
-        assert!(stash.contains("Sessiometer/acct-1"));
+        stash
+            .write("Sessiometer/11111111-1111-1111-1111-111111111111", &account)
+            .await
+            .unwrap();
+        assert!(stash.contains("Sessiometer/11111111-1111-1111-1111-111111111111"));
 
-        let got = stash.read("Sessiometer/acct-1").await.unwrap();
+        let got = stash
+            .read("Sessiometer/11111111-1111-1111-1111-111111111111")
+            .await
+            .unwrap();
         assert_eq!(got.credential.expose(), b"raw-token");
         assert_eq!(got.oauth_account.account_uuid(), "u-1");
 
         assert!(matches!(
-            stash.read("Sessiometer/acct-9").await,
+            stash
+                .read("Sessiometer/99999999-9999-9999-9999-999999999999")
+                .await,
             Err(Error::StashIncomplete { .. })
         ));
     }
@@ -496,7 +513,7 @@ mod tests {
         async fn write_then_read_round_trips_both_halves_and_refresh_is_idempotent() {
             let (_dir, kc) = fresh_keychain();
             let stash = RealAccountStash::for_keychain(kc.clone());
-            let service = "Sessiometer/acct-1";
+            let service = "Sessiometer/11111111-1111-1111-1111-111111111111";
 
             // Credential: printable JSON, stored raw (like the real canonical
             // blob #2 reads). oauthAccount: deliberately NON-ASCII (accented +
@@ -544,7 +561,9 @@ mod tests {
             let (_dir, kc) = fresh_keychain();
             let stash = RealAccountStash::for_keychain(kc.clone());
             assert!(matches!(
-                stash.read("Sessiometer/acct-absent").await,
+                stash
+                    .read("Sessiometer/00000000-0000-0000-0000-000000000000")
+                    .await,
                 Err(Error::StashIncomplete { .. })
             ));
             delete(&kc);
