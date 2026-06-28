@@ -30,7 +30,7 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Result;
 use crate::paths;
@@ -80,16 +80,15 @@ pub(crate) enum Event {
         session_pct: u8,
     },
     /// The active account is over a trigger but no other account is a viable swap
-    /// target — the all-exhausted state. `hold` is the handle held this cycle;
-    /// `resets_at` is the soonest window reset, rendered only when known.
-    ///
-    /// The terminal behavior — and the computation of `resets_at` from per-window
-    /// reset timestamps — is issue #11; here `resets_at` is `None` until #11 plumbs
-    /// it through (the formatter omits the field when absent, so the line stays
-    /// forward-compatible).
+    /// target — the all-exhausted terminal state (issue #11). `hold` is the
+    /// least-bad account the daemon holds on: the one whose weekly window resets
+    /// soonest. `resets_at` is that account's weekly reset as epoch seconds,
+    /// rendered to RFC 3339 by [`Event::to_log_line`] and present whenever the API
+    /// supplied a parseable timestamp; `None` (the field is omitted) when no
+    /// account reported one, keeping the line forward-compatible.
     AllExhausted {
         hold: String,
-        resets_at: Option<String>,
+        resets_at: Option<i64>,
     },
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
     /// row. Observability only — the re-stash this eventually warrants is issue #13.
@@ -125,7 +124,8 @@ impl Event {
                 )
             }
             Event::AllExhausted { hold, resets_at } => match resets_at {
-                Some(resets_at) => {
+                Some(secs) => {
+                    let resets_at = rfc3339(system_time_from_epoch(*secs));
                     format!("ts={ts} event=all_exhausted hold={hold} resets_at={resets_at}")
                 }
                 None => format!("ts={ts} event=all_exhausted hold={hold}"),
@@ -143,6 +143,20 @@ impl Event {
                 format!("ts={ts} event=usage_scope_fail account={account} status=403")
             }
         }
+    }
+}
+
+/// A [`SystemTime`] from epoch seconds — used to render an `all_exhausted`
+/// event's `resets_at` (issue #11) through the same [`rfc3339`] formatter as the
+/// line timestamp, so reset times read identically regardless of whether the API
+/// gave an epoch or an ISO string. A negative (pre-epoch) input is not expected
+/// for a reset time but is handled so this best-effort log path can never panic
+/// (it renders via `rfc3339`'s epoch sentinel).
+fn system_time_from_epoch(secs: i64) -> SystemTime {
+    if secs >= 0 {
+        UNIX_EPOCH + Duration::from_secs(secs as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
     }
 }
 
@@ -303,9 +317,9 @@ mod tests {
     }
 
     #[test]
-    fn all_exhausted_omits_resets_at_until_it_is_known() {
-        // #11 plumbs resets_at later; until then the field is simply absent — the
-        // line stays well-formed and forward-compatible.
+    fn all_exhausted_renders_resets_at_when_known_and_omits_it_otherwise() {
+        // No reset reported (#11 fallback) → the field is simply absent and the
+        // line stays well-formed.
         let absent = Event::AllExhausted {
             hold: "work".to_owned(),
             resets_at: None,
@@ -314,10 +328,11 @@ mod tests {
         assert_eq!(absent, format!("{TS0} event=all_exhausted hold=work"));
         assert!(!absent.contains("resets_at"), "got: {absent}");
 
-        // When #11 supplies it, the same formatter renders it.
+        // A known reset (epoch seconds, #11) is rendered to RFC 3339 by the same
+        // single formatter — 1_782_777_600 is 2026-06-30T00:00:00Z.
         let present = Event::AllExhausted {
             hold: "work".to_owned(),
-            resets_at: Some("2026-06-30T00:00:00Z".to_owned()),
+            resets_at: Some(1_782_777_600),
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -376,7 +391,7 @@ mod tests {
             },
             Event::AllExhausted {
                 hold: "work".to_owned(),
-                resets_at: Some("2026-06-30T00:00:00Z".to_owned()),
+                resets_at: Some(1_782_777_600),
             },
             Event::Monitor401 {
                 account: "work".to_owned(),

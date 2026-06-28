@@ -188,6 +188,7 @@ mod tests {
         let usage = Usage {
             session: 0.5,
             weekly: 0.5,
+            weekly_resets_at: None,
         };
         // Session below 0.95 AND weekly below 0.98 → hold.
         assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Hold);
@@ -200,6 +201,7 @@ mod tests {
         let usage = Usage {
             session: 0.95,
             weekly: 0.1,
+            weekly_resets_at: None,
         };
         assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Swap);
     }
@@ -210,6 +212,7 @@ mod tests {
         let usage = Usage {
             session: 0.50,
             weekly: 0.98,
+            weekly_resets_at: None,
         };
         assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Swap);
     }
@@ -224,6 +227,7 @@ mod tests {
         let usage = Usage {
             session: 0.50,
             weekly: 0.96,
+            weekly_resets_at: None,
         };
         assert_eq!(decide(&usage, 0.95, 0.98), SwapDecision::Hold);
         assert_eq!(decide(&usage, 0.95, 0.95), SwapDecision::Swap);
