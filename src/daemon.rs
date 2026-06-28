@@ -22,9 +22,9 @@
 //! 3. **Decide and swap.** If the active account's worst dimension is at/above the
 //!    swap-away trigger — drawn this cycle from its timing strategy and clamped to
 //!    range (issue #38) — pick the freshest viable target (most account-dimension
-//!    headroom, [`pick_target`]) and run the out-of-band [`swap::swap`]. A minimal
-//!    post-swap cooldown floor (also a per-cycle jittered draw) guards against an
-//!    immediate re-swap (the #10 seam).
+//!    headroom, [`pick_target`]) and run the out-of-band [`swap::swap`]. A
+//!    per-cycle jittered post-swap cooldown (issue #10) refuses a re-swap until it
+//!    has elapsed, bounding oscillation between two near-exhausted accounts.
 //!
 //! The trigger, the cooldown, and the inter-poll interval are each a
 //! [`Strategy`] (base + optional jitter, issue #38): a fresh value is drawn and
@@ -47,10 +47,12 @@
 //!   no-half-swap): complete-or-abort, never a torn swap.
 //!
 //! The minimal `last_swap` shown by `status` (the handle swapped to + a relative
-//! age) is surfaced here (#8). Sibling work this leaves as seams: the cooldown
-//! *policy* (anti-oscillation, #10), the all-exhausted terminal state
-//! ([`TickAction::NoViableTarget`], #11), and the structured swap-history
-//! event-log (#9).
+//! age) is surfaced here (#8). The post-swap cooldown that bounds oscillation
+//! (#10) is wired into the decision below — a re-swap is refused until the
+//! per-cycle jittered cooldown has elapsed, and the swap-target session floor is
+//! opt-in (off by default). Sibling work this leaves as seams: the all-exhausted
+//! terminal state ([`TickAction::NoViableTarget`], #11) and the structured
+//! swap-history event-log (#9).
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -419,15 +421,17 @@ pub(crate) enum TickAction {
     Held,
     /// Swapped the active credential from roster index `from` to `to`.
     Swapped { from: usize, to: usize },
-    /// Active is over the trigger but no other account is a viable target (all
-    /// over the floor, or unavailable). The terminal behavior is #11.
+    /// Active is over the trigger but no other account is a viable target (none
+    /// available, or — when the opt-in session floor is enabled — all over it).
+    /// The terminal behavior is #11.
     NoViableTarget,
     /// The active account could not be identified — poll-only, no swap.
     SkippedActiveUnknown,
     /// The active account's reading was unavailable this cycle (transient / 401 /
     /// unreadable) — never swap on missing data.
     SkippedActiveUnavailable,
-    /// Over the trigger but within the post-swap cooldown floor (the #10 seam).
+    /// Over the trigger but within the post-swap cooldown — the re-swap is
+    /// refused to bound oscillation (issue #10).
     SkippedCooldown,
     /// A swap was attempted but the engine returned an error; #6 is no-half-swap,
     /// so the state is coherent and the loop retries next cycle.
@@ -469,9 +473,9 @@ struct DecisionState {
     /// swap. `None` until first resolved (then the loop polls but never swaps).
     active: Option<usize>,
     /// The last swap performed, or `None` until the first. Drives both the
-    /// post-swap cooldown floor (the #10 seam — the minimal #7 guard refuses an
-    /// immediate re-swap within `cooldown`; the directional anti-oscillation
-    /// policy using `cooldown_secs` lands in #10) and the minimal `last_swap`
+    /// post-swap cooldown (anti-oscillation, #10): a re-swap is refused until this
+    /// cycle's jittered `cooldown` has elapsed since this swap, so two
+    /// near-exhausted accounts cannot ping-pong — and the minimal `last_swap`
     /// shown by `status` (#8).
     last_swap: Option<LastSwap>,
 }
@@ -488,9 +492,11 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// `50..=99` percent each cycle, then `/100` for the swap decision. Replaces
     /// the former fixed `session_trigger` fraction.
     trigger_strategy: Strategy,
-    /// Only swap TO an account whose session usage is below this fraction
-    /// (`session_floor / 100`).
-    session_floor: f64,
+    /// Opt-in swap-target session guard (#10): `Some(fraction)` only swaps TO an
+    /// account whose session usage is below it (`session_floor / 100`); `None` (the
+    /// default) disables the guard, leaving target choice to weekly headroom alone —
+    /// the configuration under which the cooldown alone bounds oscillation.
+    session_floor: Option<f64>,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `0..=3600` s each cycle. Replaces
     /// the former fixed `cooldown` duration.
@@ -529,7 +535,7 @@ where
             clock,
             claude_json,
             trigger_strategy: tunables.trigger_strategy,
-            session_floor: f64::from(tunables.session_floor) / 100.0,
+            session_floor: tunables.session_floor.map(|floor| f64::from(floor) / 100.0),
             cooldown_strategy: tunables.cooldown_strategy,
             poll_strategy: tunables.poll_strategy,
             rng: SplitMix64::from_entropy(),
@@ -671,8 +677,9 @@ where
         if swap::decide(&active_usage, trigger) == SwapDecision::Hold {
             return TickAction::Held;
         }
-        // Over the trigger. Minimal cooldown floor (the #10 seam): refuse an
-        // immediate re-swap within this cycle's (jittered) cooldown of the last.
+        // Over the trigger. Cooldown (anti-oscillation, #10): refuse a re-swap
+        // until this cycle's (jittered) cooldown has elapsed since the last swap,
+        // so two near-exhausted accounts cannot ping-pong.
         let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
             &mut self.rng,
             COOLDOWN_SECS_LO,
@@ -685,8 +692,9 @@ where
         }
         // Pick the freshest viable target (most account-dimension headroom).
         let Some(target_idx) = pick_target(active_idx, readings, self.session_floor) else {
-            // Every other account is over the floor (or unavailable): nothing to
-            // swap to. The all-exhausted terminal behavior is #11; here we hold.
+            // No other account is available (or, with the opt-in floor enabled, all
+            // are over it): nothing to swap to. The all-exhausted terminal behavior
+            // is #11; here we hold.
             return TickAction::NoViableTarget;
         };
         // Run the out-of-band swap. #6 is no-half-swap: an error leaves the
@@ -767,17 +775,19 @@ where
 }
 
 /// Pick the freshest viable swap target: among accounts other than `active` whose
-/// reading is available and whose session usage is below `floor`, the one with the
-/// most account-dimension (weekly) headroom — i.e. the lowest weekly usage —
-/// breaking ties by lowest session usage, then roster order. `None` when no
-/// account qualifies (the all-exhausted case, #11).
-fn pick_target(active: usize, readings: &[Option<Usage>], floor: f64) -> Option<usize> {
+/// reading is available — and, when the opt-in `floor` is `Some`, whose session
+/// usage is below it (#10) — the one with the most account-dimension (weekly)
+/// headroom, i.e. the lowest weekly usage, breaking ties by lowest session usage,
+/// then roster order. With `floor == None` (the default) the session guard is off
+/// and any available other account qualifies. `None` when none qualifies (the
+/// all-exhausted case, #11).
+fn pick_target(active: usize, readings: &[Option<Usage>], floor: Option<f64>) -> Option<usize> {
     readings
         .iter()
         .enumerate()
         .filter(|&(i, _)| i != active)
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
-        .filter(|&(_, usage)| usage.session < floor)
+        .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         .min_by(|&(_, a), &(_, b)| {
             a.weekly
                 .total_cmp(&b.weekly)
@@ -1001,7 +1011,9 @@ mod tests {
         Tunables {
             poll_secs: 60,
             cooldown_secs: cooldown,
-            session_floor: floor,
+            // Most daemon tests opt the floor IN (the pre-#10 behavior they were
+            // written against); `tunables_floor_off` covers the new default.
+            session_floor: Some(floor),
             session_trigger: trigger,
             monitor_401_n: 3,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
@@ -1009,6 +1021,15 @@ mod tests {
             poll_strategy: Strategy::fixed(60.0),
             trigger_strategy: Strategy::fixed(f64::from(trigger)),
             cooldown_strategy: Strategy::fixed(cooldown as f64),
+        }
+    }
+
+    /// Tunables with the session-floor guard OFF — the #10 default. The floor is
+    /// the only field that differs from [`tunables`], so the rest is reused.
+    fn tunables_floor_off(trigger: u8, cooldown: u64) -> Tunables {
+        Tunables {
+            session_floor: None,
+            ..tunables(trigger, 0, cooldown)
         }
     }
 
@@ -1089,7 +1110,7 @@ mod tests {
                 weekly: 0.01,
             }), // session over floor -> not viable
         ];
-        assert_eq!(pick_target(0, &readings, 0.80), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
     }
 
     #[test]
@@ -1105,7 +1126,7 @@ mod tests {
                 weekly: 0.30,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, 0.80), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
     }
 
     #[test]
@@ -1124,7 +1145,7 @@ mod tests {
                 weekly: 0.10,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, 0.80), None);
+        assert_eq!(pick_target(0, &readings, Some(0.80)), None);
     }
 
     #[test]
@@ -1143,7 +1164,32 @@ mod tests {
                 weekly: 0.20,
             }), // tie weekly, session 0.20 -> winner
         ];
-        assert_eq!(pick_target(0, &readings, 0.80), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
+    }
+
+    #[test]
+    fn pick_target_with_no_floor_admits_any_available_other() {
+        // #10: with the session floor OFF (None), an account is a viable target on
+        // weekly headroom alone — even one whose session usage is high (which an
+        // enabled floor would exclude).
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+            }), // index 0 = active (excluded)
+            Some(Usage {
+                session: 0.95, // high session — an enabled floor would exclude this…
+                weekly: 0.10,
+            }), // …but with no floor it is the lowest-weekly viable target
+            Some(Usage {
+                session: 0.05,
+                weekly: 0.60,
+            }), // low session but more weekly used
+        ];
+        // No floor → index 1 wins on weekly headroom despite its high session…
+        assert_eq!(pick_target(0, &readings, None), Some(1));
+        // …whereas an enabled 80% floor excludes index 1 and falls to index 2.
+        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
     }
 
     // --- tick: decision + swap --------------------------------------------
@@ -1459,6 +1505,67 @@ mod tests {
         let outcome = daemon.tick().await;
 
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+    }
+
+    #[tokio::test]
+    async fn two_high_accounts_swap_at_most_once_per_cooldown_window() {
+        // Issue #10 acceptance (non-oscillation): with the session floor OFF (the
+        // default) and two accounts both hovering 94–96%, the cooldown ALONE bounds
+        // oscillation — ≤ 1 swap per cooldown window, and never A→B→A within it.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Both hover high (over the 95 trigger), low weekly so each is a viable
+        // target for the other — the setup that WOULD ping-pong without a cooldown.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.95, 0.20)
+            .ok("u-B", 0.96, 0.20);
+        // Floor OFF (the #10 default); cooldown 100 s, trigger 95, no jitter.
+        let tun = tunables_floor_off(95, 100);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+
+        // Tick 1 (window opens): A is over the trigger, no prior swap → swap A→B.
+        assert_eq!(
+            daemon.tick().await.action,
+            TickAction::Swapped { from: 0, to: 1 }
+        );
+
+        // Every later tick WITHIN the 100 s window: B is now active and also over
+        // the trigger, with A wide open as a target — yet each re-swap is refused by
+        // the cooldown. No second swap in the window → in particular no A→B→A.
+        for offset in [20u64, 40, 60, 80] {
+            daemon.clock.advance(Duration::from_secs(20));
+            assert_eq!(
+                daemon.tick().await.action,
+                TickAction::SkippedCooldown,
+                "a re-swap at +{offset}s (within the 100 s cooldown) must be refused"
+            );
+        }
+
+        // Past the cooldown the swap-back is allowed — oscillation is BOUNDED by the
+        // cooldown, not frozen.
+        daemon.clock.advance(Duration::from_secs(40)); // now at +120 s
+        assert_eq!(
+            daemon.tick().await.action,
+            TickAction::Swapped { from: 1, to: 0 }
+        );
     }
 
     // --- timing jitter strategies (issue #38) ------------------------------
