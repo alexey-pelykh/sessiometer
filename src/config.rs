@@ -64,6 +64,13 @@ pub(crate) struct Account {
     pub(crate) stash: String,
     /// Human-readable label shown by `list` / `status`.
     pub(crate) label: String,
+    /// Whether this account participates in the rotation (issue #36). A disabled
+    /// account stays in the roster and keeps its stash, but the daemon never swaps
+    /// TO it and does not poll it; `sessiometer enable` returns it to the candidate
+    /// pool. Defaults to `true` — a config entry that omits the key (every pre-#36
+    /// one) loads fully enabled. The reversible sibling of removal (#13), which
+    /// instead deletes the stash.
+    pub(crate) enabled: bool,
 }
 
 /// The daemon tunables, validated into their typed ranges.
@@ -347,6 +354,7 @@ impl Config {
                 account_uuid: account.account_uuid,
                 stash: account.stash,
                 label: account.label,
+                enabled: account.enabled,
             });
         }
 
@@ -427,6 +435,13 @@ impl Config {
             ));
             out.push_str(&format!("stash = {}\n", basic_string(&account.stash)));
             out.push_str(&format!("label = {}\n", basic_string(&account.label)));
+            // Issue #36: in the rotation? A disabled account is kept (and keeps its
+            // stash) but is never polled or swapped to — `sessiometer enable`
+            // returns it. Defaults to true; omitting the key leaves it enabled.
+            out.push_str(
+                "# In the rotation? false parks it (kept, but never polled or swapped to). Default true.\n",
+            );
+            out.push_str(&format!("enabled = {}\n", account.enabled));
         }
         out
     }
@@ -566,6 +581,16 @@ struct RawAccount {
     account_uuid: String,
     stash: String,
     label: String,
+    /// In the rotation? (issue #36) Absent → `true`: a pre-#36 `[[account]]` entry
+    /// omits the key and must stay fully enabled (backward-compatible default).
+    #[serde(default = "default_account_enabled")]
+    enabled: bool,
+}
+
+/// The backward-compatible default for [`RawAccount::enabled`] (issue #36): an
+/// account entry that omits `enabled` is enabled.
+fn default_account_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -911,6 +936,46 @@ label = "personal"
         let reparsed = Config::parse(&original.render()).unwrap();
         assert_eq!(original.tunables, reparsed.tunables);
         assert_eq!(original.roster, reparsed.roster);
+    }
+
+    // --- account enable/disable (issue #36) --------------------------------
+
+    #[test]
+    fn account_enabled_defaults_to_true_when_the_key_is_absent() {
+        // Backward-compat AC: every pre-#36 `[[account]]` omits `enabled`, so an
+        // absent key must load fully enabled — VALID's two accounts have no key.
+        let config = Config::parse(VALID).unwrap();
+        assert!(
+            config.roster.iter().all(|a| a.enabled),
+            "default is enabled"
+        );
+    }
+
+    #[test]
+    fn account_enabled_false_parses_as_disabled() {
+        let toml =
+            "[[account]]\naccount_uuid = \"u\"\nstash = \"s\"\nlabel = \"l\"\nenabled = false\n";
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.roster[0].enabled);
+    }
+
+    #[test]
+    fn rendered_config_documents_and_round_trips_the_enabled_flag() {
+        // The renderer writes `enabled` for every account (capture writes it; #36)
+        // with an inline doc, and a disabled account survives a render→parse cycle.
+        let mut config = Config::parse(VALID).unwrap();
+        config.roster[1].enabled = false;
+        let text = config.render();
+        assert!(text.contains("enabled = true"), "got {text}");
+        assert!(text.contains("enabled = false"), "got {text}");
+        assert!(
+            text.contains("# In the rotation?"),
+            "documents enabled: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.roster, config.roster);
+        assert!(reparsed.roster[0].enabled);
+        assert!(!reparsed.roster[1].enabled);
     }
 
     // --- timing jitter strategies (issue #38) ------------------------------

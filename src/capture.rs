@@ -176,6 +176,8 @@ fn plan_capture(
         account_uuid: account_uuid.to_owned(),
         stash: stash.clone(),
         label,
+        // A freshly captured account joins the rotation enabled (issue #36).
+        enabled: true,
     });
     Ok((stash, CaptureOutcome::Captured))
 }
@@ -203,6 +205,7 @@ mod tests {
             account_uuid: uuid.to_owned(),
             stash: stash.to_owned(),
             label: label.to_owned(),
+            enabled: true,
         }
     }
 

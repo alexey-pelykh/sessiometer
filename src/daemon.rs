@@ -327,6 +327,9 @@ pub(crate) struct StatusSnapshot {
 pub(crate) struct AccountReading {
     pub(crate) label: String,
     pub(crate) active: bool,
+    /// Whether the account is in the rotation (issue #36) — surfaced so `status`
+    /// can mark a parked account. A disabled account is shown but never swapped to.
+    pub(crate) enabled: bool,
     pub(crate) usage: Option<Usage>,
 }
 
@@ -347,6 +350,9 @@ pub(crate) struct AccountStatusLine {
     /// The operator-chosen handle (label) — never the email (issue #15).
     pub(crate) label: String,
     pub(crate) active: bool,
+    /// Whether the account is in the rotation (issue #36); `false` for a parked
+    /// account, which `status` marks. Non-secret — a plain flag.
+    pub(crate) enabled: bool,
     /// Last-polled session-window usage percent (`0..=100`); `null` if the last
     /// poll for this account failed (never a fabricated `0`).
     pub(crate) session_pct: Option<u8>,
@@ -383,6 +389,7 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
             .map(|account| AccountStatusLine {
                 label: account.label.clone(),
                 active: account.active,
+                enabled: account.enabled,
                 session_pct: account.usage.map(|u| to_pct(u.session)),
                 weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
             })
@@ -675,6 +682,17 @@ where
         let mut events: Vec<Event> = Vec::new();
         let mut readings: Vec<Option<Usage>> = Vec::with_capacity(self.roster.len());
         for i in 0..self.roster.len() {
+            // Skip polling a disabled (parked) account (issue #36): it is never a
+            // swap target and its stashed token may be stale, so a poll would waste
+            // a `curl`. Its reading stays absent (`None`), keeping `readings` indexed
+            // by roster position. The ACTIVE account is always polled even when
+            // disabled, so the normal swap-AWAY trigger still fires — a parked active
+            // account keeps running until its trigger, then swaps away and is never
+            // re-picked (the minimal "active-disabled" resolution, option (a)).
+            if active != Some(i) && !self.roster[i].enabled {
+                readings.push(None);
+                continue;
+            }
             let result = self.poller.poll(&self.roster[i], active == Some(i)).await;
             self.note_poll_outcome(i, &result, &mut events);
             readings.push(result.ok());
@@ -778,11 +796,19 @@ where
             }
         }
         // Pick the freshest viable target (most account-dimension headroom). A
-        // weekly-exhausted account is not viable (see `pick_target`), so when every
-        // other account is weekly-exhausted this returns `None`.
-        let Some(target_idx) =
-            pick_target(active_idx, readings, self.session_floor, weekly_trigger)
-        else {
+        // disabled (parked) account is not viable (issue #36), and a weekly-exhausted
+        // account is not viable (#11) — so when every ENABLED other account is
+        // weekly-exhausted this returns `None`. A disabled account, even with weekly
+        // headroom, never counts, so it cannot hold the daemon out of the
+        // all-exhausted terminal state (#11).
+        let enabled: Vec<bool> = self.roster.iter().map(|account| account.enabled).collect();
+        let Some(target_idx) = pick_target(
+            active_idx,
+            readings,
+            &enabled,
+            self.session_floor,
+            weekly_trigger,
+        ) else {
             // No viable target — every other account is weekly-exhausted (or, with
             // the opt-in floor enabled, over it). The all-exhausted TERMINAL state
             // (issue #11): HOLD, do NOT swap (swapping among exhausted accounts only
@@ -868,6 +894,7 @@ where
                 .map(|(i, account)| AccountReading {
                     label: account.label.clone(),
                     active: active == Some(i),
+                    enabled: account.enabled,
                     usage: readings[i],
                 })
                 .collect(),
@@ -899,21 +926,27 @@ where
     }
 }
 
-/// Pick the freshest viable swap target: among accounts other than `active` whose
-/// reading is available, that are NOT weekly-exhausted (weekly usage below
-/// `weekly_trigger`, issue #11) — and, when the opt-in `floor` is `Some`, whose
-/// session usage is below it (#10) — the one with the most account-dimension
-/// (weekly) headroom, i.e. the lowest weekly usage, breaking ties by lowest
-/// session usage, then roster order. `None` when none qualifies: with every other
-/// account weekly-exhausted that is the all-exhausted terminal state (#11).
+/// Pick the freshest viable swap target: among accounts other than `active` that
+/// are enabled (issue #36), whose reading is available, that are NOT weekly-
+/// exhausted (weekly usage below `weekly_trigger`, issue #11) — and, when the
+/// opt-in `floor` is `Some`, whose session usage is below it (#10) — the one with
+/// the most account-dimension (weekly) headroom, i.e. the lowest weekly usage,
+/// breaking ties by lowest session usage, then roster order. `None` when none
+/// qualifies: with every enabled other account weekly-exhausted that is the
+/// all-exhausted terminal state (#11). `enabled` is indexed by roster position,
+/// parallel to `readings`.
 ///
-/// The weekly-exhaustion exclusion is load-bearing: a target at/above its weekly
-/// trigger would re-trip [`swap::decide`] next cycle and thrash, so it can never
-/// be a useful destination — excluding it is exactly what turns "all accounts
-/// weekly-exhausted" into a no-viable-target verdict instead of a swap.
+/// Two exclusions are load-bearing. The weekly-exhaustion exclusion: a target
+/// at/above its weekly trigger would re-trip [`swap::decide`] next cycle and
+/// thrash, so it can never be a useful destination — excluding it is what turns
+/// "all enabled accounts weekly-exhausted" into a no-viable-target verdict instead
+/// of a swap. The disabled exclusion (#36): a parked account is never a destination
+/// even with ample headroom, and — being excluded here rather than relying on its
+/// (skipped) poll — it can never hold the daemon out of the #11 terminal state.
 fn pick_target(
     active: usize,
     readings: &[Option<Usage>],
+    enabled: &[bool],
     floor: Option<f64>,
     weekly_trigger: f64,
 ) -> Option<usize> {
@@ -921,6 +954,7 @@ fn pick_target(
         .iter()
         .enumerate()
         .filter(|&(i, _)| i != active)
+        .filter(|&(i, _)| enabled[i])
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
         .filter(|&(_, usage)| usage.weekly < weekly_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
@@ -1218,6 +1252,15 @@ mod tests {
             account_uuid: uuid.to_owned(),
             stash: stash.to_owned(),
             label: label.to_owned(),
+            enabled: true,
+        }
+    }
+
+    /// A roster account that starts parked (issue #36) — for the disable paths.
+    fn disabled_account(uuid: &str, stash: &str, label: &str) -> Account {
+        Account {
+            enabled: false,
+            ..account(uuid, stash, label)
         }
     }
 
@@ -1316,6 +1359,13 @@ mod tests {
     // floor / headroom behavior); the #11 tests below use readings at/above it.
     const WK: f64 = 0.98;
 
+    /// An all-enabled flag slice sized to `readings` (issue #36): the pre-#36
+    /// pick_target tests pin the floor / headroom / weekly-exhaustion behavior with
+    /// every account enabled, so the new disabled exclusion is a no-op for them.
+    fn all_on(readings: &[Option<Usage>]) -> Vec<bool> {
+        vec![true; readings.len()]
+    }
+
     #[test]
     fn pick_target_chooses_the_lowest_weekly_among_session_viable_accounts() {
         let readings = vec![
@@ -1340,7 +1390,10 @@ mod tests {
                 weekly_resets_at: None,
             }), // session over floor -> not viable
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1358,7 +1411,10 @@ mod tests {
                 weekly_resets_at: None,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1380,7 +1436,10 @@ mod tests {
                 weekly_resets_at: None,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80), WK), None);
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            None
+        );
     }
 
     #[test]
@@ -1402,7 +1461,10 @@ mod tests {
                 weekly_resets_at: None,
             }), // tie weekly, session 0.20 -> winner
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1428,9 +1490,15 @@ mod tests {
             }), // low session but more weekly used
         ];
         // No floor → index 1 wins on weekly headroom despite its high session…
-        assert_eq!(pick_target(0, &readings, None, WK), Some(1));
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), None, WK),
+            Some(1)
+        );
         // …whereas an enabled 80% floor excludes index 1 and falls to index 2.
-        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1455,7 +1523,10 @@ mod tests {
                 weekly_resets_at: None,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, None, WK), Some(2));
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), None, WK),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1479,7 +1550,61 @@ mod tests {
                 weekly_resets_at: None,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, None, WK), None);
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), None, WK),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_target_excludes_a_disabled_account_even_with_the_most_headroom() {
+        // #36: index 1 has the lowest weekly (it would win on headroom) but is
+        // disabled, so it is never a target; selection falls to the enabled index 2.
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: None,
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.05, // lowest weekly — the would-be winner…
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.30,
+                weekly_resets_at: None,
+            }),
+        ];
+        let enabled = [true, false, true]; // …but index 1 is parked
+        assert_eq!(pick_target(0, &readings, &enabled, None, WK), Some(2));
+    }
+
+    #[test]
+    fn pick_target_disabled_headroom_does_not_rescue_an_all_exhausted_roster() {
+        // #11 × #36: the only account with weekly headroom is disabled, so the
+        // verdict is still no-viable-target — a parked account must not hold the
+        // daemon out of the all-exhausted terminal state.
+        let readings = vec![
+            Some(Usage {
+                session: 0.50,
+                weekly: 0.99,
+                weekly_resets_at: None,
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.98, // enabled but weekly-exhausted
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.01, // ample headroom — but disabled, so not viable
+                weekly_resets_at: None,
+            }),
+        ];
+        let enabled = [true, true, false];
+        assert_eq!(pick_target(0, &readings, &enabled, None, WK), None);
     }
 
     // --- soonest_weekly_reset (pure, #11) ---------------------------------
@@ -1586,6 +1711,57 @@ mod tests {
         assert_eq!(displayed_uuid(&json).as_deref(), Some("u-B"));
         // …and the in-memory active advanced to B, so the next read polls B.
         assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn tick_excludes_a_disabled_account_from_polling_and_targeting() {
+        // #36 end-to-end: the active account is over its trigger; the parked account
+        // (index 1) has the most headroom but is disabled, so the swap goes to the
+        // enabled `spare` (index 2) instead — and the parked account is never polled,
+        // so its snapshot reading stays absent despite a scripted `ok`.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            disabled_account("u-B", "Sessiometer/u-B", "parked"),
+            account("u-C", "Sessiometer/u-C", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40) // active: over trigger
+            .ok("u-B", 0.01, 0.01) // parked: would be the freshest target IF polled
+            .ok("u-C", 0.30, 0.50); // enabled, viable
+        let tun = tunables(95, 80, 0);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        let outcome = daemon.tick().await;
+
+        // Swapped to the ENABLED spare, not the parked account with more headroom.
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 2 });
+        assert_eq!(daemon.state.active, Some(2));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-C"));
+        // The parked account was skipped by the poll loop: its reading is absent
+        // even though the poller was scripted to return one for it.
+        let parked = &outcome.snapshot.accounts[1];
+        assert_eq!(parked.label, "parked");
+        assert!(!parked.enabled, "the snapshot marks it disabled");
+        assert!(
+            parked.usage.is_none(),
+            "a disabled account is not polled, so its reading stays absent"
+        );
     }
 
     #[tokio::test]
@@ -2453,6 +2629,7 @@ mod tests {
                 AccountReading {
                     label: "work".to_owned(),
                     active: true,
+                    enabled: true,
                     usage: Some(Usage {
                         session: 0.97,
                         weekly: 0.40,
@@ -2462,6 +2639,7 @@ mod tests {
                 AccountReading {
                     label: "spare".to_owned(),
                     active: false,
+                    enabled: true,
                     usage: None,
                 },
             ],
@@ -2470,6 +2648,8 @@ mod tests {
         let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
         assert!(json.contains("\"label\":\"work\""));
         assert!(json.contains("\"active\":true"));
+        // Issue #36: the rotation flag is carried so `status` can mark a parked account.
+        assert!(json.contains("\"enabled\":true"));
         assert!(json.contains("\"session_pct\":97"));
         assert!(json.contains("\"weekly_pct\":40"));
         // The unavailable account reports null, not a fabricated 0.
@@ -2490,6 +2670,7 @@ mod tests {
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
                 active: true,
+                enabled: true,
                 usage: Some(Usage {
                     session: 0.50,
                     weekly: 0.25,
@@ -2560,11 +2741,13 @@ mod tests {
                 AccountReading {
                     label: "work".to_owned(),
                     active: false,
+                    enabled: true,
                     usage: None,
                 },
                 AccountReading {
                     label: "spare".to_owned(),
                     active: true,
+                    enabled: true,
                     usage: None,
                 },
             ],
@@ -3152,6 +3335,10 @@ mod tests {
                 field: "accountUuid",
             },
             Error::LabelRequired,
+            Error::RotationLabelRequired { verb: "disable" },
+            Error::AccountLabelNotFound {
+                label: "work".to_owned(),
+            },
             Error::StashIncomplete {
                 service: "Sessiometer/11111111-1111-1111-1111-111111111111".to_owned(),
             },
