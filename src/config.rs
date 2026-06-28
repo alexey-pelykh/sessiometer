@@ -39,8 +39,6 @@ const DEFAULT_POLL_SECS: u64 = 300;
 const DEFAULT_POLL_JITTER_STDDEV: f64 = 30.0;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
-/// Default `session_floor` percent.
-const DEFAULT_SESSION_FLOOR: u8 = 80;
 /// Default `session_trigger` percent.
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// Default consecutive-401 count before an account is treated as rejected.
@@ -77,10 +75,13 @@ pub(crate) struct Tunables {
     /// Consumed by the cooldown logic (#10 / #11).
     #[allow(dead_code)]
     pub(crate) cooldown_secs: u64,
-    /// Only swap *to* an account whose session usage is below this percent
-    /// (`0..=session_trigger`). Consumed by swap-target selection (#6 / #7).
-    #[allow(dead_code)]
-    pub(crate) session_floor: u8,
+    /// Opt-in swap-target session guard (#10): when `Some(pct)`, only swap *to* an
+    /// account whose session usage is below `pct` percent (`0..=session_trigger`);
+    /// `None` (the default) disables the guard, so target choice rests on the
+    /// separate weekly-headroom selection alone — the configuration under which the
+    /// post-swap cooldown alone bounds oscillation. OFF by default: operators opt
+    /// in, and a sensible enabled value mirrors `session_trigger`.
+    pub(crate) session_floor: Option<u8>,
     /// Swap *away* from the active account at or above this session percent
     /// (`50..=99`).
     pub(crate) session_trigger: u8,
@@ -107,7 +108,7 @@ impl Default for Tunables {
         Self {
             poll_secs: DEFAULT_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
-            session_floor: DEFAULT_SESSION_FLOOR,
+            session_floor: None,
             session_trigger: DEFAULT_SESSION_TRIGGER,
             monitor_401_n: DEFAULT_MONITOR_401_N,
             poll_strategy: Strategy {
@@ -216,20 +217,28 @@ impl Config {
         let t = raw.tunables;
 
         range("session_trigger", t.session_trigger, 50, 99)?;
-        // session_floor's lower bound is 0; its upper bound is session_trigger,
-        // surfaced as a distinct cross-field error.
-        if t.session_floor < 0 {
-            return Err(Error::ConfigInvalid(format!(
-                "session_floor must be in 0..={}, got {}",
-                t.session_trigger, t.session_floor
-            )));
-        }
-        if t.session_floor > t.session_trigger {
-            return Err(Error::ConfigFloorAboveTrigger {
-                floor: t.session_floor,
-                trigger: t.session_trigger,
-            });
-        }
+        // session_floor is opt-in (#10): absent → None (the guard is off). When
+        // present, its lower bound is 0 and its upper bound is session_trigger (a
+        // higher floor could never admit a target), the latter a distinct
+        // cross-field error.
+        let session_floor = match t.session_floor {
+            None => None,
+            Some(floor) => {
+                if floor < 0 {
+                    return Err(Error::ConfigInvalid(format!(
+                        "session_floor must be in 0..={}, got {floor}",
+                        t.session_trigger
+                    )));
+                }
+                if floor > t.session_trigger {
+                    return Err(Error::ConfigFloorAboveTrigger {
+                        floor,
+                        trigger: t.session_trigger,
+                    });
+                }
+                Some(floor as u8)
+            }
+        };
         range("poll_secs", t.poll_secs, 5, 3600)?;
         range("cooldown_secs", t.cooldown_secs, 0, 3600)?;
         range("monitor_401_n", t.monitor_401_n, 1, 20)?;
@@ -247,7 +256,7 @@ impl Config {
         let tunables = Tunables {
             poll_secs: t.poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
-            session_floor: t.session_floor as u8,
+            session_floor,
             session_trigger: t.session_trigger as u8,
             monitor_401_n: t.monitor_401_n as u8,
             poll_strategy: Strategy {
@@ -338,9 +347,13 @@ impl Config {
         out.push_str(
             "# Only swap TO an account whose session usage is below this percent\n\
              # (0..=session_trigger): a candidate must be at most this full to receive the\n\
-             # active session. This is NOT the level that triggers a swap.\n",
+             # active session. This is NOT the level that triggers a swap. OFF by default\n\
+             # (opt-in, #10): uncomment to enable; a sensible value mirrors session_trigger.\n",
         );
-        out.push_str(&format!("session_floor = {}\n", t.session_floor));
+        match t.session_floor {
+            Some(floor) => out.push_str(&format!("session_floor = {floor}\n")),
+            None => out.push_str(&format!("# session_floor = {}\n", t.session_trigger)),
+        }
         out.push_str(
             "# Swap AWAY from the active account at or above this session percent (50..=99).\n",
         );
@@ -524,8 +537,9 @@ struct RawTunables {
     poll_secs: i64,
     #[serde(default = "default_cooldown_secs")]
     cooldown_secs: i64,
-    #[serde(default = "default_session_floor")]
-    session_floor: i64,
+    /// Opt-in (#10): absent → `None` (the session-floor guard is off by default).
+    #[serde(default)]
+    session_floor: Option<i64>,
     #[serde(default = "default_session_trigger")]
     session_trigger: i64,
     #[serde(default = "default_monitor_401_n")]
@@ -537,7 +551,7 @@ impl Default for RawTunables {
         Self {
             poll_secs: default_poll_secs(),
             cooldown_secs: default_cooldown_secs(),
-            session_floor: default_session_floor(),
+            session_floor: None,
             session_trigger: default_session_trigger(),
             monitor_401_n: default_monitor_401_n(),
         }
@@ -549,9 +563,6 @@ fn default_poll_secs() -> i64 {
 }
 fn default_cooldown_secs() -> i64 {
     DEFAULT_COOLDOWN_SECS as i64
-}
-fn default_session_floor() -> i64 {
-    i64::from(DEFAULT_SESSION_FLOOR)
 }
 fn default_session_trigger() -> i64 {
     i64::from(DEFAULT_SESSION_TRIGGER)
@@ -633,7 +644,7 @@ label = "personal"
             Tunables {
                 poll_secs: 30,
                 cooldown_secs: 45,
-                session_floor: 70,
+                session_floor: Some(70),
                 session_trigger: 90,
                 monitor_401_n: 5,
                 // No [jitter] table in VALID → default strategies: poll jitters
@@ -662,7 +673,8 @@ label = "personal"
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
         assert_eq!(config.tunables.session_trigger, 95);
-        assert_eq!(config.tunables.session_floor, 80);
+        // #10: the session-floor guard is OFF by default (opt-in).
+        assert_eq!(config.tunables.session_floor, None);
     }
 
     #[test]
@@ -711,6 +723,30 @@ label = "personal"
     fn rejects_negative_floor() {
         let toml = with_tunables("session_floor = -1");
         assert!(matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))));
+    }
+
+    #[test]
+    fn session_floor_is_off_by_default_and_opt_in() {
+        // #10: an absent session_floor leaves the guard OFF (None), even when other
+        // tunables are set…
+        let off = Config::parse(&with_tunables("session_trigger = 95")).unwrap();
+        assert_eq!(off.tunables.session_floor, None);
+        // …and a present value opts in at that percent.
+        let on = Config::parse(&with_tunables("session_floor = 90\nsession_trigger = 95")).unwrap();
+        assert_eq!(on.tunables.session_floor, Some(90));
+    }
+
+    #[test]
+    fn rendered_default_config_documents_session_floor_as_off() {
+        // With the floor off, render emits a commented-out opt-in line (suggesting
+        // the trigger value) and round-trips back to None — never a live assignment.
+        let mut config = Config::parse(VALID).unwrap();
+        config.tunables.session_floor = None;
+        let text = config.render();
+        assert!(text.contains("OFF by default"), "got {text}");
+        assert!(text.contains("# session_floor ="), "got {text}");
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.tunables.session_floor, None);
     }
 
     #[test]
