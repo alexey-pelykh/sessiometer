@@ -87,8 +87,13 @@ interactive prompt. This run validated the interactive path, not the daemon path
   `~/.claude.json` `oauthAccount` (display) — i.e. **replicate `/login`'s writes** to inherit its
   proven cross-session propagation. Co-write is best-effort, not atomic-critical. Restart-based swap is
   the proven fallback. If propagation ever fails, `/login` may emit an extra signal we must reproduce.
-- **#12 (mid-turn swap):** hot-swap (no restart) is very likely viable via the `/login`-style propagation
-  above; confirm with the garbage-token test before relying on it; otherwise restart on swap.
+- **#12 (mid-turn swap):** the credential-cut core — a concurrent reader across a forced swap sees a
+  clean A→B cut and never a torn blob — is now demonstrated in CI against the real `security` CLI
+  (`src/swap.rs` `tests::mid_turn_live`), resting on the atomic `-U` write. The fully-live tail (a
+  running session adopts B on its next request; the in-flight request absorbs ≤1 transparently-retried
+  401) still needs a live Claude token: hot-swap (no restart) is very likely viable via the
+  `/login`-style propagation above — confirm with the garbage-token test before relying on it;
+  otherwise restart on swap (the proven fallback).
 - **#4 (account capture):** capture must stash **both** the keychain token **and** the `oauthAccount`
   block per account (H1 confirms the stash survives `/login`).
 - **#13 (edge cases):** read the keychain **non-interactively** (expect 36 on lock); pre-check lock state;
