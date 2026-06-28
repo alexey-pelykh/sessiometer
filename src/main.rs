@@ -20,6 +20,7 @@ mod observability;
 mod paths;
 mod stash;
 mod swap;
+mod timing;
 mod usage;
 
 use std::process::ExitCode;

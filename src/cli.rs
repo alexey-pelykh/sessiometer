@@ -108,14 +108,15 @@ async fn run() -> Result<()> {
         RealRosterPoller::new(config.tunables.monitor_401_n),
         RealCredentialStore::new(),
         RealAccountStash::new(),
-        RealClock::new(config.poll_interval()),
+        RealClock::new(),
         paths::claude_json()?,
         &config.tunables,
     );
     let mut shutdown = RealShutdown::new()?;
 
     eprintln!(
-        "sessiometer: daemon started (polling every {}s); Ctrl-C or SIGTERM to stop",
+        "sessiometer: daemon started (polling about every {}s, jittered); \
+         Ctrl-C or SIGTERM to stop",
         config.tunables.poll_secs,
     );
     let result = run_loop(&mut daemon, &mut log, &mut shutdown, &control).await;
@@ -331,6 +332,9 @@ mod tests {
                 session_floor: 80,
                 session_trigger: 95,
                 monitor_401_n: 3,
+                // `list` reads no timing strategies; default jitter is a fine
+                // placeholder (issue #38).
+                ..Tunables::default()
             },
         }
     }
