@@ -3011,4 +3011,295 @@ mod tests {
             "got: {logged:?}"
         );
     }
+
+    // --- redaction METER (issue #15) ---------------------------------------
+    //
+    // The whole-corpus output-redaction gate. It drives the poll→decide→swap loop
+    // body ([`Daemon::tick`]) across fault-injected scenarios with KNOWN secrets
+    // seeded into every daemon input (the canonical store, the stashes, and
+    // `~/.claude.json`), harvests EVERY operator-facing channel into one corpus,
+    // and asserts — via [`crate::redaction::meter`] — that no token, no
+    // credential-blob fingerprint, and no email surfaces anywhere. The meter
+    // engine and its own non-vacuity proofs (each leak class planted and caught)
+    // live in `crate::redaction`; this is the driver that feeds it real output.
+
+    /// An `oauthAccount` carrying a chosen `uuid` and the secret `email`.
+    fn meter_oauth(uuid: &str, email: &str) -> OauthAccount {
+        OauthAccount::from_object_bytes(
+            format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{email}"}}"#).as_bytes(),
+        )
+        .unwrap()
+    }
+
+    /// A stash holding the secret `blob` + an identity carrying the secret `email`.
+    fn meter_stashed(blob: &[u8], uuid: &str, email: &str) -> StashedAccount {
+        StashedAccount {
+            credential: cred(blob),
+            oauth_account: meter_oauth(uuid, email),
+        }
+    }
+
+    /// A daemon whose every credential input carries the fixture's secrets: the
+    /// canonical store and each per-account stash hold the secret blob, and each
+    /// stashed identity (plus `~/.claude.json`) carries the secret email. Returns
+    /// the daemon and the tempdir guard that keeps `~/.claude.json` alive.
+    ///
+    /// `~/.claude.json` is Claude Code's OWN state file — it legitimately holds the
+    /// email — and is deliberately NOT one of the harvested output channels.
+    async fn meter_daemon(
+        secrets: &crate::redaction::meter::Secrets,
+        accounts: &[(&str, &str)],
+        poller: FakeRosterPoller,
+        tun: &Tunables,
+    ) -> (FakeDaemon, tempfile::TempDir) {
+        let blob = secrets.blob();
+        let email = secrets.email();
+
+        let roster: Vec<Account> = accounts
+            .iter()
+            .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
+            .collect();
+
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(blob)).await.unwrap();
+        let stash = FakeAccountStash::empty();
+        for (uuid, _) in accounts {
+            stash
+                .write(
+                    &format!("Sessiometer/{uuid}"),
+                    &meter_stashed(blob, uuid, email),
+                )
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join(".claude.json");
+        std::fs::write(
+            &json,
+            format!(
+                r#"{{"numStartups":1,"oauthAccount":{{"accountUuid":"{}","emailAddress":"{email}"}}}}"#,
+                accounts[0].0
+            ),
+        )
+        .unwrap();
+
+        let daemon = Daemon::new(roster, poller, store, stash, FakeClock::frozen(), json, tun);
+        (daemon, dir)
+    }
+
+    /// Append every operator-facing channel of one tick's outcome to `corpus`,
+    /// sourced from the EXACT canonical surfaces production uses: the single log
+    /// surface ([`Event::to_log_line`]), the UDS wire ([`status_response`] +
+    /// [`control_reply`]), the `status` text ([`crate::cli::render_status`]), and
+    /// the foreground swap echo ([`swap_report`]).
+    fn harvest_channels(outcome: &TickOutcome, corpus: &mut String) {
+        // A fixed wall-clock stamp keeps the log lines deterministic; the value is
+        // a non-secret timestamp regardless.
+        let ts = std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600);
+        for event in &outcome.events {
+            corpus.push_str(&event.to_log_line(ts));
+            corpus.push('\n');
+        }
+        let response = status_response(&outcome.snapshot);
+        corpus.push_str(&serde_json::to_string(&response).unwrap());
+        corpus.push('\n');
+        corpus.push_str(&control_reply(r#"{"cmd":"status"}"#, &outcome.snapshot));
+        corpus.push('\n');
+        corpus.push_str(&crate::cli::render_status(&response));
+        if let Some(report) = swap_report(outcome) {
+            corpus.push_str(&report);
+            corpus.push('\n');
+        }
+    }
+
+    /// One representative value of EVERY [`Error`] variant — the error-message
+    /// channel. Each carries only structural fields (paths, counts, codes, static
+    /// field/op names); none can carry a token or email by construction, and the
+    /// METER confirms the Display format strings hold to that.
+    fn every_error_variant() -> Vec<Error> {
+        vec![
+            Error::Unimplemented("usage polling (#5)"),
+            Error::UnknownCommand("bogus".to_owned()),
+            Error::HomeUnresolved,
+            Error::ForeignOwnership(PathBuf::from("/home/op/.config/sessiometer")),
+            Error::CredentialNotFound,
+            Error::CredentialAmbiguous { count: 2 },
+            Error::KeychainLocked { op: "read" },
+            Error::Keychain {
+                op: "write",
+                code: 1,
+            },
+            Error::ConfigNotFound {
+                path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
+            },
+            Error::RosterEmpty,
+            Error::ConfigParse("expected `=` at line 3".to_owned()),
+            Error::ConfigInvalid("session_trigger must be in 50..=99, got 120".to_owned()),
+            Error::ConfigFloorAboveTrigger {
+                floor: 95,
+                trigger: 90,
+            },
+            Error::ClaudeStateNotFound {
+                path: PathBuf::from("/home/op/.claude.json"),
+            },
+            Error::ClaudeStateParse {
+                line: 5,
+                column: 12,
+            },
+            Error::OauthAccountMissing,
+            Error::OauthAccountFieldMissing {
+                field: "accountUuid",
+            },
+            Error::LabelRequired,
+            Error::StashIncomplete {
+                service: "Sessiometer/11111111-1111-1111-1111-111111111111".to_owned(),
+            },
+            Error::UsageTokenUnreadable,
+            Error::UsageTransient { status: 0 },
+            Error::UsageRateLimited { status: 429 },
+            Error::UsageRejected { status: 400 },
+            Error::UsageUnauthorized,
+            Error::UsageScopeMissing,
+            Error::UsageParse("no session (five_hour) dimension".to_owned()),
+            Error::AlreadyRunning,
+            Error::DaemonNotRunning,
+            Error::Io(std::io::Error::other("boom")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn redaction_meter_emits_no_secret_on_any_channel_across_the_full_loop() {
+        use crate::redaction::meter::{assert_clean, Secrets};
+
+        let secrets = Secrets::meter_fixture();
+        let mut corpus = String::new();
+
+        // Recognizable, LOW-entropy uuids/labels: only the label reaches the
+        // log/status/UDS channels; the uuid reaches only the `list` view. Keeping
+        // them low-entropy means the entropy backstop fires only on a genuine
+        // secret leak, never on the test scaffolding itself.
+        const A: (&str, &str) = ("11111111-1111-1111-1111-111111111111", "work");
+        const B: (&str, &str) = ("22222222-2222-2222-2222-222222222222", "spare");
+        const C: (&str, &str) = ("33333333-3333-3333-3333-333333333333", "backup");
+
+        // Scenario 1 — a swap: Event::Swap, the snapshot, and the foreground echo.
+        {
+            let poller = FakeRosterPoller::new()
+                .ok(A.0, 0.97, 0.40) // active, over the session trigger
+                .ok(B.0, 0.10, 0.20); // freshest viable target
+            let tun = tunables(95, 80, 0);
+            let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
+            let outcome = daemon.tick().await;
+            assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+            harvest_channels(&outcome, &mut corpus);
+        }
+
+        // Scenario 2 — the all-exhausted terminal state: Event::AllExhausted with a
+        // rendered `resets_at` (every account weekly-exhausted, no viable target).
+        {
+            const A_RESET: i64 = 1_782_777_600;
+            const B_RESET: i64 = 1_782_496_800; // soonest -> the held account
+            const C_RESET: i64 = 1_782_864_000;
+            let poller = FakeRosterPoller::new()
+                .ok_resets(A.0, 0.50, 0.99, A_RESET)
+                .ok_resets(B.0, 0.50, 0.99, B_RESET)
+                .ok_resets(C.0, 0.50, 0.99, C_RESET);
+            let tun = tunables_floor_off(95, 0);
+            let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
+            let outcome = daemon.tick().await;
+            assert_eq!(outcome.action, TickAction::NoViableTarget);
+            harvest_channels(&outcome, &mut corpus);
+        }
+
+        // Scenario 3 — fault injection: a 401, a locked keychain, and a 403 each
+        // emit their poll-outcome event in one tick.
+        {
+            let poller = FakeRosterPoller::new()
+                .unauthorized(A.0) // monitor_401
+                .keychain_locked(B.0) // keychain_locked_wait
+                .scope_missing(C.0); // usage_scope_fail (403)
+            let tun = tunables(95, 80, 0);
+            let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
+            let outcome = daemon.tick().await;
+            assert_eq!(outcome.action, TickAction::SkippedActiveUnavailable);
+            harvest_channels(&outcome, &mut corpus);
+        }
+
+        // Channel — the offline `list` roster view (label · uuid · stash).
+        let roster: Vec<Account> = [A, B, C]
+            .iter()
+            .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
+            .collect();
+        corpus.push_str(&crate::cli::render_roster(&roster));
+
+        // Channel — the UDS error replies (malformed request / unknown command).
+        corpus.push_str(&control_reply("not json", &StatusSnapshot::default()));
+        corpus.push('\n');
+        corpus.push_str(&control_reply(
+            r#"{"cmd":"nope"}"#,
+            &StatusSnapshot::default(),
+        ));
+        corpus.push('\n');
+
+        // Channel — every error message Display.
+        for err in every_error_variant() {
+            corpus.push_str(&err.to_string());
+            corpus.push('\n');
+        }
+
+        // Cardinality: a gate that passes on an empty/degraded corpus is no
+        // evidence (issue #15). Prove every channel actually contributed its
+        // expected non-secret content before trusting the clean verdict.
+        assert!(
+            corpus.contains("event=swap from=work to=spare"),
+            "log channel: swap event missing"
+        );
+        assert!(
+            corpus.contains("event=all_exhausted hold=spare"),
+            "log channel: all_exhausted event missing"
+        );
+        assert!(
+            corpus.contains("event=monitor_401 account=work"),
+            "log channel: 401 event missing"
+        );
+        assert!(
+            corpus.contains("event=keychain_locked_wait account=spare"),
+            "log channel: keychain-lock event missing"
+        );
+        assert!(
+            corpus.contains("event=usage_scope_fail account=backup"),
+            "log channel: 403 event missing"
+        );
+        assert!(
+            corpus.contains(r#""session_pct":97"#),
+            "UDS channel: status wire missing"
+        );
+        assert!(
+            corpus.contains("· session 97%"),
+            "status-text channel missing"
+        );
+        assert!(
+            corpus.contains("swapped: work → spare"),
+            "foreground channel: swap report missing"
+        );
+        assert!(
+            corpus.contains("Sessiometer/11111111"),
+            "list channel: roster view missing"
+        );
+        assert!(
+            corpus.contains("daemon not running"),
+            "error channel missing"
+        );
+        assert!(
+            corpus.len() > 800,
+            "corpus implausibly small ({} bytes) — channels not captured",
+            corpus.len()
+        );
+
+        // The METER: no token prefix, no known token, no blob fingerprint (leading
+        // bytes or sha256), no email shape, and no high-entropy run — on ANY of the
+        // channels above.
+        assert_clean(&corpus, &secrets);
+    }
 }

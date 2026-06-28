@@ -18,6 +18,7 @@ mod error;
 mod keychain;
 mod observability;
 mod paths;
+mod redaction;
 mod stash;
 mod swap;
 mod timing;

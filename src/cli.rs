@@ -196,7 +196,10 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// Render a [`StatusResponse`] as the text `status` prints. Pure (no clock, no
 /// I/O) so the response→text mapping is unit-testable. Sourced solely from the
 /// response's non-secret fields, so it can never print a token or email (issue #15).
-fn render_status(response: &StatusResponse) -> String {
+///
+/// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
+/// can route this exact `status`-text surface through its scan.
+pub(crate) fn render_status(response: &StatusResponse) -> String {
     let mut out = String::new();
     for account in &response.accounts {
         // `*` marks the active account (as the event log does); a leading space
@@ -281,7 +284,10 @@ fn view(loaded: Result<Config>) -> Result<String> {
 ///
 /// Sourced solely from each [`Account`]'s non-secret fields (label, short
 /// `account_uuid`, stash) — never a token or email (issue #15 redaction).
-fn render_roster(roster: &[Account]) -> String {
+///
+/// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
+/// can route this exact `list`-view surface through its scan.
+pub(crate) fn render_roster(roster: &[Account]) -> String {
     let mut out = String::new();
     for account in roster {
         out.push_str(&format!(
