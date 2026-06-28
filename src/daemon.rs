@@ -55,9 +55,11 @@
 //! [`crate::observability`]). The post-swap cooldown that bounds oscillation (#10)
 //! is wired into the decision below — a re-swap is refused until the per-cycle
 //! jittered cooldown has elapsed, and the swap-target session floor is opt-in (off
-//! by default). Sibling work this leaves as a seam: the all-exhausted terminal
-//! state ([`TickAction::NoViableTarget`], #11), whose `resets_at` will fill the
-//! event log's currently-`None` `all_exhausted resets_at=` field.
+//! by default). When EVERY account is weekly-exhausted there is no viable target
+//! ([`TickAction::NoViableTarget`], #11): the loop enters the all-exhausted
+//! terminal state — it HOLDS (no swap, so no thrash) and emits a single
+//! edge-triggered `all_exhausted` event naming the least-bad account (the soonest
+//! weekly `resets_at`), which now fills the event log's `resets_at=` field.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -432,9 +434,10 @@ pub(crate) enum TickAction {
     Held,
     /// Swapped the active credential from roster index `from` to `to`.
     Swapped { from: usize, to: usize },
-    /// Active is over the trigger but no other account is a viable target (none
-    /// available, or — when the opt-in session floor is enabled — all over it).
-    /// The terminal behavior is #11.
+    /// Active is over the trigger but no other account is a viable target: every
+    /// other account is weekly-exhausted (or, with the opt-in session floor
+    /// enabled, all over it). The all-exhausted terminal state (#11) — the loop
+    /// holds and emits one edge-triggered `all_exhausted` signal, never swapping.
     NoViableTarget,
     /// The active account could not be identified — poll-only, no swap.
     SkippedActiveUnknown,
@@ -500,6 +503,12 @@ struct DecisionState {
     /// log line and drives no behavior — the re-stash trigger remains the #13 seam.
     /// Sized to the roster in [`Daemon::new`].
     consec_401: Vec<u32>,
+    /// Edge-trigger guard for the all-exhausted signal (issue #11): set when an
+    /// `all_exhausted` event is emitted, and cleared by [`Daemon::tick`] on any
+    /// cycle that is NOT the no-viable-target state. So the signal fires exactly
+    /// ONCE per all-exhausted episode — not once per poll while every account
+    /// stays exhausted — and fires afresh if the state clears and is re-entered.
+    signaled_all_exhausted: bool,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -672,6 +681,13 @@ where
         }
 
         let action = self.decide_action(at, active, &readings, &mut events).await;
+        // Edge-trigger the all-exhausted signal (issue #11): clear the guard
+        // whenever this cycle is NOT the no-viable-target state, so a later
+        // re-entry signals afresh. `decide_action` sets the guard (and emits once)
+        // while in the state; this is the matching reset on the way out.
+        if !matches!(action, TickAction::NoViableTarget) {
+            self.state.signaled_all_exhausted = false;
+        }
         let snapshot = self.snapshot(at, active, &readings);
         TickOutcome {
             action,
@@ -761,17 +777,33 @@ where
                 return TickAction::SkippedCooldown;
             }
         }
-        // Pick the freshest viable target (most account-dimension headroom).
-        let Some(target_idx) = pick_target(active_idx, readings, self.session_floor) else {
-            // No other account is available (or, with the opt-in floor enabled, all
-            // are over it): nothing to swap to. The all-exhausted terminal behavior
-            // is #11; here we hold and log the state (issue #9). `resets_at` is #11's
-            // data — `Usage` drops the per-window reset timestamps today — so it is
-            // omitted for now (the formatter renders the line without it).
-            events.push(Event::AllExhausted {
-                hold: self.roster[active_idx].label.clone(),
-                resets_at: None,
-            });
+        // Pick the freshest viable target (most account-dimension headroom). A
+        // weekly-exhausted account is not viable (see `pick_target`), so when every
+        // other account is weekly-exhausted this returns `None`.
+        let Some(target_idx) =
+            pick_target(active_idx, readings, self.session_floor, weekly_trigger)
+        else {
+            // No viable target — every other account is weekly-exhausted (or, with
+            // the opt-in floor enabled, over it). The all-exhausted TERMINAL state
+            // (issue #11): HOLD, do NOT swap (swapping among exhausted accounts only
+            // thrashes), and emit ONE edge-triggered signal naming the least-bad
+            // account — the one whose weekly window resets soonest, so the operator
+            // knows when relief arrives. The active account is left exactly as is.
+            // The signal is edge-triggered: emit only on ENTERING the state, so the
+            // payload is computed once per episode, not every poll while it holds.
+            if !self.state.signaled_all_exhausted {
+                let (hold_idx, resets_at) = match soonest_weekly_reset(readings) {
+                    Some((idx, at)) => (idx, Some(at)),
+                    // No account reported a parseable weekly reset: fall back to the
+                    // active account, timestamp omitted (forward-compatible).
+                    None => (active_idx, None),
+                };
+                events.push(Event::AllExhausted {
+                    hold: self.roster[hold_idx].label.clone(),
+                    resets_at,
+                });
+                self.state.signaled_all_exhausted = true;
+            }
             return TickAction::NoViableTarget;
         };
         // Run the out-of-band swap. #6 is no-half-swap: an error leaves the
@@ -868,18 +900,29 @@ where
 }
 
 /// Pick the freshest viable swap target: among accounts other than `active` whose
-/// reading is available — and, when the opt-in `floor` is `Some`, whose session
-/// usage is below it (#10) — the one with the most account-dimension (weekly)
-/// headroom, i.e. the lowest weekly usage, breaking ties by lowest session usage,
-/// then roster order. With `floor == None` (the default) the session guard is off
-/// and any available other account qualifies. `None` when none qualifies (the
-/// all-exhausted case, #11).
-fn pick_target(active: usize, readings: &[Option<Usage>], floor: Option<f64>) -> Option<usize> {
+/// reading is available, that are NOT weekly-exhausted (weekly usage below
+/// `weekly_trigger`, issue #11) — and, when the opt-in `floor` is `Some`, whose
+/// session usage is below it (#10) — the one with the most account-dimension
+/// (weekly) headroom, i.e. the lowest weekly usage, breaking ties by lowest
+/// session usage, then roster order. `None` when none qualifies: with every other
+/// account weekly-exhausted that is the all-exhausted terminal state (#11).
+///
+/// The weekly-exhaustion exclusion is load-bearing: a target at/above its weekly
+/// trigger would re-trip [`swap::decide`] next cycle and thrash, so it can never
+/// be a useful destination — excluding it is exactly what turns "all accounts
+/// weekly-exhausted" into a no-viable-target verdict instead of a swap.
+fn pick_target(
+    active: usize,
+    readings: &[Option<Usage>],
+    floor: Option<f64>,
+    weekly_trigger: f64,
+) -> Option<usize> {
     readings
         .iter()
         .enumerate()
         .filter(|&(i, _)| i != active)
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
+        .filter(|&(_, usage)| usage.weekly < weekly_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         .min_by(|&(_, a), &(_, b)| {
             a.weekly
@@ -887,6 +930,23 @@ fn pick_target(active: usize, readings: &[Option<Usage>], floor: Option<f64>) ->
                 .then(a.session.total_cmp(&b.session))
         })
         .map(|(i, _)| i)
+}
+
+/// The roster index (and its epoch) of the account whose WEEKLY window resets
+/// soonest, among readings that reported a parseable reset (issue #11). The
+/// all-exhausted terminal state holds on this least-bad account. Accounts without
+/// a known reset are skipped; an exact tie keeps the earliest roster index. `None`
+/// when no account reported a reset, leaving the caller to fall back.
+fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
+    let mut soonest: Option<(usize, i64)> = None;
+    for (i, reading) in readings.iter().enumerate() {
+        if let Some(at) = reading.as_ref().and_then(|usage| usage.weekly_resets_at) {
+            if soonest.is_none_or(|(_, best)| at < best) {
+                soonest = Some((i, at));
+            }
+        }
+    }
+    soonest
 }
 
 /// The console line for a swap this cycle, or `None` for any non-swap outcome.
@@ -1051,8 +1111,34 @@ mod tests {
             }
         }
         fn ok(mut self, uuid: &str, session: f64, weekly: f64) -> Self {
-            self.readings
-                .insert(uuid.to_owned(), Scripted::Ok(Usage { session, weekly }));
+            self.readings.insert(
+                uuid.to_owned(),
+                Scripted::Ok(Usage {
+                    session,
+                    weekly,
+                    weekly_resets_at: None,
+                }),
+            );
+            self
+        }
+        /// Like [`ok`](Self::ok) but with a known weekly `resets_at` (epoch
+        /// seconds) — the all-exhausted tests (#11) script which account resets
+        /// soonest through this.
+        fn ok_resets(
+            mut self,
+            uuid: &str,
+            session: f64,
+            weekly: f64,
+            weekly_resets_at: i64,
+        ) -> Self {
+            self.readings.insert(
+                uuid.to_owned(),
+                Scripted::Ok(Usage {
+                    session,
+                    weekly,
+                    weekly_resets_at: Some(weekly_resets_at),
+                }),
+            );
             self
         }
         fn failing(mut self, uuid: &str) -> Self {
@@ -1225,27 +1311,36 @@ mod tests {
 
     // --- pick_target (pure) ------------------------------------------------
 
+    // A weekly trigger well above every reading in the pre-#11 pick_target tests,
+    // so the new weekly-exhaustion exclusion is a no-op for them (they pin the
+    // floor / headroom behavior); the #11 tests below use readings at/above it.
+    const WK: f64 = 0.98;
+
     #[test]
     fn pick_target_chooses_the_lowest_weekly_among_session_viable_accounts() {
         let readings = vec![
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.50,
                 weekly: 0.60,
+                weekly_resets_at: None,
             }), // viable, weekly 0.60
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20,
+                weekly_resets_at: None,
             }), // viable, weekly 0.20 -> winner
             Some(Usage {
                 session: 0.85,
                 weekly: 0.01,
+                weekly_resets_at: None,
             }), // session over floor -> not viable
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
     }
 
     #[test]
@@ -1254,14 +1349,16 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }),
             None, // unavailable
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
+                weekly_resets_at: None,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
     }
 
     #[test]
@@ -1270,17 +1367,20 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }),
             Some(Usage {
                 session: 0.90,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }),
             Some(Usage {
                 session: 0.81,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }),
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80)), None);
+        assert_eq!(pick_target(0, &readings, Some(0.80), WK), None);
     }
 
     #[test]
@@ -1289,17 +1389,20 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }),
             Some(Usage {
                 session: 0.40,
                 weekly: 0.20,
+                weekly_resets_at: None,
             }), // tie weekly, session 0.40
             Some(Usage {
                 session: 0.20,
                 weekly: 0.20,
+                weekly_resets_at: None,
             }), // tie weekly, session 0.20 -> winner
         ];
-        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
     }
 
     #[test]
@@ -1311,20 +1414,131 @@ mod tests {
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.95, // high session — an enabled floor would exclude this…
                 weekly: 0.10,
+                weekly_resets_at: None,
             }), // …but with no floor it is the lowest-weekly viable target
             Some(Usage {
                 session: 0.05,
                 weekly: 0.60,
+                weekly_resets_at: None,
             }), // low session but more weekly used
         ];
         // No floor → index 1 wins on weekly headroom despite its high session…
-        assert_eq!(pick_target(0, &readings, None), Some(1));
+        assert_eq!(pick_target(0, &readings, None, WK), Some(1));
         // …whereas an enabled 80% floor excludes index 1 and falls to index 2.
-        assert_eq!(pick_target(0, &readings, Some(0.80)), Some(2));
+        assert_eq!(pick_target(0, &readings, Some(0.80), WK), Some(2));
+    }
+
+    #[test]
+    fn pick_target_excludes_weekly_exhausted_accounts() {
+        // #11: an account at/above the weekly trigger is not a viable target, even
+        // with the session floor OFF and ample session headroom — swapping there
+        // would only re-trigger and thrash.
+        let readings = vec![
+            Some(Usage {
+                session: 0.50,
+                weekly: 0.99,
+                weekly_resets_at: None,
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.99, // weekly-exhausted -> not viable despite low session
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.20, // the only non-exhausted other account
+                weekly_resets_at: None,
+            }),
+        ];
+        assert_eq!(pick_target(0, &readings, None, WK), Some(2));
+    }
+
+    #[test]
+    fn pick_target_is_none_when_every_other_account_is_weekly_exhausted() {
+        // #11 core: with the floor off, the ONLY thing that makes all others
+        // non-viable is weekly exhaustion — at/above the trigger (inclusive).
+        let readings = vec![
+            Some(Usage {
+                session: 0.50,
+                weekly: 0.99,
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.98, // exactly at the trigger -> exhausted (>=)
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 1.00,
+                weekly_resets_at: None,
+            }),
+        ];
+        assert_eq!(pick_target(0, &readings, None, WK), None);
+    }
+
+    // --- soonest_weekly_reset (pure, #11) ---------------------------------
+
+    #[test]
+    fn soonest_weekly_reset_picks_the_earliest_known_timestamp() {
+        let readings = vec![
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: Some(300),
+            }),
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: Some(100), // soonest
+            }),
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: Some(200),
+            }),
+            None,
+        ];
+        assert_eq!(soonest_weekly_reset(&readings), Some((1, 100)));
+    }
+
+    #[test]
+    fn soonest_weekly_reset_ignores_unknowns_and_breaks_ties_to_first() {
+        // Accounts without a known reset are skipped; an exact tie keeps the
+        // earliest roster index.
+        let tie = vec![
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: Some(500), // first of the tie -> winner
+            }),
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: Some(500),
+            }),
+        ];
+        assert_eq!(soonest_weekly_reset(&tie), Some((1, 500)));
+        // All-unknown → None (the caller falls back to the active account).
+        let none = vec![
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.0,
+                weekly_resets_at: None,
+            }),
+            None,
+        ];
+        assert_eq!(soonest_weekly_reset(&none), None);
     }
 
     // --- tick: decision + swap --------------------------------------------
@@ -1636,8 +1850,10 @@ mod tests {
         let outcome = daemon.tick().await;
 
         assert_eq!(outcome.action, TickAction::NoViableTarget);
-        // The no-viable-target path emits exactly one all_exhausted event holding
-        // the active handle; `resets_at` stays None until #11 supplies window data.
+        // The floor-driven no-viable-target path emits one all_exhausted event.
+        // No reading carried a weekly reset here, so #11 falls back to the active
+        // handle with `resets_at` omitted (the soonest-reset path is covered by the
+        // all-weekly-exhausted test below).
         assert_eq!(
             outcome.events,
             vec![Event::AllExhausted {
@@ -1651,6 +1867,122 @@ mod tests {
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn tick_holds_on_soonest_reset_when_all_accounts_are_weekly_exhausted() {
+        // #11 acceptance: every account is weekly-exhausted, so there is no viable
+        // swap target. The daemon must HOLD on the least-bad account — the one
+        // whose weekly window resets soonest — emit exactly ONE signal, and perform
+        // ZERO swaps no matter how many ticks run.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+            account("u-C", "Sessiometer/u-C", "third"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // All three weekly-exhausted (weekly 0.99 ≥ weekly_trigger 0.98). B resets
+        // soonest, so it is the least-bad hold target even though A is active.
+        const A_RESET: i64 = 1_782_777_600; // 2026-06-30T00:00:00Z
+        const B_RESET: i64 = 1_782_496_800; // 2026-06-26T18:00:00Z (soonest)
+        const C_RESET: i64 = 1_782_864_000; // 2026-07-01T00:00:00Z
+        let poller = FakeRosterPoller::new()
+            .ok_resets("u-A", 0.50, 0.99, A_RESET)
+            .ok_resets("u-B", 0.50, 0.99, B_RESET)
+            .ok_resets("u-C", 0.50, 0.99, C_RESET);
+        // Floor OFF (the #10 default); weekly_trigger 98 via the tunables helper, so
+        // the swap-away fires on the weekly dimension and every target is excluded.
+        let tun = tunables_floor_off(95, 0);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // First tick: detect all-exhausted, hold on B (soonest reset), emit once.
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::NoViableTarget);
+        assert_eq!(
+            first.events,
+            vec![Event::AllExhausted {
+                hold: "spare".to_owned(),
+                resets_at: Some(B_RESET),
+            }],
+        );
+
+        // Two more ticks in the same episode: still no viable target, but the
+        // signal is edge-triggered, so NOTHING further is emitted.
+        for _ in 0..2 {
+            let again = daemon.tick().await;
+            assert_eq!(again.action, TickAction::NoViableTarget);
+            assert!(
+                again.events.is_empty(),
+                "all_exhausted must be edge-triggered, got {:?}",
+                again.events
+            );
+        }
+
+        // ZERO swaps across the whole episode: canonical still A, active unchanged.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[tokio::test]
+    async fn leaving_the_all_exhausted_state_clears_the_edge_guard() {
+        // #11 edge re-fire: once the daemon leaves the all-exhausted state the
+        // guard clears, so a later re-entry signals afresh. Here a Hold (active
+        // below both triggers) is the non-exhausted cycle that resets it.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables_floor_off(95, 0);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        // Pretend a prior all-exhausted episode already signaled.
+        daemon.state.signaled_all_exhausted = true;
+
+        let outcome = daemon.tick().await;
+        assert_eq!(outcome.action, TickAction::Held);
+        assert!(
+            !daemon.state.signaled_all_exhausted,
+            "leaving the all-exhausted state must clear the edge guard",
+        );
     }
 
     #[tokio::test]
@@ -2124,6 +2456,7 @@ mod tests {
                     usage: Some(Usage {
                         session: 0.97,
                         weekly: 0.40,
+                        weekly_resets_at: None,
                     }),
                 },
                 AccountReading {
@@ -2160,6 +2493,7 @@ mod tests {
                 usage: Some(Usage {
                     session: 0.50,
                     weekly: 0.25,
+                    weekly_resets_at: None,
                 }),
             }],
             last_swap: None,
@@ -2488,6 +2822,7 @@ mod tests {
             &Ok(Usage {
                 session: 0.10,
                 weekly: 0.10,
+                weekly_resets_at: None,
             }),
             &mut events,
         );

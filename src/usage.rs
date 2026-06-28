@@ -88,35 +88,51 @@ pub(crate) struct Usage {
     pub(crate) session: f64,
     /// Fraction in `[0.0, 1.0]` of the weekly window consumed.
     pub(crate) weekly: f64,
+    /// Epoch seconds at which the WEEKLY window resets, when the API reported a
+    /// parseable timestamp; `None` otherwise. The all-exhausted terminal logic
+    /// (issue #11) consumes it: when every account is weekly-exhausted the daemon
+    /// holds on the account whose weekly window resets soonest. Only the weekly
+    /// dimension is projected here — the weekly window is the hard limit whose
+    /// reset actually ends the all-exhausted state.
+    pub(crate) weekly_resets_at: Option<i64>,
 }
 
 /// The full parse of a usage response: both dimensions plus each window's reset
-/// timestamp. [`Usage`] is the swap-decision projection of this; the reset
-/// timestamps are extracted here (issue #5 acceptance: "returns session%,
-/// account%, resets_at") and consumed by the cooldown / all-exhausted terminal
-/// logic (#10 / #11), which widen the seam when they need them — the #9 event log
-/// already carries an `all_exhausted resets_at=` field awaiting that value.
+/// timestamp, kept VERBATIM as the API rendered them (ISO string or epoch). The
+/// reset timestamps are extracted here (issue #5 acceptance: "returns session%,
+/// account%, resets_at"); [`to_usage`](UsageReport::to_usage) is the swap-decision
+/// projection, normalizing the weekly reset to epoch seconds for the all-exhausted
+/// terminal logic (#11). Keeping the raw form here means this extraction stays a
+/// faithful mirror of the response; normalization is a separate, tested concern.
 #[derive(Debug, Clone, PartialEq)]
 struct UsageReport {
     session: f64,
     weekly: f64,
     /// Raw `resets_at` of the session window, as the API rendered it (ISO string
-    /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Surfaced to
-    /// the cooldown / terminal logic (#10 / #11), not the swap decision, hence
-    /// unread here yet.
+    /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Extracted
+    /// for completeness; no consumer needs the session reset yet (the terminal
+    /// logic keys off the weekly window), so it stays unread.
     #[allow(dead_code)]
     session_resets_at: Option<String>,
-    /// Raw `resets_at` of the weekly window (see `session_resets_at`).
-    #[allow(dead_code)]
+    /// Raw `resets_at` of the weekly window (see `session_resets_at`). Projected
+    /// to epoch seconds by [`to_usage`](UsageReport::to_usage) for the
+    /// all-exhausted terminal logic (#11).
     weekly_resets_at: Option<String>,
 }
 
 impl UsageReport {
-    /// The swap-decision projection: the two dimensions the loop acts on.
+    /// The swap-decision projection: the two usage dimensions the loop acts on,
+    /// plus the weekly reset normalized to epoch seconds (issue #11) so the
+    /// all-exhausted logic can compare reset times across accounts. A weekly
+    /// reset the API did not supply — or that does not parse — projects to `None`.
     fn to_usage(&self) -> Usage {
         Usage {
             session: self.session,
             weekly: self.weekly,
+            weekly_resets_at: self
+                .weekly_resets_at
+                .as_deref()
+                .and_then(epoch_from_resets_at),
         }
     }
 }
@@ -490,6 +506,90 @@ fn resets_at_of(obj: &Value) -> Option<String> {
     }
 }
 
+/// Normalize a raw `resets_at` (as [`resets_at_of`] captured it) to epoch seconds,
+/// so the all-exhausted logic (#11) can order reset times across accounts.
+/// Tolerant of the two shapes the API uses: a whole-second epoch rendered as
+/// digits, or an RFC 3339 instant (`2026-06-30T00:00:00Z`). `None` for anything
+/// it cannot parse — a missing reset time is never fatal; the terminal signal just
+/// omits it.
+fn epoch_from_resets_at(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if let Ok(epoch) = raw.parse::<i64>() {
+        return Some(epoch);
+    }
+    epoch_from_rfc3339(raw)
+}
+
+/// Parse an RFC 3339 / ISO 8601 instant to epoch seconds, second-granular.
+/// Tolerant: accepts a `Z`/`z` suffix, an explicit `±HH:MM` offset, or none
+/// (treated as UTC); a fractional-seconds part is dropped. `None` on any deviation
+/// from the expected `YYYY-MM-DDTHH:MM:SS` shape, so a surprising format degrades
+/// to "reset time unknown" rather than a wrong instant.
+fn epoch_from_rfc3339(s: &str) -> Option<i64> {
+    let (date, rest) = s.split_once('T').or_else(|| s.split_once(' '))?;
+
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let (time, offset_secs) = split_offset(rest)?;
+    let time = time.split('.').next().unwrap_or(time);
+    let mut time_parts = time.split(':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next().unwrap_or("0").parse().ok()?;
+    if time_parts.next().is_some()
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - offset_secs)
+}
+
+/// Split a time-of-day from its timezone suffix, returning the bare time and the
+/// offset in seconds EAST of UTC (so `epoch = local - offset`). `Z`/`z` or no
+/// suffix is UTC (offset 0); an explicit `±HH:MM` / `±HHMM` / `±HH` is parsed.
+fn split_offset(rest: &str) -> Option<(&str, i64)> {
+    if let Some(time) = rest.strip_suffix(['Z', 'z']) {
+        return Some((time, 0));
+    }
+    let Some(pos) = rest.rfind(['+', '-']) else {
+        return Some((rest, 0)); // no offset → UTC
+    };
+    let (time, tz) = rest.split_at(pos);
+    let sign = if tz.starts_with('-') { -1 } else { 1 };
+    let tz = &tz[1..];
+    let (hours, minutes) = match tz.split_once(':') {
+        Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
+        None if tz.len() == 4 => (tz[..2].parse().ok()?, tz[2..].parse().ok()?),
+        None => (tz.parse::<i64>().ok()?, 0),
+    };
+    Some((time, sign * (hours * 3_600 + minutes * 60)))
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian civil date — Howard Hinnant's
+/// `days_from_civil`, the inverse of the `civil_from_days` the event log uses to
+/// render the reset back. Correct across leap years and the 100/400 century rules
+/// for the post-epoch dates the usage API returns.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = (if year >= 0 { year } else { year - 399 }) / 400;
+    let yoe = year - era * 400; // [0, 399]
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + (day - 1); // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +719,84 @@ mod tests {
     #[test]
     fn non_json_body_is_a_parse_error() {
         assert!(matches!(parse_usage("not json"), Err(Error::UsageParse(_))));
+    }
+
+    // --- resets_at normalization to epoch (issue #11) ---
+
+    #[test]
+    fn epoch_from_resets_at_parses_a_digit_epoch_string() {
+        // The numeric API shape arrives stringified (see `resets_at_of`).
+        assert_eq!(epoch_from_resets_at("1750960800"), Some(1_750_960_800));
+        assert_eq!(epoch_from_resets_at("  1750960800  "), Some(1_750_960_800));
+    }
+
+    #[test]
+    fn epoch_from_resets_at_parses_an_rfc3339_instant() {
+        // Cross-checked against the event log's `rfc3339` renderer, which maps
+        // 1_750_960_800 -> 2025-06-26T18:00:00Z (see the observability tests), so
+        // the two halves of the round-trip agree.
+        assert_eq!(
+            epoch_from_resets_at("2025-06-26T18:00:00Z"),
+            Some(1_750_960_800)
+        );
+        // A lower-case `z` and a fractional-seconds part are both tolerated; the
+        // fraction is dropped (the log is second-granular).
+        assert_eq!(
+            epoch_from_resets_at("2025-06-26T18:00:00.512z"),
+            Some(1_750_960_800)
+        );
+    }
+
+    #[test]
+    fn epoch_from_rfc3339_applies_a_timezone_offset() {
+        // 20:00:00+02:00 and 13:00:00-05:00 are both the 18:00:00Z instant.
+        assert_eq!(
+            epoch_from_rfc3339("2025-06-26T20:00:00+02:00"),
+            Some(1_750_960_800)
+        );
+        assert_eq!(
+            epoch_from_rfc3339("2025-06-26T13:00:00-05:00"),
+            Some(1_750_960_800)
+        );
+    }
+
+    #[test]
+    fn epoch_from_rfc3339_handles_a_leap_day() {
+        // 2024-02-29 exists (a leap year): pins the leap-day arithmetic.
+        assert_eq!(
+            epoch_from_rfc3339("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800)
+        );
+    }
+
+    #[test]
+    fn epoch_from_resets_at_rejects_unparseable_input() {
+        for bad in [
+            "",
+            "not-a-date",
+            "2025-13-01T00:00:00Z", // month out of range
+            "2025-06-26",           // date only, no time
+            "2025-06-26T25:00:00Z", // hour out of range
+        ] {
+            assert_eq!(epoch_from_resets_at(bad), None, "{bad} should not parse");
+        }
+    }
+
+    #[test]
+    fn to_usage_normalizes_the_weekly_reset_to_epoch() {
+        let report = UsageReport {
+            session: 0.1,
+            weekly: 0.2,
+            session_resets_at: Some("2025-01-01T00:00:00Z".to_owned()),
+            weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
+        };
+        assert_eq!(report.to_usage().weekly_resets_at, Some(1_750_960_800));
+        // An absent weekly reset projects to None (no fabricated value).
+        let no_reset = UsageReport {
+            weekly_resets_at: None,
+            ..report.clone()
+        };
+        assert_eq!(no_reset.to_usage().weekly_resets_at, None);
     }
 
     // --- access_token_from_blob (pure) ---
