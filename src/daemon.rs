@@ -50,12 +50,14 @@
 //!   no-half-swap): complete-or-abort, never a torn swap.
 //!
 //! The minimal `last_swap` shown by `status` (the handle swapped to + a relative
-//! age) is surfaced here (#8). The post-swap cooldown that bounds oscillation
-//! (#10) is wired into the decision below — a re-swap is refused until the
-//! per-cycle jittered cooldown has elapsed, and the swap-target session floor is
-//! opt-in (off by default). Sibling work this leaves as seams: the all-exhausted
-//! terminal state ([`TickAction::NoViableTarget`], #11) and the structured
-//! swap-history event-log (#9).
+//! age) is surfaced here (#8), and every swap / all-exhausted / token-rejection /
+//! lock-wait is recorded to the structured event log (#9, via
+//! [`crate::observability`]). The post-swap cooldown that bounds oscillation (#10)
+//! is wired into the decision below — a re-swap is refused until the per-cycle
+//! jittered cooldown has elapsed, and the swap-target session floor is opt-in (off
+//! by default). Sibling work this leaves as a seam: the all-exhausted terminal
+//! state ([`TickAction::NoViableTarget`], #11), whose `resets_at` will fill the
+//! event log's currently-`None` `all_exhausted resets_at=` field.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -69,7 +71,7 @@ use crate::claude_state;
 use crate::config::{Account, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
-use crate::observability::EventLog;
+use crate::observability::{Event, EventLog, SwapReason};
 use crate::stash::{AccountStash, RealAccountStash};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{SplitMix64, Strategy};
@@ -450,13 +452,14 @@ pub(crate) enum TickAction {
 /// The result of one poll iteration.
 #[derive(Debug)]
 pub(crate) struct TickOutcome {
-    /// 1-based sequence number of this poll.
-    pub(crate) tick: u64,
-    /// When the reading was taken.
-    pub(crate) at: Instant,
     /// What the loop decided to do.
     pub(crate) action: TickAction,
-    /// The per-account readings this cycle (for the event log and the socket).
+    /// The structured log events this cycle generated (issue #9): the
+    /// poll-outcome events (401 / keychain-locked / 403) in roster order, then the
+    /// decision event (swap / all-exhausted) if any. `run_loop` emits each to the
+    /// event log; a Hold or a skip generates none.
+    pub(crate) events: Vec<Event>,
+    /// The per-account readings this cycle, for the control socket (`status`).
     pub(crate) snapshot: StatusSnapshot,
 }
 
@@ -487,6 +490,16 @@ struct DecisionState {
     /// near-exhausted accounts cannot ping-pong — and the minimal `last_swap`
     /// shown by `status` (#8).
     last_swap: Option<LastSwap>,
+    /// Per-account consecutive-401 count, indexed by roster position — the
+    /// `consecutive=` field of a `monitor_401` log event (issue #9). Incremented
+    /// when an account's poll returns 401, reset on ANY other outcome (success or a
+    /// non-401 error), mirroring [`crate::usage::Monitor401`]'s streak semantics.
+    ///
+    /// Daemon-level because that per-poll monitor is recreated each poll (so it
+    /// cannot observe a streak *across* ticks). OBSERVABILITY ONLY: it feeds the
+    /// log line and drives no behavior — the re-stash trigger remains the #13 seam.
+    /// Sized to the roster in [`Daemon::new`].
+    consec_401: Vec<u32>,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -540,6 +553,8 @@ where
         claude_json: PathBuf,
         tunables: &Tunables,
     ) -> Self {
+        // The per-account 401 streak counters (issue #9), one per roster slot.
+        let consec_401 = vec![0; roster.len()];
         Self {
             roster,
             poller,
@@ -553,7 +568,10 @@ where
             cooldown_strategy: tunables.cooldown_strategy,
             poll_strategy: tunables.poll_strategy,
             rng: SplitMix64::from_entropy(),
-            state: DecisionState::default(),
+            state: DecisionState {
+                consec_401,
+                ..DecisionState::default()
+            },
         }
     }
 
@@ -630,7 +648,6 @@ where
     /// account, then decide and (if warranted) swap.
     pub(crate) async fn tick(&mut self) -> TickOutcome {
         self.state.ticks += 1;
-        let tick = self.state.ticks;
         let at = self.clock.now();
 
         // Resolve the active account once; cached and updated on each swap.
@@ -643,24 +660,55 @@ where
         // token is the freshest), every other via its stash. A failed poll
         // (transient / 401 / unreadable) leaves that account's reading absent — it
         // is simply not a candidate this cycle, and the loop never swaps on
-        // missing data.
+        // missing data. The poll OUTCOME also feeds the event log (issue #9): a 401
+        // / keychain-lock / 403 each emits one line, in roster order, and the
+        // per-account 401 streak is maintained here.
+        let mut events: Vec<Event> = Vec::new();
         let mut readings: Vec<Option<Usage>> = Vec::with_capacity(self.roster.len());
         for i in 0..self.roster.len() {
-            let reading = self
-                .poller
-                .poll(&self.roster[i], active == Some(i))
-                .await
-                .ok();
-            readings.push(reading);
+            let result = self.poller.poll(&self.roster[i], active == Some(i)).await;
+            self.note_poll_outcome(i, &result, &mut events);
+            readings.push(result.ok());
         }
 
-        let action = self.decide_action(at, active, &readings).await;
+        let action = self.decide_action(at, active, &readings, &mut events).await;
         let snapshot = self.snapshot(at, active, &readings);
         TickOutcome {
-            tick,
-            at,
             action,
+            events,
             snapshot,
+        }
+    }
+
+    /// Update the per-account 401 streak and push any poll-outcome event (issue
+    /// #9) for account `i`'s poll `result`. A 401 increments the streak and emits
+    /// `monitor_401`; a locked keychain emits `keychain_locked_wait`; a 403 emits
+    /// `usage_scope_fail`. Every NON-401 outcome (a success, or any other error)
+    /// resets the streak. A success — or a transient / rate-limited / rejected
+    /// error — emits no event (only the four named conditions are observable here).
+    fn note_poll_outcome(&mut self, i: usize, result: &Result<Usage>, events: &mut Vec<Event>) {
+        match result {
+            Err(Error::UsageUnauthorized) => {
+                let consecutive = self.state.consec_401[i].saturating_add(1);
+                self.state.consec_401[i] = consecutive;
+                events.push(Event::Monitor401 {
+                    account: self.roster[i].label.clone(),
+                    consecutive,
+                });
+            }
+            Err(Error::KeychainLocked { .. }) => {
+                self.state.consec_401[i] = 0;
+                events.push(Event::KeychainLockedWait {
+                    account: self.roster[i].label.clone(),
+                });
+            }
+            Err(Error::UsageScopeMissing) => {
+                self.state.consec_401[i] = 0;
+                events.push(Event::UsageScopeFail {
+                    account: self.roster[i].label.clone(),
+                });
+            }
+            _ => self.state.consec_401[i] = 0,
         }
     }
 
@@ -671,6 +719,7 @@ where
         at: Instant,
         active: Option<usize>,
         readings: &[Option<Usage>],
+        events: &mut Vec<Event>,
     ) -> TickAction {
         // No identifiable active account → poll-only (never swap on an unknown
         // active account: it is missing data about WHO to swap away from).
@@ -716,7 +765,13 @@ where
         let Some(target_idx) = pick_target(active_idx, readings, self.session_floor) else {
             // No other account is available (or, with the opt-in floor enabled, all
             // are over it): nothing to swap to. The all-exhausted terminal behavior
-            // is #11; here we hold.
+            // is #11; here we hold and log the state (issue #9). `resets_at` is #11's
+            // data — `Usage` drops the per-window reset timestamps today — so it is
+            // omitted for now (the formatter renders the line without it).
+            events.push(Event::AllExhausted {
+                hold: self.roster[active_idx].label.clone(),
+                resets_at: None,
+            });
             return TickAction::NoViableTarget;
         };
         // Run the out-of-band swap. #6 is no-half-swap: an error leaves the
@@ -739,6 +794,22 @@ where
                 self.state.last_swap = Some(LastSwap {
                     to: self.roster[target_idx].label.clone(),
                     at,
+                });
+                // Log the swap (issue #9). `swap::decide` returns only a binary
+                // verdict, so the reason is re-derived here from the active reading:
+                // session-first when BOTH dimensions are over their (this-cycle)
+                // triggers. `session_pct` reuses `to_pct` so the log agrees with the
+                // percentage `status` shows for the same reading.
+                let reason = if active_usage.session >= session_trigger {
+                    SwapReason::Session
+                } else {
+                    SwapReason::Weekly
+                };
+                events.push(Event::Swap {
+                    from: self.roster[active_idx].label.clone(),
+                    to: self.roster[target_idx].label.clone(),
+                    reason,
+                    session_pct: to_pct(active_usage.session),
                 });
                 TickAction::Swapped {
                     from: active_idx,
@@ -872,9 +943,13 @@ where
 
     loop {
         let outcome = daemon.tick().await;
-        // Best-effort logging: a log write failure must not kill the daemon.
-        if let Err(err) = log.record(&outcome) {
-            eprintln!("sessiometer: event log write failed: {err}");
+        // Best-effort logging (issue #9): emit each event the tick produced. A
+        // write failure must not kill the daemon, and one failed event must not
+        // drop the rest of the tick's events — so log and continue, never return.
+        for event in &outcome.events {
+            if let Err(err) = log.emit(event) {
+                eprintln!("sessiometer: event log write failed: {err}");
+            }
         }
         // Echo a swap to the operator watching the foreground process (issue #8).
         // The file event log (above) records every cycle; the console gets just
@@ -950,10 +1025,23 @@ mod tests {
         }
     }
 
-    /// Scripts per-account usage keyed by `account_uuid`. An unscripted account, or
-    /// one explicitly marked failing, returns a transient error (unavailable).
+    /// A scripted per-account poll outcome. `Ok` yields a reading; each error
+    /// variant drives one of [`Daemon::note_poll_outcome`]'s issue-#9 arms, so the
+    /// 401 / keychain-lock / 403 event paths and the 401 streak become testable.
+    #[derive(Clone, Copy)]
+    enum Scripted {
+        Ok(Usage),
+        Transient,
+        Unauthorized,
+        Locked,
+        ScopeMissing,
+    }
+
+    /// Scripts each account's poll outcome keyed by `account_uuid`: `ok` yields a
+    /// reading, the error builders inject the issue-#9 conditions, and an
+    /// unscripted account returns a transient error (unavailable).
     struct FakeRosterPoller {
-        readings: HashMap<String, Option<Usage>>,
+        readings: HashMap<String, Scripted>,
     }
 
     impl FakeRosterPoller {
@@ -964,11 +1052,25 @@ mod tests {
         }
         fn ok(mut self, uuid: &str, session: f64, weekly: f64) -> Self {
             self.readings
-                .insert(uuid.to_owned(), Some(Usage { session, weekly }));
+                .insert(uuid.to_owned(), Scripted::Ok(Usage { session, weekly }));
             self
         }
         fn failing(mut self, uuid: &str) -> Self {
-            self.readings.insert(uuid.to_owned(), None);
+            self.readings.insert(uuid.to_owned(), Scripted::Transient);
+            self
+        }
+        fn unauthorized(mut self, uuid: &str) -> Self {
+            self.readings
+                .insert(uuid.to_owned(), Scripted::Unauthorized);
+            self
+        }
+        fn keychain_locked(mut self, uuid: &str) -> Self {
+            self.readings.insert(uuid.to_owned(), Scripted::Locked);
+            self
+        }
+        fn scope_missing(mut self, uuid: &str) -> Self {
+            self.readings
+                .insert(uuid.to_owned(), Scripted::ScopeMissing);
             self
         }
     }
@@ -976,7 +1078,11 @@ mod tests {
     impl RosterPoller for FakeRosterPoller {
         async fn poll(&self, account: &Account, _active: bool) -> Result<Usage> {
             match self.readings.get(&account.account_uuid) {
-                Some(Some(usage)) => Ok(*usage),
+                Some(Scripted::Ok(usage)) => Ok(*usage),
+                Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
+                Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
+                Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
+                // Explicit `Transient` and any unscripted account both land here.
                 _ => Err(Error::UsageTransient { status: 0 }),
             }
         }
@@ -1530,6 +1636,15 @@ mod tests {
         let outcome = daemon.tick().await;
 
         assert_eq!(outcome.action, TickAction::NoViableTarget);
+        // The no-viable-target path emits exactly one all_exhausted event holding
+        // the active handle; `resets_at` stays None until #11 supplies window data.
+        assert_eq!(
+            outcome.events,
+            vec![Event::AllExhausted {
+                hold: "work".to_owned(),
+                resets_at: None,
+            }],
+        );
         assert!(daemon
             .store
             .read()
@@ -2122,9 +2237,8 @@ mod tests {
             last_swap: None,
         };
         let outcome = |action| TickOutcome {
-            tick: 1,
-            at: Instant::now(),
             action,
+            events: Vec::new(),
             snapshot: snapshot.clone(),
         };
         assert_eq!(
@@ -2239,7 +2353,8 @@ mod tests {
         );
 
         let logdir = tempfile::tempdir().unwrap();
-        let mut log = EventLog::at(&logdir.path().join("events.log")).unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
         let mut shutdown = FakeShutdown::after(3);
         let control = NoControl;
 
@@ -2282,7 +2397,8 @@ mod tests {
         );
 
         let logdir = tempfile::tempdir().unwrap();
-        let mut log = EventLog::at(&logdir.path().join("events.log")).unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
         let mut shutdown = FakeShutdown::after(1); // stop right after the first tick
         let control = NoControl;
 
@@ -2300,5 +2416,264 @@ mod tests {
             .matches(&cred(b"B-token")));
         assert_eq!(displayed_uuid(&json).as_deref(), Some("u-B"));
         assert_eq!(daemon.state.active, Some(1));
+
+        // End-to-end (issue #9): the swap wrote exactly one structured event line —
+        // handles only (work → spare), never a token or email — to the event log.
+        // The session reading (0.97) is at/over the 95 % trigger, so the line is
+        // tagged `reason=session` with the outgoing account's `session_pct`.
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(logged.lines().count(), 1, "one event line: {logged:?}");
+        assert!(
+            logged.contains("event=swap from=work to=spare reason=session session_pct=97"),
+            "got: {logged:?}"
+        );
+        assert!(logged.starts_with("ts="), "stamped: {logged:?}");
+        assert!(!logged.contains('@'), "no email: {logged:?}");
+    }
+
+    #[tokio::test]
+    async fn note_poll_outcome_walks_the_401_streak_and_emits_one_event_per_named_condition() {
+        // The daemon-side poll-outcome → event mapping and the per-account 401
+        // streak (issue #9) are exercised directly: `note_poll_outcome` turns each
+        // poll `Result` into at most one event and maintains the streak. Driving it
+        // by hand (rather than through the loop) lets us assert the reset, which a
+        // static poller cannot script on a single account across ticks.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let mut events = Vec::new();
+
+        // A 401 on account 0 starts its streak at 1; a second consecutive 401
+        // climbs to 2 — one `monitor_401` per occurrence, account 1 untouched.
+        daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
+        daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
+        assert_eq!(daemon.state.consec_401, vec![2, 0]);
+        assert_eq!(
+            events,
+            vec![
+                Event::Monitor401 {
+                    account: "work".to_owned(),
+                    consecutive: 1,
+                },
+                Event::Monitor401 {
+                    account: "work".to_owned(),
+                    consecutive: 2,
+                },
+            ]
+        );
+
+        // A success resets account 0's streak and emits nothing.
+        events.clear();
+        daemon.note_poll_outcome(
+            0,
+            &Ok(Usage {
+                session: 0.10,
+                weekly: 0.10,
+            }),
+            &mut events,
+        );
+        assert_eq!(daemon.state.consec_401, vec![0, 0]);
+        assert!(events.is_empty());
+
+        // After the reset the next 401 restarts the streak at 1 (not 3).
+        daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
+        assert_eq!(daemon.state.consec_401, vec![1, 0]);
+        assert_eq!(
+            events,
+            vec![Event::Monitor401 {
+                account: "work".to_owned(),
+                consecutive: 1,
+            }]
+        );
+
+        // A locked keychain on account 1 emits `keychain_locked_wait`; being a
+        // non-401 outcome it holds account 1 at 0 and leaves account 0's streak.
+        events.clear();
+        daemon.note_poll_outcome(1, &Err(Error::KeychainLocked { op: "read" }), &mut events);
+        assert_eq!(daemon.state.consec_401, vec![1, 0]);
+        assert_eq!(
+            events,
+            vec![Event::KeychainLockedWait {
+                account: "spare".to_owned(),
+            }]
+        );
+
+        // A 403 (missing usage scope) on account 0 emits `usage_scope_fail` and
+        // resets its streak — every non-401 outcome clears the streak.
+        events.clear();
+        daemon.note_poll_outcome(0, &Err(Error::UsageScopeMissing), &mut events);
+        assert_eq!(daemon.state.consec_401, vec![0, 0]);
+        assert_eq!(
+            events,
+            vec![Event::UsageScopeFail {
+                account: "work".to_owned(),
+            }]
+        );
+
+        // A transient error is silent and also resets (no event, streak cleared).
+        events.clear();
+        daemon.note_poll_outcome(0, &Err(Error::UsageTransient { status: 0 }), &mut events);
+        assert_eq!(daemon.state.consec_401, vec![0, 0]);
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_loop_logs_one_line_per_poll_rejection_each_tick() {
+        // Issue #9 acceptance: each token-rejection (401), keychain-lock, and 403
+        // (missing usage scope) emits EXACTLY one structured line per occurrence. A
+        // roster where every account fails a different way, run for two ticks, must
+        // write two lines per account — and the 401 streak must climb 1 → 2 in the
+        // log, proving `note_poll_outcome` is wired into the loop and serialized.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+            account("u-C", "Sessiometer/u-C", "backup"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .unauthorized("u-A")
+            .keychain_locked("u-B")
+            .scope_missing("u-C");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let mut shutdown = FakeShutdown::after(2);
+        let control = NoControl;
+
+        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+            .await
+            .unwrap();
+
+        assert_eq!(daemon.state.ticks, 2);
+
+        // Two ticks × three failing accounts = six event lines, each stamped, none
+        // carrying secret material (handles only — never a token or email).
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(logged.lines().count(), 6, "six lines: {logged:?}");
+        assert!(
+            logged.lines().all(|l| l.starts_with("ts=")),
+            "stamped: {logged:?}"
+        );
+        assert!(!logged.contains('@'), "no email: {logged:?}");
+
+        // The 401 streak is per-occurrence and climbs across ticks.
+        assert!(
+            logged.contains("event=monitor_401 account=work consecutive=1"),
+            "{logged:?}"
+        );
+        assert!(
+            logged.contains("event=monitor_401 account=work consecutive=2"),
+            "{logged:?}"
+        );
+        // The lock and 403 lines render once per tick; the 403 carries `status=403`.
+        assert_eq!(
+            logged
+                .lines()
+                .filter(|l| l.contains("event=keychain_locked_wait account=spare"))
+                .count(),
+            2,
+            "{logged:?}"
+        );
+        assert_eq!(
+            logged
+                .lines()
+                .filter(|l| l.contains("event=usage_scope_fail account=backup status=403"))
+                .count(),
+            2,
+            "{logged:?}"
+        );
+        // The active account was unavailable every tick, so no swap line appears;
+        // the streak is pure observability. Final state: account 0 saw two 401s.
+        assert!(!logged.contains("event=swap"), "{logged:?}");
+        assert_eq!(daemon.state.consec_401, vec![2, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn run_loop_logs_a_weekly_reason_when_only_the_weekly_dimension_trips() {
+        // Issue #9: a swap driven by the WEEKLY dimension (session below its
+        // trigger) is logged `reason=weekly`, while `session_pct` still reports the
+        // outgoing account's session reading (the schema carries no weekly percent).
+        // This guards the reason re-derivation against mislabeling a weekly-only
+        // swap as `session`.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Session 0.50 is below the 95 % session trigger; weekly 0.99 is over the
+        // fixed 98 % weekly trigger → a weekly-only swap. Target B is under the floor.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.99)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let mut shutdown = FakeShutdown::after(1);
+        let control = NoControl;
+
+        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+            .await
+            .unwrap();
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(logged.lines().count(), 1, "one event line: {logged:?}");
+        assert!(
+            logged.contains("event=swap from=work to=spare reason=weekly session_pct=50"),
+            "got: {logged:?}"
+        );
     }
 }
