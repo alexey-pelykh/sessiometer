@@ -89,7 +89,7 @@ pub(crate) struct Tunables {
     /// Opt-in swap-target session guard (#10): when `Some(pct)`, only swap *to* an
     /// account whose session usage is below `pct` percent (`0..=session_trigger`);
     /// `None` (the default) disables the guard, so target choice rests on the
-    /// separate weekly-headroom selection alone — the configuration under which the
+    /// soonest-reset selection alone (issue #37) — the configuration under which the
     /// post-swap cooldown alone bounds oscillation. OFF by default: operators opt
     /// in, and a sensible enabled value mirrors `session_trigger`.
     pub(crate) session_floor: Option<u8>,

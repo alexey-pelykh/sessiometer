@@ -22,9 +22,9 @@
 //! 3. **Decide and swap.** If the active account's SESSION usage is at/above the
 //!    session swap-away trigger, OR its WEEKLY usage is at/above the separate
 //!    (typically higher) weekly trigger — each drawn this cycle from its own
-//!    timing strategy and clamped to range (issues #38, #41) — pick the freshest
-//!    viable target (most account-dimension headroom, [`pick_target`]) and run the
-//!    out-of-band [`swap::swap`]. A per-cycle jittered post-swap cooldown (issue
+//!    timing strategy and clamped to range (issues #38, #41) — pick the viable
+//!    target whose weekly quota resets soonest (issue #37, [`pick_target`]) and run
+//!    the out-of-band [`swap::swap`]. A per-cycle jittered post-swap cooldown (issue
 //!    #10) refuses a re-swap until it has elapsed, bounding oscillation between two
 //!    near-exhausted accounts.
 //!
@@ -536,8 +536,9 @@ pub(crate) struct Daemon<P, C, S, K> {
     weekly_trigger_strategy: Strategy,
     /// Opt-in swap-target session guard (#10): `Some(fraction)` only swaps TO an
     /// account whose session usage is below it (`session_floor / 100`); `None` (the
-    /// default) disables the guard, leaving target choice to weekly headroom alone —
-    /// the configuration under which the cooldown alone bounds oscillation.
+    /// default) disables the guard, leaving target choice to the soonest-reset rule
+    /// alone (issue #37) — the configuration under which the cooldown alone bounds
+    /// oscillation.
     session_floor: Option<f64>,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `0..=3600` s each cycle. Replaces
@@ -795,7 +796,7 @@ where
                 return TickAction::SkippedCooldown;
             }
         }
-        // Pick the freshest viable target (most account-dimension headroom). A
+        // Pick the viable target whose weekly quota resets soonest (issue #37). A
         // disabled (parked) account is not viable (issue #36), and a weekly-exhausted
         // account is not viable (#11) — so when every ENABLED other account is
         // weekly-exhausted this returns `None`. A disabled account, even with weekly
@@ -926,15 +927,29 @@ where
     }
 }
 
-/// Pick the freshest viable swap target: among accounts other than `active` that
-/// are enabled (issue #36), whose reading is available, that are NOT weekly-
-/// exhausted (weekly usage below `weekly_trigger`, issue #11) — and, when the
-/// opt-in `floor` is `Some`, whose session usage is below it (#10) — the one with
-/// the most account-dimension (weekly) headroom, i.e. the lowest weekly usage,
-/// breaking ties by lowest session usage, then roster order. `None` when none
-/// qualifies: with every enabled other account weekly-exhausted that is the
-/// all-exhausted terminal state (#11). `enabled` is indexed by roster position,
+/// Pick the viable swap target whose weekly window resets SOONEST (issue #37):
+/// among accounts other than `active` that are enabled (issue #36), whose reading
+/// is available, that are NOT weekly-exhausted (weekly usage below `weekly_trigger`,
+/// issue #11) — and, when the opt-in `floor` is `Some`, whose session usage is
+/// below it (#10) — the one with the earliest weekly `resets_at`. An account with a
+/// known reset is preferred over one without (an unknown reset sorts last); an
+/// exact tie — or an all-unknown field — keeps the earliest roster index. `None`
+/// when none qualifies: with every enabled other account weekly-exhausted that is
+/// the all-exhausted terminal state (#11). `enabled` is indexed by roster position,
 /// parallel to `readings`.
+///
+/// Soonest-reset (issue #37) SUPERSEDES the former most-weekly-headroom rule.
+/// Swapping TO the account whose quota refills first burns an allowance that is
+/// about to reset anyway and preserves the longer-runway account, raising total
+/// roster utilization. It also UNIFIES normal selection with the #11 terminal hold,
+/// which already holds on the soonest-`resets_at` account
+/// ([`soonest_weekly_reset`]) — so, when resets are known, the daemon prefers the
+/// same least-time-to-relief account whether or not a viable target exists. The two
+/// differ deliberately only on the degenerate `None` case: this fn keeps an
+/// unknown-reset account as a last-resort eligible target (selection must pick
+/// SOMETHING viable), whereas [`soonest_weekly_reset`] excludes `None` outright (the
+/// hold then omits a timestamp). The viability FILTER is unchanged; only the choice
+/// AMONG viable accounts changed.
 ///
 /// Two exclusions are load-bearing. The weekly-exhaustion exclusion: a target
 /// at/above its weekly trigger would re-trip [`swap::decide`] next cycle and
@@ -958,10 +973,14 @@ fn pick_target(
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
         .filter(|&(_, usage)| usage.weekly < weekly_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
-        .min_by(|&(_, a), &(_, b)| {
-            a.weekly
-                .total_cmp(&b.weekly)
-                .then(a.session.total_cmp(&b.session))
+        // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
+        // unknown one (`false` < `true`), then by the reset epoch ascending;
+        // `min_by_key` keeps the first of equal keys, so an exact tie — or an
+        // all-unknown field — falls to the earliest roster index, matching
+        // [`soonest_weekly_reset`]'s tie-break (#11).
+        .min_by_key(|&(_, usage)| match usage.weekly_resets_at {
+            Some(resets_at) => (false, resets_at),
+            None => (true, i64::MAX),
         })
         .map(|(i, _)| i)
 }
@@ -1354,45 +1373,49 @@ mod tests {
 
     // --- pick_target (pure) ------------------------------------------------
 
-    // A weekly trigger well above every reading in the pre-#11 pick_target tests,
-    // so the new weekly-exhaustion exclusion is a no-op for them (they pin the
-    // floor / headroom behavior); the #11 tests below use readings at/above it.
+    // A weekly trigger well above every reading in the pick_target tests below, so
+    // the weekly-exhaustion exclusion (#11) is a no-op for the ones that pin the
+    // floor / selection behavior; the #11 tests use readings at/above it.
     const WK: f64 = 0.98;
 
     /// An all-enabled flag slice sized to `readings` (issue #36): the pre-#36
-    /// pick_target tests pin the floor / headroom / weekly-exhaustion behavior with
+    /// pick_target tests pin the floor / selection / weekly-exhaustion behavior with
     /// every account enabled, so the new disabled exclusion is a no-op for them.
     fn all_on(readings: &[Option<Usage>]) -> Vec<bool> {
         vec![true; readings.len()]
     }
 
     #[test]
-    fn pick_target_chooses_the_lowest_weekly_among_session_viable_accounts() {
+    fn pick_target_chooses_the_soonest_reset_among_viable_accounts() {
+        // #37: among viable accounts the one whose weekly window resets SOONEST wins,
+        // even when it does NOT have the most weekly headroom (the superseded rule).
         let readings = vec![
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
-                weekly_resets_at: None,
+                weekly_resets_at: Some(100), // soonest overall — but it is active
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.50,
-                weekly: 0.60,
-                weekly_resets_at: None,
-            }), // viable, weekly 0.60
+                weekly: 0.60,                // less headroom than index 2…
+                weekly_resets_at: Some(200), // …but resets soonest among viable -> winner
+            }),
             Some(Usage {
                 session: 0.10,
-                weekly: 0.20,
-                weekly_resets_at: None,
-            }), // viable, weekly 0.20 -> winner
+                weekly: 0.20,                // most headroom — would win the OLD rule…
+                weekly_resets_at: Some(500), // …but resets latest
+            }),
             Some(Usage {
                 session: 0.85,
                 weekly: 0.01,
-                weekly_resets_at: None,
+                weekly_resets_at: Some(50), // earliest of all — but session over floor
             }), // session over floor -> not viable
         ];
+        // Index 1 (reset 200) beats the most-headroom index 2 (reset 500); index 0 is
+        // active and index 3 fails the floor, so neither earlier reset is eligible.
         assert_eq!(
             pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
-            Some(2)
+            Some(1)
         );
     }
 
@@ -1443,53 +1466,112 @@ mod tests {
     }
 
     #[test]
-    fn pick_target_breaks_a_weekly_tie_by_lower_session() {
+    fn pick_target_breaks_a_reset_tie_by_roster_order() {
+        // #37: when two viable accounts share the same weekly reset, the earlier
+        // roster index wins — matching soonest_weekly_reset's tie-break (#11). The
+        // superseded rule would have picked index 2 here on its lower session.
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: Some(100),
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.40,
+                weekly: 0.20,
+                weekly_resets_at: Some(300), // tie -> first of the tie wins
+            }),
+            Some(Usage {
+                session: 0.20,
+                weekly: 0.20,
+                weekly_resets_at: Some(300), // tie, lower session (the OLD winner)
+            }),
+        ];
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_target_prefers_a_known_reset_over_an_unknown_one() {
+        // #37: an account with a known reset is preferred over one whose reset is
+        // unknown (None sorts last) — even when the unknown-reset account has an
+        // earlier roster index and more weekly headroom.
         let readings = vec![
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: None,
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.05,           // more headroom + earlier index…
+                weekly_resets_at: None, // …but no known reset -> sorts last
             }),
             Some(Usage {
-                session: 0.40,
-                weekly: 0.20,
-                weekly_resets_at: None,
-            }), // tie weekly, session 0.40
-            Some(Usage {
-                session: 0.20,
-                weekly: 0.20,
-                weekly_resets_at: None,
-            }), // tie weekly, session 0.20 -> winner
+                session: 0.10,
+                weekly: 0.40,
+                weekly_resets_at: Some(900), // a known reset -> preferred
+            }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            pick_target(0, &readings, &all_on(&readings), None, WK),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn pick_target_falls_back_to_roster_order_when_no_reset_is_known() {
+        // #37: with no viable account reporting a weekly reset, selection falls back
+        // to the earliest roster index (the all-unknown tie) — NOT to weekly headroom
+        // (the superseded rule, which would have picked the lower-weekly index 2).
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: None,
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.30, // more weekly used, earlier index -> winner
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.05, // most headroom, but no reset and a later index
+                weekly_resets_at: None,
+            }),
+        ];
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), None, WK),
+            Some(1)
         );
     }
 
     #[test]
     fn pick_target_with_no_floor_admits_any_available_other() {
         // #10: with the session floor OFF (None), an account is a viable target on
-        // weekly headroom alone — even one whose session usage is high (which an
-        // enabled floor would exclude).
+        // its reset alone — even one whose session usage is high (which an enabled
+        // floor would exclude).
         let readings = vec![
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
-                weekly_resets_at: None,
+                weekly_resets_at: Some(100),
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.95, // high session — an enabled floor would exclude this…
                 weekly: 0.10,
-                weekly_resets_at: None,
-            }), // …but with no floor it is the lowest-weekly viable target
+                weekly_resets_at: Some(200), // …but with no floor it is the soonest-reset viable target
+            }),
             Some(Usage {
                 session: 0.05,
                 weekly: 0.60,
-                weekly_resets_at: None,
-            }), // low session but more weekly used
+                weekly_resets_at: Some(300),
+            }), // low session but resets later
         ];
-        // No floor → index 1 wins on weekly headroom despite its high session…
+        // No floor → index 1 wins as the soonest-reset viable target despite its high session…
         assert_eq!(
             pick_target(0, &readings, &all_on(&readings), None, WK),
             Some(1)
@@ -1557,24 +1639,24 @@ mod tests {
     }
 
     #[test]
-    fn pick_target_excludes_a_disabled_account_even_with_the_most_headroom() {
-        // #36: index 1 has the lowest weekly (it would win on headroom) but is
+    fn pick_target_excludes_a_disabled_account_even_when_it_resets_soonest() {
+        // #36 × #37: index 1 resets soonest (it would win the new rule) but is
         // disabled, so it is never a target; selection falls to the enabled index 2.
         let readings = vec![
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
-                weekly_resets_at: None,
+                weekly_resets_at: Some(500),
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
-                weekly: 0.05, // lowest weekly — the would-be winner…
-                weekly_resets_at: None,
+                weekly: 0.05,
+                weekly_resets_at: Some(100), // soonest reset — the would-be winner…
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
-                weekly_resets_at: None,
+                weekly_resets_at: Some(200),
             }),
         ];
         let enabled = [true, false, true]; // …but index 1 is parked
@@ -1582,10 +1664,10 @@ mod tests {
     }
 
     #[test]
-    fn pick_target_disabled_headroom_does_not_rescue_an_all_exhausted_roster() {
+    fn pick_target_a_disabled_account_does_not_rescue_an_all_exhausted_roster() {
         // #11 × #36: the only account with weekly headroom is disabled, so the
         // verdict is still no-viable-target — a parked account must not hold the
-        // daemon out of the all-exhausted terminal state.
+        // daemon out of the all-exhausted terminal state, however soon it resets.
         let readings = vec![
             Some(Usage {
                 session: 0.50,
@@ -1599,8 +1681,8 @@ mod tests {
             }),
             Some(Usage {
                 session: 0.10,
-                weekly: 0.01, // ample headroom — but disabled, so not viable
-                weekly_resets_at: None,
+                weekly: 0.01, // ample headroom + soonest reset — but disabled, so not viable
+                weekly_resets_at: Some(100),
             }),
         ];
         let enabled = [true, true, false];
@@ -1669,7 +1751,10 @@ mod tests {
     // --- tick: decision + swap --------------------------------------------
 
     #[tokio::test]
-    async fn tick_swaps_active_over_trigger_to_the_freshest_viable_target() {
+    async fn tick_swaps_active_over_trigger_to_the_soonest_reset_target() {
+        // #37 end-to-end: the active account is over its trigger; among the two viable
+        // targets the daemon picks the one that resets SOONEST — even though the other
+        // has more weekly headroom (the superseded rule would have picked it).
         let roster = vec![
             account("u-A", "Sessiometer/u-A", "work"),
             account("u-B", "Sessiometer/u-B", "spare"),
@@ -1683,10 +1768,12 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
+        const B_RESET: i64 = 1_782_864_000; // 2026-07-01 — later
+        const C_RESET: i64 = 1_782_496_800; // 2026-06-26 — soonest
         let poller = FakeRosterPoller::new()
-            .ok("u-A", 0.97, 0.40) // active: over trigger
-            .ok("u-B", 0.10, 0.20) // viable, lowest weekly -> freshest
-            .ok("u-C", 0.30, 0.50); // viable, more weekly used
+            .ok_resets("u-A", 0.97, 0.40, 1_782_777_600) // active: over trigger
+            .ok_resets("u-B", 0.10, 0.20, B_RESET) // viable, most headroom but resets later
+            .ok_resets("u-C", 0.30, 0.50, C_RESET); // viable, resets soonest -> winner
         let tun = tunables(95, 80, 0);
 
         let mut daemon: FakeDaemon = Daemon::new(
@@ -1700,25 +1787,25 @@ mod tests {
         );
         let outcome = daemon.tick().await;
 
-        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
-        // The canonical item now holds B's token, and the display shows B…
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 2 });
+        // The canonical item now holds C's token, and the display shows C…
         assert!(daemon
             .store
             .read()
             .await
             .unwrap()
-            .matches(&cred(b"B-token")));
-        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-B"));
-        // …and the in-memory active advanced to B, so the next read polls B.
-        assert_eq!(daemon.state.active, Some(1));
+            .matches(&cred(b"C-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-C"));
+        // …and the in-memory active advanced to C, so the next read polls C.
+        assert_eq!(daemon.state.active, Some(2));
     }
 
     #[tokio::test]
     async fn tick_excludes_a_disabled_account_from_polling_and_targeting() {
         // #36 end-to-end: the active account is over its trigger; the parked account
-        // (index 1) has the most headroom but is disabled, so the swap goes to the
-        // enabled `spare` (index 2) instead — and the parked account is never polled,
-        // so its snapshot reading stays absent despite a scripted `ok`.
+        // (index 1) would be an obvious target but is disabled, so the swap goes to
+        // the enabled `spare` (index 2) instead — and the parked account is never
+        // polled, so its snapshot reading stays absent despite a scripted `ok`.
         let roster = vec![
             account("u-A", "Sessiometer/u-A", "work"),
             disabled_account("u-B", "Sessiometer/u-B", "parked"),
@@ -1734,7 +1821,7 @@ mod tests {
         let (_dir, json) = claude_json("u-A");
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.97, 0.40) // active: over trigger
-            .ok("u-B", 0.01, 0.01) // parked: would be the freshest target IF polled
+            .ok("u-B", 0.01, 0.01) // parked: would be an obvious target IF polled
             .ok("u-C", 0.30, 0.50); // enabled, viable
         let tun = tunables(95, 80, 0);
 
@@ -1749,7 +1836,7 @@ mod tests {
         );
         let outcome = daemon.tick().await;
 
-        // Swapped to the ENABLED spare, not the parked account with more headroom.
+        // Swapped to the ENABLED spare, not the parked account.
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 2 });
         assert_eq!(daemon.state.active, Some(2));
         assert_eq!(displayed_uuid(&json).as_deref(), Some("u-C"));
@@ -1808,7 +1895,7 @@ mod tests {
     async fn tick_swaps_when_weekly_reaches_its_trigger_while_session_is_below() {
         // AC #2 (the new dimension, issue #41): the active account's SESSION usage
         // is comfortably below its trigger, but its WEEKLY usage has reached the
-        // separate weekly trigger → swap to the freshest viable target.
+        // separate weekly trigger → swap to the (only) viable target.
         let roster = vec![
             account("u-A", "Sessiometer/u-A", "work"),
             account("u-B", "Sessiometer/u-B", "spare"),
@@ -3374,7 +3461,7 @@ mod tests {
         {
             let poller = FakeRosterPoller::new()
                 .ok(A.0, 0.97, 0.40) // active, over the session trigger
-                .ok(B.0, 0.10, 0.20); // freshest viable target
+                .ok(B.0, 0.10, 0.20); // the (only) viable target
             let tun = tunables(95, 80, 0);
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
             let outcome = daemon.tick().await;
