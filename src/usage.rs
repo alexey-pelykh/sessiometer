@@ -77,20 +77,17 @@ const BETA_HEADER: &str = "anthropic-beta: oauth-2025-04-20";
 const POLL_TIMEOUT_SECS: u32 = 30;
 
 /// A point-in-time usage reading for one account, across both quota windows.
+///
+/// The swap decision compares each dimension against its OWN threshold (issue
+/// #41: session vs `session_trigger`, weekly vs the separate `weekly_trigger`),
+/// so the reading carries both fractions and projects neither to a single
+/// worst-case scalar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Usage {
     /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed.
     pub(crate) session: f64,
     /// Fraction in `[0.0, 1.0]` of the weekly window consumed.
     pub(crate) weekly: f64,
-}
-
-impl Usage {
-    /// The worst-case (highest) of the two dimensions — the one that drives a
-    /// swap decision.
-    pub(crate) fn max_ratio(self) -> f64 {
-        self.session.max(self.weekly)
-    }
 }
 
 /// The full parse of a usage response: both dimensions plus each window's reset
@@ -495,17 +492,6 @@ fn resets_at_of(obj: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-
-    // --- Usage / projection ---
-
-    #[test]
-    fn max_ratio_picks_the_worst_dimension() {
-        let usage = Usage {
-            session: 0.3,
-            weekly: 0.8,
-        };
-        assert_eq!(usage.max_ratio(), 0.8);
-    }
 
     // --- classify_status (pure, the taxonomy) ---
 

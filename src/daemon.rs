@@ -19,14 +19,17 @@
 //!    seam #5 anticipated (`CurlTransport` is generic over [`CredentialStore`]). A
 //!    failed poll just drops that account from this cycle; the loop never swaps on
 //!    missing data.
-//! 3. **Decide and swap.** If the active account's worst dimension is at/above the
-//!    swap-away trigger — drawn this cycle from its timing strategy and clamped to
-//!    range (issue #38) — pick the freshest viable target (most account-dimension
-//!    headroom, [`pick_target`]) and run the out-of-band [`swap::swap`]. A
-//!    per-cycle jittered post-swap cooldown (issue #10) refuses a re-swap until it
-//!    has elapsed, bounding oscillation between two near-exhausted accounts.
+//! 3. **Decide and swap.** If the active account's SESSION usage is at/above the
+//!    session swap-away trigger, OR its WEEKLY usage is at/above the separate
+//!    (typically higher) weekly trigger — each drawn this cycle from its own
+//!    timing strategy and clamped to range (issues #38, #41) — pick the freshest
+//!    viable target (most account-dimension headroom, [`pick_target`]) and run the
+//!    out-of-band [`swap::swap`]. A per-cycle jittered post-swap cooldown (issue
+//!    #10) refuses a re-swap until it has elapsed, bounding oscillation between two
+//!    near-exhausted accounts.
 //!
-//! The trigger, the cooldown, and the inter-poll interval are each a
+//! The session trigger, the weekly trigger (#41), the cooldown, and the
+//! inter-poll interval are each a
 //! [`Strategy`] (base + optional jitter, issue #38): a fresh value is drawn and
 //! clamped to the parameter's range every cycle through the [`SplitMix64`] seam,
 //! so polling/swaps decorrelate across accounts and cycles instead of running in
@@ -76,6 +79,12 @@ use crate::usage::{CurlTransport, NoopReStashTrigger, RealUsageSource, Usage, Us
 /// config's `session_trigger` range so a jittered draw can never escape it.
 const TRIGGER_PCT_LO: f64 = 50.0;
 const TRIGGER_PCT_HI: f64 = 99.0;
+/// Per-cycle clamp bounds for the WEEKLY swap-away trigger draw, in PERCENT
+/// (issue #41) — mirrors config's `weekly_trigger` range. Its own constants
+/// (numerically equal to the session bounds today) so the two triggers stay
+/// independently bounded.
+const WEEKLY_TRIGGER_PCT_LO: f64 = 50.0;
+const WEEKLY_TRIGGER_PCT_HI: f64 = 99.0;
 /// Per-cycle clamp bounds for the cooldown draw, in seconds (config range).
 const COOLDOWN_SECS_LO: f64 = 0.0;
 const COOLDOWN_SECS_HI: f64 = 3600.0;
@@ -492,6 +501,10 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// `50..=99` percent each cycle, then `/100` for the swap decision. Replaces
     /// the former fixed `session_trigger` fraction.
     trigger_strategy: Strategy,
+    /// Per-cycle WEEKLY swap-away trigger strategy (issue #41): drawn + clamped to
+    /// `50..=99` percent each cycle, then `/100` for the swap decision — the
+    /// weekly-dimension counterpart of `trigger_strategy`, independent of it.
+    weekly_trigger_strategy: Strategy,
     /// Opt-in swap-target session guard (#10): `Some(fraction)` only swaps TO an
     /// account whose session usage is below it (`session_floor / 100`); `None` (the
     /// default) disables the guard, leaving target choice to weekly headroom alone —
@@ -535,6 +548,7 @@ where
             clock,
             claude_json,
             trigger_strategy: tunables.trigger_strategy,
+            weekly_trigger_strategy: tunables.weekly_trigger_strategy,
             session_floor: tunables.session_floor.map(|floor| f64::from(floor) / 100.0),
             cooldown_strategy: tunables.cooldown_strategy,
             poll_strategy: tunables.poll_strategy,
@@ -668,13 +682,21 @@ where
         let Some(active_usage) = readings[active_idx] else {
             return TickAction::SkippedActiveUnavailable;
         };
-        // Draw this cycle's swap-away trigger (issue #38): jittered + clamped to
-        // 50..=99 percent, then to a fraction for the decision. Below it → hold.
-        let trigger = self
-            .trigger_strategy
-            .draw(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
-            / 100.0;
-        if swap::decide(&active_usage, trigger) == SwapDecision::Hold {
+        // Draw this cycle's swap-away triggers (issues #38, #41): each jittered +
+        // clamped to 50..=99 percent, then to a fraction for the decision. The
+        // session and weekly triggers are independent — swap when EITHER dimension
+        // reaches its own; below BOTH → hold. Both are drawn every cycle (a fixed
+        // strategy consumes no RNG), keeping the per-cycle draw order deterministic.
+        let session_trigger =
+            self.trigger_strategy
+                .draw(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
+                / 100.0;
+        let weekly_trigger = self.weekly_trigger_strategy.draw(
+            &mut self.rng,
+            WEEKLY_TRIGGER_PCT_LO,
+            WEEKLY_TRIGGER_PCT_HI,
+        ) / 100.0;
+        if swap::decide(&active_usage, session_trigger, weekly_trigger) == SwapDecision::Hold {
             return TickAction::Held;
         }
         // Over the trigger. Cooldown (anti-oscillation, #10): refuse a re-swap
@@ -1008,6 +1030,11 @@ mod tests {
     }
 
     fn tunables(trigger: u8, floor: u8, cooldown: u64) -> Tunables {
+        // Weekly trigger fixed high (98) so the existing tests' weekly readings
+        // (all well below it) never trip the new weekly path (issue #41): these
+        // tests pin the SESSION trigger. A fixed strategy draws no RNG, so the
+        // per-cycle draw sequence — and every seeded-jitter test — is unchanged.
+        const WEEKLY_TRIGGER: u8 = 98;
         Tunables {
             poll_secs: 60,
             cooldown_secs: cooldown,
@@ -1015,11 +1042,13 @@ mod tests {
             // written against); `tunables_floor_off` covers the new default.
             session_floor: Some(floor),
             session_trigger: trigger,
+            weekly_trigger: WEEKLY_TRIGGER,
             monitor_401_n: 3,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
             trigger_strategy: Strategy::fixed(f64::from(trigger)),
+            weekly_trigger_strategy: Strategy::fixed(f64::from(WEEKLY_TRIGGER)),
             cooldown_strategy: Strategy::fixed(cooldown as f64),
         }
     }
@@ -1271,6 +1300,94 @@ mod tests {
         assert_eq!(outcome.action, TickAction::Held);
         // No swap has happened, so `status` would show `last swap: none`.
         assert!(outcome.snapshot.last_swap.is_none());
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn tick_swaps_when_weekly_reaches_its_trigger_while_session_is_below() {
+        // AC #2 (the new dimension, issue #41): the active account's SESSION usage
+        // is comfortably below its trigger, but its WEEKLY usage has reached the
+        // separate weekly trigger → swap to the freshest viable target.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // A: session 0.50 (below the 95 session trigger) but weekly 0.98 (at the
+        // helper's 98 weekly trigger) → must swap. B is open and session-viable.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.98)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        let outcome = daemon.tick().await;
+
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn tick_holds_when_weekly_is_below_its_own_trigger_even_above_the_session_trigger() {
+        // Issue #41: weekly is gated by its OWN (higher) trigger, not the session
+        // one. Weekly 0.96 sits ABOVE the 0.95 session trigger yet BELOW the 0.98
+        // weekly trigger, and session itself (0.50) is below its trigger — so the
+        // cycle HOLDS. (Under a single-threshold rule keyed on session_trigger this
+        // same reading would have swapped; the separate weekly trigger is exactly
+        // what changes that.)
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.96)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0); // session trigger 95, weekly trigger 98
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        let outcome = daemon.tick().await;
+
+        assert_eq!(outcome.action, TickAction::Held);
         assert!(daemon
             .store
             .read()
@@ -1680,6 +1797,67 @@ mod tests {
         assert!(
             holds > 0 && swaps > 0,
             "jittered trigger should produce both holds ({holds}) and swaps ({swaps})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jittered_weekly_trigger_is_deterministic_and_varies_the_swap_decision() {
+        // The WEEKLY-axis mirror of the jittered-trigger test (issue #41): session
+        // is held LOW (never trips its trigger), weekly sits at a fixed 60%, and a
+        // wide uniform weekly-trigger jitter spans the whole 50..=99 range — so
+        // some cycles draw a weekly trigger ≤ 60 (→ swap on the weekly dimension)
+        // and others > 60 (→ hold). Deterministic per seed, varying across seeds:
+        // proof the weekly trigger is drawn anew each cycle from its own strategy.
+        async fn action_for(seed: u64) -> TickAction {
+            let roster = vec![
+                account("u-A", "Sessiometer/u-A", "work"),
+                account("u-B", "Sessiometer/u-B", "spare"),
+            ];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+            ])
+            .await;
+            let (_dir, json) = claude_json("u-A");
+            // Session fixed low (never trips the 95 session trigger); weekly fixed
+            // at 60%, the axis the jittered weekly trigger straddles.
+            let poller = FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.60)
+                .ok("u-B", 0.05, 0.05);
+            let mut tun = tunables(95, 80, 0);
+            tun.weekly_trigger_strategy = Strategy {
+                base: 95.0,
+                jitter: Jitter::Uniform { spread: 100.0 },
+            };
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                poller,
+                store,
+                stash,
+                FakeClock::frozen(),
+                json,
+                &tun,
+            )
+            .with_seed(seed);
+            daemon.tick().await.action
+        }
+        // Determinism: the same seed replays the same decision.
+        assert_eq!(action_for(11).await, action_for(11).await);
+        // Variation: across seeds the jittered weekly trigger yields BOTH outcomes
+        // at the same fixed 60% weekly usage.
+        let mut holds = 0;
+        let mut swaps = 0;
+        for seed in 0..48 {
+            match action_for(seed).await {
+                TickAction::Held => holds += 1,
+                TickAction::Swapped { from: 0, to: 1 } => swaps += 1,
+                other => panic!("unexpected action under seed {seed}: {other:?}"),
+            }
+        }
+        assert!(
+            holds > 0 && swaps > 0,
+            "jittered weekly trigger should produce both holds ({holds}) and swaps ({swaps})"
         );
     }
 
