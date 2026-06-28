@@ -34,6 +34,26 @@ sessiometer run
 sessiometer status
 ```
 
+## Parking an account
+
+Take an account out of the rotation without losing its captured credential — a
+reversible **park**, distinct from removing it. A disabled account keeps its
+roster entry and its stash, but the daemon never swaps **to** it and does not
+poll it:
+
+```sh
+# Take `work` out of the rotation (kept, but skipped):
+sessiometer disable work
+
+# Return it to the candidate pool:
+sessiometer enable work
+```
+
+Accounts resolve by their `list` label. The state is stored in `config.toml`, so
+it persists across daemon restarts; `list` and `status` mark a parked account as
+`disabled`. The change takes effect at the next daemon start (a running daemon
+loads the roster once).
+
 ## Roster size and poll cost
 
 There is **no fixed limit** on how many accounts the roster holds — capture as

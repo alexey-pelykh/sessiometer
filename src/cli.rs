@@ -43,6 +43,17 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                 "run" => run().await,
                 "status" => status().await,
                 "list" => list().await,
+                // `disable`/`enable <label>` flip an account's rotation flag and
+                // persist (issue #36). Mirror `capture`'s optional-positional parse;
+                // a missing label surfaces as `RotationLabelRequired`.
+                "disable" => {
+                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
+                    set_enabled(label, false).await
+                }
+                "enable" => {
+                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
+                    set_enabled(label, true).await
+                }
                 "-h" | "--help" => {
                     print_usage();
                     Ok(())
@@ -65,6 +76,8 @@ fn print_usage() {
          run        Run the foreground daemon (poll + swap)\n    \
          status     Show the roster and the last swap\n    \
          list       List captured accounts\n    \
+         disable <label>      Park an account: keep it but take it out of the rotation\n    \
+         enable <label>       Return a parked account to the rotation\n    \
          --help     Print this help"
     );
 }
@@ -205,12 +218,16 @@ pub(crate) fn render_status(response: &StatusResponse) -> String {
         // `*` marks the active account (as the event log does); a leading space
         // keeps the other labels aligned under it.
         let marker = if account.active { "*" } else { " " };
+        // A parked account is marked inline (issue #36); an enabled one adds
+        // nothing, so existing status output is unchanged.
+        let state = if account.enabled { "" } else { " · disabled" };
         out.push_str(&format!(
-            "{} {} · session {} · weekly {}\n",
+            "{} {} · session {} · weekly {}{}\n",
             marker,
             account.label,
             pct(account.session_pct),
             pct(account.weekly_pct),
+            state,
         ));
     }
     out.push('\n');
@@ -290,11 +307,15 @@ fn view(loaded: Result<Config>) -> Result<String> {
 pub(crate) fn render_roster(roster: &[Account]) -> String {
     let mut out = String::new();
     for account in roster {
+        // A parked account is marked inline (issue #36); an enabled one adds
+        // nothing, so existing rosters render exactly as before.
+        let state = if account.enabled { "" } else { " · disabled" };
         out.push_str(&format!(
-            "{} · {} · {}\n",
+            "{} · {} · {}{}\n",
             account.label,
             short_uuid(&account.account_uuid),
             account.stash,
+            state,
         ));
     }
     let n = roster.len();
@@ -313,6 +334,70 @@ fn short_uuid(account_uuid: &str) -> &str {
     }
 }
 
+/// `disable`/`enable <label>` — take an account out of the rotation, or return it
+/// (issue #36). A reversible park, distinct from removal (#13): the account keeps
+/// its roster entry and its stash; only its `enabled` flag flips. Resolve the
+/// account by its non-secret label, set the flag, and persist via [`Config::save`]
+/// so the change survives a daemon restart (config-backed). Takes effect at the
+/// next daemon start — a running daemon loads the roster once.
+///
+/// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
+/// account is [`Error::AccountLabelNotFound`]. `enabled` selects the verb so one
+/// body serves both subcommands; the `verb` it derives names the usage in errors.
+async fn set_enabled(label: Option<String>, enabled: bool) -> Result<()> {
+    let verb = if enabled { "enable" } else { "disable" };
+    let label = label.ok_or(Error::RotationLabelRequired { verb })?;
+    let mut config = Config::load()?;
+    let outcome = apply_enabled(&mut config.roster, &label, enabled)?;
+    // Only rewrite config.toml when the flag actually changed — re-disabling an
+    // already-parked account is a friendly no-op, not a needless disk write.
+    if matches!(outcome, FlipOutcome::Changed) {
+        config.save()?;
+    }
+    println!("{}", flip_confirmation(outcome, &label, enabled));
+    Ok(())
+}
+
+/// Whether an [`apply_enabled`] flip actually changed the stored flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlipOutcome {
+    /// The flag was flipped to the requested state.
+    Changed,
+    /// The account was already in the requested state — nothing to persist.
+    Unchanged,
+}
+
+/// Resolve `label` in `roster` and set its `enabled` flag, reporting whether the
+/// value actually changed. Pure (no I/O) so the resolve-and-flip policy is unit-
+/// testable without touching `config.toml`; the caller persists only on
+/// [`FlipOutcome::Changed`]. `Err(AccountLabelNotFound)` when no account carries
+/// the label. The first match wins (labels are operator handles; uniqueness is not
+/// enforced, so a duplicate label resolves to the earliest roster entry).
+fn apply_enabled(roster: &mut [Account], label: &str, enabled: bool) -> Result<FlipOutcome> {
+    let account = roster
+        .iter_mut()
+        .find(|account| account.label == label)
+        .ok_or_else(|| Error::AccountLabelNotFound {
+            label: label.to_owned(),
+        })?;
+    if account.enabled == enabled {
+        Ok(FlipOutcome::Unchanged)
+    } else {
+        account.enabled = enabled;
+        Ok(FlipOutcome::Changed)
+    }
+}
+
+/// The confirmation line for a `disable`/`enable`. Names the label (non-secret,
+/// issue #15) and reflects whether the flag changed or was already in that state.
+fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    match outcome {
+        FlipOutcome::Changed => format!("{state} `{label}`"),
+        FlipOutcome::Unchanged => format!("`{label}` is already {state}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +410,7 @@ mod tests {
             account_uuid: uuid.to_owned(),
             stash: stash.to_owned(),
             label: label.to_owned(),
+            enabled: true,
         }
     }
 
@@ -458,6 +544,107 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
         );
     }
 
+    // --- enable/disable (issue #36) ----------------------------------------
+
+    #[test]
+    fn render_roster_marks_a_disabled_account_and_leaves_enabled_ones_unchanged() {
+        let mut work = acct("work", "11111111-1111", "Sessiometer/11111111-1111");
+        work.enabled = false;
+        let spare = acct("spare", "22222222-2222", "Sessiometer/22222222-2222");
+        let out = render_roster(&[work, spare]);
+        assert_eq!(
+            out,
+            "work · 11111111 · Sessiometer/11111111-1111 · disabled\n\
+spare · 22222222 · Sessiometer/22222222-2222\n\
+\n\
+2 accounts\n"
+        );
+    }
+
+    #[test]
+    fn render_status_marks_a_disabled_account_only() {
+        let mut spare = status_line("spare", false, Some(10), Some(20));
+        spare.enabled = false;
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
+            last_swap: None,
+        };
+        let out = render_status(&response);
+        // The enabled active account is unmarked; the parked one carries the tag.
+        assert!(
+            out.contains("* work · session 50% · weekly 25%\n"),
+            "got {out:?}"
+        );
+        assert!(
+            out.contains("  spare · session 10% · weekly 20% · disabled\n"),
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn apply_enabled_flips_the_resolved_account_and_reports_change() {
+        let mut roster = vec![acct("work", "u1", "s1"), acct("spare", "u2", "s2")];
+        // Resolve `spare` by label and disable it; the other account is untouched.
+        assert_eq!(
+            apply_enabled(&mut roster, "spare", false).unwrap(),
+            FlipOutcome::Changed
+        );
+        assert!(roster[0].enabled, "the unaddressed account is left alone");
+        assert!(!roster[1].enabled);
+        // Re-enable flips it back.
+        assert_eq!(
+            apply_enabled(&mut roster, "spare", true).unwrap(),
+            FlipOutcome::Changed
+        );
+        assert!(roster[1].enabled);
+    }
+
+    #[test]
+    fn apply_enabled_is_idempotent_when_already_in_the_target_state() {
+        let mut roster = vec![acct("work", "u1", "s1")];
+        // Already enabled → Unchanged, so the caller skips the config rewrite.
+        assert_eq!(
+            apply_enabled(&mut roster, "work", true).unwrap(),
+            FlipOutcome::Unchanged
+        );
+        assert!(roster[0].enabled);
+    }
+
+    #[test]
+    fn apply_enabled_rejects_an_unknown_label_without_touching_the_roster() {
+        let mut roster = vec![acct("work", "u1", "s1")];
+        let err =
+            apply_enabled(&mut roster, "ghost", false).expect_err("an unmatched label is an error");
+        assert!(
+            matches!(err, Error::AccountLabelNotFound { ref label } if label == "ghost"),
+            "got {err:?}"
+        );
+        assert!(
+            roster[0].enabled,
+            "a failed resolve leaves the roster intact"
+        );
+    }
+
+    #[test]
+    fn flip_confirmation_reflects_changed_vs_already_in_state() {
+        assert_eq!(
+            flip_confirmation(FlipOutcome::Changed, "work", false),
+            "disabled `work`"
+        );
+        assert_eq!(
+            flip_confirmation(FlipOutcome::Changed, "work", true),
+            "enabled `work`"
+        );
+        assert_eq!(
+            flip_confirmation(FlipOutcome::Unchanged, "work", false),
+            "`work` is already disabled"
+        );
+        assert_eq!(
+            flip_confirmation(FlipOutcome::Unchanged, "work", true),
+            "`work` is already enabled"
+        );
+    }
+
     // --- status: response → text (issue #8) --------------------------------
 
     fn status_line(
@@ -471,6 +658,7 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
             active,
             session_pct: session,
             weekly_pct: weekly,
+            enabled: true,
         }
     }
 

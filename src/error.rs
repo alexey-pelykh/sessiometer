@@ -128,6 +128,19 @@ pub(crate) enum Error {
     #[error("a label is required for a new account: pass `sessiometer capture <label>`")]
     LabelRequired,
 
+    // --- Account enable/disable (issue #36) ----------------------------------
+    /// `sessiometer disable`/`enable` was invoked without the required `<label>`.
+    /// Carries the subcommand (a static, secret-free string) so the message names
+    /// the exact usage.
+    #[error("a label is required: `sessiometer {verb} <label>`")]
+    RotationLabelRequired { verb: &'static str },
+
+    /// `sessiometer disable`/`enable` was given a `<label>` that matches no roster
+    /// account. The label is the operator's non-secret handle (issue #15), safe to
+    /// quote; the message points at `list` to show the valid handles.
+    #[error("no account labelled `{label}` — run `sessiometer list` to see the roster")]
+    AccountLabelNotFound { label: String },
+
     /// A per-account stash is missing one or both of its keychain items
     /// (credential / oauthAccount), so the account cannot be restored. Carries
     /// the `service` (the `Sessiometer/<account_uuid>` stash name — a config value, never
