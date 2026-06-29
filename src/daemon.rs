@@ -211,7 +211,7 @@ impl RosterPoller for RealRosterPoller {
             // anticipated: `CurlTransport` is generic over `CredentialStore`.
             RealUsageSource::new(CurlTransport::new(StashCredentialStore {
                 stash: &self.stash,
-                service: account.stash.clone(),
+                service: account.stash(),
             }))
             .usage()
             .await
@@ -838,7 +838,7 @@ where
     pub(crate) async fn reconcile_on_start(&self) -> Result<()> {
         let canonical = self.store.read().await?;
         for account in &self.roster {
-            let Ok(stashed) = self.stash.read(&account.stash).await else {
+            let Ok(stashed) = self.stash.read(&account.stash()).await else {
                 continue;
             };
             if !stashed.credential.matches(&canonical) {
@@ -1064,7 +1064,7 @@ where
     /// [`resolve_active`](Self::resolve_active) and the re-auth re-stash path (#13).
     async fn resolve_account_for(&self, canonical: &Credential) -> Option<usize> {
         for (i, account) in self.roster.iter().enumerate() {
-            if let Ok(stashed) = self.stash.read(&account.stash).await {
+            if let Ok(stashed) = self.stash.read(&account.stash()).await {
                 if stashed.credential.matches(canonical) {
                     return Some(i);
                 }
@@ -1091,7 +1091,7 @@ where
         let account = &self.roster[idx];
         // Prefer the identity already stashed for this account: it is authoritative
         // and does not depend on the best-effort display file.
-        let oauth_account = if let Ok(existing) = self.stash.read(&account.stash).await {
+        let oauth_account = if let Ok(existing) = self.stash.read(&account.stash()).await {
             existing.oauth_account
         } else if let Ok(displayed) = claude_state::read_oauth_account_from(&self.claude_json) {
             // No existing stash: fall back to the displayed identity, but only if it
@@ -1107,7 +1107,7 @@ where
             credential: canonical.clone(),
             oauth_account,
         };
-        self.stash.write(&account.stash, &refreshed).await.is_ok()
+        self.stash.write(&account.stash(), &refreshed).await.is_ok()
     }
 
     /// Fold account `i`'s poll `result` into its per-account health (issue #42) and
@@ -1297,8 +1297,8 @@ where
         // is no-half-swap: an error (including a contended lock that fails closed)
         // leaves the canonical item and both stashes coherent, so we simply retry
         // next cycle.
-        let outgoing = self.roster[active_idx].stash.clone();
-        let incoming = self.roster[target_idx].stash.clone();
+        let outgoing = self.roster[active_idx].stash();
+        let incoming = self.roster[target_idx].stash();
         match self.locked_swap(&outgoing, &incoming).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
@@ -1443,8 +1443,8 @@ where
         // #6 is no-half-swap: an error (including a fail-closed contended swap lock,
         // #64) leaves the canonical item and both stashes coherent — the dead active
         // stays quarantined and the emergency swap retries next cycle.
-        let outgoing = self.roster[active_idx].stash.clone();
-        let incoming = self.roster[target_idx].stash.clone();
+        let outgoing = self.roster[active_idx].stash();
+        let incoming = self.roster[target_idx].stash();
         match self.locked_swap(&outgoing, &incoming).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
@@ -1966,20 +1966,19 @@ mod tests {
 
     // --- builders ----------------------------------------------------------
 
-    fn account(uuid: &str, stash: &str, label: &str) -> Account {
+    fn account(uuid: &str, label: &str) -> Account {
         Account {
             account_uuid: uuid.to_owned(),
-            stash: stash.to_owned(),
             label: label.to_owned(),
             enabled: true,
         }
     }
 
     /// A roster account that starts parked (issue #36) — for the disable paths.
-    fn disabled_account(uuid: &str, stash: &str, label: &str) -> Account {
+    fn disabled_account(uuid: &str, label: &str) -> Account {
         Account {
             enabled: false,
-            ..account(uuid, stash, label)
+            ..account(uuid, label)
         }
     }
 
@@ -2457,9 +2456,9 @@ mod tests {
         // targets the daemon picks the one that resets SOONEST — even though the other
         // has more weekly headroom (the superseded rule would have picked it).
         let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-            account("u-C", "Sessiometer/u-C", "third"),
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -2508,9 +2507,9 @@ mod tests {
         // the enabled `spare` (index 2) instead — and the parked account is never
         // polled, so its snapshot reading stays absent despite a scripted `ok`.
         let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            disabled_account("u-B", "Sessiometer/u-B", "parked"),
-            account("u-C", "Sessiometer/u-C", "spare"),
+            account("u-A", "work"),
+            disabled_account("u-B", "parked"),
+            account("u-C", "spare"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -2554,10 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_holds_when_active_is_below_the_trigger() {
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -2597,10 +2593,7 @@ mod tests {
         // AC #2 (the new dimension, issue #41): the active account's SESSION usage
         // is comfortably below its trigger, but its WEEKLY usage has reached the
         // separate weekly trigger → swap to the (only) viable target.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -2644,10 +2637,7 @@ mod tests {
         // cycle HOLDS. (Under a single-threshold rule keyed on session_trigger this
         // same reading would have swapped; the separate weekly trigger is exactly
         // what changes that.)
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -2684,10 +2674,7 @@ mod tests {
     async fn tick_skips_without_swapping_when_the_active_poll_fails() {
         // Active A's poll fails (transient); B is wide open. Must NOT swap on
         // missing active data.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -2722,7 +2709,7 @@ mod tests {
     async fn tick_skips_when_the_active_account_cannot_be_identified() {
         // Canonical token matches no stash, and ~/.claude.json shows an account
         // not in the roster → active unknown → poll-only, no swap.
-        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
+        let roster = vec![account("u-A", "work")];
         let store = store_holding(b"unknown-token").await;
         let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-STRANGER");
@@ -2749,10 +2736,7 @@ mod tests {
         // Steady state: the active account's token has refreshed in place, so the
         // canonical matches NO stash. The `~/.claude.json` display (u-A, in the
         // roster) is the fallback that still identifies the active account.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-drifted-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-stale-token", "u-A"), // no longer matches canonical
@@ -2792,10 +2776,7 @@ mod tests {
         // back-off as the next wait. The daemon never auto-unlocks or prompts; the
         // back-off is the whole response. A is set over the session trigger so that,
         // absent the lock, this cycle WOULD swap — proving the lock truly defers it.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -2856,7 +2837,7 @@ mod tests {
         // #13: the deferred-cycle back-off grows exponentially from the base and
         // saturates at the cap, so a long lock settles at one retry per cap-interval
         // rather than spinning or growing without bound.
-        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
+        let roster = vec![account("u-A", "work")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-A");
@@ -2899,10 +2880,7 @@ mod tests {
         // #13: after a lock episode, the first readable cycle clears the back-off
         // (next_wait None → normal interval) and re-arms the edge-trigger, so a
         // LATER lock episode signals afresh and restarts the back-off at the base.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -2952,10 +2930,7 @@ mod tests {
         // stays A — same account, refreshed credential). Tick 2 detects the
         // out-of-band change and re-stashes A with the new token, so A's stash tracks
         // the live credential; tick 3 sees no further change and does not re-fire.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3028,10 +3003,7 @@ mod tests {
         // the canonical becomes B's fresh token AND the display switches to B. The
         // daemon re-stashes B with the new token (resolved via the display, since no
         // stash matches the fresh token yet) and re-resolves the active account to B.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3079,10 +3051,7 @@ mod tests {
 
     #[tokio::test]
     async fn tick_reports_no_viable_target_when_every_other_account_is_over_the_floor() {
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3134,9 +3103,9 @@ mod tests {
         // whose weekly window resets soonest — emit exactly ONE signal, and perform
         // ZERO swaps no matter how many ticks run.
         let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-            account("u-C", "Sessiometer/u-C", "third"),
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -3207,10 +3176,7 @@ mod tests {
         // #11 edge re-fire: once the daemon leaves the all-exhausted state the
         // guard clears, so a later re-entry signals afresh. Here a Hold (active
         // below both triggers) is the non-exhausted cycle that resets it.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3245,10 +3211,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_over_trigger_active_within_the_cooldown_is_skipped() {
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3292,10 +3255,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_over_trigger_active_past_the_cooldown_swaps() {
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3334,10 +3294,7 @@ mod tests {
         // Issue #10 acceptance (non-oscillation): with the session floor OFF (the
         // default) and two accounts both hovering 94–96%, the cooldown ALONE bounds
         // oscillation — ≤ 1 swap per cooldown window, and never A→B→A within it.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3398,10 +3355,7 @@ mod tests {
         // token), the daemon adopts the notification — which ARMS the post-swap
         // cooldown and re-resolves active — so its very next poll HOLDS on B rather
         // than immediately reverting it, EVEN THOUGH B sits over its swap-away trigger.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         // The manual swap already rewrote the canonical to B's token.
         let store = store_holding(b"B-token").await;
         let stash = stash_with(&[
@@ -3457,10 +3411,7 @@ mod tests {
         // the daemon is NOT notified (no adopt). It resolves active to B, finds B over
         // the trigger with NO cooldown armed, and immediately reverts B→A — exactly
         // the revert the #64 notification exists to prevent.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"B-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3495,10 +3446,7 @@ mod tests {
         // AUTHORITATIVE canonical item. Here the cached active is STALE (A) while the
         // canonical already holds B's token — adoption corrects it to B, so an
         // out-of-order or contentless message cannot corrupt the daemon's state.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"B-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3532,10 +3480,7 @@ mod tests {
         // acquires + releases it around its own swap, so an UNcontended swap proceeds
         // exactly as before. (The lock's mutual-exclusion property is proven in
         // `swap.rs`; here we only confirm `with_swap_lock` does not deadlock the path.)
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3637,10 +3582,7 @@ mod tests {
         // (→ swap) and others > 60 (→ hold). Deterministic per seed, but VARYING
         // across seeds — proof the trigger is drawn anew each cycle.
         async fn action_for(seed: u64) -> TickAction {
-            let roster = vec![
-                account("u-A", "Sessiometer/u-A", "work"),
-                account("u-B", "Sessiometer/u-B", "spare"),
-            ];
+            let roster = vec![account("u-A", "work"), account("u-B", "spare")];
             let store = store_holding(b"A-token").await;
             let stash = stash_with(&[
                 ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3696,10 +3638,7 @@ mod tests {
         // and others > 60 (→ hold). Deterministic per seed, varying across seeds:
         // proof the weekly trigger is drawn anew each cycle from its own strategy.
         async fn action_for(seed: u64) -> TickAction {
-            let roster = vec![
-                account("u-A", "Sessiometer/u-A", "work"),
-                account("u-B", "Sessiometer/u-B", "spare"),
-            ];
+            let roster = vec![account("u-A", "work"), account("u-B", "spare")];
             let store = store_holding(b"A-token").await;
             let stash = stash_with(&[
                 ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3755,10 +3694,7 @@ mod tests {
         // below the 100 s elapsed (→ swap) and others above it (→ skip).
         // Deterministic per seed, varying across seeds.
         async fn action_for(seed: u64) -> TickAction {
-            let roster = vec![
-                account("u-A", "Sessiometer/u-A", "work"),
-                account("u-B", "Sessiometer/u-B", "spare"),
-            ];
+            let roster = vec![account("u-A", "work"), account("u-B", "spare")];
             let store = store_holding(b"A-token").await;
             let stash = stash_with(&[
                 ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3814,10 +3750,7 @@ mod tests {
     async fn reconcile_co_writes_the_matched_account_when_the_display_is_stale() {
         // Post-swap crash: canonical holds B's token, but the display still shows
         // A (the co-write never landed). Reconcile heals the display to B.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"B-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -3844,7 +3777,7 @@ mod tests {
     async fn reconcile_leaves_the_display_untouched_when_no_stash_matches() {
         // Normal restart: the active account's token has drifted (refreshed in
         // place), matching no stash. The display is already correct → untouched.
-        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
+        let roster = vec![account("u-A", "work")];
         let store = store_holding(b"A-drifted-token").await;
         let stash = stash_with(&[("Sessiometer/u-A", b"A-old-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-A");
@@ -3865,7 +3798,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_is_a_noop_when_the_display_already_matches() {
-        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
+        let roster = vec![account("u-A", "work")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
         let (_dir, json) = claude_json("u-A");
@@ -4113,10 +4046,7 @@ mod tests {
         // Tick 1: A is over the trigger → swap to B; the snapshot reports the swap
         // at age 0. Advance the clock; tick 2 holds (B is fresh) but the snapshot
         // still reports the swap, now aged by the elapsed time.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4185,10 +4115,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_loop_ticks_deterministically_and_stops_on_shutdown() {
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4234,10 +4161,7 @@ mod tests {
         // `adopt_manual_swap` through the LIVE select, not as a disconnected unit call.
         // A regression that turned the `Some(ManualSwapped) => break` arm back into a
         // `continue` would leave `last_swap` None and fail this test.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4292,10 +4216,7 @@ mod tests {
         // Tick 1 triggers a swap; shutdown is then requested. Because a swap runs
         // to completion inside `tick` (shutdown is only observed between ticks),
         // the post-loop state is coherent — no half-swap.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4359,10 +4280,7 @@ mod tests {
         // poll `Result` into at most one event and maintains the streak. Driving it
         // by hand (rather than through the loop) lets us assert the reset, which a
         // static poller cannot script on a single account across ticks.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4473,9 +4391,9 @@ mod tests {
         // the 401 streak must climb 1 → 2, proving `note_poll_outcome` is wired into
         // the loop and serialized.
         let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-            account("u-C", "Sessiometer/u-C", "backup"),
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "backup"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -4567,10 +4485,7 @@ mod tests {
         // outgoing account's session reading (the schema carries no weekly percent).
         // This guards the reason re-derivation against mislabeling a weekly-only
         // swap as `session`.
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4632,10 +4547,7 @@ mod tests {
     /// Like [`lifecycle_daemon`] but with a caller-chosen poller + tunables, for the
     /// tick-driven tests that script per-account poll outcomes.
     async fn lifecycle_daemon_with(poller: FakeRosterPoller, tun: Tunables) -> FakeDaemon {
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
@@ -4746,9 +4658,9 @@ mod tests {
         // to a healthy target. The daemon never halts the whole rotation on one dead
         // account.
         let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-            account("u-C", "Sessiometer/u-C", "backup"),
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "backup"),
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -5039,10 +4951,7 @@ mod tests {
         // away so the spare is active) is re-logged-in by the operator. The #13
         // canonical-change re-stash makes it active again; THEN — and only then — its
         // live polls count toward recovery, un-quarantining it after M (2).
-        let roster = vec![
-            account("u-A", "Sessiometer/u-A", "work"),
-            account("u-B", "Sessiometer/u-B", "spare"),
-        ];
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"B-token").await; // `spare` is active post-emergency-swap
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"), // the OLD dead token
@@ -5206,7 +5115,7 @@ mod tests {
 
         let roster: Vec<Account> = accounts
             .iter()
-            .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
+            .map(|(uuid, label)| account(uuid, label))
             .collect();
 
         let store = FakeCredentialStore::empty();
@@ -5438,7 +5347,7 @@ mod tests {
         // Channel — the offline `list` roster view (label, full uuid).
         let roster: Vec<Account> = [A, B, C]
             .iter()
-            .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
+            .map(|(uuid, label)| account(uuid, label))
             .collect();
         corpus.push_str(&crate::cli::render_roster(&roster));
 
@@ -5603,7 +5512,7 @@ mod tests {
         // Roster: A (index 0), B (index 1), C (index 2 — the non-viable distractor).
         let roster: Vec<Account> = [A, B, C]
             .iter()
-            .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
+            .map(|(uuid, label)| account(uuid, label))
             .collect();
 
         // Each account's stash holds its OWN secret blob + a secret-bearing identity.
@@ -5741,9 +5650,9 @@ mod tests {
         // --- the remaining operator channels: the offline `list` view, the UDS error
         // replies, and every Error Display — all secret-free by construction. -------
         corpus.push_str(&crate::cli::render_roster(&[
-            account(A.0, &format!("Sessiometer/{}", A.0), A.1),
-            account(B.0, &format!("Sessiometer/{}", B.0), B.1),
-            account(C.0, &format!("Sessiometer/{}", C.0), C.1),
+            account(A.0, A.1),
+            account(B.0, B.1),
+            account(C.0, C.1),
         ]));
         corpus.push('\n');
         corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);

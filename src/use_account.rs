@@ -181,7 +181,7 @@ impl SwapTarget {
         weekly_trigger: f64,
         in_cooldown: bool,
     ) -> Result<GateOutcome> {
-        if account.stash == active_stash {
+        if account.stash() == active_stash {
             return Ok(GateOutcome::AlreadyActive);
         }
         if in_cooldown {
@@ -189,7 +189,7 @@ impl SwapTarget {
         }
         match poll_viability(poller, account, weekly_trigger).await? {
             Viability::Viable => Ok(GateOutcome::Proceed(SwapTarget {
-                incoming_stash: account.stash.clone(),
+                incoming_stash: account.stash(),
             })),
             Viability::WeeklyExhausted => Ok(GateOutcome::Refused(Refusal::WeeklyExhausted)),
             Viability::Quarantined => Ok(GateOutcome::Refused(Refusal::Quarantined)),
@@ -202,7 +202,7 @@ impl SwapTarget {
     /// [`swap::swap`] (canonical-first read ⇒ a locked keychain still aborts).
     fn forced(account: &Account) -> Self {
         SwapTarget {
-            incoming_stash: account.stash.clone(),
+            incoming_stash: account.stash(),
         }
     }
 
@@ -378,7 +378,7 @@ where
                 .find(|account| account.account_uuid == uuid)
         })
         .ok_or(Error::ActiveAccountUnresolved)?;
-    let active_stash = active.stash.clone();
+    let active_stash = active.stash();
     let active_label = active.label.clone();
 
     let weekly_trigger = f64::from(config.tunables.weekly_trigger) / 100.0;
@@ -644,7 +644,6 @@ mod tests {
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
             account_uuid: uuid.to_owned(),
-            stash: format!("Sessiometer/{uuid}"),
             label: label.to_owned(),
             enabled: true,
         }

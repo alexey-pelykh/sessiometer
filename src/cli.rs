@@ -479,8 +479,9 @@ async fn remove_account(label: Option<String>) -> Result<()> {
     // destructive stash delete, so any failure past here orphans a harmless stash
     // rather than dangling a roster entry at a deleted one.
     config.save()?;
-    // Then delete the now-unreferenced stash — both halves, idempotent.
-    RealAccountStash::new().delete(&removed.stash).await?;
+    // Then delete the now-unreferenced stash — both halves, idempotent. The
+    // service name is derived from the removed account's uuid (issue #70).
+    RealAccountStash::new().delete(&removed.stash()).await?;
     println!("{}", remove_confirmation(&label));
     Ok(())
 }
@@ -513,10 +514,9 @@ mod tests {
     use crate::daemon::{AccountStatusLine, LastSwapLine};
     use std::path::PathBuf;
 
-    fn acct(label: &str, uuid: &str, stash: &str) -> Account {
+    fn acct(label: &str, uuid: &str) -> Account {
         Account {
             account_uuid: uuid.to_owned(),
-            stash: stash.to_owned(),
             label: label.to_owned(),
             enabled: true,
         }
@@ -542,16 +542,8 @@ mod tests {
     #[test]
     fn renders_each_account_then_the_count_total() {
         let out = render_roster(&[
-            acct(
-                "work",
-                "11111111-1111-1111-1111-111111111111",
-                "Sessiometer/11111111-1111-1111-1111-111111111111",
-            ),
-            acct(
-                "personal",
-                "22222222-2222-2222-2222-222222222222",
-                "Sessiometer/22222222-2222-2222-2222-222222222222",
-            ),
+            acct("work", "11111111-1111-1111-1111-111111111111"),
+            acct("personal", "22222222-2222-2222-2222-222222222222"),
         ]);
         assert_eq!(
             out,
@@ -571,7 +563,6 @@ personal  22222222-2222-2222-2222-222222222222\n\
                 acct(
                     &format!("l{i}"),
                     &format!("0000000{i}-0000-0000-0000-000000000000"),
-                    &format!("Sessiometer/0000000{i}"),
                 )
             })
             .collect();
@@ -585,11 +576,7 @@ personal  22222222-2222-2222-2222-222222222222\n\
 
     #[test]
     fn view_renders_a_present_roster() {
-        let config = config_with(vec![acct(
-            "work",
-            "11111111-aaaa",
-            "Sessiometer/11111111-aaaa",
-        )]);
+        let config = config_with(vec![acct("work", "11111111-aaaa")]);
         let out = view(Ok(config)).expect("a present roster is not an error");
         // A single-account roster reads "1 account" (singular), not "1 accounts".
         assert_eq!(out, "work  11111111-aaaa\n\n1 account\n");
@@ -638,11 +625,7 @@ personal  22222222-2222-2222-2222-222222222222\n\
         // fields it shows (`label`, `account_uuid`), so it never auto-introduces a
         // token or email. (A label the operator sets to an email is their own
         // value, not a leak — see issue #69.)
-        let out = render_roster(&[acct(
-            "work",
-            "11111111-1111-1111-1111-111111111111",
-            "Sessiometer/11111111-1111-1111-1111-111111111111",
-        )]);
+        let out = render_roster(&[acct("work", "11111111-1111-1111-1111-111111111111")]);
         assert!(
             !out.contains('@'),
             "list output must not contain an email: {out:?}"
@@ -653,9 +636,9 @@ personal  22222222-2222-2222-2222-222222222222\n\
 
     #[test]
     fn render_roster_marks_a_disabled_account_and_leaves_enabled_ones_unchanged() {
-        let mut work = acct("work", "11111111-1111", "Sessiometer/11111111-1111");
+        let mut work = acct("work", "11111111-1111");
         work.enabled = false;
-        let spare = acct("spare", "22222222-2222", "Sessiometer/22222222-2222");
+        let spare = acct("spare", "22222222-2222");
         let out = render_roster(&[work, spare]);
         assert_eq!(
             out,
@@ -715,7 +698,7 @@ spare  22222222-2222\n\
 
     #[test]
     fn apply_enabled_flips_the_resolved_account_and_reports_change() {
-        let mut roster = vec![acct("work", "u1", "s1"), acct("spare", "u2", "s2")];
+        let mut roster = vec![acct("work", "u1"), acct("spare", "u2")];
         // Resolve `spare` by label and disable it; the other account is untouched.
         assert_eq!(
             apply_enabled(&mut roster, "spare", false).unwrap(),
@@ -733,7 +716,7 @@ spare  22222222-2222\n\
 
     #[test]
     fn apply_enabled_is_idempotent_when_already_in_the_target_state() {
-        let mut roster = vec![acct("work", "u1", "s1")];
+        let mut roster = vec![acct("work", "u1")];
         // Already enabled → Unchanged, so the caller skips the config rewrite.
         assert_eq!(
             apply_enabled(&mut roster, "work", true).unwrap(),
@@ -744,7 +727,7 @@ spare  22222222-2222\n\
 
     #[test]
     fn apply_enabled_rejects_an_unknown_label_without_touching_the_roster() {
-        let mut roster = vec![acct("work", "u1", "s1")];
+        let mut roster = vec![acct("work", "u1")];
         let err =
             apply_enabled(&mut roster, "ghost", false).expect_err("an unmatched label is an error");
         assert!(
@@ -782,15 +765,15 @@ spare  22222222-2222\n\
     #[test]
     fn apply_remove_drops_the_resolved_account_and_returns_it() {
         let mut roster = vec![
-            acct("work", "u1", "Sessiometer/u1"),
-            acct("spare", "u2", "Sessiometer/u2"),
-            acct("backup", "u3", "Sessiometer/u3"),
+            acct("work", "u1"),
+            acct("spare", "u2"),
+            acct("backup", "u3"),
         ];
         // Resolve `spare` by label, remove it, and hand its stash name back so the
         // caller can delete the keychain stash.
         let removed = apply_remove(&mut roster, "spare").expect("a present label removes");
         assert_eq!(removed.label, "spare");
-        assert_eq!(removed.stash, "Sessiometer/u2");
+        assert_eq!(removed.stash(), "Sessiometer/u2");
         // The entry is gone and the survivors keep their order.
         assert_eq!(roster.len(), 2);
         assert_eq!(roster[0].label, "work");
@@ -799,7 +782,7 @@ spare  22222222-2222\n\
 
     #[test]
     fn apply_remove_rejects_an_unknown_label_without_touching_the_roster() {
-        let mut roster = vec![acct("work", "u1", "Sessiometer/u1")];
+        let mut roster = vec![acct("work", "u1")];
         let err = apply_remove(&mut roster, "ghost").expect_err("an unmatched label is an error");
         assert!(
             matches!(err, Error::AccountLabelNotFound { ref label } if label == "ghost"),

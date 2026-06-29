@@ -40,10 +40,6 @@ use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use std::path::Path;
 
-/// The keychain-service namespace prefix; the account's immutable `account_uuid`
-/// is appended to form the per-account stash service `Sessiometer/<account_uuid>`.
-const STASH_PREFIX: &str = "Sessiometer/";
-
 /// Whether a `capture` added a new account or refreshed an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureOutcome {
@@ -143,7 +139,7 @@ async fn run_capture(
     // The final label lives on the rostered account (a refresh may have updated it).
     let label = roster
         .iter()
-        .find(|a| a.stash == stash_name)
+        .find(|a| a.stash() == stash_name)
         .expect("the account just planned is in the roster")
         .label
         .clone();
@@ -178,7 +174,7 @@ fn plan_capture(
         if let Some(l) = provided {
             existing.label = l.to_owned();
         }
-        return Ok((existing.stash.clone(), CaptureOutcome::Refreshed));
+        return Ok((existing.stash(), CaptureOutcome::Refreshed));
     }
 
     // New account: an explicit label is required. There is no roster ceiling
@@ -188,15 +184,16 @@ fn plan_capture(
     // Key the stash by the immutable, server-assigned account_uuid — not a
     // positional slot. The keychain service accepts the uuid (hex + hyphens)
     // verbatim, and the stash uses fixed `acct=credential`/`acct=oauthAccount`,
-    // so no resolve/uniqueness step is needed (unlike the canonical item).
-    let stash = format!("{STASH_PREFIX}{account_uuid}");
-    roster.push(Account {
+    // so no resolve/uniqueness step is needed (unlike the canonical item). The
+    // service name is derived by `Account::stash`, never stored (issue #70).
+    let account = Account {
         account_uuid: account_uuid.to_owned(),
-        stash: stash.clone(),
         label,
         // A freshly captured account joins the rotation enabled (issue #36).
         enabled: true,
-    });
+    };
+    let stash = account.stash();
+    roster.push(account);
     Ok((stash, CaptureOutcome::Captured))
 }
 
@@ -218,10 +215,9 @@ mod tests {
     use super::*;
     use crate::stash::FakeAccountStash;
 
-    fn account(uuid: &str, stash: &str, label: &str) -> Account {
+    fn account(uuid: &str, label: &str) -> Account {
         Account {
             account_uuid: uuid.to_owned(),
-            stash: stash.to_owned(),
             label: label.to_owned(),
             enabled: true,
         }
@@ -241,7 +237,7 @@ mod tests {
         assert_eq!(stash, "Sessiometer/u-1");
         assert_eq!(outcome, CaptureOutcome::Captured);
         assert_eq!(roster.len(), 1);
-        assert_eq!(roster[0], account("u-1", "Sessiometer/u-1", "work"));
+        assert_eq!(roster[0], account("u-1", "work"));
     }
 
     #[test]
@@ -258,7 +254,7 @@ mod tests {
         .unwrap();
         assert_eq!(stash, "Sessiometer/11111111-1111-1111-1111-111111111111");
         assert_eq!(
-            roster[0].stash,
+            roster[0].stash(),
             "Sessiometer/11111111-1111-1111-1111-111111111111"
         );
     }
@@ -294,7 +290,7 @@ mod tests {
 
     #[test]
     fn recapture_is_a_refresh_on_the_same_stash() {
-        let mut roster = vec![account("u-1", "Sessiometer/u-1", "work")];
+        let mut roster = vec![account("u-1", "work")];
         let (stash, outcome) = plan_capture(&mut roster, "u-1", None).unwrap();
         assert_eq!(stash, "Sessiometer/u-1");
         assert_eq!(outcome, CaptureOutcome::Refreshed);
@@ -306,7 +302,7 @@ mod tests {
 
     #[test]
     fn recapture_updates_the_label_when_a_new_one_is_given() {
-        let mut roster = vec![account("u-1", "Sessiometer/u-1", "work")];
+        let mut roster = vec![account("u-1", "work")];
         plan_capture(&mut roster, "u-1", Some("personal")).unwrap();
         assert_eq!(roster[0].label, "personal");
         assert_eq!(roster.len(), 1);
@@ -316,7 +312,7 @@ mod tests {
     fn a_new_account_is_keyed_by_its_account_uuid() {
         // A second distinct account is keyed by its OWN account_uuid — there is no
         // positional slot allocation; the stash is `Sessiometer/<account_uuid>`.
-        let mut roster = vec![account("u-1", "Sessiometer/u-1", "work")];
+        let mut roster = vec![account("u-1", "work")];
         let (stash, outcome) = plan_capture(&mut roster, "u-2", Some("personal")).unwrap();
         assert_eq!(stash, "Sessiometer/u-2");
         assert_eq!(outcome, CaptureOutcome::Captured);
@@ -327,9 +323,7 @@ mod tests {
     fn capturing_beyond_the_former_cap_succeeds() {
         // #35: there is no roster ceiling — a 6th (and beyond) new account is
         // appended, not rejected.
-        let mut roster: Vec<Account> = (1..=5)
-            .map(|i| account(&format!("u-{i}"), &format!("Sessiometer/u-{i}"), "l"))
-            .collect();
+        let mut roster: Vec<Account> = (1..=5).map(|i| account(&format!("u-{i}"), "l")).collect();
         let (stash, outcome) = plan_capture(&mut roster, "u-6", Some("sixth")).unwrap();
         assert_eq!(stash, "Sessiometer/u-6");
         assert_eq!(outcome, CaptureOutcome::Captured);
@@ -374,7 +368,7 @@ mod tests {
         assert_eq!(report.count, 1);
         assert_eq!(report.label, "work");
         assert_eq!(report.config.roster.len(), 1);
-        assert_eq!(report.config.roster[0].stash, "Sessiometer/u-1");
+        assert_eq!(report.config.roster[0].stash(), "Sessiometer/u-1");
         assert_eq!(report.config.roster[0].account_uuid, "u-1");
 
         // Both halves are in the stash under its service name.
@@ -423,7 +417,7 @@ mod tests {
     async fn recapture_refreshes_the_stash_without_growing_the_roster() {
         let stash = FakeAccountStash::empty();
         let existing = Config {
-            roster: vec![account("u-1", "Sessiometer/u-1", "work")],
+            roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
         };
 
@@ -451,7 +445,7 @@ mod tests {
     async fn a_second_distinct_account_is_appended() {
         let stash = FakeAccountStash::empty();
         let existing = Config {
-            roster: vec![account("u-1", "Sessiometer/u-1", "work")],
+            roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
         };
 
@@ -468,7 +462,7 @@ mod tests {
         assert_eq!(report.outcome, CaptureOutcome::Captured);
         assert_eq!(report.count, 2);
         assert_eq!(report.config.roster.len(), 2);
-        assert_eq!(report.config.roster[1].stash, "Sessiometer/u-2");
+        assert_eq!(report.config.roster[1].stash(), "Sessiometer/u-2");
         assert_eq!(stash.len(), 1); // only the new stash was written this call
         assert!(stash.contains("Sessiometer/u-2"));
     }
