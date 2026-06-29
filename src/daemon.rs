@@ -9,27 +9,36 @@
 //! real time, no signals, no socket. The current-thread runtime (see `main`) is
 //! what lets the seams stay free of `Send` bounds.
 //!
-//! ## One cycle ([`Daemon::tick`])
+//! ## One tick ([`Daemon::tick`])
 //!
 //! 1. **Identify the active account.** Resolved once and cached, updated on each
 //!    swap — see [`Daemon::resolve_active`]. `None` (un-identifiable) → poll-only,
 //!    never swap.
-//! 2. **Poll every account.** The active account through the canonical credential
-//!    (its token is the freshest), every other through its stash — the per-account
-//!    seam #5 anticipated (`CurlTransport` is generic over [`CredentialStore`]). A
-//!    failed poll just drops that account from this cycle; the loop never swaps on
-//!    missing data.
-//! 3. **Decide and swap.** If the active account's SESSION usage is at/above the
+//! 2. **Poll ONE account** (issue #80). Each tick polls a single account — the next
+//!    entry in a staggered round-robin schedule (the active account first, then each
+//!    enabled non-active in turn) — through the canonical credential when it is the
+//!    active account (freshest token) or its stash otherwise. Spreading a cycle's N
+//!    polls across N sub-intervals (≈`poll_secs / N` apart) keeps each request in its
+//!    own rate-limit window: the usage endpoint is source-scoped and serves ~one
+//!    request per short window, so the former poll-of-all BURST had all-but-one
+//!    `429`-fail at the CDN edge. The polled account's reading updates its slot in the
+//!    carried `last_readings`; a failed poll clears it. A `429` / `5xx` backs the
+//!    WHOLE loop off (issue #76) — rate-limiting is endpoint-global.
+//! 3. **Decide and swap** on the LAST-KNOWN reading of each account (issue #80) — no
+//!    longer a single-instant poll-of-all, so one account's number may be ~a cycle
+//!    older than another's. If the active account's SESSION usage is at/above the
 //!    session swap-away trigger, OR its WEEKLY usage is at/above the separate
 //!    (typically higher) weekly trigger — each drawn this cycle from its own
 //!    timing strategy and clamped to range (issues #38, #41) — pick the viable
 //!    target whose weekly quota resets soonest (issue #37, [`pick_target`]) and run
 //!    the out-of-band [`swap::swap`]. A per-cycle jittered post-swap cooldown (issue
 //!    #10) refuses a re-swap until it has elapsed, bounding oscillation between two
-//!    near-exhausted accounts.
+//!    near-exhausted accounts. Until the first cycle has polled every account once,
+//!    the swap-away decision HOLDS (warm-up): acting on a partial reading set could
+//!    swap to a suboptimal target or declare a spurious all-exhausted (issue #80).
 //!
 //! The session trigger, the weekly trigger (#41), the cooldown, and the
-//! inter-poll interval are each a
+//! poll interval are each a
 //! [`Strategy`] (base + optional jitter, issue #38): a fresh value is drawn and
 //! clamped to the parameter's range every cycle through the [`SplitMix64`] seam,
 //! so polling/swaps decorrelate across accounts and cycles instead of running in
@@ -794,6 +803,41 @@ struct DecisionState {
     /// keychain lock short-circuits the whole tick (`locked_tick`), whereas this
     /// rides a tick that DID poll and was throttled.
     poll_backoff_streak: u32,
+    /// Last-known usage reading per roster account (issue #80), indexed by roster
+    /// position. The daemon polls ONE account per tick (round-robin, active first),
+    /// so a decision is taken on the most recent reading of EACH account rather than
+    /// a single-instant poll-of-all — one account's number may be ~a cycle older than
+    /// another's. `None` until an account is first polled (or after a poll fails).
+    /// Sized to the roster in [`Daemon::new`]. The decision/snapshot view masks an
+    /// out-of-rotation (disabled / quarantined) non-active account back to `None`
+    /// ([`decision_readings`](Daemon::decision_readings)), so stale carried data can
+    /// never leak into [`pick_target`].
+    last_readings: Vec<Option<Usage>>,
+    /// The staggered poll schedule for the CURRENT cycle (issue #80): the roster
+    /// indices to poll, in order — the active account first (its swap-away trigger is
+    /// the most time-sensitive), then every enabled, non-quarantined non-active
+    /// account. One entry is consumed per tick; when [`poll_pos`](Self::poll_pos)
+    /// reaches its end the schedule is rebuilt for the next cycle (re-resolving active
+    /// and re-reading rotation membership). Empty only for a degenerate roster (no
+    /// active and nothing enabled), in which case a tick polls nothing.
+    poll_schedule: Vec<usize>,
+    /// Cursor into [`poll_schedule`](Self::poll_schedule): the position to poll this
+    /// tick. Advances by one per tick and triggers a schedule rebuild on wrap, so the
+    /// daemon walks active → spare → spare → … one account per sub-interval instead of
+    /// bursting all at once (issue #80).
+    poll_pos: usize,
+    /// Whether each roster account has been polled at least once this run (issue #80),
+    /// indexed by roster position. Drives the warm-up latch below; sized to the roster
+    /// in [`Daemon::new`].
+    polled_once: Vec<bool>,
+    /// Warm-up latch (issue #80): `false` until every account in the FIRST cycle's
+    /// schedule has been polled once, then latched `true` for the run. While `false`
+    /// the swap-away decision HOLDS — no swap and no `all_exhausted` signal — because
+    /// the carried readings are still partial: acting on them could swap to a
+    /// suboptimal target or declare a spurious all-exhausted when an unpolled account
+    /// might still be viable. Once warmed up, [`decide_action`](Daemon::decide_action)
+    /// runs normally on the full last-known set.
+    warmed_up: bool,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -871,6 +915,10 @@ where
     ) -> Self {
         // Per-account health carried across ticks (issue #42), one slot per account.
         let health = vec![AccountHealth::default(); roster.len()];
+        // Carried last-known reading + warm-up tracking per account (issue #80), one
+        // slot per account, sized to the roster like `health`.
+        let last_readings = vec![None; roster.len()];
+        let polled_once = vec![false; roster.len()];
         Self {
             roster,
             poller,
@@ -895,6 +943,8 @@ where
             swap_lock_path: None,
             state: DecisionState {
                 health,
+                last_readings,
+                polled_once,
                 ..DecisionState::default()
             },
         }
@@ -1029,54 +1079,47 @@ where
         }
         let active = self.state.active;
 
-        // Poll every account: the active one via the canonical credential (its
-        // token is the freshest), every other via its stash. A failed poll
-        // (transient / 401 / unreadable) leaves that account's reading absent — it
-        // is simply not a candidate this cycle, and the loop never swaps on
-        // missing data. The poll OUTCOME also feeds the event log (issue #9): a 401
-        // or a 403 each emits one line, in roster order, and the per-account 401
-        // streak is maintained here. (A locked keychain is handled at top-of-tick,
-        // not per-account — see `locked_tick`.)
-        let mut readings: Vec<Option<Usage>> = Vec::with_capacity(self.roster.len());
-        // Track whether ANY polled account this cycle was rate-limited (`429`) or hit
-        // a transient (`5xx` / network) failure, plus the largest server-advised
-        // `Retry-After` among them — the inputs to the poll back-off (issue #76).
-        // Rate-limiting is an endpoint-global signal (one usage endpoint for the whole
-        // roster), so any account seeing it backs off the whole loop.
+        // Poll ONE account this tick — the next entry in the staggered schedule
+        // (issue #80): active first, then each enabled, non-quarantined non-active in
+        // turn, one account per sub-interval, so the N requests of a cycle land in N
+        // separate rate-limit windows instead of a single back-to-back burst (most of
+        // which the source-scoped usage endpoint `429`s at the CDN edge). The polled
+        // account's reading replaces its slot in the carried `last_readings`; every
+        // OTHER slot keeps its most-recent value, so the decision below is taken on
+        // last-known-per-account readings (one account's number may be ~a cycle older
+        // than another's). The poll OUTCOME still feeds the event log (issue #9: a 401
+        // / 403 each emits a line) and the diagnostic channel (issue #77). The active
+        // account is polled through the canonical credential (freshest token); a
+        // disabled / quarantined active is still polled (swap-AWAY trigger, dead-active
+        // re-probe), never a disabled / quarantined non-active. A locked keychain is
+        // handled at top-of-tick, not here (see `locked_tick`).
+        let poll_idx = self.next_poll_index(active);
+        // Whether THIS poll was rate-limited (`429`) or a transient (`5xx` / network)
+        // failure, with any server-advised `Retry-After` — the inputs to the poll
+        // back-off (issue #76). Rate-limiting is an endpoint-global signal (one usage
+        // endpoint for the whole roster), so the single account seeing it this tick
+        // backs off the WHOLE loop, not just itself.
         let mut backed_off = false;
         let mut retry_after_floor: Option<Duration> = None;
-        for i in 0..self.roster.len() {
-            // Skip polling a disabled (parked, #36) or QUARANTINED (dead, #42)
-            // non-active account: neither is a swap target and a poll would waste a
-            // `curl` (a quarantined account's stored token is dead). Its reading
-            // stays absent (`None`), keeping `readings` indexed by roster position
-            // and auto-excluding it from `pick_target`. The ACTIVE account is ALWAYS
-            // polled — even when disabled (so its swap-AWAY trigger still fires) or
-            // quarantined (so a dead active is re-probed: a 401 keeps it dead and
-            // drives the emergency swap; a success is a recovery probe, #42).
-            if active != Some(i) && (!self.roster[i].enabled || self.state.health[i].quarantined) {
-                readings.push(None);
-                continue;
-            }
+        if let Some(i) = poll_idx {
             let result = self.poller.poll(&self.roster[i], active == Some(i)).await;
             self.note_poll_outcome(i, &result, &mut events);
-            // Diagnostic per-poll outcome (issue #77): every polled account, in
-            // roster order — including the `live` and `rate_limited`/`transient`
-            // outcomes the event log records NO event for (the #77 invisibility).
             diagnostics.push(Diagnostic::Poll {
                 account: self.roster[i].label.clone(),
                 outcome: diag_poll_class(&result),
             });
             if let Some(signal) = backoff_signal(&result) {
                 backed_off = true;
-                if let Some(ra) = signal.retry_after {
-                    retry_after_floor =
-                        Some(retry_after_floor.map_or(ra, |current| current.max(ra)));
-                }
+                retry_after_floor = signal.retry_after;
             }
-            readings.push(result.ok());
+            self.state.last_readings[i] = result.ok();
+            self.note_polled(i);
         }
 
+        // Decide on the carried last-known readings, masking an out-of-rotation
+        // (disabled / quarantined) non-active account back to `None` so its stale
+        // carried value can never become a swap target (issue #80).
+        let readings = self.decision_readings(active);
         let action = self.decide_action(at, active, &readings, &mut events).await;
         // Edge-trigger the all-exhausted signal (issue #11): clear the guard
         // whenever this cycle is NOT the no-viable-target state, so a later
@@ -1119,6 +1162,101 @@ where
             snapshot,
             next_wait,
         }
+    }
+
+    /// The roster index to poll THIS tick — the next entry in the staggered schedule
+    /// (issue #80) — advancing the cursor and rebuilding the schedule at the start of
+    /// each cycle. The schedule is the active account first, then every enabled,
+    /// non-quarantined non-active account (see [`build_poll_schedule`](Self::build_poll_schedule));
+    /// consuming one entry per tick spaces a cycle's N polls across N sub-intervals.
+    /// `None` only for a degenerate roster whose schedule is empty (no active and
+    /// nothing enabled) — that tick polls nothing and simply decides + waits.
+    fn next_poll_index(&mut self, active: Option<usize>) -> Option<usize> {
+        // Start of a cycle: rebuild the schedule from the freshly-resolved active and
+        // current rotation membership (a swap or an enable/disable since last cycle is
+        // picked up here, at the cycle boundary).
+        if self.state.poll_pos >= self.state.poll_schedule.len() {
+            self.state.poll_schedule = self.build_poll_schedule(active);
+            self.state.poll_pos = 0;
+        }
+        let idx = self.state.poll_schedule.get(self.state.poll_pos).copied();
+        self.state.poll_pos += 1;
+        idx
+    }
+
+    /// Build this cycle's poll schedule (issue #80): the active account FIRST (its
+    /// swap-away trigger is the most time-sensitive), then every enabled (#36),
+    /// non-quarantined (#42) non-active account in roster order. The active account is
+    /// always included even when disabled / quarantined (its swap-AWAY trigger must
+    /// still fire and a dead active is re-probed), exactly as the former poll-all loop
+    /// did; a disabled / quarantined non-active is excluded (never a swap target, and
+    /// polling its dead token would waste a `curl`).
+    fn build_poll_schedule(&self, active: Option<usize>) -> Vec<usize> {
+        let mut schedule = Vec::with_capacity(self.roster.len());
+        if let Some(a) = active {
+            schedule.push(a);
+        }
+        for i in 0..self.roster.len() {
+            if active == Some(i) {
+                continue; // already first
+            }
+            if self.roster[i].enabled && !self.state.health[i].quarantined {
+                schedule.push(i);
+            }
+        }
+        schedule
+    }
+
+    /// Record that account `i` was polled this run and latch the warm-up flag (issue
+    /// #80) once every account in the current schedule has been polled at least once —
+    /// i.e. the first full cycle is complete and the carried readings are no longer
+    /// partial. Until then the swap-away decision HOLDS (see
+    /// [`decide_action`](Self::decide_action)).
+    fn note_polled(&mut self, i: usize) {
+        self.state.polled_once[i] = true;
+        if !self.state.warmed_up
+            && self
+                .state
+                .poll_schedule
+                .iter()
+                .all(|&j| self.state.polled_once[j])
+        {
+            self.state.warmed_up = true;
+        }
+    }
+
+    /// The per-account readings the decision and snapshot operate on (issue #80): the
+    /// carried last-known reading for the active account and every enabled,
+    /// non-quarantined account, but `None` for a disabled (#36) / quarantined (#42)
+    /// NON-active account. The mask mirrors the former poll-all loop (which pushed
+    /// `None` for a skipped account), so a stale carried reading for an account that
+    /// has since left the rotation can never be selected by [`pick_target`] — and the
+    /// snapshot keeps showing such an account as unavailable, not at a stale number.
+    fn decision_readings(&self, active: Option<usize>) -> Vec<Option<Usage>> {
+        (0..self.roster.len())
+            .map(|i| {
+                if active == Some(i)
+                    || (self.roster[i].enabled && !self.state.health[i].quarantined)
+                {
+                    self.state.last_readings[i]
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The number of accounts in the current poll rotation (issue #80): the active
+    /// account plus every enabled, non-quarantined non-active account — the schedule
+    /// length, and the divisor that spreads a cycle's polls across the interval (see
+    /// [`next_subinterval`](Self::next_subinterval)). At least 0; callers clamp to ≥ 1.
+    fn rotation_len(&self) -> usize {
+        (0..self.roster.len())
+            .filter(|&i| {
+                self.state.active == Some(i)
+                    || (self.roster[i].enabled && !self.state.health[i].quarantined)
+            })
+            .count()
     }
 
     /// The keychain was LOCKED when this cycle went to read the canonical
@@ -1402,6 +1540,17 @@ where
         if swap::decide(&active_usage, session_trigger, weekly_trigger) == SwapDecision::Hold {
             return TickAction::Held;
         }
+        // Over the trigger — but until the staggered loop has polled every account in
+        // the rotation at least once (issue #80 warm-up), the carried readings are
+        // still partial: a swap now could pick a suboptimal target (a soonest-reset
+        // account not yet polled, #37) or declare a spurious `all_exhausted` when an
+        // unpolled account is in fact viable (#11). HOLD until the first cycle
+        // completes, then decide on the full last-known set. (Emergency swaps away from
+        // a confirmed-dead active are NOT gated — they take a separate path above and
+        // self-correct by retrying as targets become known.)
+        if !self.state.warmed_up {
+            return TickAction::Held;
+        }
         // Over the trigger. Cooldown (anti-oscillation, #10): refuse a re-swap
         // until this cycle's (jittered) cooldown has elapsed since the last swap,
         // so two near-exhausted accounts cannot ping-pong.
@@ -1655,9 +1804,12 @@ where
         }
     }
 
-    /// Draw this cycle's poll interval from the poll strategy (issue #38),
+    /// Draw this cycle's FULL poll interval from the poll strategy (issue #38),
     /// clamped to the valid `5..=3600` s range. The fixed (no-jitter) case
-    /// returns the base verbatim; deterministic under a seeded RNG.
+    /// returns the base verbatim; deterministic under a seeded RNG. This is the
+    /// per-account cadence (how often any one account is re-polled) and the base of
+    /// the rate-limit back-off (issue #76); the staggered loop spreads it across the
+    /// rotation via [`next_subinterval`](Self::next_subinterval).
     pub(crate) fn next_poll_interval(&mut self) -> Duration {
         Duration::from_secs_f64(
             self.poll_strategy
@@ -1665,10 +1817,23 @@ where
         )
     }
 
-    /// Sleep until the next poll is due — a freshly drawn, jittered interval
-    /// (issue #38) handed to the [`Clock`] seam.
-    pub(crate) async fn wait_for_next_poll(&mut self) {
+    /// The wait between two consecutive single-account polls (issue #80): the full
+    /// jittered interval divided by the rotation size, so the N accounts of a cycle
+    /// are spaced ~`poll_secs / N` apart (≈40–45 s for a typical roster) and a full
+    /// sweep still takes ~one `poll_secs`. Each sub-interval draws a fresh full
+    /// interval (inheriting the #38 jitter decorrelation) before dividing. The divisor
+    /// is clamped to ≥ 1 so a single-account roster simply waits the whole interval —
+    /// there is nothing to stagger and no burst is possible.
+    fn next_subinterval(&mut self) -> Duration {
         let interval = self.next_poll_interval();
+        let len = self.rotation_len().max(1) as u32;
+        interval / len
+    }
+
+    /// Sleep until the next single-account poll is due — a freshly drawn, jittered
+    /// sub-interval (issues #38, #80) handed to the [`Clock`] seam.
+    pub(crate) async fn wait_for_next_poll(&mut self) {
+        let interval = self.next_subinterval();
         self.clock.tick(interval).await;
     }
 
@@ -2372,6 +2537,29 @@ mod tests {
 
     type FakeDaemon = Daemon<FakeRosterPoller, FakeCredentialStore, FakeAccountStash, FakeClock>;
 
+    /// Drive the staggered daemon (issue #80) through one full warm-up cycle — one
+    /// tick per in-rotation account — and return the LAST tick's outcome. By then
+    /// every account has a fresh last-known reading and the warm-up latch is set, so
+    /// that tick takes the first real swap-away decision on a FULL reading set: the
+    /// staggered-era equivalent of the pre-#80 single poll-all `tick`. The latch is
+    /// set inside the tick that polls the last schedule entry (before its
+    /// `decide_action`), so the returned outcome already reflects the warmed decision.
+    async fn warmed_tick(daemon: &mut FakeDaemon) -> TickOutcome {
+        // Warm-up latches within one full cycle — at most one tick per in-rotation
+        // account, so never more than the roster size. Bound the loop accordingly (+1
+        // slack) so a misuse on a roster that can NEVER warm up — no identifiable
+        // active AND nothing enabled, i.e. an empty schedule whose `note_polled` never
+        // fires — fails LOUDLY here instead of hanging the test forever.
+        let max_ticks = daemon.roster.len() + 1;
+        for _ in 0..max_ticks {
+            let outcome = daemon.tick().await;
+            if daemon.state.warmed_up {
+                return outcome;
+            }
+        }
+        panic!("warm-up did not complete within {max_ticks} ticks — empty/degenerate schedule?");
+    }
+
     // --- pick_target (pure) ------------------------------------------------
 
     // A weekly trigger well above every reading in the pick_target tests below, so
@@ -2826,7 +3014,7 @@ mod tests {
             json.clone(),
             &tun,
         );
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 2 });
         // The canonical item now holds C's token, and the display shows C…
@@ -2875,7 +3063,7 @@ mod tests {
             json.clone(),
             &tun,
         );
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         // Swapped to the ENABLED spare, not the parked account.
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 2 });
@@ -2916,27 +3104,41 @@ mod tests {
             json,
             &tun,
         );
-        let outcome = daemon.tick().await;
-
-        assert_eq!(outcome.action, TickAction::Held);
+        // Tick 1 polls the active `work` first (issue #80 stagger), below its trigger.
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::Held);
         // No swap has happened, so `status` would show `last swap: none`.
-        assert!(outcome.snapshot.last_swap.is_none());
+        assert!(first.snapshot.last_swap.is_none());
         assert!(daemon
             .store
             .read()
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
-        // Diagnostic channel (#77): a per-poll line per account (both live, in roster
-        // order), then the per-tick Hold decision with NO back-off — and, not having
-        // been in the all-exhausted state, NO leave marker.
+        // Diagnostic channel (#77): ONE per-poll line this tick (the staggered loop
+        // polls a single account per sub-interval), then the per-tick Hold decision
+        // with NO back-off — and, not having been in the all-exhausted state, NO leave
+        // marker.
         assert_eq!(
-            outcome.diagnostics,
+            first.diagnostics,
             vec![
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::Live,
                 },
+                Diagnostic::Tick {
+                    decision: DecisionClass::Hold,
+                    backoff_secs: None,
+                },
+            ],
+        );
+        // Tick 2 polls the non-active `spare` (next in the round-robin) and still holds
+        // — both accounts are below trigger, just observed one sub-interval apart.
+        let second = daemon.tick().await;
+        assert_eq!(second.action, TickAction::Held);
+        assert_eq!(
+            second.diagnostics,
+            vec![
                 Diagnostic::Poll {
                     account: "spare".to_owned(),
                     outcome: PollClass::Live,
@@ -2978,7 +3180,7 @@ mod tests {
             json.clone(),
             &tun,
         );
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
         assert!(daemon
@@ -3533,39 +3735,213 @@ mod tests {
         )
         .await;
 
-        let outcome = daemon.tick().await;
-        assert_eq!(outcome.next_wait, Some(Duration::from_secs(120)));
+        // Tick 1 polls the ACTIVE A (clean) — no back-off from this account.
+        let first = daemon.tick().await;
+        assert_eq!(first.next_wait, None);
+        // Tick 2 polls the NON-active B (the next round-robin entry), which is
+        // rate-limited — and the WHOLE loop backs off (2× the 60 s interval), even
+        // though B is not the active account: rate-limiting is endpoint-global.
+        let second = daemon.tick().await;
+        assert_eq!(second.next_wait, Some(Duration::from_secs(120)));
     }
 
     #[tokio::test]
-    async fn the_largest_retry_after_across_accounts_governs_the_back_off() {
-        // When more than one account is throttled in the same cycle, the back-off
-        // honours the LARGEST server-advised `Retry-After` among them (a fold by
-        // `max`), so the daemon waits at least as long as the most-constrained reply
-        // asks. The fold is order-independent — proven by reversing which account
-        // carries the larger value and getting the same wait. 300 s > the 120 s
-        // first-cycle exponential, so the folded floor governs.
-        let (_d1, mut larger_second) = two_account_rate_limit_daemon(
+    async fn a_throttled_non_active_accounts_retry_after_governs_the_global_back_off() {
+        // The staggered loop (issue #80) polls ONE account per tick, so the former
+        // same-cycle fold across accounts no longer applies — but the back-off is still
+        // endpoint-global and still honours the throttled account's `Retry-After`,
+        // whichever account in the rotation hits it. Here the active A polls clean (no
+        // back-off) and the non-active B carries a `Retry-After` of 300 s on its
+        // round-robin tick; 300 s > the 120 s first-cycle exponential, so B's hint
+        // governs the WHOLE loop's wait even though B is not the active account.
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
             FakeRosterPoller::new()
-                .rate_limited("u-A", Some(Duration::from_secs(100)))
+                .ok("u-A", 0.10, 0.10)
                 .rate_limited("u-B", Some(Duration::from_secs(300))),
         )
         .await;
+        // Tick 1: active A, clean — no back-off.
+        assert_eq!(daemon.tick().await.next_wait, None);
+        // Tick 2: non-active B, throttled with Retry-After 300 → the loop waits 300 s.
         assert_eq!(
-            larger_second.tick().await.next_wait,
+            daemon.tick().await.next_wait,
             Some(Duration::from_secs(300))
         );
+    }
 
-        let (_d2, mut larger_first) = two_account_rate_limit_daemon(
+    // --- #80 staggered round-robin poll scheduling -------------------------
+    //
+    // The cycle no longer bursts every account in one tick. Each tick polls ONE
+    // account from a round-robin schedule — the active first (its swap-away trigger
+    // is the most time-sensitive, so it is polled every cycle), then the enabled,
+    // non-quarantined non-actives — carrying the rest at their last-known reading.
+    // The swap-away decision HOLDS until a warm-up cycle has polled everyone once,
+    // and the per-poll wait is the full interval spread across the rotation. Every
+    // seam is hermetic — no real clock or network (AC #4).
+
+    /// A three-account daemon (`work` active, `spare`, `backup`) with the canonical
+    /// holding `work`'s token — the fixture for the scheduling tests below. The
+    /// caller supplies the poller so each test scripts its own per-account readings.
+    async fn three_account_daemon(poller: FakeRosterPoller) -> FakeDaemon {
+        let roster = vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "backup"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        // Keep the temp `~/.claude.json` alive for the daemon's lifetime by leaking
+        // the guard — these are short-lived unit-test daemons (as `lifecycle_daemon`).
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+    }
+
+    #[tokio::test]
+    async fn each_tick_polls_one_account_and_carries_the_rest_at_their_last_reading() {
+        // AC #1/#2: no N-request burst — each tick polls exactly ONE account, and the
+        // decision set accumulates the others as last-known readings rather than
+        // re-polling them. Distinct per-account session values make the polled slot
+        // identifiable: exactly one new reading lands per tick, in round-robin order
+        // (active `work` first, then `spare`, then `backup`).
+        let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
-                .rate_limited("u-A", Some(Duration::from_secs(300)))
-                .rate_limited("u-B", Some(Duration::from_secs(100))),
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
         )
         .await;
+        let sessions = |d: &FakeDaemon| -> Vec<Option<f64>> {
+            d.state
+                .last_readings
+                .iter()
+                .map(|u| u.as_ref().map(|r| r.session))
+                .collect()
+        };
+
+        daemon.tick().await;
         assert_eq!(
-            larger_first.tick().await.next_wait,
-            Some(Duration::from_secs(300))
+            sessions(&daemon),
+            vec![Some(0.11), None, None],
+            "tick 1 polls only the active work; spare/backup are still unread"
         );
+        daemon.tick().await;
+        assert_eq!(
+            sessions(&daemon),
+            vec![Some(0.11), Some(0.22), None],
+            "tick 2 adds spare, carrying work's earlier reading"
+        );
+        daemon.tick().await;
+        assert_eq!(
+            sessions(&daemon),
+            vec![Some(0.11), Some(0.22), Some(0.33)],
+            "tick 3 completes the cycle — every account now carried at its last reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_poll_schedule_leads_with_the_active_then_round_robins_and_wraps() {
+        // AC #1/#2: the schedule is the active account FIRST (polled every cycle),
+        // then the enabled non-quarantined non-actives in roster order; the cursor
+        // advances one entry per tick and wraps at the cycle boundary.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // With `spare` (index 1) active, the schedule leads with it, then the others.
+        assert_eq!(daemon.build_poll_schedule(Some(1)), vec![1, 0, 2]);
+
+        // Driving the cursor a full cycle plus one yields the wrap back to the lead.
+        let polled: Vec<usize> = (0..4)
+            .map(|_| daemon.next_poll_index(Some(1)).unwrap())
+            .collect();
+        assert_eq!(
+            polled,
+            vec![1, 0, 2, 1],
+            "active-first, then round-robin, then wrap to the lead"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sub_interval_spreads_a_cycle_across_the_rotation() {
+        // AC #1: the per-poll wait is the full interval (60 s here, fixed) divided by
+        // the rotation size, so a 3-account cycle spaces its polls 20 s apart and a
+        // full sweep still spans ~one interval — instead of three back-to-back polls.
+        let mut three = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        assert_eq!(three.next_subinterval(), Duration::from_secs(20));
+
+        // A single-account roster has nothing to stagger: it waits the WHOLE interval,
+        // so the cadence is unchanged from before the split (divisor clamped to ≥ 1).
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+        let (_dir, json) = claude_json("u-A");
+        let tun = tunables(95, 80, 0);
+        let mut solo: FakeDaemon = Daemon::new(
+            vec![account("u-A", "work")],
+            FakeRosterPoller::new().ok("u-A", 0.10, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        assert_eq!(solo.next_subinterval(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn the_warm_up_cycle_holds_the_swap_until_every_account_is_polled_once() {
+        // AC #2: until the staggered loop has polled every account once the carried
+        // readings are partial — swapping then could pick a suboptimal target or
+        // declare a spurious all-exhausted. So the swap-away decision HOLDS through the
+        // warm-up cycle and fires only on the full last-known set. Active `work` is
+        // over its trigger from tick 1, yet the swap waits for the third (final) tick.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.97, 0.10) // active, over the 95 % session trigger
+                .ok("u-B", 0.10, 0.10) // the viable target
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::Held, "tick 1: still warming up");
+        assert!(!daemon.state.warmed_up);
+
+        let second = daemon.tick().await;
+        assert_eq!(second.action, TickAction::Held, "tick 2: still warming up");
+        assert!(!daemon.state.warmed_up);
+
+        let third = daemon.tick().await;
+        assert_eq!(
+            third.action,
+            TickAction::Swapped { from: 0, to: 1 },
+            "tick 3: warm-up complete → the swap fires on the full last-known set"
+        );
+        assert!(daemon.state.warmed_up);
     }
 
     #[tokio::test]
@@ -3719,7 +4095,7 @@ mod tests {
             json,
             &tun,
         );
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::NoViableTarget);
         // The floor-driven no-viable-target path emits one all_exhausted event.
@@ -3783,8 +4159,9 @@ mod tests {
             &tun,
         );
 
-        // First tick: detect all-exhausted, hold on B (soonest reset), emit once.
-        let first = daemon.tick().await;
+        // First full cycle warms up the carried readings; its last tick detects
+        // all-exhausted, holds on B (soonest reset), and emits once (issue #80).
+        let first = warmed_tick(&mut daemon).await;
         assert_eq!(first.action, TickAction::NoViableTarget);
         assert_eq!(
             first.events,
@@ -3852,12 +4229,12 @@ mod tests {
             !daemon.state.signaled_all_exhausted,
             "leaving the all-exhausted state must clear the edge guard",
         );
-        // And the full diagnostic vec (#77), in emission order: a per-poll line per
-        // account (both live, in roster order), then — exactly ONCE — the
-        // `AllExhaustedCleared` LEAVE marker (the symmetric partner of the
-        // edge-triggered ENTER), then the per-tick Hold decision. The marker is
-        // computed from the guard BEFORE the reset above, so a genuine leave is told
-        // apart from a never-entered hold (a stale "all exhausted" reading vs a
+        // And the full diagnostic vec (#77), in emission order: ONE per-poll line (the
+        // staggered loop polls a single account — the active `work` — this tick), then
+        // — exactly ONCE — the `AllExhaustedCleared` LEAVE marker (the symmetric
+        // partner of the edge-triggered ENTER), then the per-tick Hold decision. The
+        // marker is computed from the guard BEFORE the reset above, so a genuine leave
+        // is told apart from a never-entered hold (a stale "all exhausted" reading vs a
         // current one — the #77 motivation). Asserting the whole vec — not just the
         // marker count — pins the operator-visible ORDER against an accidental reorder.
         assert_eq!(
@@ -3865,10 +4242,6 @@ mod tests {
             vec![
                 Diagnostic::Poll {
                     account: "work".to_owned(),
-                    outcome: PollClass::Live,
-                },
-                Diagnostic::Poll {
-                    account: "spare".to_owned(),
                     outcome: PollClass::Live,
                 },
                 Diagnostic::AllExhaustedCleared,
@@ -3996,7 +4369,9 @@ mod tests {
         });
         daemon.clock.advance(Duration::from_secs(10)); // still within the 100s cooldown
 
-        let outcome = daemon.tick().await;
+        // Warm up the carried readings first (issue #80); the warmed tick then takes
+        // the real decision — the cooldown skip — within the window.
+        let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::SkippedCooldown);
         // No swap despite A being over the trigger and B wide open.
@@ -4039,7 +4414,7 @@ mod tests {
         });
         daemon.clock.advance(Duration::from_secs(150)); // past the 100s cooldown
 
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
     }
@@ -4075,9 +4450,10 @@ mod tests {
             &tun,
         );
 
-        // Tick 1 (window opens): A is over the trigger, no prior swap → swap A→B.
+        // First cycle (window opens): warm up the readings, then A — over the trigger
+        // with no prior swap — swaps A→B (issue #80 warm-up).
         assert_eq!(
-            daemon.tick().await.action,
+            warmed_tick(&mut daemon).await.action,
             TickAction::Swapped { from: 0, to: 1 }
         );
 
@@ -4148,7 +4524,7 @@ mod tests {
         assert_eq!(armed.at, daemon.clock.now());
 
         daemon.clock.advance(Duration::from_secs(10)); // within the 100s cooldown
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         // The daemon HOLDS on the operator's choice — no immediate revert.
         assert_eq!(outcome.action, TickAction::SkippedCooldown);
@@ -4189,7 +4565,7 @@ mod tests {
             &tun,
         );
 
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         // Without the cooldown armed, the daemon reverts the (unannounced) manual swap.
         assert_eq!(outcome.action, TickAction::Swapped { from: 1, to: 0 });
@@ -4260,7 +4636,7 @@ mod tests {
         )
         .with_swap_lock(lock_dir.path().join("swap.lock"));
 
-        let outcome = daemon.tick().await;
+        let outcome = warmed_tick(&mut daemon).await;
 
         // The swap landed normally, the lock acquired and released around it: A→B.
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
@@ -4363,7 +4739,7 @@ mod tests {
                 &tun,
             )
             .with_seed(seed);
-            daemon.tick().await.action
+            warmed_tick(&mut daemon).await.action
         }
         // Determinism: the same seed replays the same decision.
         assert_eq!(action_for(11).await, action_for(11).await);
@@ -4421,7 +4797,7 @@ mod tests {
                 &tun,
             )
             .with_seed(seed);
-            daemon.tick().await.action
+            warmed_tick(&mut daemon).await.action
         }
         // Determinism: the same seed replays the same decision.
         assert_eq!(action_for(11).await, action_for(11).await);
@@ -4481,7 +4857,7 @@ mod tests {
                 at: daemon.clock.now(),
             });
             daemon.clock.advance(Duration::from_secs(100));
-            daemon.tick().await.action
+            warmed_tick(&mut daemon).await.action
         }
         assert_eq!(action_for(5).await, action_for(5).await);
         let mut skipped = 0;
@@ -4806,9 +5182,11 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_carries_last_swap_with_a_relative_age_after_a_swap() {
-        // Tick 1: A is over the trigger → swap to B; the snapshot reports the swap
-        // at age 0. Advance the clock; tick 2 holds (B is fresh) but the snapshot
-        // still reports the swap, now aged by the elapsed time.
+        // Once warmed up (issue #80: both accounts polled once across the staggered
+        // cycle), A is over the trigger → swap to B; the snapshot reports the swap at
+        // age 0 (the clock has not advanced during warm-up since it is frozen).
+        // Advance the clock; the next tick holds (B is fresh) but the snapshot still
+        // reports the swap, now aged by the elapsed time.
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -4817,7 +5195,7 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
-        // After the swap, B is active; keep B below the trigger so tick 2 holds.
+        // After the swap, B is active; keep B below the trigger so the next tick holds.
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.97, 0.40)
             .ok("u-B", 0.10, 0.10);
@@ -4832,7 +5210,7 @@ mod tests {
             &tun,
         );
 
-        let first = daemon.tick().await;
+        let first = warmed_tick(&mut daemon).await;
         assert_eq!(first.action, TickAction::Swapped { from: 0, to: 1 });
         let swap = first.snapshot.last_swap.expect("a swap was recorded");
         assert_eq!(swap.to, "spare");
@@ -5023,9 +5401,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_loop_completes_a_swap_before_a_concurrent_shutdown() {
-        // Tick 1 triggers a swap; shutdown is then requested. Because a swap runs
-        // to completion inside `tick` (shutdown is only observed between ticks),
-        // the post-loop state is coherent — no half-swap.
+        // The warm-up cycle (issue #80) polls A then B across two staggered ticks;
+        // the swap fires on the warm-up-completing second tick. Shutdown is then
+        // requested. Because a swap runs to completion inside `tick` (shutdown is only
+        // observed between ticks), the post-loop state is coherent — no half-swap.
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -5051,9 +5430,9 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        // after(2): 1 idle shutdown-check + 1 start-up check (#76 de-burst) — stop
-        // right after the first tick.
-        let mut shutdown = FakeShutdown::after(2);
+        // after(3): 1 start-up check (#76 de-burst) + 2 idle shutdown-checks — run
+        // both warm-up ticks (poll A, then poll B + swap), then stop.
+        let mut shutdown = FakeShutdown::after(3);
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
@@ -5061,8 +5440,9 @@ mod tests {
             .await
             .unwrap();
 
-        // The single tick's swap landed fully: canonical = B, display = B, active = B.
-        assert_eq!(daemon.state.ticks, 1);
+        // The warm-up-completing tick's swap landed fully: canonical = B, display = B,
+        // active = B.
+        assert_eq!(daemon.state.ticks, 2);
         assert!(daemon
             .store
             .read()
@@ -5203,14 +5583,17 @@ mod tests {
 
     #[tokio::test]
     async fn run_loop_logs_one_line_per_poll_rejection_each_tick() {
-        // Issue #9 acceptance (as amended by #13): each PER-ACCOUNT poll rejection
-        // — a 401 and a 403 (missing usage scope) — emits EXACTLY one structured
-        // line per occurrence. A per-account keychain-lock is now SILENT here: the
-        // lock is process-global and signaled once at top-of-tick (#13), not per
-        // poll. A roster where one account 401s, one hits a (now-silent) lock, and
-        // one 403s, run for two ticks, writes two lines per EMITTING account — and
-        // the 401 streak must climb 1 → 2, proving `note_poll_outcome` is wired into
-        // the loop and serialized.
+        // Issue #9 acceptance (as amended by #13, #80): each PER-ACCOUNT poll
+        // rejection — a 401 and a 403 (missing usage scope) — emits EXACTLY one
+        // structured line per occurrence. A per-account keychain-lock is now SILENT
+        // here: the lock is process-global and signaled once at top-of-tick (#13),
+        // not per poll. The staggered loop (#80) polls ONE account per tick in
+        // round-robin (active A first, then B, then C), so a full sweep of the
+        // 3-account roster takes three ticks; running FOUR ticks polls A twice
+        // (ticks 1 and 4) — proving the per-account 401 streak climbs 1 → 2 across
+        // its own re-polls — with B's (silent) lock on tick 2 and C's 403 on tick 3
+        // in between, demonstrating `note_poll_outcome` is wired into the loop and
+        // serialized.
         let roster = vec![
             account("u-A", "work"),
             account("u-B", "spare"),
@@ -5242,8 +5625,9 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        // after(3): 2 idle shutdown-checks + 1 start-up check (#76 de-burst).
-        let mut shutdown = FakeShutdown::after(3);
+        // after(5): 4 idle shutdown-checks + 1 start-up check (#76 de-burst) — four
+        // staggered ticks (A, B, C, A).
+        let mut shutdown = FakeShutdown::after(5);
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
@@ -5251,13 +5635,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(daemon.state.ticks, 2);
+        assert_eq!(daemon.state.ticks, 4);
 
-        // Two ticks × two EMITTING accounts (401 + 403) = four event lines, each
-        // stamped, none carrying secret material (handles only — never a token or
-        // email). The locked account contributes nothing per-account (#13).
+        // Across the four staggered ticks (#80), A 401s twice (ticks 1, 4) and C 403s
+        // once (tick 3) → three event lines, each stamped, none carrying secret
+        // material (handles only — never a token or email). The locked account B
+        // contributes nothing per-account (#13).
         let logged = std::fs::read_to_string(&log_path).unwrap();
-        assert_eq!(logged.lines().count(), 4, "four lines: {logged:?}");
+        assert_eq!(logged.lines().count(), 3, "three lines: {logged:?}");
         assert!(
             logged.lines().all(|l| l.starts_with("ts=")),
             "stamped: {logged:?}"
@@ -5279,13 +5664,14 @@ mod tests {
             !logged.contains("event=keychain_locked_wait"),
             "a per-account lock must not emit a line: {logged:?}"
         );
-        // The 403 line renders once per tick and carries `status=403`.
+        // The 403 line renders once per poll of C (one poll across the four staggered
+        // ticks, #80) and carries `status=403`.
         assert_eq!(
             logged
                 .lines()
                 .filter(|l| l.contains("event=usage_scope_fail account=backup status=403"))
                 .count(),
-            2,
+            1,
             "{logged:?}"
         );
         // The active account was unavailable every tick, so no swap line appears;
@@ -5318,6 +5704,7 @@ mod tests {
         let (_dir, json) = claude_json("u-A");
         // Session 0.50 is below the 95 % session trigger; weekly 0.99 is over the
         // fixed 98 % weekly trigger → a weekly-only swap. Target B is under the floor.
+        // The swap fires on the warm-up-completing second staggered tick (#80).
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.50, 0.99)
             .ok("u-B", 0.10, 0.10);
@@ -5335,8 +5722,9 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        // after(2): 1 idle shutdown-check + 1 start-up check (#76 de-burst).
-        let mut shutdown = FakeShutdown::after(2);
+        // after(3): 2 idle shutdown-checks + 1 start-up check (#76 de-burst) — two
+        // warm-up ticks (poll A, then poll B + swap).
+        let mut shutdown = FakeShutdown::after(3);
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
@@ -5519,7 +5907,10 @@ mod tests {
         // `spare` is already dead from a prior episode.
         daemon.state.health[1].quarantined = true;
 
-        let outcome = daemon.tick().await;
+        // The staggered schedule (#80) is [work, backup] — the quarantined spare is
+        // excluded outright — so the warm-up cycle polls only those two; the swap
+        // fires on the warm-up-completing tick.
+        let outcome = warmed_tick(&mut daemon).await;
 
         // The rotation continues: the active account swaps to the healthy `backup`,
         // NOT to the dead `spare` (a quarantined account is never a target).
@@ -5850,21 +6241,45 @@ mod tests {
         );
         assert_eq!(daemon.state.health[0].recovery_successes, 1);
 
-        // Tick 3: the second consecutive live poll reaches M → RESTORED, once.
+        // Tick 3: now that `work` is active again the staggered schedule (#80) is
+        // [work, spare]; this tick the round-robin cursor lands on the SPARE, so
+        // `work` is not re-polled and its recovery streak HOLDS at 1 — un-broken (a
+        // poll of another account never resets a per-account recovery streak), just
+        // not advanced.
         let third = daemon.tick().await;
+        assert!(
+            daemon.state.health[0].quarantined,
+            "still recovering — work was not the account polled this tick"
+        );
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 1,
+            "polling the spare does not advance work's recovery"
+        );
+        assert!(
+            !third
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CredentialRestored { .. })),
+            "no restore until work itself is re-polled: {:?}",
+            third.events
+        );
+
+        // Tick 4: the cursor wraps back to `work`; its second consecutive live poll
+        // reaches M → RESTORED, once.
+        let fourth = daemon.tick().await;
         assert!(
             !daemon.state.health[0].quarantined,
             "M live polls un-quarantine it"
         );
         assert_eq!(
-            third
+            fourth
                 .events
                 .iter()
                 .filter(|e| matches!(e, Event::CredentialRestored { account } if account == "work"))
                 .count(),
             1,
             "exactly one credential_restored on the edge: {:?}",
-            third.events
+            fourth.events
         );
     }
 
@@ -6118,7 +6533,8 @@ mod tests {
                 .ok(B.0, 0.10, 0.20); // the (only) viable target
             let tun = tunables(95, 80, 0);
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
-            let outcome = daemon.tick().await;
+            // The swap lands on the warm-up-completing staggered tick (#80).
+            let outcome = warmed_tick(&mut daemon).await;
             assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
             harvest_channels(&outcome, &mut corpus);
         }
@@ -6135,7 +6551,9 @@ mod tests {
                 .ok_resets(C.0, 0.50, 0.99, C_RESET);
             let tun = tunables_floor_off(95, 0);
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
-            let outcome = daemon.tick().await;
+            // The terminal verdict is reached on the warm-up-completing tick (#80),
+            // once every account's exhaustion is known.
+            let outcome = warmed_tick(&mut daemon).await;
             assert_eq!(outcome.action, TickAction::NoViableTarget);
             harvest_channels(&outcome, &mut corpus);
         }
@@ -6150,9 +6568,15 @@ mod tests {
                 .scope_missing(C.0); // usage_scope_fail (403)
             let tun = tunables(95, 80, 0);
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
-            let outcome = daemon.tick().await;
-            assert_eq!(outcome.action, TickAction::SkippedActiveUnavailable);
-            harvest_channels(&outcome, &mut corpus);
+            // One poll per staggered tick (#80): work (401), then the silent
+            // per-account lock on spare, then backup (403). Harvest the whole rotation
+            // so both the monitor_401 and usage_scope_fail channels are exercised. The
+            // active account's reading is unavailable every tick → SkippedActiveUnavailable.
+            for _ in 0..3 {
+                let outcome = daemon.tick().await;
+                assert_eq!(outcome.action, TickAction::SkippedActiveUnavailable);
+                harvest_channels(&outcome, &mut corpus);
+            }
         }
 
         // Scenario 3b — a globally LOCKED keychain (#13): the top-of-tick canonical
@@ -6182,12 +6606,19 @@ mod tests {
                 ..tunables(95, 80, 0)
             };
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
-            let outcome = daemon.tick().await;
+            // The dead active is declared on the first staggered tick (#80) — emitting
+            // `credential_dead` and the durable quarantine status — but the escape
+            // target is not yet known (the spare polls only on the next tick), so the
+            // emergency swap completes one tick later. Harvest both ticks.
+            let dead = daemon.tick().await;
+            assert_eq!(dead.action, TickAction::ActiveDeadNoTarget);
+            harvest_channels(&dead, &mut corpus);
+            let escaped = daemon.tick().await;
             assert_eq!(
-                outcome.action,
+                escaped.action,
                 TickAction::EmergencySwapped { from: 0, to: 1 }
             );
-            harvest_channels(&outcome, &mut corpus);
+            harvest_channels(&escaped, &mut corpus);
         }
 
         // Scenario 5 — auto-recovery (#42): a re-logged-in account polls live and,
@@ -6484,8 +6915,10 @@ mod tests {
 
         // --- B → A: the active account (B), over its trigger, swaps to a viable
         // target. C (weekly-exhausted) is excluded; A is selected. The promoted
-        // credential propagates to BOTH the canonical item and the display. --------
-        let outcome = daemon.tick().await;
+        // credential propagates to BOTH the canonical item and the display. The swap
+        // lands on the warm-up-completing staggered tick (#80) — once the round-robin
+        // has polled all three accounts and the last-known set is complete. -----------
+        let outcome = warmed_tick(&mut daemon).await;
         assert_eq!(
             outcome.action,
             TickAction::Swapped { from: 1, to: 0 },
