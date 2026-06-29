@@ -14,8 +14,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::{Account, Config};
 use crate::daemon::{
-    run_loop, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown, StatusResponse,
-    UnixControl,
+    run_loop, AccountStatusLine, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown,
+    StatusResponse, UnixControl,
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
@@ -41,7 +41,12 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     crate::capture::capture(label).await
                 }
                 "run" => run().await,
-                "status" => status().await,
+                // `status [--json]` — `--json` dumps the full response verbatim,
+                // the full-data contract regardless of terminal width (issue #72).
+                "status" => {
+                    let json = args.any(|arg| arg.to_string_lossy() == "--json");
+                    status(json).await
+                }
                 "list" => list().await,
                 // `use <account> [--force]` switches the active account on demand
                 // (issue #63), reusing the swap engine (#6). The target is the first
@@ -102,7 +107,7 @@ fn print_usage() {
          COMMANDS:\n    \
          capture [<label>]    Stash the active account into the rotation\n    \
          run        Run the foreground daemon (poll + swap)\n    \
-         status     Show the roster and the last swap\n    \
+         status [--json]      Show each account's usage + resets-in, and the last swap\n    \
          list       List captured accounts\n    \
          use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
@@ -206,10 +211,22 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
 /// connect is the friendly [`Error::DaemonNotRunning`] (exit non-zero), never a
 /// raw connection error — the live analog of `list`'s empty-state friendliness.
 /// The printer is sourced solely from the [`StatusResponse`], which carries
-/// handles + percentages + a swap age only (issue #15 redaction).
-async fn status() -> Result<()> {
+/// handles + percentages + per-account reset instants + a swap age only (issue
+/// #15 redaction). `--json` prints that same response verbatim — the full-data
+/// contract regardless of terminal width (issue #72).
+async fn status(json: bool) -> Result<()> {
     let response = query_status(&paths::control_socket()?).await?;
-    print!("{}", render_status(&response));
+    if json {
+        // The full-data contract, regardless of terminal width (issue #72): the
+        // raw response — both per-account reset instants included — pretty-printed,
+        // for scripts (`status --json | jq`). Sourced from the same non-secret
+        // response as the text view, so it too can never carry a token or email.
+        let rendered = serde_json::to_string_pretty(&response)
+            .map_err(|err| Error::Io(std::io::Error::other(err)))?;
+        println!("{rendered}");
+    } else {
+        print!("{}", render_status(&response, now_epoch(), terminal_cols()));
+    }
     Ok(())
 }
 
@@ -244,37 +261,75 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
     serde_json::from_str(line.trim_end()).map_err(|err| Error::Io(std::io::Error::other(err)))
 }
 
-/// Render a [`StatusResponse`] as the text `status` prints. Pure (no clock, no
-/// I/O) so the response→text mapping is unit-testable. Sourced solely from the
-/// response's non-secret fields, so it can never print a token or email (issue #15).
+/// Render a [`StatusResponse`] as the text `status` prints: an aligned column
+/// table (issue #72), one record per line, then the `last_swap` footer. Pure (no
+/// clock, no I/O) so the response→text mapping is unit-testable — the caller
+/// passes `now` (epoch seconds) so each account's "resets in" is deterministic,
+/// and `cols` (the terminal width, or `None` when stdout is not a TTY) so the
+/// narrow-terminal column degradation is testable.
+///
+/// Columns, in display order: `ACCOUNT` `SESSION` `WEEKLY` `RESETS` `STATUS`
+/// (`STATUS` is omitted when no account carries a tag). When the full table is
+/// wider than `cols`, the lowest-priority columns drop in order — `WEEKLY` first,
+/// then `STATUS` — never wrapping a row; `ACCOUNT` + `SESSION` + `RESETS` are
+/// always kept. A `None` width (piped / redirected) keeps the full table, so
+/// `status | grep` and `status > file` stay the complete, greppable surface.
+///
+/// Sourced solely from the response's non-secret fields — labels, percentages, a
+/// swap age, reset instants — so it can never print a token or email (issue #15).
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
 /// can route this exact `status`-text surface through its scan.
-pub(crate) fn render_status(response: &StatusResponse) -> String {
-    let mut out = String::new();
-    for account in &response.accounts {
-        // `*` marks the active account (as the event log does); a leading space
-        // keeps the other labels aligned under it.
-        let marker = if account.active { "*" } else { " " };
-        // Inline state tags: a parked account is marked `disabled` (issue #36) and a
-        // dead-credential account `needs re-login` (issue #42, the durable quarantine
-        // status). A healthy enabled account adds nothing, so its line is unchanged.
-        let mut state = String::new();
-        if !account.enabled {
-            state.push_str(" · disabled");
-        }
-        if account.quarantined {
-            state.push_str(" · needs re-login");
-        }
-        out.push_str(&format!(
-            "{} {} · session {} · weekly {}{}\n",
-            marker,
-            account.label,
-            pct(account.session_pct),
-            pct(account.weekly_pct),
-            state,
-        ));
+pub(crate) fn render_status(response: &StatusResponse, now: i64, cols: Option<usize>) -> String {
+    let rows: Vec<StatusRow> = response
+        .accounts
+        .iter()
+        .map(|account| StatusRow::new(account, now))
+        .collect();
+
+    // Display order, each tagged with a drop priority (`None` = always keep; lower
+    // number drops first). `STATUS` is included only when some account carries a
+    // tag — an all-healthy roster shows no empty `STATUS` column.
+    let mut columns: Vec<Column> = vec![
+        Column::keep("ACCOUNT", |row| &row.account),
+        Column::keep("SESSION", |row| &row.session),
+        Column::droppable("WEEKLY", 1, |row| &row.weekly),
+        Column::keep("RESETS", |row| &row.resets),
+    ];
+    if rows.iter().any(|row| !row.status.is_empty()) {
+        columns.push(Column::droppable("STATUS", 2, |row| &row.status));
     }
+
+    // Drop the lowest-priority droppable column until the table fits `cols`. A
+    // non-TTY width (`None`) never enters the loop — the full table is preserved.
+    while let Some(width) = cols {
+        if table_width(&columns, &rows) <= width {
+            break;
+        }
+        match columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| col.drop_priority.map(|prio| (prio, idx)))
+            .min()
+        {
+            Some((_, idx)) => {
+                columns.remove(idx);
+            }
+            // Only keep-columns remain: never wrap, just let the essential three
+            // overflow a very narrow terminal (predictable, one record per line).
+            None => break,
+        }
+    }
+
+    let widths = column_widths(&columns, &rows);
+    let mut out = String::new();
+    let headers: Vec<&str> = columns.iter().map(|col| col.header).collect();
+    out.push_str(&render_cells(&headers, &widths));
+    for row in &rows {
+        let cells: Vec<&str> = columns.iter().map(|col| (col.get)(row)).collect();
+        out.push_str(&render_cells(&cells, &widths));
+    }
+
     out.push('\n');
     match &response.last_swap {
         Some(swap) => out.push_str(&format!(
@@ -287,6 +342,132 @@ pub(crate) fn render_status(response: &StatusResponse) -> String {
     out
 }
 
+/// Gap between adjacent `status`-table columns (two spaces, matching `list`).
+const STATUS_COL_GAP: usize = 2;
+
+/// One account projected to its `status`-table cells (issue #72). Pre-rendered
+/// strings so column widths can be measured uniformly across header + rows.
+struct StatusRow {
+    /// `* label` (active) or `  label` — the marker folds into this column.
+    account: String,
+    session: String,
+    weekly: String,
+    /// Compact "resets in", or `n/a` when the governing reset is unknown.
+    resets: String,
+    /// Inline tags (`disabled`, `needs re-login`), comma-joined; empty when none.
+    status: String,
+}
+
+impl StatusRow {
+    fn new(account: &AccountStatusLine, now: i64) -> Self {
+        // `*` marks the active account (as the event log does); a leading space
+        // keeps the inactive labels aligned under it.
+        let marker = if account.active { '*' } else { ' ' };
+        // A parked account is `disabled` (issue #36); a dead-credential one
+        // `needs re-login` (issue #42, the durable quarantine status). Both can
+        // hold at once, so they comma-join rather than overwrite.
+        let mut status = String::new();
+        if !account.enabled {
+            status.push_str("disabled");
+        }
+        if account.quarantined {
+            if !status.is_empty() {
+                status.push_str(", ");
+            }
+            status.push_str("needs re-login");
+        }
+        StatusRow {
+            account: format!("{marker} {}", account.label),
+            session: pct(account.session_pct),
+            weekly: pct(account.weekly_pct),
+            resets: resets_in(account, now),
+            status,
+        }
+    }
+}
+
+/// One `status`-table column: its header, a borrow of the matching [`StatusRow`]
+/// cell, and a drop priority (`None` = always keep; `Some(n)` = droppable, lower
+/// `n` drops first under a narrow terminal).
+struct Column {
+    header: &'static str,
+    get: fn(&StatusRow) -> &str,
+    drop_priority: Option<u8>,
+}
+
+impl Column {
+    fn keep(header: &'static str, get: fn(&StatusRow) -> &str) -> Self {
+        Column {
+            header,
+            get,
+            drop_priority: None,
+        }
+    }
+    fn droppable(header: &'static str, priority: u8, get: fn(&StatusRow) -> &str) -> Self {
+        Column {
+            header,
+            get,
+            drop_priority: Some(priority),
+        }
+    }
+}
+
+/// Each included column's render width: the widest of its header and its cells
+/// (by char count, matching the `{:<width$}` fill).
+fn column_widths(columns: &[Column], rows: &[StatusRow]) -> Vec<usize> {
+    columns
+        .iter()
+        .map(|col| {
+            let cells = rows.iter().map(|row| (col.get)(row).chars().count());
+            cells.max().unwrap_or(0).max(col.header.chars().count())
+        })
+        .collect()
+}
+
+/// Total rendered width of the table: summed column widths plus the inter-column
+/// gaps. Used to decide whether a column must drop to fit the terminal.
+fn table_width(columns: &[Column], rows: &[StatusRow]) -> usize {
+    let cells: usize = column_widths(columns, rows).iter().sum();
+    cells + columns.len().saturating_sub(1) * STATUS_COL_GAP
+}
+
+/// Render one table line: each cell left-padded to its column width, joined by the
+/// column gap, with trailing whitespace trimmed (so an empty trailing cell — a
+/// healthy account's `STATUS` — leaves no dangling spaces and the line stays
+/// greppable).
+fn render_cells(cells: &[&str], widths: &[usize]) -> String {
+    let mut line = String::new();
+    for (idx, (cell, width)) in cells.iter().zip(widths).enumerate() {
+        if idx > 0 {
+            line.push_str(&" ".repeat(STATUS_COL_GAP));
+        }
+        line.push_str(&format!("{cell:<width$}", width = *width));
+    }
+    format!("{}\n", line.trim_end())
+}
+
+/// One account's compact "resets in" (issue #72): the time until it next regains
+/// capacity. When the weekly window is exhausted (`weekly_exhausted` — the daemon's
+/// own `weekly >= weekly_trigger` viability verdict, issue #11/#37) the account is
+/// blocked until the WEEKLY reset; otherwise the rolling 5-hour SESSION window is
+/// what gates it, so the SESSION reset is when it becomes usable again. Keying off
+/// the daemon's flag — not a re-derived `weekly_pct == 100` — keeps the display
+/// honest for an account at/above the trigger but below a rounded 100%: it is
+/// already blocked for the week, and is shown as such. `n/a` when the governing
+/// reset is unknown (the poll failed, or the API gave no parseable timestamp) —
+/// never a fabricated duration.
+fn resets_in(account: &AccountStatusLine, now: i64) -> String {
+    let reset_at = if account.weekly_exhausted {
+        account.weekly_resets_at
+    } else {
+        account.session_resets_at
+    };
+    match reset_at {
+        Some(at) => humanize_until(at - now),
+        None => "n/a".to_owned(),
+    }
+}
+
 /// A `0..=100` percent as `N%`, or `n/a` when the last poll for that account
 /// failed (never a fabricated `0`).
 fn pct(percent: Option<u8>) -> String {
@@ -294,6 +475,68 @@ fn pct(percent: Option<u8>) -> String {
         Some(percent) => format!("{percent}%"),
         None => "n/a".to_owned(),
     }
+}
+
+/// A whole-second remaining time as a compact "resets in" string: the two largest
+/// non-zero units, e.g. `12m`, `4h`, `3d4h` (a trailing zero unit is dropped). A
+/// reset already reached (`<= 0`) renders as `now`, and under a minute as `<1m`.
+/// The forward-looking counterpart to [`humanize_secs`] (which renders an elapsed
+/// `…ago`).
+fn humanize_until(secs: i64) -> String {
+    if secs <= 0 {
+        return "now".to_owned();
+    }
+    const MINUTE: i64 = 60;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    let days = secs / DAY;
+    let hours = (secs % DAY) / HOUR;
+    let mins = (secs % HOUR) / MINUTE;
+    if days > 0 {
+        if hours > 0 {
+            format!("{days}d{hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if mins > 0 {
+            format!("{hours}h{mins}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        "<1m".to_owned()
+    }
+}
+
+/// The controlling terminal's column count for stdout, or `None` when stdout is
+/// not a TTY (piped / redirected) or the query fails. Drives `status`'s
+/// narrow-terminal column degradation (issue #72); the `None` non-interactive case
+/// keeps the full table, so `status | grep` and `status > file` stay complete.
+fn terminal_cols() -> Option<usize> {
+    // SAFETY: `winsize` is plain-old-data we zero-initialize; the ioctl only writes
+    // into it through the pointer we pass and returns `0` on success. The same
+    // direct-libc idiom the rest of the crate uses (e.g. `getpeereid`, `flock`).
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_col > 0 {
+        Some(ws.ws_col as usize)
+    } else {
+        None
+    }
+}
+
+/// Current wall-clock time as epoch seconds — the reference `status` measures each
+/// account's "resets in" against. A pre-1970 clock degrades to `0` rather than
+/// panicking, the same tolerant projection [`crate::observability`] uses.
+fn now_epoch() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// A whole-second age as a compact relative string, e.g. `90` → `1m ago`. Coarse
@@ -657,15 +900,18 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             last_swap: None,
         };
-        let out = render_status(&response);
+        let out = render_status(&response, NOW, None);
         // The enabled active account is unmarked; the parked one carries the tag.
+        let work = out.lines().find(|l| l.contains("work")).unwrap();
+        assert!(work.starts_with("* work") && work.contains("50%") && work.contains("25%"));
         assert!(
-            out.contains("* work · session 50% · weekly 25%\n"),
-            "got {out:?}"
+            !work.contains("disabled"),
+            "active account is unmarked: {work}"
         );
+        let spare = out.lines().find(|l| l.contains("spare")).unwrap();
         assert!(
-            out.contains("  spare · session 10% · weekly 20% · disabled\n"),
-            "got {out:?}"
+            spare.starts_with("  spare") && spare.contains("10%") && spare.contains("disabled"),
+            "the parked account carries the tag: {spare}"
         );
     }
 
@@ -680,14 +926,16 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             last_swap: None,
         };
-        let out = render_status(&response);
+        let out = render_status(&response, NOW, None);
+        let work = out.lines().find(|l| l.contains("work")).unwrap();
         assert!(
-            out.contains("* work · session 50% · weekly 25%\n"),
-            "the healthy active account is unmarked: {out:?}"
+            work.starts_with("* work") && work.contains("50%") && !work.contains("re-login"),
+            "the healthy active account is unmarked: {work}"
         );
+        let spare = out.lines().find(|l| l.contains("spare")).unwrap();
         assert!(
-            out.contains("  spare · session n/a · weekly n/a · needs re-login\n"),
-            "the dead account carries the durable re-login tag: {out:?}"
+            spare.contains("n/a") && spare.contains("needs re-login"),
+            "the dead account carries the durable re-login tag: {spare}"
         );
         assert!(
             !out.contains('@'),
@@ -813,11 +1061,43 @@ spare  22222222-2222\n\
             weekly_pct: weekly,
             enabled: true,
             quarantined: false,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            weekly_exhausted: false,
         }
     }
 
+    /// A reading with known reset instants and a weekly-exhaustion verdict — the
+    /// `resets in` tests (issue #72) script which window each account is waiting on.
+    fn status_line_resets(
+        label: &str,
+        session: Option<u8>,
+        weekly: Option<u8>,
+        weekly_exhausted: bool,
+        session_resets_at: Option<i64>,
+        weekly_resets_at: Option<i64>,
+    ) -> AccountStatusLine {
+        AccountStatusLine {
+            label: label.to_owned(),
+            active: false,
+            session_pct: session,
+            weekly_pct: weekly,
+            enabled: true,
+            quarantined: false,
+            session_resets_at,
+            weekly_resets_at,
+            weekly_exhausted,
+        }
+    }
+
+    // A fixed `now` for the deterministic `resets in` tests (issue #72): an
+    // arbitrary epoch the per-account reset instants below are offset from.
+    const NOW: i64 = 1_782_777_600;
+
     #[test]
-    fn render_status_shows_marker_quotas_and_a_present_last_swap() {
+    fn render_status_renders_an_aligned_table_with_a_present_last_swap() {
+        // Healthy roster (no tags) → no STATUS column. The full table (cols None)
+        // keeps every column; values align under their headers, one row each.
         let response = StatusResponse {
             accounts: vec![
                 status_line("work", true, Some(97), Some(40)),
@@ -830,13 +1110,136 @@ spare  22222222-2222\n\
             }),
         };
         let expected = concat!(
-            "* work · session 97% · weekly 40%\n",
-            "  spare · session 10% · weekly 20%\n",
-            "  third · session n/a · weekly n/a\n",
+            "ACCOUNT  SESSION  WEEKLY  RESETS\n",
+            "* work   97%      40%     n/a\n",
+            "  spare  10%      20%     n/a\n",
+            "  third  n/a      n/a     n/a\n",
             "\n",
             "last swap: spare (2m ago)\n",
         );
-        assert_eq!(render_status(&response), expected);
+        assert_eq!(render_status(&response, NOW, None), expected);
+    }
+
+    #[test]
+    fn render_status_shows_resets_in_for_every_account() {
+        // Each account shows when it next regains capacity — the SESSION reset
+        // normally, the WEEKLY reset only when the weekly window is exhausted
+        // (issue #72). Not only the exhausted one: every row carries a value.
+        let response = StatusResponse {
+            accounts: vec![
+                // healthy → session reset (12 min out)
+                status_line_resets(
+                    "work",
+                    Some(30),
+                    Some(40),
+                    false,
+                    Some(NOW + 12 * 60),
+                    Some(NOW + 5 * 86_400),
+                ),
+                // session-exhausted, weekly fine → session reset (4h out), NOT the
+                // far-off weekly reset.
+                status_line_resets(
+                    "spare",
+                    Some(100),
+                    Some(60),
+                    false,
+                    Some(NOW + 4 * 3_600),
+                    Some(NOW + 3 * 86_400),
+                ),
+                // weekly-exhausted → weekly reset (3d4h out), the binding window.
+                status_line_resets(
+                    "third",
+                    Some(100),
+                    Some(100),
+                    true,
+                    Some(NOW + 2 * 3_600),
+                    Some(NOW + 3 * 86_400 + 4 * 3_600),
+                ),
+            ],
+            last_swap: None,
+        };
+        let out = render_status(&response, NOW, None);
+        let line = |label: &str| {
+            out.lines()
+                .find(|l| l.contains(label))
+                .unwrap_or_else(|| panic!("no row for {label} in:\n{out}"))
+                .to_owned()
+        };
+        assert!(line("work").contains("12m"), "{}", line("work"));
+        assert!(line("spare").contains("4h"), "{}", line("spare"));
+        assert!(line("third").contains("3d4h"), "{}", line("third"));
+        // Every account row carries a resets value (none blank), and the header
+        // names the column.
+        assert!(out.contains("RESETS"), "{out}");
+    }
+
+    #[test]
+    fn render_status_marks_disabled_and_quarantined_in_a_status_column() {
+        // A tag on any account adds the STATUS column; both tags can hold at once.
+        let mut quarantined = status_line("dead", false, None, None);
+        quarantined.enabled = false;
+        quarantined.quarantined = true;
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
+            last_swap: None,
+        };
+        let out = render_status(&response, NOW, None);
+        assert!(out.contains("STATUS"), "tagged roster shows STATUS: {out}");
+        let dead = out.lines().find(|l| l.contains("dead")).unwrap();
+        assert!(
+            dead.contains("disabled, needs re-login"),
+            "both tags shown: {dead}"
+        );
+        // A healthy account's row carries no tag text.
+        let work = out.lines().find(|l| l.contains("work")).unwrap();
+        assert!(!work.contains("disabled") && !work.contains("re-login"));
+    }
+
+    #[test]
+    fn render_status_drops_columns_in_priority_order_when_narrow() {
+        let response = StatusResponse {
+            accounts: vec![{
+                let mut a = status_line("work", false, Some(50), Some(25));
+                a.enabled = false; // a STATUS tag, so the column exists to be dropped
+                a
+            }],
+            last_swap: None,
+        };
+        // Full table is `ACCOUNT(7) SESSION(7) WEEKLY(6) RESETS(6) STATUS(8)` plus
+        // four 2-space gaps = 42; dropping WEEKLY → 34; dropping STATUS too → 24.
+        // Full width: every column.
+        let full = render_status(&response, NOW, Some(200));
+        assert!(full.contains("WEEKLY") && full.contains("STATUS"));
+        // Narrow (38 ∈ [34,41]): WEEKLY drops first; STATUS + the three stay.
+        let narrow = render_status(&response, NOW, Some(38));
+        assert!(!narrow.contains("WEEKLY"), "WEEKLY drops first: {narrow}");
+        assert!(
+            narrow.contains("STATUS"),
+            "STATUS outlives WEEKLY: {narrow}"
+        );
+        // Narrower (28 ∈ [24,33]): STATUS drops next; the essential three remain.
+        let tiny = render_status(&response, NOW, Some(28));
+        assert!(
+            !tiny.contains("WEEKLY") && !tiny.contains("STATUS"),
+            "{tiny}"
+        );
+        assert!(
+            tiny.contains("ACCOUNT") && tiny.contains("SESSION") && tiny.contains("RESETS"),
+            "the essential three are always kept: {tiny}"
+        );
+        // Every degraded form is still one record per line (never wrapped).
+        assert_eq!(tiny.lines().filter(|l| l.contains("work")).count(), 1);
+        // Even a width too small for the essential three (24 > 10): they are NEVER
+        // dropped and the row is NEVER wrapped — it simply overflows, staying one
+        // greppable record per line (the terminal soft-wraps it visually).
+        let overflow = render_status(&response, NOW, Some(10));
+        assert!(
+            overflow.contains("ACCOUNT")
+                && overflow.contains("SESSION")
+                && overflow.contains("RESETS"),
+            "the essential three survive any width: {overflow}"
+        );
+        assert_eq!(overflow.lines().filter(|l| l.contains("work")).count(), 1);
     }
 
     #[test]
@@ -845,22 +1248,29 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             last_swap: None,
         };
-        let out = render_status(&response);
+        let out = render_status(&response, NOW, None);
         assert!(out.ends_with("last swap: none\n"), "got: {out:?}");
     }
 
     #[test]
     fn render_status_never_carries_an_email_or_token_sigil() {
-        // #15: the printer sources only labels + percentages + a swap age, so a
-        // token / email can never reach the printed surface.
+        // #15: the printer sources only labels + percentages + reset instants + a
+        // swap age, so a token / email can never reach the printed surface.
         let response = StatusResponse {
-            accounts: vec![status_line("work", true, Some(50), Some(25))],
+            accounts: vec![status_line_resets(
+                "work",
+                Some(50),
+                Some(25),
+                false,
+                Some(NOW + 600),
+                Some(NOW + 86_400),
+            )],
             last_swap: Some(LastSwapLine {
                 to: "spare".to_owned(),
                 secs_ago: 5,
             }),
         };
-        let out = render_status(&response);
+        let out = render_status(&response, NOW, None);
         assert!(
             !out.contains('@'),
             "status output must not contain an email: {out:?}"
@@ -877,6 +1287,60 @@ spare  22222222-2222\n\
         assert_eq!(humanize_secs(3600), "1h ago");
         assert_eq!(humanize_secs(86_399), "23h ago");
         assert_eq!(humanize_secs(86_400), "1d ago");
+    }
+
+    #[test]
+    fn humanize_until_uses_two_largest_compact_units() {
+        assert_eq!(humanize_until(0), "now"); // reached
+        assert_eq!(humanize_until(-30), "now"); // already past
+        assert_eq!(humanize_until(30), "<1m"); // under a minute
+        assert_eq!(humanize_until(12 * 60), "12m");
+        assert_eq!(humanize_until(60 * 60), "1h");
+        assert_eq!(humanize_until(2 * 3_600 + 30 * 60), "2h30m");
+        assert_eq!(humanize_until(3 * 86_400 + 4 * 3_600), "3d4h");
+        assert_eq!(humanize_until(3 * 86_400), "3d"); // trailing zero unit dropped
+    }
+
+    #[test]
+    fn resets_in_keys_off_the_binding_window() {
+        // weekly NOT exhausted → session reset governs.
+        let healthy = status_line_resets(
+            "a",
+            Some(50),
+            Some(50),
+            false,
+            Some(NOW + 600),
+            Some(NOW + 99),
+        );
+        assert_eq!(resets_in(&healthy, NOW), "10m");
+        // weekly exhausted → weekly reset governs, even though the session reset is
+        // sooner.
+        let weekly_out = status_line_resets(
+            "b",
+            Some(100),
+            Some(100),
+            true,
+            Some(NOW + 600),
+            Some(NOW + 7_200),
+        );
+        assert_eq!(resets_in(&weekly_out, NOW), "2h");
+        // The band the daemon counts as exhausted but a rounded percent does NOT:
+        // weekly_pct rounds to 98 (< 100), yet `weekly_exhausted` is true (the raw
+        // fraction is at/above the trigger). The OLD `weekly_pct == 100` heuristic
+        // would have wrongly shown the 4h session reset; the daemon's flag shows the
+        // real 3d weekly block. This is the reviewer-flagged correctness fix.
+        let band = status_line_resets(
+            "c",
+            Some(100),
+            Some(98),
+            true,
+            Some(NOW + 4 * 3_600),
+            Some(NOW + 3 * 86_400),
+        );
+        assert_eq!(resets_in(&band, NOW), "3d");
+        // Governing reset unknown → n/a (never a fabricated duration).
+        let unknown = status_line_resets("d", Some(50), Some(50), false, None, Some(NOW + 600));
+        assert_eq!(resets_in(&unknown, NOW), "n/a");
     }
 
     #[tokio::test]

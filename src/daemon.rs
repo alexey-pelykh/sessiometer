@@ -388,6 +388,13 @@ pub(crate) struct AccountReading {
     /// re-login (issue #42). The durable "needs re-login" status `status` surfaces;
     /// non-secret (a plain flag on the account's handle).
     pub(crate) quarantined: bool,
+    /// Whether the account's WEEKLY window is EXHAUSTED — `weekly >= weekly_trigger`
+    /// (the base, un-jittered threshold; issue #11/#37), the daemon's own viability
+    /// verdict. When true the account is blocked until its weekly reset, so `status`
+    /// keys its "resets in" off the weekly reset rather than the sooner session
+    /// reset (issue #72). Precomputed here (where the threshold lives) so the wire
+    /// projection stays threshold-free; `false` when the last poll failed.
+    pub(crate) weekly_exhausted: bool,
     pub(crate) usage: Option<Usage>,
 }
 
@@ -420,6 +427,23 @@ pub(crate) struct AccountStatusLine {
     pub(crate) session_pct: Option<u8>,
     /// Last-polled weekly-window usage percent (`0..=100`).
     pub(crate) weekly_pct: Option<u8>,
+    /// Epoch seconds at which the rolling 5-hour SESSION window resets, or `null`
+    /// when the last poll failed or the API supplied no parseable timestamp.
+    /// Carried so the client can render a per-account "resets in" (issue #72); an
+    /// absolute instant (not a relative duration), so the client computes the
+    /// freshest delta against its own clock at print time. Non-secret — an integer.
+    #[serde(default)]
+    pub(crate) session_resets_at: Option<i64>,
+    /// Epoch seconds at which the WEEKLY window resets (see `session_resets_at`).
+    /// `null` when unknown. Non-secret — an integer.
+    #[serde(default)]
+    pub(crate) weekly_resets_at: Option<i64>,
+    /// Whether the account's WEEKLY window is exhausted (`weekly >= weekly_trigger`),
+    /// the daemon's own viability verdict (issue #11/#37). The client keys "resets
+    /// in" off this: a weekly-exhausted account is blocked until the WEEKLY reset,
+    /// otherwise the sooner SESSION reset governs (issue #72). Non-secret — a flag.
+    #[serde(default)]
+    pub(crate) weekly_exhausted: bool,
 }
 
 /// The minimal `last_swap` shown by `status` (issue #8): the handle swapped TO
@@ -455,6 +479,9 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 quarantined: account.quarantined,
                 session_pct: account.usage.map(|u| to_pct(u.session)),
                 weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
+                session_resets_at: account.usage.and_then(|u| u.session_resets_at),
+                weekly_resets_at: account.usage.and_then(|u| u.weekly_resets_at),
+                weekly_exhausted: account.weekly_exhausted,
             })
             .collect(),
         // Already computed (a label + a relative age) at snapshot build; copy it
@@ -722,6 +749,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// `50..=99` percent each cycle, then `/100` for the swap decision — the
     /// weekly-dimension counterpart of `trigger_strategy`, independent of it.
     weekly_trigger_strategy: Strategy,
+    /// Base WEEKLY-exhaustion threshold as a fraction (`weekly_trigger / 100`),
+    /// un-jittered — the SAME value the `use` pre-swap gate treats as "weekly
+    /// exhausted" (issue #11/#37). Distinct from `weekly_trigger_strategy` (the
+    /// per-cycle JITTERED swap-decision draw): the snapshot's `weekly_exhausted`
+    /// verdict (issue #72) must be deterministic and match the user-facing
+    /// viability rule, so it keys off this base, not a per-cycle draw.
+    weekly_trigger_base: f64,
     /// Opt-in swap-target session guard (#10): `Some(fraction)` only swaps TO an
     /// account whose session usage is below it (`session_floor / 100`); `None` (the
     /// default) disables the guard, leaving target choice to the soonest-reset rule
@@ -783,6 +817,10 @@ where
             claude_json,
             trigger_strategy: tunables.trigger_strategy,
             weekly_trigger_strategy: tunables.weekly_trigger_strategy,
+            // The un-jittered base the `use` gate uses for "weekly exhausted" — the
+            // deterministic threshold the `status` `weekly_exhausted` verdict keys
+            // off (issue #72), NOT the per-cycle jittered swap-decision draw.
+            weekly_trigger_base: f64::from(tunables.weekly_trigger) / 100.0,
             session_floor: tunables.session_floor.map(|floor| f64::from(floor) / 100.0),
             cooldown_strategy: tunables.cooldown_strategy,
             poll_strategy: tunables.poll_strategy,
@@ -1479,6 +1517,11 @@ where
                     active: active == Some(i),
                     enabled: account.enabled,
                     quarantined: self.state.health[i].quarantined,
+                    // The daemon's own viability verdict, deterministic (base, not
+                    // jittered, trigger) so the displayed "resets in" matches when
+                    // `use` would accept the account again (issue #72).
+                    weekly_exhausted: readings[i]
+                        .is_some_and(|usage| usage.weekly >= self.weekly_trigger_base),
                     usage: readings[i],
                 })
                 .collect(),
@@ -1844,6 +1887,7 @@ mod tests {
                     session,
                     weekly,
                     weekly_resets_at: None,
+                    session_resets_at: None,
                 }),
             );
             self
@@ -1864,6 +1908,7 @@ mod tests {
                     session,
                     weekly,
                     weekly_resets_at: Some(weekly_resets_at),
+                    session_resets_at: None,
                 }),
             );
             self
@@ -2094,21 +2139,25 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: Some(100), // soonest overall — but it is active
+                session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.50,
                 weekly: 0.60,                // less headroom than index 2…
                 weekly_resets_at: Some(200), // …but resets soonest among viable -> winner
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20,                // most headroom — would win the OLD rule…
                 weekly_resets_at: Some(500), // …but resets latest
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.85,
                 weekly: 0.01,
                 weekly_resets_at: Some(50), // earliest of all — but session over floor
+                session_resets_at: None,
             }), // session over floor -> not viable
         ];
         // Index 1 (reset 200) beats the most-headroom index 2 (reset 500); index 0 is
@@ -2126,12 +2175,14 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             None, // unavailable
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2147,16 +2198,19 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.90,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.81,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2175,16 +2229,19 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: Some(100),
+                session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.40,
                 weekly: 0.20,
                 weekly_resets_at: Some(300), // tie -> first of the tie wins
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.20,
                 weekly: 0.20,
                 weekly_resets_at: Some(300), // tie, lower session (the OLD winner)
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2203,16 +2260,19 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.05,           // more headroom + earlier index…
                 weekly_resets_at: None, // …but no known reset -> sorts last
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.40,
                 weekly_resets_at: Some(900), // a known reset -> preferred
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2231,16 +2291,19 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30, // more weekly used, earlier index -> winner
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.05, // most headroom, but no reset and a later index
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2259,16 +2322,19 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: Some(100),
+                session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
                 session: 0.95, // high session — an enabled floor would exclude this…
                 weekly: 0.10,
                 weekly_resets_at: Some(200), // …but with no floor it is the soonest-reset viable target
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.05,
                 weekly: 0.60,
                 weekly_resets_at: Some(300),
+                session_resets_at: None,
             }), // low session but resets later
         ];
         // No floor → index 1 wins as the soonest-reset viable target despite its high session…
@@ -2293,16 +2359,19 @@ mod tests {
                 session: 0.50,
                 weekly: 0.99,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.99, // weekly-exhausted -> not viable despite low session
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.20, // the only non-exhausted other account
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2320,16 +2389,19 @@ mod tests {
                 session: 0.50,
                 weekly: 0.99,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.98, // exactly at the trigger -> exhausted (>=)
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 1.00,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         assert_eq!(
@@ -2347,16 +2419,19 @@ mod tests {
                 session: 0.97,
                 weekly: 0.10,
                 weekly_resets_at: Some(500),
+                session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.05,
                 weekly_resets_at: Some(100), // soonest reset — the would-be winner…
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.30,
                 weekly_resets_at: Some(200),
+                session_resets_at: None,
             }),
         ];
         let enabled = [true, false, true]; // …but index 1 is parked
@@ -2373,16 +2448,19 @@ mod tests {
                 session: 0.50,
                 weekly: 0.99,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }), // active (excluded)
             Some(Usage {
                 session: 0.10,
                 weekly: 0.98, // enabled but weekly-exhausted
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.01, // ample headroom + soonest reset — but disabled, so not viable
                 weekly_resets_at: Some(100),
+                session_resets_at: None,
             }),
         ];
         let enabled = [true, true, false];
@@ -2398,16 +2476,19 @@ mod tests {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: Some(300),
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: Some(100), // soonest
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: Some(200),
+                session_resets_at: None,
             }),
             None,
         ];
@@ -2423,16 +2504,19 @@ mod tests {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: Some(500), // first of the tie -> winner
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: Some(500),
+                session_resets_at: None,
             }),
         ];
         assert_eq!(soonest_weekly_reset(&tie), Some((1, 500)));
@@ -2442,6 +2526,7 @@ mod tests {
                 session: 0.0,
                 weekly: 0.0,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             None,
         ];
@@ -3828,10 +3913,12 @@ mod tests {
                     active: true,
                     enabled: true,
                     quarantined: false,
+                    weekly_exhausted: false,
                     usage: Some(Usage {
                         session: 0.97,
                         weekly: 0.40,
                         weekly_resets_at: None,
+                        session_resets_at: None,
                     }),
                 },
                 AccountReading {
@@ -3839,6 +3926,7 @@ mod tests {
                     active: false,
                     enabled: true,
                     quarantined: false,
+                    weekly_exhausted: false,
                     usage: None,
                 },
             ],
@@ -3871,10 +3959,12 @@ mod tests {
                 active: true,
                 enabled: true,
                 quarantined: false,
+                weekly_exhausted: false,
                 usage: Some(Usage {
                     session: 0.50,
                     weekly: 0.25,
                     weekly_resets_at: None,
+                    session_resets_at: None,
                 }),
             }],
             last_swap: None,
@@ -4006,6 +4096,7 @@ mod tests {
                     active: false,
                     enabled: true,
                     quarantined: false,
+                    weekly_exhausted: false,
                     usage: None,
                 },
                 AccountReading {
@@ -4013,6 +4104,7 @@ mod tests {
                     active: true,
                     enabled: true,
                     quarantined: false,
+                    weekly_exhausted: false,
                     usage: None,
                 },
             ],
@@ -4336,6 +4428,7 @@ mod tests {
                 session: 0.10,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             &mut events,
         );
@@ -4574,6 +4667,7 @@ mod tests {
             session,
             weekly,
             weekly_resets_at: None,
+            session_resets_at: None,
         })
     }
 
@@ -4732,6 +4826,7 @@ mod tests {
                 session: 0.10,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         let mut events = Vec::new();
@@ -4767,11 +4862,13 @@ mod tests {
                 session: 0.10,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
             Some(Usage {
                 session: 0.10,
                 weekly: 0.10,
                 weekly_resets_at: None,
+                session_resets_at: None,
             }),
         ];
         let mut events = Vec::new();
@@ -5164,7 +5261,9 @@ mod tests {
         corpus.push('\n');
         corpus.push_str(&control_reply(r#"{"cmd":"status"}"#, &outcome.snapshot, true).0);
         corpus.push('\n');
-        corpus.push_str(&crate::cli::render_status(&response));
+        // Scan the FULL table (`cols: None` → no width degradation), the maximal
+        // text surface; the fixed `now` keeps "resets in" deterministic (issue #72).
+        corpus.push_str(&crate::cli::render_status(&response, 1_782_777_600, None));
         if let Some(report) = swap_report(outcome) {
             corpus.push_str(&report);
             corpus.push('\n');
@@ -5424,7 +5523,7 @@ mod tests {
             "UDS channel: quarantine status missing"
         );
         assert!(
-            corpus.contains("· needs re-login"),
+            corpus.contains("needs re-login"),
             "status-text channel: quarantine tag missing"
         );
         assert!(
@@ -5432,7 +5531,10 @@ mod tests {
             "UDS channel: status wire missing"
         );
         assert!(
-            corpus.contains("· session 97%"),
+            // `97%` (with the percent sigil) is unique to the status-TEXT table —
+            // the UDS wire renders the same reading as `"session_pct":97` (issue #72
+            // reformatted the text into an aligned column table).
+            corpus.contains("97%"),
             "status-text channel missing"
         );
         assert!(
@@ -5689,7 +5791,10 @@ mod tests {
             "UDS channel: the status wire is missing"
         );
         assert!(
-            corpus.contains("· session 96%"),
+            // `96%` (with the percent sigil) is unique to the status-TEXT table —
+            // the UDS wire renders the same reading as `"session_pct":96` (issue #72
+            // reformatted the text into an aligned column table).
+            corpus.contains("96%"),
             "status-text channel is missing"
         );
         assert!(
