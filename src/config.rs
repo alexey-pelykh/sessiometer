@@ -32,12 +32,16 @@ use crate::timing::{Jitter, Strategy};
 
 /// Default seconds between usage polls. Issue #38 lengthened this from the
 /// original fixed 60 s to a longer base that the normal poll jitter then
-/// decorrelates across accounts/cycles.
+/// decorrelates across accounts/cycles; issue #76 confirmed 5 min as a comfortable
+/// steady-state cadence (the rate-limit / transient back-off widens it further
+/// under sustained `429` / `5xx`, so the base need not be conservative).
 const DEFAULT_POLL_SECS: u64 = 300;
 /// Default standard deviation (seconds) of the poll interval's normal jitter —
-/// ~10% of [`DEFAULT_POLL_SECS`]. Poll is the one tunable that jitters by
-/// default (issue #38 AC: "poll interval uses a longer base + normal jitter").
-const DEFAULT_POLL_JITTER_STDDEV: f64 = 30.0;
+/// ~20% of [`DEFAULT_POLL_SECS`]. Poll is the one tunable that jitters by default
+/// (issue #38). Issue #76 WIDENED this from 30 s to 60 s so concurrent accounts
+/// (and successive cycles) decorrelate over a ~1–3 min spread rather than clustering
+/// within ~±30 s of the 5 min mark.
+const DEFAULT_POLL_JITTER_STDDEV: f64 = 60.0;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// Default `session_trigger` percent.
@@ -426,7 +430,12 @@ impl Config {
         );
 
         out.push_str("[tunables]\n");
-        out.push_str("# Seconds between usage polls (5..=3600).\n");
+        out.push_str(
+            "# Seconds between usage polls (5..=3600). The default 300 (5 min) plus the\n\
+             # normal `poll` jitter below spaces concurrent accounts ~1-3 min apart; under\n\
+             # sustained 429/5xx the daemon backs off automatically — widening this and\n\
+             # honouring any Retry-After — instead of re-polling at the fixed interval.\n",
+        );
         out.push_str(&format!("poll_secs = {}\n", t.poll_secs));
         out.push_str("# Seconds to wait after a swap before another swap is allowed (0..=3600).\n");
         out.push_str(&format!("cooldown_secs = {}\n", t.cooldown_secs));
@@ -466,7 +475,9 @@ impl Config {
         out.push_str("\n[jitter]\n");
         out.push_str(
             "# Randomization drawn each cycle and clamped to the tunable's range.\n\
-             # kind = \"none\" | \"uniform\" (with `spread`) | \"normal\" (with `stddev`).\n",
+             # kind = \"none\" | \"uniform\" (with `spread`) | \"normal\" (with `stddev`).\n\
+             # poll defaults to normal jitter (stddev ~20% of poll_secs) so accounts\n\
+             # decorrelate; trigger, weekly_trigger and cooldown default to none.\n",
         );
         out.push_str(&format!(
             "poll = {}\n",
@@ -1239,7 +1250,7 @@ label = "personal"
         // The default poll jitter renders as a normal strategy with a decimal
         // magnitude (so it re-parses as a TOML float).
         assert!(text.contains("kind = \"normal\""));
-        assert!(text.contains("stddev = 30.0"));
+        assert!(text.contains("stddev = 60.0"));
     }
 
     #[test]
@@ -1270,6 +1281,21 @@ label = "personal"
         ] {
             assert!(text.contains(key), "rendered config must mention {key}");
         }
+        // Issue #76 AC3: the poll_secs comment documents the default cadence + jitter
+        // AND the rate-limit / transient back-off (incl. Retry-After) — so an operator
+        // hand-editing poll_secs learns the spacing widens automatically under 429/5xx.
+        assert!(
+            text.contains("The default 300 (5 min)"),
+            "poll_secs comment must document the default cadence: {text:?}"
+        );
+        assert!(
+            text.contains("backs off automatically"),
+            "poll_secs comment must document the back-off: {text:?}"
+        );
+        assert!(
+            text.contains("Retry-After"),
+            "poll_secs comment must document honouring Retry-After: {text:?}"
+        );
     }
 
     #[test]
