@@ -600,7 +600,10 @@ mod tests {
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),
-                Probe::Transient => Err(Error::UsageTransient { status: 503 }),
+                Probe::Transient => Err(Error::UsageTransient {
+                    status: 503,
+                    retry_after: None,
+                }),
                 Probe::Locked => Err(Error::KeychainLocked { op: "read" }),
             }
         }

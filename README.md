@@ -174,6 +174,14 @@ long-running rotation hits:
   off** — the wait between retries grows to at most ~60 s — logging the wait once.
   It never tries to unlock the keychain or prompt for a password; unlock it
   yourself and the daemon resumes on its next retry.
+- **Rate-limiting and transient errors back off.** When the usage endpoint returns
+  `429` (rate-limited) or a `5xx` / network error, the daemon **widens its poll
+  spacing** instead of re-polling at the fixed interval — an exponential back-off
+  that doubles each consecutive throttled cycle (capped at ~1 h) and honours any
+  `Retry-After` the server sends as a minimum wait; a clean poll resets it. The
+  default cadence also carries normal jitter so concurrent accounts decorrelate,
+  and on start-up the daemon waits a small jittered delay before its first poll so
+  repeated restarts don't synchronise a burst of requests.
 - **Re-authentication is picked up automatically.** If you `claude /login` an
   account again (refreshing its token, or switching the active account), the
   daemon detects the changed canonical credential and **re-stashes** the affected

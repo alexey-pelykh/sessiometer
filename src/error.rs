@@ -9,6 +9,7 @@
 //! on.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// The result type used throughout the crate.
 pub(crate) type Result<T> = std::result::Result<T, Error>;
@@ -172,14 +173,24 @@ pub(crate) enum Error {
     /// The poll did not complete: a `5xx` server error, or — when `status` is
     /// `0` — `curl` returned no HTTP response at all (DNS / connection / TLS /
     /// timeout). Transient by the taxonomy (5xx / network): back off and skip the
-    /// cycle, never swap on missing data.
+    /// cycle, never swap on missing data. `retry_after` carries the server-advised
+    /// `Retry-After` (a `503` may send one), parsed from its delta-seconds form;
+    /// the daemon honours it as a MINIMUM back-off wait (issue #76).
     #[error("usage poll did not complete (HTTP status {status}; 0 means no HTTP response)")]
-    UsageTransient { status: u16 },
+    UsageTransient {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
 
     /// The usage endpoint rate-limited the poll (`HTTP 429`). Back off, log, skip
-    /// the cycle — never swap on a throttled (missing) reading.
+    /// the cycle — never swap on a throttled (missing) reading. `retry_after`
+    /// carries the server-advised `Retry-After` (delta-seconds form) when present;
+    /// the daemon honours it as a MINIMUM back-off wait (issue #76).
     #[error("usage poll was rate-limited (HTTP {status})")]
-    UsageRateLimited { status: u16 },
+    UsageRateLimited {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
 
     /// A non-401, non-403 `4xx` other than 429 (e.g. `400` / `404` / `422`). Like
     /// 429 on the monitor path (design G4): back off, log, skip — never swap on a

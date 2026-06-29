@@ -78,7 +78,7 @@ use crate::keychain::{
 use crate::observability::{Event, EventLog, SwapReason};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
-use crate::timing::{SplitMix64, Strategy};
+use crate::timing::{Jitter, SplitMix64, Strategy};
 use crate::usage::{CurlTransport, RealUsageSource, Usage, UsageSource};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
@@ -107,6 +107,23 @@ const LOCK_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// keychain that stays locked. The daemon NEVER auto-unlocks or prompts; a locked
 /// keychain is the operator's to open (a non-interactive read just fails, exit 36).
 const LOCK_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Largest exponent applied to the rate-limit / transient poll back-off (issue
+/// #76). A backed-off cycle widens the wait to `interval × 2^min(streak, this)`;
+/// clamping the exponent keeps the intermediate finite, while [`POLL_BACKOFF_CAP`]
+/// is the actual ceiling. `6` (×64) is past the cap for any realistic interval, so
+/// it is a safety bound, not the operative limit.
+const POLL_BACKOFF_MAX_SHIFT: u32 = 6;
+/// Ceiling on the rate-limit / transient poll back-off (issue #76). Under sustained
+/// `429` / `5xx` the effective poll spacing grows exponentially but settles here —
+/// one poll per hour, gentle on a throttling endpoint without going fully dark. A
+/// larger server-advised `Retry-After` still overrides this (honoured as a MINIMUM).
+const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
+/// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
+/// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
+/// the same config — and the N accounts within a cycle — do not synchronize an
+/// immediate burst of usage requests. Small enough to stay responsive on launch.
+const STARTUP_DELAY_CAP: f64 = 30.0;
 
 /// Time seam: the daemon reads "now" and sleeps until the next poll through
 /// this, so a fake can drive time and make the loop run instantly in tests.
@@ -639,9 +656,10 @@ pub(crate) struct TickOutcome {
     /// The per-account readings this cycle, for the control socket (`status`).
     pub(crate) snapshot: StatusSnapshot,
     /// How long the run loop should wait before the next tick. `None` = the normal
-    /// jittered poll interval (issue #38); `Some(d)` = an explicit wait — the
-    /// locked-keychain back-off (issue #13), which grows the gap between retries
-    /// while the keychain stays locked.
+    /// jittered poll interval (issue #38); `Some(d)` = an explicit wait that widens
+    /// the gap between retries — either the locked-keychain back-off (issue #13,
+    /// while the keychain stays locked) or the rate-limit / transient poll back-off
+    /// (issue #76, while the usage endpoint keeps returning `429` / `5xx`).
     pub(crate) next_wait: Option<Duration>,
 }
 
@@ -731,6 +749,16 @@ struct DecisionState {
     /// backed-off retry while the keychain stays locked — mirroring
     /// `signaled_all_exhausted`.
     signaled_keychain_locked: bool,
+    /// Consecutive cycles whose polls saw a rate-limit (`429`) or transient (`5xx`
+    /// / network) failure and therefore backed off (issue #76). Drives the
+    /// exponential widening of [`TickOutcome::next_wait`]: the wait is this cycle's
+    /// jittered poll interval times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, capped
+    /// at [`POLL_BACKOFF_CAP`] (and never below a server-advised `Retry-After`).
+    /// Reset to 0 on the first cycle whose polls are all clean, so a later
+    /// throttling episode starts the climb afresh. Distinct from `lock_backoff`: the
+    /// keychain lock short-circuits the whole tick (`locked_tick`), whereas this
+    /// rides a tick that DID poll and was throttled.
+    poll_backoff_streak: u32,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -972,6 +1000,13 @@ where
         // streak is maintained here. (A locked keychain is handled at top-of-tick,
         // not per-account — see `locked_tick`.)
         let mut readings: Vec<Option<Usage>> = Vec::with_capacity(self.roster.len());
+        // Track whether ANY polled account this cycle was rate-limited (`429`) or hit
+        // a transient (`5xx` / network) failure, plus the largest server-advised
+        // `Retry-After` among them — the inputs to the poll back-off (issue #76).
+        // Rate-limiting is an endpoint-global signal (one usage endpoint for the whole
+        // roster), so any account seeing it backs off the whole loop.
+        let mut backed_off = false;
+        let mut retry_after_floor: Option<Duration> = None;
         for i in 0..self.roster.len() {
             // Skip polling a disabled (parked, #36) or QUARANTINED (dead, #42)
             // non-active account: neither is a swap target and a poll would waste a
@@ -987,6 +1022,13 @@ where
             }
             let result = self.poller.poll(&self.roster[i], active == Some(i)).await;
             self.note_poll_outcome(i, &result, &mut events);
+            if let Some(signal) = backoff_signal(&result) {
+                backed_off = true;
+                if let Some(ra) = signal.retry_after {
+                    retry_after_floor =
+                        Some(retry_after_floor.map_or(ra, |current| current.max(ra)));
+                }
+            }
             readings.push(result.ok());
         }
 
@@ -998,14 +1040,22 @@ where
         if !matches!(action, TickAction::NoViableTarget) {
             self.state.signaled_all_exhausted = false;
         }
+        // Rate-limit / transient back-off (issue #76): a cycle whose polls saw a
+        // `429` / `5xx` widens the next poll's spacing instead of re-polling at the
+        // fixed interval; a fully-clean cycle resets the climb so a later episode
+        // starts afresh.
+        let next_wait = if backed_off {
+            Some(self.note_poll_backoff(retry_after_floor))
+        } else {
+            self.state.poll_backoff_streak = 0;
+            None
+        };
         let snapshot = self.snapshot(at, active, &readings);
         TickOutcome {
             action,
             events,
             snapshot,
-            // A normal cycle waits the regular jittered poll interval (#38); only
-            // the locked path (`locked_tick`) overrides this with a back-off.
-            next_wait: None,
+            next_wait,
         }
     }
 
@@ -1554,13 +1604,58 @@ where
 
     /// Sleep until the next tick is due. `next_wait` is the just-finished tick's
     /// requested wait: `None` → the normal jittered poll interval (issue #38);
-    /// `Some(d)` → an explicit duration, the locked-keychain back-off (issue #13).
-    /// Behind the [`Clock`] seam, so tests drive both paths deterministically.
+    /// `Some(d)` → an explicit back-off duration — the locked-keychain back-off
+    /// (issue #13) or the rate-limit / transient poll back-off (issue #76). Behind
+    /// the [`Clock`] seam, so tests drive both paths deterministically.
     pub(crate) async fn wait_after_tick(&mut self, next_wait: Option<Duration>) {
         match next_wait {
             Some(backoff) => self.clock.tick(backoff).await,
             None => self.wait_for_next_poll().await,
         }
+    }
+
+    /// Fold a backed-off cycle (a `429` / `5xx` poll, issue #76) into the poll
+    /// back-off and return the wait that WIDENS the next poll's spacing. The base is
+    /// this cycle's freshly-drawn, jittered poll interval — so the back-off inherits
+    /// the #38 decorrelation — multiplied by `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`,
+    /// then clamped to [`POLL_BACKOFF_CAP`]. The first
+    /// backed-off cycle already waits ~2× the normal interval, so the effective
+    /// spacing is WIDER than re-polling at the fixed cadence — the issue's core ask.
+    /// A server-advised `Retry-After` is honoured as a MINIMUM: the wait is never
+    /// shorter than it, even past the cap. Advances and stores the streak so the next
+    /// consecutive backed-off cycle doubles again.
+    fn note_poll_backoff(&mut self, retry_after: Option<Duration>) -> Duration {
+        let streak = self.state.poll_backoff_streak.saturating_add(1);
+        self.state.poll_backoff_streak = streak;
+        let shift = streak.min(POLL_BACKOFF_MAX_SHIFT);
+        let widened = self
+            .next_poll_interval()
+            .checked_mul(1u32 << shift)
+            .unwrap_or(POLL_BACKOFF_CAP)
+            .min(POLL_BACKOFF_CAP);
+        match retry_after {
+            Some(ra) => widened.max(ra),
+            None => widened,
+        }
+    }
+
+    /// Draw the jittered start-up delay (issue #76): a uniform `[0,
+    /// STARTUP_DELAY_CAP)` wait taken ONCE, before the first poll, so repeated
+    /// restarts of the same config — and the N accounts polled within a cycle — do
+    /// not synchronize an immediate burst of usage requests. Deterministic under the
+    /// seeded RNG, like [`next_poll_interval`](Self::next_poll_interval), so it is
+    /// unit-testable without a wall clock.
+    pub(crate) fn startup_delay(&mut self) -> Duration {
+        // base = spread = CAP/2 makes the draw `CAP/2 + (2u-1)*CAP/2 = CAP*u` for the
+        // unit draw u in [0, 1) — i.e. uniform [0, CAP). The `draw`'s own clamp to
+        // [0, CAP] is then purely defensive: the raw value is already in range.
+        let strategy = Strategy {
+            base: STARTUP_DELAY_CAP / 2.0,
+            jitter: Jitter::Uniform {
+                spread: STARTUP_DELAY_CAP / 2.0,
+            },
+        };
+        Duration::from_secs_f64(strategy.draw(&mut self.rng, 0.0, STARTUP_DELAY_CAP))
     }
 }
 
@@ -1601,6 +1696,30 @@ fn classify_poll(result: &Result<Usage>) -> PollOutcome {
         Err(Error::UsageUnauthorized) => PollOutcome::Unauthorized,
         Err(Error::UsageScopeMissing) => PollOutcome::ScopeMissing,
         Err(_) => PollOutcome::Transient,
+    }
+}
+
+/// A poll outcome that asks the loop to back off (issue #76): a `429`
+/// (rate-limited) or a `5xx` / network transient. Carries the server-advised
+/// `Retry-After` the response supplied, if any.
+struct BackoffSignal {
+    retry_after: Option<Duration>,
+}
+
+/// Classify a poll `Result` for the rate-limit / transient back-off (issue #76):
+/// `Some` when it is a back-off outcome (`429` or `5xx` / network), carrying any
+/// `Retry-After`; `None` otherwise. A success, a `401`, a `403`, or any other error
+/// does NOT, by itself, widen the poll spacing. Deliberately separate from
+/// [`classify_poll`] (which feeds the #42 dead-credential health machine): back-off
+/// is orthogonal — a `429` both resets the 401 streak (via `classify_poll`'s
+/// `Transient`) AND asks the loop to slow down (here).
+fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
+    match result {
+        Err(Error::UsageRateLimited { retry_after, .. })
+        | Err(Error::UsageTransient { retry_after, .. }) => Some(BackoffSignal {
+            retry_after: *retry_after,
+        }),
+        _ => None,
     }
 }
 
@@ -1744,10 +1863,25 @@ where
     enum Idle {
         /// SIGINT / SIGTERM observed — exit the loop cleanly.
         Shutdown,
-        /// The poll interval (or locked-keychain back-off) elapsed — re-tick.
+        /// The poll interval (or a back-off wait — #13 locked-keychain or #76
+        /// rate-limit) elapsed — re-tick.
         Elapsed,
         /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
         ManualSwapped,
+    }
+
+    // De-burst start-up (issue #76): wait a small jittered delay before the FIRST
+    // poll, so repeated restarts of the same config do not synchronize an immediate
+    // burst of usage requests. Behind the Clock seam, so tests pass through it
+    // instantly. Shutdown-responsive (like the per-cycle idle below): a SIGINT /
+    // SIGTERM during the delay exits cleanly rather than being deferred for up to
+    // STARTUP_DELAY_CAP. No control serving here — there is no snapshot to answer
+    // from until the first tick.
+    let startup_delay = daemon.startup_delay();
+    tokio::select! {
+        biased;
+        _ = shutdown.requested() => return Ok(()),
+        _ = daemon.clock.tick(startup_delay) => {}
     }
 
     loop {
@@ -1766,8 +1900,9 @@ where
         if let Some(report) = swap_report(&outcome) {
             eprintln!("sessiometer: {report}");
         }
-        // The wait this tick requested — a locked-keychain back-off overrides the
-        // normal interval (issue #13); captured before the snapshot is moved.
+        // The wait this tick requested — an explicit back-off overrides the normal
+        // interval (locked-keychain #13, or rate-limit / transient #76); captured
+        // before the snapshot is moved.
         let next_wait = outcome.next_wait;
         // The snapshot the control socket answers from until the next poll.
         let snapshot = outcome.snapshot;
@@ -1862,6 +1997,9 @@ mod tests {
     enum Scripted {
         Ok(Usage),
         Transient,
+        /// A `429` rate-limit carrying an optional server-advised `Retry-After`
+        /// (issue #76) — drives the poll back-off path.
+        RateLimited(Option<Duration>),
         Unauthorized,
         Locked,
         ScopeMissing,
@@ -1917,6 +2055,13 @@ mod tests {
             self.readings.insert(uuid.to_owned(), Scripted::Transient);
             self
         }
+        /// Script a `429` rate-limit, optionally carrying a `Retry-After` (issue
+        /// #76) — exercises the poll back-off path.
+        fn rate_limited(mut self, uuid: &str, retry_after: Option<Duration>) -> Self {
+            self.readings
+                .insert(uuid.to_owned(), Scripted::RateLimited(retry_after));
+            self
+        }
         fn unauthorized(mut self, uuid: &str) -> Self {
             self.readings
                 .insert(uuid.to_owned(), Scripted::Unauthorized);
@@ -1940,14 +2085,24 @@ mod tests {
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
+                Some(Scripted::RateLimited(retry_after)) => Err(Error::UsageRateLimited {
+                    status: 429,
+                    retry_after: *retry_after,
+                }),
                 // Explicit `Transient` and any unscripted account both land here.
-                _ => Err(Error::UsageTransient { status: 0 }),
+                _ => Err(Error::UsageTransient {
+                    status: 0,
+                    retry_after: None,
+                }),
             }
         }
     }
 
-    /// Resolves on its `stop_at`-th `requested()` call (the run loop calls it once
-    /// per tick), so the loop stops after exactly `stop_at` ticks.
+    /// Resolves on its `stop_at`-th `requested()` call. The run loop polls
+    /// `requested()` ONCE at start-up (the issue #76 de-burst shutdown-check, before
+    /// the first poll) and then once per idle cycle — so `after(n)` lets the loop run
+    /// `n - 1` ticks before stopping. Each run-loop test sizes `stop_at` to
+    /// `desired_ticks + 1` accordingly.
     struct FakeShutdown {
         calls: Cell<u32>,
         stop_at: u32,
@@ -3006,6 +3161,263 @@ mod tests {
         let relocked = daemon.tick().await;
         assert_eq!(relocked.events, vec![Event::KeychainLockedWait]);
         assert_eq!(relocked.next_wait, Some(LOCK_BACKOFF_BASE));
+    }
+
+    // --- rate-limit / transient poll back-off (issue #76) ------------------
+
+    /// A single-account ('u-A', active) daemon with the fixed 60 s poll interval —
+    /// the seam the poll back-off tests read `tick().next_wait` off (frozen clock,
+    /// no jitter, so the back-off is `60 s × 2^streak`). Returns the tempdir guard so
+    /// the caller keeps the displayed `~/.claude.json` alive for the daemon's life.
+    async fn rate_limit_daemon(poller: FakeRosterPoller) -> (tempfile::TempDir, FakeDaemon) {
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+        let (dir, json) = claude_json("u-A");
+        let tun = tunables(95, 80, 0);
+        let daemon = Daemon::new(
+            vec![account("u-A", "work")],
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        (dir, daemon)
+    }
+
+    #[tokio::test]
+    async fn a_sustained_rate_limit_backs_off_instead_of_re_polling_at_the_fixed_interval() {
+        // AC: sustained 429 WIDENS the effective poll spacing rather than re-polling
+        // at the fixed interval. The first backed-off cycle already waits 2× the 60 s
+        // interval, and each consecutive 429 doubles it.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::SkippedActiveUnavailable);
+        assert_eq!(first.next_wait, Some(Duration::from_secs(120)));
+        assert_eq!(
+            daemon.tick().await.next_wait,
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(
+            daemon.tick().await.next_wait,
+            Some(Duration::from_secs(480))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_back_off_doubles_then_caps() {
+        // The back-off grows exponentially from the interval and saturates at the cap,
+        // so sustained throttling settles at one poll per hour rather than growing
+        // without bound — mirroring the locked-keychain back-off shape.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            waits.push(daemon.tick().await.next_wait.unwrap());
+        }
+        // 60 s × 2^streak: 120, 240, 480, 960, 1920, then 3840→capped 3600, then 3600.
+        assert_eq!(
+            waits,
+            vec![
+                Duration::from_secs(120),
+                Duration::from_secs(240),
+                Duration::from_secs(480),
+                Duration::from_secs(960),
+                Duration::from_secs(1920),
+                POLL_BACKOFF_CAP,
+                POLL_BACKOFF_CAP,
+                POLL_BACKOFF_CAP,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_honoured_as_a_minimum_wait() {
+        // AC: Retry-After is honoured as a MINIMUM. When it exceeds the exponential
+        // back-off it wins; when it is smaller, the larger exponential governs but the
+        // wait is never below Retry-After.
+        // Larger than the 120 s first-cycle exponential → Retry-After (600 s) wins.
+        let (_d1, mut bigger) = rate_limit_daemon(
+            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(600))),
+        )
+        .await;
+        assert_eq!(
+            bigger.tick().await.next_wait,
+            Some(Duration::from_secs(600))
+        );
+
+        // Smaller than the exponential → the 120 s exponential governs (and is ≥ 10 s).
+        let (_d2, mut smaller) = rate_limit_daemon(
+            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(10))),
+        )
+        .await;
+        assert_eq!(
+            smaller.tick().await.next_wait,
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_overrides_the_cap_when_larger() {
+        // AC: Retry-After is a minimum even past POLL_BACKOFF_CAP — a server asking
+        // for 2 h is obeyed though the exponential ceiling is 1 h.
+        let two_hours = Duration::from_secs(7200);
+        assert!(two_hours > POLL_BACKOFF_CAP);
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(two_hours))).await;
+        assert_eq!(daemon.tick().await.next_wait, Some(two_hours));
+    }
+
+    #[tokio::test]
+    async fn a_clean_cycle_resets_the_rate_limit_back_off() {
+        // Once polls succeed again the back-off clears (next_wait None → normal
+        // interval) and the streak resets, so a LATER 429 restarts at 2× — not where
+        // the prior episode left off.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        assert_eq!(
+            daemon.tick().await.next_wait,
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            daemon.tick().await.next_wait,
+            Some(Duration::from_secs(240))
+        );
+
+        // A clean poll clears the back-off and resets the streak.
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        assert_eq!(daemon.tick().await.next_wait, None);
+
+        // A later 429 restarts the climb at the base multiplier, not at 480.
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        assert_eq!(
+            daemon.tick().await.next_wait,
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[tokio::test]
+    async fn only_throttling_outcomes_trigger_the_back_off() {
+        // Back-off is scoped to 429 (rate-limit) and 5xx / network (transient). A 403
+        // (scope) and a 401 (unauthorized) authenticate-or-reject the token but are not
+        // endpoint throttling — neither backs off; a transient does.
+        let (_d1, mut scope) =
+            rate_limit_daemon(FakeRosterPoller::new().scope_missing("u-A")).await;
+        assert_eq!(scope.tick().await.next_wait, None);
+
+        let (_d2, mut unauth) =
+            rate_limit_daemon(FakeRosterPoller::new().unauthorized("u-A")).await;
+        assert_eq!(unauth.tick().await.next_wait, None);
+
+        let (_d3, mut transient) = rate_limit_daemon(FakeRosterPoller::new().failing("u-A")).await;
+        assert_eq!(
+            transient.tick().await.next_wait,
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_delay_is_bounded_and_deterministic_under_a_seed() {
+        // The start-up de-burst draws a uniform [0, STARTUP_DELAY_CAP) wait,
+        // deterministic under a seeded RNG (no wall clock) so repeated restarts of the
+        // same config decorrelate their first poll.
+        let cap = Duration::from_secs_f64(STARTUP_DELAY_CAP);
+        let (_d1, daemon) = rate_limit_daemon(FakeRosterPoller::new()).await;
+        let mut a_daemon = daemon.with_seed(2024);
+        let a: Vec<Duration> = (0..64).map(|_| a_daemon.startup_delay()).collect();
+
+        let (_d2, daemon) = rate_limit_daemon(FakeRosterPoller::new()).await;
+        let mut b_daemon = daemon.with_seed(2024);
+        let b: Vec<Duration> = (0..64).map(|_| b_daemon.startup_delay()).collect();
+
+        assert_eq!(a, b, "same seed must replay the same start-up delays");
+        assert!(
+            a.iter().all(|d| *d < cap),
+            "every start-up delay must be < the cap"
+        );
+        assert!(
+            a.iter().any(|&d| d != a[0]),
+            "the jitter must actually spread the delay"
+        );
+    }
+
+    /// A two-account daemon (`work` active + `spare`), both tokens stashed and the
+    /// canonical holding `work`'s — for the endpoint-global back-off tests (issue
+    /// #76), where a poll outcome on a NON-active account must steer the whole loop.
+    async fn two_account_rate_limit_daemon(
+        poller: FakeRosterPoller,
+    ) -> (tempfile::TempDir, FakeDaemon) {
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        let tun = tunables(95, 80, 0);
+        let daemon = Daemon::new(
+            vec![account("u-A", "work"), account("u-B", "spare")],
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        (dir, daemon)
+    }
+
+    #[tokio::test]
+    async fn a_non_active_rate_limit_backs_off_the_whole_loop() {
+        // AC: rate-limiting is endpoint-global — there is ONE usage endpoint for the
+        // whole roster, so a `429` on ANY polled account widens the next poll's
+        // spacing for the entire loop. Here the active `work` polls clean and holds
+        // (under its trigger), while the non-active `spare` is throttled: the loop
+        // still backs off (2× the 60 s interval). Were the back-off scoped only to an
+        // unavailable ACTIVE account, this cycle's `next_wait` would be `None`.
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", None),
+        )
+        .await;
+
+        let outcome = daemon.tick().await;
+        assert_eq!(outcome.next_wait, Some(Duration::from_secs(120)));
+    }
+
+    #[tokio::test]
+    async fn the_largest_retry_after_across_accounts_governs_the_back_off() {
+        // When more than one account is throttled in the same cycle, the back-off
+        // honours the LARGEST server-advised `Retry-After` among them (a fold by
+        // `max`), so the daemon waits at least as long as the most-constrained reply
+        // asks. The fold is order-independent — proven by reversing which account
+        // carries the larger value and getting the same wait. 300 s > the 120 s
+        // first-cycle exponential, so the folded floor governs.
+        let (_d1, mut larger_second) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .rate_limited("u-A", Some(Duration::from_secs(100)))
+                .rate_limited("u-B", Some(Duration::from_secs(300))),
+        )
+        .await;
+        assert_eq!(
+            larger_second.tick().await.next_wait,
+            Some(Duration::from_secs(300))
+        );
+
+        let (_d2, mut larger_first) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .rate_limited("u-A", Some(Duration::from_secs(300)))
+                .rate_limited("u-B", Some(Duration::from_secs(100))),
+        )
+        .await;
+        assert_eq!(
+            larger_first.tick().await.next_wait,
+            Some(Duration::from_secs(300))
+        );
     }
 
     #[tokio::test]
@@ -4232,7 +4644,9 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        let mut shutdown = FakeShutdown::after(3);
+        // after(4): 3 idle shutdown-checks + 1 start-up check (#76 de-burst) the run
+        // loop now polls before the first poll.
+        let mut shutdown = FakeShutdown::after(4);
         let control = NoControl;
 
         run_loop(&mut daemon, &mut log, &mut shutdown, &control)
@@ -4241,6 +4655,46 @@ mod tests {
 
         // The fake clock makes the cadence deterministic: exactly 3 ticks ran.
         assert_eq!(daemon.state.ticks, 3);
+    }
+
+    #[tokio::test]
+    async fn run_loop_honours_shutdown_during_the_startup_delay() {
+        // Issue #76: the start-up de-burst delay is shutdown-responsive — a SIGINT /
+        // SIGTERM arriving DURING the initial jittered wait exits cleanly, before the
+        // first poll, rather than being deferred for up to STARTUP_DELAY_CAP. With
+        // `after(1)` the very first `requested()` poll — the start-up check, ahead of
+        // the first tick — resolves, so the loop returns having run ZERO ticks. A
+        // regression to a bare `clock.tick(startup_delay).await` would run one tick
+        // first (the start-up check no longer consumes `after(1)`), failing this.
+        let roster = vec![account("u-A", "work")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        let mut shutdown = FakeShutdown::after(1);
+        let control = NoControl;
+
+        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            daemon.state.ticks, 0,
+            "shutdown during the start-up delay must exit before the first tick"
+        );
     }
 
     #[tokio::test]
@@ -4284,7 +4738,9 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
         // Tick 1 → idle delivers `ManualSwapped` (adopt) → tick 2 → shutdown.
-        let mut shutdown = FakeShutdown::after(2);
+        // after(3): 2 idle shutdown-checks + 1 start-up check (#76 de-burst). The
+        // start-up check must NOT win (it pends), or the adoption never fires.
+        let mut shutdown = FakeShutdown::after(3);
         let control = OnceManualSwap::new();
 
         run_loop(&mut daemon, &mut log, &mut shutdown, &control)
@@ -4333,7 +4789,9 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        let mut shutdown = FakeShutdown::after(1); // stop right after the first tick
+        // after(2): 1 idle shutdown-check + 1 start-up check (#76 de-burst) — stop
+        // right after the first tick.
+        let mut shutdown = FakeShutdown::after(2);
         let control = NoControl;
 
         run_loop(&mut daemon, &mut log, &mut shutdown, &control)
@@ -4468,7 +4926,14 @@ mod tests {
 
         // A transient error is silent and also resets (no event, streak cleared).
         events.clear();
-        daemon.note_poll_outcome(0, &Err(Error::UsageTransient { status: 0 }), &mut events);
+        daemon.note_poll_outcome(
+            0,
+            &Err(Error::UsageTransient {
+                status: 0,
+                retry_after: None,
+            }),
+            &mut events,
+        );
         assert_eq!(streak_of(&daemon), vec![0, 0]);
         assert!(events.is_empty());
     }
@@ -4514,7 +4979,8 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        let mut shutdown = FakeShutdown::after(2);
+        // after(3): 2 idle shutdown-checks + 1 start-up check (#76 de-burst).
+        let mut shutdown = FakeShutdown::after(3);
         let control = NoControl;
 
         run_loop(&mut daemon, &mut log, &mut shutdown, &control)
@@ -4605,7 +5071,8 @@ mod tests {
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
-        let mut shutdown = FakeShutdown::after(1);
+        // after(2): 1 idle shutdown-check + 1 start-up check (#76 de-burst).
+        let mut shutdown = FakeShutdown::after(2);
         let control = NoControl;
 
         run_loop(&mut daemon, &mut log, &mut shutdown, &control)
@@ -4687,8 +5154,14 @@ mod tests {
             PollOutcome::ScopeMissing
         );
         for err in [
-            Error::UsageTransient { status: 0 },
-            Error::UsageRateLimited { status: 429 },
+            Error::UsageTransient {
+                status: 0,
+                retry_after: None,
+            },
+            Error::UsageRateLimited {
+                status: 429,
+                retry_after: None,
+            },
             Error::UsageRejected { status: 400 },
             Error::KeychainLocked { op: "read" },
             Error::UsageTokenUnreadable,
@@ -5331,8 +5804,14 @@ mod tests {
                 service: "Sessiometer/11111111-1111-1111-1111-111111111111".to_owned(),
             },
             Error::UsageTokenUnreadable,
-            Error::UsageTransient { status: 0 },
-            Error::UsageRateLimited { status: 429 },
+            Error::UsageTransient {
+                status: 0,
+                retry_after: None,
+            },
+            Error::UsageRateLimited {
+                status: 429,
+                retry_after: None,
+            },
             Error::UsageRejected { status: 400 },
             Error::UsageUnauthorized,
             Error::UsageScopeMissing,
