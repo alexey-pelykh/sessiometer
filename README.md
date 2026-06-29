@@ -108,7 +108,10 @@ them apart.
 `--force` overrides those **policy** checks (and warns when you force onto an
 exhausted or quarantined account), but it never bypasses **safety**: if the login
 keychain is locked the switch still aborts at once, writing nothing. `use` works
-whether or not the daemon is running.
+whether or not the daemon is running: when one is up, the pre-swap gate reads the
+**cached** usage the daemon already polled — so `use` makes no usage request of its
+own and won't trip a rate limit — and with no daemon it falls back to a single live
+check.
 
 ## Parking an account
 
