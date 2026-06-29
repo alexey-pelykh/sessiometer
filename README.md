@@ -9,6 +9,14 @@ accounts.
 > behind the CLI are still being implemented — see the
 > [open issues](https://github.com/alexey-pelykh/sessiometer/issues).
 
+## Responsibilities
+
+`sessiometer` operates on credentials for provider accounts that you own and
+configure. You are responsible for complying with each provider's terms —
+including the Terms of Service that govern the accounts you configure with
+`sessiometer`. Review those terms and make sure your own use of those
+accounts is permitted under them.
+
 ## Prerequisites
 
 - **macOS**, using the **login keychain**.
