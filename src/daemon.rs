@@ -203,7 +203,7 @@ impl Shutdown for RealShutdown {
 
 /// Per-account usage seam: poll one roster account, routing the active account
 /// through the canonical credential and every other through its stash. The test
-/// fake ([`tests::FakeRosterPoller`]) returns scripted per-account readings.
+/// fake (`FakeRosterPoller`) returns scripted per-account readings.
 pub(crate) trait RosterPoller {
     /// Poll `account`'s usage. `active` selects the token source: the canonical
     /// keychain item for the active account (whose token is the freshest), or the
@@ -588,7 +588,7 @@ fn control_reply(
 const MAX_CONTROL_LINE_BYTES: u64 = 8 * 1024;
 
 /// Upper bound on one whole control exchange (read request + write reply). Mirrors
-/// the `use`-side `MANUAL_SWAP_NOTIFY_TIMEOUT` so a peer that never completes its line
+/// the `use`-side `CONTROL_SOCKET_TIMEOUT` so a peer that never completes its line
 /// cannot hold the serve arm; the run-loop select also drops this future at the next
 /// poll tick, so this is the tighter, dedicated time bound (issue #64).
 const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -897,7 +897,7 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`next_poll_interval`](Self::next_poll_interval).
     poll_strategy: Strategy,
     /// Jitter RNG seam — process entropy in production, a fixed seed in tests
-    /// ([`with_seed`](Self::with_seed)) so per-cycle draws are deterministic.
+    /// (`with_seed`) so per-cycle draws are deterministic.
     rng: SplitMix64,
     /// Consecutive non-scope 401s before an account's stored credential is treated
     /// as DEAD and quarantined (issue #42; config `monitor_401_n`, `1..=20`).
@@ -973,7 +973,7 @@ where
     /// `flock` at `path` (blocking, bounded, fail-closed) so the daemon and a manual
     /// `use` swap can never interleave into a split state. Production sets the real
     /// `paths::swap_lock()`; a test may point it at a throwaway file. Builder-style
-    /// to mirror [`with_seed`](Self::with_seed) and keep `new`'s 7 args stable.
+    /// to mirror `with_seed` and keep `new`'s 7 args stable.
     pub(crate) fn with_swap_lock(mut self, path: PathBuf) -> Self {
         self.swap_lock_path = Some(path);
         self

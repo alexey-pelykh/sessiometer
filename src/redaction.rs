@@ -20,7 +20,7 @@
 //!
 //! ## 2. Test time (CI) — emitted output carries no secret
 //!
-//! The [`meter`] engine scans a corpus of ALL emitted output for four classes of
+//! The `meter` engine scans a corpus of ALL emitted output for four classes of
 //! leak:
 //!   - an OAuth token prefix (`sk-ant-…`), or a known token verbatim;
 //!   - a fingerprint of a known injected credential blob — its leading bytes (a
@@ -35,7 +35,7 @@
 //! [`crate::daemon`]'s `redaction_meter_*` test — and feeds every channel (the
 //! event log via [`crate::observability::Event::to_log_line`], the `status` text
 //! and `list` view via [`crate::cli`], error `Display`, and the UDS control
-//! replies) through [`meter::scan`]. This module owns the engine and proves it is
+//! replies) through `meter::scan`. This module owns the engine and proves it is
 //! non-vacuous: its own tests plant each leak class and assert the scan catches
 //! it.
 //!

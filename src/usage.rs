@@ -151,9 +151,9 @@ impl UsageReport {
     }
 }
 
-/// Seam: reads one account's usage quota. The real impl ([`RealUsageSource`])
-/// polls the usage API; the test impl ([`FakeUsageSource`]) returns scripted
-/// readings.
+/// Seam: reads one account's usage quota. The only impl ([`RealUsageSource`])
+/// polls the usage API; it is exercised in tests through its [`UsageTransport`]
+/// seam (a fake transport returns scripted responses), not a separate fake source.
 pub(crate) trait UsageSource {
     async fn usage(&self) -> Result<Usage>;
 }

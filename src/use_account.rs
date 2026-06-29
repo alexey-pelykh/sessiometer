@@ -84,7 +84,7 @@ trait ManualSwapNotifier {
 /// The real [`ManualSwapNotifier`]: connect to the daemon's control socket and
 /// send one newline-delimited `manual-swapped` request (issue #64), reading the
 /// one-line ack so the daemon has received it before returning. Bounded by
-/// [`MANUAL_SWAP_NOTIFY_TIMEOUT`] so a missing / wedged daemon never hangs `use`;
+/// [`CONTROL_SOCKET_TIMEOUT`] so a missing / wedged daemon never hangs `use`;
 /// the "no daemon" case (connect refused / not found) and a timeout both surface
 /// as `Err` for the caller to log-and-ignore. The request carries NO credential
 /// and NO write target — it is a pure cooldown-only signal.
