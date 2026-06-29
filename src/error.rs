@@ -298,6 +298,22 @@ pub(crate) enum Error {
     )]
     UseTargetQuarantined { label: String },
 
+    /// The pre-swap gate could not VERIFY `use <label>`'s viability (issue #75):
+    /// with no daemon running to consult a CACHED reading, the single live fallback
+    /// poll was rate-limited (`HTTP 429`). Distinct from the daemon-internal
+    /// [`Error::UsageRateLimited`] so the operator gets actionable guidance instead
+    /// of an opaque abort — start the daemon so the gate reads its cached verdict,
+    /// or `--force` to swap anyway. This is an inability to RUN the gate, not a gate
+    /// refusal, so it is NOT in the exit-`7` refusal taxonomy — a generic `1`, the
+    /// same transient class the raw rate-limit mapped to before. ZERO writes;
+    /// `label` is the target's non-secret handle (issue #15).
+    #[error(
+        "cannot verify `{label}`: the usage check was rate-limited (HTTP 429) and no \
+         daemon is running to consult a cached reading — start it with `sessiometer run`, \
+         or use `--force` to swap anyway"
+    )]
+    UseViabilityUnverifiable { label: String },
+
     // --- Single-writer swap lock (issue #64) ---------------------------------
     /// The single-writer swap lock (issue #64) could not be acquired within the
     /// bounded wait — another swap (a concurrent `use`, or the daemon's own swap
@@ -440,6 +456,10 @@ mod tests {
             .to_string(),
             Error::UseCooldownActive.to_string(),
             Error::UseTargetQuarantined {
+                label: "spare".into(),
+            }
+            .to_string(),
+            Error::UseViabilityUnverifiable {
                 label: "spare".into(),
             }
             .to_string(),

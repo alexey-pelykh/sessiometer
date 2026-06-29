@@ -51,7 +51,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::claude_state;
 use crate::config::{Account, Config};
-use crate::daemon::{RealRosterPoller, RosterPoller};
+use crate::daemon::{AccountStatusLine, RealRosterPoller, RosterPoller, StatusResponse};
 use crate::error::{Error, Result};
 use crate::keychain::{CredentialStore, RealCredentialStore};
 use crate::observability::{self, Event, EventLog, SwapReason};
@@ -59,12 +59,15 @@ use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash};
 use crate::swap;
 
-/// How long the best-effort manual-hold notify ([`ControlSocketNotifier`]) waits
-/// on the control socket before giving up (issue #64). Short: a live daemon, idle
-/// between polls, answers instantly; a missing or wedged daemon must never hang
-/// `use`, so the notify times out and is logged-and-ignored (the swap already
-/// succeeded — the keychain write is authoritative).
-const MANUAL_SWAP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long either control-socket exchange `use` makes — the cached-reading query
+/// ([`ControlSocketCache`], issue #75) before the gate, and the best-effort
+/// manual-hold notify ([`ControlSocketNotifier`], issue #64) after the swap —
+/// waits before giving up. Short: a live daemon, idle between polls, answers
+/// instantly; a missing or wedged daemon must NEVER hang `use`, so each exchange
+/// times out and degrades gracefully — the query falls back to a single live poll,
+/// and the notify is logged-and-ignored (the swap already succeeded — the keychain
+/// write is authoritative).
+const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Notifies a running daemon that a manual swap just committed (issue #64), so it
 /// arms its cooldown (#10) and re-resolves active — the "manual-hold" that stops
@@ -106,7 +109,7 @@ impl ManualSwapNotifier for ControlSocketNotifier {
             buffered.read_line(&mut line).await?;
             Ok::<(), Error>(())
         };
-        tokio::time::timeout(MANUAL_SWAP_NOTIFY_TIMEOUT, exchange)
+        tokio::time::timeout(CONTROL_SOCKET_TIMEOUT, exchange)
             .await
             .map_err(|_| {
                 Error::Io(std::io::Error::new(
@@ -114,6 +117,110 @@ impl ManualSwapNotifier for ControlSocketNotifier {
                     "manual-hold notify timed out",
                 ))
             })?
+    }
+}
+
+/// Consults the daemon's CACHED per-account reading for a target's viability
+/// (issue #75), so the pre-swap gate need not issue its OWN live usage poll when a
+/// daemon is already polling on its cadence. Injected as a seam so both the
+/// cache-HIT path (daemon up, usable reading present) and the cache-MISS path (no
+/// daemon / no usable reading → the caller's single live fallback) run hermetically
+/// against in-memory fakes in tests.
+trait CachedViabilitySource {
+    /// The daemon's cached viability verdict for `account`, or `None` when there is
+    /// no usable cached reading — no daemon running, the exchange failed, the
+    /// target's handle is absent or duplicated in the reply, or the daemon's last
+    /// poll for it failed. `None` is the signal to fall back to a single live poll.
+    async fn cached_viability(&self, account: &Account) -> Option<Viability>;
+}
+
+/// The real [`CachedViabilitySource`]: ask the daemon's control socket for `status`
+/// and read the target's CACHED viability from the reply (issue #75) — the SAME
+/// non-secret [`StatusResponse`] the `status` command renders, carrying per-account
+/// `quarantined` (#42) + `weekly_exhausted` (#11/#37, the daemon's own viability
+/// verdict). Issues ZERO usage-endpoint requests of its own. Bounded by
+/// [`CONTROL_SOCKET_TIMEOUT`] so a missing / wedged daemon never hangs `use`; ANY
+/// failure (no daemon, a timeout, a malformed reply, an absent/duplicated handle)
+/// is a cache MISS (`None`) → the caller's single live fallback poll.
+struct ControlSocketCache {
+    socket: PathBuf,
+}
+
+impl CachedViabilitySource for ControlSocketCache {
+    async fn cached_viability(&self, account: &Account) -> Option<Viability> {
+        // A live daemon answers instantly; a missing / wedged daemon must never hang
+        // `use`, so a timeout — like any other exchange failure — is a cache MISS.
+        let response = tokio::time::timeout(CONTROL_SOCKET_TIMEOUT, self.query_status())
+            .await
+            .ok()? // timed out → MISS
+            .ok()?; // no daemon / I/O / malformed reply → MISS
+        cached_viability_for(&response, &account.label)
+    }
+}
+
+impl ControlSocketCache {
+    /// One `status` request/reply over the control socket, parsed into the shared
+    /// [`StatusResponse`]. The SAME newline-delimited JSON the daemon's
+    /// `serve_control` speaks and the `status` command's own client uses; the shared
+    /// wire type keeps the two clients in lockstep. The "no daemon" case (connect
+    /// refused / not found) needs no special remap — the caller maps EVERY error
+    /// identically to a cache MISS (fall back to a live poll).
+    async fn query_status(&self) -> Result<StatusResponse> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let stream = tokio::net::UnixStream::connect(&self.socket).await?;
+        let mut buffered = tokio::io::BufReader::new(stream);
+        buffered.write_all(b"{\"cmd\":\"status\"}\n").await?;
+        buffered.flush().await?;
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        serde_json::from_str(line.trim_end()).map_err(|err| Error::Io(std::io::Error::other(err)))
+    }
+}
+
+/// The daemon's cached viability for the account with handle `label`, or `None`
+/// when the `status` reply carries no usable verdict for it (issue #75). The handle
+/// must match EXACTLY ONE line: labels are operator handles and NOT guaranteed
+/// unique (see [`resolve_target`]), and the wire reply carries only the handle
+/// (issue #15: never the account-uuid), so a zero- or multiple-match is treated as
+/// "no usable cached reading" → live fallback rather than guessing.
+///
+/// A consequence of keying on the handle: in the exotic case where the running
+/// daemon is STALE *and* a handle has since been reassigned to a different
+/// account-uuid, the cached reading cannot be cross-checked against the uuid, so
+/// the verdict returned is the stale account's — a bounded, recoverable mismatch
+/// (the swap still operates on the correct target's stash; the daemon's next cycle
+/// or a `--force` corrects a wrong refusal). Closing it would mean widening the
+/// non-secret wire contract with the account-uuid, out of scope for this gate.
+fn cached_viability_for(response: &StatusResponse, label: &str) -> Option<Viability> {
+    let mut matches = response.accounts.iter().filter(|line| line.label == label);
+    let line = matches.next()?;
+    if matches.next().is_some() {
+        // A duplicated handle: cannot disambiguate from the wire reply alone.
+        return None;
+    }
+    cached_viability_of(line)
+}
+
+/// Map one daemon `status` line to a cached viability verdict, or `None` when the
+/// line carries no usable reading (issue #75). The daemon's own flags ARE the
+/// verdict: `quarantined` (#42, checked first — a dead credential is the harder
+/// block and the daemon stops polling it, so it carries no usage payload) and
+/// `weekly_exhausted` (#11/#37, computed off the SAME un-jittered base the gate
+/// treats as exhausted) need no usage reading. Otherwise a line is viable ONLY when
+/// the daemon actually holds a fresh reading for it (`weekly_pct.is_some()`); a
+/// non-quarantined line with no reading means the daemon's last poll for it failed
+/// (or it is parked / unpolled) — NOT a viability verdict → `None`, so the caller
+/// falls back to a live poll.
+fn cached_viability_of(line: &AccountStatusLine) -> Option<Viability> {
+    if line.quarantined {
+        Some(Viability::Quarantined)
+    } else if line.weekly_exhausted {
+        Some(Viability::WeeklyExhausted)
+    } else if line.weekly_pct.is_some() {
+        Some(Viability::Viable)
+    } else {
+        None
     }
 }
 
@@ -127,14 +234,15 @@ struct SwapTarget {
     incoming_stash: String,
 }
 
-/// The target's viability, as proven by a poll of its stashed token.
+/// The target's viability — sourced from the daemon's CACHED reading when one is
+/// available (issue #75), else proven by a live poll of its stashed token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Viability {
-    /// A live poll below the weekly trigger — a sound destination.
+    /// Below the weekly trigger — a sound destination.
     Viable,
     /// The stored credential is dead (`401`/`403`) — quarantined / needs re-login (#42).
     Quarantined,
-    /// A live poll at/above the weekly trigger — the weekly window is exhausted (#11/#37).
+    /// At/above the weekly trigger — the weekly window is exhausted (#11/#37).
     WeeklyExhausted,
 }
 
@@ -166,15 +274,20 @@ enum Refusal {
 impl SwapTarget {
     /// The gated constructor — the ONLY path to a non-forced target. Runs the
     /// pre-swap gate for `account` (the resolved target): already-active → no-op;
-    /// in-cooldown → refused; otherwise poll viability and mint a target ONLY when
-    /// it is viable. A locked keychain or a transient poll failure propagates as
-    /// `Err` (still before any write) for the caller to surface.
+    /// in-cooldown → refused; otherwise classify viability via [`gate_viability`]
+    /// (the daemon's CACHED reading first, a single live poll only on a miss —
+    /// issue #75) and mint a target ONLY when it is viable. A locked keychain or a
+    /// transient poll failure on the live fallback propagates as `Err` (still
+    /// before any write) for the caller to surface.
     ///
     /// `active_stash` is the active (outgoing) account's stash, `weekly_trigger` is
     /// the fraction at/above which the weekly window counts as exhausted, and
     /// `in_cooldown` is the caller-computed cooldown verdict (kept a parameter so
     /// the gate stays pure and hermetically testable, independent of wall-clock).
-    async fn resolve<P: RosterPoller>(
+    /// The cooldown refusal short-circuits BEFORE any cache query or live poll, so a
+    /// cooled-down `use` touches neither the socket nor the network.
+    async fn resolve<R: CachedViabilitySource, P: RosterPoller>(
+        cache: &R,
         poller: &P,
         account: &Account,
         active_stash: &str,
@@ -187,7 +300,7 @@ impl SwapTarget {
         if in_cooldown {
             return Ok(GateOutcome::Refused(Refusal::Cooldown));
         }
-        match poll_viability(poller, account, weekly_trigger).await? {
+        match gate_viability(cache, poller, account, weekly_trigger).await? {
             Viability::Viable => Ok(GateOutcome::Proceed(SwapTarget {
                 incoming_stash: account.stash(),
             })),
@@ -234,6 +347,42 @@ async fn poll_viability<P: RosterPoller>(
         // A locked keychain (SAFETY) or a transient poll failure: not a viability
         // verdict — propagate for the caller to surface or tolerate.
         Err(other) => Err(other),
+    }
+}
+
+/// The pre-swap gate's viability check (issue #75): consult the daemon's CACHED
+/// reading FIRST — zero usage-endpoint requests when a daemon is up — and only on a
+/// cache MISS (no daemon running, or no usable cached reading for the target) fall
+/// back to a single live [`poll_viability`] poll. The fallback is today's
+/// behaviour, preserving the "`use` needs no daemon" property.
+///
+/// On that live fallback a `429` ([`Error::UsageRateLimited`]) is remapped to the
+/// distinct [`Error::UseViabilityUnverifiable`] — a clear, actionable abort naming
+/// the target instead of the opaque raw rate-limit error (issue #75 acceptance). A
+/// locked keychain and every other transient poll failure propagate unchanged: the
+/// gated caller aborts with ZERO writes. (`--force` does NOT route through here —
+/// it tolerates a miss best-effort; see [`run_use`].)
+async fn gate_viability<R, P>(
+    cache: &R,
+    poller: &P,
+    account: &Account,
+    weekly_trigger: f64,
+) -> Result<Viability>
+where
+    R: CachedViabilitySource,
+    P: RosterPoller,
+{
+    if let Some(cached) = cache.cached_viability(account).await {
+        return Ok(cached);
+    }
+    // Cache MISS → a single live poll (today's behaviour). A `429` here is the
+    // opaque abort issue #75 fixes: with no daemon to consult, surface a distinct,
+    // actionable error rather than the raw rate-limit.
+    match poll_viability(poller, account, weekly_trigger).await {
+        Err(Error::UsageRateLimited { .. }) => Err(Error::UseViabilityUnverifiable {
+            label: account.label.clone(),
+        }),
+        other => other,
     }
 }
 
@@ -317,8 +466,13 @@ fn force_warning(viability: Viability, label: &str) -> Option<String> {
 /// The injectable seams [`run_use`] drives — the viability/credential/stash/state
 /// surfaces — so the whole gate→swap flow runs hermetically against in-memory fakes
 /// in tests, exactly as [`crate::daemon::Daemon`] injects its seams.
-struct Seams<'a, P, C, S, N> {
-    /// Polls the TARGET's stashed token for viability (#37/#42).
+struct Seams<'a, R, P, C, S, N> {
+    /// Consults the daemon's CACHED per-account viability over the control socket
+    /// (issue #75) — so the gate need not issue its own live poll when a daemon is
+    /// already polling. A miss falls back to `poller`.
+    cache: &'a R,
+    /// Polls the TARGET's stashed token for viability (#37/#42) — the live FALLBACK
+    /// when the daemon holds no cached reading (issue #75).
     poller: &'a P,
     /// The canonical credential the swap reroutes (#6).
     store: &'a C,
@@ -345,15 +499,16 @@ struct Seams<'a, P, C, S, N> {
 /// every refusal / abort is a typed [`Error`] whose `exit_code` extends the taxonomy
 /// (issue #63), and on every error path the swap has not run, so there are ZERO
 /// writes.
-async fn run_use<P, C, S, N>(
+async fn run_use<R, P, C, S, N>(
     config: &Config,
     query: &str,
     force: bool,
     in_cooldown: bool,
-    seams: Seams<'_, P, C, S, N>,
+    seams: Seams<'_, R, P, C, S, N>,
     log: &mut EventLog,
 ) -> Result<()>
 where
+    R: CachedViabilitySource,
     P: RosterPoller,
     C: CredentialStore,
     S: AccountStash,
@@ -387,28 +542,35 @@ where
     let (swap_target, reason) = if force {
         // `--force` bypasses the POLICY gates (cooldown, weekly-exhausted,
         // already-active), but still WARNS when forcing onto a non-viable target.
-        // SAFETY is never bypassed: a locked keychain aborts (ZERO writes); a
-        // transient poll failure only affects the informational warning, so the
-        // forced swap proceeds best-effort without one.
-        match poll_viability(seams.poller, target, weekly_trigger).await {
-            // A known viability: emit the matching warn-and-proceed warning (none
-            // for a viable target). The DECISION is the pure `force_warning`; only
-            // the emission lives here.
-            Ok(viability) => {
-                if let Some(warning) = force_warning(viability, &target_label) {
-                    eprintln!("{warning}");
-                }
-            }
-            // SAFETY is never bypassed: a locked keychain aborts even with `--force`
-            // (ZERO writes — the swap never runs).
-            Err(err @ Error::KeychainLocked { .. }) => return Err(err),
-            // A transient poll failure only affects the (informational) warning, so
-            // the forced swap proceeds best-effort without one (decision D1).
-            Err(_) => {}
+        // Consult the daemon's CACHED verdict first (issue #75 — ZERO usage-endpoint
+        // requests when a daemon is up); only on a cache MISS do a single live poll.
+        // SAFETY is never bypassed: a locked keychain on the live fallback aborts
+        // (ZERO writes); any other live-poll failure (transient / 429) only affects
+        // the informational warning, so the forced swap proceeds best-effort
+        // without one (decision D1).
+        let viability = match seams.cache.cached_viability(target).await {
+            Some(cached) => Some(cached),
+            None => match poll_viability(seams.poller, target, weekly_trigger).await {
+                Ok(viability) => Some(viability),
+                // SAFETY is never bypassed: a locked keychain aborts even with
+                // `--force` (ZERO writes — the swap never runs).
+                Err(err @ Error::KeychainLocked { .. }) => return Err(err),
+                // A transient / rate-limited poll only affects the (informational)
+                // warning, so the forced swap proceeds without one (decision D1).
+                Err(_) => None,
+            },
+        };
+        // The DECISION of WHICH warning to emit is the pure `force_warning` (none for
+        // a viable target, none when viability is unknown); only the emission lives
+        // here. An unknown verdict (cache miss + failed live poll) warns nothing and
+        // the forced swap still proceeds.
+        if let Some(warning) = viability.and_then(|v| force_warning(v, &target_label)) {
+            eprintln!("{warning}");
         }
         (SwapTarget::forced(target), SwapReason::Forced)
     } else {
         match SwapTarget::resolve(
+            seams.cache,
             seams.poller,
             target,
             &active_stash,
@@ -519,8 +681,14 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
 
     let claude_json = paths::claude_json()?;
     let lock_path = paths::swap_lock()?;
+    // Both control-socket clients (the cached-reading query #75 and the manual-hold
+    // notify #64) speak to the same daemon socket; resolve it once.
+    let control_socket = paths::control_socket()?;
+    let cache = ControlSocketCache {
+        socket: control_socket.clone(),
+    };
     let notifier = ControlSocketNotifier {
-        socket: paths::control_socket()?,
+        socket: control_socket,
     };
     let mut log = EventLog::open()?;
     run_use(
@@ -529,6 +697,7 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
         force,
         in_cooldown,
         Seams {
+            cache: &cache,
             poller: &RealRosterPoller::new(),
             store: &RealCredentialStore::new(),
             stash: &RealAccountStash::new(),
@@ -570,6 +739,10 @@ mod tests {
         ScopeMissing,
         /// A transient failure (server / network) — not a viability verdict.
         Transient,
+        /// A `429` rate-limit. On the gated live fallback issue #75 remaps it to the
+        /// distinct [`Error::UseViabilityUnverifiable`]; `--force` tolerates it
+        /// best-effort.
+        RateLimited,
         /// The keychain is locked (the always-enforced safety abort).
         Locked,
     }
@@ -604,8 +777,46 @@ mod tests {
                     status: 503,
                     retry_after: None,
                 }),
+                Probe::RateLimited => Err(Error::UsageRateLimited {
+                    status: 429,
+                    retry_after: None,
+                }),
                 Probe::Locked => Err(Error::KeychainLocked { op: "read" }),
             }
+        }
+    }
+
+    /// A scripted [`CachedViabilitySource`] for the cache-vs-live tests (issue #75):
+    /// a cache HIT returns a fixed verdict; a cache MISS returns `None` (→ the
+    /// caller's single live fallback poll). Counts calls so a test can assert the
+    /// gate consulted the cache.
+    struct FakeCache {
+        verdict: Option<Viability>,
+        calls: Cell<u32>,
+    }
+
+    impl FakeCache {
+        /// A cache MISS — the daemon-down / no-cached-reading case → live fallback.
+        /// The default for the gate tests that predate the cache.
+        fn miss() -> Self {
+            Self {
+                verdict: None,
+                calls: Cell::new(0),
+            }
+        }
+        /// A cache HIT carrying `verdict` — a running daemon with a usable reading.
+        fn hit(verdict: Viability) -> Self {
+            Self {
+                verdict: Some(verdict),
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl CachedViabilitySource for FakeCache {
+        async fn cached_viability(&self, _account: &Account) -> Option<Viability> {
+            self.calls.set(self.calls.get() + 1);
+            self.verdict
         }
     }
 
@@ -711,10 +922,12 @@ mod tests {
         (store, stash)
     }
 
-    /// Run `use spare` (uuid `u-B`) against a fresh fixture: active = `work` (`u-A`).
-    /// Returns the result, the store, the stash, the poll-call count, and the log's
-    /// text — everything a test needs to assert the swap (or its absence).
-    async fn run(
+    /// Run `use spare` (uuid `u-B`) against a fresh fixture: active = `work` (`u-A`),
+    /// with a caller-supplied `cache` seam. Returns the result, the store, the stash,
+    /// the LIVE-poll call count, and the log's text — everything a test needs to
+    /// assert the swap (or its absence) AND whether the gate fell back to a live poll.
+    async fn run_with(
+        cache: &FakeCache,
         query: &str,
         force: bool,
         in_cooldown: bool,
@@ -745,6 +958,7 @@ mod tests {
             force,
             in_cooldown,
             Seams {
+                cache,
                 poller: &poller,
                 store: &store,
                 stash: &stash,
@@ -758,6 +972,44 @@ mod tests {
 
         let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
         (result, store, stash, poller.calls.get(), log_text)
+    }
+
+    /// `use` with NO usable cached reading — the daemon-down path that falls back to
+    /// a single live poll (today's behaviour). The default for the gate tests that
+    /// predate the cache (issue #75): they assert the LIVE-poll path unchanged.
+    async fn run(
+        query: &str,
+        force: bool,
+        in_cooldown: bool,
+        probe: Probe,
+    ) -> (
+        Result<()>,
+        FakeCredentialStore,
+        FakeAccountStash,
+        u32,
+        String,
+    ) {
+        run_with(&FakeCache::miss(), query, force, in_cooldown, probe).await
+    }
+
+    /// `use` with a daemon-CACHED `cached` verdict (issue #75). The `probe` is the
+    /// poller the gate must NOT consult on a cache hit — these tests pass the poison
+    /// [`Probe::Locked`] (which would abort if wrongly polled) and assert the
+    /// live-poll count is `0`, proving the swap used the cached reading alone.
+    async fn run_with_cache(
+        cached: Viability,
+        query: &str,
+        force: bool,
+        in_cooldown: bool,
+        probe: Probe,
+    ) -> (
+        Result<()>,
+        FakeCredentialStore,
+        FakeAccountStash,
+        u32,
+        String,
+    ) {
+        run_with(&FakeCache::hit(cached), query, force, in_cooldown, probe).await
     }
 
     /// The canonical credential's current blob (the active reroute target).
@@ -878,6 +1130,91 @@ mod tests {
             force_warning(Viability::Quarantined, "spare"),
             Some(warn_quarantined("spare"))
         );
+    }
+
+    // --- cached viability classification (pure, issue #75) -------------------
+
+    /// Build a daemon `status` line for the cached-viability classifier tests: only
+    /// the fields the gate reads vary — handle, `quarantined`, `weekly_exhausted`,
+    /// and whether a usage reading is present (a failed poll leaves both pct fields
+    /// `None`, exactly as the daemon projects it).
+    fn status_line(
+        label: &str,
+        quarantined: bool,
+        weekly_exhausted: bool,
+        weekly_pct: Option<u8>,
+    ) -> AccountStatusLine {
+        AccountStatusLine {
+            label: label.to_owned(),
+            active: false,
+            enabled: true,
+            quarantined,
+            session_pct: weekly_pct,
+            weekly_pct,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            weekly_exhausted,
+        }
+    }
+
+    #[test]
+    fn cached_viability_of_maps_each_line() {
+        // A quarantined line is a usable verdict even with NO usage reading — the
+        // daemon stops polling a dead account, so it carries no percentages.
+        assert_eq!(
+            cached_viability_of(&status_line("a", true, false, None)),
+            Some(Viability::Quarantined)
+        );
+        // A weekly-exhausted line → WeeklyExhausted (the daemon's own verdict).
+        assert_eq!(
+            cached_viability_of(&status_line("a", false, true, Some(99))),
+            Some(Viability::WeeklyExhausted)
+        );
+        // A healthy line WITH a fresh reading → Viable.
+        assert_eq!(
+            cached_viability_of(&status_line("a", false, false, Some(10))),
+            Some(Viability::Viable)
+        );
+        // A healthy line with NO reading (the daemon's last poll failed, or it is
+        // parked / unpolled) is NOT a verdict → `None` → the caller's live fallback.
+        assert_eq!(
+            cached_viability_of(&status_line("a", false, false, None)),
+            None
+        );
+        // Quarantined takes priority over any (stale) exhausted flag.
+        assert_eq!(
+            cached_viability_of(&status_line("a", true, true, None)),
+            Some(Viability::Quarantined)
+        );
+    }
+
+    #[test]
+    fn cached_viability_for_requires_a_unique_handle_match() {
+        // A unique handle match → its verdict.
+        let unique = StatusResponse {
+            accounts: vec![
+                status_line("work", false, false, Some(20)),
+                status_line("spare", false, false, Some(10)),
+            ],
+            last_swap: None,
+        };
+        assert_eq!(
+            cached_viability_for(&unique, "spare"),
+            Some(Viability::Viable)
+        );
+        // A handle absent from the reply → no cached reading → live fallback.
+        assert_eq!(cached_viability_for(&unique, "ghost"), None);
+        // A DUPLICATED handle cannot be disambiguated from the wire reply alone
+        // (labels are not unique, and the reply carries no account-uuid) → live
+        // fallback, never a guess.
+        let duped = StatusResponse {
+            accounts: vec![
+                status_line("dup", false, false, Some(10)),
+                status_line("dup", true, false, None),
+            ],
+            last_swap: None,
+        };
+        assert_eq!(cached_viability_for(&duped, "dup"), None);
     }
 
     // --- acceptance: viable use (#63) ---------------------------------------
@@ -1011,6 +1348,220 @@ mod tests {
         assert!(!log.contains("event=swap"), "log: {log}");
     }
 
+    // --- acceptance: daemon-cached viability + live fallback (#75) -----------
+
+    #[tokio::test]
+    async fn cached_viable_target_swaps_without_a_live_poll() {
+        // AC#1: with a running daemon holding a viable cached reading, `use` swaps on
+        // that reading and issues ZERO usage-endpoint requests of its own. The poison
+        // `Probe::Locked` would abort if the gate wrongly fell back to a live poll —
+        // it does not, and the live-poll count is 0.
+        let (result, store, stash, calls, log) =
+            run_with_cache(Viability::Viable, "spare", false, false, Probe::Locked).await;
+        assert!(result.is_ok(), "a cached-viable target swaps: {result:?}");
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "canonical rerouted to B"
+        );
+        // The outgoing account A was re-stashed with its fresh canonical token.
+        assert_eq!(
+            stash
+                .read("Sessiometer/u-A")
+                .await
+                .unwrap()
+                .credential
+                .expose(),
+            b"A-token"
+        );
+        assert!(
+            log.contains("event=swap from=work to=spare reason=manual"),
+            "log: {log}"
+        );
+        assert_eq!(
+            calls, 0,
+            "ZERO live polls — the gate used the cached reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_weekly_exhausted_refuses_without_a_live_poll() {
+        // AC#2: a cached weekly-exhausted reading produces the SAME refusal as a live
+        // one (UseTargetWeeklyExhausted), with ZERO live polls and ZERO writes.
+        let (result, store, _stash, calls, log) = run_with_cache(
+            Viability::WeeklyExhausted,
+            "spare",
+            false,
+            false,
+            Probe::Locked,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::UseTargetWeeklyExhausted { ref label }) if label == "spare"),
+            "got {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
+        assert_eq!(calls, 0, "ZERO live polls — refused on the cached reading");
+        assert!(!log.contains("event=swap"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn cached_quarantined_refuses_without_a_live_poll() {
+        // AC#2: a cached quarantined reading → UseTargetQuarantined, ZERO live polls,
+        // ZERO writes — the same refusal a live dead-credential poll produces.
+        let (result, store, _stash, calls, log) =
+            run_with_cache(Viability::Quarantined, "spare", false, false, Probe::Locked).await;
+        assert!(
+            matches!(result, Err(Error::UseTargetQuarantined { ref label }) if label == "spare"),
+            "got {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
+        assert_eq!(calls, 0, "ZERO live polls — refused on the cached reading");
+        assert!(!log.contains("event=swap"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn force_overrides_a_cached_exhausted_reading_without_a_live_poll() {
+        // AC#2: --force still overrides a cached refusal (warn-and-proceed), deciding
+        // the warning from the cached reading alone — ZERO live polls.
+        let (result, store, _stash, calls, log) = run_with_cache(
+            Viability::WeeklyExhausted,
+            "spare",
+            true,
+            false,
+            Probe::Locked,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "--force overrides a cached weekly-exhausted: {result:?}"
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "the forced swap rerouted to B"
+        );
+        assert!(log.contains("reason=forced"), "log: {log}");
+        assert_eq!(
+            calls, 0,
+            "ZERO live polls — the warning used the cached reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_daemon_falls_back_to_a_single_live_poll() {
+        // AC#3: with no daemon (a cache MISS), `use` falls back to a single live poll
+        // — today's behaviour. A viable live poll swaps, polling exactly once.
+        let (result, store, _stash, calls, log) =
+            run("spare", false, false, Probe::Live { weekly: 0.10 }).await;
+        assert!(
+            result.is_ok(),
+            "the live fallback swaps a viable target: {result:?}"
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "canonical rerouted to B"
+        );
+        assert!(
+            log.contains("event=swap from=work to=spare reason=manual"),
+            "log: {log}"
+        );
+        assert_eq!(calls, 1, "exactly one live fallback poll");
+    }
+
+    #[tokio::test]
+    async fn rate_limited_live_fallback_surfaces_a_distinct_error() {
+        // AC#3: a 429 on the live fallback is surfaced as the distinct, actionable
+        // UseViabilityUnverifiable — NOT the opaque raw UsageRateLimited — with ZERO
+        // writes. (Before #75 the raw 429 propagated and aborted `use` opaquely even
+        // for a plainly-viable target.)
+        let (result, store, _stash, calls, log) =
+            run("spare", false, false, Probe::RateLimited).await;
+        assert!(
+            matches!(result, Err(Error::UseViabilityUnverifiable { ref label }) if label == "spare"),
+            "got {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
+        assert_eq!(
+            calls, 1,
+            "one live fallback poll, then a clean abort (no busy-spin)"
+        );
+        assert!(!log.contains("event=swap"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn force_with_a_rate_limited_live_fallback_proceeds_best_effort() {
+        // AC#3 + D1: under --force a 429 on the live fallback only costs the warning,
+        // so the forced swap proceeds — it never surfaces UseViabilityUnverifiable.
+        let (result, store, _stash, _calls, log) =
+            run("spare", true, false, Probe::RateLimited).await;
+        assert!(
+            result.is_ok(),
+            "a rate-limited poll must not block a forced swap: {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"B-token");
+        assert!(log.contains("reason=forced"), "log: {log}");
+    }
+
+    // --- ControlSocketCache: the REAL client over a real socket (#75) --------
+
+    #[tokio::test]
+    async fn control_socket_cache_reads_a_cached_verdict_over_a_real_socket() {
+        // The production [`ControlSocketCache`] round-trips the SAME newline-JSON
+        // `status` exchange the daemon serves and the `status` command speaks: bind a
+        // socket, serve one reply, and assert the client reads the target's cached
+        // verdict — proving the real socket path (not just the pure classifiers) maps
+        // a live reply to a viability without any usage-endpoint request.
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let response = StatusResponse {
+            accounts: vec![
+                status_line("work", false, false, Some(20)),
+                status_line("spare", false, false, Some(10)),
+            ],
+            last_swap: None,
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        // Server: accept one connection, expect the status request, reply once.
+        let server = async move {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut buffered = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            buffered.read_line(&mut request).await.unwrap();
+            assert_eq!(request.trim_end(), r#"{"cmd":"status"}"#);
+            buffered.write_all(wire.as_bytes()).await.unwrap();
+            buffered.write_all(b"\n").await.unwrap();
+            buffered.flush().await.unwrap();
+        };
+
+        let cache = ControlSocketCache { socket };
+        let target = acct("spare", "u-B");
+        let (_, verdict) = tokio::join!(server, cache.cached_viability(&target));
+        assert_eq!(
+            verdict,
+            Some(Viability::Viable),
+            "the real client reads the cached viable verdict over the socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_socket_cache_misses_when_no_daemon_is_listening() {
+        // No socket bound → the cache MISSES (`None`) so the gate falls back to a live
+        // poll — a missing daemon must never block `use` (issue #75), the daemon-down
+        // counterpart of the manual-hold notify's best-effort contract (#64).
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock"); // never bound
+        let cache = ControlSocketCache { socket };
+        let target = acct("spare", "u-B");
+        assert_eq!(cache.cached_viability(&target).await, None);
+    }
+
     // --- acceptance: not-found / ambiguous through run_use (#63) -------------
 
     #[tokio::test]
@@ -1107,12 +1658,16 @@ mod tests {
         let lock_dir = tempfile::tempdir().unwrap();
         let lock_path = lock_dir.path().join("swap.lock");
         let notifier = FakeNotifier::ok();
+        // The active account is unresolvable, so the gate (and its cache query) is
+        // never reached — a miss cache that, like the poller, must go untouched.
+        let cache = FakeCache::miss();
         let result = run_use(
             &config,
             "spare",
             false,
             false,
             Seams {
+                cache: &cache,
                 poller: &poller,
                 store: &store,
                 stash: &stash,
@@ -1123,6 +1678,11 @@ mod tests {
             &mut log,
         )
         .await;
+        assert_eq!(
+            cache.calls.get(),
+            0,
+            "the gate (and its cache query) is reached only after active resolution"
+        );
         // The swap never ran, so the daemon was never notified (no manual hold to
         // signal). ZERO writes AND zero notifications.
         assert_eq!(notifier.calls.get(), 0, "an aborted swap must not notify");
@@ -1145,6 +1705,8 @@ mod tests {
         let (_json_dir, json) = claude_json_for("u-A");
         let log_dir = tempfile::tempdir().unwrap();
         let mut log = EventLog::at(&log_dir.path().join("sessiometer.log")).unwrap();
+        // No daemon cached reading → the gate falls back to the live (viable) poll.
+        let cache = FakeCache::miss();
         let poller = FakePoller::new(Probe::Live { weekly: 0.10 });
         let lock_dir = tempfile::tempdir().unwrap();
         let lock_path = lock_dir.path().join("swap.lock");
@@ -1154,6 +1716,7 @@ mod tests {
             false,
             false,
             Seams {
+                cache: &cache,
                 poller: &poller,
                 store: &store,
                 stash: &stash,
@@ -1237,6 +1800,10 @@ mod tests {
             .to_string(),
             Error::UseCooldownActive.to_string(),
             Error::UseTargetQuarantined {
+                label: "spare".into(),
+            }
+            .to_string(),
+            Error::UseViabilityUnverifiable {
                 label: "spare".into(),
             }
             .to_string(),
