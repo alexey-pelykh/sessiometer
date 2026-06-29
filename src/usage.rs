@@ -49,6 +49,7 @@
 //! and never accumulate). The poller never self-refreshes a token.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 #[cfg(test)]
 use std::cell::RefCell;
@@ -73,7 +74,7 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const BETA_HEADER: &str = "anthropic-beta: oauth-2025-04-20";
 
 /// Hard ceiling (seconds) on a single poll, so a hung request can never wedge the
-/// poll loop. Comfortably below the default 60s poll interval.
+/// poll loop. Comfortably below the default 300 s (5 min) poll interval.
 const POLL_TIMEOUT_SECS: u32 = 30;
 
 /// A point-in-time usage reading for one account, across both quota windows.
@@ -170,6 +171,12 @@ pub(crate) trait UsageTransport {
 pub(crate) struct HttpResponse {
     status: u16,
     body: String,
+    /// The server-advised `Retry-After` (delta-seconds form) when the response
+    /// carried that header; `None` otherwise. Threaded into the rate-limited /
+    /// transient errors so the daemon can honour it as a MINIMUM back-off wait
+    /// (issue #76). Only a `4xx`/`5xx` carrying it is meaningful; on a `2xx` it is
+    /// simply ignored.
+    retry_after: Option<Duration>,
 }
 
 /// Real usage poller: classify the HTTP outcome and parse a success. Generic over
@@ -197,9 +204,15 @@ where
             UsageStatus::Unauthorized => Err(Error::UsageUnauthorized),
             UsageStatus::Success => Ok(parse_usage(&response.body)?.to_usage()),
             UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
-            UsageStatus::RateLimited => Err(Error::UsageRateLimited { status }),
+            UsageStatus::RateLimited => Err(Error::UsageRateLimited {
+                status,
+                retry_after: response.retry_after,
+            }),
             UsageStatus::ClientError => Err(Error::UsageRejected { status }),
-            UsageStatus::Transient => Err(Error::UsageTransient { status }),
+            UsageStatus::Transient => Err(Error::UsageTransient {
+                status,
+                retry_after: response.retry_after,
+            }),
         }
     }
 }
@@ -248,6 +261,7 @@ impl<C: CredentialStore> UsageTransport for CurlTransport<C> {
             return Ok(HttpResponse {
                 status: 0,
                 body: String::new(),
+                retry_after: None,
             });
         }
         Ok(parse_curl_output(&output.stdout))
@@ -301,9 +315,12 @@ fn access_token_from_blob(blob: &[u8]) -> Result<Zeroizing<String>> {
 }
 
 /// Build the `curl --config -` body fed on stdin. Keeps the bearer out of argv;
-/// `write-out` appends `\n<status>` after the body so the caller can recover the
-/// HTTP status. The token is an opaque `sk-ant-…` string (no `"`/newline), so it
-/// needs no escaping inside the quoted `header` value. Zeroized on drop.
+/// `write-out` appends `\n<status>\n<retry-after>` after the body so the caller
+/// can recover the HTTP status and the `Retry-After` response header (empty when
+/// absent — `%header{}` requires curl ≥ 7.84, present on every supported macOS;
+/// an unparseable value just degrades to `None`, issue #76). The token is an
+/// opaque `sk-ant-…` string (no `"`/newline), so it needs no escaping inside the
+/// quoted `header` value. Zeroized on drop.
 fn curl_config(token: &str) -> Zeroizing<String> {
     let mut config = String::new();
     config.push_str("url = \"");
@@ -320,26 +337,52 @@ fn curl_config(token: &str) -> Zeroizing<String> {
     config.push_str("silent\n");
     config.push_str("show-error\n");
     config.push_str(&format!("max-time = {POLL_TIMEOUT_SECS}\n"));
-    // Body, then a newline and the numeric status, on stdout.
-    config.push_str("write-out = \"\\n%{http_code}\"\n");
+    // Body, then a newline and the numeric status, then a newline and the
+    // `Retry-After` header value (empty when absent), on stdout.
+    config.push_str("write-out = \"\\n%{http_code}\\n%header{retry-after}\"\n");
     Zeroizing::new(config)
 }
 
-/// Split `curl`'s stdout (`<body>\n<status>`, per the `write-out` above) into a
-/// [`HttpResponse`]. Tolerant: an unparseable trailing code becomes `0` (→
-/// Transient), and a no-body output is just the code.
+/// Split `curl`'s stdout (`<body>\n<status>\n<retry-after>`, per the `write-out`
+/// above) into a [`HttpResponse`]. The two metadata lines are peeled from the END,
+/// so a multi-line body is preserved. Tolerant: the `Retry-After` line is empty
+/// (→ `None`) on most responses; an unparseable trailing code becomes `0` (→
+/// Transient); a no-body output is just the metadata.
 fn parse_curl_output(stdout: &[u8]) -> HttpResponse {
     let text = String::from_utf8_lossy(stdout);
-    match text.rsplit_once('\n') {
+    // Peel the last line (the `Retry-After` value, empty when the header was
+    // absent), then the new-last line (the status); everything before is the body.
+    let Some((rest, retry_after_line)) = text.rsplit_once('\n') else {
+        // No newline at all — degenerate; treat the whole output as the code.
+        return HttpResponse {
+            status: text.trim().parse().unwrap_or(0),
+            body: String::new(),
+            retry_after: None,
+        };
+    };
+    let retry_after = parse_retry_after(retry_after_line);
+    match rest.rsplit_once('\n') {
         Some((body, code)) => HttpResponse {
             status: code.trim().parse().unwrap_or(0),
             body: body.to_owned(),
+            retry_after,
         },
         None => HttpResponse {
-            status: text.trim().parse().unwrap_or(0),
+            status: rest.trim().parse().unwrap_or(0),
             body: String::new(),
+            retry_after,
         },
     }
+}
+
+/// Parse a `Retry-After` header value into a back-off floor. Only the
+/// delta-seconds form (a non-negative integer count of seconds) is honoured →
+/// `Some(Duration)`; the HTTP-date form, and any empty or unparseable value,
+/// yields `None`, leaving the daemon's exponential back-off to govern the wait
+/// (issue #76). A negative or fractional value parses as neither a `u64` → `None`.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(secs))
 }
 
 /// Parse a `200` usage body into both dimensions plus reset timestamps.
@@ -831,31 +874,68 @@ mod tests {
         assert!(config.contains(&format!("url = \"{USAGE_URL}\"")));
         assert!(config.contains("header = \"Authorization: Bearer sk-ant-oat-TESTTOKEN\""));
         assert!(config.contains(&format!("header = \"{BETA_HEADER}\"")));
-        assert!(config.contains("write-out = \"\\n%{http_code}\""));
+        assert!(config.contains("write-out = \"\\n%{http_code}\\n%header{retry-after}\""));
         assert!(config.contains(&format!("max-time = {POLL_TIMEOUT_SECS}")));
     }
 
     // --- parse_curl_output (pure) ---
 
     #[test]
-    fn parse_curl_output_splits_body_and_trailing_status() {
-        let resp = parse_curl_output(b"{\"limits\":[]}\n200");
+    fn parse_curl_output_splits_body_status_and_empty_retry_after() {
+        // write-out shape: <body>\n<status>\n<retry-after> — the trailing
+        // retry-after line is empty on a normal response.
+        let resp = parse_curl_output(b"{\"limits\":[]}\n200\n");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, "{\"limits\":[]}");
+        assert_eq!(resp.retry_after, None);
     }
 
     #[test]
     fn parse_curl_output_handles_a_multiline_body() {
-        let resp = parse_curl_output(b"{\n  \"a\": 1\n}\n403");
+        // The two metadata lines are peeled from the end, so newlines inside the
+        // body survive.
+        let resp = parse_curl_output(b"{\n  \"a\": 1\n}\n403\n");
         assert_eq!(resp.status, 403);
         assert_eq!(resp.body, "{\n  \"a\": 1\n}");
+        assert_eq!(resp.retry_after, None);
+    }
+
+    #[test]
+    fn parse_curl_output_captures_a_numeric_retry_after() {
+        // A 429 with `Retry-After: 30` and an empty body.
+        let resp = parse_curl_output(b"\n429\n30");
+        assert_eq!(resp.status, 429);
+        assert_eq!(resp.body, "");
+        assert_eq!(resp.retry_after, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_curl_output_ignores_an_http_date_retry_after() {
+        // The HTTP-date form is not honoured (delta-seconds only) → None, leaving
+        // exponential back-off to govern the wait.
+        let resp = parse_curl_output(b"\n503\nWed, 21 Oct 2015 07:28:00 GMT");
+        assert_eq!(resp.status, 503);
+        assert_eq!(resp.retry_after, None);
     }
 
     #[test]
     fn parse_curl_output_tolerates_a_missing_or_unparseable_status() {
-        // No trailing newline + non-numeric → status 0 (→ Transient).
+        // No newline at all + non-numeric → status 0 (→ Transient).
         assert_eq!(parse_curl_output(b"garbage").status, 0);
+        // A lone newline → empty status + empty retry-after → status 0.
         assert_eq!(parse_curl_output(b"\n").status, 0);
+    }
+
+    #[test]
+    fn parse_retry_after_honours_only_the_delta_seconds_form() {
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("  7 "), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        // Empty, negative, fractional, and HTTP-date forms all decline to None.
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("-5"), None);
+        assert_eq!(parse_retry_after("1.5"), None);
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
     }
 
     // --- RealUsageSource end-to-end (fake transport) ---
@@ -876,6 +956,16 @@ mod tests {
             Ok(HttpResponse {
                 status,
                 body: body.to_owned(),
+                retry_after: None,
+            })
+        }
+
+        /// A bodyless response carrying a `Retry-After`, for the throttled paths.
+        fn ok_retry_after(status: u16, retry_after: Option<Duration>) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status,
+                body: String::new(),
+                retry_after,
             })
         }
     }
@@ -926,15 +1016,41 @@ mod tests {
         ]);
         assert!(matches!(
             src.usage().await,
-            Err(Error::UsageRateLimited { status: 429 })
+            Err(Error::UsageRateLimited { status: 429, .. })
         ));
         assert!(matches!(
             src.usage().await,
-            Err(Error::UsageTransient { status: 503 })
+            Err(Error::UsageTransient { status: 503, .. })
         ));
         assert!(matches!(
             src.usage().await,
             Err(Error::UsageRejected { status: 400 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_threads_into_the_throttled_errors() {
+        // Issue #76: the server-advised Retry-After rides the rate-limited and
+        // transient errors so the daemon can honour it as a minimum back-off.
+        let src = source(vec![
+            FakeUsageTransport::ok_retry_after(429, Some(Duration::from_secs(42))),
+            FakeUsageTransport::ok_retry_after(503, Some(Duration::from_secs(7))),
+            FakeUsageTransport::ok_retry_after(429, None),
+        ]);
+        assert!(matches!(
+            src.usage().await,
+            Err(Error::UsageRateLimited { retry_after: Some(d), .. }) if d == Duration::from_secs(42)
+        ));
+        assert!(matches!(
+            src.usage().await,
+            Err(Error::UsageTransient { retry_after: Some(d), .. }) if d == Duration::from_secs(7)
+        ));
+        assert!(matches!(
+            src.usage().await,
+            Err(Error::UsageRateLimited {
+                retry_after: None,
+                ..
+            })
         ));
     }
 
