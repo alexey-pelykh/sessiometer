@@ -104,7 +104,10 @@ Restore your normal values when finished (Step 9).
    `sessiometer.log`, and any error output (e.g. run a bogus `sessiometer status` with the daemon
    stopped). They carry account **labels**, **percentages**, and relative ages only — **never** a token
    (`sk-ant-…`), a credential blob, or an account email. (This is exactly what the redaction METER
-   asserts mechanically over the same channels in CI, issue #15.)
+   asserts mechanically over the same channels in CI, issue #15.) On an interactive terminal `status`
+   color-codes each row by urgency (green/yellow/red, issue #73); the color only **augments** the same
+   non-secret text and adds nothing but ANSI escapes — pipe it (`sessiometer status | cat -v`) to
+   confirm the escapes vanish and not a single secret appears.
 
 9. **Teardown.** `Ctrl-C` the daemon. Restore `config.toml` to your normal `session_trigger` /
    `poll_secs` / `cooldown_secs`. The rotation and both stashes are unchanged.
