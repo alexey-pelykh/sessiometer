@@ -102,6 +102,12 @@ long-running rotation hits:
   effectively undone by the concurrent login and re-running heals the state. This
   is an accepted `0.1.0` limitation.
 
+These behaviours, and the full threshold → swap → propagate loop, are verified
+end-to-end: a hermetic acceptance test runs on every CI build (driving the loop
+through injected usage / credential / clock seams, no real quota), and a
+documented manual smoke test against real accounts —
+[`build/smoke-test.md`](build/smoke-test.md) — is the human-run complement.
+
 ## Roster size and poll cost
 
 There is **no fixed limit** on how many accounts the roster holds — capture as
