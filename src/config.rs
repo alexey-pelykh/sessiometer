@@ -30,11 +30,13 @@ use crate::error::{Error, Result};
 use crate::paths;
 use crate::timing::{Jitter, Strategy};
 
-/// Default seconds between usage polls. Issue #38 lengthened this from the
-/// original fixed 60 s to a longer base that the normal poll jitter then
-/// decorrelates across accounts/cycles; issue #76 confirmed 5 min as a comfortable
-/// steady-state cadence (the rate-limit / transient back-off widens it further
-/// under sustained `429` / `5xx`, so the base need not be conservative).
+/// Default seconds between re-polling a given account — the per-account cadence.
+/// Issue #38 lengthened this from the original fixed 60 s to a longer base that the
+/// normal poll jitter then decorrelates across accounts/cycles; issue #76 confirmed
+/// 5 min as a comfortable steady-state cadence (the rate-limit / transient back-off
+/// widens it further under sustained `429` / `5xx`, so the base need not be
+/// conservative). Issue #80 spreads the roster WITHIN this cadence — one account per
+/// `poll_secs / N` sub-interval — rather than bursting all N at once.
 const DEFAULT_POLL_SECS: u64 = 300;
 /// Default standard deviation (seconds) of the poll interval's normal jitter —
 /// ~20% of [`DEFAULT_POLL_SECS`]. Poll is the one tunable that jitters by default
@@ -107,7 +109,10 @@ impl Account {
 /// `assert_eq!` and for the render round-trip check.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Tunables {
-    /// Seconds between usage polls (`5..=3600`).
+    /// Seconds between re-polling a GIVEN account (`5..=3600`) — the per-account
+    /// cadence and the base of the rate-limit back-off. The daemon polls one account
+    /// per `poll_secs / N` sub-interval (issue #80), so a roster of N accounts is swept
+    /// once per `poll_secs` without bursting all N requests at once.
     pub(crate) poll_secs: u64,
     /// Seconds to wait after a swap before another is allowed (`0..=3600`).
     /// Consumed by the cooldown logic (#10 / #11).
@@ -431,9 +436,11 @@ impl Config {
 
         out.push_str("[tunables]\n");
         out.push_str(
-            "# Seconds between usage polls (5..=3600). The default 300 (5 min) plus the\n\
-             # normal `poll` jitter below spaces concurrent accounts ~1-3 min apart; under\n\
-             # sustained 429/5xx the daemon backs off automatically — widening this and\n\
+            "# Seconds between re-polling a given account (5..=3600) — the per-account\n\
+             # cadence. The default 300 (5 min) plus the normal `poll` jitter below\n\
+             # decorrelates cycles; the daemon staggers the roster within it, polling one\n\
+             # account per poll_secs/N sub-interval so requests do not burst all at once.\n\
+             # Under sustained 429/5xx it backs off automatically — widening this and\n\
              # honouring any Retry-After — instead of re-polling at the fixed interval.\n",
         );
         out.push_str(&format!("poll_secs = {}\n", t.poll_secs));
