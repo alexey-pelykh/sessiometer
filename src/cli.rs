@@ -41,11 +41,21 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     crate::capture::capture(label).await
                 }
                 "run" => run().await,
-                // `status [--json]` — `--json` dumps the full response verbatim,
-                // the full-data contract regardless of terminal width (issue #72).
+                // `status [--json] [--no-color]` — `--json` dumps the full
+                // response verbatim, the full-data contract regardless of terminal
+                // width (issue #72); `--no-color` forces the urgency overlay off
+                // (issue #73). Both flags may appear in any order; extras ignored.
                 "status" => {
-                    let json = args.any(|arg| arg.to_string_lossy() == "--json");
-                    status(json).await
+                    let mut json = false;
+                    let mut no_color = false;
+                    for arg in args.by_ref() {
+                        match arg.to_string_lossy().as_ref() {
+                            "--json" => json = true,
+                            "--no-color" => no_color = true,
+                            _ => {}
+                        }
+                    }
+                    status(json, no_color).await
                 }
                 "list" => list().await,
                 // `use <account> [--force]` switches the active account on demand
@@ -107,7 +117,7 @@ fn print_usage() {
          COMMANDS:\n    \
          capture [<label>]    Stash the active account into the rotation\n    \
          run        Run the foreground daemon (poll + swap)\n    \
-         status [--json]      Show each account's usage + resets-in, and the last swap\n    \
+         status [--json] [--no-color]  Show each account's usage + resets-in, and the last swap\n    \
          list       List captured accounts\n    \
          use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
@@ -214,18 +224,29 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
 /// handles + percentages + per-account reset instants + a swap age only (issue
 /// #15 redaction). `--json` prints that same response verbatim — the full-data
 /// contract regardless of terminal width (issue #72).
-async fn status(json: bool) -> Result<()> {
+///
+/// The text view marks each account's urgency with a green/yellow/red color
+/// overlay (issue #73), but only when the color gate is open — an interactive
+/// stdout TTY with none of the opt-outs ([`should_colorize`]). `--json` is never
+/// colored (raw data for scripts), and the gate keeps ANSI out of any pipe,
+/// redirect, or log, so `status | grep` and `status > file` stay escape-free.
+async fn status(json: bool, no_color: bool) -> Result<()> {
     let response = query_status(&paths::control_socket()?).await?;
     if json {
         // The full-data contract, regardless of terminal width (issue #72): the
         // raw response — both per-account reset instants included — pretty-printed,
         // for scripts (`status --json | jq`). Sourced from the same non-secret
         // response as the text view, so it too can never carry a token or email.
+        // Never colored — scripts consume the bytes verbatim.
         let rendered = serde_json::to_string_pretty(&response)
             .map_err(|err| Error::Io(std::io::Error::other(err)))?;
         println!("{rendered}");
     } else {
-        print!("{}", render_status(&response, now_epoch(), terminal_cols()));
+        let color = should_colorize(no_color);
+        print!(
+            "{}",
+            render_status(&response, now_epoch(), terminal_cols(), color)
+        );
     }
     Ok(())
 }
@@ -264,9 +285,10 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// Render a [`StatusResponse`] as the text `status` prints: an aligned column
 /// table (issue #72), one record per line, then the `last_swap` footer. Pure (no
 /// clock, no I/O) so the response→text mapping is unit-testable — the caller
-/// passes `now` (epoch seconds) so each account's "resets in" is deterministic,
-/// and `cols` (the terminal width, or `None` when stdout is not a TTY) so the
-/// narrow-terminal column degradation is testable.
+/// passes `now` (epoch seconds) so each account's "resets in" and urgency are
+/// deterministic, `cols` (the terminal width, or `None` when stdout is not a TTY)
+/// so the narrow-terminal column degradation is testable, and `color` (whether
+/// the color gate is open; [`should_colorize`]) so the ANSI overlay is too.
 ///
 /// Columns, in display order: `ACCOUNT` `SESSION` `WEEKLY` `RESETS` `STATUS`
 /// (`STATUS` is omitted when no account carries a tag). When the full table is
@@ -275,12 +297,27 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// always kept. A `None` width (piped / redirected) keeps the full table, so
 /// `status | grep` and `status > file` stay the complete, greppable surface.
 ///
+/// When `color` is set each account row is tinted by its urgency ([`severity`]):
+/// green / yellow / red for how much you can rely on it at a glance (issue #73).
+/// The color AUGMENTS — it wraps the already-padded, already-complete text, so a
+/// no-color reader still sees every state and percentage; it is never the only
+/// signal. Padding is computed on DISPLAY WIDTH and applied BEFORE the color
+/// (pad-before-color), so colored and multibyte rows stay aligned, and the escape
+/// bytes never enter the column-width math. The header and any account with no
+/// reading (nothing to classify) stay uncolored.
+///
 /// Sourced solely from the response's non-secret fields — labels, percentages, a
-/// swap age, reset instants — so it can never print a token or email (issue #15).
+/// swap age, reset instants — so it can never print a token or email (issue #15);
+/// the ANSI overlay adds only `\x1b[3Xm`…`\x1b[0m`, never a secret.
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
 /// can route this exact `status`-text surface through its scan.
-pub(crate) fn render_status(response: &StatusResponse, now: i64, cols: Option<usize>) -> String {
+pub(crate) fn render_status(
+    response: &StatusResponse,
+    now: i64,
+    cols: Option<usize>,
+    color: bool,
+) -> String {
     let rows: Vec<StatusRow> = response
         .accounts
         .iter()
@@ -324,10 +361,14 @@ pub(crate) fn render_status(response: &StatusResponse, now: i64, cols: Option<us
     let widths = column_widths(&columns, &rows);
     let mut out = String::new();
     let headers: Vec<&str> = columns.iter().map(|col| col.header).collect();
-    out.push_str(&render_cells(&headers, &widths));
+    // The header is never tinted — it labels columns, it is not an account.
+    out.push_str(&render_cells(&headers, &widths, None));
     for row in &rows {
         let cells: Vec<&str> = columns.iter().map(|col| (col.get)(row)).collect();
-        out.push_str(&render_cells(&cells, &widths));
+        // Tint the whole row by its urgency when the gate is open; a row with no
+        // reading (`severity` is `None`) and the no-color path stay uncolored.
+        let sgr = color.then(|| row.severity.map(Severity::sgr)).flatten();
+        out.push_str(&render_cells(&cells, &widths, sgr));
     }
 
     out.push('\n');
@@ -356,6 +397,9 @@ struct StatusRow {
     resets: String,
     /// Inline tags (`disabled`, `needs re-login`), comma-joined; empty when none.
     status: String,
+    /// Urgency for the color overlay (issue #73): green / yellow / red, or `None`
+    /// when there is no reading to classify (printed without color).
+    severity: Option<Severity>,
 }
 
 impl StatusRow {
@@ -382,8 +426,108 @@ impl StatusRow {
             weekly: pct(account.weekly_pct),
             resets: resets_in(account, now),
             status,
+            severity: severity(account, now),
         }
     }
+}
+
+/// Per-account urgency for the `status` color overlay (issue #73): how much you
+/// can rely on this account at a glance.
+///
+/// - `Green` — healthy: plenty of quota, usable now.
+/// - `Yellow` — getting depleted, OR heavily used but about to reset (recovering).
+/// - `Red` — heavily used and not about to reset: the least-available account.
+///
+/// Purely a redundant overlay on the `SESSION`/`WEEKLY` percentages and the
+/// `RESETS` time the row already prints — the text stands alone without color
+/// (color augments, never the sole signal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Green,
+    Yellow,
+    Red,
+}
+
+impl Severity {
+    /// The ANSI SGR foreground code for this severity (`32`/`33`/`31` =
+    /// green/yellow/red). Emitted only when the color gate is open
+    /// ([`should_colorize`]); the codes carry no secret (issue #15).
+    fn sgr(self) -> &'static str {
+        match self {
+            Severity::Green => "32",
+            Severity::Yellow => "33",
+            Severity::Red => "31",
+        }
+    }
+}
+
+/// Utilization at/above which an account is `Red` — heavily depleted, sitting just
+/// below the default 95% session swap-away trigger (issue #41), so a red account
+/// is genuinely at or near exhaustion.
+const RED_UTIL_PCT: u8 = 90;
+/// Utilization at/above which an account is at least `Yellow` — getting depleted,
+/// worth watching.
+const YELLOW_UTIL_PCT: u8 = 75;
+/// A binding-window reset within this many seconds counts as "about to recover":
+/// it downgrades an otherwise-`Red` account to `Yellow`, telling a heavily-used
+/// account that resets imminently apart from one stuck waiting.
+const RESET_SOON_SECS: i64 = 30 * 60;
+
+/// Classify one account's urgency (issue #73), or `None` when there is no reading
+/// to classify (both windows `n/a` — the poll failed); such a row is printed
+/// without color, since absence of color is not a false "healthy" signal — the
+/// `n/a` text carries the truth.
+///
+/// Utilization sets the base from the BINDING window. A weekly-EXHAUSTED account
+/// (the daemon's blocked-for-the-week verdict, `weekly >= weekly_trigger`, issue
+/// #11/#37) is bound by its weekly window whatever the raw percentages say — the
+/// SAME window [`resets_in`] shows — and is at least Red: a week-blocked account
+/// is never painted "healthy", even when the operator has lowered `weekly_trigger`
+/// (configurable down to 50) below the Red utilization cutoff. Otherwise the
+/// more-depleted of session / weekly is the constraint, and its percent governs:
+/// `>= RED_UTIL_PCT` Red, `>= YELLOW_UTIL_PCT` Yellow, else Green. Reset proximity
+/// then refines a depleted account: if the binding window resets within
+/// `RESET_SOON_SECS` the account is about to recover, so a Red is downgraded to
+/// Yellow. A Green account is never recolored — green is reserved for genuinely
+/// low utilization and never lies. Both inputs the issue names — how MUCH is used
+/// and how SOON it resets — thus drive the color.
+fn severity(account: &AccountStatusLine, now: i64) -> Option<Severity> {
+    // The binding window. A weekly-exhausted account is bound by its weekly window
+    // regardless of which percent is numerically larger — the daemon has already
+    // ruled it blocked for the week (and `weekly_exhausted` implies a present
+    // weekly reading, since both derive from the same poll). Otherwise the binding
+    // window is whichever of session / weekly is more used; a missing reading
+    // counts as "least used" so the other governs, and both missing → None.
+    let (util, binding_reset_at) = if account.weekly_exhausted {
+        (account.weekly_pct.unwrap_or(100), account.weekly_resets_at)
+    } else {
+        match (account.session_pct, account.weekly_pct) {
+            (None, None) => return None,
+            (Some(session), None) => (session, account.session_resets_at),
+            (None, Some(weekly)) => (weekly, account.weekly_resets_at),
+            (Some(session), Some(weekly)) if session >= weekly => {
+                (session, account.session_resets_at)
+            }
+            (Some(_), Some(weekly)) => (weekly, account.weekly_resets_at),
+        }
+    };
+    // A weekly-exhausted account is Red whatever its percent — it is blocked for
+    // the week; otherwise the binding utilization sets the base.
+    let base = if account.weekly_exhausted || util >= RED_UTIL_PCT {
+        Severity::Red
+    } else if util >= YELLOW_UTIL_PCT {
+        Severity::Yellow
+    } else {
+        Severity::Green
+    };
+    // Recovering soon? A Red whose binding window resets within the window (or has
+    // already reset — a non-positive delta) is about to free up → downgrade to
+    // Yellow. Green / Yellow are unaffected: a soon reset cannot make a depleted
+    // account look healthier than Yellow, and never reddens a healthy one.
+    if base == Severity::Red && binding_reset_at.is_some_and(|at| at - now <= RESET_SOON_SECS) {
+        return Some(Severity::Yellow);
+    }
+    Some(base)
 }
 
 /// One `status`-table column: its header, a borrow of the matching [`StatusRow`]
@@ -412,14 +556,16 @@ impl Column {
     }
 }
 
-/// Each included column's render width: the widest of its header and its cells
-/// (by char count, matching the `{:<width$}` fill).
+/// Each included column's render width: the widest of its header and its cells,
+/// measured in DISPLAY WIDTH ([`display_width`]) — terminal columns, not `char`
+/// count — so a wide (CJK) or zero-width glyph in a label sizes the column
+/// correctly and the next column still lines up (issue #73).
 fn column_widths(columns: &[Column], rows: &[StatusRow]) -> Vec<usize> {
     columns
         .iter()
         .map(|col| {
-            let cells = rows.iter().map(|row| (col.get)(row).chars().count());
-            cells.max().unwrap_or(0).max(col.header.chars().count())
+            let cells = rows.iter().map(|row| display_width((col.get)(row)));
+            cells.max().unwrap_or(0).max(display_width(col.header))
         })
         .collect()
 }
@@ -435,15 +581,85 @@ fn table_width(columns: &[Column], rows: &[StatusRow]) -> usize {
 /// column gap, with trailing whitespace trimmed (so an empty trailing cell — a
 /// healthy account's `STATUS` — leaves no dangling spaces and the line stays
 /// greppable).
-fn render_cells(cells: &[&str], widths: &[usize]) -> String {
+///
+/// Padding is computed on DISPLAY WIDTH ([`display_width`]) — not `char`/byte
+/// count, which Rust's `{:<width$}` fill would use — so a wide-glyph cell lands
+/// the next column correctly. When `color` is `Some(sgr)` the whole VISIBLE line
+/// is wrapped in that ANSI color AFTER padding + trimming (pad-before-color, issue
+/// #73): the escape bytes bracket the trimmed text and never enter the width math,
+/// so colored and multibyte rows stay aligned. `color` is `None` for the header
+/// and whenever the gate is closed — then not one escape byte is emitted, keeping
+/// a piped / redirected surface clean.
+fn render_cells(cells: &[&str], widths: &[usize], color: Option<&str>) -> String {
     let mut line = String::new();
     for (idx, (cell, width)) in cells.iter().zip(widths).enumerate() {
         if idx > 0 {
             line.push_str(&" ".repeat(STATUS_COL_GAP));
         }
-        line.push_str(&format!("{cell:<width$}", width = *width));
+        line.push_str(cell);
+        line.push_str(&" ".repeat(width.saturating_sub(display_width(cell))));
     }
-    format!("{}\n", line.trim_end())
+    let line = line.trim_end();
+    match color {
+        Some(sgr) => format!("\x1b[{sgr}m{line}\x1b[0m\n"),
+        None => format!("{line}\n"),
+    }
+}
+
+/// The display (terminal-column) width of `s`: how many cells it occupies when
+/// printed, which is NOT its `char` count for non-Latin text (issue #73). A
+/// pragmatic wcwidth (UAX #11) — wide East Asian glyphs (CJK, Hangul, Kana,
+/// fullwidth forms) count two, combining marks and zero-width characters count
+/// zero, everything else one. Hand-rolled to keep the dependency graph minimal,
+/// matching the crate's other hand-rolled primitives (the SHA-256 in
+/// [`crate::redaction`], the civil-date math); it covers the ranges that occur in
+/// real operator labels rather than the full Unicode table, and that is enough to
+/// keep colored and multibyte `status` rows aligned where `char` count would not.
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// The display width of one `char`: 0 (combining / zero-width / NUL), 2 (East
+/// Asian wide & fullwidth), or 1 (everything else). The ranges are the well-known
+/// UAX #11 wide blocks plus the common zero-width set — see [`display_width`] for
+/// the pragmatic-vs-exhaustive scope.
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    // Inclusive `(lo, hi)` code-point ranges that occupy ZERO cells: combining
+    // marks, the zero-width space/joiner family, variation selectors, and the BOM.
+    const ZERO_WIDTH: &[(u32, u32)] = &[
+        (0x0300, 0x036F), // combining diacritical marks
+        (0x200B, 0x200F), // zero-width space … RLM
+        (0xFE00, 0xFE0F), // variation selectors
+        (0xFEFF, 0xFEFF), // zero-width no-break space (BOM)
+    ];
+    // Inclusive ranges that occupy TWO cells: the principal East Asian blocks,
+    // fullwidth forms, wide emoji / pictographs, and the supplementary CJK planes.
+    const WIDE: &[(u32, u32)] = &[
+        (0x1100, 0x115F),   // Hangul Jamo
+        (0x2E80, 0x303E),   // CJK radicals … Kangxi … CJK symbols
+        (0x3041, 0x33FF),   // Hiragana, Katakana, CJK symbols & punctuation
+        (0x3400, 0x4DBF),   // CJK Unified Ext A
+        (0x4E00, 0x9FFF),   // CJK Unified Ideographs
+        (0xA000, 0xA4CF),   // Yi
+        (0xAC00, 0xD7A3),   // Hangul Syllables
+        (0xF900, 0xFAFF),   // CJK Compatibility Ideographs
+        (0xFE30, 0xFE4F),   // CJK Compatibility Forms
+        (0xFF00, 0xFF60),   // Fullwidth Forms
+        (0xFFE0, 0xFFE6),   // Fullwidth signs
+        (0x1F300, 0x1FAFF), // emoji & pictographs (approximated as uniformly wide)
+        (0x20000, 0x3FFFD), // CJK Ext B+ (supplementary planes)
+    ];
+    let in_any = |ranges: &[(u32, u32)]| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp));
+    // NUL and the zero-width set render nothing; the wide set renders two cells;
+    // everything else (the common Latin / ASCII path) renders one.
+    if cp == 0 || in_any(ZERO_WIDTH) {
+        0
+    } else if in_any(WIDE) {
+        2
+    } else {
+        1
+    }
 }
 
 /// One account's compact "resets in" (issue #72): the time until it next regains
@@ -526,6 +742,62 @@ fn terminal_cols() -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Whether to emit the ANSI urgency overlay on the `status` table (issue #73).
+/// Color AUGMENTS the text and must NEVER reach a non-interactive sink (a pipe, a
+/// redirect, a log), so the gate is conservative — color is on ONLY on an
+/// interactive stdout TTY, and any standard opt-out forces it off. Reads the
+/// environment + TTY here; the decision itself is the pure [`color_decision`].
+fn should_colorize(no_color: bool) -> bool {
+    color_decision(
+        no_color,
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::env::var("CLICOLOR").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        stdout_is_tty(),
+    )
+}
+
+/// The pure color decision (issue #73), split from [`should_colorize`] so the
+/// gate is unit-testable without touching the process environment or a real TTY.
+/// Color is on only when NONE of the opt-outs fire AND stdout is a TTY:
+///   - `no_color_flag` — `--no-color` was passed,
+///   - `no_color_env` — `NO_COLOR` present and non-empty (<https://no-color.org>),
+///   - `clicolor` — `CLICOLOR=0` (the clicolors convention),
+///   - `term` — `TERM=dumb` (a terminal that cannot render SGR),
+///   - `is_tty` — stdout is interactive (piped / redirected → off).
+fn color_decision(
+    no_color_flag: bool,
+    no_color_env: Option<&str>,
+    clicolor: Option<&str>,
+    term: Option<&str>,
+    is_tty: bool,
+) -> bool {
+    if no_color_flag {
+        return false;
+    }
+    // `NO_COLOR`: present and non-empty disables; an empty value is treated as
+    // unset (the no-color.org wording).
+    if no_color_env.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    if clicolor == Some("0") {
+        return false;
+    }
+    if term == Some("dumb") {
+        return false;
+    }
+    is_tty
+}
+
+/// Whether stdout is an interactive terminal — the color gate's final condition
+/// (issue #73). The `isatty(3)` sibling of [`terminal_cols`]'s `TIOCGWINSZ` probe:
+/// a pipe, a redirect, or a closed stdout is not a TTY, so color stays off there.
+fn stdout_is_tty() -> bool {
+    // SAFETY: `isatty` only inspects the fd and returns 1 (a TTY) or 0; it touches
+    // no memory. The same direct-libc idiom the crate uses elsewhere.
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
 
 /// Current wall-clock time as epoch seconds — the reference `status` measures each
@@ -900,7 +1172,7 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             last_swap: None,
         };
-        let out = render_status(&response, NOW, None);
+        let out = render_status(&response, NOW, None, false);
         // The enabled active account is unmarked; the parked one carries the tag.
         let work = out.lines().find(|l| l.contains("work")).unwrap();
         assert!(work.starts_with("* work") && work.contains("50%") && work.contains("25%"));
@@ -926,7 +1198,7 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             last_swap: None,
         };
-        let out = render_status(&response, NOW, None);
+        let out = render_status(&response, NOW, None, false);
         let work = out.lines().find(|l| l.contains("work")).unwrap();
         assert!(
             work.starts_with("* work") && work.contains("50%") && !work.contains("re-login"),
@@ -1117,7 +1389,7 @@ spare  22222222-2222\n\
             "\n",
             "last swap: spare (2m ago)\n",
         );
-        assert_eq!(render_status(&response, NOW, None), expected);
+        assert_eq!(render_status(&response, NOW, None, false), expected);
     }
 
     #[test]
@@ -1158,7 +1430,7 @@ spare  22222222-2222\n\
             ],
             last_swap: None,
         };
-        let out = render_status(&response, NOW, None);
+        let out = render_status(&response, NOW, None, false);
         let line = |label: &str| {
             out.lines()
                 .find(|l| l.contains(label))
@@ -1183,7 +1455,7 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             last_swap: None,
         };
-        let out = render_status(&response, NOW, None);
+        let out = render_status(&response, NOW, None, false);
         assert!(out.contains("STATUS"), "tagged roster shows STATUS: {out}");
         let dead = out.lines().find(|l| l.contains("dead")).unwrap();
         assert!(
@@ -1208,17 +1480,17 @@ spare  22222222-2222\n\
         // Full table is `ACCOUNT(7) SESSION(7) WEEKLY(6) RESETS(6) STATUS(8)` plus
         // four 2-space gaps = 42; dropping WEEKLY → 34; dropping STATUS too → 24.
         // Full width: every column.
-        let full = render_status(&response, NOW, Some(200));
+        let full = render_status(&response, NOW, Some(200), false);
         assert!(full.contains("WEEKLY") && full.contains("STATUS"));
         // Narrow (38 ∈ [34,41]): WEEKLY drops first; STATUS + the three stay.
-        let narrow = render_status(&response, NOW, Some(38));
+        let narrow = render_status(&response, NOW, Some(38), false);
         assert!(!narrow.contains("WEEKLY"), "WEEKLY drops first: {narrow}");
         assert!(
             narrow.contains("STATUS"),
             "STATUS outlives WEEKLY: {narrow}"
         );
         // Narrower (28 ∈ [24,33]): STATUS drops next; the essential three remain.
-        let tiny = render_status(&response, NOW, Some(28));
+        let tiny = render_status(&response, NOW, Some(28), false);
         assert!(
             !tiny.contains("WEEKLY") && !tiny.contains("STATUS"),
             "{tiny}"
@@ -1232,7 +1504,7 @@ spare  22222222-2222\n\
         // Even a width too small for the essential three (24 > 10): they are NEVER
         // dropped and the row is NEVER wrapped — it simply overflows, staying one
         // greppable record per line (the terminal soft-wraps it visually).
-        let overflow = render_status(&response, NOW, Some(10));
+        let overflow = render_status(&response, NOW, Some(10), false);
         assert!(
             overflow.contains("ACCOUNT")
                 && overflow.contains("SESSION")
@@ -1248,7 +1520,7 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             last_swap: None,
         };
-        let out = render_status(&response, NOW, None);
+        let out = render_status(&response, NOW, None, false);
         assert!(out.ends_with("last swap: none\n"), "got: {out:?}");
     }
 
@@ -1270,12 +1542,318 @@ spare  22222222-2222\n\
                 secs_ago: 5,
             }),
         };
-        let out = render_status(&response, NOW, None);
+        let out = render_status(&response, NOW, None, false);
         assert!(
             !out.contains('@'),
             "status output must not contain an email: {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
+    }
+
+    // --- status: urgency color + display width (issue #73) -----------------
+
+    /// Strip ANSI SGR sequences (`\x1b[…m`) from `s` — the test-side inverse of
+    /// the color overlay, to prove the overlay is purely ADDITIVE: stripping it
+    /// must recover the exact plain table.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Skip the CSI body up to and including its final `m`.
+                for d in chars.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn severity_classifies_by_utilization_then_reset_proximity() {
+        // Low utilization → green, whatever the reset timing.
+        let healthy = status_line_resets(
+            "a",
+            Some(50),
+            Some(40),
+            false,
+            Some(NOW + 600),
+            Some(NOW + 5 * 86_400),
+        );
+        assert_eq!(severity(&healthy, NOW), Some(Severity::Green));
+        // Moderately used (>= 75) → yellow.
+        let warm = status_line_resets(
+            "b",
+            Some(80),
+            Some(40),
+            false,
+            Some(NOW + 4 * 3_600),
+            Some(NOW + 5 * 86_400),
+        );
+        assert_eq!(severity(&warm, NOW), Some(Severity::Yellow));
+        // Heavily used (>= 90) with a FAR binding (session) reset → red (stuck).
+        let hot = status_line_resets(
+            "c",
+            Some(96),
+            Some(40),
+            false,
+            Some(NOW + 4 * 3_600),
+            Some(NOW + 5 * 86_400),
+        );
+        assert_eq!(severity(&hot, NOW), Some(Severity::Red));
+        // Heavily used but the binding window resets within RESET_SOON_SECS →
+        // downgraded to yellow (recovering, not stuck).
+        let recovering = status_line_resets(
+            "d",
+            Some(96),
+            Some(40),
+            false,
+            Some(NOW + 10 * 60),
+            Some(NOW + 5 * 86_400),
+        );
+        assert_eq!(severity(&recovering, NOW), Some(Severity::Yellow));
+        // The binding window is the MORE-used one: weekly 96 dominates session 10,
+        // and ITS far reset governs → red, NOT downgraded by the soon session reset.
+        let weekly_bound = status_line_resets(
+            "e",
+            Some(10),
+            Some(96),
+            true,
+            Some(NOW + 60),
+            Some(NOW + 3 * 86_400),
+        );
+        assert_eq!(severity(&weekly_bound, NOW), Some(Severity::Red));
+        // No reading at all → unclassifiable (printed without color).
+        let dark = status_line_resets("f", None, None, false, None, None);
+        assert_eq!(severity(&dark, NOW), None);
+    }
+
+    #[test]
+    fn severity_sits_at_the_documented_thresholds() {
+        // `status_line` carries no reset instants, so no soon-reset downgrade fires.
+        let at_yellow = status_line("a", false, Some(YELLOW_UTIL_PCT), Some(0));
+        assert_eq!(severity(&at_yellow, NOW), Some(Severity::Yellow));
+        let below_yellow = status_line("b", false, Some(YELLOW_UTIL_PCT - 1), Some(0));
+        assert_eq!(severity(&below_yellow, NOW), Some(Severity::Green));
+        let at_red = status_line("c", false, Some(RED_UTIL_PCT), Some(0));
+        assert_eq!(severity(&at_red, NOW), Some(Severity::Red));
+    }
+
+    #[test]
+    fn severity_treats_a_weekly_exhausted_account_as_blocked_not_healthy() {
+        // The daemon's blocked-for-the-week verdict (`weekly_exhausted`) must win
+        // over raw utilization: with a lowered `weekly_trigger` an account can be
+        // exhausted at a weekly percent well BELOW the Red cutoff, yet it is
+        // blocked for days — it must read Red, never the "healthy" Green its 65%
+        // utilization would otherwise give. Mirrors what `resets_in` shows (the
+        // far weekly reset).
+        let blocked = status_line_resets(
+            "blocked",
+            Some(30),               // session is fine…
+            Some(65),               // …weekly below RED_UTIL_PCT, but…
+            true,                   // …exhausted (e.g. weekly_trigger lowered to 60)
+            Some(NOW + 600),        // a soon SESSION reset must NOT rescue it
+            Some(NOW + 3 * 86_400), // the binding WEEKLY reset is 3 days out
+        );
+        assert_eq!(
+            severity(&blocked, NOW),
+            Some(Severity::Red),
+            "a week-blocked account is Red, not Green, and the soon session reset \
+             does not downgrade it (the weekly reset governs)"
+        );
+        // …unless the WEEKLY reset itself is imminent → recovering → Yellow.
+        let recovering = status_line_resets(
+            "soon",
+            Some(30),
+            Some(65),
+            true,
+            Some(NOW + 4 * 3_600),
+            Some(NOW + 5 * 60), // weekly reset in 5 min
+        );
+        assert_eq!(severity(&recovering, NOW), Some(Severity::Yellow));
+    }
+
+    #[test]
+    fn severity_reset_proximity_handles_the_boundary_past_and_unknown_cases() {
+        let red = |session_reset| {
+            severity(
+                &status_line_resets("r", Some(99), Some(40), false, session_reset, None),
+                NOW,
+            )
+        };
+        // Exactly at the soon boundary (`<=`) downgrades.
+        assert_eq!(red(Some(NOW + RESET_SOON_SECS)), Some(Severity::Yellow));
+        // One second past the boundary does not.
+        assert_eq!(red(Some(NOW + RESET_SOON_SECS + 1)), Some(Severity::Red));
+        // An already-past reset (negative delta) downgrades — it has recovered.
+        assert_eq!(red(Some(NOW - 100)), Some(Severity::Yellow));
+        // An unknown binding reset leaves the Red base intact (no fabricated
+        // recovery) — the downgrade rests on the pairing being present.
+        assert_eq!(red(None), Some(Severity::Red));
+    }
+
+    #[test]
+    fn display_width_counts_terminal_cells_not_chars() {
+        assert_eq!(display_width("ascii"), 5);
+        assert_eq!(display_width("* work"), 6);
+        // Wide CJK: each glyph is two cells (three chars → six cells).
+        assert_eq!(display_width("日本語"), 6);
+        assert_eq!("日本語".chars().count(), 3); // the count it must NOT use
+                                                 // A combining mark adds no width: "e" + U+0301 (combining acute) → one cell.
+        assert_eq!(display_width("e\u{0301}"), 1);
+        // Zero-width joiner and the BOM contribute nothing.
+        assert_eq!(display_width("a\u{200d}b"), 2);
+        assert_eq!(display_width("\u{feff}hi"), 2);
+    }
+
+    #[test]
+    fn color_decision_requires_a_tty_and_honors_every_opt_out() {
+        // Happy path: a TTY, no opt-out → color on.
+        assert!(color_decision(false, None, None, None, true));
+        // Not a TTY (piped / redirected) → off, even with no opt-out.
+        assert!(!color_decision(false, None, None, None, false));
+        // `--no-color` forces off on a TTY.
+        assert!(!color_decision(true, None, None, None, true));
+        // NO_COLOR present and non-empty → off; an empty value is treated as unset.
+        assert!(!color_decision(false, Some("1"), None, None, true));
+        assert!(color_decision(false, Some(""), None, None, true));
+        // CLICOLOR=0 → off; CLICOLOR=1 does not force color onto a non-TTY.
+        assert!(!color_decision(false, None, Some("0"), None, true));
+        assert!(!color_decision(false, None, Some("1"), None, false));
+        // TERM=dumb → off; a normal TERM is fine.
+        assert!(!color_decision(false, None, None, Some("dumb"), true));
+        assert!(color_decision(
+            false,
+            None,
+            None,
+            Some("xterm-256color"),
+            true
+        ));
+    }
+
+    #[test]
+    fn color_off_emits_not_one_escape_byte() {
+        // Even with a red-urgency account present, color=false yields no ANSI — so
+        // a pipe / redirect / log never carries an escape (the gate's promise).
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "hot",
+                Some(99),
+                Some(40),
+                false,
+                Some(NOW + 4 * 3_600),
+                Some(NOW + 5 * 86_400),
+            )],
+            last_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        assert!(
+            !out.contains('\x1b'),
+            "no escape byte when color is off: {out:?}"
+        );
+    }
+
+    #[test]
+    fn color_on_tints_each_row_and_strips_back_to_the_exact_plain_table() {
+        let response = StatusResponse {
+            accounts: vec![
+                // green: low utilization.
+                status_line_resets(
+                    "calm",
+                    Some(20),
+                    Some(15),
+                    false,
+                    Some(NOW + 3_600),
+                    Some(NOW + 5 * 86_400),
+                ),
+                // red: heavily used, far reset.
+                status_line_resets(
+                    "hot",
+                    Some(99),
+                    Some(40),
+                    false,
+                    Some(NOW + 4 * 3_600),
+                    Some(NOW + 5 * 86_400),
+                ),
+            ],
+            last_swap: Some(LastSwapLine {
+                to: "calm".to_owned(),
+                secs_ago: 30,
+            }),
+        };
+        let plain = render_status(&response, NOW, None, false);
+        let colored = render_status(&response, NOW, None, true);
+        // The overlay emits escapes and tints by severity (green=32, red=31).
+        assert!(
+            colored.contains("\x1b[32m"),
+            "green row tinted: {colored:?}"
+        );
+        assert!(colored.contains("\x1b[31m"), "red row tinted: {colored:?}");
+        // …and is purely ADDITIVE: stripping the ANSI recovers the EXACT plain
+        // table — proving color augments (every state + percentage still present)
+        // and that padding was computed BEFORE coloring (alignment survives strip).
+        assert_eq!(strip_ansi(&colored), plain);
+        // The header line is never tinted (it labels columns, it is not an account).
+        let header = colored.lines().next().unwrap();
+        assert!(header.starts_with("ACCOUNT") && !header.contains('\x1b'));
+    }
+
+    #[test]
+    fn multibyte_label_rows_stay_aligned_on_display_width() {
+        // A wide (CJK) label is two display cells per glyph; padding on display
+        // width keeps the SESSION column under its header where `.chars().count()`
+        // would misalign it.
+        let response = StatusResponse {
+            accounts: vec![
+                status_line("ascii", true, Some(50), Some(60)),
+                status_line("日本語", false, Some(10), Some(20)),
+            ],
+            last_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        // Each row's SESSION value begins at the same DISPLAY column.
+        let session_col = |needle: &str| {
+            let line = out.lines().find(|l| l.contains(needle)).unwrap();
+            let idx = line.find(needle).unwrap();
+            display_width(&line[..idx])
+        };
+        assert_eq!(
+            session_col("50%"),
+            session_col("10%"),
+            "wide-label and ascii rows align the SESSION column on display width:\n{out}"
+        );
+    }
+
+    #[test]
+    fn colored_output_never_carries_an_email_or_token_sigil() {
+        // #15 holds with the #73 overlay: the ANSI codes add only `\x1b[3Xm`…,
+        // never an `@`-email or a token sigil.
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "work",
+                Some(99),
+                Some(40),
+                false,
+                Some(NOW + 4 * 3_600),
+                Some(NOW + 5 * 86_400),
+            )],
+            last_swap: Some(LastSwapLine {
+                to: "spare".to_owned(),
+                secs_ago: 5,
+            }),
+        };
+        let out = render_status(&response, NOW, None, true);
+        assert!(out.contains('\x1b'), "the overlay is active: {out:?}");
+        assert!(
+            !out.contains('@'),
+            "no email on the colored surface: {out:?}"
+        );
+        assert!(!out.to_lowercase().contains("token"));
+        assert!(!out.contains("sk-ant-"));
     }
 
     #[test]

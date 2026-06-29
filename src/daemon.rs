@@ -5736,7 +5736,21 @@ mod tests {
         corpus.push('\n');
         // Scan the FULL table (`cols: None` → no width degradation), the maximal
         // text surface; the fixed `now` keeps "resets in" deterministic (issue #72).
-        corpus.push_str(&crate::cli::render_status(&response, 1_782_777_600, None));
+        // Scan it BOTH uncolored and color-on (issue #73): the ANSI urgency overlay
+        // must carry no secret either — it adds only `\x1b[3Xm`…`\x1b[0m`, never a
+        // token or email.
+        corpus.push_str(&crate::cli::render_status(
+            &response,
+            1_782_777_600,
+            None,
+            false,
+        ));
+        corpus.push_str(&crate::cli::render_status(
+            &response,
+            1_782_777_600,
+            None,
+            true,
+        ));
         if let Some(report) = swap_report(outcome) {
             corpus.push_str(&report);
             corpus.push('\n');
