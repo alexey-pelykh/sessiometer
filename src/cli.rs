@@ -340,14 +340,19 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// always kept. A `None` width (piped / redirected) keeps the full table, so
 /// `status | grep` and `status > file` stay the complete, greppable surface.
 ///
-/// When `color` is set each account row is tinted by its urgency ([`severity`]):
-/// green / yellow / red for how much you can rely on it at a glance (issue #73).
-/// The color AUGMENTS — it wraps the already-padded, already-complete text, so a
-/// no-color reader still sees every state and percentage; it is never the only
-/// signal. Padding is computed on DISPLAY WIDTH and applied BEFORE the color
-/// (pad-before-color), so colored and multibyte rows stay aligned, and the escape
-/// bytes never enter the column-width math. The header and any account with no
-/// reading (nothing to classify) stay uncolored.
+/// When `color` is set each CELL is tinted by its OWN health (issue #84), so one
+/// glance reads four independent signals per account: `ACCOUNT` by the overall
+/// urgency ([`severity`]), `SESSION` / `WEEKLY` by each window's own band
+/// ([`util_severity`] / [`weekly_cell_severity`]), and `RESETS` by its relief signal
+/// ([`reset_severity`]) — a 95% / 40% account can show a red `SESSION` beside a
+/// green `WEEKLY`. (`STATUS` stays untinted: its tags are their own signal.) This
+/// supersedes the issue-#73 row-wide tint. The color AUGMENTS — it wraps the
+/// already-padded text, so a no-color reader still sees every state and percentage;
+/// it is never the only signal. Padding is computed on DISPLAY WIDTH from the raw
+/// cell and applied BEFORE the color (pad-before-color), so per-cell colored and
+/// multibyte rows stay aligned and the escape bytes never enter the column-width
+/// math. The header, the untinted `STATUS` column, and any cell with no reading
+/// (nothing to classify — `n/a` is not a false "healthy") stay uncolored.
 ///
 /// Sourced solely from the response's non-secret fields — labels, percentages, a
 /// swap age, reset instants — so it can never print a token or email (issue #15);
@@ -371,13 +376,16 @@ pub(crate) fn render_status(
     // number drops first). `STATUS` is included only when some account carries a
     // tag — an all-healthy roster shows no empty `STATUS` column.
     let mut columns: Vec<Column> = vec![
-        Column::keep("ACCOUNT", |row| &row.account),
-        Column::keep("SESSION", |row| &row.session),
-        Column::droppable("WEEKLY", 1, |row| &row.weekly),
-        Column::keep("RESETS", |row| &row.resets),
+        Column::keep("ACCOUNT", |row| &row.account, |row| row.account_severity),
+        Column::keep("SESSION", |row| &row.session, |row| row.session_severity),
+        Column::droppable("WEEKLY", 1, |row| &row.weekly, |row| row.weekly_severity),
+        Column::keep("RESETS", |row| &row.resets, |row| row.resets_severity),
     ];
     if rows.iter().any(|row| !row.status.is_empty()) {
-        columns.push(Column::droppable("STATUS", 2, |row| &row.status));
+        // STATUS carries its own textual tags (`disabled`, `needs re-login`); it is
+        // never tinted (issue #84) — the tags are their own signal, so its severity
+        // getter is always `None`.
+        columns.push(Column::droppable("STATUS", 2, |row| &row.status, |_| None));
     }
 
     // Drop the lowest-priority droppable column until the table fits `cols`. A
@@ -405,13 +413,22 @@ pub(crate) fn render_status(
     let mut out = String::new();
     let headers: Vec<&str> = columns.iter().map(|col| col.header).collect();
     // The header is never tinted — it labels columns, it is not an account.
-    out.push_str(&render_cells(&headers, &widths, None));
+    let header_colors = vec![None; headers.len()];
+    out.push_str(&render_cells(&headers, &widths, &header_colors));
     for row in &rows {
         let cells: Vec<&str> = columns.iter().map(|col| (col.get)(row)).collect();
-        // Tint the whole row by its urgency when the gate is open; a row with no
-        // reading (`severity` is `None`) and the no-color path stay uncolored.
-        let sgr = color.then(|| row.severity.map(Severity::sgr)).flatten();
-        out.push_str(&render_cells(&cells, &widths, sgr));
+        // Each cell is tinted by its OWN health when the gate is open (issue #84), so
+        // one row can show four independent colors; a cell with no reading, and the
+        // whole no-color path, stay uncolored.
+        let colors: Vec<Option<&str>> = columns
+            .iter()
+            .map(|col| {
+                color
+                    .then(|| (col.severity)(row).map(Severity::sgr))
+                    .flatten()
+            })
+            .collect();
+        out.push_str(&render_cells(&cells, &widths, &colors));
     }
 
     out.push('\n');
@@ -440,9 +457,19 @@ struct StatusRow {
     resets: String,
     /// Inline tags (`disabled`, `needs re-login`), comma-joined; empty when none.
     status: String,
-    /// Urgency for the color overlay (issue #73): green / yellow / red, or `None`
-    /// when there is no reading to classify (printed without color).
-    severity: Option<Severity>,
+    /// Per-cell urgency for the color overlay (issue #84): each cell carries its OWN
+    /// health, so one row can show four independent colors (a red `SESSION` beside a
+    /// green `WEEKLY`, etc.). Each is `None` when its cell has no reading — that cell
+    /// is then printed without color, since absence of color is not a false
+    /// "healthy" signal. `account` is the OVERALL (binding-window) [`severity`];
+    /// `session` the [`util_severity`] bands on `session_pct`; `weekly` the
+    /// [`weekly_cell_severity`] (bands plus the weekly-exhaustion override); `resets`
+    /// the [`reset_severity`] relief signal. `STATUS` is never tinted (its tags are
+    /// their own signal), so it has no field here.
+    account_severity: Option<Severity>,
+    session_severity: Option<Severity>,
+    weekly_severity: Option<Severity>,
+    resets_severity: Option<Severity>,
 }
 
 impl StatusRow {
@@ -469,17 +496,24 @@ impl StatusRow {
             weekly: pct(account.weekly_pct),
             resets: resets_in(account, now),
             status,
-            severity: severity(account, now),
+            // Each cell colored by its OWN health (issue #84): ACCOUNT → the overall
+            // binding-window severity; SESSION / WEEKLY → each window's own bands
+            // (WEEKLY honoring the weekly-exhaustion override); RESETS → the shown
+            // reset's relief signal. A cell with no reading stays `None` (uncolored).
+            account_severity: severity(account, now),
+            session_severity: account.session_pct.map(util_severity),
+            weekly_severity: weekly_cell_severity(account),
+            resets_severity: reset_severity(account, now),
         }
     }
 }
 
-/// Per-account urgency for the `status` color overlay (issue #73): how much you
-/// can rely on this account at a glance.
+/// One urgency band for the `status` color overlay (issue #73), carried per CELL
+/// since issue #84: how much you can rely on what that cell reports at a glance.
 ///
 /// - `Green` — healthy: plenty of quota, usable now.
 /// - `Yellow` — getting depleted, OR heavily used but about to reset (recovering).
-/// - `Red` — heavily used and not about to reset: the least-available account.
+/// - `Red` — heavily used and not about to reset: the least-available.
 ///
 /// Purely a redundant overlay on the `SESSION`/`WEEKLY` percentages and the
 /// `RESETS` time the row already prints — the text stands alone without color
@@ -516,8 +550,25 @@ const YELLOW_UTIL_PCT: u8 = 75;
 /// account that resets imminently apart from one stuck waiting.
 const RESET_SOON_SECS: i64 = 30 * 60;
 
-/// Classify one account's urgency (issue #73), or `None` when there is no reading
-/// to classify (both windows `n/a` — the poll failed); such a row is printed
+/// Classify one utilization percent into the fixed urgency bands: `>= RED_UTIL_PCT`
+/// Red, `>= YELLOW_UTIL_PCT` Yellow, else Green. Extracted (issue #84) so the
+/// per-window `SESSION` / `WEEKLY` cells colour off the SAME bands the aggregate
+/// [`severity`] applies to its binding window — one definition of "how full is too
+/// full", reused everywhere. A pure band lookup: reset proximity and the
+/// weekly-exhaustion override live in the callers that need them.
+fn util_severity(pct: u8) -> Severity {
+    if pct >= RED_UTIL_PCT {
+        Severity::Red
+    } else if pct >= YELLOW_UTIL_PCT {
+        Severity::Yellow
+    } else {
+        Severity::Green
+    }
+}
+
+/// Classify one account's OVERALL urgency (issue #73) — the `ACCOUNT` cell's colour
+/// under the per-cell overlay (issue #84) — or `None` when there is no reading
+/// to classify (both windows `n/a` — the poll failed); such a cell is printed
 /// without color, since absence of color is not a false "healthy" signal — the
 /// `n/a` text carries the truth.
 ///
@@ -555,13 +606,12 @@ fn severity(account: &AccountStatusLine, now: i64) -> Option<Severity> {
         }
     };
     // A weekly-exhausted account is Red whatever its percent — it is blocked for
-    // the week; otherwise the binding utilization sets the base.
-    let base = if account.weekly_exhausted || util >= RED_UTIL_PCT {
+    // the week; otherwise the binding utilization sets the base via the shared
+    // [`util_severity`] bands (issue #84).
+    let base = if account.weekly_exhausted {
         Severity::Red
-    } else if util >= YELLOW_UTIL_PCT {
-        Severity::Yellow
     } else {
-        Severity::Green
+        util_severity(util)
     };
     // Recovering soon? A Red whose binding window resets within the window (or has
     // already reset — a non-positive delta) is about to free up → downgrade to
@@ -573,27 +623,96 @@ fn severity(account: &AccountStatusLine, now: i64) -> Option<Severity> {
     Some(base)
 }
 
+/// The `WEEKLY` cell's own health (issue #84): the fixed [`util_severity`] bands on
+/// `weekly_pct`, except a weekly-EXHAUSTED account (the daemon's `weekly >=
+/// weekly_trigger` verdict, issue #11/#37) reads Red whatever its rounded percent —
+/// a week-blocked account is never painted "healthy", even when the operator has
+/// lowered `weekly_trigger` below the Red cutoff (the same guarantee [`severity`]
+/// gives the aggregate). `None` when the weekly poll failed: the cell then shows
+/// `n/a`, which stays uncolored (absence of color is not a false "healthy"), so the
+/// exhaustion override is mapped over a PRESENT reading only.
+fn weekly_cell_severity(account: &AccountStatusLine) -> Option<Severity> {
+    account.weekly_pct.map(|pct| {
+        if account.weekly_exhausted {
+            Severity::Red
+        } else {
+            util_severity(pct)
+        }
+    })
+}
+
+/// The `RESETS` cell's own health (issue #84): proximity-as-relief for the reset the
+/// cell SHOWS. Mirrors [`resets_in`] — the WEEKLY reset governs when the account is
+/// weekly-exhausted, otherwise the rolling SESSION reset — so the color always
+/// describes the duration printed, and keying off the SAME instant `resets_in` uses
+/// guarantees a cell shown as `n/a` is never tinted. A depleted account
+/// (weekly-exhausted, or the shown window `>= RED_UTIL_PCT`) whose reset lands
+/// within `RESET_SOON_SECS` (or has already passed) is about to recover → Yellow
+/// ("relief soon"); depleted with a far reset → Red (stuck waiting); a healthy
+/// account → Green (the reset is no concern). `None` when that reset instant is
+/// unknown — the cell shows `n/a`, which stays uncolored (absence of color must not
+/// read as a false "healthy"). This refines, per the reset dimension alone, the
+/// Red→Yellow reset-proximity rule [`severity`] applies to the aggregate.
+fn reset_severity(account: &AccountStatusLine, now: i64) -> Option<Severity> {
+    // The window the RESETS cell displays (see `resets_in`): weekly when exhausted,
+    // else session — so the color describes the time actually shown.
+    let (pct, reset_at) = if account.weekly_exhausted {
+        (account.weekly_pct, account.weekly_resets_at)
+    } else {
+        (account.session_pct, account.session_resets_at)
+    };
+    // Unknown governing reset → the cell shows `n/a`; stay uncolored.
+    let reset_at = reset_at?;
+    let depleted = account.weekly_exhausted || pct.is_some_and(|p| p >= RED_UTIL_PCT);
+    if !depleted {
+        // Plenty of quota: the reset is no concern.
+        return Some(Severity::Green);
+    }
+    // Depleted: relief is imminent (reset within the window, or already past) →
+    // Yellow; a far reset leaves it stuck → Red.
+    if reset_at - now <= RESET_SOON_SECS {
+        Some(Severity::Yellow)
+    } else {
+        Some(Severity::Red)
+    }
+}
+
 /// One `status`-table column: its header, a borrow of the matching [`StatusRow`]
-/// cell, and a drop priority (`None` = always keep; `Some(n)` = droppable, lower
-/// `n` drops first under a narrow terminal).
+/// cell, the per-cell urgency getter for the color overlay (issue #84), and a drop
+/// priority (`None` = always keep; `Some(n)` = droppable, lower `n` drops first
+/// under a narrow terminal). `severity` returns this column's own health for a row,
+/// or `None` for a column that is never tinted (the `STATUS` tags) or a cell with no
+/// reading.
 struct Column {
     header: &'static str,
     get: fn(&StatusRow) -> &str,
+    severity: fn(&StatusRow) -> Option<Severity>,
     drop_priority: Option<u8>,
 }
 
 impl Column {
-    fn keep(header: &'static str, get: fn(&StatusRow) -> &str) -> Self {
+    fn keep(
+        header: &'static str,
+        get: fn(&StatusRow) -> &str,
+        severity: fn(&StatusRow) -> Option<Severity>,
+    ) -> Self {
         Column {
             header,
             get,
+            severity,
             drop_priority: None,
         }
     }
-    fn droppable(header: &'static str, priority: u8, get: fn(&StatusRow) -> &str) -> Self {
+    fn droppable(
+        header: &'static str,
+        priority: u8,
+        get: fn(&StatusRow) -> &str,
+        severity: fn(&StatusRow) -> Option<Severity>,
+    ) -> Self {
         Column {
             header,
             get,
+            severity,
             drop_priority: Some(priority),
         }
     }
@@ -626,27 +745,32 @@ fn table_width(columns: &[Column], rows: &[StatusRow]) -> usize {
 /// greppable).
 ///
 /// Padding is computed on DISPLAY WIDTH ([`display_width`]) — not `char`/byte
-/// count, which Rust's `{:<width$}` fill would use — so a wide-glyph cell lands
-/// the next column correctly. When `color` is `Some(sgr)` the whole VISIBLE line
-/// is wrapped in that ANSI color AFTER padding + trimming (pad-before-color, issue
-/// #73): the escape bytes bracket the trimmed text and never enter the width math,
-/// so colored and multibyte rows stay aligned. `color` is `None` for the header
-/// and whenever the gate is closed — then not one escape byte is emitted, keeping
-/// a piped / redirected surface clean.
-fn render_cells(cells: &[&str], widths: &[usize], color: Option<&str>) -> String {
+/// count, which Rust's `{:<width$}` fill would use — so a wide-glyph cell lands the
+/// next column correctly. `colors` carries one entry PER cell (issue #84): when a
+/// cell's entry is `Some(sgr)` that cell's text is wrapped in the ANSI color, and
+/// the color math is done on the RAW cell width so the escape bytes never enter it —
+/// per-cell colors keep the columns aligned exactly as the old row-wide tint did
+/// (pad-before-color, issue #73). The trailing pad is appended OUTSIDE the escape so
+/// the line's trailing whitespace (an empty `STATUS` cell, a short last cell) still
+/// trims away cleanly, leaving no dangling spaces — and stripping every escape
+/// recovers the exact plain table (color is purely additive). An entry is `None` for
+/// the header, an untinted column, a cell with no reading, and whenever the gate is
+/// closed — then that cell emits not one escape byte, keeping a piped / redirected
+/// surface clean.
+fn render_cells(cells: &[&str], widths: &[usize], colors: &[Option<&str>]) -> String {
     let mut line = String::new();
-    for (idx, (cell, width)) in cells.iter().zip(widths).enumerate() {
+    for (idx, ((cell, width), color)) in cells.iter().zip(widths).zip(colors).enumerate() {
         if idx > 0 {
             line.push_str(&" ".repeat(STATUS_COL_GAP));
         }
-        line.push_str(cell);
+        match color {
+            Some(sgr) => line.push_str(&format!("\x1b[{sgr}m{cell}\x1b[0m")),
+            None => line.push_str(cell),
+        }
         line.push_str(&" ".repeat(width.saturating_sub(display_width(cell))));
     }
     let line = line.trim_end();
-    match color {
-        Some(sgr) => format!("\x1b[{sgr}m{line}\x1b[0m\n"),
-        None => format!("{line}\n"),
-    }
+    format!("{line}\n")
 }
 
 /// The display (terminal-column) width of `s`: how many cells it occupies when
@@ -1740,6 +1864,82 @@ spare  22222222-2222\n\
     }
 
     #[test]
+    fn util_severity_classifies_at_the_documented_thresholds() {
+        // The per-window (SESSION / WEEKLY) band core (issue #84): the same
+        // thresholds the aggregate uses, with no reset-proximity or exhaustion logic.
+        assert_eq!(util_severity(0), Severity::Green);
+        assert_eq!(util_severity(YELLOW_UTIL_PCT - 1), Severity::Green);
+        assert_eq!(util_severity(YELLOW_UTIL_PCT), Severity::Yellow);
+        assert_eq!(util_severity(RED_UTIL_PCT - 1), Severity::Yellow);
+        assert_eq!(util_severity(RED_UTIL_PCT), Severity::Red);
+        assert_eq!(util_severity(100), Severity::Red);
+    }
+
+    #[test]
+    fn weekly_cell_severity_applies_bands_and_the_exhaustion_override() {
+        // Not exhausted → the plain util bands on weekly_pct.
+        let mut acct = status_line("w", false, Some(50), Some(50));
+        assert_eq!(weekly_cell_severity(&acct), Some(Severity::Green));
+        acct.weekly_pct = Some(80);
+        assert_eq!(weekly_cell_severity(&acct), Some(Severity::Yellow));
+        acct.weekly_pct = Some(95);
+        assert_eq!(weekly_cell_severity(&acct), Some(Severity::Red));
+        // Exhausted (the daemon's weekly_trigger verdict) → Red even at a percent
+        // well below the Red cutoff: a week-blocked cell never reads "healthy",
+        // honoring a lowered weekly_trigger (issue #11/#37).
+        let blocked = status_line_resets("b", Some(20), Some(65), true, None, Some(NOW + 86_400));
+        assert_eq!(weekly_cell_severity(&blocked), Some(Severity::Red));
+        // No weekly reading → None: the cell shows `n/a`, which stays uncolored.
+        let dark = status_line("d", false, Some(50), None);
+        assert_eq!(weekly_cell_severity(&dark), None);
+    }
+
+    #[test]
+    fn reset_severity_is_proximity_as_relief() {
+        // Healthy (shown window below the Red cutoff) → green: the reset is no
+        // concern, however far off.
+        let healthy =
+            status_line_resets("h", Some(50), Some(40), false, Some(NOW + 5 * 86_400), None);
+        assert_eq!(reset_severity(&healthy, NOW), Some(Severity::Green));
+        // Depleted (session >= RED) with a FAR session reset → red (stuck waiting).
+        let stuck = status_line_resets("s", Some(99), Some(40), false, Some(NOW + 4 * 3_600), None);
+        assert_eq!(reset_severity(&stuck, NOW), Some(Severity::Red));
+        // Depleted with a SOON session reset → yellow (relief soon); an already-past
+        // reset counts as relief too.
+        let soon = status_line_resets("r", Some(99), Some(40), false, Some(NOW + 10 * 60), None);
+        assert_eq!(reset_severity(&soon, NOW), Some(Severity::Yellow));
+        let past = status_line_resets("p", Some(99), Some(40), false, Some(NOW - 100), None);
+        assert_eq!(reset_severity(&past, NOW), Some(Severity::Yellow));
+        // Weekly-exhausted → the WEEKLY reset governs (mirrors `resets_in`): a far
+        // weekly reset is red despite a soon session reset; a soon one is yellow.
+        let weekly_far = status_line_resets(
+            "wf",
+            Some(20),
+            Some(65),
+            true,
+            Some(NOW + 60),
+            Some(NOW + 3 * 86_400),
+        );
+        assert_eq!(reset_severity(&weekly_far, NOW), Some(Severity::Red));
+        let weekly_soon = status_line_resets(
+            "ws",
+            Some(20),
+            Some(65),
+            true,
+            Some(NOW + 4 * 3_600),
+            Some(NOW + 5 * 60),
+        );
+        assert_eq!(reset_severity(&weekly_soon, NOW), Some(Severity::Yellow));
+        // The SHOWN reset unknown → the cell shows `n/a`; stay uncolored (None) even
+        // though a util reading exists — absence of color is not a false "healthy".
+        let na = status_line_resets("n", Some(99), Some(40), false, None, Some(NOW + 600));
+        assert_eq!(reset_severity(&na, NOW), None);
+        // No reading at all → None.
+        let dark = status_line_resets("d", None, None, false, None, None);
+        assert_eq!(reset_severity(&dark, NOW), None);
+    }
+
+    #[test]
     fn display_width_counts_terminal_cells_not_chars() {
         assert_eq!(display_width("ascii"), 5);
         assert_eq!(display_width("* work"), 6);
@@ -1843,6 +2043,73 @@ spare  22222222-2222\n\
         // The header line is never tinted (it labels columns, it is not an account).
         let header = colored.lines().next().unwrap();
         assert!(header.starts_with("ACCOUNT") && !header.contains('\x1b'));
+    }
+
+    #[test]
+    fn color_paints_each_cell_by_its_own_health() {
+        // One account, four independent signals (issue #84): SESSION heavily used
+        // (red) sits beside a comfortable WEEKLY (green) on the SAME row — proving
+        // per-cell color, not one row-wide tint.
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "mix",
+                Some(99), // SESSION: red band
+                Some(40), // WEEKLY: green band
+                false,
+                Some(NOW + 4 * 3_600), // far session reset → depleted + far
+                Some(NOW + 5 * 86_400),
+            )],
+            last_swap: None,
+        };
+        let colored = render_status(&response, NOW, None, true);
+        let plain = render_status(&response, NOW, None, false);
+        let row = colored
+            .lines()
+            .find(|l| l.contains("mix"))
+            .expect("a row for mix");
+        // The SESSION cell is red AND the WEEKLY cell is green, on one line.
+        assert!(row.contains("\x1b[31m99%"), "session cell red: {row:?}");
+        assert!(row.contains("\x1b[32m40%"), "weekly cell green: {row:?}");
+        // Each colored cell is independently wrapped + reset (not one row-wide span).
+        assert!(
+            row.matches("\x1b[0m").count() >= 2,
+            "multiple independently-tinted cells: {row:?}"
+        );
+        // Still purely additive: stripping the ANSI recovers the exact plain table.
+        assert_eq!(strip_ansi(&colored), plain);
+    }
+
+    #[test]
+    fn color_leaves_an_n_a_cell_uncolored() {
+        // SESSION has a reading (red); WEEKLY does not (`n/a`). The n/a cell must
+        // stay uncolored — absence of color is not a false "healthy" (issue #84) —
+        // while its colored siblings prove the overlay is active.
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "half",
+                Some(99), // session present → red
+                None,     // weekly n/a → uncolored
+                false,
+                Some(NOW + 4 * 3_600),
+                None,
+            )],
+            last_swap: None,
+        };
+        let colored = render_status(&response, NOW, None, true);
+        let plain = render_status(&response, NOW, None, false);
+        // No `n/a` is ever wrapped in an SGR color (the only n/a here is WEEKLY).
+        for sgr in ["31", "32", "33"] {
+            assert!(
+                !colored.contains(&format!("\x1b[{sgr}mn/a")),
+                "the n/a weekly cell stays uncolored: {colored:?}"
+            );
+        }
+        // …yet the overlay is active on the cells that DO have a reading.
+        assert!(
+            colored.contains("\x1b[31m"),
+            "session cell tinted: {colored:?}"
+        );
+        assert_eq!(strip_ansi(&colored), plain);
     }
 
     #[test]
