@@ -14,8 +14,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::{Account, Config};
 use crate::daemon::{
-    run_loop, AccountStatusLine, Daemon, InstanceLock, RealClock, RealRosterPoller, RealShutdown,
-    StatusResponse, UnixControl,
+    run_loop, AccountStatusLine, Daemon, InstanceLock, NextSwap, RealClock, RealRosterPoller,
+    RealShutdown, StatusResponse, UnixControl,
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
@@ -131,7 +131,7 @@ fn print_usage() {
          COMMANDS:\n    \
          capture [<label>]    Stash the active account into the rotation\n    \
          run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)\n    \
-         status [--json] [--no-color]  Show each account's usage + resets-in, and the last swap\n    \
+         status [--json] [--no-color]  Show each account's usage + resets-in, and the next swap\n    \
          list       List captured accounts\n    \
          use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
@@ -256,7 +256,7 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
     Ok(UnixControl::new(listener))
 }
 
-/// Show the active account, every account's usage, and the last swap (issue #8).
+/// Show the active account, every account's usage, and the next swap candidate (#88).
 ///
 /// The **live** counterpart to the offline `list` (#17): a control-socket CLIENT.
 /// Connect to the running daemon's `0600` socket, ask for `status`, and pretty-
@@ -264,8 +264,8 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
 /// connect is the friendly [`Error::DaemonNotRunning`] (exit non-zero), never a
 /// raw connection error — the live analog of `list`'s empty-state friendliness.
 /// The printer is sourced solely from the [`StatusResponse`], which carries
-/// handles + percentages + per-account reset instants + a swap age only (issue
-/// #15 redaction). `--json` prints that same response verbatim — the full-data
+/// handles + percentages + per-account reset instants + a next-swap candidate
+/// label only (issue #15 redaction). `--json` prints that same response verbatim — the full-data
 /// contract regardless of terminal width (issue #72).
 ///
 /// The text view marks each account's urgency with a green/yellow/red color
@@ -326,7 +326,7 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 }
 
 /// Render a [`StatusResponse`] as the text `status` prints: an aligned column
-/// table (issue #72), one record per line, then the `last_swap` footer. Pure (no
+/// table (issue #72), one record per line, then the next-swap footer (#88). Pure (no
 /// clock, no I/O) so the response→text mapping is unit-testable — the caller
 /// passes `now` (epoch seconds) so each account's "resets in" and urgency are
 /// deterministic, `cols` (the terminal width, or `None` when stdout is not a TTY)
@@ -354,8 +354,8 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// math. The header, the untinted `STATUS` column, and any cell with no reading
 /// (nothing to classify — `n/a` is not a false "healthy") stay uncolored.
 ///
-/// Sourced solely from the response's non-secret fields — labels, percentages, a
-/// swap age, reset instants — so it can never print a token or email (issue #15);
+/// Sourced solely from the response's non-secret fields — labels, percentages,
+/// reset instants, a next-swap candidate label — so it can never print a token or email (issue #15);
 /// the ANSI overlay adds only `\x1b[3Xm`…`\x1b[0m`, never a secret.
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
@@ -432,13 +432,17 @@ pub(crate) fn render_status(
     }
 
     out.push('\n');
-    match &response.last_swap {
-        Some(swap) => out.push_str(&format!(
-            "last swap: {} ({})\n",
-            swap.to,
-            humanize_secs(swap.secs_ago),
-        )),
-        None => out.push_str("last swap: none\n"),
+    // The forward-looking next-swap candidate (issue #88), computed daemon-side
+    // ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like
+    // the table footer it replaces (per-cell health coloring is #84, orthogonal). A
+    // `None` field means the daemon sent no candidate — either a current daemon with no
+    // active account to anchor a swap from, or (via `#[serde(default)]`) a pre-#88 daemon
+    // that omits the field — and renders a bare `none` either way.
+    match &response.next_swap {
+        Some(NextSwap::Target { to }) => out.push_str(&format!("next swap: {to}\n")),
+        Some(NextSwap::NoViableTarget) => out.push_str("next swap: none (no viable target)\n"),
+        Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
+        None => out.push_str("next swap: none\n"),
     }
     out
 }
@@ -863,8 +867,6 @@ fn pct(percent: Option<u8>) -> String {
 /// A whole-second remaining time as a compact "resets in" string: the two largest
 /// non-zero units, e.g. `12m`, `4h`, `3d4h` (a trailing zero unit is dropped). A
 /// reset already reached (`<= 0`) renders as `now`, and under a minute as `<1m`.
-/// The forward-looking counterpart to [`humanize_secs`] (which renders an elapsed
-/// `…ago`).
 fn humanize_until(secs: i64) -> String {
     if secs <= 0 {
         return "now".to_owned();
@@ -976,23 +978,6 @@ fn now_epoch() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// A whole-second age as a compact relative string, e.g. `90` → `1m ago`. Coarse
-/// by design — the minimal `last_swap` presentation for #8.
-fn humanize_secs(secs: u64) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    if secs < MINUTE {
-        format!("{secs}s ago")
-    } else if secs < HOUR {
-        format!("{}m ago", secs / MINUTE)
-    } else if secs < DAY {
-        format!("{}h ago", secs / HOUR)
-    } else {
-        format!("{}d ago", secs / DAY)
-    }
 }
 
 /// List captured accounts — the offline, read-only roster view (issue #17).
@@ -1193,7 +1178,7 @@ fn remove_confirmation(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Tunables;
-    use crate::daemon::{AccountStatusLine, LastSwapLine};
+    use crate::daemon::{AccountStatusLine, NextSwap};
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -1337,7 +1322,7 @@ spare  22222222-2222\n\
         spare.enabled = false;
         let response = StatusResponse {
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
-            last_swap: None,
+            next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
         // The enabled active account is unmarked; the parked one carries the tag.
@@ -1363,7 +1348,7 @@ spare  22222222-2222\n\
         spare.quarantined = true;
         let response = StatusResponse {
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
-            last_swap: None,
+            next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
         let work = out.lines().find(|l| l.contains("work")).unwrap();
@@ -1534,18 +1519,18 @@ spare  22222222-2222\n\
     const NOW: i64 = 1_782_777_600;
 
     #[test]
-    fn render_status_renders_an_aligned_table_with_a_present_last_swap() {
+    fn render_status_renders_an_aligned_table_with_a_next_swap_candidate() {
         // Healthy roster (no tags) → no STATUS column. The full table (cols None)
-        // keeps every column; values align under their headers, one row each.
+        // keeps every column; values align under their headers, one row each, then the
+        // forward-looking next-swap footer naming the candidate (#88).
         let response = StatusResponse {
             accounts: vec![
                 status_line("work", true, Some(97), Some(40)),
                 status_line("spare", false, Some(10), Some(20)),
                 status_line("third", false, None, None),
             ],
-            last_swap: Some(LastSwapLine {
+            next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
-                secs_ago: 125,
             }),
         };
         let expected = concat!(
@@ -1554,7 +1539,7 @@ spare  22222222-2222\n\
             "  spare  10%      20%     n/a\n",
             "  third  n/a      n/a     n/a\n",
             "\n",
-            "last swap: spare (2m ago)\n",
+            "next swap: spare\n",
         );
         assert_eq!(render_status(&response, NOW, None, false), expected);
     }
@@ -1595,7 +1580,7 @@ spare  22222222-2222\n\
                     Some(NOW + 3 * 86_400 + 4 * 3_600),
                 ),
             ],
-            last_swap: None,
+            next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
         let line = |label: &str| {
@@ -1620,7 +1605,7 @@ spare  22222222-2222\n\
         quarantined.quarantined = true;
         let response = StatusResponse {
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
-            last_swap: None,
+            next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
         assert!(out.contains("STATUS"), "tagged roster shows STATUS: {out}");
@@ -1642,7 +1627,7 @@ spare  22222222-2222\n\
                 a.enabled = false; // a STATUS tag, so the column exists to be dropped
                 a
             }],
-            last_swap: None,
+            next_swap: None,
         };
         // Full table is `ACCOUNT(7) SESSION(7) WEEKLY(6) RESETS(6) STATUS(8)` plus
         // four 2-space gaps = 42; dropping WEEKLY → 34; dropping STATUS too → 24.
@@ -1682,19 +1667,62 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn render_status_shows_last_swap_none_before_any_swap() {
-        let response = StatusResponse {
-            accounts: vec![status_line("work", true, Some(50), Some(25))],
-            last_swap: None,
+    fn render_status_shows_each_next_swap_footer_state() {
+        // Every footer variant the candidate (#88) can take. The roster body is the
+        // same single active account each time — only `next_swap` drives the footer.
+        let footer = |next_swap| {
+            let response = StatusResponse {
+                accounts: vec![status_line("work", true, Some(50), Some(25))],
+                next_swap,
+            };
+            render_status(&response, NOW, None, false)
+                .lines()
+                .last()
+                .unwrap()
+                .to_owned()
         };
-        let out = render_status(&response, NOW, None, false);
-        assert!(out.ends_with("last swap: none\n"), "got: {out:?}");
+        assert_eq!(
+            footer(Some(NextSwap::Target {
+                to: "spare".to_owned()
+            })),
+            "next swap: spare"
+        );
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget)),
+            "next swap: none (no viable target)"
+        );
+        assert_eq!(
+            footer(Some(NextSwap::AwaitingData)),
+            "next swap: none (awaiting usage data)"
+        );
+        // `None` (a current daemon with no active anchor, or a pre-#88 daemon that omits
+        // the field) → a bare `none`.
+        assert_eq!(footer(None), "next swap: none");
+    }
+
+    #[test]
+    fn render_status_footer_is_plain_even_under_color() {
+        // The candidate footer (#88) carries no SGR even when the color gate is open —
+        // per-cell health coloring is #84, orthogonal; the footer stays uncolored.
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(99), Some(40))],
+            next_swap: Some(NextSwap::Target {
+                to: "spare".to_owned(),
+            }),
+        };
+        let colored = render_status(&response, NOW, None, true);
+        let footer = colored.lines().last().unwrap();
+        assert_eq!(footer, "next swap: spare");
+        assert!(
+            !footer.contains('\x1b'),
+            "the next-swap footer is never tinted: {colored:?}"
+        );
     }
 
     #[test]
     fn render_status_never_carries_an_email_or_token_sigil() {
         // #15: the printer sources only labels + percentages + reset instants + a
-        // swap age, so a token / email can never reach the printed surface.
+        // next-swap candidate label, so a token / email can never reach the printed surface.
         let response = StatusResponse {
             accounts: vec![status_line_resets(
                 "work",
@@ -1704,9 +1732,8 @@ spare  22222222-2222\n\
                 Some(NOW + 600),
                 Some(NOW + 86_400),
             )],
-            last_swap: Some(LastSwapLine {
+            next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
-                secs_ago: 5,
             }),
         };
         let out = render_status(&response, NOW, None, false);
@@ -1991,7 +2018,7 @@ spare  22222222-2222\n\
                 Some(NOW + 4 * 3_600),
                 Some(NOW + 5 * 86_400),
             )],
-            last_swap: None,
+            next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
         assert!(
@@ -2023,9 +2050,8 @@ spare  22222222-2222\n\
                     Some(NOW + 5 * 86_400),
                 ),
             ],
-            last_swap: Some(LastSwapLine {
+            next_swap: Some(NextSwap::Target {
                 to: "calm".to_owned(),
-                secs_ago: 30,
             }),
         };
         let plain = render_status(&response, NOW, None, false);
@@ -2059,7 +2085,7 @@ spare  22222222-2222\n\
                 Some(NOW + 4 * 3_600), // far session reset → depleted + far
                 Some(NOW + 5 * 86_400),
             )],
-            last_swap: None,
+            next_swap: None,
         };
         let colored = render_status(&response, NOW, None, true);
         let plain = render_status(&response, NOW, None, false);
@@ -2093,7 +2119,7 @@ spare  22222222-2222\n\
                 Some(NOW + 4 * 3_600),
                 None,
             )],
-            last_swap: None,
+            next_swap: None,
         };
         let colored = render_status(&response, NOW, None, true);
         let plain = render_status(&response, NOW, None, false);
@@ -2122,7 +2148,7 @@ spare  22222222-2222\n\
                 status_line("ascii", true, Some(50), Some(60)),
                 status_line("日本語", false, Some(10), Some(20)),
             ],
-            last_swap: None,
+            next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
         // Each row's SESSION value begins at the same DISPLAY column.
@@ -2151,9 +2177,8 @@ spare  22222222-2222\n\
                 Some(NOW + 4 * 3_600),
                 Some(NOW + 5 * 86_400),
             )],
-            last_swap: Some(LastSwapLine {
+            next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
-                secs_ago: 5,
             }),
         };
         let out = render_status(&response, NOW, None, true);
@@ -2164,17 +2189,6 @@ spare  22222222-2222\n\
         );
         assert!(!out.to_lowercase().contains("token"));
         assert!(!out.contains("sk-ant-"));
-    }
-
-    #[test]
-    fn humanize_secs_uses_compact_units() {
-        assert_eq!(humanize_secs(0), "0s ago");
-        assert_eq!(humanize_secs(59), "59s ago");
-        assert_eq!(humanize_secs(60), "1m ago");
-        assert_eq!(humanize_secs(3599), "59m ago");
-        assert_eq!(humanize_secs(3600), "1h ago");
-        assert_eq!(humanize_secs(86_399), "23h ago");
-        assert_eq!(humanize_secs(86_400), "1d ago");
     }
 
     #[test]
@@ -2254,9 +2268,8 @@ spare  22222222-2222\n\
 
         let response = StatusResponse {
             accounts: vec![status_line("work", true, Some(50), Some(25))],
-            last_swap: Some(LastSwapLine {
+            next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
-                secs_ago: 120,
             }),
         };
         let wire = serde_json::to_string(&response).unwrap();
@@ -2279,8 +2292,26 @@ spare  22222222-2222\n\
         assert_eq!(parsed.accounts.len(), 1);
         assert_eq!(parsed.accounts[0].label, "work");
         assert_eq!(parsed.accounts[0].session_pct, Some(50));
-        let swap = parsed.last_swap.expect("last_swap present");
-        assert_eq!(swap.to, "spare");
-        assert_eq!(swap.secs_ago, 120);
+        // The next-swap candidate round-trips intact (#88).
+        assert_eq!(
+            parsed.next_swap,
+            Some(NextSwap::Target {
+                to: "spare".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn status_response_decodes_a_payload_that_omits_next_swap() {
+        // Backward-compatible decode (#88): a pre-#88 daemon's reply carries no
+        // `next_swap` key at all. `#[serde(default)]` must decode the absent field to
+        // `None` rather than fail — the round-trip test above only proves the field
+        // survives when PRESENT, so this pins the ABSENT case the compat guarantee
+        // actually exists for (cf. the sibling `session_resets_at` added-field convention).
+        let wire = r#"{"accounts":[]}"#;
+        let parsed: StatusResponse =
+            serde_json::from_str(wire).expect("an absent next_swap decodes, not errors");
+        assert_eq!(parsed.next_swap, None);
+        assert!(parsed.accounts.is_empty());
     }
 }

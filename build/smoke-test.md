@@ -79,8 +79,9 @@ Restore your normal values when finished (Step 9).
 4. **Observe the swap (threshold → viable → swap → propagate).** Within a poll interval or two, with
    the active account's real session usage ≥ 50%, the daemon swaps to the other account. Confirm, with
    **no manual step**:
-   - `sessiometer status` (second terminal) now shows the **other** account active, and a `last swap`
-     line naming it.
+   - `sessiometer status` (second terminal) now shows the **other** account active. (The `next swap:`
+     footer is forward-looking — it names the *next* candidate, not the swap that just happened; the
+     swap itself is confirmed by the event log below.)
    - `~/Library/Logs/sessiometer/sessiometer.log` has an `event=swap from=… to=…` line.
    - Claude Code itself continues working as the swapped-to account (the canonical credential and
      `~/.claude.json` both moved — propagation).
