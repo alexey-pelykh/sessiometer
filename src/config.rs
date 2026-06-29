@@ -15,8 +15,9 @@
 //! does not satisfy the bounds.
 //!
 //! Nothing here carries secret material: the roster keys accounts by
-//! `account_uuid` / `stash` / `label`, never by token or email (issues #9, #15,
-//! #17). Error messages quote only those non-secret fields.
+//! `account_uuid` / `label`, never by token or email (issues #9, #15, #17). The
+//! keychain stash name is derived from `account_uuid`, not stored (issue #70).
+//! Error messages quote only those non-secret fields.
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -51,29 +52,48 @@ const DEFAULT_MONITOR_401_N: u8 = 3;
 /// account is restored to the rotation (issue #42).
 const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
 
-/// One captured account in the roster. Keyed by non-secret fields only.
+/// The keychain service-name namespace every account's stash lives under; the
+/// full name is `Sessiometer/<account_uuid>` ([`Account::stash`]). Kept as one
+/// shared constant so the prefix has a single definition (issue #70).
+pub(crate) const STASH_PREFIX: &str = "Sessiometer/";
+
+/// One captured account in the roster. Keyed by `account_uuid` alone.
 ///
-/// The fields beyond the uniqueness keys are read by the write path
+/// The fields beyond the uniqueness key are read by the write path
 /// ([`Config::render`], for `capture` #4) and by `list` / `status` (#17 / #9);
 /// the swap engine (#6 / #7) rotates across the roster. They are validated and
 /// persisted here ahead of those consumers.
+///
+/// The keychain stash name is NOT stored: it is definitionally
+/// `Sessiometer/<account_uuid>` (issue #70), so [`Account::stash`] derives it
+/// from `account_uuid` rather than carrying a duplicate, separately-persisted
+/// copy that could drift out of sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct Account {
-    /// Stable per-account identifier (the Claude `account_uuid`); roster key.
+    /// Stable per-account identifier (the Claude `account_uuid`); the sole roster
+    /// key, and the basis for the derived [`stash`](Account::stash) name.
     pub(crate) account_uuid: String,
-    /// Keychain stash name the captured credential lives under
-    /// (`Sessiometer/<account_uuid>`); roster key.
-    pub(crate) stash: String,
     /// Human-readable label shown by `list` / `status`.
     pub(crate) label: String,
     /// Whether this account participates in the rotation (issue #36). A disabled
-    /// account stays in the roster and keeps its stash, but the daemon never swaps
-    /// TO it and does not poll it; `sessiometer enable` returns it to the candidate
-    /// pool. Defaults to `true` — a config entry that omits the key (every pre-#36
-    /// one) loads fully enabled. The reversible sibling of removal (#13), which
-    /// instead deletes the stash.
+    /// account stays in the roster (its keychain stash is untouched), but the
+    /// daemon never swaps TO it and does not poll it; `sessiometer enable` returns
+    /// it to the candidate pool. Defaults to `true` — a config entry that omits the
+    /// key (every pre-#36 one) loads fully enabled. The reversible sibling of
+    /// removal (#13), which instead deletes the stash.
     pub(crate) enabled: bool,
+}
+
+impl Account {
+    /// The keychain service name the captured credential lives under,
+    /// `Sessiometer/<account_uuid>`. Derived, never stored (issue #70): the stash
+    /// is definitionally a function of `account_uuid`, so the roster keeps one
+    /// source of truth and `config.toml` no longer carries a redundant
+    /// `stash = …` line. See [`crate::stash`] for the stash layout itself.
+    pub(crate) fn stash(&self) -> String {
+        format!("{STASH_PREFIX}{}", self.account_uuid)
+    }
 }
 
 /// The daemon tunables, validated into their typed ranges.
@@ -167,7 +187,7 @@ fn default_poll_jitter() -> Jitter {
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
-    /// Captured accounts (unique `account_uuid` + `stash`; no fixed upper bound —
+    /// Captured accounts (unique `account_uuid`; no fixed upper bound —
     /// #35, and possibly empty — the daemon's "at least one" precondition is
     /// [`Config::require_roster`], not a parse-time rule, so `capture` can load a
     /// tunables-only file to add the first account). Consumed by the swap engine
@@ -360,17 +380,17 @@ impl Config {
         // `daemon::Daemon::tick`), so a larger roster grows per-tick work and
         // outbound request volume linearly. The operator self-limits by choice
         // (smaller roster, or a larger `poll_secs`); the tool enforces no ceiling.
+        // Uniqueness keys on `account_uuid` alone: the stash is derived from it
+        // ([`Account::stash`]), so distinct uuids imply distinct stashes and a
+        // non-empty uuid implies a non-empty stash — the former empty-/duplicate-
+        // stash checks are now redundant (issue #70).
         let mut uuids = HashSet::new();
-        let mut stashes = HashSet::new();
         let mut roster = Vec::with_capacity(raw.account.len());
         for account in raw.account {
             if account.account_uuid.trim().is_empty() {
                 return Err(Error::ConfigInvalid(
                     "account_uuid must not be empty".into(),
                 ));
-            }
-            if account.stash.trim().is_empty() {
-                return Err(Error::ConfigInvalid("stash must not be empty".into()));
             }
             if account.label.trim().is_empty() {
                 return Err(Error::ConfigInvalid("label must not be empty".into()));
@@ -381,15 +401,8 @@ impl Config {
                     account.account_uuid
                 )));
             }
-            if !stashes.insert(account.stash.clone()) {
-                return Err(Error::ConfigInvalid(format!(
-                    "duplicate stash: {}",
-                    account.stash
-                )));
-            }
             roster.push(Account {
                 account_uuid: account.account_uuid,
-                stash: account.stash,
                 label: account.label,
                 enabled: account.enabled,
             });
@@ -478,7 +491,8 @@ impl Config {
                 "account_uuid = {}\n",
                 basic_string(&account.account_uuid)
             ));
-            out.push_str(&format!("stash = {}\n", basic_string(&account.stash)));
+            // No `stash` line: it is derived from `account_uuid` on load
+            // ([`Account::stash`]), never persisted (issue #70).
             out.push_str(&format!("label = {}\n", basic_string(&account.label)));
             // Issue #36: in the rotation? A disabled account is kept (and keeps its
             // stash) but is never polled or swapped to — `sessiometer enable`
@@ -624,6 +638,14 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawAccount {
     account_uuid: String,
+    /// Legacy back-compat (issue #70): pre-#70 `config.toml` files persisted a
+    /// `stash = "Sessiometer/<account_uuid>"` line. The stash is now derived
+    /// ([`Account::stash`]) and never re-written, but the key is still ACCEPTED
+    /// here — and ignored — so existing files keep parsing under
+    /// `deny_unknown_fields`; the next `save` drops it. Absent (a post-#70 file) →
+    /// empty via `#[serde(default)]`.
+    #[serde(default)]
+    #[allow(dead_code)]
     stash: String,
     label: String,
     /// In the rotation? (issue #36) Absent → `true`: a pre-#36 `[[account]]` entry
@@ -738,12 +760,10 @@ monitor_recovery_m = 4
 
 [[account]]
 account_uuid = "11111111-1111-1111-1111-111111111111"
-stash = "Sessiometer/11111111-1111-1111-1111-111111111111"
 label = "work"
 
 [[account]]
 account_uuid = "22222222-2222-2222-2222-222222222222"
-stash = "Sessiometer/22222222-2222-2222-2222-222222222222"
 label = "personal"
 "#;
 
@@ -754,7 +774,6 @@ label = "personal"
             "[tunables]\n{fragment}\n\
              [[account]]\n\
              account_uuid = \"u\"\n\
-             stash = \"Sessiometer/u\"\n\
              label = \"l\"\n"
         )
     }
@@ -786,8 +805,9 @@ label = "personal"
             }
         );
         assert_eq!(config.roster[0].label, "work");
+        // The stash name is derived from `account_uuid`, not parsed from the file.
         assert_eq!(
-            config.roster[1].stash,
+            config.roster[1].stash(),
             "Sessiometer/22222222-2222-2222-2222-222222222222"
         );
     }
@@ -796,7 +816,6 @@ label = "personal"
     fn tunables_default_when_table_absent() {
         let toml = "[[account]]\n\
                     account_uuid = \"u\"\n\
-                    stash = \"Sessiometer/u\"\n\
                     label = \"only\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
@@ -977,7 +996,7 @@ label = "personal"
         let mut toml = String::new();
         for i in 0..8 {
             toml.push_str(&format!(
-                "[[account]]\naccount_uuid = \"u{i}\"\nstash = \"s{i}\"\nlabel = \"l{i}\"\n"
+                "[[account]]\naccount_uuid = \"u{i}\"\nlabel = \"l{i}\"\n"
             ));
         }
         let config = Config::parse(&toml).unwrap();
@@ -986,21 +1005,19 @@ label = "personal"
 
     #[test]
     fn rejects_duplicate_uuid() {
-        let toml = "[[account]]\naccount_uuid = \"same\"\nstash = \"s1\"\nlabel = \"a\"\n\
-                    [[account]]\naccount_uuid = \"same\"\nstash = \"s2\"\nlabel = \"b\"\n";
+        let toml = "[[account]]\naccount_uuid = \"same\"\nlabel = \"a\"\n\
+                    [[account]]\naccount_uuid = \"same\"\nlabel = \"b\"\n";
         assert!(matches!(Config::parse(toml), Err(Error::ConfigInvalid(_))));
     }
 
-    #[test]
-    fn rejects_duplicate_stash() {
-        let toml = "[[account]]\naccount_uuid = \"u1\"\nstash = \"same\"\nlabel = \"a\"\n\
-                    [[account]]\naccount_uuid = \"u2\"\nstash = \"same\"\nlabel = \"b\"\n";
-        assert!(matches!(Config::parse(toml), Err(Error::ConfigInvalid(_))));
-    }
+    // (Pre-#70 there was a `rejects_duplicate_stash` test; the stash is now derived
+    // from `account_uuid`, so duplicate stashes cannot occur independently of
+    // duplicate uuids — the check, and its test, are gone. See
+    // `stash_is_derived_from_account_uuid` and `legacy_stash_field_is_ignored`.)
 
     #[test]
     fn rejects_empty_label() {
-        let toml = "[[account]]\naccount_uuid = \"u\"\nstash = \"s\"\nlabel = \"\"\n";
+        let toml = "[[account]]\naccount_uuid = \"u\"\nlabel = \"\"\n";
         assert!(matches!(Config::parse(toml), Err(Error::ConfigInvalid(_))));
     }
 
@@ -1010,6 +1027,45 @@ label = "personal"
         let reparsed = Config::parse(&original.render()).unwrap();
         assert_eq!(original.tunables, reparsed.tunables);
         assert_eq!(original.roster, reparsed.roster);
+    }
+
+    #[test]
+    fn stash_is_derived_from_account_uuid() {
+        // The stash name is a pure function of `account_uuid` (issue #70): there is
+        // no stored field to read, so a roster entry with only the required keys
+        // still resolves its keychain service name.
+        let config =
+            Config::parse("[[account]]\naccount_uuid = \"abc-123\"\nlabel = \"work\"\n").unwrap();
+        assert_eq!(config.roster[0].stash(), "Sessiometer/abc-123");
+    }
+
+    #[test]
+    fn legacy_stash_field_is_ignored() {
+        // Back-compat (issue #70): a pre-#70 file carrying a `stash = …` line still
+        // PARSES (the key is accepted, not rejected by `deny_unknown_fields`), and
+        // the stored value is IGNORED — the stash is derived from `account_uuid`. A
+        // deliberately mismatched stored value proves the field is not read.
+        let toml = "[[account]]\n\
+                    account_uuid = \"u\"\n\
+                    stash = \"Sessiometer/STALE-IGNORED\"\n\
+                    label = \"work\"\n";
+        let config = Config::parse(toml).expect("a legacy stash line must still parse");
+        assert_eq!(config.roster[0].stash(), "Sessiometer/u");
+    }
+
+    #[test]
+    fn rendered_config_omits_the_derived_stash() {
+        // `render` no longer emits a `stash = …` line (issue #70), so the next save
+        // of a legacy file drops it. The derived stash survives the render→parse
+        // round-trip because it rides on `account_uuid`.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(
+            !text.contains("stash ="),
+            "render must not emit a stash line: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.roster[0].stash(), config.roster[0].stash());
     }
 
     // --- account enable/disable (issue #36) --------------------------------
@@ -1027,8 +1083,7 @@ label = "personal"
 
     #[test]
     fn account_enabled_false_parses_as_disabled() {
-        let toml =
-            "[[account]]\naccount_uuid = \"u\"\nstash = \"s\"\nlabel = \"l\"\nenabled = false\n";
+        let toml = "[[account]]\naccount_uuid = \"u\"\nlabel = \"l\"\nenabled = false\n";
         let config = Config::parse(toml).unwrap();
         assert!(!config.roster[0].enabled);
     }
@@ -1061,7 +1116,6 @@ label = "personal"
             "[jitter]\n{fragment}\n\
              [[account]]\n\
              account_uuid = \"u\"\n\
-             stash = \"Sessiometer/u\"\n\
              label = \"l\"\n"
         )
     }
@@ -1192,7 +1246,6 @@ label = "personal"
     fn round_trips_a_label_that_needs_escaping() {
         let toml = "[[account]]\n\
                     account_uuid = \"u\"\n\
-                    stash = \"Sessiometer/u\"\n\
                     label = \"tab\\there \\\"quote\\\" and \\\\ slash\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.roster[0].label, "tab\there \"quote\" and \\ slash");
