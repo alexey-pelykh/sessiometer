@@ -72,7 +72,9 @@ Restore your normal values when finished (Step 9).
 2. **Apply the synthetic threshold.** Edit `config.toml` as above (`session_trigger = 50`,
    `poll_secs = 5`, `cooldown_secs = 60`).
 
-3. **Start the daemon (foreground).** `sessiometer run`. It reconciles on start, then begins polling.
+3. **Start the daemon (foreground).** `sessiometer run` — or `sessiometer run -v` to also watch the
+   per-cycle diagnostic channel (issue #77) on stderr: a `diag=start` config summary, then each poll's
+   outcome and the per-tick decision. It reconciles on start, then begins polling.
 
 4. **Observe the swap (threshold → viable → swap → propagate).** Within a poll interval or two, with
    the active account's real session usage ≥ 50%, the daemon swaps to the other account. Confirm, with
@@ -101,13 +103,13 @@ Restore your normal values when finished (Step 9).
    `sessiometer status` / by re-reading `~/.claude.json`.
 
 8. **Confirm no secret leaks.** Skim every operator surface — `sessiometer status`, the full
-   `sessiometer.log`, and any error output (e.g. run a bogus `sessiometer status` with the daemon
-   stopped). They carry account **labels**, **percentages**, and relative ages only — **never** a token
-   (`sk-ant-…`), a credential blob, or an account email. (This is exactly what the redaction METER
-   asserts mechanically over the same channels in CI, issue #15.) On an interactive terminal `status`
-   color-codes each row by urgency (green/yellow/red, issue #73); the color only **augments** the same
-   non-secret text and adds nothing but ANSI escapes — pipe it (`sessiometer status | cat -v`) to
-   confirm the escapes vanish and not a single secret appears.
+   `sessiometer.log`, the `-v` diagnostic channel on stderr (issue #77), and any error output (e.g. run
+   a bogus `sessiometer status` with the daemon stopped). They carry account **labels**, **percentages**,
+   and relative ages only — **never** a token (`sk-ant-…`), a credential blob, or an account email.
+   (This is exactly what the redaction METER asserts mechanically over the same channels in CI, issues
+   #15 and #77.) On an interactive terminal `status` color-codes each row by urgency (green/yellow/red,
+   issue #73); the color only **augments** the same non-secret text and adds nothing but ANSI escapes —
+   pipe it (`sessiometer status | cat -v`) to confirm the escapes vanish and not a single secret appears.
 
 9. **Teardown.** `Ctrl-C` the daemon. Restore `config.toml` to your normal `session_trigger` /
    `poll_secs` / `cooldown_secs`. The rotation and both stashes are unchanged.

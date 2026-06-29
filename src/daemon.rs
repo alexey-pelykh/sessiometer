@@ -62,6 +62,7 @@
 //! weekly `resets_at`), which now fills the event log's `resets_at=` field.
 
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -75,7 +76,9 @@ use crate::error::{Error, Result};
 use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
-use crate::observability::{Event, EventLog, SwapReason};
+use crate::observability::{
+    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, PollClass, SwapReason,
+};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
@@ -643,6 +646,28 @@ pub(crate) enum TickAction {
     KeychainLocked,
 }
 
+impl TickAction {
+    /// The operator-facing [`DecisionClass`] this action renders as on the diagnostic
+    /// channel (issue #77). Total and 1:1 over the variants; the swap participants of
+    /// [`Swapped`](Self::Swapped) / [`EmergencySwapped`](Self::EmergencySwapped) are
+    /// intentionally dropped (the decision line is a pure label — the handles ride the
+    /// event log's `swap` line and the foreground echo).
+    fn decision_class(self) -> DecisionClass {
+        match self {
+            TickAction::Held => DecisionClass::Hold,
+            TickAction::Swapped { .. } => DecisionClass::Swap,
+            TickAction::EmergencySwapped { .. } => DecisionClass::EmergencySwap,
+            TickAction::ActiveDeadNoTarget => DecisionClass::ActiveDeadNoTarget,
+            TickAction::NoViableTarget => DecisionClass::AllExhausted,
+            TickAction::SkippedActiveUnknown => DecisionClass::SkipActiveUnknown,
+            TickAction::SkippedActiveUnavailable => DecisionClass::SkipActiveUnavailable,
+            TickAction::SkippedCooldown => DecisionClass::SkipCooldown,
+            TickAction::SwapFailed => DecisionClass::SwapFailed,
+            TickAction::KeychainLocked => DecisionClass::KeychainLocked,
+        }
+    }
+}
+
 /// The result of one poll iteration.
 #[derive(Debug)]
 pub(crate) struct TickOutcome {
@@ -653,6 +678,16 @@ pub(crate) struct TickOutcome {
     /// decision event (swap / all-exhausted) if any. `run_loop` emits each to the
     /// event log; a Hold or a skip generates none.
     pub(crate) events: Vec<Event>,
+    /// The operator-facing diagnostics this cycle generated (issue #77), in the
+    /// order they are emitted: one [`Diagnostic::Poll`] per polled account (in
+    /// roster order), then — on the edge — a [`Diagnostic::AllExhaustedCleared`]
+    /// when this cycle LEFT the all-exhausted state, and finally the per-tick
+    /// [`Diagnostic::Tick`] decision (with any back-off). Unlike `events`, EVERY
+    /// tick produces some (a Hold still logs its poll outcomes + decision), so
+    /// `run_loop`'s [`DiagnosticLog`] — not this vec — applies the verbosity gate.
+    /// Produced unconditionally so the #15 redaction meter scans them on every
+    /// cycle, in quiet mode too.
+    pub(crate) diagnostics: Vec<Diagnostic>,
     /// The per-account readings this cycle, for the control socket (`status`).
     pub(crate) snapshot: StatusSnapshot,
     /// How long the run loop should wait before the next tick. `None` = the normal
@@ -950,6 +985,9 @@ where
         self.state.ticks += 1;
         let at = self.clock.now();
         let mut events: Vec<Event> = Vec::new();
+        // The operator-facing diagnostics this cycle (issue #77), produced
+        // unconditionally — `run_loop`'s `DiagnosticLog` applies the verbosity gate.
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
         // Read the canonical credential ONCE at the top of the cycle. It drives
         // three things, all from this single read: lock detection (defer the whole
@@ -1022,6 +1060,13 @@ where
             }
             let result = self.poller.poll(&self.roster[i], active == Some(i)).await;
             self.note_poll_outcome(i, &result, &mut events);
+            // Diagnostic per-poll outcome (issue #77): every polled account, in
+            // roster order — including the `live` and `rate_limited`/`transient`
+            // outcomes the event log records NO event for (the #77 invisibility).
+            diagnostics.push(Diagnostic::Poll {
+                account: self.roster[i].label.clone(),
+                outcome: diag_poll_class(&result),
+            });
             if let Some(signal) = backoff_signal(&result) {
                 backed_off = true;
                 if let Some(ra) = signal.retry_after {
@@ -1038,6 +1083,15 @@ where
         // re-entry signals afresh. `decide_action` sets the guard (and emits once)
         // while in the state; this is the matching reset on the way out.
         if !matches!(action, TickAction::NoViableTarget) {
+            // Diagnostic LEAVE edge (issue #77): the guard is still set from the
+            // prior episode here (it has NOT been cleared yet), so a set guard on a
+            // non-exhausted cycle means we are LEAVING the state — emit the marker
+            // BEFORE the reset below. The symmetric partner of the event log's
+            // edge-triggered `all_exhausted` ENTER, so a stale reading is
+            // distinguishable from a current one.
+            if self.state.signaled_all_exhausted {
+                diagnostics.push(Diagnostic::AllExhaustedCleared);
+            }
             self.state.signaled_all_exhausted = false;
         }
         // Rate-limit / transient back-off (issue #76): a cycle whose polls saw a
@@ -1050,10 +1104,18 @@ where
             self.state.poll_backoff_streak = 0;
             None
         };
+        // The per-tick decision diagnostic (issue #77), with any back-off this tick
+        // imposed — the decision class names what the loop did (swap / hold / skip /
+        // all_exhausted / …); a `None` back-off omits the field.
+        diagnostics.push(Diagnostic::Tick {
+            decision: action.decision_class(),
+            backoff_secs: next_wait.map(|wait| wait.as_secs()),
+        });
         let snapshot = self.snapshot(at, active, &readings);
         TickOutcome {
             action,
             events,
+            diagnostics,
             snapshot,
             next_wait,
         }
@@ -1086,9 +1148,17 @@ where
         // `status` still lists the roster and the last swap rather than going dark.
         let readings = vec![None; self.roster.len()];
         let snapshot = self.snapshot(at, self.state.active, &readings);
+        // Diagnostic (issue #77): a locked tick polls NOTHING (it short-circuits
+        // before the poll loop), so there are no per-poll lines — just the decision
+        // line naming the deferral and the back-off wait it imposed.
+        let diagnostics = vec![Diagnostic::Tick {
+            decision: TickAction::KeychainLocked.decision_class(),
+            backoff_secs: Some(backoff.as_secs()),
+        }];
         TickOutcome {
             action: TickAction::KeychainLocked,
             events,
+            diagnostics,
             snapshot,
             next_wait: Some(backoff),
         }
@@ -1699,6 +1769,22 @@ fn classify_poll(result: &Result<Usage>) -> PollOutcome {
     }
 }
 
+/// Classify a poll `Result` into its operator-facing [`PollClass`] for the diagnostic
+/// channel (issue #77). Distinct from [`classify_poll`] in ONE place: a `429`
+/// (rate-limited) is its OWN class here, where the dead-credential machine folds it
+/// into `Transient` — an operator debugging a throttling storm needs to see
+/// `rate_limited` rather than a generic transient (the very signal #77 surfaces). The
+/// `5xx` / network / unreadable / unparseable remainder is `Transient`.
+fn diag_poll_class(result: &Result<Usage>) -> PollClass {
+    match result {
+        Ok(_) => PollClass::Live,
+        Err(Error::UsageUnauthorized) => PollClass::Unauthorized,
+        Err(Error::UsageScopeMissing) => PollClass::Scope,
+        Err(Error::UsageRateLimited { .. }) => PollClass::RateLimited,
+        Err(_) => PollClass::Transient,
+    }
+}
+
 /// A poll outcome that asks the loop to back off (issue #76): a `429`
 /// (rate-limited) or a `5xx` / network transient. Carries the server-advised
 /// `Retry-After` the response supplied, if any.
@@ -1832,14 +1918,18 @@ fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
 
 /// Drive the poll loop until shutdown.
 ///
-/// Reconcile-on-start, then forever: tick, log, and idle until the next poll —
-/// meanwhile serving control requests and watching for shutdown. Shutdown is
+/// Reconcile-on-start, then forever: tick, log (the event log `log` AND the
+/// operator-facing diagnostic channel `diag`, issue #77), and idle until the next
+/// poll — meanwhile serving control requests and watching for shutdown. Shutdown is
 /// observed only HERE (between ticks), never mid-tick: a swap inside [`Daemon::tick`]
 /// always runs to completion, so a shutdown can never tear a swap
-/// (complete-or-abort; #6 is no-half-swap).
-pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl>(
+/// (complete-or-abort; #6 is no-half-swap). The lifecycle markers (`diag=start` /
+/// `diag=stop`) bracket this call in [`crate::cli`], which owns the process
+/// lifecycle; this loop emits only the per-tick diagnostics.
+pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl, W>(
     daemon: &mut Daemon<P, C, S, K>,
     log: &mut EventLog,
+    diag: &mut DiagnosticLog<W>,
     shutdown: &mut Sh,
     control: &Ctl,
 ) -> Result<()>
@@ -1850,6 +1940,7 @@ where
     K: Clock,
     Sh: Shutdown,
     Ctl: Control,
+    W: Write,
 {
     // Reconcile-on-start is best-effort: a failure is logged and the loop still
     // starts — the next swap re-establishes consistency anyway.
@@ -1893,6 +1984,13 @@ where
             if let Err(err) = log.emit(event) {
                 eprintln!("sessiometer: event log write failed: {err}");
             }
+        }
+        // Operator-facing diagnostics (issue #77): emit each to the diagnostic
+        // channel, which DROPS them unless `-v`/`--verbose` was passed. Per-poll
+        // outcomes, the per-tick decision, and any all-exhausted-leave edge — the
+        // run-debugging detail the edge-triggered event log deliberately omits.
+        for diagnostic in &outcome.diagnostics {
+            diag.emit(diagnostic);
         }
         // Echo a swap to the operator watching the foreground process (issue #8).
         // The file event log (above) records every cycle; the console gets just
@@ -1947,6 +2045,9 @@ mod tests {
     use crate::claude_state::OauthAccount;
     use crate::config::Tunables;
     use crate::keychain::FakeCredentialStore;
+    // `Verbosity` is named only in test code here (the diagnostic SINK gating lives
+    // in `cli`); import it test-scoped so a non-test build sees no unused import.
+    use crate::observability::Verbosity;
     use crate::stash::{FakeAccountStash, StashedAccount};
     use crate::timing::Jitter;
     use std::cell::Cell;
@@ -2826,6 +2927,26 @@ mod tests {
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
+        // Diagnostic channel (#77): a per-poll line per account (both live, in roster
+        // order), then the per-tick Hold decision with NO back-off — and, not having
+        // been in the all-exhausted state, NO leave marker.
+        assert_eq!(
+            outcome.diagnostics,
+            vec![
+                Diagnostic::Poll {
+                    account: "work".to_owned(),
+                    outcome: PollClass::Live,
+                },
+                Diagnostic::Poll {
+                    account: "spare".to_owned(),
+                    outcome: PollClass::Live,
+                },
+                Diagnostic::Tick {
+                    decision: DecisionClass::Hold,
+                    backoff_secs: None,
+                },
+            ],
+        );
     }
 
     #[tokio::test]
@@ -3051,6 +3172,16 @@ mod tests {
         // status still answers — the roster is listed, every reading absent.
         assert_eq!(first.snapshot.accounts.len(), 2);
         assert!(first.snapshot.accounts.iter().all(|a| a.usage.is_none()));
+        // Diagnostic channel (#77): a locked tick polls NOTHING (it short-circuits
+        // before the poll loop), so there are NO per-poll lines — just the decision
+        // line naming the deferral and the back-off wait it imposed.
+        assert_eq!(
+            first.diagnostics,
+            vec![Diagnostic::Tick {
+                decision: DecisionClass::KeychainLocked,
+                backoff_secs: Some(LOCK_BACKOFF_BASE.as_secs()),
+            }],
+        );
 
         // A second locked cycle is SILENT (edge-triggered) and the back-off grows.
         let second = daemon.tick().await;
@@ -3197,6 +3328,23 @@ mod tests {
         let first = daemon.tick().await;
         assert_eq!(first.action, TickAction::SkippedActiveUnavailable);
         assert_eq!(first.next_wait, Some(Duration::from_secs(120)));
+        // Diagnostic channel (#77): the poll surfaces as the `rate_limited` class —
+        // NOT a generic transient — and the per-tick decision carries the back-off in
+        // whole seconds. This is exactly the `429` storm the issue says was previously
+        // invisible (the event log emits no event for a rate-limited poll).
+        assert_eq!(
+            first.diagnostics,
+            vec![
+                Diagnostic::Poll {
+                    account: "work".to_owned(),
+                    outcome: PollClass::RateLimited,
+                },
+                Diagnostic::Tick {
+                    decision: DecisionClass::SkipActiveUnavailable,
+                    backoff_secs: Some(120),
+                },
+            ],
+        );
         assert_eq!(
             daemon.tick().await.next_wait,
             Some(Duration::from_secs(240))
@@ -3703,6 +3851,116 @@ mod tests {
         assert!(
             !daemon.state.signaled_all_exhausted,
             "leaving the all-exhausted state must clear the edge guard",
+        );
+        // And the full diagnostic vec (#77), in emission order: a per-poll line per
+        // account (both live, in roster order), then — exactly ONCE — the
+        // `AllExhaustedCleared` LEAVE marker (the symmetric partner of the
+        // edge-triggered ENTER), then the per-tick Hold decision. The marker is
+        // computed from the guard BEFORE the reset above, so a genuine leave is told
+        // apart from a never-entered hold (a stale "all exhausted" reading vs a
+        // current one — the #77 motivation). Asserting the whole vec — not just the
+        // marker count — pins the operator-visible ORDER against an accidental reorder.
+        assert_eq!(
+            outcome.diagnostics,
+            vec![
+                Diagnostic::Poll {
+                    account: "work".to_owned(),
+                    outcome: PollClass::Live,
+                },
+                Diagnostic::Poll {
+                    account: "spare".to_owned(),
+                    outcome: PollClass::Live,
+                },
+                Diagnostic::AllExhaustedCleared,
+                Diagnostic::Tick {
+                    decision: DecisionClass::Hold,
+                    backoff_secs: None,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn diag_poll_class_separates_rate_limited_from_transient() {
+        // The DIAGNOSTIC taxonomy (#77) splits a `429` (rate-limited) out as its own
+        // class — the signal an operator debugging a throttling storm needs — whereas
+        // the dead-credential `classify_poll` folds it into the generic transient.
+        assert_eq!(
+            diag_poll_class(&Err(Error::UsageUnauthorized)),
+            PollClass::Unauthorized
+        );
+        assert_eq!(
+            diag_poll_class(&Err(Error::UsageScopeMissing)),
+            PollClass::Scope
+        );
+        assert_eq!(
+            diag_poll_class(&Err(Error::UsageRateLimited {
+                status: 429,
+                retry_after: None,
+            })),
+            PollClass::RateLimited
+        );
+        assert_eq!(
+            diag_poll_class(&Err(Error::UsageTransient {
+                status: 503,
+                retry_after: None,
+            })),
+            PollClass::Transient
+        );
+        assert_eq!(
+            diag_poll_class(&Err(Error::UsageTokenUnreadable)),
+            PollClass::Transient
+        );
+        // Contrast on the SAME 429: the health axis folds it into `Transient`.
+        assert_eq!(
+            classify_poll(&Err(Error::UsageRateLimited {
+                status: 429,
+                retry_after: None,
+            })),
+            PollOutcome::Transient
+        );
+    }
+
+    #[test]
+    fn decision_class_maps_every_tick_action() {
+        // 1:1 and total over the variants (#77); swap participants are dropped — the
+        // decision line is a pure label.
+        assert_eq!(TickAction::Held.decision_class(), DecisionClass::Hold);
+        assert_eq!(
+            TickAction::Swapped { from: 0, to: 1 }.decision_class(),
+            DecisionClass::Swap
+        );
+        assert_eq!(
+            TickAction::EmergencySwapped { from: 0, to: 1 }.decision_class(),
+            DecisionClass::EmergencySwap
+        );
+        assert_eq!(
+            TickAction::ActiveDeadNoTarget.decision_class(),
+            DecisionClass::ActiveDeadNoTarget
+        );
+        assert_eq!(
+            TickAction::NoViableTarget.decision_class(),
+            DecisionClass::AllExhausted
+        );
+        assert_eq!(
+            TickAction::SkippedActiveUnknown.decision_class(),
+            DecisionClass::SkipActiveUnknown
+        );
+        assert_eq!(
+            TickAction::SkippedActiveUnavailable.decision_class(),
+            DecisionClass::SkipActiveUnavailable
+        );
+        assert_eq!(
+            TickAction::SkippedCooldown.decision_class(),
+            DecisionClass::SkipCooldown
+        );
+        assert_eq!(
+            TickAction::SwapFailed.decision_class(),
+            DecisionClass::SwapFailed
+        );
+        assert_eq!(
+            TickAction::KeychainLocked.decision_class(),
+            DecisionClass::KeychainLocked
         );
     }
 
@@ -4525,6 +4783,7 @@ mod tests {
         let outcome = |action| TickOutcome {
             action,
             events: Vec::new(),
+            diagnostics: Vec::new(),
             snapshot: snapshot.clone(),
             next_wait: None,
         };
@@ -4649,7 +4908,8 @@ mod tests {
         let mut shutdown = FakeShutdown::after(4);
         let control = NoControl;
 
-        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
             .await
             .unwrap();
 
@@ -4687,7 +4947,8 @@ mod tests {
         let mut shutdown = FakeShutdown::after(1);
         let control = NoControl;
 
-        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
             .await
             .unwrap();
 
@@ -4743,7 +5004,8 @@ mod tests {
         let mut shutdown = FakeShutdown::after(3);
         let control = OnceManualSwap::new();
 
-        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
             .await
             .unwrap();
 
@@ -4794,7 +5056,8 @@ mod tests {
         let mut shutdown = FakeShutdown::after(2);
         let control = NoControl;
 
-        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
             .await
             .unwrap();
 
@@ -4983,7 +5246,8 @@ mod tests {
         let mut shutdown = FakeShutdown::after(3);
         let control = NoControl;
 
-        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
             .await
             .unwrap();
 
@@ -5075,7 +5339,8 @@ mod tests {
         let mut shutdown = FakeShutdown::after(2);
         let control = NoControl;
 
-        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
             .await
             .unwrap();
 
@@ -5717,16 +5982,24 @@ mod tests {
     }
 
     /// Append every operator-facing channel of one tick's outcome to `corpus`,
-    /// sourced from the EXACT canonical surfaces production uses: the single log
-    /// surface ([`Event::to_log_line`]), the UDS wire ([`status_response`] +
-    /// [`control_reply`]), the `status` text ([`crate::cli::render_status`]), and
-    /// the foreground swap echo ([`swap_report`]).
+    /// sourced from the EXACT canonical surfaces production uses: the single event-log
+    /// surface ([`Event::to_log_line`]), the single diagnostic surface
+    /// ([`Diagnostic::to_log_line`], issue #77), the UDS wire ([`status_response`] +
+    /// [`control_reply`]), the `status` text ([`crate::cli::render_status`]), and the
+    /// foreground swap echo ([`swap_report`]).
     fn harvest_channels(outcome: &TickOutcome, corpus: &mut String) {
         // A fixed wall-clock stamp keeps the log lines deterministic; the value is
         // a non-secret timestamp regardless.
         let ts = std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600);
         for event in &outcome.events {
             corpus.push_str(&event.to_log_line(ts));
+            corpus.push('\n');
+        }
+        // The diagnostic channel (issue #77) — the per-poll lines carry an account
+        // HANDLE, so they must clear the same #15 bar as the event log. Harvested
+        // through the SAME `to_log_line` surface production renders to stderr.
+        for diagnostic in &outcome.diagnostics {
+            corpus.push_str(&diagnostic.to_log_line(ts));
             corpus.push('\n');
         }
         let response = status_response(&outcome.snapshot);
@@ -5943,6 +6216,24 @@ mod tests {
             .collect();
         corpus.push_str(&crate::cli::render_roster(&roster));
 
+        // Channel — the diagnostic lifecycle Start summary (issue #77). The per-poll /
+        // per-tick diagnostic lines are harvested per-cycle by `harvest_channels`
+        // above; Start is emitted only at process start (by `cli::run`), so plant a
+        // representative one here. It carries counts/percentages only — no handle.
+        corpus.push_str(
+            &Diagnostic::Start {
+                accounts: 3,
+                poll_secs: 30,
+                session_floor: Some(70),
+                session_trigger: 90,
+                weekly_trigger: 98,
+                monitor_401_n: 5,
+                monitor_recovery_m: 4,
+            }
+            .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
+        );
+        corpus.push('\n');
+
         // Channel — the UDS error replies (malformed request / unknown command) and
         // the `manual-swapped` ack / unauthorized replies (#64), all secret-free.
         corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
@@ -6044,6 +6335,21 @@ mod tests {
         assert!(
             corpus.contains("daemon not running"),
             "error channel missing"
+        );
+        // Diagnostic channel (issue #77): the per-poll handle line, the per-tick
+        // decision line, and the lifecycle Start summary each contributed — so the
+        // clean verdict below is non-vacuous for the new channel too.
+        assert!(
+            corpus.contains("diag=poll account=work"),
+            "diagnostic channel: per-poll outcome missing"
+        );
+        assert!(
+            corpus.contains("diag=tick decision="),
+            "diagnostic channel: per-tick decision missing"
+        );
+        assert!(
+            corpus.contains("diag=start accounts=3"),
+            "diagnostic channel: lifecycle start summary missing"
         );
         assert!(
             corpus.len() > 800,

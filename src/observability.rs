@@ -27,6 +27,20 @@
 //! an *empty* label but not whitespace, so a label containing a space or `=` would
 //! split the `key=val` grammar. Enforcing the handle charset is the meter's job
 //! (#15); this module localizes the surface but does not police it.
+//!
+//! ## The diagnostic channel (issue #77)
+//!
+//! Separate from the event log above, the OPERATOR-FACING diagnostic channel
+//! answers "what is `run` doing right now" — per-poll outcomes, the per-tick
+//! decision, and lifecycle markers — for an operator debugging the daemon. Where
+//! the event log records durable STATE CHANGES (edge-triggered, levelless), the
+//! diagnostic channel is per-cycle DETAIL behind a verbosity gate ([`Verbosity`]):
+//! default [`Verbosity::Quiet`] emits nothing, `-v`/`--verbose` opts in. It rides
+//! its own single redaction surface — [`Diagnostic::to_log_line`], the sibling of
+//! [`Event::to_log_line`] — under the SAME field discipline (every field a handle /
+//! enum / number / timestamp, never a token or email), so the #15 METER scans
+//! rendered diagnostics alongside events and the channel inherits the redaction
+//! guarantee without weakening it.
 
 use std::fs::File;
 use std::io::Write;
@@ -333,6 +347,233 @@ pub(crate) fn last_swap_at(path: &std::path::Path) -> Option<SystemTime> {
     // The log only ever writes post-epoch instants; guard the cast so a malformed
     // pre-epoch stamp degrades to `None` rather than wrapping into a wrong instant.
     (epoch >= 0).then(|| UNIX_EPOCH + Duration::from_secs(epoch as u64))
+}
+
+/// Operator-facing diagnostic verbosity (issue #77) for the `run` daemon. Default
+/// [`Quiet`](Self::Quiet) — no console spam without opt-in; `-v`/`--verbose` selects
+/// [`Verbose`](Self::Verbose). The gate is applied by [`DiagnosticLog::emit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verbosity {
+    /// Default: drop every diagnostic line (the diagnostic channel is silent).
+    Quiet,
+    /// Emit per-poll, per-tick, and lifecycle diagnostics to the channel sink.
+    Verbose,
+}
+
+/// The per-poll outcome class on the DIAGNOSTIC channel (issue #77) — the operator
+/// taxonomy that SEPARATES a rate-limit (`429`) from a generic transient (`5xx` /
+/// network / unreadable), unlike the daemon's poll classification
+/// ([`crate::daemon`]'s health-machine `PollOutcome`), which folds both into one
+/// transient class. The two views are deliberately different: a rate-limit storm and
+/// a flaky network read are the same to the back-off, but an operator staring at the
+/// channel needs to tell "I am being throttled" apart from "the endpoint is flaky".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollClass {
+    /// A successful usage reading — the credential is alive.
+    Live,
+    /// HTTP 401 — the stored token was rejected.
+    Unauthorized,
+    /// HTTP 403 — authenticated but lacking the usage scope (issue #5).
+    Scope,
+    /// HTTP 429 — rate-limited; the daemon backs off (issue #76).
+    RateLimited,
+    /// Any other failure (`5xx` / network / unreadable token / unparseable body) —
+    /// a generic transient carrying no liveness signal.
+    Transient,
+}
+
+impl PollClass {
+    /// The `outcome=` token.
+    fn as_str(self) -> &'static str {
+        match self {
+            PollClass::Live => "live",
+            PollClass::Unauthorized => "unauthorized",
+            PollClass::Scope => "scope",
+            PollClass::RateLimited => "rate_limited",
+            PollClass::Transient => "transient",
+        }
+    }
+}
+
+/// The per-tick DECISION class on the diagnostic channel (issue #77) — the operator
+/// rendering of the daemon's per-cycle verdict, one token per
+/// [`crate::daemon::TickAction`]. The swap PARTICIPANTS (the from/to handles) are
+/// deliberately NOT carried here: they already ride the event log's `swap` line and
+/// the foreground swap echo, so the diagnostic decision line stays a pure label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionClass {
+    /// Active is below the swap-away trigger — stay put.
+    Hold,
+    /// Swapped the active credential to a viable target.
+    Swap,
+    /// Emergency-swapped away from a dead active account (issue #42).
+    EmergencySwap,
+    /// Over the trigger but no viable target — the all-exhausted hold (issue #11).
+    AllExhausted,
+    /// The active credential is dead and no target is viable — held, unable to
+    /// escape (issue #42).
+    ActiveDeadNoTarget,
+    /// The active account could not be identified — poll-only.
+    SkipActiveUnknown,
+    /// The active account's reading was unavailable this cycle — never swap on
+    /// missing data.
+    SkipActiveUnavailable,
+    /// Over the trigger but within the post-swap cooldown (issue #10).
+    SkipCooldown,
+    /// A swap was attempted but the engine returned an error (#6 no-half-swap).
+    SwapFailed,
+    /// The keychain was locked — the whole tick was deferred (issue #13).
+    KeychainLocked,
+}
+
+impl DecisionClass {
+    /// The `decision=` token.
+    fn as_str(self) -> &'static str {
+        match self {
+            DecisionClass::Hold => "hold",
+            DecisionClass::Swap => "swap",
+            DecisionClass::EmergencySwap => "emergency_swap",
+            DecisionClass::AllExhausted => "all_exhausted",
+            DecisionClass::ActiveDeadNoTarget => "active_dead_no_target",
+            DecisionClass::SkipActiveUnknown => "skip_active_unknown",
+            DecisionClass::SkipActiveUnavailable => "skip_active_unavailable",
+            DecisionClass::SkipCooldown => "skip_cooldown",
+            DecisionClass::SwapFailed => "swap_failed",
+            DecisionClass::KeychainLocked => "keychain_locked",
+        }
+    }
+}
+
+/// One operator-facing diagnostic line (issue #77), rendered by the single
+/// [`Diagnostic::to_log_line`] formatter — the diagnostic channel's redaction
+/// surface, the sibling of [`Event::to_log_line`].
+///
+/// Every field is a HANDLE (an operator label), an enum, a number, or a timestamp —
+/// never a token or email (issue #15). That type-level constraint is what lets this
+/// channel reuse the event log's redaction guarantee without weakening it: the #15
+/// METER scans rendered diagnostics alongside events, and there is no field through
+/// which a secret could reach the line.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Diagnostic {
+    /// The daemon started: the effective config summary, so one run's lines can be
+    /// read against the configuration that produced them. `accounts` is the roster
+    /// size; the rest are the swap/poll tunables — counts and percentages only, no
+    /// handle.
+    Start {
+        accounts: usize,
+        poll_secs: u64,
+        session_floor: Option<u8>,
+        session_trigger: u8,
+        weekly_trigger: u8,
+        monitor_401_n: u8,
+        monitor_recovery_m: u8,
+    },
+    /// The daemon is stopping on a clean shutdown (SIGINT / SIGTERM).
+    Stop,
+    /// One account's poll outcome this tick: its handle and the outcome class.
+    Poll { account: String, outcome: PollClass },
+    /// The per-tick decision, plus the back-off wait this tick imposed when any —
+    /// the locked-keychain back-off (issue #13) or the rate-limit / transient
+    /// back-off (issue #76). `None` ⇒ the field is omitted and the next poll uses
+    /// the normal jittered interval.
+    Tick {
+        decision: DecisionClass,
+        backoff_secs: Option<u64>,
+    },
+    /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap
+    /// target is possible again. The edge-triggered LEAVE marker — the symmetric
+    /// partner of the event log's edge-triggered `all_exhausted` ENTER — so a stale
+    /// "all exhausted" reading from an earlier episode can be told from a current
+    /// one (the very confusion that motivated #77).
+    AllExhaustedCleared,
+}
+
+impl Diagnostic {
+    /// Render this diagnostic as its single line (no trailing newline), stamped with
+    /// `ts`. Pure and the *only* place a diagnostic becomes text, so — exactly like
+    /// [`Event::to_log_line`] — the redaction surface is this method alone. `ts` is a
+    /// parameter (not read here) so the formatting is deterministically unit-testable;
+    /// [`DiagnosticLog::emit`] supplies `SystemTime::now()` at write time.
+    pub(crate) fn to_log_line(&self, ts: SystemTime) -> String {
+        let ts = rfc3339(ts);
+        match self {
+            Diagnostic::Start {
+                accounts,
+                poll_secs,
+                session_floor,
+                session_trigger,
+                weekly_trigger,
+                monitor_401_n,
+                monitor_recovery_m,
+            } => {
+                // session_floor is opt-in (#10): render the disabled state as an
+                // explicit `off` sentinel rather than omitting the key, so the
+                // summary always STATES whether the swap-target session guard is on.
+                let session_floor = match session_floor {
+                    Some(floor) => floor.to_string(),
+                    None => "off".to_owned(),
+                };
+                format!(
+                    "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
+                     session_floor={session_floor} session_trigger={session_trigger} \
+                     weekly_trigger={weekly_trigger} monitor_401_n={monitor_401_n} \
+                     monitor_recovery_m={monitor_recovery_m}"
+                )
+            }
+            Diagnostic::Stop => format!("ts={ts} diag=stop"),
+            Diagnostic::Poll { account, outcome } => {
+                let outcome = outcome.as_str();
+                format!("ts={ts} diag=poll account={account} outcome={outcome}")
+            }
+            Diagnostic::Tick {
+                decision,
+                backoff_secs,
+            } => {
+                let decision = decision.as_str();
+                // Omit `backoff_secs` when there is none — an empty value after `=`
+                // would split the `key=val` grammar (mirrors `all_exhausted`'s
+                // optional `resets_at`).
+                match backoff_secs {
+                    Some(secs) => {
+                        format!("ts={ts} diag=tick decision={decision} backoff_secs={secs}")
+                    }
+                    None => format!("ts={ts} diag=tick decision={decision}"),
+                }
+            }
+            Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
+        }
+    }
+}
+
+/// The operator-facing diagnostic SINK (issue #77): writes each [`Diagnostic`] as one
+/// line when [`Verbosity::Verbose`], and DROPS every line when [`Verbosity::Quiet`]
+/// (the default — no console spam without opt-in). Generic over its `Write` sink:
+/// production wires `std::io::stderr()` — the foreground daemon's operator channel,
+/// where the lifecycle line and swap echo already go — while tests wire a `Vec<u8>`
+/// and read the buffer back.
+pub(crate) struct DiagnosticLog<W> {
+    sink: W,
+    verbosity: Verbosity,
+}
+
+impl<W: Write> DiagnosticLog<W> {
+    /// Wrap `sink`, emitting only when `verbosity` is [`Verbosity::Verbose`].
+    pub(crate) fn new(sink: W, verbosity: Verbosity) -> Self {
+        Self { sink, verbosity }
+    }
+
+    /// Emit `diag` as one stamped line — unless [`Verbosity::Quiet`], when it is
+    /// dropped before any work. Best-effort like the event log: a diagnostic write
+    /// failure must never kill the daemon, so a write error is ignored (the
+    /// diagnostic channel is a debugging aid, not a durable guarantee).
+    pub(crate) fn emit(&mut self, diag: &Diagnostic) {
+        if self.verbosity == Verbosity::Quiet {
+            return;
+        }
+        let mut line = diag.to_log_line(SystemTime::now());
+        line.push('\n');
+        let _ = self.sink.write_all(line.as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -672,5 +913,204 @@ ts=1970-01-01T00:00:40Z event=monitor_401 account=c consecutive=1\n";
         )
         .unwrap();
         assert_eq!(last_swap_at(&path), Some(at_epoch(60)));
+    }
+
+    // --- Diagnostic::to_log_line (the diagnostic channel's redaction surface, #77) ---
+
+    #[test]
+    fn start_line_renders_the_effective_config_summary() {
+        // session_floor present → its percent; the rest are counts/percentages.
+        let on = Diagnostic::Start {
+            accounts: 3,
+            poll_secs: 30,
+            session_floor: Some(70),
+            session_trigger: 90,
+            weekly_trigger: 98,
+            monitor_401_n: 5,
+            monitor_recovery_m: 4,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            on,
+            format!(
+                "{TS0} diag=start accounts=3 poll_secs=30 session_floor=70 \
+                 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4"
+            )
+        );
+
+        // session_floor absent → the explicit `off` sentinel (the guard is disabled,
+        // #10), never an empty value that would split the key=val grammar.
+        let off = Diagnostic::Start {
+            accounts: 1,
+            poll_secs: 60,
+            session_floor: None,
+            session_trigger: 80,
+            weekly_trigger: 95,
+            monitor_401_n: 3,
+            monitor_recovery_m: 2,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(off.contains("session_floor=off"), "got: {off}");
+    }
+
+    #[test]
+    fn stop_line_is_bare() {
+        assert_eq!(
+            Diagnostic::Stop.to_log_line(at_epoch(0)),
+            format!("{TS0} diag=stop")
+        );
+    }
+
+    #[test]
+    fn poll_line_carries_the_handle_and_each_outcome_class() {
+        // The 5-way diagnostic taxonomy — rate_limited is SEPARATE from transient.
+        for (outcome, token) in [
+            (PollClass::Live, "live"),
+            (PollClass::Unauthorized, "unauthorized"),
+            (PollClass::Scope, "scope"),
+            (PollClass::RateLimited, "rate_limited"),
+            (PollClass::Transient, "transient"),
+        ] {
+            let line = Diagnostic::Poll {
+                account: "work".to_owned(),
+                outcome,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!("{TS0} diag=poll account=work outcome={token}")
+            );
+        }
+    }
+
+    #[test]
+    fn tick_line_renders_the_decision_and_omits_backoff_when_absent() {
+        // No back-off → the field is simply absent (the line stays well-formed).
+        let held = Diagnostic::Tick {
+            decision: DecisionClass::Hold,
+            backoff_secs: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(held, format!("{TS0} diag=tick decision=hold"));
+        assert!(!held.contains("backoff_secs"), "got: {held}");
+
+        // A back-off (#13 / #76) → the wait in whole seconds.
+        let backed_off = Diagnostic::Tick {
+            decision: DecisionClass::KeychainLocked,
+            backoff_secs: Some(8),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            backed_off,
+            format!("{TS0} diag=tick decision=keychain_locked backoff_secs=8")
+        );
+    }
+
+    #[test]
+    fn every_decision_class_renders_its_token() {
+        // One token per TickAction (the map is exhaustive, #77).
+        for (decision, token) in [
+            (DecisionClass::Hold, "hold"),
+            (DecisionClass::Swap, "swap"),
+            (DecisionClass::EmergencySwap, "emergency_swap"),
+            (DecisionClass::AllExhausted, "all_exhausted"),
+            (DecisionClass::ActiveDeadNoTarget, "active_dead_no_target"),
+            (DecisionClass::SkipActiveUnknown, "skip_active_unknown"),
+            (
+                DecisionClass::SkipActiveUnavailable,
+                "skip_active_unavailable",
+            ),
+            (DecisionClass::SkipCooldown, "skip_cooldown"),
+            (DecisionClass::SwapFailed, "swap_failed"),
+            (DecisionClass::KeychainLocked, "keychain_locked"),
+        ] {
+            let line = Diagnostic::Tick {
+                decision,
+                backoff_secs: None,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(line, format!("{TS0} diag=tick decision={token}"));
+        }
+    }
+
+    #[test]
+    fn all_exhausted_cleared_line_is_bare() {
+        assert_eq!(
+            Diagnostic::AllExhaustedCleared.to_log_line(at_epoch(0)),
+            format!("{TS0} diag=all_exhausted_cleared")
+        );
+    }
+
+    #[test]
+    fn no_diagnostic_line_carries_an_email_or_token_sigil() {
+        // #15: every diagnostic field is a handle / enum / number / timestamp, so a
+        // token or email can never reach a rendered line. Mirrors the event-log guard.
+        let diags = [
+            Diagnostic::Start {
+                accounts: 2,
+                poll_secs: 30,
+                session_floor: Some(70),
+                session_trigger: 90,
+                weekly_trigger: 98,
+                monitor_401_n: 5,
+                monitor_recovery_m: 4,
+            },
+            Diagnostic::Stop,
+            Diagnostic::Poll {
+                account: "work".to_owned(),
+                outcome: PollClass::RateLimited,
+            },
+            Diagnostic::Tick {
+                decision: DecisionClass::Swap,
+                backoff_secs: Some(16),
+            },
+            Diagnostic::AllExhaustedCleared,
+        ];
+        for diag in &diags {
+            let line = diag.to_log_line(at_epoch(0));
+            assert!(!line.contains('@'), "no email sigil: {line}");
+            assert!(!line.to_lowercase().contains("token"), "no token: {line}");
+            assert_eq!(line.lines().count(), 1, "single line: {line}");
+        }
+    }
+
+    // --- DiagnosticLog (the verbosity-gated sink, #77) ----------------------
+
+    #[test]
+    fn diagnostic_log_is_silent_when_quiet() {
+        // Default QUIET → nothing reaches the sink (no console spam without opt-in).
+        let mut log = DiagnosticLog::new(Vec::<u8>::new(), Verbosity::Quiet);
+        log.emit(&Diagnostic::Stop);
+        log.emit(&Diagnostic::Poll {
+            account: "work".to_owned(),
+            outcome: PollClass::Live,
+        });
+        assert!(
+            log.sink.is_empty(),
+            "quiet must emit nothing: {:?}",
+            log.sink
+        );
+    }
+
+    #[test]
+    fn diagnostic_log_emits_one_line_per_diagnostic_when_verbose() {
+        let mut log = DiagnosticLog::new(Vec::<u8>::new(), Verbosity::Verbose);
+        log.emit(&Diagnostic::Poll {
+            account: "work".to_owned(),
+            outcome: PollClass::RateLimited,
+        });
+        log.emit(&Diagnostic::Tick {
+            decision: DecisionClass::Hold,
+            backoff_secs: None,
+        });
+        let out = String::from_utf8(log.sink).unwrap();
+        assert_eq!(out.lines().count(), 2, "one line per emit: {out:?}");
+        assert!(out.contains("diag=poll account=work outcome=rate_limited"));
+        assert!(out.contains("diag=tick decision=hold"));
+        // Each line is stamped and newline-terminated.
+        assert!(out.ends_with('\n'));
+        for line in out.lines() {
+            assert!(line.starts_with("ts="), "stamped: {line:?}");
+        }
     }
 }

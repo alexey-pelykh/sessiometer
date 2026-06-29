@@ -19,7 +19,7 @@ use crate::daemon::{
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
-use crate::observability::EventLog;
+use crate::observability::{Diagnostic, DiagnosticLog, EventLog, Verbosity};
 use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash};
 
@@ -40,7 +40,21 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     let label = args.next().map(|s| s.to_string_lossy().into_owned());
                     crate::capture::capture(label).await
                 }
-                "run" => run().await,
+                // `run [-v|--verbose]` — verbosity opts into the operator-facing
+                // diagnostic channel (issue #77); position-independent, mirroring
+                // `status --json`.
+                "run" => {
+                    let verbose = args.any(|arg| {
+                        let arg = arg.to_string_lossy();
+                        arg == "-v" || arg == "--verbose"
+                    });
+                    let verbosity = if verbose {
+                        Verbosity::Verbose
+                    } else {
+                        Verbosity::Quiet
+                    };
+                    run(verbosity).await
+                }
                 // `status [--json] [--no-color]` — `--json` dumps the full
                 // response verbatim, the full-data contract regardless of terminal
                 // width (issue #72); `--no-color` forces the urgency overlay off
@@ -116,7 +130,7 @@ fn print_usage() {
          \n\
          COMMANDS:\n    \
          capture [<label>]    Stash the active account into the rotation\n    \
-         run        Run the foreground daemon (poll + swap)\n    \
+         run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)\n    \
          status [--json] [--no-color]  Show each account's usage + resets-in, and the last swap\n    \
          list       List captured accounts\n    \
          use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
@@ -134,7 +148,13 @@ fn print_usage() {
 /// until SIGINT / SIGTERM. Lifecycle order is load-bearing: take the
 /// single-instance lock FIRST (a second `run` exits `3` without disturbing the
 /// first), then bind the control socket, then run.
-async fn run() -> Result<()> {
+///
+/// `verbosity` (issue #77) gates the operator-facing diagnostic channel: this
+/// function owns the process lifecycle, so it brackets the loop with the
+/// `diag=start` / `diag=stop` markers, and the per-tick diagnostics are emitted
+/// inside [`run_loop`]. Default [`Verbosity::Quiet`] keeps `run` silent on that
+/// channel; `-v`/`--verbose` opts in.
+async fn run(verbosity: Verbosity) -> Result<()> {
     // The native-local support dir holds both the lock and the socket; ensure it
     // (0700) before either touches it.
     paths::ensure_private_dir(&paths::support_dir()?)?;
@@ -185,7 +205,30 @@ async fn run() -> Result<()> {
          Ctrl-C or SIGTERM to stop",
         config.tunables.poll_secs,
     );
-    let result = run_loop(&mut daemon, &mut log, &mut shutdown, &control).await;
+
+    // The operator-facing diagnostic channel (issue #77): stderr, gated by the
+    // verbosity selected from `-v`/`--verbose` (default quiet — no console spam).
+    // The lifecycle markers bracket the loop HERE because `cli` owns the process
+    // lifecycle: a clean shutdown through EITHER of `run_loop`'s exit paths (the
+    // startup-delay or the idle loop) returns `Ok`, so a single `diag=stop` after it
+    // covers both. The per-tick diagnostics are emitted inside `run_loop`. The Start
+    // summary is the effective config, so one run's lines read against it.
+    let mut diag = DiagnosticLog::new(std::io::stderr(), verbosity);
+    diag.emit(&Diagnostic::Start {
+        accounts: config.roster.len(),
+        poll_secs: config.tunables.poll_secs,
+        session_floor: config.tunables.session_floor,
+        session_trigger: config.tunables.session_trigger,
+        weekly_trigger: config.tunables.weekly_trigger,
+        monitor_401_n: config.tunables.monitor_401_n,
+        monitor_recovery_m: config.tunables.monitor_recovery_m,
+    });
+    let result = run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control).await;
+    // A clean shutdown (`Ok`) → the lifecycle stop marker. An error exit is NOT a
+    // clean stop (it surfaces via `main`'s error print), so it emits none.
+    if result.is_ok() {
+        diag.emit(&Diagnostic::Stop);
+    }
 
     // Best-effort cleanup: remove our socket on the way out (the lock releases
     // when `_lock` drops at the end of this scope).
