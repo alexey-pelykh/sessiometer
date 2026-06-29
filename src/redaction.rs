@@ -470,14 +470,14 @@ pub(crate) mod meter {
         // --- the meter, end to end (a clean corpus vs each planted leak) --------
 
         /// A representative CLEAN corpus: handles, percentages, an event line, a
-        /// UUID/stash fragment, a timestamp — every shape the real channels emit,
-        /// none of them secret.
+        /// full UUID, a timestamp — every shape the real channels emit, none of
+        /// them secret.
         const CLEAN: &str = "ts=2026-06-30T00:00:00Z event=swap from=work to=spare \
              reason=session session_pct=97\n\
              {\"accounts\":[{\"label\":\"work\",\"active\":true,\"session_pct\":97,\"weekly_pct\":40}],\
              \"last_swap\":{\"to\":\"spare\",\"secs_ago\":0}}\n\
              * work · session 97% · weekly 40%\n  spare · session 10% · weekly 20%\n\
-             work · 11111111 · Sessiometer/11111111-1111-1111-1111-111111111111\n\
+             work  11111111-1111-1111-1111-111111111111\n\
              no Claude Code credential found in the keychain (capture an account first)\n";
 
         #[test]

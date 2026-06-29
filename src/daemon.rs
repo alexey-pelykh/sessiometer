@@ -5435,7 +5435,7 @@ mod tests {
             harvest_channels(&outcome, &mut corpus);
         }
 
-        // Channel — the offline `list` roster view (label · uuid · stash).
+        // Channel — the offline `list` roster view (label, full uuid).
         let roster: Vec<Account> = [A, B, C]
             .iter()
             .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
@@ -5531,7 +5531,10 @@ mod tests {
             "foreground channel: swap report missing"
         );
         assert!(
-            corpus.contains("Sessiometer/11111111"),
+            // The `list` view now shows the FULL account_uuid (issue #69), dropping
+            // the former `Sessiometer/<uuid>` keychain-name column; this full uuid
+            // is emitted by no other channel, so it proves the roster view ran.
+            corpus.contains("11111111-1111-1111-1111-111111111111"),
             "list channel: roster view missing"
         );
         assert!(
