@@ -325,34 +325,39 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
     serde_json::from_str(line.trim_end()).map_err(|err| Error::Io(std::io::Error::other(err)))
 }
 
-/// Render a [`StatusResponse`] as the text `status` prints: an aligned column
-/// table (issue #72), one record per line, then the next-swap footer (#88). Pure (no
-/// clock, no I/O) so the response→text mapping is unit-testable — the caller
-/// passes `now` (epoch seconds) so each account's "resets in" and urgency are
-/// deterministic, `cols` (the terminal width, or `None` when stdout is not a TTY)
-/// so the narrow-terminal column degradation is testable, and `color` (whether
-/// the color gate is open; [`should_colorize`]) so the ANSI overlay is too.
+/// Render a [`StatusResponse`] as the text `status` prints: an aligned,
+/// header-less table (issue #94), one record per line, then the next-swap footer
+/// (#88). Pure (no clock, no I/O) so the response→text mapping is unit-testable —
+/// the caller passes `now` (epoch seconds) so each account's "resets in" and
+/// urgency are deterministic, `cols` (the terminal width, or `None` when stdout is
+/// not a TTY) so the narrow-terminal column degradation is testable, and `color`
+/// (whether the color gate is open; [`should_colorize`]) so the ANSI overlay is too.
 ///
-/// Columns, in display order: `ACCOUNT` `SESSION` `WEEKLY` `RESETS` `STATUS`
-/// (`STATUS` is omitted when no account carries a tag). When the full table is
-/// wider than `cols`, the lowest-priority columns drop in order — `WEEKLY` first,
-/// then `STATUS` — never wrapping a row; `ACCOUNT` + `SESSION` + `RESETS` are
-/// always kept. A `None` width (piped / redirected) keeps the full table, so
+/// Columns, in display order: `account` then the SESSION pair (`session% `
+/// `session-reset`), then the WEEKLY pair (`weekly% ` `weekly-reset`), then the
+/// health-text tags (issue #94). There is NO header row: each `%` sits immediately
+/// before its OWN reset, so the pairing is disambiguated by adjacency, not a label.
+/// A reset's lead gap is a single space (tying it to its `%`); independent columns
+/// are two spaces apart. When the full table is wider than `cols`, the lowest-priority
+/// columns drop — the WEEKLY pair (`weekly%` + `weekly-reset`) FIRST and ATOMICALLY
+/// (never a `%` stranded without its reset), then the health-text column — never
+/// wrapping a row; `account` + the SESSION pair (the soonest, most actionable reset)
+/// are always kept. A `None` width (piped / redirected) keeps the full table, so
 /// `status | grep` and `status > file` stay the complete, greppable surface.
 ///
 /// When `color` is set each CELL is tinted by its OWN health (issue #84), so one
-/// glance reads four independent signals per account: `ACCOUNT` by the overall
-/// urgency ([`severity`]), `SESSION` / `WEEKLY` by each window's own band
-/// ([`util_severity`] / [`weekly_cell_severity`]), and `RESETS` by its relief signal
-/// ([`reset_severity`]) — a 95% / 40% account can show a red `SESSION` beside a
-/// green `WEEKLY`. (`STATUS` stays untinted: its tags are their own signal.) This
-/// supersedes the issue-#73 row-wide tint. The color AUGMENTS — it wraps the
-/// already-padded text, so a no-color reader still sees every state and percentage;
-/// it is never the only signal. Padding is computed on DISPLAY WIDTH from the raw
-/// cell and applied BEFORE the color (pad-before-color), so per-cell colored and
+/// glance reads several independent signals per account: `account` by the overall
+/// urgency ([`severity`]), each `%` by its window's own utilization band
+/// ([`util_severity`] / [`weekly_cell_severity`]), and each reset by its OWN
+/// PROXIMITY ([`proximity_severity`], issue #94) — a far weekly reset can read green
+/// while an imminent session reset on the same row reads red. (The health-text tags
+/// stay untinted: they are their own signal.) The color AUGMENTS — it wraps the
+/// already-padded text, so a no-color reader still sees every state, percentage, and
+/// reset; it is never the only signal. Padding is computed on DISPLAY WIDTH from the
+/// raw cell and applied BEFORE the color (pad-before-color), so per-cell colored and
 /// multibyte rows stay aligned and the escape bytes never enter the column-width
-/// math. The header, the untinted `STATUS` column, and any cell with no reading
-/// (nothing to classify — `n/a` is not a false "healthy") stay uncolored.
+/// math. The untinted health-text column, and any cell with no reading (nothing to
+/// classify — `n/a` is not a false "healthy") stay uncolored.
 ///
 /// Sourced solely from the response's non-secret fields — labels, percentages,
 /// reset instants, a next-swap candidate label — so it can never print a token or email (issue #15);
@@ -372,53 +377,77 @@ pub(crate) fn render_status(
         .map(|account| StatusRow::new(account, now))
         .collect();
 
-    // Display order, each tagged with a drop priority (`None` = always keep; lower
-    // number drops first). `STATUS` is included only when some account carries a
-    // tag — an all-healthy roster shows no empty `STATUS` column.
+    // Display order (issue #94): `account`, then the SESSION pair (% + its reset),
+    // then the WEEKLY pair, then the health-text tags. Each column carries a lead
+    // gap (the spaces BEFORE it): `0` for the first column, `1` to tie a reset
+    // tightly to the `%` it pairs with, `2` between independent columns — so each
+    // `%` reads immediately followed by its own reset without a header. A drop
+    // priority of `None` always keeps the column; the WEEKLY pair shares priority 1
+    // so both leave atomically (never a `%` without its reset); the health-text
+    // column is priority 2 (drops next). The health-text column is included only
+    // when some account carries a tag — an all-healthy roster shows none.
     let mut columns: Vec<Column> = vec![
-        Column::keep("ACCOUNT", |row| &row.account, |row| row.account_severity),
-        Column::keep("SESSION", |row| &row.session, |row| row.session_severity),
-        Column::droppable("WEEKLY", 1, |row| &row.weekly, |row| row.weekly_severity),
-        Column::keep("RESETS", |row| &row.resets, |row| row.resets_severity),
+        Column::keep(|row| &row.account, |row| row.account_severity, 0),
+        Column::keep(
+            |row| &row.session,
+            |row| row.session_severity,
+            STATUS_COL_GAP,
+        ),
+        Column::keep(
+            |row| &row.session_reset,
+            |row| row.session_reset_severity,
+            STATUS_PAIR_GAP,
+        ),
+        Column::droppable(
+            1,
+            |row| &row.weekly,
+            |row| row.weekly_severity,
+            STATUS_COL_GAP,
+        ),
+        Column::droppable(
+            1,
+            |row| &row.weekly_reset,
+            |row| row.weekly_reset_severity,
+            STATUS_PAIR_GAP,
+        ),
     ];
     if rows.iter().any(|row| !row.status.is_empty()) {
-        // STATUS carries its own textual tags (`disabled`, `needs re-login`); it is
-        // never tinted (issue #84) — the tags are their own signal, so its severity
-        // getter is always `None`.
-        columns.push(Column::droppable("STATUS", 2, |row| &row.status, |_| None));
+        // The health-text column carries its own tags (`disabled`, `needs re-login`);
+        // it is never tinted (issue #84) — the tags are their own signal, so its
+        // severity getter is always `None`.
+        columns.push(Column::droppable(
+            2,
+            |row| &row.status,
+            |_| None,
+            STATUS_COL_GAP,
+        ));
     }
 
-    // Drop the lowest-priority droppable column until the table fits `cols`. A
-    // non-TTY width (`None`) never enters the loop — the full table is preserved.
+    // Drop the lowest-priority droppable columns until the table fits `cols`. ALL
+    // columns sharing the lowest present priority drop together, so the WEEKLY pair
+    // (both priority 1) leaves atomically — never a weekly `%` stranded without its
+    // reset. A non-TTY width (`None`) never enters the loop — the full table is kept.
     while let Some(width) = cols {
         if table_width(&columns, &rows) <= width {
             break;
         }
-        match columns
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, col)| col.drop_priority.map(|prio| (prio, idx)))
-            .min()
-        {
-            Some((_, idx)) => {
-                columns.remove(idx);
-            }
-            // Only keep-columns remain: never wrap, just let the essential three
+        match columns.iter().filter_map(|col| col.drop_priority).min() {
+            Some(min_priority) => columns.retain(|col| col.drop_priority != Some(min_priority)),
+            // Only keep-columns remain: never wrap, just let the essential columns
             // overflow a very narrow terminal (predictable, one record per line).
             None => break,
         }
     }
 
     let widths = column_widths(&columns, &rows);
+    let lead_gaps: Vec<usize> = columns.iter().map(|col| col.lead_gap).collect();
     let mut out = String::new();
-    let headers: Vec<&str> = columns.iter().map(|col| col.header).collect();
-    // The header is never tinted — it labels columns, it is not an account.
-    let header_colors = vec![None; headers.len()];
-    out.push_str(&render_cells(&headers, &widths, &header_colors));
+    // No header row (issue #94): the layout is header-less, disambiguated by each
+    // `%` sitting immediately before its own reset.
     for row in &rows {
         let cells: Vec<&str> = columns.iter().map(|col| (col.get)(row)).collect();
         // Each cell is tinted by its OWN health when the gate is open (issue #84), so
-        // one row can show four independent colors; a cell with no reading, and the
+        // one row can show several independent colors; a cell with no reading, and the
         // whole no-color path, stay uncolored.
         let colors: Vec<Option<&str>> = columns
             .iter()
@@ -428,7 +457,7 @@ pub(crate) fn render_status(
                     .flatten()
             })
             .collect();
-        out.push_str(&render_cells(&cells, &widths, &colors));
+        out.push_str(&render_cells(&cells, &widths, &colors, &lead_gaps));
     }
 
     out.push('\n');
@@ -447,33 +476,45 @@ pub(crate) fn render_status(
     out
 }
 
-/// Gap between adjacent `status`-table columns (two spaces, matching `list`).
+/// Gap between adjacent independent `status`-table columns (two spaces, matching
+/// `list`).
 const STATUS_COL_GAP: usize = 2;
+/// Tighter gap that ties a reset to the `%` it pairs with (issue #94): one space, so
+/// `session% session-reset` reads as one pair and the header-less table stays
+/// disambiguated by adjacency.
+const STATUS_PAIR_GAP: usize = 1;
 
 /// One account projected to its `status`-table cells (issue #72). Pre-rendered
 /// strings so column widths can be measured uniformly across header + rows.
 struct StatusRow {
     /// `* label` (active) or `  label` — the marker folds into this column.
     account: String,
+    /// SESSION usage percent, or `n/a` when the last poll failed.
     session: String,
+    /// Compact time until the SESSION window resets, or `n/a` when that instant is
+    /// unknown (issue #94).
+    session_reset: String,
+    /// WEEKLY usage percent, or `n/a`.
     weekly: String,
-    /// Compact "resets in", or `n/a` when the governing reset is unknown.
-    resets: String,
+    /// Compact time until the WEEKLY window resets, or `n/a` (issue #94).
+    weekly_reset: String,
     /// Inline tags (`disabled`, `needs re-login`), comma-joined; empty when none.
     status: String,
     /// Per-cell urgency for the color overlay (issue #84): each cell carries its OWN
-    /// health, so one row can show four independent colors (a red `SESSION` beside a
-    /// green `WEEKLY`, etc.). Each is `None` when its cell has no reading — that cell
-    /// is then printed without color, since absence of color is not a false
-    /// "healthy" signal. `account` is the OVERALL (binding-window) [`severity`];
-    /// `session` the [`util_severity`] bands on `session_pct`; `weekly` the
-    /// [`weekly_cell_severity`] (bands plus the weekly-exhaustion override); `resets`
-    /// the [`reset_severity`] relief signal. `STATUS` is never tinted (its tags are
-    /// their own signal), so it has no field here.
+    /// health, so one row can show several independent colors (a red `session` reset
+    /// beside a green `weekly` reset, etc.). Each is `None` when its cell has no
+    /// reading — that cell is then printed without color, since absence of color is
+    /// not a false "healthy" signal. `account` is the OVERALL (binding-window)
+    /// [`severity`]; `session` / `weekly` the [`util_severity`] /
+    /// [`weekly_cell_severity`] utilization bands on each `%`; each reset its OWN
+    /// [`proximity_severity`] (issue #94) — how soon that window flips, independent
+    /// of utilization. The health-text column is never tinted (its tags are their own
+    /// signal), so it has no field here.
     account_severity: Option<Severity>,
     session_severity: Option<Severity>,
+    session_reset_severity: Option<Severity>,
     weekly_severity: Option<Severity>,
-    resets_severity: Option<Severity>,
+    weekly_reset_severity: Option<Severity>,
 }
 
 impl StatusRow {
@@ -497,17 +538,20 @@ impl StatusRow {
         StatusRow {
             account: format!("{marker} {}", account.label),
             session: pct(account.session_pct),
+            session_reset: reset_cell(account.session_resets_at, now),
             weekly: pct(account.weekly_pct),
-            resets: resets_in(account, now),
+            weekly_reset: reset_cell(account.weekly_resets_at, now),
             status,
-            // Each cell colored by its OWN health (issue #84): ACCOUNT → the overall
-            // binding-window severity; SESSION / WEEKLY → each window's own bands
-            // (WEEKLY honoring the weekly-exhaustion override); RESETS → the shown
-            // reset's relief signal. A cell with no reading stays `None` (uncolored).
+            // Each cell colored by its OWN health (issue #84): `account` → the overall
+            // binding-window severity; `session` / `weekly` `%` → each window's own
+            // utilization bands (weekly honoring the exhaustion override); each reset →
+            // its OWN proximity (issue #94), how soon that window flips. A cell with no
+            // reading stays `None` (uncolored).
             account_severity: severity(account, now),
             session_severity: account.session_pct.map(util_severity),
+            session_reset_severity: proximity_severity(account.session_resets_at, now),
             weekly_severity: weekly_cell_severity(account),
-            resets_severity: reset_severity(account, now),
+            weekly_reset_severity: proximity_severity(account.weekly_resets_at, now),
         }
     }
 }
@@ -579,7 +623,7 @@ fn util_severity(pct: u8) -> Severity {
 /// Utilization sets the base from the BINDING window. A weekly-EXHAUSTED account
 /// (the daemon's blocked-for-the-week verdict, `weekly >= weekly_trigger`, issue
 /// #11/#37) is bound by its weekly window whatever the raw percentages say — the
-/// SAME window [`resets_in`] shows — and is at least Red: a week-blocked account
+/// SAME window its WEEKLY reset cell shows — and is at least Red: a week-blocked account
 /// is never painted "healthy", even when the operator has lowered `weekly_trigger`
 /// (configurable down to 50) below the Red utilization cutoff. Otherwise the
 /// more-depleted of session / weekly is the constraint, and its percent governs:
@@ -645,128 +689,142 @@ fn weekly_cell_severity(account: &AccountStatusLine) -> Option<Severity> {
     })
 }
 
-/// The `RESETS` cell's own health (issue #84): proximity-as-relief for the reset the
-/// cell SHOWS. Mirrors [`resets_in`] — the WEEKLY reset governs when the account is
-/// weekly-exhausted, otherwise the rolling SESSION reset — so the color always
-/// describes the duration printed, and keying off the SAME instant `resets_in` uses
-/// guarantees a cell shown as `n/a` is never tinted. A depleted account
-/// (weekly-exhausted, or the shown window `>= RED_UTIL_PCT`) whose reset lands
-/// within `RESET_SOON_SECS` (or has already passed) is about to recover → Yellow
-/// ("relief soon"); depleted with a far reset → Red (stuck waiting); a healthy
-/// account → Green (the reset is no concern). `None` when that reset instant is
-/// unknown — the cell shows `n/a`, which stays uncolored (absence of color must not
-/// read as a false "healthy"). This refines, per the reset dimension alone, the
-/// Red→Yellow reset-proximity rule [`severity`] applies to the aggregate.
-fn reset_severity(account: &AccountStatusLine, now: i64) -> Option<Severity> {
-    // The window the RESETS cell displays (see `resets_in`): weekly when exhausted,
-    // else session — so the color describes the time actually shown.
-    let (pct, reset_at) = if account.weekly_exhausted {
-        (account.weekly_pct, account.weekly_resets_at)
+/// A reset at/under this many seconds out reads as IMMINENT — the most urgent
+/// proximity band (Red): the window is about to flip (issue #94).
+const RESET_IMMINENT_SECS: i64 = 60 * 60;
+/// A reset beyond this many seconds out reads as FAR — the calm band (Green); a
+/// reset between [`RESET_IMMINENT_SECS`] and this is APPROACHING (Yellow) (issue #94).
+const RESET_FAR_SECS: i64 = 24 * 60 * 60;
+
+/// One reset cell's own health (issue #94): its PROXIMITY, not utilization. The
+/// cell answers "how soon does THIS window flip", so a sooner reset reads more
+/// urgent and a later one less urgent — independent of how depleted the account is.
+/// That is exactly why a far weekly reset can read green while an imminent session
+/// reset on the SAME row reads red (the issue's worked example). Bands: at/under
+/// [`RESET_IMMINENT_SECS`] (1h) Red; beyond [`RESET_FAR_SECS`] (1d) Green; in
+/// between Yellow. A reset already past (non-positive delta) is maximally imminent →
+/// Red. `None` when the reset instant is unknown — the cell shows `n/a`, which stays
+/// uncolored (absence of color must not read as a false "healthy").
+///
+/// This is intentionally DISTINCT from the account-overall [`severity`], which keeps
+/// its RELIEF reading of reset proximity (a depleted account about to reset is
+/// recovering, so its `account` cell softens Red→Yellow). The two answer different
+/// questions — `account` "how usable is this account", a reset cell "how soon does
+/// this window flip" — and per the #84 model each cell's signal is independent. The
+/// reset-cell colour driver is documented here so the sibling colour-audit issue
+/// (#90) can confirm the semantics: sooner = redder, later = greener.
+fn proximity_severity(reset_at: Option<i64>, now: i64) -> Option<Severity> {
+    let delta = reset_at? - now;
+    Some(if delta <= RESET_IMMINENT_SECS {
+        Severity::Red
+    } else if delta > RESET_FAR_SECS {
+        Severity::Green
     } else {
-        (account.session_pct, account.session_resets_at)
-    };
-    // Unknown governing reset → the cell shows `n/a`; stay uncolored.
-    let reset_at = reset_at?;
-    let depleted = account.weekly_exhausted || pct.is_some_and(|p| p >= RED_UTIL_PCT);
-    if !depleted {
-        // Plenty of quota: the reset is no concern.
-        return Some(Severity::Green);
-    }
-    // Depleted: relief is imminent (reset within the window, or already past) →
-    // Yellow; a far reset leaves it stuck → Red.
-    if reset_at - now <= RESET_SOON_SECS {
-        Some(Severity::Yellow)
-    } else {
-        Some(Severity::Red)
-    }
+        Severity::Yellow
+    })
 }
 
-/// One `status`-table column: its header, a borrow of the matching [`StatusRow`]
-/// cell, the per-cell urgency getter for the color overlay (issue #84), and a drop
-/// priority (`None` = always keep; `Some(n)` = droppable, lower `n` drops first
-/// under a narrow terminal). `severity` returns this column's own health for a row,
-/// or `None` for a column that is never tinted (the `STATUS` tags) or a cell with no
-/// reading.
+/// One `status`-table column (issue #94): a borrow of the matching [`StatusRow`]
+/// cell, the per-cell urgency getter for the color overlay (issue #84), a `lead_gap`
+/// (the spaces rendered BEFORE this column — `0` for the first column, `1` to tie a
+/// reset tightly to the `%` it pairs with, `2` between independent columns), and a
+/// drop priority (`None` = always keep; `Some(n)` = droppable, lower `n` drops first
+/// under a narrow terminal — all columns sharing the lowest present priority drop
+/// together, so a `%`+reset PAIR leaves atomically). There is no header field: the
+/// table is header-less (issue #94), so a column is identified only by position and
+/// the adjacency of each `%` to its own reset. `severity` returns this column's own
+/// health for a row, or `None` for a column that is never tinted (the health-text
+/// tags) or a cell with no reading.
 struct Column {
-    header: &'static str,
     get: fn(&StatusRow) -> &str,
     severity: fn(&StatusRow) -> Option<Severity>,
+    lead_gap: usize,
     drop_priority: Option<u8>,
 }
 
 impl Column {
     fn keep(
-        header: &'static str,
         get: fn(&StatusRow) -> &str,
         severity: fn(&StatusRow) -> Option<Severity>,
+        lead_gap: usize,
     ) -> Self {
         Column {
-            header,
             get,
             severity,
+            lead_gap,
             drop_priority: None,
         }
     }
     fn droppable(
-        header: &'static str,
         priority: u8,
         get: fn(&StatusRow) -> &str,
         severity: fn(&StatusRow) -> Option<Severity>,
+        lead_gap: usize,
     ) -> Self {
         Column {
-            header,
             get,
             severity,
+            lead_gap,
             drop_priority: Some(priority),
         }
     }
 }
 
-/// Each included column's render width: the widest of its header and its cells,
-/// measured in DISPLAY WIDTH ([`display_width`]) — terminal columns, not `char`
-/// count — so a wide (CJK) or zero-width glyph in a label sizes the column
-/// correctly and the next column still lines up (issue #73).
+/// Each included column's render width: the widest of its cells, measured in DISPLAY
+/// WIDTH ([`display_width`]) — terminal columns, not `char` count — so a wide (CJK)
+/// or zero-width glyph in a label sizes the column correctly and the next column
+/// still lines up (issue #73). The table is header-less (issue #94), so only the
+/// cells size each column.
 fn column_widths(columns: &[Column], rows: &[StatusRow]) -> Vec<usize> {
     columns
         .iter()
         .map(|col| {
-            let cells = rows.iter().map(|row| display_width((col.get)(row)));
-            cells.max().unwrap_or(0).max(display_width(col.header))
+            rows.iter()
+                .map(|row| display_width((col.get)(row)))
+                .max()
+                .unwrap_or(0)
         })
         .collect()
 }
 
-/// Total rendered width of the table: summed column widths plus the inter-column
-/// gaps. Used to decide whether a column must drop to fit the terminal.
+/// Total rendered width of the table: summed column widths plus each column's lead
+/// gap. The first column's lead gap is `0`, so it never double-counts. Used to decide
+/// whether columns must drop to fit the terminal.
 fn table_width(columns: &[Column], rows: &[StatusRow]) -> usize {
     let cells: usize = column_widths(columns, rows).iter().sum();
-    cells + columns.len().saturating_sub(1) * STATUS_COL_GAP
+    let gaps: usize = columns.iter().map(|col| col.lead_gap).sum();
+    cells + gaps
 }
 
-/// Render one table line: each cell left-padded to its column width, joined by the
-/// column gap, with trailing whitespace trimmed (so an empty trailing cell — a
-/// healthy account's `STATUS` — leaves no dangling spaces and the line stays
-/// greppable).
+/// Render one table line: each cell preceded by its column's `lead_gap` and
+/// left-padded to its column width, with trailing whitespace trimmed (so an empty
+/// trailing cell — a healthy account's health-text — leaves no dangling spaces and
+/// the line stays greppable).
 ///
-/// Padding is computed on DISPLAY WIDTH ([`display_width`]) — not `char`/byte
-/// count, which Rust's `{:<width$}` fill would use — so a wide-glyph cell lands the
-/// next column correctly. `colors` carries one entry PER cell (issue #84): when a
-/// cell's entry is `Some(sgr)` that cell's text is wrapped in the ANSI color, and
-/// the color math is done on the RAW cell width so the escape bytes never enter it —
-/// per-cell colors keep the columns aligned exactly as the old row-wide tint did
+/// The lead gap is the spacing BEFORE a column (issue #94): `0` for the first column,
+/// `1` to tie a reset to the `%` it pairs with, `2` between independent columns — so
+/// each `%` reads immediately followed by its own reset even though the table is
+/// header-less. Padding is computed on DISPLAY WIDTH ([`display_width`]) — not
+/// `char`/byte count, which Rust's `{:<width$}` fill would use — so a wide-glyph cell
+/// lands the next column correctly. `colors` carries one entry PER cell (issue #84):
+/// when a cell's entry is `Some(sgr)` that cell's text is wrapped in the ANSI color,
+/// and the color math is done on the RAW cell width so the escape bytes never enter
+/// it — per-cell colors keep the columns aligned exactly as the old row-wide tint did
 /// (pad-before-color, issue #73). The trailing pad is appended OUTSIDE the escape so
-/// the line's trailing whitespace (an empty `STATUS` cell, a short last cell) still
+/// the line's trailing whitespace (an empty health-text cell, a short last cell) still
 /// trims away cleanly, leaving no dangling spaces — and stripping every escape
 /// recovers the exact plain table (color is purely additive). An entry is `None` for
-/// the header, an untinted column, a cell with no reading, and whenever the gate is
-/// closed — then that cell emits not one escape byte, keeping a piped / redirected
-/// surface clean.
-fn render_cells(cells: &[&str], widths: &[usize], colors: &[Option<&str>]) -> String {
+/// an untinted column, a cell with no reading, and whenever the gate is closed — then
+/// that cell emits not one escape byte, keeping a piped / redirected surface clean.
+fn render_cells(
+    cells: &[&str],
+    widths: &[usize],
+    colors: &[Option<&str>],
+    lead_gaps: &[usize],
+) -> String {
     let mut line = String::new();
-    for (idx, ((cell, width), color)) in cells.iter().zip(widths).zip(colors).enumerate() {
-        if idx > 0 {
-            line.push_str(&" ".repeat(STATUS_COL_GAP));
-        }
+    for (((cell, width), color), gap) in cells.iter().zip(widths).zip(colors).zip(lead_gaps) {
+        line.push_str(&" ".repeat(*gap));
         match color {
             Some(sgr) => line.push_str(&format!("\x1b[{sgr}m{cell}\x1b[0m")),
             None => line.push_str(cell),
@@ -833,22 +891,14 @@ fn char_width(c: char) -> usize {
     }
 }
 
-/// One account's compact "resets in" (issue #72): the time until it next regains
-/// capacity. When the weekly window is exhausted (`weekly_exhausted` — the daemon's
-/// own `weekly >= weekly_trigger` viability verdict, issue #11/#37) the account is
-/// blocked until the WEEKLY reset; otherwise the rolling 5-hour SESSION window is
-/// what gates it, so the SESSION reset is when it becomes usable again. Keying off
-/// the daemon's flag — not a re-derived `weekly_pct == 100` — keeps the display
-/// honest for an account at/above the trigger but below a rounded 100%: it is
-/// already blocked for the week, and is shown as such. `n/a` when the governing
-/// reset is unknown (the poll failed, or the API gave no parseable timestamp) —
-/// never a fabricated duration.
-fn resets_in(account: &AccountStatusLine, now: i64) -> String {
-    let reset_at = if account.weekly_exhausted {
-        account.weekly_resets_at
-    } else {
-        account.session_resets_at
-    };
+/// One window's compact "resets in" (issue #94): the time until `reset_at`, or `n/a`
+/// when that reset instant is unknown (the poll failed, or the API gave no parseable
+/// timestamp) — never a fabricated duration. Unlike the pre-#94 single "resets in"
+/// (issue #72), which collapsed an account to its one binding window, each window
+/// (SESSION, WEEKLY) is now rendered DIRECTLY from its own instant, so `status` shows
+/// both side by side and the operator sees when work resumes AND when the account
+/// fully frees up.
+fn reset_cell(reset_at: Option<i64>, now: i64) -> String {
     match reset_at {
         Some(at) => humanize_until(at - now),
         None => "n/a".to_owned(),
@@ -1519,25 +1569,42 @@ spare  22222222-2222\n\
     const NOW: i64 = 1_782_777_600;
 
     #[test]
-    fn render_status_renders_an_aligned_table_with_a_next_swap_candidate() {
-        // Healthy roster (no tags) → no STATUS column. The full table (cols None)
-        // keeps every column; values align under their headers, one row each, then the
-        // forward-looking next-swap footer naming the candidate (#88).
+    fn render_status_renders_an_aligned_header_less_paired_table_with_a_next_swap_candidate() {
+        // The header-less paired layout (issue #94): each `%` is immediately followed
+        // by its OWN reset (a single space ties the pair; two spaces separate the
+        // SESSION pair from the WEEKLY pair), aligned in columns, one record per line,
+        // then the forward-looking next-swap footer (#88). Healthy roster (no tags) →
+        // no health-text column. The exact match proves there is NO header row.
+        let mut work = status_line_resets(
+            "work",
+            Some(97),
+            Some(40),
+            false,
+            Some(NOW + 12 * 60),
+            Some(NOW + 5 * 86_400),
+        );
+        work.active = true;
         let response = StatusResponse {
             accounts: vec![
-                status_line("work", true, Some(97), Some(40)),
-                status_line("spare", false, Some(10), Some(20)),
-                status_line("third", false, None, None),
+                work,
+                status_line_resets(
+                    "spare",
+                    Some(10),
+                    Some(20),
+                    false,
+                    Some(NOW + 2 * 3_600),
+                    Some(NOW + 3 * 86_400),
+                ),
+                status_line_resets("third", None, None, false, None, None),
             ],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
             }),
         };
         let expected = concat!(
-            "ACCOUNT  SESSION  WEEKLY  RESETS\n",
-            "* work   97%      40%     n/a\n",
-            "  spare  10%      20%     n/a\n",
-            "  third  n/a      n/a     n/a\n",
+            "* work   97% 12m  40% 5d\n",
+            "  spare  10% 2h   20% 3d\n",
+            "  third  n/a n/a  n/a n/a\n",
             "\n",
             "next swap: spare\n",
         );
@@ -1545,13 +1612,14 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn render_status_shows_resets_in_for_every_account() {
-        // Each account shows when it next regains capacity — the SESSION reset
-        // normally, the WEEKLY reset only when the weekly window is exhausted
-        // (issue #72). Not only the exhausted one: every row carries a value.
+    fn render_status_shows_both_session_and_weekly_resets_for_every_account() {
+        // The #94 core: every account shows BOTH its session reset AND its weekly
+        // reset, side by side — not the single collapsed "binding window" of #72.
+        // This holds even for a weekly-EXHAUSTED account (`third`): pre-#94 it showed
+        // only the weekly reset; now it shows the session reset too.
         let response = StatusResponse {
             accounts: vec![
-                // healthy → session reset (12 min out)
+                // healthy: session 12m, weekly 5d — both appear.
                 status_line_resets(
                     "work",
                     Some(30),
@@ -1560,8 +1628,7 @@ spare  22222222-2222\n\
                     Some(NOW + 12 * 60),
                     Some(NOW + 5 * 86_400),
                 ),
-                // session-exhausted, weekly fine → session reset (4h out), NOT the
-                // far-off weekly reset.
+                // session-depleted, weekly fine: session 4h, weekly 3d — both appear.
                 status_line_resets(
                     "spare",
                     Some(100),
@@ -1570,7 +1637,8 @@ spare  22222222-2222\n\
                     Some(NOW + 4 * 3_600),
                     Some(NOW + 3 * 86_400),
                 ),
-                // weekly-exhausted → weekly reset (3d4h out), the binding window.
+                // weekly-exhausted: session 2h AND weekly 3d4h — BOTH shown (the #94
+                // change; #72 would have shown only the binding weekly reset).
                 status_line_resets(
                     "third",
                     Some(100),
@@ -1589,17 +1657,38 @@ spare  22222222-2222\n\
                 .unwrap_or_else(|| panic!("no row for {label} in:\n{out}"))
                 .to_owned()
         };
-        assert!(line("work").contains("12m"), "{}", line("work"));
-        assert!(line("spare").contains("4h"), "{}", line("spare"));
-        assert!(line("third").contains("3d4h"), "{}", line("third"));
-        // Every account row carries a resets value (none blank), and the header
-        // names the column.
-        assert!(out.contains("RESETS"), "{out}");
+        assert!(
+            line("work").contains("12m") && line("work").contains("5d"),
+            "both resets on the healthy row: {}",
+            line("work")
+        );
+        assert!(
+            line("spare").contains("4h") && line("spare").contains("3d"),
+            "both resets on the session-depleted row: {}",
+            line("spare")
+        );
+        assert!(
+            line("third").contains("2h") && line("third").contains("3d4h"),
+            "the weekly-exhausted account shows BOTH resets, not just the weekly: {}",
+            line("third")
+        );
+        // No header row (issue #94): the column labels of the pre-#94 table are gone.
+        for header in ["ACCOUNT", "SESSION", "WEEKLY", "RESETS", "STATUS"] {
+            assert!(
+                !out.contains(header),
+                "no header row, found {header:?}: {out}"
+            );
+        }
+        // Greppable: one record per line — each label on exactly one line.
+        for label in ["work", "spare", "third"] {
+            assert_eq!(out.lines().filter(|l| l.contains(label)).count(), 1);
+        }
     }
 
     #[test]
     fn render_status_marks_disabled_and_quarantined_in_a_status_column() {
-        // A tag on any account adds the STATUS column; both tags can hold at once.
+        // A tag on any account adds the health-text column (issue #94 — no header,
+        // so its presence is the tag text itself); both tags can hold at once.
         let mut quarantined = status_line("dead", false, None, None);
         quarantined.enabled = false;
         quarantined.quarantined = true;
@@ -1608,7 +1697,6 @@ spare  22222222-2222\n\
             next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
-        assert!(out.contains("STATUS"), "tagged roster shows STATUS: {out}");
         let dead = out.lines().find(|l| l.contains("dead")).unwrap();
         assert!(
             dead.contains("disabled, needs re-login"),
@@ -1620,48 +1708,64 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn render_status_drops_columns_in_priority_order_when_narrow() {
+    fn render_status_drops_the_weekly_pair_first_then_health_text_when_narrow() {
+        // Issue #94 degradation order: drop the WEEKLY pair (weekly% + weekly-reset)
+        // FIRST and ATOMICALLY, then the health-text column — always keeping the label
+        // + the SESSION pair (the soonest, most actionable reset); never wrap a row.
+        // Cells are identified by their content (no header to grep): weekly% `25%`,
+        // weekly-reset `3d`, health-text `disabled`, session pair `50%`/`2h`.
         let response = StatusResponse {
             accounts: vec![{
-                let mut a = status_line("work", false, Some(50), Some(25));
-                a.enabled = false; // a STATUS tag, so the column exists to be dropped
+                let mut a = status_line_resets(
+                    "work",
+                    Some(50),
+                    Some(25),
+                    false,
+                    Some(NOW + 2 * 3_600),
+                    Some(NOW + 3 * 86_400),
+                );
+                a.enabled = false; // a health-text tag, so that column exists to drop
                 a
             }],
             next_swap: None,
         };
-        // Full table is `ACCOUNT(7) SESSION(7) WEEKLY(6) RESETS(6) STATUS(8)` plus
-        // four 2-space gaps = 42; dropping WEEKLY → 34; dropping STATUS too → 24.
-        // Full width: every column.
+        // Full table = account(6) session%(3) session-reset(2) weekly%(3)
+        // weekly-reset(2) health-text(8) + gaps(0+2+1+2+1+2=8) = 32; dropping the
+        // weekly pair → 24; dropping health-text too → 14.
         let full = render_status(&response, NOW, Some(200), false);
-        assert!(full.contains("WEEKLY") && full.contains("STATUS"));
-        // Narrow (38 ∈ [34,41]): WEEKLY drops first; STATUS + the three stay.
-        let narrow = render_status(&response, NOW, Some(38), false);
-        assert!(!narrow.contains("WEEKLY"), "WEEKLY drops first: {narrow}");
         assert!(
-            narrow.contains("STATUS"),
-            "STATUS outlives WEEKLY: {narrow}"
+            full.contains("25%") && full.contains("3d") && full.contains("disabled"),
+            "full table keeps both pairs and the health-text: {full}"
         );
-        // Narrower (28 ∈ [24,33]): STATUS drops next; the essential three remain.
-        let tiny = render_status(&response, NOW, Some(28), false);
+        // Narrow (24 ≤ 28 < 32): the WEEKLY pair drops first, atomically — NEITHER
+        // weekly% nor weekly-reset survives; health-text + the session pair stay.
+        let narrow = render_status(&response, NOW, Some(28), false);
         assert!(
-            !tiny.contains("WEEKLY") && !tiny.contains("STATUS"),
-            "{tiny}"
+            !narrow.contains("25%") && !narrow.contains("3d"),
+            "the weekly pair drops first and atomically (no stranded %): {narrow}"
         );
         assert!(
-            tiny.contains("ACCOUNT") && tiny.contains("SESSION") && tiny.contains("RESETS"),
-            "the essential three are always kept: {tiny}"
+            narrow.contains("disabled") && narrow.contains("50%") && narrow.contains("2h"),
+            "health-text and the session pair outlive the weekly pair: {narrow}"
         );
-        // Every degraded form is still one record per line (never wrapped).
+        // Narrower (14 ≤ 20 < 24): health-text drops next; label + session pair remain.
+        let tiny = render_status(&response, NOW, Some(20), false);
+        assert!(
+            !tiny.contains("25%") && !tiny.contains("3d") && !tiny.contains("disabled"),
+            "weekly pair and health-text both gone: {tiny}"
+        );
+        assert!(
+            tiny.contains("work") && tiny.contains("50%") && tiny.contains("2h"),
+            "label + session pair are always kept: {tiny}"
+        );
         assert_eq!(tiny.lines().filter(|l| l.contains("work")).count(), 1);
-        // Even a width too small for the essential three (24 > 10): they are NEVER
-        // dropped and the row is NEVER wrapped — it simply overflows, staying one
-        // greppable record per line (the terminal soft-wraps it visually).
-        let overflow = render_status(&response, NOW, Some(10), false);
+        // Even a width too small for the essentials (14 > 5): they are NEVER dropped
+        // and the row is NEVER wrapped — it simply overflows, staying one greppable
+        // record per line (the terminal soft-wraps it visually).
+        let overflow = render_status(&response, NOW, Some(5), false);
         assert!(
-            overflow.contains("ACCOUNT")
-                && overflow.contains("SESSION")
-                && overflow.contains("RESETS"),
-            "the essential three survive any width: {overflow}"
+            overflow.contains("work") && overflow.contains("50%") && overflow.contains("2h"),
+            "label + session pair survive any width: {overflow}"
         );
         assert_eq!(overflow.lines().filter(|l| l.contains("work")).count(), 1);
     }
@@ -1843,8 +1947,8 @@ spare  22222222-2222\n\
         // over raw utilization: with a lowered `weekly_trigger` an account can be
         // exhausted at a weekly percent well BELOW the Red cutoff, yet it is
         // blocked for days — it must read Red, never the "healthy" Green its 65%
-        // utilization would otherwise give. Mirrors what `resets_in` shows (the
-        // far weekly reset).
+        // utilization would otherwise give. Mirrors what its WEEKLY reset cell shows
+        // (the far weekly reset).
         let blocked = status_line_resets(
             "blocked",
             Some(30),               // session is fine…
@@ -1922,48 +2026,62 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn reset_severity_is_proximity_as_relief() {
-        // Healthy (shown window below the Red cutoff) → green: the reset is no
-        // concern, however far off.
-        let healthy =
-            status_line_resets("h", Some(50), Some(40), false, Some(NOW + 5 * 86_400), None);
-        assert_eq!(reset_severity(&healthy, NOW), Some(Severity::Green));
-        // Depleted (session >= RED) with a FAR session reset → red (stuck waiting).
-        let stuck = status_line_resets("s", Some(99), Some(40), false, Some(NOW + 4 * 3_600), None);
-        assert_eq!(reset_severity(&stuck, NOW), Some(Severity::Red));
-        // Depleted with a SOON session reset → yellow (relief soon); an already-past
-        // reset counts as relief too.
-        let soon = status_line_resets("r", Some(99), Some(40), false, Some(NOW + 10 * 60), None);
-        assert_eq!(reset_severity(&soon, NOW), Some(Severity::Yellow));
-        let past = status_line_resets("p", Some(99), Some(40), false, Some(NOW - 100), None);
-        assert_eq!(reset_severity(&past, NOW), Some(Severity::Yellow));
-        // Weekly-exhausted → the WEEKLY reset governs (mirrors `resets_in`): a far
-        // weekly reset is red despite a soon session reset; a soon one is yellow.
-        let weekly_far = status_line_resets(
-            "wf",
-            Some(20),
-            Some(65),
-            true,
-            Some(NOW + 60),
-            Some(NOW + 3 * 86_400),
+    fn proximity_severity_colors_a_reset_by_how_soon_it_flips() {
+        // Issue #94: a reset cell's colour is its PROXIMITY, not utilization — sooner
+        // reads more urgent (red), later less urgent (green), independent of how
+        // depleted the account is. An imminent reset (≤ 1h) is red; a far one (> 1d)
+        // is green; in between is yellow.
+        assert_eq!(
+            proximity_severity(Some(NOW + 12 * 60), NOW),
+            Some(Severity::Red),
+            "12m out is imminent → red"
         );
-        assert_eq!(reset_severity(&weekly_far, NOW), Some(Severity::Red));
-        let weekly_soon = status_line_resets(
-            "ws",
-            Some(20),
-            Some(65),
-            true,
-            Some(NOW + 4 * 3_600),
-            Some(NOW + 5 * 60),
+        assert_eq!(
+            proximity_severity(Some(NOW + 5 * 86_400), NOW),
+            Some(Severity::Green),
+            "5d out is far → green"
         );
-        assert_eq!(reset_severity(&weekly_soon, NOW), Some(Severity::Yellow));
-        // The SHOWN reset unknown → the cell shows `n/a`; stay uncolored (None) even
-        // though a util reading exists — absence of color is not a false "healthy".
-        let na = status_line_resets("n", Some(99), Some(40), false, None, Some(NOW + 600));
-        assert_eq!(reset_severity(&na, NOW), None);
-        // No reading at all → None.
-        let dark = status_line_resets("d", None, None, false, None, None);
-        assert_eq!(reset_severity(&dark, NOW), None);
+        assert_eq!(
+            proximity_severity(Some(NOW + 6 * 3_600), NOW),
+            Some(Severity::Yellow),
+            "6h out (between 1h and 1d) → yellow"
+        );
+        // Proximity ignores utilization: a far reset is green even at 99% used, and an
+        // imminent reset is red even at 5% used — the worked example of a green weekly
+        // beside a red session on one row.
+        assert_eq!(
+            proximity_severity(Some(NOW + 5 * 86_400), NOW),
+            Some(Severity::Green)
+        );
+        assert_eq!(
+            proximity_severity(Some(NOW + 10 * 60), NOW),
+            Some(Severity::Red)
+        );
+        // Boundaries (`<=` imminent, `>` far): exactly 1h is still red, one second
+        // past is yellow; exactly 1d is yellow, one second past is green.
+        assert_eq!(
+            proximity_severity(Some(NOW + RESET_IMMINENT_SECS), NOW),
+            Some(Severity::Red)
+        );
+        assert_eq!(
+            proximity_severity(Some(NOW + RESET_IMMINENT_SECS + 1), NOW),
+            Some(Severity::Yellow)
+        );
+        assert_eq!(
+            proximity_severity(Some(NOW + RESET_FAR_SECS), NOW),
+            Some(Severity::Yellow)
+        );
+        assert_eq!(
+            proximity_severity(Some(NOW + RESET_FAR_SECS + 1), NOW),
+            Some(Severity::Green)
+        );
+        // An already-past reset (non-positive delta) is maximally imminent → red.
+        assert_eq!(
+            proximity_severity(Some(NOW - 100), NOW),
+            Some(Severity::Red)
+        );
+        // Unknown reset instant → None: the cell shows `n/a`, which stays uncolored.
+        assert_eq!(proximity_severity(None, NOW), None);
     }
 
     #[test]
@@ -2066,9 +2184,13 @@ spare  22222222-2222\n\
         // table — proving color augments (every state + percentage still present)
         // and that padding was computed BEFORE coloring (alignment survives strip).
         assert_eq!(strip_ansi(&colored), plain);
-        // The header line is never tinted (it labels columns, it is not an account).
-        let header = colored.lines().next().unwrap();
-        assert!(header.starts_with("ACCOUNT") && !header.contains('\x1b'));
+        // No header row (issue #94): the first line is the first ACCOUNT, not a
+        // column-label header.
+        let first_plain = strip_ansi(colored.lines().next().unwrap());
+        assert!(
+            !first_plain.starts_with("ACCOUNT") && first_plain.contains("calm"),
+            "first line is an account row, not a header: {first_plain:?}"
+        );
     }
 
     #[test]
@@ -2102,6 +2224,50 @@ spare  22222222-2222\n\
             "multiple independently-tinted cells: {row:?}"
         );
         // Still purely additive: stripping the ANSI recovers the exact plain table.
+        assert_eq!(strip_ansi(&colored), plain);
+    }
+
+    #[test]
+    fn color_paints_each_reset_cell_by_its_own_proximity() {
+        // The #94 headline: on ONE row, a far weekly reset reads GREEN while an
+        // imminent session reset reads RED — each reset cell coloured by its own
+        // proximity, independent of utilization (both `%` here are a calm green).
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "mix",
+                Some(50), // session %: green band
+                Some(50), // weekly %: green band
+                false,
+                Some(NOW + 10 * 60),    // session reset imminent → red
+                Some(NOW + 5 * 86_400), // weekly reset far → green
+            )],
+            next_swap: None,
+        };
+        let colored = render_status(&response, NOW, None, true);
+        let plain = render_status(&response, NOW, None, false);
+        let row = colored
+            .lines()
+            .find(|l| l.contains("mix"))
+            .expect("a row for mix");
+        // The imminent session reset is red; the far weekly reset is green — on one row.
+        assert!(
+            row.contains("\x1b[31m10m"),
+            "imminent session reset red: {row:?}"
+        );
+        assert!(
+            row.contains("\x1b[32m5d"),
+            "far weekly reset green: {row:?}"
+        );
+        // …and not the inverse — proving proximity, not a fixed colour, drives it.
+        assert!(
+            !row.contains("\x1b[32m10m"),
+            "the imminent reset is not green: {row:?}"
+        );
+        assert!(
+            !row.contains("\x1b[31m5d"),
+            "the far reset is not red: {row:?}"
+        );
+        // Purely additive: stripping the ANSI recovers the exact plain table.
         assert_eq!(strip_ansi(&colored), plain);
     }
 
@@ -2204,45 +2370,57 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn resets_in_keys_off_the_binding_window() {
-        // weekly NOT exhausted → session reset governs.
-        let healthy = status_line_resets(
-            "a",
-            Some(50),
-            Some(50),
-            false,
-            Some(NOW + 600),
-            Some(NOW + 99),
-        );
-        assert_eq!(resets_in(&healthy, NOW), "10m");
-        // weekly exhausted → weekly reset governs, even though the session reset is
-        // sooner.
-        let weekly_out = status_line_resets(
-            "b",
+    fn reset_cell_renders_each_window_directly_or_n_a() {
+        // Issue #94: each window's reset is rendered DIRECTLY from its own instant —
+        // no binding-window collapse. A known instant humanizes; an unknown one is
+        // `n/a` (never a fabricated duration), independent of utilization or the
+        // weekly-exhaustion flag.
+        assert_eq!(reset_cell(Some(NOW + 600), NOW), "10m");
+        assert_eq!(reset_cell(Some(NOW + 2 * 3_600), NOW), "2h");
+        assert_eq!(reset_cell(Some(NOW + 3 * 86_400), NOW), "3d");
+        assert_eq!(reset_cell(None, NOW), "n/a");
+        // Both windows of one exhausted account render their OWN instants — the
+        // session reset is NOT suppressed in favour of the weekly one (the pre-#94
+        // binding-window behaviour). The renderer shows both side by side.
+        let exhausted = status_line_resets(
+            "x",
             Some(100),
             Some(100),
-            true,
-            Some(NOW + 600),
-            Some(NOW + 7_200),
-        );
-        assert_eq!(resets_in(&weekly_out, NOW), "2h");
-        // The band the daemon counts as exhausted but a rounded percent does NOT:
-        // weekly_pct rounds to 98 (< 100), yet `weekly_exhausted` is true (the raw
-        // fraction is at/above the trigger). The OLD `weekly_pct == 100` heuristic
-        // would have wrongly shown the 4h session reset; the daemon's flag shows the
-        // real 3d weekly block. This is the reviewer-flagged correctness fix.
-        let band = status_line_resets(
-            "c",
-            Some(100),
-            Some(98),
             true,
             Some(NOW + 4 * 3_600),
             Some(NOW + 3 * 86_400),
         );
-        assert_eq!(resets_in(&band, NOW), "3d");
-        // Governing reset unknown → n/a (never a fabricated duration).
-        let unknown = status_line_resets("d", Some(50), Some(50), false, None, Some(NOW + 600));
-        assert_eq!(resets_in(&unknown, NOW), "n/a");
+        assert_eq!(reset_cell(exhausted.session_resets_at, NOW), "4h");
+        assert_eq!(reset_cell(exhausted.weekly_resets_at, NOW), "3d");
+    }
+
+    #[test]
+    fn json_exposes_both_session_and_weekly_reset_instants() {
+        // Issue #94 full-data contract: `--json` carries BOTH reset instants (raw
+        // epoch seconds), regardless of terminal width — the text view may drop the
+        // weekly pair on a narrow terminal, but the JSON never does. (`status --json`
+        // serializes this exact response verbatim, the same surface scripts consume.)
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "work",
+                Some(50),
+                Some(40),
+                false,
+                Some(NOW + 12 * 60),
+                Some(NOW + 5 * 86_400),
+            )],
+            next_swap: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(
+            json.contains("\"session_resets_at\"") && json.contains("\"weekly_resets_at\""),
+            "both reset keys present: {json}"
+        );
+        assert!(
+            json.contains(&(NOW + 12 * 60).to_string())
+                && json.contains(&(NOW + 5 * 86_400).to_string()),
+            "both reset instants present as raw epoch seconds: {json}"
+        );
     }
 
     #[tokio::test]
