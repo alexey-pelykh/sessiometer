@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
 use crate::observability::EventLog;
 use crate::paths;
-use crate::stash::RealAccountStash;
+use crate::stash::{AccountStash, RealAccountStash};
 
 /// Parse `argv` and run the requested subcommand.
 pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
@@ -54,6 +54,13 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     let label = args.next().map(|s| s.to_string_lossy().into_owned());
                     set_enabled(label, true).await
                 }
+                // `remove <label>` drops an account from the roster AND deletes its
+                // stash — the destructive sibling of `disable` (issue #13). Same
+                // optional-positional parse; a missing label is RotationLabelRequired.
+                "remove" => {
+                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
+                    remove_account(label).await
+                }
                 "-h" | "--help" => {
                     print_usage();
                     Ok(())
@@ -78,6 +85,7 @@ fn print_usage() {
          list       List captured accounts\n    \
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
          enable <label>       Return a parked account to the rotation\n    \
+         remove <label>       Delete an account: drop it from the rotation and erase its stash\n    \
          --help     Print this help"
     );
 }
@@ -398,6 +406,60 @@ fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String
     }
 }
 
+/// `remove <label>` — the DESTRUCTIVE sibling of `disable` (issue #13): drop the
+/// account from the roster AND delete its keychain stash, so it is gone for good
+/// (vs `disable`, which keeps both and only flips the rotation flag). Resolve by
+/// label, then persist the roster without the entry FIRST and delete the stash
+/// SECOND.
+///
+/// The ordering is the crash-safe one: a failure (a crash, or a locked keychain at
+/// the delete) after the config save leaves only an ORPHANED, unreferenced stash —
+/// harmless keychain data nothing reads — rather than a roster entry pointing at a
+/// stash that has already been deleted, which the daemon would repeatedly fail to
+/// read. The stash delete is idempotent (an already-absent half is success), so a
+/// re-run after a partial failure still converges.
+///
+/// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
+/// account is [`Error::AccountLabelNotFound`]. Takes effect at the next daemon
+/// start — a running daemon loads the roster once. Removing the ACTIVE account is
+/// allowed and self-heals: this touches only sessiometer's roster entry and stash,
+/// never the canonical credential, so the daemon simply polls-only (resolving no
+/// active account) until another account is captured or the operator `/login`s.
+async fn remove_account(label: Option<String>) -> Result<()> {
+    let label = label.ok_or(Error::RotationLabelRequired { verb: "remove" })?;
+    let mut config = Config::load()?;
+    let removed = apply_remove(&mut config.roster, &label)?;
+    // Config FIRST (see the doc): persist the roster without the entry before the
+    // destructive stash delete, so any failure past here orphans a harmless stash
+    // rather than dangling a roster entry at a deleted one.
+    config.save()?;
+    // Then delete the now-unreferenced stash — both halves, idempotent.
+    RealAccountStash::new().delete(&removed.stash).await?;
+    println!("{}", remove_confirmation(&label));
+    Ok(())
+}
+
+/// Resolve `label` in `roster` and REMOVE its entry, returning the removed account
+/// (whose `stash` name the caller needs to delete the keychain stash). Pure (no
+/// I/O) so the resolve-and-remove policy is unit-testable without touching
+/// `config.toml`. `Err(AccountLabelNotFound)` when no account carries the label.
+/// The first match wins (labels are operator handles; uniqueness is not enforced,
+/// so a duplicate label removes the earliest roster entry).
+fn apply_remove(roster: &mut Vec<Account>, label: &str) -> Result<Account> {
+    let idx = roster
+        .iter()
+        .position(|account| account.label == label)
+        .ok_or_else(|| Error::AccountLabelNotFound {
+            label: label.to_owned(),
+        })?;
+    Ok(roster.remove(idx))
+}
+
+/// The confirmation line for a `remove`. Names the label (non-secret, issue #15).
+fn remove_confirmation(label: &str) -> String {
+    format!("removed `{label}`")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,6 +705,44 @@ spare · 22222222 · Sessiometer/22222222-2222\n\
             flip_confirmation(FlipOutcome::Unchanged, "work", true),
             "`work` is already enabled"
         );
+    }
+
+    // --- remove (issue #13) ------------------------------------------------
+
+    #[test]
+    fn apply_remove_drops_the_resolved_account_and_returns_it() {
+        let mut roster = vec![
+            acct("work", "u1", "Sessiometer/u1"),
+            acct("spare", "u2", "Sessiometer/u2"),
+            acct("backup", "u3", "Sessiometer/u3"),
+        ];
+        // Resolve `spare` by label, remove it, and hand its stash name back so the
+        // caller can delete the keychain stash.
+        let removed = apply_remove(&mut roster, "spare").expect("a present label removes");
+        assert_eq!(removed.label, "spare");
+        assert_eq!(removed.stash, "Sessiometer/u2");
+        // The entry is gone and the survivors keep their order.
+        assert_eq!(roster.len(), 2);
+        assert_eq!(roster[0].label, "work");
+        assert_eq!(roster[1].label, "backup");
+    }
+
+    #[test]
+    fn apply_remove_rejects_an_unknown_label_without_touching_the_roster() {
+        let mut roster = vec![acct("work", "u1", "Sessiometer/u1")];
+        let err = apply_remove(&mut roster, "ghost").expect_err("an unmatched label is an error");
+        assert!(
+            matches!(err, Error::AccountLabelNotFound { ref label } if label == "ghost"),
+            "got {err:?}"
+        );
+        assert_eq!(roster.len(), 1, "a failed resolve leaves the roster intact");
+    }
+
+    #[test]
+    fn remove_confirmation_names_the_label() {
+        assert_eq!(remove_confirmation("work"), "removed `work`");
+        // #15: the confirmation carries only the operator label, never a secret.
+        assert!(!remove_confirmation("work").contains('@'));
     }
 
     // --- status: response → text (issue #8) --------------------------------

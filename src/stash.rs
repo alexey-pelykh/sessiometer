@@ -86,6 +86,12 @@ pub(crate) trait AccountStash {
     async fn write(&self, service: &str, account: &StashedAccount) -> Result<()>;
     /// Read both halves back, or [`Error::StashIncomplete`] if either is absent.
     async fn read(&self, service: &str) -> Result<StashedAccount>;
+    /// Delete both halves of the stash under `service` — account removal (issue
+    /// #13). Idempotent: an already-absent half is treated as success (the
+    /// post-condition "the stash is gone" holds), so a partially-written stash and
+    /// a re-run both delete cleanly. Surfaces [`Error::KeychainLocked`] if the
+    /// keychain is locked.
+    async fn delete(&self, service: &str) -> Result<()>;
 }
 
 /// Real keychain-backed stash, driving `/usr/bin/security`.
@@ -172,6 +178,29 @@ impl RealAccountStash {
             }
         }
     }
+
+    /// `delete-generic-password` one item, tolerating an absent one. Unlike
+    /// `add_item` there is no secret payload (service + acct are non-secret config
+    /// values), so this is a plain argv call — no `security -i` / #39 concern. A
+    /// `44` (`errSecItemNotFound`) is mapped to `Ok`: the post-condition "the item
+    /// is gone" already holds, so deletes are idempotent. `36` maps to
+    /// [`Error::KeychainLocked`] via [`stash_error`].
+    async fn delete_item(&self, service: &str, acct: &str, keychain: &Path) -> Result<()> {
+        let output = Command::new(SECURITY)
+            .args(delete_item_args(service, acct, keychain))
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let code = output.status.code().unwrap_or(-1);
+        if code == 44 {
+            Ok(()) // already absent → idempotent success
+        } else {
+            Err(stash_error("stash delete", code))
+        }
+    }
 }
 
 impl AccountStash for RealAccountStash {
@@ -218,6 +247,17 @@ impl AccountStash for RealAccountStash {
             credential,
             oauth_account,
         })
+    }
+
+    async fn delete(&self, service: &str) -> Result<()> {
+        let keychain = self.keychain_path()?;
+        // Delete both halves. A missing half is tolerated (`delete_item` maps
+        // not-found to Ok), so a partially-written stash still deletes cleanly and
+        // the operation is safe to re-run.
+        self.delete_item(service, ACCT_CREDENTIAL, &keychain)
+            .await?;
+        self.delete_item(service, ACCT_OAUTH, &keychain).await?;
+        Ok(())
     }
 }
 
@@ -298,6 +338,20 @@ fn read_item_args(service: &str, acct: &str, keychain: &Path) -> Vec<OsString> {
     vec![
         "find-generic-password".into(),
         "-w".into(),
+        "-s".into(),
+        service.into(),
+        "-a".into(),
+        acct.into(),
+        keychain.as_os_str().to_owned(),
+    ]
+}
+
+/// `delete-generic-password` arguments (after the program name): delete the item
+/// `(service, acct)`, pinning the keychain path. No `-w` / payload — delete needs
+/// only the non-secret identifiers (issue #13 account removal).
+fn delete_item_args(service: &str, acct: &str, keychain: &Path) -> Vec<OsString> {
+    vec![
+        "delete-generic-password".into(),
         "-s".into(),
         service.into(),
         "-a".into(),
@@ -398,6 +452,12 @@ impl AccountStash for FakeAccountStash {
                 service: service.to_owned(),
             })
     }
+
+    async fn delete(&self, service: &str) -> Result<()> {
+        // Idempotent: removing an absent service is a no-op success.
+        self.items.borrow_mut().remove(service);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +513,28 @@ mod tests {
                 OsString::from("Sessiometer/22222222-2222-2222-2222-222222222222"),
                 OsString::from("-a"),
                 OsString::from("oauthAccount"),
+                kc.as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_args_pin_service_acct_and_keychain_without_payload() {
+        let kc = Path::new("/tmp/login.keychain-db");
+        // No `-w` and no payload — delete needs only the non-secret identifiers,
+        // so (unlike write) there is nothing to keep off argv.
+        assert_eq!(
+            delete_item_args(
+                "Sessiometer/33333333-3333-3333-3333-333333333333",
+                ACCT_CREDENTIAL,
+                kc
+            ),
+            vec![
+                OsString::from("delete-generic-password"),
+                OsString::from("-s"),
+                OsString::from("Sessiometer/33333333-3333-3333-3333-333333333333"),
+                OsString::from("-a"),
+                OsString::from("credential"),
                 kc.as_os_str().to_owned(),
             ]
         );
@@ -533,6 +615,29 @@ mod tests {
                 .await,
             Err(Error::StashIncomplete { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn fake_delete_removes_and_is_idempotent() {
+        let stash = FakeAccountStash::empty();
+        let service = "Sessiometer/11111111-1111-1111-1111-111111111111";
+        let account = StashedAccount {
+            credential: Credential::new(b"raw-token".to_vec()),
+            oauth_account: OauthAccount::from_object_bytes(br#"{"accountUuid":"u-1"}"#).unwrap(),
+        };
+        stash.write(service, &account).await.unwrap();
+        assert!(stash.contains(service));
+
+        // Delete removes the stash, and reads now report it absent.
+        stash.delete(service).await.unwrap();
+        assert!(!stash.contains(service));
+        assert!(matches!(
+            stash.read(service).await,
+            Err(Error::StashIncomplete { .. })
+        ));
+
+        // Deleting an already-absent service is a no-op success (idempotent).
+        stash.delete(service).await.unwrap();
     }
 
     /// Drives the real `security` CLI end-to-end against a throwaway keychain
@@ -625,6 +730,34 @@ mod tests {
                     .await,
                 Err(Error::StashIncomplete { .. })
             ));
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn delete_removes_both_halves_and_is_idempotent() {
+            let (_dir, kc) = fresh_keychain();
+            let stash = RealAccountStash::for_keychain(kc.clone());
+            let service = "Sessiometer/33333333-3333-3333-3333-333333333333";
+            let account = StashedAccount {
+                credential: Credential::new(b"raw-token".to_vec()),
+                oauth_account: OauthAccount::from_object_bytes(
+                    br#"{"accountUuid":"33333333-3333-3333-3333-333333333333"}"#,
+                )
+                .unwrap(),
+            };
+            stash.write(service, &account).await.expect("write stash");
+            stash.read(service).await.expect("stash present");
+
+            // Delete drops both halves: a subsequent read reports the stash gone.
+            stash.delete(service).await.expect("delete stash");
+            assert!(matches!(
+                stash.read(service).await,
+                Err(Error::StashIncomplete { .. })
+            ));
+
+            // Re-deleting an already-absent stash succeeds (each half's not-found
+            // maps to Ok) — removal is safe to re-run.
+            stash.delete(service).await.expect("idempotent re-delete");
             delete(&kc);
         }
 

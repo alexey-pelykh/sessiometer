@@ -7,10 +7,12 @@
 //! [`SwapDecision`] (the poll loop's per-tick verdict), and [`swap`] is the
 //! out-of-band swap **engine** that *acts* on a decision — the callable unit that
 //! rotates the active credential from one account to another. The poll→decision
-//! loop that calls them (#7), cooldown / terminal state (#10 / #11) and the
-//! Monitor-401 re-stash trigger (#13) wire this engine in; the engine itself is
-//! account-identity-agnostic, moving blobs between stashes and the canonical
-//! keychain item addressed only by `Sessiometer/<account_uuid>` stash-service name.
+//! loop that calls them (#7) and the cooldown / terminal state (#10 / #11) wire
+//! this engine in; the engine itself is account-identity-agnostic, moving blobs
+//! between stashes and the canonical keychain item addressed only by
+//! `Sessiometer/<account_uuid>` stash-service name. (Issue #13's re-auth re-stash
+//! is a sibling path: it refreshes a single stash through the same `AccountStash`
+//! seam on a detected canonical change, without driving this swap engine.)
 //!
 //! ## The swap sequence (outgoing A → incoming B, one tick, this order)
 //!
@@ -392,6 +394,13 @@ mod tests {
                     .ok_or(Error::StashIncomplete {
                         service: service.to_owned(),
                     })
+            }
+            async fn delete(&self, service: &str) -> Result<()> {
+                self.log
+                    .borrow_mut()
+                    .push(format!("delete-stash:{service}"));
+                self.items.borrow_mut().remove(service);
+                Ok(())
             }
         }
 
