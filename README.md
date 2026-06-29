@@ -38,7 +38,7 @@ sessiometer capture
 #    to the next account before the current one is exhausted:
 sessiometer run
 
-# 3. Check the roster and the last swap at any time:
+# 3. Check the roster and the next swap candidate at any time:
 sessiometer status
 ```
 
@@ -53,7 +53,7 @@ ACCOUNT  SESSION  WEEKLY  RESETS  STATUS
   spare  10%      20%     1h12m
   dead   n/a      n/a     n/a     needs re-login
 
-last swap: work (2m ago)
+next swap: spare
 ```
 
 - `*` marks the **active** account.
@@ -68,6 +68,14 @@ last swap: work (2m ago)
 - `STATUS` carries inline tags — `disabled` (parked, issue #36) and
   `needs re-login` (a dead credential, issue #42); the column is omitted when no
   account carries a tag.
+
+The **`next swap:`** footer names the account the daemon would rotate to next — the
+viable target whose weekly quota resets soonest. It reads `none (no viable target)`
+when every other account is weekly-exhausted (or over the opt-in swap-target session
+floor), and `none (awaiting usage data)` right after the daemon starts, before it has
+polled the other accounts. It is **forward-looking** and recomputed every cycle, so —
+unlike a remembered "last swap" — it survives a daemon restart and always shows where
+the next rotation will land.
 
 On a terminal too narrow for the full table the lowest-priority columns drop in
 order — `WEEKLY` first, then `STATUS` — never wrapping a row; `ACCOUNT`,
@@ -94,7 +102,7 @@ sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
 ```
 
 The output is sourced solely from non-secret fields (labels, percentages, reset
-instants, a swap age), so it never prints a token or email (issue #15).
+instants, a next-swap candidate label), so it never prints a token or email (issue #15).
 
 ## Watching the daemon (diagnostics)
 

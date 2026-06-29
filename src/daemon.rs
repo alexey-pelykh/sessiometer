@@ -58,9 +58,10 @@
 //!   *between* ticks, so an in-flight swap always runs to completion (#6 is
 //!   no-half-swap): complete-or-abort, never a torn swap.
 //!
-//! The minimal `last_swap` shown by `status` (the handle swapped to + a relative
-//! age) is surfaced here (#8), and every swap / all-exhausted / token-rejection /
-//! lock-wait is recorded to the structured event log (#9, via
+//! The forward-looking `next_swap` candidate shown by `status` (the account the
+//! daemon would rotate to next, #88) is computed here, and every swap /
+//! all-exhausted / token-rejection / lock-wait is recorded to the structured event
+//! log (#9, via
 //! [`crate::observability`]). The post-swap cooldown that bounds oscillation (#10)
 //! is wired into the decision below — a re-swap is refused until the per-cycle
 //! jittered cooldown has elapsed, and the swap-target session floor is opt-in (off
@@ -399,10 +400,11 @@ impl InstanceLock {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StatusSnapshot {
     pub(crate) accounts: Vec<AccountReading>,
-    /// The most recent swap as of this cycle (issue #8), or `None` until the
-    /// first. Already projected to a relative age; [`status_response`] copies it
-    /// straight onto the wire.
-    pub(crate) last_swap: Option<LastSwapLine>,
+    /// The next swap candidate as of this cycle (issue #88): who [`pick_target`]
+    /// would rotate the active session to, or why there is no candidate. Computed
+    /// daemon-side ([`Daemon::next_swap`]); [`status_response`] copies it straight
+    /// onto the wire. `None` only when there is no active anchor to swap from.
+    pub(crate) next_swap: Option<NextSwap>,
 }
 
 /// One account's latest reading.
@@ -427,16 +429,19 @@ pub(crate) struct AccountReading {
     pub(crate) usage: Option<Usage>,
 }
 
-/// The control socket's `status` reply — handles + percentages + a minimal
-/// `last_swap`, and nothing else (issue #15: never a token or email). Derives
-/// both `Serialize` (the daemon writes it) and `Deserialize` (the `status` client
-/// reads it), so this one definition is the whole wire contract. The richer
-/// swap-history event-log view is #9.
+/// The control socket's `status` reply — handles + percentages + the forward-looking
+/// `next_swap` candidate, and nothing else (issue #15: never a token or email).
+/// Derives both `Serialize` (the daemon writes it) and `Deserialize` (the `status`
+/// client reads it), so this one definition is the whole wire contract. The durable,
+/// timestamped swap HISTORY remains the event-log view (#9), not `status`.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StatusResponse {
     pub(crate) accounts: Vec<AccountStatusLine>,
-    /// The most recent swap, or `null` if none has happened this run.
-    pub(crate) last_swap: Option<LastSwapLine>,
+    /// The next swap candidate (issue #88), or `null` when there is no active anchor
+    /// to swap from. `#[serde(default)]` per the added-field convention (cf.
+    /// `session_resets_at`): a pre-#88 daemon that omits the field decodes to `None`.
+    #[serde(default)]
+    pub(crate) next_swap: Option<NextSwap>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -475,17 +480,28 @@ pub(crate) struct AccountStatusLine {
     pub(crate) weekly_exhausted: bool,
 }
 
-/// The minimal `last_swap` shown by `status` (issue #8): the handle swapped TO
-/// and a relative age (`secs_ago`, computed as of the last poll). Non-secret by
-/// construction — a label + an integer, never a token or email (issue #15). The
-/// swap *history* (richer records) is #9. One serializable type for both
-/// [`StatusSnapshot`] (built each cycle) and [`StatusResponse`] (the wire).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct LastSwapLine {
-    /// The label of the account swapped TO — never the email (issue #15).
-    pub(crate) to: String,
-    /// Whole seconds since the swap completed, as of the last poll.
-    pub(crate) secs_ago: u64,
+/// The next swap candidate shown by `status` (issue #88): who the daemon would
+/// rotate the active session TO if a swap fired right now. DERIVED state —
+/// recomputed each cycle from the latest readings — so, unlike the dropped in-process
+/// `last_swap` (#8), it survives a daemon restart by construction and never reads
+/// `none` merely because the process is young. Non-secret by construction: a roster
+/// label or a bare reason, never a token or email (issue #15). One serializable type
+/// for both [`StatusSnapshot`] (built each cycle) and [`StatusResponse`] (the wire),
+/// mirroring the redaction posture of the now-removed `LastSwapLine`. Internally
+/// tagged (`state`), so the three cases stay one self-describing field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub(crate) enum NextSwap {
+    /// A viable target exists — [`pick_target`]'s choice, by roster label.
+    Target { to: String },
+    /// [`pick_target`] found nothing viable with readings in hand: every other
+    /// enabled account is weekly-exhausted or over the session floor, or there is no
+    /// other enabled account.
+    NoViableTarget,
+    /// No usable reading for any other enabled account yet — the post-restart moment,
+    /// before the staggered poll loop has read the rotation. Kept distinct from
+    /// `NoViableTarget` because it is exactly the moment an operator checks `status`.
+    AwaitingData,
 }
 
 /// The `{"cmd": "..."}` control request.
@@ -513,9 +529,8 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 weekly_exhausted: account.weekly_exhausted,
             })
             .collect(),
-        // Already computed (a label + a relative age) at snapshot build; copy it
-        // to the wire (issue #8).
-        last_swap: snapshot.last_swap.clone(),
+        // Already computed at snapshot build (issue #88); copy it to the wire.
+        next_swap: snapshot.next_swap.clone(),
     }
 }
 
@@ -707,16 +722,14 @@ pub(crate) struct TickOutcome {
     pub(crate) next_wait: Option<Duration>,
 }
 
-/// The last swap the loop performed: the handle swapped TO and when. One record
-/// serves two readers — the cooldown floor (its `at`) and the `status` display
-/// (#8, projected to a [`LastSwapLine`] at snapshot time).
+/// When the loop last performed a swap. Drives the post-swap cooldown floor (its
+/// `at`); the forward-looking `status` candidate is computed fresh from readings
+/// (#88's `next_swap`), so this record no longer feeds the display.
 #[derive(Debug, Clone)]
 struct LastSwap {
-    /// Label of the account swapped TO (non-secret; issue #15).
-    to: String,
-    /// When the swap completed — monotonic, so it is both the cooldown floor and
-    /// the base for the `status` "seconds ago". Process-local: never serialized
-    /// directly (an [`Instant`] is meaningless across the socket).
+    /// When the swap completed — monotonic, so it is the cooldown floor.
+    /// Process-local: never serialized directly (an [`Instant`] is meaningless across
+    /// the socket).
     at: Instant,
 }
 
@@ -756,11 +769,11 @@ struct DecisionState {
     /// Roster index of the active account, resolved once and updated on each
     /// swap. `None` until first resolved (then the loop polls but never swaps).
     active: Option<usize>,
-    /// The last swap performed, or `None` until the first. Drives both the
-    /// post-swap cooldown (anti-oscillation, #10): a re-swap is refused until this
-    /// cycle's jittered `cooldown` has elapsed since this swap, so two
-    /// near-exhausted accounts cannot ping-pong — and the minimal `last_swap`
-    /// shown by `status` (#8).
+    /// The last swap performed, or `None` until the first. Drives the post-swap
+    /// cooldown (anti-oscillation, #10): a re-swap is refused until this cycle's
+    /// jittered `cooldown` has elapsed since this swap, so two near-exhausted accounts
+    /// cannot ping-pong. (The forward-looking `status` candidate is #88's `next_swap`,
+    /// computed fresh from readings — not this record.)
     last_swap: Option<LastSwap>,
     /// Per-account health carried across ticks (issue #42), indexed by roster
     /// position: the consecutive-401 streak (feeding the `monitor_401` log event and
@@ -1045,7 +1058,7 @@ where
         // changed out-of-band, #13), and the active resolution below. A locked
         // keychain is the one outcome that short-circuits the entire tick.
         let canonical = match self.store.read().await {
-            Err(Error::KeychainLocked { .. }) => return self.locked_tick(at),
+            Err(Error::KeychainLocked { .. }) => return self.locked_tick(),
             Ok(canonical) => {
                 // Readable: clear any lock back-off and re-arm the edge-triggered
                 // lock signal, then heal an out-of-band canonical change (#13).
@@ -1154,7 +1167,7 @@ where
             decision: action.decision_class(),
             backoff_secs: next_wait.map(|wait| wait.as_secs()),
         });
-        let snapshot = self.snapshot(at, active, &readings);
+        let snapshot = self.snapshot(active, &readings);
         TickOutcome {
             action,
             events,
@@ -1268,7 +1281,7 @@ where
     /// `signaled_keychain_locked`), not every backed-off retry. The daemon NEVER
     /// auto-unlocks or prompts — a locked keychain is the operator's to open; a
     /// non-interactive read just fails (exit 36), and the daemon waits it out.
-    fn locked_tick(&mut self, at: Instant) -> TickOutcome {
+    fn locked_tick(&mut self) -> TickOutcome {
         let mut events = Vec::new();
         if !self.state.signaled_keychain_locked {
             events.push(Event::KeychainLockedWait);
@@ -1283,9 +1296,10 @@ where
         self.state.lock_backoff = Some(backoff);
         // Build an all-absent snapshot so the control socket keeps answering while
         // locked: every reading is unavailable (the keychain is unreadable), but
-        // `status` still lists the roster and the last swap rather than going dark.
+        // `status` still lists the roster rather than going dark. With no readings the
+        // next-swap candidate is `awaiting usage data` (#88), which is exactly true.
         let readings = vec![None; self.roster.len()];
-        let snapshot = self.snapshot(at, self.state.active, &readings);
+        let snapshot = self.snapshot(self.state.active, &readings);
         // Diagnostic (issue #77): a locked tick polls NOTHING (it short-circuits
         // before the poll loop), so there are no per-poll lines — just the decision
         // line naming the deferral and the back-off wait it imposed.
@@ -1645,10 +1659,7 @@ where
     /// the normal swap and the emergency swap (#42).
     async fn record_swap(&mut self, target_idx: usize, incoming: &str, at: Instant) {
         self.state.active = Some(target_idx);
-        self.state.last_swap = Some(LastSwap {
-            to: self.roster[target_idx].label.clone(),
-            at,
-        });
+        self.state.last_swap = Some(LastSwap { at });
         if let Ok(incoming_stashed) = self.stash.read(incoming).await {
             self.state
                 .canonical_watch
@@ -1700,16 +1711,10 @@ where
             self.state.active = self.resolve_account_for(&canonical).await;
             self.state.canonical_watch.commit(&canonical);
         }
-        // Record it as the latest swap: arms the cooldown (#10) and updates the
-        // `status` last_swap (#8). The label is best-effort (status only); the
-        // cooldown arming is what makes the choice stick, so it happens even when
-        // the active account could not be resolved just now.
-        let to = self
-            .state
-            .active
-            .map(|idx| self.roster[idx].label.clone())
-            .unwrap_or_default();
-        self.state.last_swap = Some(LastSwap { to, at });
+        // Record it as the latest swap: arms the cooldown (#10). The cooldown arming
+        // is what makes a manual choice stick, so it happens even when the active
+        // account could not be resolved just now.
+        self.state.last_swap = Some(LastSwap { at });
     }
 
     /// Emergency-swap away from a confirmed-DEAD active account (issue #42): the live
@@ -1768,14 +1773,56 @@ where
         }
     }
 
+    /// The forward-looking next-swap candidate for the `status` display (issue #88):
+    /// who [`pick_target`] would choose right now, or why there is no candidate. THE
+    /// candidate is computed daemon-side — the CLI never re-derives the selection rule
+    /// (it cannot: the wire carries only rounded percents, not the raw `Usage` /
+    /// `session_floor` / `weekly_trigger` `pick_target` consumes). Uses the BASE
+    /// (un-jittered) weekly trigger [`Self::weekly_trigger_base`] — the same threshold
+    /// the snapshot's per-account `weekly_exhausted` flag keys off — so the candidate
+    /// and the displayed exhaustion state can never disagree, and the candidate does
+    /// not flicker with the per-cycle swap-decision jitter.
+    ///
+    /// `None` only when there is no active account to swap FROM (no anchor). Otherwise
+    /// the three cases mirror `pick_target`'s verdict: a viable [`NextSwap::Target`], a
+    /// [`NextSwap::NoViableTarget`] when readings are in hand but none qualifies (or no
+    /// other account is enabled), and [`NextSwap::AwaitingData`] for the post-restart
+    /// moment when no other enabled account has a reading yet — the distinction #88
+    /// exists to draw.
+    fn next_swap(&self, active: Option<usize>, readings: &[Option<Usage>]) -> Option<NextSwap> {
+        let active_idx = active?;
+        let enabled = self.enabled_mask();
+        if let Some(target) = pick_target(
+            active_idx,
+            readings,
+            &enabled,
+            self.session_floor,
+            self.weekly_trigger_base,
+        ) {
+            return Some(NextSwap::Target {
+                to: self.roster[target].label.clone(),
+            });
+        }
+        // No viable target. Distinguish the post-restart "no readings yet" case (some
+        // other enabled account exists, but none has been polled) from a genuine "all
+        // exhausted / none enabled" verdict — drawing that line is the point of #88.
+        let mut any_other_enabled = false;
+        let mut all_unpolled = true;
+        for (i, reading) in readings.iter().enumerate() {
+            if i != active_idx && enabled[i] {
+                any_other_enabled = true;
+                all_unpolled &= reading.is_none();
+            }
+        }
+        Some(if any_other_enabled && all_unpolled {
+            NextSwap::AwaitingData
+        } else {
+            NextSwap::NoViableTarget
+        })
+    }
+
     /// Build the non-secret per-account snapshot for the event log and the socket.
-    /// `at` (this cycle's instant) is the base for the `last_swap` relative age.
-    fn snapshot(
-        &self,
-        at: Instant,
-        active: Option<usize>,
-        readings: &[Option<Usage>],
-    ) -> StatusSnapshot {
+    fn snapshot(&self, active: Option<usize>, readings: &[Option<Usage>]) -> StatusSnapshot {
         StatusSnapshot {
             accounts: self
                 .roster
@@ -1794,13 +1841,10 @@ where
                     usage: readings[i],
                 })
                 .collect(),
-            // Project the monotonic last-swap record to a relative age as of this
-            // cycle (issue #8); sourced from a label only, so no token/email can
+            // The forward-looking next-swap candidate (issue #88), computed from the
+            // same raw readings; sourced from a label only, so no token/email can
             // reach it (issue #15).
-            last_swap: self.state.last_swap.as_ref().map(|swap| LastSwapLine {
-                to: swap.to.clone(),
-                secs_ago: at.saturating_duration_since(swap.at).as_secs(),
-            }),
+            next_swap: self.next_swap(active, readings),
         }
     }
 
@@ -3107,8 +3151,9 @@ mod tests {
         // Tick 1 polls the active `work` first (issue #80 stagger), below its trigger.
         let first = daemon.tick().await;
         assert_eq!(first.action, TickAction::Held);
-        // No swap has happened, so `status` would show `last swap: none`.
-        assert!(first.snapshot.last_swap.is_none());
+        // No swap has happened, and only the active account has been polled this tick
+        // (#80 stagger) — so the next-swap candidate is `awaiting usage data` (#88).
+        assert_eq!(first.snapshot.next_swap, Some(NextSwap::AwaitingData));
         assert!(daemon
             .store
             .read()
@@ -4364,7 +4409,6 @@ mod tests {
         // Simulate a swap that just happened: active A, last swap at "now".
         daemon.state.active = Some(0);
         daemon.state.last_swap = Some(LastSwap {
-            to: "spare".to_owned(),
             at: daemon.clock.now(),
         });
         daemon.clock.advance(Duration::from_secs(10)); // still within the 100s cooldown
@@ -4409,7 +4453,6 @@ mod tests {
         );
         daemon.state.active = Some(0);
         daemon.state.last_swap = Some(LastSwap {
-            to: "spare".to_owned(),
             at: daemon.clock.now(),
         });
         daemon.clock.advance(Duration::from_secs(150)); // past the 100s cooldown
@@ -4520,7 +4563,6 @@ mod tests {
         // Adoption armed the cooldown (last_swap at "now") and re-resolved active to B.
         assert_eq!(daemon.state.active, Some(1));
         let armed = daemon.state.last_swap.as_ref().expect("cooldown armed");
-        assert_eq!(armed.to, "spare");
         assert_eq!(armed.at, daemon.clock.now());
 
         daemon.clock.advance(Duration::from_secs(10)); // within the 100s cooldown
@@ -4853,7 +4895,6 @@ mod tests {
             .with_seed(seed);
             daemon.state.active = Some(0);
             daemon.state.last_swap = Some(LastSwap {
-                to: "spare".to_owned(),
                 at: daemon.clock.now(),
             });
             daemon.clock.advance(Duration::from_secs(100));
@@ -4976,7 +5017,10 @@ mod tests {
                     usage: None,
                 },
             ],
-            last_swap: None,
+            // A viable candidate rides the wire as a label (#88).
+            next_swap: Some(NextSwap::Target {
+                to: "spare".to_owned(),
+            }),
         };
         let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
         assert!(json.contains("\"label\":\"work\""));
@@ -4987,10 +5031,13 @@ mod tests {
         assert!(json.contains("\"weekly_pct\":40"));
         // The unavailable account reports null, not a fabricated 0.
         assert!(json.contains("\"session_pct\":null"));
-        // No swap yet → the wire carries an explicit null, never a fabricated entry.
-        assert!(json.contains("\"last_swap\":null"));
-        // Issue #15: the projection sources only labels + percentages, so neither
-        // an email nor a token can ever reach the wire.
+        // The next-swap candidate is projected as a label (#88); `last_swap` is gone.
+        assert!(json.contains("\"next_swap\":"));
+        assert!(json.contains("\"state\":\"target\""));
+        assert!(json.contains("\"to\":\"spare\""));
+        assert!(!json.contains("last_swap"));
+        // Issue #15: the projection sources only labels + percentages, so neither an
+        // email nor a token can ever reach the wire — the new candidate included.
         assert!(!json.contains('@'));
         assert!(!json.to_lowercase().contains("token"));
     }
@@ -5013,7 +5060,7 @@ mod tests {
                     session_resets_at: None,
                 }),
             }],
-            last_swap: None,
+            next_swap: None,
         };
         let (mut client, server) = tokio::io::duplex(1024);
         client.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
@@ -5114,23 +5161,50 @@ mod tests {
         );
     }
 
-    // --- last_swap + swap report (issue #8) --------------------------------
+    // --- next_swap candidate (issue #88) + swap report ---------------------
 
     #[test]
-    fn status_response_projects_a_present_last_swap_without_a_secret() {
-        let snapshot = StatusSnapshot {
+    fn status_response_projects_the_next_swap_candidate_and_drops_last_swap() {
+        // A viable candidate projects as a label (#88), never a token/email (#15).
+        let target = StatusSnapshot {
             accounts: vec![],
-            last_swap: Some(LastSwapLine {
+            next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
-                secs_ago: 125,
             }),
         };
-        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        let json = serde_json::to_string(&status_response(&target)).unwrap();
+        assert!(json.contains("\"next_swap\":"), "got {json}");
+        assert!(json.contains("\"state\":\"target\""), "got {json}");
         assert!(json.contains("\"to\":\"spare\""), "got {json}");
-        assert!(json.contains("\"secs_ago\":125"), "got {json}");
-        // #15: a label + an integer only — never an email or token sigil.
+        // #15: a label only — never an email or token sigil.
         assert!(!json.contains('@'));
         assert!(!json.to_lowercase().contains("token"));
+
+        // The two no-candidate verdicts project as bare reasons (no label at all), so
+        // the client can tell `no viable target` from `awaiting usage data`.
+        let no_target = StatusSnapshot {
+            accounts: vec![],
+            next_swap: Some(NextSwap::NoViableTarget),
+        };
+        assert!(serde_json::to_string(&status_response(&no_target))
+            .unwrap()
+            .contains("\"next_swap\":{\"state\":\"no_viable_target\"}"));
+        let awaiting = StatusSnapshot {
+            accounts: vec![],
+            next_swap: Some(NextSwap::AwaitingData),
+        };
+        assert!(serde_json::to_string(&status_response(&awaiting))
+            .unwrap()
+            .contains("\"next_swap\":{\"state\":\"awaiting_data\"}"));
+
+        // No anchor → null candidate; and the dropped `last_swap` field never appears.
+        let none = StatusSnapshot {
+            accounts: vec![],
+            next_swap: None,
+        };
+        let json = serde_json::to_string(&status_response(&none)).unwrap();
+        assert!(json.contains("\"next_swap\":null"), "got {json}");
+        assert!(!json.contains("last_swap"), "got {json}");
     }
 
     #[test]
@@ -5154,7 +5228,7 @@ mod tests {
                     usage: None,
                 },
             ],
-            last_swap: None,
+            next_swap: None,
         };
         let outcome = |action| TickOutcome {
             action,
@@ -5181,50 +5255,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_carries_last_swap_with_a_relative_age_after_a_swap() {
-        // Once warmed up (issue #80: both accounts polled once across the staggered
-        // cycle), A is over the trigger → swap to B; the snapshot reports the swap at
-        // age 0 (the clock has not advanced during warm-up since it is frozen).
-        // Advance the clock; the next tick holds (B is fresh) but the snapshot still
-        // reports the swap, now aged by the elapsed time.
-        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
-        let store = store_holding(b"A-token").await;
-        let stash = stash_with(&[
-            ("Sessiometer/u-A", b"A-token", "u-A"),
-            ("Sessiometer/u-B", b"B-token", "u-B"),
-        ])
-        .await;
-        let (_dir, json) = claude_json("u-A");
-        // After the swap, B is active; keep B below the trigger so the next tick holds.
-        let poller = FakeRosterPoller::new()
-            .ok("u-A", 0.97, 0.40)
-            .ok("u-B", 0.10, 0.10);
-        let tun = tunables(95, 80, 0);
-        let mut daemon: FakeDaemon = Daemon::new(
-            roster,
-            poller,
-            store,
-            stash,
-            FakeClock::frozen(),
-            json,
-            &tun,
+    async fn next_swap_classifies_the_candidate_from_the_readings() {
+        // The daemon-side candidate (#88) IS `pick_target` mapped to a label, plus the
+        // two no-candidate verdicts the wire must distinguish. Reuses the 3-account
+        // harness (work=0, spare=1, backup=2; session_floor 0.80, weekly_trigger_base
+        // 0.98). This pins the projection/classification wrapper — `pick_target`'s own
+        // selection logic is covered by its dedicated suite above.
+        let daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let usage = |session: f64, weekly: f64| {
+            Some(Usage {
+                session,
+                weekly,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            })
+        };
+
+        // Viable target → the choice mapped to a label. spare and backup are both under
+        // the floor and weekly-viable; with no known reset the tie falls to the earliest
+        // roster index (spare), mirroring `pick_target`.
+        assert_eq!(
+            daemon.next_swap(
+                Some(0),
+                &[usage(0.97, 0.40), usage(0.10, 0.10), usage(0.20, 0.10)]
+            ),
+            Some(NextSwap::Target {
+                to: "spare".to_owned()
+            }),
         );
 
-        let first = warmed_tick(&mut daemon).await;
-        assert_eq!(first.action, TickAction::Swapped { from: 0, to: 1 });
-        let swap = first.snapshot.last_swap.expect("a swap was recorded");
-        assert_eq!(swap.to, "spare");
-        assert_eq!(swap.secs_ago, 0);
+        // Readings in hand but none viable (both over the 0.80 session floor) → a
+        // genuine no-viable-target verdict, NOT awaiting-data.
+        assert_eq!(
+            daemon.next_swap(
+                Some(0),
+                &[usage(0.97, 0.40), usage(0.95, 0.10), usage(0.90, 0.10)]
+            ),
+            Some(NextSwap::NoViableTarget),
+        );
 
-        daemon.clock.advance(Duration::from_secs(125));
-        let second = daemon.tick().await;
-        assert_eq!(second.action, TickAction::Held);
-        let swap = second
-            .snapshot
-            .last_swap
-            .expect("the swap is still reported");
-        assert_eq!(swap.to, "spare");
-        assert_eq!(swap.secs_ago, 125);
+        // Every other account weekly-exhausted (>= 0.98 base) → no viable target.
+        assert_eq!(
+            daemon.next_swap(
+                Some(0),
+                &[usage(0.97, 0.40), usage(0.10, 0.99), usage(0.10, 0.99)]
+            ),
+            Some(NextSwap::NoViableTarget),
+        );
+
+        // No reading for any other account yet — the post-restart moment #88 exists to
+        // surface distinctly.
+        assert_eq!(
+            daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
+            Some(NextSwap::AwaitingData),
+        );
+
+        // No active anchor to swap from → no candidate at all (renders a bare `none`).
+        assert_eq!(
+            daemon.next_swap(None, &[usage(0.97, 0.40), None, None]),
+            None
+        );
     }
 
     // --- single-instance lock ----------------------------------------------
@@ -5390,12 +5480,10 @@ mod tests {
         // The signal reached `adopt_manual_swap` through the idle select: it
         // re-resolved active from the canonical (A) and armed the cooldown — the only
         // way `last_swap` is Some after a holds-only run.
-        let armed = daemon
-            .state
-            .last_swap
-            .as_ref()
-            .expect("the ManualSwapped signal must arm the cooldown via adoption");
-        assert_eq!(armed.to, "work");
+        assert!(
+            daemon.state.last_swap.is_some(),
+            "the ManualSwapped signal must arm the cooldown via adoption"
+        );
         assert_eq!(daemon.state.active, Some(0));
     }
 
@@ -5944,7 +6032,6 @@ mod tests {
         daemon.state.active = Some(0);
         daemon.state.health[0].quarantined = true;
         daemon.state.last_swap = Some(LastSwap {
-            to: "work".to_owned(),
             at, // zero elapsed against a 9_999s cooldown → a normal swap would defer
         });
 

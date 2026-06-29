@@ -1196,7 +1196,7 @@ mod tests {
                 status_line("work", false, false, Some(20)),
                 status_line("spare", false, false, Some(10)),
             ],
-            last_swap: None,
+            next_swap: None,
         };
         assert_eq!(
             cached_viability_for(&unique, "spare"),
@@ -1212,7 +1212,7 @@ mod tests {
                 status_line("dup", false, false, Some(10)),
                 status_line("dup", true, false, None),
             ],
-            last_swap: None,
+            next_swap: None,
         };
         assert_eq!(cached_viability_for(&duped, "dup"), None);
     }
@@ -1525,7 +1525,7 @@ mod tests {
                 status_line("work", false, false, Some(20)),
                 status_line("spare", false, false, Some(10)),
             ],
-            last_swap: None,
+            next_swap: None,
         };
         let wire = serde_json::to_string(&response).unwrap();
         // Server: accept one connection, expect the status request, reply once.
