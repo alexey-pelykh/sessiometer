@@ -75,6 +75,17 @@ order — `WEEKLY` first, then `STATUS` — never wrapping a row; `ACCOUNT`,
 a TTY) always keeps the full table, so `sessiometer status | grep work` stays
 complete.
 
+On an interactive terminal each account row is **color-coded by urgency** —
+**green** (healthy, plenty of quota), **yellow** (getting depleted, or heavily
+used but about to reset), **red** (heavily used and not about to reset). The
+color reflects both how *much* is used and how *soon* the account resets; it
+**augments** the row — every percentage and `RESETS` value is fully readable
+without it — and is never the only signal. Color is emitted **only** on an
+interactive TTY: it is suppressed when output is piped or redirected, when
+`--no-color` is passed, or when `NO_COLOR`, `CLICOLOR=0`, or `TERM=dumb` is set
+in the environment — so an escape sequence never reaches a pipe, a redirect, or a
+log.
+
 For the full data regardless of terminal width — both reset instants as raw
 epoch seconds, for scripting — use `--json`:
 
