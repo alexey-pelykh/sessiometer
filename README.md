@@ -42,6 +42,49 @@ sessiometer run
 sessiometer status
 ```
 
+## Checking status
+
+`sessiometer status` queries the running daemon and prints each account as one
+row of an aligned, border-less table — greppable, one record per line:
+
+```text
+ACCOUNT  SESSION  WEEKLY  RESETS  STATUS
+* work   97%      40%     4h
+  spare  10%      20%     1h12m
+  dead   n/a      n/a     n/a     needs re-login
+
+last swap: work (2m ago)
+```
+
+- `*` marks the **active** account.
+- `SESSION` / `WEEKLY` are the last-polled usage percentages (`n/a` when the last
+  poll for that account failed — never a fabricated `0`).
+- **`RESETS`** is the compact time until the account next regains capacity —
+  shown for **every** account, not only an exhausted one. Normally this is the
+  rolling 5-hour **session** window's reset (e.g. `12m`, `4h`); when an account's
+  **weekly** window is exhausted it is blocked for longer, so `RESETS` shows the
+  **weekly** reset instead (e.g. `3d4h`). `n/a` when the governing reset is
+  unknown.
+- `STATUS` carries inline tags — `disabled` (parked, issue #36) and
+  `needs re-login` (a dead credential, issue #42); the column is omitted when no
+  account carries a tag.
+
+On a terminal too narrow for the full table the lowest-priority columns drop in
+order — `WEEKLY` first, then `STATUS` — never wrapping a row; `ACCOUNT`,
+`SESSION`, and `RESETS` are always kept. Output that is piped or redirected (not
+a TTY) always keeps the full table, so `sessiometer status | grep work` stays
+complete.
+
+For the full data regardless of terminal width — both reset instants as raw
+epoch seconds, for scripting — use `--json`:
+
+```sh
+sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
+```
+
+The output is sourced solely from non-secret fields (labels, percentages, reset
+instants, a swap age), so it never prints a token or email (issue #15).
+
 ## Switching the active account
 
 Switch the active account **on demand**, without waiting for the daemon to swap

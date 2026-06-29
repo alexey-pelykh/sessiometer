@@ -596,6 +596,7 @@ mod tests {
                     session: 0.10,
                     weekly,
                     weekly_resets_at: None,
+                    session_resets_at: None,
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),

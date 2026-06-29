@@ -92,9 +92,17 @@ pub(crate) struct Usage {
     /// parseable timestamp; `None` otherwise. The all-exhausted terminal logic
     /// (issue #11) consumes it: when every account is weekly-exhausted the daemon
     /// holds on the account whose weekly window resets soonest. Only the weekly
-    /// dimension is projected here — the weekly window is the hard limit whose
-    /// reset actually ends the all-exhausted state.
+    /// dimension drives that terminal signal — the weekly window is the hard limit
+    /// whose reset actually ends the all-exhausted state.
     pub(crate) weekly_resets_at: Option<i64>,
+    /// Epoch seconds at which the rolling 5-hour SESSION window resets, when the
+    /// API reported a parseable timestamp; `None` otherwise. Carried so `status`
+    /// can show a per-account "resets in" (issue #72): in normal rotation an
+    /// account is session-exhausted (out for hours) while its weekly window is
+    /// fine, so the SESSION reset — not the weekly one — is when it becomes usable
+    /// again. The swap-decision loop ignores it (the terminal signal keys off the
+    /// weekly reset above); it exists purely for the `status` display.
+    pub(crate) session_resets_at: Option<i64>,
 }
 
 /// The full parse of a usage response: both dimensions plus each window's reset
@@ -109,10 +117,9 @@ struct UsageReport {
     session: f64,
     weekly: f64,
     /// Raw `resets_at` of the session window, as the API rendered it (ISO string
-    /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Extracted
-    /// for completeness; no consumer needs the session reset yet (the terminal
-    /// logic keys off the weekly window), so it stays unread.
-    #[allow(dead_code)]
+    /// or epoch-as-string); tolerant — `None` if absent/unrecognized. Projected to
+    /// epoch seconds by [`to_usage`](UsageReport::to_usage) for the `status`
+    /// per-account "resets in" display (issue #72).
     session_resets_at: Option<String>,
     /// Raw `resets_at` of the weekly window (see `session_resets_at`). Projected
     /// to epoch seconds by [`to_usage`](UsageReport::to_usage) for the
@@ -122,15 +129,21 @@ struct UsageReport {
 
 impl UsageReport {
     /// The swap-decision projection: the two usage dimensions the loop acts on,
-    /// plus the weekly reset normalized to epoch seconds (issue #11) so the
-    /// all-exhausted logic can compare reset times across accounts. A weekly
-    /// reset the API did not supply — or that does not parse — projects to `None`.
+    /// plus each window's reset normalized to epoch seconds. The weekly reset feeds
+    /// the all-exhausted logic (issue #11) so it can compare reset times across
+    /// accounts; the session reset feeds the `status` "resets in" display (issue
+    /// #72). A reset the API did not supply — or that does not parse — projects to
+    /// `None`.
     fn to_usage(&self) -> Usage {
         Usage {
             session: self.session,
             weekly: self.weekly,
             weekly_resets_at: self
                 .weekly_resets_at
+                .as_deref()
+                .and_then(epoch_from_resets_at),
+            session_resets_at: self
+                .session_resets_at
                 .as_deref()
                 .and_then(epoch_from_resets_at),
         }
@@ -751,20 +764,26 @@ mod tests {
     }
 
     #[test]
-    fn to_usage_normalizes_the_weekly_reset_to_epoch() {
+    fn to_usage_normalizes_both_resets_to_epoch() {
         let report = UsageReport {
             session: 0.1,
             weekly: 0.2,
             session_resets_at: Some("2025-01-01T00:00:00Z".to_owned()),
             weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
         };
-        assert_eq!(report.to_usage().weekly_resets_at, Some(1_750_960_800));
-        // An absent weekly reset projects to None (no fabricated value).
+        let usage = report.to_usage();
+        assert_eq!(usage.weekly_resets_at, Some(1_750_960_800));
+        // Both windows' resets are projected for the `status` display (issue #72).
+        assert_eq!(usage.session_resets_at, Some(1_735_689_600));
+        // An absent reset (either window) projects to None (no fabricated value).
         let no_reset = UsageReport {
+            session_resets_at: None,
             weekly_resets_at: None,
             ..report.clone()
         };
-        assert_eq!(no_reset.to_usage().weekly_resets_at, None);
+        let usage = no_reset.to_usage();
+        assert_eq!(usage.weekly_resets_at, None);
+        assert_eq!(usage.session_resets_at, None);
     }
 
     // --- access_token_from_blob (pure) ---
