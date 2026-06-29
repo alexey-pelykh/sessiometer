@@ -494,13 +494,18 @@ pub(crate) struct AccountStatusLine {
 pub(crate) enum NextSwap {
     /// A viable target exists — [`pick_target`]'s choice, by roster label.
     Target { to: String },
-    /// [`pick_target`] found nothing viable with readings in hand: every other
-    /// enabled account is weekly-exhausted or over the session floor, or there is no
-    /// other enabled account.
+    /// No sound swap destination — [`pick_target`] picked nothing AND no *live*
+    /// (enabled, non-quarantined) account is merely awaiting its first reading.
+    /// Reached when every other account is excluded (disabled #36, or quarantined and
+    /// needing a re-login #42 — its reading masked away by `decision_readings`), or has
+    /// a reading that does not qualify (weekly-exhausted, or over the opt-in session
+    /// floor), or there is simply no other account.
     NoViableTarget,
-    /// No usable reading for any other enabled account yet — the post-restart moment,
-    /// before the staggered poll loop has read the rotation. Kept distinct from
-    /// `NoViableTarget` because it is exactly the moment an operator checks `status`.
+    /// No reading yet for any *live* (enabled, non-quarantined) other account — the
+    /// post-restart moment, before the staggered poll loop (#80) has read the rotation.
+    /// Kept distinct from `NoViableTarget` because it is exactly the moment an operator
+    /// checks `status`; a quarantined account's masked-away reading does NOT count here
+    /// (its data needs a re-login, not a poll).
     AwaitingData,
 }
 
@@ -1811,6 +1816,14 @@ where
         // masks its reading to `None`, but a dead credential is NOT "data on the way"
         // (it needs a re-login), so counting it would mislabel an all-dead-spares roster
         // as `awaiting usage data` instead of the truthful `no viable target`.
+        //
+        // `all_unpolled` (EVERY live other unpolled), not "any unpolled", is deliberate:
+        // in steady state a single transient `None` (one account's poll blipped) must not
+        // flip the footer back to `awaiting usage data` while the others still hold
+        // readings — so AwaitingData demands ALL live others be unpolled. The cost is a
+        // brief, self-correcting `no viable target` during staggered warm-up (#80) once
+        // the first spare is polled but a later one has not; acceptable, as the real swap
+        // is itself warm-up-gated.
         let mut any_other_enabled = false;
         let mut all_unpolled = true;
         for (i, reading) in readings.iter().enumerate() {
