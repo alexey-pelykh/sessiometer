@@ -23,6 +23,7 @@ mod stash;
 mod swap;
 mod timing;
 mod usage;
+mod use_account;
 
 use std::process::ExitCode;
 
