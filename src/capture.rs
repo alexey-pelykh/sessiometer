@@ -36,7 +36,9 @@ use crate::claude_state::{read_oauth_account, OauthAccount};
 use crate::config::{Account, Config, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
+use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
+use std::path::Path;
 
 /// The keychain-service namespace prefix; the account's immutable `account_uuid`
 /// is appended to form the per-account stash service `Sessiometer/<account_uuid>`.
@@ -93,7 +95,18 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
 /// daemon's [`Config::require_roster`] precondition, not a load-time rejection, #58).
 /// A file that exists but is *malformed* stays a hard error — never silently replaced.
 fn load_existing() -> Result<Option<Config>> {
-    match Config::load() {
+    load_existing_from(&paths::config_file()?)
+}
+
+/// [`load_existing`] against an explicit path — the injectable seam over
+/// [`Config::load_path`], so the three outcomes above (absent → `None`,
+/// tunables-only / empty-roster → `Some` with tunables preserved, malformed →
+/// `Err`) are testable end-to-end against a controlled on-disk file rather than the
+/// real config location. This is the exact `capture` config-load path
+/// (`load_existing` → [`Config::load_path`]) that the #58 fix exercised but that
+/// prior tests covered only transitively (#59).
+fn load_existing_from(path: &Path) -> Result<Option<Config>> {
+    match Config::load_path(path) {
         Ok(config) => Ok(Some(config)),
         Err(Error::ConfigNotFound { .. }) => Ok(None),
         Err(err) => Err(err),
@@ -458,5 +471,55 @@ mod tests {
         assert_eq!(report.config.roster[1].stash, "Sessiometer/u-2");
         assert_eq!(stash.len(), 1); // only the new stash was written this call
         assert!(stash.contains("Sessiometer/u-2"));
+    }
+
+    // --- load_existing_from (the on-disk load_existing → Config::load_path seam, #59) ---
+
+    #[test]
+    fn load_existing_from_reads_a_tunables_only_file_preserving_tunables() {
+        // #58 regression, now end-to-end on disk: a REAL tunables-only config.toml
+        // (operator tunables, no [[account]] → empty roster) loads as `Some` with the
+        // tunables intact and an empty roster. Previously this exact path
+        // (load_existing → Config::load_path) was covered only transitively — a
+        // validate test plus an in-memory run_capture test — never against a real file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\nsession_floor = 80\n",
+        )
+        .unwrap();
+
+        let loaded = load_existing_from(&path).unwrap();
+        let config = loaded.expect("a tunables-only file that EXISTS is Some, not None");
+        assert!(
+            config.roster.is_empty(),
+            "a file with no [[account]] loads with an empty roster"
+        );
+        // The operator's tunables survive the load — NOT reset to defaults (default
+        // poll_secs is 300, default session_floor is None).
+        assert_eq!(config.tunables.poll_secs, 120);
+        assert_eq!(config.tunables.session_floor, Some(80));
+    }
+
+    #[test]
+    fn load_existing_from_maps_a_missing_file_to_none() {
+        // The first-ever capture: no config.toml yet → None, so capture then creates it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(load_existing_from(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_existing_from_surfaces_a_malformed_file_as_an_error() {
+        // A file that EXISTS but does not parse stays a hard error — never silently
+        // treated as absent (which would clobber the operator's file on the next save).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"][").unwrap();
+        assert!(matches!(
+            load_existing_from(&path),
+            Err(Error::ConfigParse(_))
+        ));
     }
 }

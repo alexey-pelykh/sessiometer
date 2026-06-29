@@ -196,8 +196,9 @@ impl Config {
     /// [`load`](Config::load) against an explicit path — the injectable seam, so
     /// the file-I/O branches (absent → [`Error::ConfigNotFound`], other read
     /// failure → [`Error::Io`]) are testable without touching the real config
-    /// location.
-    fn load_path(path: &Path) -> Result<Self> {
+    /// location. `pub(crate)` so [`capture`](crate::capture)'s `load_existing_from`
+    /// routes through the same seam rather than re-implementing the read (#59).
+    pub(crate) fn load_path(path: &Path) -> Result<Self> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
