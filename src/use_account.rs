@@ -46,7 +46,7 @@
 //! to select) is an unchanged, separately-tested data-flow invariant. This command's
 //! forced constructor therefore does not — and cannot — widen the autonomous path.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::claude_state;
@@ -58,6 +58,64 @@ use crate::observability::{self, Event, EventLog, SwapReason};
 use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash};
 use crate::swap;
+
+/// How long the best-effort manual-hold notify ([`ControlSocketNotifier`]) waits
+/// on the control socket before giving up (issue #64). Short: a live daemon, idle
+/// between polls, answers instantly; a missing or wedged daemon must never hang
+/// `use`, so the notify times out and is logged-and-ignored (the swap already
+/// succeeded — the keychain write is authoritative).
+const MANUAL_SWAP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Notifies a running daemon that a manual swap just committed (issue #64), so it
+/// arms its cooldown (#10) and re-resolves active — the "manual-hold" that stops
+/// the daemon immediately reverting the operator's choice on its next poll.
+///
+/// BEST-EFFORT by contract: the keychain write is authoritative, so the manual
+/// swap has already SUCCEEDED by the time this runs; a notify failure (no daemon,
+/// a timeout) is logged and ignored, never fatal. Injected as a seam so both the
+/// success and failure paths are hermetically testable.
+trait ManualSwapNotifier {
+    async fn notify(&self) -> Result<()>;
+}
+
+/// The real [`ManualSwapNotifier`]: connect to the daemon's control socket and
+/// send one newline-delimited `manual-swapped` request (issue #64), reading the
+/// one-line ack so the daemon has received it before returning. Bounded by
+/// [`MANUAL_SWAP_NOTIFY_TIMEOUT`] so a missing / wedged daemon never hangs `use`;
+/// the "no daemon" case (connect refused / not found) and a timeout both surface
+/// as `Err` for the caller to log-and-ignore. The request carries NO credential
+/// and NO write target — it is a pure cooldown-only signal.
+struct ControlSocketNotifier {
+    socket: PathBuf,
+}
+
+impl ManualSwapNotifier for ControlSocketNotifier {
+    async fn notify(&self) -> Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let exchange = async {
+            let stream = tokio::net::UnixStream::connect(&self.socket).await?;
+            let mut buffered = tokio::io::BufReader::new(stream);
+            buffered
+                .write_all(b"{\"cmd\":\"manual-swapped\"}\n")
+                .await?;
+            buffered.flush().await?;
+            // Read the one-line ack so the daemon has processed the request before
+            // we return; the content is irrelevant (any failure is non-fatal above).
+            let mut line = String::new();
+            buffered.read_line(&mut line).await?;
+            Ok::<(), Error>(())
+        };
+        tokio::time::timeout(MANUAL_SWAP_NOTIFY_TIMEOUT, exchange)
+            .await
+            .map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "manual-hold notify timed out",
+                ))
+            })?
+    }
+}
 
 /// A vetted incoming swap target — the `incoming_stash` name [`swap::swap`] needs,
 /// plus a TYPE-LEVEL certificate of HOW it was vetted. The field is private and the
@@ -259,7 +317,7 @@ fn force_warning(viability: Viability, label: &str) -> Option<String> {
 /// The injectable seams [`run_use`] drives — the viability/credential/stash/state
 /// surfaces — so the whole gate→swap flow runs hermetically against in-memory fakes
 /// in tests, exactly as [`crate::daemon::Daemon`] injects its seams.
-struct Seams<'a, P, C, S> {
+struct Seams<'a, P, C, S, N> {
     /// Polls the TARGET's stashed token for viability (#37/#42).
     poller: &'a P,
     /// The canonical credential the swap reroutes (#6).
@@ -269,6 +327,13 @@ struct Seams<'a, P, C, S> {
     /// Claude Code's `~/.claude.json`: the active-account source (read) and the
     /// swap's best-effort display co-write target.
     claude_json: &'a Path,
+    /// The single-writer swap lock file (#64): the swap acquires it (blocking,
+    /// bounded, fail-closed) so a concurrent daemon swap cannot interleave. A real
+    /// path in production; a throwaway file in tests (uncontended → instant).
+    lock_path: &'a Path,
+    /// Best-effort daemon notifier (#64): pinged AFTER the swap commits and the
+    /// lock is released so a running daemon arms its cooldown (manual-hold).
+    notifier: &'a N,
 }
 
 /// Run the `use <account>` flow over injected seams: resolve the target, identify
@@ -280,18 +345,19 @@ struct Seams<'a, P, C, S> {
 /// every refusal / abort is a typed [`Error`] whose `exit_code` extends the taxonomy
 /// (issue #63), and on every error path the swap has not run, so there are ZERO
 /// writes.
-async fn run_use<P, C, S>(
+async fn run_use<P, C, S, N>(
     config: &Config,
     query: &str,
     force: bool,
     in_cooldown: bool,
-    seams: Seams<'_, P, C, S>,
+    seams: Seams<'_, P, C, S, N>,
     log: &mut EventLog,
 ) -> Result<()>
 where
     P: RosterPoller,
     C: CredentialStore,
     S: AccountStash,
+    N: ManualSwapNotifier,
 {
     // 1. Resolve the target by label OR uuid (the resolver never guesses, #17).
     let target = &config.roster[resolve_target(&config.roster, query)?];
@@ -371,11 +437,17 @@ where
         }
     };
 
-    // 4. Reuse the swap engine UNCHANGED: canonical write FIRST (so a locked
-    //    keychain aborts here with ZERO writes — the always-enforced safety, even
-    //    with `--force`), then the atomic, field-preserving `~/.claude.json`
-    //    co-write. The incoming stash comes from the vetted `SwapTarget`.
-    swap::swap(
+    // 4. Reuse the swap engine UNCHANGED, now wrapped in the single-writer swap
+    //    lock (#64): the lock is acquired (blocking, bounded) BEFORE the swap reads
+    //    anything and held across the whole two-step write, so a concurrent daemon
+    //    swap cannot interleave into a split state. FAIL-CLOSED — a contended lock
+    //    that never frees within the bounded wait aborts with `SwapLockBusy` (exit
+    //    `4`, ZERO writes), never a torn write. Inside, the engine's own discipline
+    //    still holds: canonical write FIRST (a locked keychain aborts here with ZERO
+    //    writes — the always-enforced safety, even with `--force`), then the atomic,
+    //    field-preserving `~/.claude.json` co-write.
+    swap::swap_locked(
+        Some((seams.lock_path, swap::SWAP_LOCK_MAX_WAIT)),
         seams.store,
         seams.stash,
         &active_stash,
@@ -395,6 +467,16 @@ where
         reason,
         session_pct: 0,
     })?;
+
+    // 6. Manual-hold (#64): the swap has COMMITTED and `swap_locked` has released
+    //    the lock on return, so — and ONLY now, never before — best-effort notify a
+    //    running daemon to arm its cooldown, so its next poll does not immediately
+    //    revert this choice. A failure (no daemon, a timeout) is logged and ignored:
+    //    the keychain write is authoritative, so the manual swap already succeeded.
+    if let Err(err) = seams.notifier.notify().await {
+        eprintln!("sessiometer: manual-hold notify skipped (is the daemon running?): {err}");
+    }
+
     println!("{}", swap_confirmation(&active_label, &target_label));
     Ok(())
 }
@@ -413,9 +495,11 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
     // offline `list` view reports.
     config.require_roster()?;
 
-    // Cooldown (#10): derived from the durable event log's most-recent swap — the
-    // only daemon-independent swap record (the daemon's in-memory `last_swap` needs
-    // the live socket, which is #64 territory). Bypassed by `--force`.
+    // Cooldown (#10): derived from the durable event log's most-recent swap — a
+    // daemon-INDEPENDENT swap record, so `use` gates correctly with NO daemon
+    // running. (The daemon's own in-memory `last_swap` is the live-socket view;
+    // this manual path also NOTIFIES the daemon to arm that cooldown after a swap,
+    // below — #64.) Bypassed by `--force`.
     let in_cooldown = if force {
         false
     } else {
@@ -427,7 +511,17 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
         )
     };
 
+    // The swap lock and the control socket live under the native-local support dir;
+    // ensure it (0700) exists before the swap acquires the lock (#64). `use` needs
+    // NO daemon — these are just files; the notify below is the only daemon-dependent
+    // step, and it is best-effort.
+    paths::ensure_private_dir(&paths::support_dir()?)?;
+
     let claude_json = paths::claude_json()?;
+    let lock_path = paths::swap_lock()?;
+    let notifier = ControlSocketNotifier {
+        socket: paths::control_socket()?,
+    };
     let mut log = EventLog::open()?;
     run_use(
         &config,
@@ -439,6 +533,8 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
             store: &RealCredentialStore::new(),
             stash: &RealAccountStash::new(),
             claude_json: &claude_json,
+            lock_path: &lock_path,
+            notifier: &notifier,
         },
         &mut log,
     )
@@ -505,6 +601,42 @@ mod tests {
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),
                 Probe::Transient => Err(Error::UsageTransient { status: 503 }),
                 Probe::Locked => Err(Error::KeychainLocked { op: "read" }),
+            }
+        }
+    }
+
+    /// A recording [`ManualSwapNotifier`] for the manual-hold tests (#64): counts
+    /// `notify` calls and can be made to FAIL, proving the best-effort contract —
+    /// a failed notify is non-fatal, so `use` still exits success.
+    struct FakeNotifier {
+        calls: Cell<u32>,
+        fail: bool,
+    }
+
+    impl FakeNotifier {
+        fn ok() -> Self {
+            Self {
+                calls: Cell::new(0),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                calls: Cell::new(0),
+                fail: true,
+            }
+        }
+    }
+
+    impl ManualSwapNotifier for FakeNotifier {
+        async fn notify(&self) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fail {
+                // The "no daemon listening" case — best-effort delivery's expected
+                // failure, which `run_use` logs and ignores.
+                Err(Error::DaemonNotRunning)
+            } else {
+                Ok(())
             }
         }
     }
@@ -598,6 +730,11 @@ mod tests {
         let log_path = log_dir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
         let poller = FakePoller::new(probe);
+        // A throwaway, uncontended swap lock (#64): acquires instantly, so the
+        // helper exercises the same locked path as production without contention.
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
 
         let result = run_use(
             &config,
@@ -609,6 +746,8 @@ mod tests {
                 store: &store,
                 stash: &stash,
                 claude_json: &json,
+                lock_path: &lock_path,
+                notifier: &notifier,
             },
             &mut log,
         )
@@ -962,6 +1101,9 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let mut log = EventLog::at(&log_dir.path().join("sessiometer.log")).unwrap();
         let poller = FakePoller::new(Probe::Live { weekly: 0.10 });
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
         let result = run_use(
             &config,
             "spare",
@@ -972,15 +1114,92 @@ mod tests {
                 store: &store,
                 stash: &stash,
                 claude_json: &json,
+                lock_path: &lock_path,
+                notifier: &notifier,
             },
             &mut log,
         )
         .await;
+        // The swap never ran, so the daemon was never notified (no manual hold to
+        // signal). ZERO writes AND zero notifications.
+        assert_eq!(notifier.calls.get(), 0, "an aborted swap must not notify");
         assert!(
             matches!(result, Err(Error::ActiveAccountUnresolved)),
             "got {result:?}"
         );
         assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
+    }
+
+    // --- acceptance: manual-hold daemon notification (#64) -------------------
+
+    /// Drive a gated `use spare` over a viable target with a caller-supplied
+    /// notifier, returning the result + the notifier so a test can assert the
+    /// notify happened. Separate from `run` (which hides its notifier) precisely so
+    /// the manual-hold tests can inspect it.
+    async fn run_with_notifier(notifier: &FakeNotifier) -> (Result<()>, FakeCredentialStore) {
+        let config = config_ab();
+        let (store, stash) = seeded_store_and_stash().await;
+        let (_json_dir, json) = claude_json_for("u-A");
+        let log_dir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&log_dir.path().join("sessiometer.log")).unwrap();
+        let poller = FakePoller::new(Probe::Live { weekly: 0.10 });
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let result = run_use(
+            &config,
+            "spare",
+            false,
+            false,
+            Seams {
+                poller: &poller,
+                store: &store,
+                stash: &stash,
+                claude_json: &json,
+                lock_path: &lock_path,
+                notifier,
+            },
+            &mut log,
+        )
+        .await;
+        (result, store)
+    }
+
+    #[tokio::test]
+    async fn a_committed_manual_swap_notifies_the_daemon_exactly_once() {
+        // Manual-hold (#64): a successful manual swap notifies the daemon so it arms
+        // its cooldown. The swap committed (canonical now holds B's token), and the
+        // notify fired exactly once — never a busy-loop.
+        let notifier = FakeNotifier::ok();
+        let (result, store) = run_with_notifier(&notifier).await;
+
+        assert!(result.is_ok(), "the swap succeeds: {result:?}");
+        assert_eq!(canonical(&store).await, b"B-token", "the swap committed");
+        assert_eq!(
+            notifier.calls.get(),
+            1,
+            "exactly one manual-hold notification after a committed swap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_notify_is_non_fatal_and_use_still_succeeds() {
+        // Best-effort (#64): the notify FAILS (no daemon listening), yet `use` still
+        // exits SUCCESS and the swap stays committed — the keychain write is
+        // authoritative, so the manual swap already succeeded; the failure is logged,
+        // not propagated.
+        let notifier = FakeNotifier::failing();
+        let (result, store) = run_with_notifier(&notifier).await;
+
+        assert!(
+            result.is_ok(),
+            "a failed manual-hold notify must NOT fail the swap: {result:?}"
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "the swap is committed regardless of the notify outcome"
+        );
+        assert_eq!(notifier.calls.get(), 1, "the notify was attempted once");
     }
 
     // --- acceptance: redaction over ALL command output (#15) -----------------

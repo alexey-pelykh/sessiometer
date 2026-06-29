@@ -119,6 +119,21 @@ pub(crate) fn control_socket() -> Result<PathBuf> {
     Ok(support_dir()?.join("daemon.sock"))
 }
 
+/// The single-WRITER swap lock file: `<support_dir>/swap.lock` (`0600`).
+///
+/// A kernel advisory `flock` held only for the DURATION of a swap (not the
+/// process lifetime) by BOTH the manual `use` swap and the daemon's swap routine,
+/// so the two-step swap (canonical keychain write → `~/.claude.json` co-write)
+/// runs as a mutually-exclusive critical section and the two writers can never
+/// interleave into a split state (issue #64). DISTINCT from [`daemon_lock`]: that
+/// one is held non-blocking for the daemon's whole lifetime (a single-INSTANCE
+/// gate), so reusing it would either hang `use` or misreport "already running".
+/// Native-local (via [`support_dir`]) so the contention is machine-global, not
+/// XDG-relative — exactly like the single-instance lock.
+pub(crate) fn swap_lock() -> Result<PathBuf> {
+    Ok(support_dir()?.join("swap.lock"))
+}
+
 /// Claude Code's per-user state file: `~/.claude.json`.
 ///
 /// Holds the active account's `oauthAccount` identity block, which `capture`
@@ -283,6 +298,16 @@ mod tests {
         let support = support_dir().unwrap();
         assert_eq!(daemon_lock().unwrap(), support.join("daemon.lock"));
         assert_eq!(control_socket().unwrap(), support.join("daemon.sock"));
+    }
+
+    #[test]
+    fn swap_lock_is_distinct_from_the_single_instance_lock() {
+        // The single-WRITER swap lock (issue #64) is native-local like the rest of
+        // the runtime files, and a DISTINCT file from the single-instance lock —
+        // reusing `daemon.lock` would hang `use` or misreport "already running".
+        let support = support_dir().unwrap();
+        assert_eq!(swap_lock().unwrap(), support.join("swap.lock"));
+        assert_ne!(swap_lock().unwrap(), daemon_lock().unwrap());
     }
 
     #[test]

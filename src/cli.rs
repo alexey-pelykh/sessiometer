@@ -151,6 +151,8 @@ async fn run() -> Result<()> {
     // Build the daemon over the real seams: per-account polling (active via the
     // canonical credential, others via their stash), the canonical store, the
     // account stash, the real clock, and `~/.claude.json` for display reconcile.
+    // Wire the single-writer swap lock (#64) so the daemon's own swaps serialize
+    // against a concurrent manual `use` swap on the same native-local `swap.lock`.
     let mut daemon = Daemon::new(
         config.roster.clone(),
         RealRosterPoller::new(),
@@ -159,7 +161,8 @@ async fn run() -> Result<()> {
         RealClock::new(),
         paths::claude_json()?,
         &config.tunables,
-    );
+    )
+    .with_swap_lock(paths::swap_lock()?);
     let mut shutdown = RealShutdown::new()?;
 
     eprintln!(

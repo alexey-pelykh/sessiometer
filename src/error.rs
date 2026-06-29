@@ -287,6 +287,17 @@ pub(crate) enum Error {
     )]
     UseTargetQuarantined { label: String },
 
+    // --- Single-writer swap lock (issue #64) ---------------------------------
+    /// The single-writer swap lock (issue #64) could not be acquired within the
+    /// bounded wait — another swap (a concurrent `use`, or the daemon's own swap
+    /// routine) held it the whole time. The lock is FAIL-CLOSED: rather than write
+    /// without it and risk a torn canonical/`~/.claude.json` pair, the swap ABORTS
+    /// with ZERO writes. Maps to exit `4`, the same "could not write safely, retry
+    /// shortly" class as [`Error::KeychainLocked`] (a locked keychain) — see
+    /// [`Error::exit_code`]. Secret-free.
+    #[error("another swap is in progress — could not acquire the swap lock; retry shortly")]
+    SwapLockBusy,
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -306,7 +317,10 @@ impl Error {
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Error::AlreadyRunning => 3,
-            Error::KeychainLocked { .. } => 4,
+            // A locked keychain AND a contended swap lock (issue #64) share exit
+            // `4`: both are the "could not write safely right now, retry shortly"
+            // class — the swap aborted with ZERO writes rather than tear state.
+            Error::KeychainLocked { .. } | Error::SwapLockBusy => 4,
             Error::UseTargetNotFound { .. } => 5,
             Error::UseTargetAmbiguous { .. } => 6,
             // The pre-swap gate refused without `--force` — weekly-exhausted,
@@ -336,6 +350,18 @@ mod tests {
         assert_eq!(Error::CredentialNotFound.exit_code(), 1);
         assert_eq!(Error::Unimplemented("x").exit_code(), 1);
         assert_eq!(Error::Io(std::io::Error::other("boom")).exit_code(), 1);
+    }
+
+    #[test]
+    fn a_contended_swap_lock_shares_the_locked_keychain_exit_code() {
+        // Issue #64: a fail-closed swap-lock abort joins the locked keychain in
+        // exit `4` — both are the "could not write safely now, ZERO writes, retry
+        // shortly" class, distinct from a generic failure (`1`).
+        assert_eq!(Error::SwapLockBusy.exit_code(), 4);
+        assert_eq!(
+            Error::SwapLockBusy.exit_code(),
+            Error::KeychainLocked { op: "write" }.exit_code(),
+        );
     }
 
     #[test]
