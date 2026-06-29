@@ -65,10 +65,12 @@
 //!   - the `apple-tool:`-ride version check — the CLI write still rides the
 //!     `apple-tool:` ACL entry on the current Claude Code version (#2).
 
+use std::fs::OpenOptions;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::claude_state;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::keychain::CredentialStore;
 use crate::stash::{AccountStash, StashedAccount};
 use crate::usage::Usage;
@@ -189,11 +191,123 @@ where
     })
 }
 
+/// How long a contended swap-lock acquire ([`SwapLock::acquire`]) waits before
+/// failing closed (issue #64). Comfortably exceeds one swap's keychain work (a
+/// handful of `security` subprocesses, sub-second to ~2 s), so the ordinary
+/// contention — the OTHER writer simply mid-swap — resolves with margin; only a
+/// genuinely wedged holder reaches the ceiling, where failing closed (ZERO writes)
+/// beats blocking forever.
+pub(crate) const SWAP_LOCK_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting on a contended swap lock (issue #64). Short enough
+/// that the wait ends within ~one interval of the holder releasing, small enough
+/// that the few polls during a typical sub-second swap are negligible.
+const SWAP_LOCK_RETRY: Duration = Duration::from_millis(50);
+
+/// A held single-WRITER swap lock: a kernel advisory `flock(LOCK_EX)` on the
+/// native-local `swap.lock`, held only for the DURATION of one swap (issue #64).
+/// The file is held open for the critical section; the kernel releases the lock on
+/// drop (or process death), so there is no stale-lock reaping.
+///
+/// DISTINCT from the daemon's single-INSTANCE lock ([`crate::daemon::InstanceLock`]),
+/// which is held NON-blocking for the whole process lifetime to reject a second
+/// `run`. This lock is BLOCKING (bounded) and per-swap: both the manual `use` swap
+/// and the daemon's own swap routine acquire it, collapsing their two-step swaps
+/// (canonical keychain write → `~/.claude.json` co-write) into mutually-exclusive
+/// critical sections so the two writers can never interleave into a split state
+/// (canonical = one account while `~/.claude.json` = another).
+#[derive(Debug)]
+pub(crate) struct SwapLock {
+    // Held open purely to keep the lock; dropping it (or the process dying)
+    // releases it.
+    _file: std::fs::File,
+}
+
+impl SwapLock {
+    /// Acquire the swap lock at `path` (creating the file `0600` if needed),
+    /// bounded-blocking up to `max_wait`.
+    ///
+    /// FAIL-CLOSED: if the lock cannot be taken within `max_wait` — another swap
+    /// held it the whole time — returns [`Error::SwapLockBusy`] so the caller
+    /// aborts with ZERO writes, rather than writing without it and reopening the
+    /// torn-write race. Polls `flock(LOCK_EX|LOCK_NB)` and yields the runtime
+    /// between tries (an async sleep, never a busy-spin or a blocked OS thread), so
+    /// the current-thread runtime keeps cooperating while it waits — the daemon
+    /// stays responsive, and `use` stays interruptible.
+    pub(crate) async fn acquire(path: &Path, max_wait: Duration) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        let deadline = Instant::now() + max_wait;
+        loop {
+            // SAFETY: `flock` takes a valid open fd (owned by `file`, which outlives
+            // the call) and the two flag constants; it has no other preconditions.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            // EWOULDBLOCK (== EAGAIN) means another swap holds the lock; anything
+            // else is a genuine I/O failure (a broken fd / filesystem), surfaced
+            // as itself rather than masqueraded as contention.
+            if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(Error::Io(err));
+            }
+            // Out of patience: fail closed (the caller aborts with ZERO writes).
+            if Instant::now() >= deadline {
+                return Err(Error::SwapLockBusy);
+            }
+            tokio::time::sleep(SWAP_LOCK_RETRY).await;
+        }
+    }
+}
+
+/// Run one out-of-band [`swap`], wrapped in the single-writer swap lock (issue
+/// #64) when `lock` is `Some((path, max_wait))`.
+///
+/// The lock is acquired BEFORE the swap reads any input and held across the WHOLE
+/// two-step sequence, so the manual `use` writer and the daemon's swap routine —
+/// the two real swap writers — are serialized on one keychain item and can never
+/// interleave into a split canonical/`~/.claude.json` pair. Whoever waits proceeds
+/// on FRESH state once the holder releases. A `lock` of `None` runs the swap
+/// unlocked: the hermetic single-process test path, where there is no second
+/// writer to serialize against.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn swap_locked<C, S>(
+    lock: Option<(&Path, Duration)>,
+    store: &C,
+    stash: &S,
+    outgoing_stash: &str,
+    incoming_stash: &str,
+    claude_json: &Path,
+) -> Result<SwapReport>
+where
+    C: CredentialStore,
+    S: AccountStash,
+{
+    // Bind the guard here so it outlives the entire swap and drops only on return.
+    // A contended acquire fails closed (`Err`) BEFORE any swap input is read, so a
+    // refusal is a true no-op (ZERO writes), exactly like the swap engine's own
+    // read-everything-before-mutating discipline.
+    let _guard = match lock {
+        Some((path, max_wait)) => Some(SwapLock::acquire(path, max_wait).await?),
+        None => None,
+    };
+    swap(store, stash, outgoing_stash, incoming_stash, claude_json).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -615,6 +729,138 @@ mod tests {
         assert_eq!(a.credential.expose(), b"A-stash-token");
         // The canonical item is likewise untouched.
         assert!(store.read().await.unwrap().matches(&cred(b"A-token")));
+    }
+
+    // --- the single-writer swap lock (#64) ---------------------------------
+
+    #[tokio::test]
+    async fn the_swap_lock_serializes_two_writers_with_no_overlap() {
+        // The lock's core property (issue #64 acceptance): two writers contending on
+        // one lock never occupy the critical section at once — the second BLOCKS
+        // until the first releases. Each worker, while holding the lock, marks the
+        // section occupied and yields TWICE, so the other worker is polled and WOULD
+        // observe an overlap if the lock did not serialize them.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+        let occupancy = Rc::new(Cell::new(0u32));
+        let max_seen = Rc::new(Cell::new(0u32));
+
+        let worker = |occupancy: Rc<Cell<u32>>, max_seen: Rc<Cell<u32>>, lock: PathBuf| async move {
+            let _guard = SwapLock::acquire(&lock, SWAP_LOCK_MAX_WAIT).await.unwrap();
+            let now = occupancy.get() + 1;
+            occupancy.set(now);
+            max_seen.set(max_seen.get().max(now));
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            occupancy.set(occupancy.get() - 1);
+        };
+
+        tokio::join!(
+            worker(occupancy.clone(), max_seen.clone(), lock.clone()),
+            worker(occupancy.clone(), max_seen.clone(), lock.clone()),
+        );
+
+        assert_eq!(
+            max_seen.get(),
+            1,
+            "the swap lock must serialize writers — the second blocks until the first releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_swap_lock_fails_closed_while_held_then_recovers_on_release() {
+        // FAIL-CLOSED (the boundary-conformance refinement): a contended acquire that
+        // exhausts its bounded wait returns `SwapLockBusy` (the caller then aborts
+        // with ZERO writes) rather than proceeding without the lock. Once the holder
+        // releases, a fresh acquire succeeds — the lock is per-swap, not sticky.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+
+        let held = SwapLock::acquire(&lock, SWAP_LOCK_MAX_WAIT).await.unwrap();
+        // A second, SEPARATE open of the same file contends even within one process
+        // (flock locks the open file description) — so the bounded wait elapses.
+        let busy = SwapLock::acquire(&lock, Duration::from_millis(120))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(busy, Error::SwapLockBusy),
+            "a held lock must fail closed, got {busy:?}"
+        );
+        assert_eq!(
+            busy.exit_code(),
+            4,
+            "fail-closed shares the locked-keychain code"
+        );
+
+        drop(held);
+        // Released → the next swap acquires it (no stale-lock reaping needed).
+        let _recovered = SwapLock::acquire(&lock, Duration::from_millis(500))
+            .await
+            .expect("the lock is free once the holder drops");
+    }
+
+    #[tokio::test]
+    async fn two_real_swap_writers_on_one_item_never_leave_a_split_pair() {
+        // The acceptance integration: two REAL swap engines (steps 1–5) contend on
+        // one keychain item + one `~/.claude.json`, serialized only by the lock. The
+        // shared store YIELDS inside its canonical write, widening the exact window a
+        // split would open (canonical written by one writer, json co-written by the
+        // other). With the lock, the writers serialize, so the final pair is
+        // CONSISTENT — canonical token and displayed identity name the SAME account —
+        // and reflects the writer that ran last (fresh state), never a torn mix.
+        type Slot = Rc<RefCell<Option<Credential>>>;
+
+        struct YieldingStore {
+            slot: Slot,
+        }
+        impl CredentialStore for YieldingStore {
+            async fn read(&self) -> Result<Credential> {
+                self.slot.borrow().clone().ok_or(Error::CredentialNotFound)
+            }
+            async fn write(&self, credential: &Credential) -> Result<()> {
+                // Yield mid-write: without the lock the OTHER swap would interleave
+                // here, between this canonical write and its own json co-write.
+                tokio::task::yield_now().await;
+                *self.slot.borrow_mut() = Some(credential.clone());
+                tokio::task::yield_now().await;
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+        let (_jdir, json) = claude_json("u-O", 0o600);
+
+        // One shared canonical item, seeded with the origin account O.
+        let slot: Slot = Rc::new(RefCell::new(Some(cred(b"O-token"))));
+        let store_x = YieldingStore { slot: slot.clone() };
+        let store_y = YieldingStore { slot: slot.clone() };
+        // Two stashes per writer: the shared origin (outgoing) and that writer's
+        // distinct incoming target. Distinct stash instances stand in for the one
+        // keychain — both writers re-stash O and write the canonical, the contended
+        // surface the lock protects.
+        let stash_x = stash_with(stashed(b"O-token", "u-O"), stashed(b"X-token", "u-X")).await;
+        let stash_y = stash_with(stashed(b"O-token", "u-O"), stashed(b"Y-token", "u-Y")).await;
+
+        let lw = (lock.as_path(), SWAP_LOCK_MAX_WAIT);
+        let (rx, ry) = tokio::join!(
+            swap_locked(Some(lw), &store_x, &stash_x, ACCT_A, ACCT_B, &json),
+            swap_locked(Some(lw), &store_y, &stash_y, ACCT_A, ACCT_B, &json),
+        );
+        rx.unwrap();
+        ry.unwrap();
+
+        // The final pair is CONSISTENT — not a split. The canonical token and the
+        // displayed identity name the SAME account (both X or both Y), proving no
+        // interleave left canonical from one writer beside json from the other.
+        let canonical = slot.borrow().clone().unwrap();
+        let displayed = displayed_uuid(&json);
+        let consistent = (canonical.matches(&cred(b"X-token")) && displayed == "u-X")
+            || (canonical.matches(&cred(b"Y-token")) && displayed == "u-Y");
+        assert!(
+            consistent,
+            "split write: canonical and ~/.claude.json disagree (displayed={displayed})"
+        );
     }
 
     /// The mid-turn swap-correctness oracle (issue #12), driven end-to-end against

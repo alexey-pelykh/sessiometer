@@ -241,13 +241,31 @@ impl<S: AccountStash> CredentialStore for StashCredentialStore<'_, S> {
     }
 }
 
+/// A side effect a served control connection asks the run loop to apply after the
+/// reply is sent. `status` produces none (a pure read); the only variant today is
+/// the manual-hold signal (issue #64). Returned by [`Control::serve`] so the
+/// mutation lands on the daemon's decision state in the run loop, where `&mut
+/// Daemon` is available — `serve` itself only borrows the read-only snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlSignal {
+    /// A manual `use` swap committed and notified the daemon (issue #64). The run
+    /// loop adopts it ([`Daemon::adopt_manual_swap`]): arm the post-swap cooldown
+    /// (#10) so the very next poll does not immediately revert the operator's
+    /// choice, and re-resolve the active account from the canonical item. A
+    /// cooldown-only signal — it carries no credential and no write target, and
+    /// never becomes a write command.
+    ManualSwapped,
+}
+
 /// Control seam: serve control-socket connections. The production impl
 /// ([`UnixControl`]) accepts on a `UnixListener`; the run loop's idle select
 /// drives it between polls. The test no-op never resolves, so it never wins the
-/// select.
+/// select. A served connection may return a [`ControlSignal`] for the run loop to
+/// apply (`None` for a pure `status` read).
 pub(crate) trait Control {
-    /// Serve at most one control connection from `snapshot`, then resolve.
-    async fn serve(&self, snapshot: &StatusSnapshot);
+    /// Serve at most one control connection from `snapshot`, then resolve to any
+    /// [`ControlSignal`] the exchange produced (`None` if none).
+    async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal>;
 }
 
 /// Production control: accept one client at a time on the bound socket and answer
@@ -263,13 +281,45 @@ impl UnixControl {
 }
 
 impl Control for UnixControl {
-    async fn serve(&self, snapshot: &StatusSnapshot) {
-        if let Ok((stream, _addr)) = self.listener.accept().await {
-            // Best-effort: a malformed or disconnected client must never crash the
-            // daemon — drop the exchange (the reply carries nothing secret anyway).
-            let _ = serve_control(stream, snapshot).await;
+    async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+        match self.listener.accept().await {
+            Ok((stream, _addr)) => {
+                // Authenticate the peer as the SAME local user (issue #64): a
+                // state-affecting command (`manual-swapped`) is honored only from
+                // our own uid. The socket is already `0600` in a `0700` dir, so
+                // this is defense-in-depth — but the manual-hold receive path must
+                // be authenticated, never trust-by-reachability. Peer creds are read
+                // from the real fd here; `serve_control` takes the verdict as a
+                // plain bool so it stays testable over an in-memory duplex.
+                let peer_authenticated = peer_is_same_user(&stream);
+                // Best-effort: a malformed or disconnected client must never crash
+                // the daemon — drop the exchange (the reply carries nothing secret).
+                serve_control(stream, snapshot, peer_authenticated)
+                    .await
+                    .unwrap_or(None)
+            }
+            Err(_) => None,
         }
     }
+}
+
+/// Whether the peer connected on `stream` is the same local user as this process
+/// (issue #64). Reads the peer's effective uid via `getpeereid(2)` (the portable
+/// BSD/macOS peer-credential call for a Unix-domain socket) and compares it to our
+/// own `getuid()`. Any failure to read the credential is treated as NOT
+/// authenticated — fail closed. Used to gate the state-affecting `manual-swapped`
+/// command; the non-secret `status` read is not gated.
+fn peer_is_same_user(stream: &tokio::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let mut euid: libc::uid_t = 0;
+    let mut egid: libc::gid_t = 0;
+    // SAFETY: `getpeereid` takes a valid connected-socket fd (owned by `stream`,
+    // which outlives the call) and two out-pointers to stack locals it fills only
+    // on success (rc == 0). No other preconditions.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+    // SAFETY: `getuid` cannot fail and has no preconditions.
+    rc == 0 && euid == unsafe { libc::getuid() }
 }
 
 /// A held single-instance lock: a kernel advisory `flock(LOCK_EX|LOCK_NB)` on the
@@ -418,33 +468,94 @@ fn to_pct(fraction: f64) -> u8 {
     (fraction * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
-/// Build the one-line reply to a control request line.
-fn control_reply(line: &str, snapshot: &StatusSnapshot) -> String {
+/// Build the one-line reply to a control request line, plus any [`ControlSignal`]
+/// the run loop must apply afterward. Pure (no I/O, no clock), so the
+/// request→(reply, signal) mapping is unit-testable; `peer_authenticated` is
+/// passed in (computed from the real fd by the caller) rather than read here, for
+/// the same testability reason `in_cooldown` is a parameter elsewhere.
+///
+/// `status` is a non-secret read, answered for any peer. `manual-swapped` (issue
+/// #64) is state-affecting, so it is honored ONLY for an authenticated same-user
+/// peer; an unauthenticated one gets an error and produces NO signal (the cooldown
+/// is never armed by a stranger).
+fn control_reply(
+    line: &str,
+    snapshot: &StatusSnapshot,
+    peer_authenticated: bool,
+) -> (String, Option<ControlSignal>) {
     match serde_json::from_str::<ControlRequest>(line) {
-        Ok(request) if request.cmd == "status" => serde_json::to_string(&status_response(snapshot))
-            .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.to_owned()),
-        Ok(_) => r#"{"error":"unknown command"}"#.to_owned(),
-        Err(_) => r#"{"error":"malformed request"}"#.to_owned(),
+        Ok(request) if request.cmd == "status" => (
+            serde_json::to_string(&status_response(snapshot))
+                .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.to_owned()),
+            None,
+        ),
+        Ok(request) if request.cmd == "manual-swapped" => {
+            if peer_authenticated {
+                (
+                    r#"{"ok":true}"#.to_owned(),
+                    Some(ControlSignal::ManualSwapped),
+                )
+            } else {
+                (r#"{"error":"unauthorized"}"#.to_owned(), None)
+            }
+        }
+        Ok(_) => (r#"{"error":"unknown command"}"#.to_owned(), None),
+        Err(_) => (r#"{"error":"malformed request"}"#.to_owned(), None),
     }
 }
 
+/// Upper bound on a single control-socket request line. A control request is one
+/// short JSON command (`{"cmd":"status"}` / `{"cmd":"manual-swapped"}`); capping the
+/// read keeps a misbehaving same-uid client from growing the daemon's buffer without
+/// bound (issue #64 — the receive path must be BOUNDED).
+const MAX_CONTROL_LINE_BYTES: u64 = 8 * 1024;
+
+/// Upper bound on one whole control exchange (read request + write reply). Mirrors
+/// the `use`-side `MANUAL_SWAP_NOTIFY_TIMEOUT` so a peer that never completes its line
+/// cannot hold the serve arm; the run-loop select also drops this future at the next
+/// poll tick, so this is the tighter, dedicated time bound (issue #64).
+const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Serve one control exchange: read one newline-delimited JSON request and write
-/// one newline-delimited JSON reply. Generic over the stream so it is testable
-/// over an in-memory duplex without binding a real socket.
-async fn serve_control<RW>(stream: RW, snapshot: &StatusSnapshot) -> Result<()>
+/// one newline-delimited JSON reply, returning any [`ControlSignal`] the request
+/// produced. Generic over the stream so it is testable over an in-memory duplex
+/// without binding a real socket; `peer_authenticated` is the caller's
+/// peer-credential verdict (issue #64), gating the state-affecting commands. The
+/// receive path is BOUNDED in space (the read is capped at [`MAX_CONTROL_LINE_BYTES`])
+/// and in time (the exchange is wrapped in [`CONTROL_EXCHANGE_TIMEOUT`]).
+async fn serve_control<RW>(
+    stream: RW,
+    snapshot: &StatusSnapshot,
+    peer_authenticated: bool,
+) -> Result<Option<ControlSignal>>
 where
     RW: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-    let mut buffered = tokio::io::BufReader::new(stream);
-    let mut line = String::new();
-    buffered.read_line(&mut line).await?;
-    let reply = control_reply(line.trim_end(), snapshot);
-    buffered.write_all(reply.as_bytes()).await?;
-    buffered.write_all(b"\n").await?;
-    buffered.flush().await?;
-    Ok(())
+    let exchange = async {
+        // Cap the request read: a control request is one short line, so a peer that
+        // streams more — or never sends a newline — is bounded here (EOF at the
+        // limit) instead of growing `line` without limit.
+        let mut buffered = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        (&mut buffered)
+            .take(MAX_CONTROL_LINE_BYTES)
+            .read_line(&mut line)
+            .await?;
+        let (reply, signal) = control_reply(line.trim_end(), snapshot, peer_authenticated);
+        buffered.write_all(reply.as_bytes()).await?;
+        buffered.write_all(b"\n").await?;
+        buffered.flush().await?;
+        Ok::<_, Error>(signal)
+    };
+    // A peer that stalls mid-line must not hold the exchange open: time-box it and
+    // drop on elapse. The reply carries nothing secret, so a dropped exchange is
+    // harmless — the caller maps both a timeout and an error to "no signal".
+    match tokio::time::timeout(CONTROL_EXCHANGE_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(None),
+    }
 }
 
 /// What the loop decided to do this cycle — logged, and asserted on in tests.
@@ -634,6 +745,14 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// Consecutive successful recovery probes before a quarantined account is
     /// restored to the rotation (issue #42; config `monitor_recovery_m`, `1..=20`).
     monitor_recovery_m: u8,
+    /// The single-writer swap lock path (issue #64), or `None` to swap WITHOUT the
+    /// cross-process lock. `None` is the hermetic-test default — a single-process
+    /// test has no second writer to serialize against, so taking a real `flock`
+    /// would only couple every swap test to a real file. Production wires the real
+    /// `swap.lock` via [`with_swap_lock`](Self::with_swap_lock); when `Some`, every
+    /// swap routes through [`swap::swap_locked`] and a contended acquire defers the
+    /// swap (fail-closed) rather than risk a torn write.
+    swap_lock_path: Option<PathBuf>,
     state: DecisionState,
 }
 
@@ -670,11 +789,24 @@ where
             rng: SplitMix64::from_entropy(),
             monitor_401_n: tunables.monitor_401_n,
             monitor_recovery_m: tunables.monitor_recovery_m,
+            // No cross-process swap lock by default; production opts in via
+            // `with_swap_lock`. See the field's docs for why tests stay lock-free.
+            swap_lock_path: None,
             state: DecisionState {
                 health,
                 ..DecisionState::default()
             },
         }
+    }
+
+    /// Wire the single-writer swap lock (issue #64): every swap then acquires the
+    /// `flock` at `path` (blocking, bounded, fail-closed) so the daemon and a manual
+    /// `use` swap can never interleave into a split state. Production sets the real
+    /// `paths::swap_lock()`; a test may point it at a throwaway file. Builder-style
+    /// to mirror [`with_seed`](Self::with_seed) and keep `new`'s 7 args stable.
+    pub(crate) fn with_swap_lock(mut self, path: PathBuf) -> Self {
+        self.swap_lock_path = Some(path);
+        self
     }
 
     /// Replace the jitter RNG with a deterministically-seeded one — the test seam
@@ -1161,19 +1293,13 @@ where
             }
             return TickAction::NoViableTarget;
         };
-        // Run the out-of-band swap. #6 is no-half-swap: an error leaves the
-        // canonical item and both stashes coherent, so we simply retry next cycle.
+        // Run the out-of-band swap, serialized by the single-writer lock (#64). #6
+        // is no-half-swap: an error (including a contended lock that fails closed)
+        // leaves the canonical item and both stashes coherent, so we simply retry
+        // next cycle.
         let outgoing = self.roster[active_idx].stash.clone();
         let incoming = self.roster[target_idx].stash.clone();
-        match swap::swap(
-            &self.store,
-            &self.stash,
-            &outgoing,
-            &incoming,
-            &self.claude_json,
-        )
-        .await
-        {
+        match self.locked_swap(&outgoing, &incoming).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 // Log the swap (issue #9). `swap::decide` returns only a binary
@@ -1223,6 +1349,62 @@ where
         }
     }
 
+    /// Run one out-of-band swap, serialized by the single-writer swap lock (issue
+    /// #64) when one is configured ([`with_swap_lock`](Self::with_swap_lock)). The
+    /// lock makes the daemon's swap and a concurrent manual `use` swap mutually
+    /// exclusive over the two-step write. A contended acquire that exhausts its
+    /// bounded wait fails closed (`Err(SwapLockBusy)`) — the caller treats it like
+    /// any other swap failure ([`TickAction::SwapFailed`]) and retries next cycle,
+    /// never a torn write. With no lock configured (hermetic tests) the swap runs
+    /// unlocked — there is no second writer in-process to serialize against.
+    async fn locked_swap(&self, outgoing: &str, incoming: &str) -> Result<swap::SwapReport> {
+        swap::swap_locked(
+            self.swap_lock_path
+                .as_deref()
+                .map(|path| (path, swap::SWAP_LOCK_MAX_WAIT)),
+            &self.store,
+            &self.stash,
+            outgoing,
+            incoming,
+            &self.claude_json,
+        )
+        .await
+    }
+
+    /// Adopt a manual `use` swap signalled over the control socket (issue #64).
+    ///
+    /// `use` rewrote the canonical credential out-of-band and then notified us; this
+    /// records it as the latest swap so the EXISTING post-swap cooldown (#10)
+    /// applies — the very next poll therefore HOLDS on the operator's choice instead
+    /// of immediately reverting it, and normal policy resumes once the cooldown
+    /// window elapses (a cooldown, never a permanent pin). The active account is
+    /// re-resolved from the AUTHORITATIVE canonical item, not from the message — the
+    /// signal carries no target — so an out-of-order or duplicate notification
+    /// cannot corrupt state; at worst it re-arms a cooldown. Mirrors
+    /// [`record_swap`](Self::record_swap): update active, arm the cooldown + `status`
+    /// display, and prime the canonical watch so this manual write is not later
+    /// re-detected as an out-of-band change (#13).
+    async fn adopt_manual_swap(&mut self) {
+        let at = self.clock.now();
+        // Re-resolve active from the canonical item and prime the watch. A locked /
+        // unreadable keychain leaves active to the next tick's own resolve, but the
+        // cooldown is armed regardless below — the load-bearing manual-hold effect.
+        if let Ok(canonical) = self.store.read().await {
+            self.state.active = self.resolve_account_for(&canonical).await;
+            self.state.canonical_watch.commit(&canonical);
+        }
+        // Record it as the latest swap: arms the cooldown (#10) and updates the
+        // `status` last_swap (#8). The label is best-effort (status only); the
+        // cooldown arming is what makes the choice stick, so it happens even when
+        // the active account could not be resolved just now.
+        let to = self
+            .state
+            .active
+            .map(|idx| self.roster[idx].label.clone())
+            .unwrap_or_default();
+        self.state.last_swap = Some(LastSwap { to, at });
+    }
+
     /// Emergency-swap away from a confirmed-DEAD active account (issue #42): the live
     /// session is blocked, so rotate to the soonest-reset viable target IMMEDIATELY —
     /// bypassing the swap-away trigger and the post-swap cooldown that gate a normal
@@ -1258,20 +1440,12 @@ where
         ) else {
             return TickAction::ActiveDeadNoTarget;
         };
-        // #6 is no-half-swap: an error leaves the canonical item and both stashes
-        // coherent — the dead active stays quarantined and the emergency swap retries
-        // next cycle.
+        // #6 is no-half-swap: an error (including a fail-closed contended swap lock,
+        // #64) leaves the canonical item and both stashes coherent — the dead active
+        // stays quarantined and the emergency swap retries next cycle.
         let outgoing = self.roster[active_idx].stash.clone();
         let incoming = self.roster[target_idx].stash.clone();
-        match swap::swap(
-            &self.store,
-            &self.stash,
-            &outgoing,
-            &incoming,
-            &self.claude_json,
-        )
-        .await
-        {
+        match self.locked_swap(&outgoing, &incoming).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::EmergencySwap {
@@ -1521,6 +1695,18 @@ where
         eprintln!("sessiometer: reconcile-on-start skipped: {err}");
     }
 
+    /// How the idle-until-next-tick wait ended. Scoping the wait future to one
+    /// block lets it (and its `&mut Daemon` borrow) drop before the run loop
+    /// applies a `ManualSwapped` adoption, which needs its own `&mut Daemon`.
+    enum Idle {
+        /// SIGINT / SIGTERM observed — exit the loop cleanly.
+        Shutdown,
+        /// The poll interval (or locked-keychain back-off) elapsed — re-tick.
+        Elapsed,
+        /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
+        ManualSwapped,
+    }
+
     loop {
         let outcome = daemon.tick().await;
         // Best-effort logging (issue #9): emit each event the tick produced. A
@@ -1546,15 +1732,33 @@ where
         // Idle until the next tick is due, serving control requests and watching
         // for shutdown. A swap (if any) already completed inside `tick`, so a
         // shutdown observed here aborts cleanly before the next tick — no half-swap.
-        let wait = daemon.wait_after_tick(next_wait);
-        tokio::pin!(wait);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.requested() => return Ok(()),
-                _ = control.serve(&snapshot) => continue,
-                _ = &mut wait => break,
+        // The wait future borrows `&mut daemon`, so it is scoped to this block and
+        // dropped before any post-idle mutation (the manual-swap adoption) runs.
+        let idle = {
+            let wait = daemon.wait_after_tick(next_wait);
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.requested() => break Idle::Shutdown,
+                    // A served control connection may carry a signal (#64): a
+                    // `manual-swapped` breaks the idle to adopt it; a `status` read
+                    // (None) just continues serving until the wait elapses.
+                    signal = control.serve(&snapshot) => match signal {
+                        Some(ControlSignal::ManualSwapped) => break Idle::ManualSwapped,
+                        None => continue,
+                    },
+                    _ = &mut wait => break Idle::Elapsed,
+                }
             }
+        };
+        match idle {
+            Idle::Shutdown => return Ok(()),
+            // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick
+            // holds on the operator's choice, and re-resolve active from the
+            // canonical — BEFORE looping back to re-tick.
+            Idle::ManualSwapped => daemon.adopt_manual_swap().await,
+            Idle::Elapsed => {}
         }
     }
 }
@@ -1729,8 +1933,34 @@ mod tests {
     struct NoControl;
 
     impl Control for NoControl {
-        async fn serve(&self, _snapshot: &StatusSnapshot) {
-            std::future::pending::<()>().await;
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+            std::future::pending().await
+        }
+    }
+
+    /// A control seam that yields `ManualSwapped` exactly once, then never resolves —
+    /// so the run loop adopts the manual hold on its first idle, then idles normally
+    /// (to `wait`/shutdown) on every later poll. Drives the live
+    /// `Idle::ManualSwapped => adopt_manual_swap` wiring that `NoControl` never does.
+    struct OnceManualSwap {
+        fired: Cell<bool>,
+    }
+
+    impl OnceManualSwap {
+        fn new() -> Self {
+            Self {
+                fired: Cell::new(false),
+            }
+        }
+    }
+
+    impl Control for OnceManualSwap {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                Some(ControlSignal::ManualSwapped)
+            }
         }
     }
 
@@ -3160,6 +3390,188 @@ mod tests {
         );
     }
 
+    // --- manual-hold: adopt a manual `use` swap (issue #64) ----------------
+
+    #[tokio::test]
+    async fn adopt_manual_swap_arms_the_cooldown_so_the_next_poll_holds() {
+        // Issue #64 manual-hold: after a manual `use` swap to B (canonical now B's
+        // token), the daemon adopts the notification — which ARMS the post-swap
+        // cooldown and re-resolves active — so its very next poll HOLDS on B rather
+        // than immediately reverting it, EVEN THOUGH B sits over its swap-away trigger.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        // The manual swap already rewrote the canonical to B's token.
+        let store = store_holding(b"B-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-B");
+        // B (the manual target) is OVER its session trigger — absent the cooldown the
+        // daemon would swap straight back to the wide-open A.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.05, 0.05)
+            .ok("u-B", 0.97, 0.40);
+        let tun = tunables(95, 80, 100); // cooldown 100s
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+        // The daemon has not yet noticed the out-of-band manual swap: no in-memory
+        // last_swap, so without the notification its next poll would revert B.
+        assert!(daemon.state.last_swap.is_none());
+
+        daemon.adopt_manual_swap().await;
+
+        // Adoption armed the cooldown (last_swap at "now") and re-resolved active to B.
+        assert_eq!(daemon.state.active, Some(1));
+        let armed = daemon.state.last_swap.as_ref().expect("cooldown armed");
+        assert_eq!(armed.to, "spare");
+        assert_eq!(armed.at, daemon.clock.now());
+
+        daemon.clock.advance(Duration::from_secs(10)); // within the 100s cooldown
+        let outcome = daemon.tick().await;
+
+        // The daemon HOLDS on the operator's choice — no immediate revert.
+        assert_eq!(outcome.action, TickAction::SkippedCooldown);
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn without_the_manual_hold_the_daemon_reverts_an_over_trigger_target() {
+        // The contrast that makes the manual-hold load-bearing: the SAME fixture, but
+        // the daemon is NOT notified (no adopt). It resolves active to B, finds B over
+        // the trigger with NO cooldown armed, and immediately reverts B→A — exactly
+        // the revert the #64 notification exists to prevent.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"B-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-B");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.05, 0.05)
+            .ok("u-B", 0.97, 0.40);
+        let tun = tunables(95, 80, 100);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+
+        let outcome = daemon.tick().await;
+
+        // Without the cooldown armed, the daemon reverts the (unannounced) manual swap.
+        assert_eq!(outcome.action, TickAction::Swapped { from: 1, to: 0 });
+    }
+
+    #[tokio::test]
+    async fn adopt_manual_swap_re_resolves_active_from_the_canonical_not_the_message() {
+        // The #64 message carries no target; the daemon re-resolves active from the
+        // AUTHORITATIVE canonical item. Here the cached active is STALE (A) while the
+        // canonical already holds B's token — adoption corrects it to B, so an
+        // out-of-order or contentless message cannot corrupt the daemon's state.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"B-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-B");
+        let tun = tunables(95, 80, 100);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+        // A STALE cached active pointing at A, though the canonical is already B.
+        daemon.state.active = Some(0);
+
+        daemon.adopt_manual_swap().await;
+
+        // Re-resolved from the canonical (B's token), not left at the stale A.
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_daemon_with_the_swap_lock_wired_still_swaps_normally() {
+        // Wiring smoke test (#64): a daemon configured with the single-writer lock
+        // acquires + releases it around its own swap, so an UNcontended swap proceeds
+        // exactly as before. (The lock's mutual-exclusion property is proven in
+        // `swap.rs`; here we only confirm `with_swap_lock` does not deadlock the path.)
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.05, 0.05);
+        let tun = tunables(95, 80, 100);
+        let lock_dir = tempfile::tempdir().unwrap();
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        )
+        .with_swap_lock(lock_dir.path().join("swap.lock"));
+
+        let outcome = daemon.tick().await;
+
+        // The swap landed normally, the lock acquired and released around it: A→B.
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
     // --- timing jitter strategies (issue #38) ------------------------------
 
     /// A minimal daemon over empty seams — enough to exercise the pure
@@ -3536,7 +3948,10 @@ mod tests {
         };
         let (mut client, server) = tokio::io::duplex(1024);
         client.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
-        serve_control(server, &snapshot).await.unwrap();
+        // `status` is a non-secret read — answered for any peer, and producing no
+        // control signal (it never mutates daemon state).
+        let signal = serve_control(server, &snapshot, false).await.unwrap();
+        assert!(signal.is_none(), "status must not produce a control signal");
 
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
@@ -3556,18 +3971,78 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(1024);
         client.write_all(b"{\"cmd\":\"nope\"}\n").await.unwrap();
-        serve_control(server, &StatusSnapshot::default())
+        let signal = serve_control(server, &StatusSnapshot::default(), true)
             .await
             .unwrap();
+        assert!(signal.is_none(), "an unknown command produces no signal");
 
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.contains("unknown command"), "got {reply:?}");
     }
 
+    #[tokio::test]
+    async fn serve_control_bounds_an_oversized_request_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Issue #64: the receive path must be BOUNDED. A peer that streams a line
+        // longer than the cap — with NO newline and the connection held OPEN — would
+        // hang an unbounded `read_line`; only the byte cap can end this read (EOF at
+        // the limit), after which the over-long request is rejected as malformed.
+        // The client never closes, so it is the cap (not an EOF) that ends the read;
+        // a regressed cap is caught by the exchange timeout firing with no reply.
+        let oversized = vec![b'{'; MAX_CONTROL_LINE_BYTES as usize + 1];
+        let (mut client, server) = tokio::io::duplex(oversized.len() + 64);
+        client.write_all(&oversized).await.unwrap();
+        let signal = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap();
+        assert!(signal.is_none(), "an oversized request produces no signal");
+
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            reply.contains("malformed"),
+            "an over-long request is bounded and rejected: {reply:?}"
+        );
+    }
+
     #[test]
     fn control_reply_rejects_malformed_json() {
-        assert!(control_reply("not json", &StatusSnapshot::default()).contains("malformed"));
+        let (reply, signal) = control_reply("not json", &StatusSnapshot::default(), true);
+        assert!(reply.contains("malformed"));
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn manual_swapped_is_honored_only_for_an_authenticated_peer() {
+        // Issue #64: `manual-swapped` is state-affecting, so an UNauthenticated peer
+        // gets an error and produces NO signal — a stranger can never arm the
+        // daemon's cooldown. The same-user peer gets an ack and the adopt signal.
+        let snap = StatusSnapshot::default();
+        let (denied, no_signal) = control_reply(r#"{"cmd":"manual-swapped"}"#, &snap, false);
+        assert!(denied.contains("unauthorized"), "got {denied:?}");
+        assert!(
+            no_signal.is_none(),
+            "an unauthenticated peer must not arm cooldown"
+        );
+
+        let (ack, signal) = control_reply(r#"{"cmd":"manual-swapped"}"#, &snap, true);
+        assert!(ack.contains("\"ok\":true"), "got {ack:?}");
+        assert_eq!(signal, Some(ControlSignal::ManualSwapped));
+    }
+
+    #[tokio::test]
+    async fn peer_is_same_user_authenticates_a_same_process_peer() {
+        // Issue #64: the manual-hold receive path authenticates the peer's uid via
+        // `getpeereid(2)` before honoring a state-affecting command. A socket pair
+        // made in THIS process has its peer on our own uid, so the real (unsafe) FFI
+        // path must report it authenticated — exercising the `getpeereid`/`getuid`
+        // computation that the boolean-gated `control_reply` tests take as a given.
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("socketpair");
+        assert!(
+            peer_is_same_user(&ours),
+            "a same-process socket peer is the same local user"
+        );
     }
 
     // --- last_swap + swap report (issue #8) --------------------------------
@@ -3747,6 +4222,69 @@ mod tests {
 
         // The fake clock makes the cadence deterministic: exactly 3 ticks ran.
         assert_eq!(daemon.state.ticks, 3);
+    }
+
+    #[tokio::test]
+    async fn run_loop_adopts_a_manual_swapped_signal_through_the_idle_select() {
+        // Issue #64: the run loop's idle select must route a `ManualSwapped` control
+        // signal into `adopt_manual_swap` — the one seam the `Idle` enum exists for,
+        // which every `NoControl`-based run-loop test leaves undriven. In a HOLDS-ONLY
+        // world no tick ever arms `last_swap`, so a cooldown armed after the loop can
+        // ONLY have come from adoption running — i.e. the signal reached
+        // `adopt_manual_swap` through the LIVE select, not as a disconnected unit call.
+        // A regression that turned the `Some(ManualSwapped) => break` arm back into a
+        // `continue` would leave `last_swap` None and fail this test.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Both accounts sit UNDER their triggers, so every tick is a Hold — no tick
+        // can arm `last_swap` on its own.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        );
+        assert!(
+            daemon.state.last_swap.is_none(),
+            "no cooldown is armed before the loop"
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // Tick 1 → idle delivers `ManualSwapped` (adopt) → tick 2 → shutdown.
+        let mut shutdown = FakeShutdown::after(2);
+        let control = OnceManualSwap::new();
+
+        run_loop(&mut daemon, &mut log, &mut shutdown, &control)
+            .await
+            .unwrap();
+
+        // The signal reached `adopt_manual_swap` through the idle select: it
+        // re-resolved active from the canonical (A) and armed the cooldown — the only
+        // way `last_swap` is Some after a holds-only run.
+        let armed = daemon
+            .state
+            .last_swap
+            .as_ref()
+            .expect("the ManualSwapped signal must arm the cooldown via adoption");
+        assert_eq!(armed.to, "work");
+        assert_eq!(daemon.state.active, Some(0));
     }
 
     #[tokio::test]
@@ -4715,7 +5253,7 @@ mod tests {
         let response = status_response(&outcome.snapshot);
         corpus.push_str(&serde_json::to_string(&response).unwrap());
         corpus.push('\n');
-        corpus.push_str(&control_reply(r#"{"cmd":"status"}"#, &outcome.snapshot));
+        corpus.push_str(&control_reply(r#"{"cmd":"status"}"#, &outcome.snapshot, true).0);
         corpus.push('\n');
         corpus.push_str(&crate::cli::render_status(&response));
         if let Some(report) = swap_report(outcome) {
@@ -4779,6 +5317,7 @@ mod tests {
             Error::UsageParse("no session (five_hour) dimension".to_owned()),
             Error::AlreadyRunning,
             Error::DaemonNotRunning,
+            Error::SwapLockBusy,
             Error::Io(std::io::Error::other("boom")),
         ]
     }
@@ -4903,13 +5442,29 @@ mod tests {
             .collect();
         corpus.push_str(&crate::cli::render_roster(&roster));
 
-        // Channel — the UDS error replies (malformed request / unknown command).
-        corpus.push_str(&control_reply("not json", &StatusSnapshot::default()));
+        // Channel — the UDS error replies (malformed request / unknown command) and
+        // the `manual-swapped` ack / unauthorized replies (#64), all secret-free.
+        corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
         corpus.push('\n');
-        corpus.push_str(&control_reply(
-            r#"{"cmd":"nope"}"#,
-            &StatusSnapshot::default(),
-        ));
+        corpus.push_str(&control_reply(r#"{"cmd":"nope"}"#, &StatusSnapshot::default(), true).0);
+        corpus.push('\n');
+        corpus.push_str(
+            &control_reply(
+                r#"{"cmd":"manual-swapped"}"#,
+                &StatusSnapshot::default(),
+                true,
+            )
+            .0,
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &control_reply(
+                r#"{"cmd":"manual-swapped"}"#,
+                &StatusSnapshot::default(),
+                false,
+            )
+            .0,
+        );
         corpus.push('\n');
 
         // Channel — every error message Display.
@@ -5188,12 +5743,18 @@ mod tests {
             account(C.0, &format!("Sessiometer/{}", C.0), C.1),
         ]));
         corpus.push('\n');
-        corpus.push_str(&control_reply("not json", &StatusSnapshot::default()));
+        corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
         corpus.push('\n');
-        corpus.push_str(&control_reply(
-            r#"{"cmd":"nope"}"#,
-            &StatusSnapshot::default(),
-        ));
+        corpus.push_str(&control_reply(r#"{"cmd":"nope"}"#, &StatusSnapshot::default(), true).0);
+        corpus.push('\n');
+        corpus.push_str(
+            &control_reply(
+                r#"{"cmd":"manual-swapped"}"#,
+                &StatusSnapshot::default(),
+                true,
+            )
+            .0,
+        );
         corpus.push('\n');
         for err in every_error_variant() {
             corpus.push_str(&err.to_string());
