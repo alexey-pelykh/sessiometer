@@ -4994,4 +4994,244 @@ mod tests {
         // channels above.
         assert_clean(&corpus, &secrets);
     }
+
+    /// The 0.1.0 "done-when" acceptance, driven end-to-end through the four seams
+    /// (the injected `UsageSource` via [`FakeRosterPoller`], [`FakeCredentialStore`],
+    /// [`FakeAccountStash`], [`FakeClock`]) so it burns no real quota, touches no
+    /// keychain, and runs in zero real time (issue #14). One hermetic run proves the
+    /// whole loop that the smaller unit tests cover only in pieces:
+    ///
+    ///   - **reconcile-on-start (#13):** a deliberate canonical≠oauth mismatch — the
+    ///     canonical holds B's token while `~/.claude.json` still DISPLAYS A (a torn
+    ///     post-swap crash) — is healed before the first poll.
+    ///   - **threshold → pick-viable → swap → propagate:** the active account, over
+    ///     its session trigger, swaps to a VIABLE target (never the weekly-exhausted
+    ///     distractor C), and the promoted credential propagates to BOTH the canonical
+    ///     keychain item AND the `~/.claude.json` display.
+    ///   - **B→A→B without oscillation (#10):** with A and B both hovering over the
+    ///     trigger, the post-swap cooldown bounds the ping-pong — a re-swap inside the
+    ///     window is refused (never A→B→A), and only past the window does the loop swap
+    ///     back, completing a B→A→B cycle. No manual step at any point.
+    ///   - **every event surfaced (#9) + nothing leaked (#15):** each cycle's output on
+    ///     every operator channel (log / status / UDS / error / list) is harvested and
+    ///     run through the redaction METER as a CI gate over the whole acceptance flow.
+    ///
+    /// The documented MANUAL counterpart — the same acceptance against real accounts,
+    /// gated on the #16 H0–H3 checks — lives in `build/smoke-test.md`; it is documented,
+    /// not run here, so this path stays hermetic and burns no real quota.
+    #[tokio::test]
+    async fn e2e_acceptance_full_loop_swaps_propagates_and_reconciles_without_oscillation_or_leak()
+    {
+        use crate::redaction::meter::{assert_clean, Secrets};
+
+        // Low-entropy uuids/labels: only labels reach the harvested channels and only
+        // uuids reach the `list` view, so the METER's entropy backstop fires solely on
+        // a genuine secret leak, never on this scaffolding (as the meter test above).
+        const A: (&str, &str) = ("11111111-1111-1111-1111-111111111111", "work");
+        const B: (&str, &str) = ("22222222-2222-2222-2222-222222222222", "spare");
+        const C: (&str, &str) = ("33333333-3333-3333-3333-333333333333", "backup");
+
+        // Three DISTINCT secret blobs — distinct so a swap visibly MOVES the canonical
+        // token (propagation is observable) and so token↔account resolution stays
+        // unambiguous. Each carries `sk-ant-…` bearers the METER would catch on any
+        // channel. A reuses the fixture blob (exercising the blob/known-token detectors
+        // too); B and C are their own secrets, with C's never reaching the canonical.
+        let secrets = Secrets::meter_fixture();
+        let email = secrets.email();
+        let a_blob = secrets.blob().to_vec();
+        let b_blob = br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-SPARE00SECRET00ACCESS00qR7sT3uV5wX9yZ","refreshToken":"sk-ant-ort-SPARE00SECRET00REFRESH00eF6gH8iJ0kL2mN","expiresAt":1782777600}}"#.to_vec();
+        let c_blob = br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-BACKUP0SECRET0ACCESS0sV1wY3zA5bC7dE","refreshToken":"sk-ant-ort-BACKUP0SECRET0REFRESH0iK2lM4nO6pQ8rS","expiresAt":1782777600}}"#.to_vec();
+
+        // Roster: A (index 0), B (index 1), C (index 2 — the non-viable distractor).
+        let roster: Vec<Account> = [A, B, C]
+            .iter()
+            .map(|(uuid, label)| account(uuid, &format!("Sessiometer/{uuid}"), label))
+            .collect();
+
+        // Each account's stash holds its OWN secret blob + a secret-bearing identity.
+        let stash = FakeAccountStash::empty();
+        for (id, blob) in [(A, &a_blob), (B, &b_blob), (C, &c_blob)] {
+            stash
+                .write(
+                    &format!("Sessiometer/{}", id.0),
+                    &meter_stashed(blob, id.0, email),
+                )
+                .await
+                .unwrap();
+        }
+
+        // The canonical item holds B's token — so the active account resolves to B …
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(&b_blob)).await.unwrap();
+        // … while `~/.claude.json` still DISPLAYS A: the deliberate canonical≠oauth
+        // mismatch (a torn post-swap crash, #13) that reconcile-on-start must heal.
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join(".claude.json");
+        std::fs::write(
+            &json,
+            format!(
+                r#"{{"numStartups":1,"oauthAccount":{{"accountUuid":"{}","emailAddress":"{email}"}}}}"#,
+                A.0
+            ),
+        )
+        .unwrap();
+
+        // A and B both hover over the 95 session trigger with low weekly usage, so each
+        // is a viable target for the other — the setup that WOULD ping-pong without a
+        // cooldown. C is WEEKLY-EXHAUSTED (0.99 ≥ the 0.98 weekly trigger) → never a
+        // viable target, so a correct loop must SELECT A or B and EXCLUDE C.
+        const C_RESET: i64 = 1_900_000_000; // far future; C is excluded regardless
+        let poller = FakeRosterPoller::new()
+            .ok(A.0, 0.96, 0.20)
+            .ok(B.0, 0.96, 0.20)
+            .ok_resets(C.0, 0.50, 0.99, C_RESET);
+        // Floor OFF (the #10 default — the cooldown ALONE bounds oscillation); cooldown
+        // 100 s; session trigger 95; no jitter, so every draw is deterministic.
+        let tun = tunables_floor_off(95, 100);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json.clone(),
+            &tun,
+        );
+
+        // --- reconcile-on-start: heal the canonical≠oauth mismatch -------------
+        assert_eq!(
+            displayed_uuid(&json).as_deref(),
+            Some(A.0),
+            "precondition: the display starts STALE (shows A while the canonical holds B)"
+        );
+        daemon.reconcile_on_start().await.unwrap();
+        assert_eq!(
+            displayed_uuid(&json).as_deref(),
+            Some(B.0),
+            "reconcile must heal the display to the account the canonical actually holds (B)"
+        );
+
+        let mut corpus = String::new();
+
+        // --- B → A: the active account (B), over its trigger, swaps to a viable
+        // target. C (weekly-exhausted) is excluded; A is selected. The promoted
+        // credential propagates to BOTH the canonical item and the display. --------
+        let outcome = daemon.tick().await;
+        assert_eq!(
+            outcome.action,
+            TickAction::Swapped { from: 1, to: 0 },
+            "B (active, over trigger) must swap to the viable A, never the exhausted C"
+        );
+        assert!(
+            daemon.store.read().await.unwrap().matches(&cred(&a_blob)),
+            "propagate: the canonical item now holds A's token"
+        );
+        assert_eq!(
+            displayed_uuid(&json).as_deref(),
+            Some(A.0),
+            "propagate: the display now shows A"
+        );
+        assert_eq!(daemon.state.active, Some(0), "the cached active is now A");
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Swap { .. })),
+            "the swap must surface a structured event (#9)"
+        );
+        harvest_channels(&outcome, &mut corpus);
+
+        // --- no oscillation: every tick WITHIN the 100 s cooldown is refused, even
+        // though A is now active and ALSO over the trigger — so never an A→B→A. ----
+        for offset in [20u64, 40, 60, 80] {
+            daemon.clock.advance(Duration::from_secs(20));
+            let outcome = daemon.tick().await;
+            assert_eq!(
+                outcome.action,
+                TickAction::SkippedCooldown,
+                "a re-swap at +{offset}s (inside the 100 s cooldown) must be refused"
+            );
+            assert!(
+                daemon.store.read().await.unwrap().matches(&cred(&a_blob)),
+                "no oscillation: the canonical still holds A's token inside the window"
+            );
+            harvest_channels(&outcome, &mut corpus);
+        }
+
+        // --- A → B: past the cooldown the swap-back is allowed, completing the
+        // B→A→B cycle — oscillation is BOUNDED by the cooldown, not frozen. --------
+        daemon.clock.advance(Duration::from_secs(40)); // now at +120 s, past the window
+        let outcome = daemon.tick().await;
+        assert_eq!(
+            outcome.action,
+            TickAction::Swapped { from: 0, to: 1 },
+            "past the cooldown A (active, over trigger) swaps back to the viable B"
+        );
+        assert!(
+            daemon.store.read().await.unwrap().matches(&cred(&b_blob)),
+            "propagate: the canonical item holds B's token again"
+        );
+        assert_eq!(
+            displayed_uuid(&json).as_deref(),
+            Some(B.0),
+            "propagate: the display shows B again — a full B→A→B cycle"
+        );
+        assert_eq!(daemon.state.active, Some(1), "the cached active is B again");
+        harvest_channels(&outcome, &mut corpus);
+
+        // --- the remaining operator channels: the offline `list` view, the UDS error
+        // replies, and every Error Display — all secret-free by construction. -------
+        corpus.push_str(&crate::cli::render_roster(&[
+            account(A.0, &format!("Sessiometer/{}", A.0), A.1),
+            account(B.0, &format!("Sessiometer/{}", B.0), B.1),
+            account(C.0, &format!("Sessiometer/{}", C.0), C.1),
+        ]));
+        corpus.push('\n');
+        corpus.push_str(&control_reply("not json", &StatusSnapshot::default()));
+        corpus.push('\n');
+        corpus.push_str(&control_reply(
+            r#"{"cmd":"nope"}"#,
+            &StatusSnapshot::default(),
+        ));
+        corpus.push('\n');
+        for err in every_error_variant() {
+            corpus.push_str(&err.to_string());
+            corpus.push('\n');
+        }
+
+        // Cardinality (issue #15): a gate that passes on an empty corpus is no
+        // evidence. Prove the loop actually surfaced each swap on a real channel before
+        // trusting the clean verdict.
+        assert!(
+            corpus.contains("event=swap from=spare to=work"),
+            "log channel: the B→A swap event is missing"
+        );
+        assert!(
+            corpus.contains("event=swap from=work to=spare"),
+            "log channel: the A→B swap-back event is missing"
+        );
+        assert!(
+            corpus.contains(r#""session_pct":96"#),
+            "UDS channel: the status wire is missing"
+        );
+        assert!(
+            corpus.contains("· session 96%"),
+            "status-text channel is missing"
+        );
+        assert!(
+            corpus.contains("swapped: spare → work"),
+            "foreground channel: the B→A swap report is missing"
+        );
+        assert!(
+            corpus.len() > 800,
+            "corpus implausibly small ({} bytes) — channels not captured",
+            corpus.len()
+        );
+
+        // The METER gate (#15): no token prefix, known token, blob fingerprint (leading
+        // bytes or sha256), email shape, or high-entropy run leaked onto ANY channel
+        // across the whole acceptance loop.
+        assert_clean(&corpus, &secrets);
+    }
 }
