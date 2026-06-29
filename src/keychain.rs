@@ -29,7 +29,9 @@
 //!   - **read** — `find-generic-password -w -s <service> -a <resolved-acct> <keychain>`;
 //!     `-w` prints the secret with a single trailing newline, which [`finish_read`]
 //!     strips so a read→write round-trip is byte-exact.
-//!   - **write** — `add-generic-password -U -s <service> -a <resolved-acct> -w <blob> <keychain>`.
+//!   - **write** — `add-generic-password -U -s <service> -a <resolved-acct> -w <blob> <keychain>`,
+//!     fed to `security -i` on **stdin** (not argv) so the blob is never visible in
+//!     this process's command line (issue #39; `build/version-compat.md`).
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -195,24 +197,71 @@ fn read_args(acct: &OsStr, keychain: &Path) -> Vec<OsString> {
     ]
 }
 
-/// `add-generic-password` arguments (after the program name). `-U` makes it an
-/// atomic in-place update of the resolved item; the blob is passed as a single
-/// argument verbatim — this matches the empirically validated write path
-/// (`build/version-compat.md`). NOTE: the blob is briefly visible in this
-/// process's argv (accepted residual risk for 0.1.0 per issue #2 — there is no
-/// stdin path for `-w`; never log the argv).
-fn write_args(acct: &OsStr, keychain: &Path, blob: &[u8]) -> Vec<OsString> {
-    vec![
-        "add-generic-password".into(),
-        "-U".into(),
-        "-s".into(),
-        SERVICE.into(),
-        "-a".into(),
-        acct.to_owned(),
-        "-w".into(),
-        OsStr::from_bytes(blob).to_owned(),
-        keychain.as_os_str().to_owned(),
-    ]
+/// Append `token` to `out` double-quoted and backslash-escaped for the
+/// `security -i` interactive tokenizer: escape `\` → `\\` and `"` → `\"`, then
+/// wrap in `"…"`. The tokenizer is **not** a shell — `$`, backticks, `;`, `|`
+/// and whitespace are all literal inside the quotes — so this suffices to carry
+/// an arbitrary single-line byte string as exactly one argument. Validated
+/// byte-exact across adversarial payloads (issue #39; `build/version-compat.md`).
+fn push_quoted(out: &mut Vec<u8>, token: &[u8]) {
+    out.push(b'"');
+    for &b in token {
+        if b == b'\\' || b == b'"' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out.push(b'"');
+}
+
+/// The `security -i` stdin line for the canonical write: an atomic in-place
+/// (`-U`) `add-generic-password` of the resolved item, every field double-quoted
+/// (incl. the blob). Feeding this on stdin keeps the blob off this process's argv
+/// — the spawned `security` carries only `-i` — closing the #2 residual risk
+/// (issue #39). The returned buffer holds the secret, so it is `Zeroizing`.
+fn write_command_line(acct: &OsStr, keychain: &Path, blob: &[u8]) -> Zeroizing<Vec<u8>> {
+    // The interactive reader is line-based: an embedded newline would truncate
+    // the command. Real payloads (single-line OAuth JSON) never contain one — and
+    // if one ever did, `security` exits non-zero and `finish_write` reports the
+    // failure rather than writing a truncated secret (never a silent partial).
+    debug_assert!(
+        !blob.contains(&b'\n'),
+        "interactive command line is newline-delimited"
+    );
+    let mut line = Vec::new();
+    line.extend_from_slice(b"add-generic-password -U -s ");
+    push_quoted(&mut line, SERVICE.as_bytes());
+    line.extend_from_slice(b" -a ");
+    push_quoted(&mut line, acct.as_bytes());
+    line.extend_from_slice(b" -w ");
+    push_quoted(&mut line, blob);
+    line.push(b' ');
+    push_quoted(&mut line, keychain.as_os_str().as_bytes());
+    line.push(b'\n');
+    Zeroizing::new(line)
+}
+
+/// Run one off-argv write: spawn `security -i` (argv is only `-i` — the blob
+/// rides stdin, never the process command line, issue #39), feed `line`, then
+/// close stdin so the CLI hits EOF and exits, and collect the result. `line`
+/// holds the secret and stays owned (and `Zeroizing`) at the call site.
+async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = Command::new(SECURITY)
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // One small (< pipe-buffer) write, so there is no stdin/stderr deadlock risk;
+    // dropping the handle at the end of the statement closes the pipe → EOF.
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(line)
+        .await?;
+    Ok(child.wait_with_output().await?)
 }
 
 /// Map a non-zero `security` exit `code` to a typed error. `36` is
@@ -337,11 +386,11 @@ impl CredentialStore for RealCredentialStore {
     async fn write(&self, credential: &Credential) -> Result<()> {
         let acct = self.acct().await?;
         let keychain = self.keychain_path()?;
-        let output = Command::new(SECURITY)
-            .args(write_args(&acct, &keychain, credential.expose()))
-            .stdin(Stdio::null())
-            .output()
-            .await?;
+        // Build the command (blob included) and feed it to `security -i` on
+        // stdin, so the blob never lands on this process's argv (issue #39).
+        // `line` is the only heap copy of the escaped secret and is `Zeroizing`.
+        let line = write_command_line(&acct, &keychain, credential.expose());
+        let output = run_interactive_write(&line).await?;
         finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
 }
@@ -397,22 +446,35 @@ mod tests {
     }
 
     #[test]
-    fn write_args_match_the_validated_command() {
+    fn push_quoted_wraps_and_escapes_only_backslash_and_quote() {
+        let mut out = Vec::new();
+        push_quoted(&mut out, b"plain");
+        assert_eq!(out, b"\"plain\"");
+
+        // `"` → `\"` and `\` → `\\`, wrapped in quotes.
+        let mut out = Vec::new();
+        push_quoted(&mut out, br#"a"b\c"#);
+        assert_eq!(out, br#""a\"b\\c""#);
+
+        // Whitespace and shell metacharacters are literal — the interactive
+        // tokenizer is not a shell, so nothing else needs escaping.
+        let mut out = Vec::new();
+        push_quoted(&mut out, b"a b$c`d;e|f&g");
+        assert_eq!(out, b"\"a b$c`d;e|f&g\"");
+    }
+
+    #[test]
+    fn write_command_line_quotes_every_field_and_keeps_the_blob_off_argv() {
         let kc = Path::new("/tmp/login.keychain-db");
-        assert_eq!(
-            write_args(OsStr::new("alice"), kc, b"the-token"),
-            vec![
-                OsString::from("add-generic-password"),
-                OsString::from("-U"),
-                OsString::from("-s"),
-                OsString::from(SERVICE),
-                OsString::from("-a"),
-                OsString::from("alice"),
-                OsString::from("-w"),
-                OsString::from("the-token"),
-                kc.as_os_str().to_owned(),
-            ]
+        let line = write_command_line(OsStr::new("alice"), kc, br#"tok "x" \y"#);
+        // Exactly the `-w` command, every field double-quoted, the blob's `"` and
+        // `\` escaped, one trailing newline. The blob lives only inside this
+        // stdin line — the spawned process's argv is the constant `-i`.
+        let expected = format!(
+            "add-generic-password -U -s \"{SERVICE}\" -a \"alice\" -w \"tok \\\"x\\\" \\\\y\" \"{}\"\n",
+            kc.display()
         );
+        assert_eq!(&line[..], expected.as_bytes());
     }
 
     #[test]
@@ -688,6 +750,96 @@ class: "genp"
                 store.read().await,
                 Err(Error::CredentialAmbiguous { count: 2 })
             ));
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn write_round_trips_a_blob_with_shell_metacharacters() {
+            // The off-argv `security -i` path must carry an arbitrary single-line
+            // blob byte-exact — including every character that would matter to a
+            // shell or a naive tokenizer: spaces, double quotes, backslashes, and
+            // `$`/backticks/`;`/`|`/`&`. (The canonical blob is opaque to us.)
+            let (_dir, kc) = fresh_keychain();
+            seed(&kc, "sessiometer-meta-acct", "seed-token");
+            let store = RealCredentialStore::for_keychain(kc.clone());
+            let nasty = br#"{"t":"a b \" c \\ d $x `y` ;z |w &q"}"#;
+            store
+                .write(&Credential::new(nasty.to_vec()))
+                .await
+                .expect("write a blob with metacharacters");
+            let got = store.read().await.expect("read it back");
+            assert_eq!(got.expose(), nasty);
+            delete(&kc);
+        }
+
+        /// Issue #39 acceptance, verified directly: the blob does not appear in
+        /// the process command line during a write. Hold the `security -i` child's
+        /// stdin open after feeding it the command — the CLI runs the line but
+        /// stays alive reading stdin — then snapshot its argv via `ps`. The
+        /// sentinel blob must be absent; argv is only `-i`.
+        #[test]
+        fn the_blob_never_appears_in_the_process_argv() {
+            use std::io::Write as _;
+            use std::thread::sleep;
+            use std::time::Duration;
+
+            let (_dir, kc) = fresh_keychain();
+            const SENTINEL: &str = "SENTINEL-oauth-blob-must-never-reach-argv-39";
+            let line = write_command_line(OsStr::new("ps-acct"), &kc, SENTINEL.as_bytes());
+
+            let mut child = StdCommand::new(SECURITY)
+                .arg("-i")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn security -i");
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin.write_all(&line).expect("feed the write command");
+            stdin.flush().expect("flush stdin");
+            // Keep `stdin` open → `security -i` runs the line but stays alive, so
+            // `ps` can observe a live process whose argv is fixed at spawn.
+            sleep(Duration::from_millis(200));
+
+            let pid = child.id().to_string();
+            let ps = StdCommand::new("/bin/ps")
+                .args(["-o", "command=", "-p", pid.as_str()])
+                .output()
+                .expect("spawn ps");
+            let argv = String::from_utf8_lossy(&ps.stdout);
+
+            // Close stdin → EOF → the CLI exits; reap it.
+            drop(stdin);
+            let _ = child.wait();
+
+            assert!(
+                argv.contains("security") && argv.contains("-i"),
+                "sanity: ps should show the live `security -i` (got {argv:?})"
+            );
+            assert!(
+                !argv.contains(SENTINEL),
+                "the blob leaked into the process argv: {argv:?}"
+            );
+
+            // The off-argv write is functional, not inert: the item landed.
+            let check = StdCommand::new(SECURITY)
+                .args([
+                    "find-generic-password",
+                    "-w",
+                    "-s",
+                    SERVICE,
+                    "-a",
+                    "ps-acct",
+                ])
+                .arg(&kc)
+                .output()
+                .expect("spawn find-generic-password");
+            assert!(check.status.success(), "the item should have been written");
+            let mut stored = check.stdout;
+            if stored.last() == Some(&b'\n') {
+                stored.pop();
+            }
+            assert_eq!(stored, SENTINEL.as_bytes());
             delete(&kc);
         }
     }

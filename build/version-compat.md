@@ -108,3 +108,76 @@ interactive prompt. This run validated the interactive path, not the daemon path
   backing) from the `macos-keychain-internals` skill — empirically observed on Darwin 25.x, under-documented by
   Apple, version-dependent; re-verify on macOS major bumps.
 - CC 2.1.181 · macOS 26.5.1 / 25F80.
+
+---
+
+# Issue #39 — off-argv credential write (the swap-write argv exposure)
+
+The follow-up to the #2 residual risk: the swap write passed the credential blob as a
+`security add-generic-password … -w <blob>` **argument**, briefly visible in the process table
+(`ps`). On a multi-account / shared host that is a real exposure. This records the empirical
+resolution, verified against `/usr/bin/security` on the same platform (macOS 26.5.1 / 25F80,
+Darwin 25.x), 2026-06-29.
+
+## Finding — `security -i` accepts the write off-argv ✅
+
+`security -i` reads commands from **stdin** and dispatches them internally, so the spawned
+process's argv is only `/usr/bin/security -i` — the blob never appears on argv. A full
+`add-generic-password -U -s <svc> -a <acct> -w <blob> <keychain>` command (the keychain pinned
+**inside** the stdin command) writes correctly and round-trips byte-exact. Adopted: both write
+paths exercised during a swap — `keychain::RealCredentialStore::write` (the canonical token) and
+`stash::…add_item` (the two stash halves) — feed the command on stdin. A swap performs three such
+writes; all three are now off-argv.
+
+## Escaping — double-quote, backslash-escape `\` and `"`
+
+The interactive tokenizer is **not a shell**: inside `"…"`, whitespace and `$`, backticks, `;`,
+`|`, `&`, `(` … are all literal. Wrapping each field in `"…"` and escaping `\` → `\\` and
+`"` → `\"` carries an arbitrary single-line byte string as exactly one argument. Validated
+byte-exact across 10 adversarial payloads (spaces, quotes, backslashes, shell metacharacters,
+realistic OAuth JSON, leading-dash, hex) and re-asserted in CI by the `real_cli` metacharacter
+round-trip tests in both modules.
+
+## Exit-code contract — preserved
+
+`security -i` propagates the inner command's exit status **unchanged** — the load-bearing property
+here. Observed interactive-vs-direct, byte-for-byte: not-found `44 == 44`; a usage/parse error
+`2 == 2`; a locked-keychain write surfaced the same raw exit either way (`152` in this probe
+context). The specific locked-write code is immaterial to #39: `finish_write` / `keychain_error` /
+`stash_error` are untouched, so whatever code `security` returns maps exactly as it did on the old
+argv path. (The `36 → KeychainLocked` mapping and the broader daemon lock-handling remain #13's
+scope — see the H0 row above for why a lock can surface differently by context.) The move to stdin
+changes the input channel, not the status.
+
+## Identity / partition list — unchanged
+
+Still `/usr/bin/security` (the `apple-tool:` code identity), so the partition-list and ACL
+guarantees recorded for #16/#2 (and in the `macos-keychain-internals` skill) are untouched — `-i`
+changes the **input channel**, not the writer's identity.
+
+## Verification — the blob is absent from argv during a write
+
+Holding the child's stdin open keeps `security -i` alive *after* it runs the write, so its argv
+can be read deterministically (not racily): `ps -o command= -p <pid>` shows only
+`/usr/bin/security -i`; a sentinel blob is absent, and the item is confirmed written. Encoded as
+the CI test `keychain::tests::real_cli::the_blob_never_appears_in_the_process_argv`.
+
+## Rejected alternative — `-w` as the last option (interactive prompt)
+
+`add-generic-password … -w` with no value *does* prompt for the secret, but via `getpass` on
+`/dev/tty` **with confirmation** (`password data for new item:` / `retype password for new item:`),
+not stdin — unusable for a TTY-less daemon. It also cannot pin an explicit keychain alongside the
+prompt (BSD getopt stops permuting at the first positional, so a trailing `-w` after the keychain
+path is rejected). Not adopted.
+
+## Residual
+
+- **Embedded newline**: the interactive reader is line-based, so a payload containing `\n` would
+  break the command. Real payloads never do (single-line OAuth JSON; the stash `oauthAccount` half
+  is pure-ASCII hex), and the failure is **loud, not silent** — the command exits non-zero, so the
+  write is reported failed rather than writing a truncated item. Guarded by a `debug_assert!`.
+- **Kernel pipe buffer**: the blob transits a pipe to the child. That is process-private (unlike
+  world-readable argv) and inherent to any off-argv hand-off; the in-process heap copy of the
+  escaped command is `Zeroizing` (wiped on drop).
+
+CC 2.1.181 · macOS 26.5.1 / 25F80 · sessiometer #39.

@@ -34,7 +34,7 @@
 //! their ACL identity is irrelevant — the `apple-tool:` preservation that matters
 //! for the canonical item does not apply here.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -45,7 +45,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use tokio::process::Command;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::claude_state::OauthAccount;
 use crate::error::{Error, Result};
@@ -118,14 +118,11 @@ impl RealAccountStash {
         }
     }
 
-    /// `add-generic-password -U` one item, storing `payload` as the secret.
-    ///
-    /// NOTE: `payload` is briefly visible in this process's argv (the same
-    /// accepted 0.1.0 residual risk as [`crate::keychain`]'s write — there is no
-    /// stdin path for `-w`; never log the argv). For the `oauthAccount` half this
-    /// argv carries the account's email (hex-encoded, but trivially recoverable),
-    /// so the exposure is wider than #2's opaque-token case — a conscious 0.1.0
-    /// trade-off, not an inherited one.
+    /// `add-generic-password -U` one item, storing `payload` as the secret —
+    /// driven through `security -i` (the command on stdin) so `payload` never
+    /// reaches this process's argv (issue #39). This matters most for the
+    /// `oauthAccount` half, whose hex carries the account's email: the previously
+    /// accepted argv exposure (wider than #2's opaque-token case) is now closed.
     async fn add_item(
         &self,
         service: &str,
@@ -133,11 +130,10 @@ impl RealAccountStash {
         keychain: &Path,
         payload: &[u8],
     ) -> Result<()> {
-        let output = Command::new(SECURITY)
-            .args(write_item_args(service, acct, keychain, payload))
-            .stdin(Stdio::null())
-            .output()
-            .await?;
+        // `line` (the command, payload included) is the only heap copy of the
+        // escaped secret and is `Zeroizing`; only `-i` ever reaches argv.
+        let line = write_item_command_line(service, acct, keychain, payload);
+        let output = run_interactive_write(&line).await?;
         if output.status.success() {
             Ok(())
         } else {
@@ -225,21 +221,75 @@ impl AccountStash for RealAccountStash {
     }
 }
 
-/// `add-generic-password` arguments (after the program name): an in-place (`-U`)
-/// update of `(service, acct)`, pinning the keychain path. The payload is passed
-/// as a single verbatim argument.
-fn write_item_args(service: &str, acct: &str, keychain: &Path, payload: &[u8]) -> Vec<OsString> {
-    vec![
-        "add-generic-password".into(),
-        "-U".into(),
-        "-s".into(),
-        service.into(),
-        "-a".into(),
-        acct.into(),
-        "-w".into(),
-        OsStr::from_bytes(payload).to_owned(),
-        keychain.as_os_str().to_owned(),
-    ]
+/// Append `token` to `out` double-quoted and backslash-escaped for the
+/// `security -i` interactive tokenizer (escape `\` → `\\` and `"` → `\"`, then
+/// wrap in `"…"`). The tokenizer is **not** a shell — whitespace, `$`, backticks,
+/// `;`, `|` are literal inside the quotes — so this carries an arbitrary
+/// single-line byte string as one argument (issue #39). Mirrors
+/// [`crate::keychain`]'s helper, kept local to avoid coupling the two modules.
+fn push_quoted(out: &mut Vec<u8>, token: &[u8]) {
+    out.push(b'"');
+    for &b in token {
+        if b == b'\\' || b == b'"' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out.push(b'"');
+}
+
+/// The `security -i` stdin line for one stash write: an in-place (`-U`)
+/// `add-generic-password` of `(service, acct)`, pinning the keychain, every field
+/// double-quoted (incl. the payload). Fed on stdin so the payload stays off argv
+/// (issue #39). The returned buffer holds the secret, so it is `Zeroizing`.
+fn write_item_command_line(
+    service: &str,
+    acct: &str,
+    keychain: &Path,
+    payload: &[u8],
+) -> Zeroizing<Vec<u8>> {
+    // Line-based reader: a newline in `payload` would truncate the command. The
+    // stored halves never contain one (the credential is single-line OAuth JSON;
+    // the oauthAccount half is pure-ASCII hex) — and if one ever did, `security`
+    // exits non-zero and the caller surfaces it, never a silent partial write.
+    debug_assert!(
+        !payload.contains(&b'\n'),
+        "interactive command line is newline-delimited"
+    );
+    let mut line = Vec::new();
+    line.extend_from_slice(b"add-generic-password -U -s ");
+    push_quoted(&mut line, service.as_bytes());
+    line.extend_from_slice(b" -a ");
+    push_quoted(&mut line, acct.as_bytes());
+    line.extend_from_slice(b" -w ");
+    push_quoted(&mut line, payload);
+    line.push(b' ');
+    push_quoted(&mut line, keychain.as_os_str().as_bytes());
+    line.push(b'\n');
+    Zeroizing::new(line)
+}
+
+/// Run one off-argv write: spawn `security -i` (argv is only `-i` — the payload
+/// rides stdin, never the process command line, issue #39), feed `line`, close
+/// stdin so the CLI hits EOF and exits, and collect the result. Mirrors
+/// [`crate::keychain`]'s helper, kept local to avoid coupling the two modules.
+async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = Command::new(SECURITY)
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // One small (< pipe-buffer) write — no stdin/stderr deadlock risk; dropping
+    // the handle closes the pipe → EOF.
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(line)
+        .await?;
+    Ok(child.wait_with_output().await?)
 }
 
 /// `find-generic-password` arguments (after the program name): read the secret of
@@ -355,27 +405,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_args_pin_service_acct_payload_and_keychain() {
+    fn push_quoted_wraps_and_escapes_only_backslash_and_quote() {
+        let mut out = Vec::new();
+        push_quoted(&mut out, b"plain");
+        assert_eq!(out, b"\"plain\"");
+
+        // `"` → `\"` and `\` → `\\`, wrapped in quotes.
+        let mut out = Vec::new();
+        push_quoted(&mut out, br#"a"b\c"#);
+        assert_eq!(out, br#""a\"b\\c""#);
+
+        // Whitespace and shell metacharacters are literal (not a shell).
+        let mut out = Vec::new();
+        push_quoted(&mut out, b"a b$c`d;e|f&g");
+        assert_eq!(out, b"\"a b$c`d;e|f&g\"");
+    }
+
+    #[test]
+    fn write_item_command_line_quotes_every_field_and_keeps_payload_off_argv() {
         let kc = Path::new("/tmp/login.keychain-db");
-        assert_eq!(
-            write_item_args(
-                "Sessiometer/11111111-1111-1111-1111-111111111111",
-                ACCT_CREDENTIAL,
-                kc,
-                b"blob"
-            ),
-            vec![
-                OsString::from("add-generic-password"),
-                OsString::from("-U"),
-                OsString::from("-s"),
-                OsString::from("Sessiometer/11111111-1111-1111-1111-111111111111"),
-                OsString::from("-a"),
-                OsString::from("credential"),
-                OsString::from("-w"),
-                OsString::from("blob"),
-                kc.as_os_str().to_owned(),
-            ]
+        let line = write_item_command_line(
+            "Sessiometer/11111111-1111-1111-1111-111111111111",
+            ACCT_CREDENTIAL,
+            kc,
+            br#"blob "x" \y"#,
         );
+        let expected = format!(
+            "add-generic-password -U -s \"Sessiometer/11111111-1111-1111-1111-111111111111\" -a \"credential\" -w \"blob \\\"x\\\" \\\\y\" \"{}\"\n",
+            kc.display()
+        );
+        assert_eq!(&line[..], expected.as_bytes());
     }
 
     #[test]
@@ -566,6 +625,29 @@ mod tests {
                     .await,
                 Err(Error::StashIncomplete { .. })
             ));
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn write_round_trips_a_credential_with_shell_metacharacters() {
+            // The credential half goes raw through the off-argv `security -i`
+            // path; prove the escaping carries spaces, double quotes, backslashes,
+            // and `$`/backticks/`;`/`|`/`&` byte-exact (issue #39). The oauthAccount
+            // half is pure-ASCII hex, trivially tokenizer-safe.
+            let (_dir, kc) = fresh_keychain();
+            let stash = RealAccountStash::for_keychain(kc.clone());
+            let service = "Sessiometer/22222222-2222-2222-2222-222222222222";
+            let blob = br#"{"accessToken":"a b \" c \\ d","x":"$y `z` ;|&"}"#;
+            let account = StashedAccount {
+                credential: Credential::new(blob.to_vec()),
+                oauth_account: OauthAccount::from_object_bytes(
+                    br#"{"accountUuid":"22222222-2222-2222-2222-222222222222"}"#,
+                )
+                .unwrap(),
+            };
+            stash.write(service, &account).await.expect("write stash");
+            let got = stash.read(service).await.expect("read stash");
+            assert_eq!(got.credential.expose(), blob);
             delete(&kc);
         }
     }
