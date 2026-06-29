@@ -342,43 +342,47 @@ fn view(loaded: Result<Config>) -> Result<String> {
     }
 }
 
-/// Render the roster as one `label · uuid · stash` row per account, then a bare
-/// `N account(s)` total. The roster has no fixed size (#35), so the total carries
-/// no "of N" denominator — just the count (pluralized for grammar).
+/// Render the roster as two space-aligned columns — each account's `label`, then
+/// its full `account_uuid` — one row per account, followed by a bare
+/// `N account(s)` total. The label column is padded to the widest label plus a
+/// two-space gap so the uuid column lines up. The FULL uuid (not a truncated
+/// prefix) is shown so it can be copied straight into `sessiometer use <uuid>`,
+/// and the former keychain-name column is dropped — it was just `Sessiometer/` +
+/// the uuid, redundant once the full uuid is shown (issue #69). The roster has no
+/// fixed size (#35), so the total carries no "of N" denominator — just the count
+/// (pluralized for grammar).
 ///
-/// Sourced solely from each [`Account`]'s non-secret fields (label, short
-/// `account_uuid`, stash) — never a token or email (issue #15 redaction).
+/// Sourced solely from each [`Account`]'s two non-secret display fields — `label`
+/// and `account_uuid` — never a token or email (issue #15 redaction). A label is
+/// operator-provided free text: one that happens to contain an `@` is the
+/// operator's own value, not a leak.
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
 /// can route this exact `list`-view surface through its scan.
 pub(crate) fn render_roster(roster: &[Account]) -> String {
+    // Pad the label column to the widest label (by char count, matching the
+    // `{:<width$}` fill) so the uuid column aligns. The offline `list` never
+    // renders an empty roster (that maps to the friendly `RosterEmpty`), but
+    // `unwrap_or(0)` keeps this total for the METER's direct callers.
+    let width = roster
+        .iter()
+        .map(|account| account.label.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     for account in roster {
         // A parked account is marked inline (issue #36); an enabled one adds
-        // nothing, so existing rosters render exactly as before.
+        // nothing.
         let state = if account.enabled { "" } else { " · disabled" };
         out.push_str(&format!(
-            "{} · {} · {}{}\n",
-            account.label,
-            short_uuid(&account.account_uuid),
-            account.stash,
-            state,
+            "{:<width$}  {}{}\n",
+            account.label, account.account_uuid, state,
         ));
     }
     let n = roster.len();
     let noun = if n == 1 { "account" } else { "accounts" };
     out.push_str(&format!("\n{n} {noun}\n"));
     out
-}
-
-/// The display-friendly short form of an `account_uuid`: its first segment (the
-/// leading 8 characters of a canonical UUID), or the whole value when shorter.
-/// Char-boundary safe — the field is an arbitrary, validated-non-empty string.
-fn short_uuid(account_uuid: &str) -> &str {
-    match account_uuid.char_indices().nth(8) {
-        Some((boundary, _)) => &account_uuid[..boundary],
-        None => account_uuid,
-    }
 }
 
 /// `disable`/`enable <label>` — take an account out of the rotation, or return it
@@ -548,8 +552,8 @@ mod tests {
         ]);
         assert_eq!(
             out,
-            "work · 11111111 · Sessiometer/11111111-1111-1111-1111-111111111111\n\
-personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
+            "work      11111111-1111-1111-1111-111111111111\n\
+personal  22222222-2222-2222-2222-222222222222\n\
 \n\
 2 accounts\n"
         );
@@ -577,20 +581,6 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
     }
 
     #[test]
-    fn short_uuid_takes_the_leading_eight_chars_of_a_canonical_uuid() {
-        assert_eq!(
-            short_uuid("11111111-2222-3333-4444-555555555555"),
-            "11111111"
-        );
-    }
-
-    #[test]
-    fn short_uuid_returns_a_shorter_or_eight_char_value_whole() {
-        assert_eq!(short_uuid("u"), "u");
-        assert_eq!(short_uuid("12345678"), "12345678");
-    }
-
-    #[test]
     fn view_renders_a_present_roster() {
         let config = config_with(vec![acct(
             "work",
@@ -599,10 +589,7 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
         )]);
         let out = view(Ok(config)).expect("a present roster is not an error");
         // A single-account roster reads "1 account" (singular), not "1 accounts".
-        assert_eq!(
-            out,
-            "work · 11111111 · Sessiometer/11111111-aaaa\n\n1 account\n"
-        );
+        assert_eq!(out, "work  11111111-aaaa\n\n1 account\n");
     }
 
     #[test]
@@ -644,8 +631,10 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
 
     #[test]
     fn output_never_carries_an_email_or_token_sigil() {
-        // #15 redaction: the formatter sources only the three non-secret roster
-        // fields, so a token / email can never reach the printed surface.
+        // #15 redaction: the formatter sources only the two non-secret roster
+        // fields it shows (`label`, `account_uuid`), so it never auto-introduces a
+        // token or email. (A label the operator sets to an email is their own
+        // value, not a leak — see issue #69.)
         let out = render_roster(&[acct(
             "work",
             "11111111-1111-1111-1111-111111111111",
@@ -667,8 +656,8 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
         let out = render_roster(&[work, spare]);
         assert_eq!(
             out,
-            "work · 11111111 · Sessiometer/11111111-1111 · disabled\n\
-spare · 22222222 · Sessiometer/22222222-2222\n\
+            "work   11111111-1111 · disabled\n\
+spare  22222222-2222\n\
 \n\
 2 accounts\n"
         );
