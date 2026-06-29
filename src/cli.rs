@@ -435,7 +435,9 @@ pub(crate) fn render_status(
     // The forward-looking next-swap candidate (issue #88), computed daemon-side
     // ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like
     // the table footer it replaces (per-cell health coloring is #84, orthogonal). A
-    // `None` field can only be a pre-#88 daemon that never sends it → bare `none`.
+    // `None` field means the daemon sent no candidate — either a current daemon with no
+    // active account to anchor a swap from, or (via `#[serde(default)]`) a pre-#88 daemon
+    // that omits the field — and renders a bare `none` either way.
     match &response.next_swap {
         Some(NextSwap::Target { to }) => out.push_str(&format!("next swap: {to}\n")),
         Some(NextSwap::NoViableTarget) => out.push_str("next swap: none (no viable target)\n"),
@@ -1693,7 +1695,8 @@ spare  22222222-2222\n\
             footer(Some(NextSwap::AwaitingData)),
             "next swap: none (awaiting usage data)"
         );
-        // `None` is only a pre-#88 daemon that omits the field → a bare `none`.
+        // `None` (a current daemon with no active anchor, or a pre-#88 daemon that omits
+        // the field) → a bare `none`.
         assert_eq!(footer(None), "next swap: none");
     }
 
@@ -2296,5 +2299,19 @@ spare  22222222-2222\n\
                 to: "spare".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn status_response_decodes_a_payload_that_omits_next_swap() {
+        // Backward-compatible decode (#88): a pre-#88 daemon's reply carries no
+        // `next_swap` key at all. `#[serde(default)]` must decode the absent field to
+        // `None` rather than fail — the round-trip test above only proves the field
+        // survives when PRESENT, so this pins the ABSENT case the compat guarantee
+        // actually exists for (cf. the sibling `session_resets_at` added-field convention).
+        let wire = r#"{"accounts":[]}"#;
+        let parsed: StatusResponse =
+            serde_json::from_str(wire).expect("an absent next_swap decodes, not errors");
+        assert_eq!(parsed.next_swap, None);
+        assert!(parsed.accounts.is_empty());
     }
 }

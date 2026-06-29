@@ -1297,7 +1297,8 @@ where
         // Build an all-absent snapshot so the control socket keeps answering while
         // locked: every reading is unavailable (the keychain is unreadable), but
         // `status` still lists the roster rather than going dark. With no readings the
-        // next-swap candidate is `awaiting usage data` (#88), which is exactly true.
+        // next-swap candidate reads `awaiting usage data` for any live spare (#88) — an
+        // honest "no swap right now", since a lock merely defers the data behind it.
         let readings = vec![None; self.roster.len()];
         let snapshot = self.snapshot(self.state.active, &readings);
         // Diagnostic (issue #77): a locked tick polls NOTHING (it short-circuits
@@ -1784,11 +1785,11 @@ where
     /// not flicker with the per-cycle swap-decision jitter.
     ///
     /// `None` only when there is no active account to swap FROM (no anchor). Otherwise
-    /// the three cases mirror `pick_target`'s verdict: a viable [`NextSwap::Target`], a
+    /// the three cases mirror `pick_target`'s verdict: a viable [`NextSwap::Target`]; a
     /// [`NextSwap::NoViableTarget`] when readings are in hand but none qualifies (or no
-    /// other account is enabled), and [`NextSwap::AwaitingData`] for the post-restart
-    /// moment when no other enabled account has a reading yet — the distinction #88
-    /// exists to draw.
+    /// other enabled, non-quarantined account exists at all); and
+    /// [`NextSwap::AwaitingData`] for the post-restart moment when such an account exists
+    /// but none has a reading yet — the distinction #88 exists to draw.
     fn next_swap(&self, active: Option<usize>, readings: &[Option<Usage>]) -> Option<NextSwap> {
         let active_idx = active?;
         let enabled = self.enabled_mask();
@@ -1805,11 +1806,15 @@ where
         }
         // No viable target. Distinguish the post-restart "no readings yet" case (some
         // other enabled account exists, but none has been polled) from a genuine "all
-        // exhausted / none enabled" verdict — drawing that line is the point of #88.
+        // exhausted / none enabled" verdict — drawing that line is the point of #88. A
+        // QUARANTINED account (#42) is excluded from this tally: `decision_readings`
+        // masks its reading to `None`, but a dead credential is NOT "data on the way"
+        // (it needs a re-login), so counting it would mislabel an all-dead-spares roster
+        // as `awaiting usage data` instead of the truthful `no viable target`.
         let mut any_other_enabled = false;
         let mut all_unpolled = true;
         for (i, reading) in readings.iter().enumerate() {
-            if i != active_idx && enabled[i] {
+            if i != active_idx && enabled[i] && !self.state.health[i].quarantined {
                 any_other_enabled = true;
                 all_unpolled &= reading.is_none();
             }
@@ -5314,6 +5319,43 @@ mod tests {
         assert_eq!(
             daemon.next_swap(None, &[usage(0.97, 0.40), None, None]),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn next_swap_reads_all_quarantined_others_as_no_viable_target() {
+        // A `None` reading for another account has two causes the #88 substates must NOT
+        // conflate: a not-yet-polled cold start (genuine `awaiting usage data`) vs a
+        // QUARANTINED account (#42) whose reading `decision_readings` masks to `None`.
+        // When every OTHER enabled account is quarantined there is no live target, so the
+        // footer must say `no viable target` — promising "usage data" that needs a
+        // re-login, not a poll, would mislead. Reuses the 3-account harness (work=0
+        // active, spare=1, backup=2).
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let usage = |session: f64, weekly: f64| {
+            Some(Usage {
+                session,
+                weekly,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            })
+        };
+
+        // Both other accounts dead (their readings masked to `None`, as the snapshot
+        // would pass them) → no viable target, NOT awaiting-data.
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[2].quarantined = true;
+        assert_eq!(
+            daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
+            Some(NextSwap::NoViableTarget),
+        );
+
+        // Revive one: a live, not-yet-polled other account restores the genuine
+        // cold-start `awaiting usage data` verdict (the substate is unchanged for it).
+        daemon.state.health[1].quarantined = false;
+        assert_eq!(
+            daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
+            Some(NextSwap::AwaitingData),
         );
     }
 

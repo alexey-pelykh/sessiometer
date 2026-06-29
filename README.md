@@ -71,9 +71,10 @@ next swap: spare
 
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`
-when every other account is weekly-exhausted (or over the opt-in swap-target session
-floor), and `none (awaiting usage data)` right after the daemon starts, before it has
-polled the other accounts. It is **forward-looking** and recomputed every cycle, so —
+when no other account is a sound swap destination — every one is weekly-exhausted, over
+the opt-in swap-target session floor, or quarantined and needs a re-login — and
+`none (awaiting usage data)` right after the daemon starts, before it has polled the
+other accounts. It is **forward-looking** and recomputed every cycle, so —
 unlike a remembered "last swap" — it survives a daemon restart and always shows where
 the next rotation will land.
 
