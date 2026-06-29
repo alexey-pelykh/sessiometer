@@ -494,12 +494,13 @@ pub(crate) struct AccountStatusLine {
 pub(crate) enum NextSwap {
     /// A viable target exists — [`pick_target`]'s choice, by roster label.
     Target { to: String },
-    /// No sound swap destination — [`pick_target`] picked nothing AND no *live*
-    /// (enabled, non-quarantined) account is merely awaiting its first reading.
-    /// Reached when every other account is excluded (disabled #36, or quarantined and
-    /// needing a re-login #42 — its reading masked away by `decision_readings`), or has
-    /// a reading that does not qualify (weekly-exhausted, or over the opt-in session
-    /// floor), or there is simply no other account.
+    /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
+    /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
+    /// *live* (enabled, non-quarantined) other account has already been polled and none
+    /// qualifies (weekly-exhausted, or over the opt-in session floor) — even while other
+    /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
+    /// there is no live other account at all (every other disabled #36 or quarantined #42,
+    /// its reading masked away by `decision_readings`, or there is simply no other account).
     NoViableTarget,
     /// No reading yet for any *live* (enabled, non-quarantined) other account — the
     /// post-restart moment, before the staggered poll loop (#80) has read the rotation.
@@ -5326,6 +5327,17 @@ mod tests {
         assert_eq!(
             daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
             Some(NextSwap::AwaitingData),
+        );
+
+        // MIXED warm-up: one live other already polled-and-disqualified (spare over the
+        // 0.80 floor), another still unpolled (backup). This is the ONLY input that
+        // separates the `all_unpolled` rule from a naive any-unpolled one — `all_unpolled`
+        // is false (spare has a reading), so the verdict is `no viable target`, NOT
+        // `awaiting usage data`, even though a live account is still awaiting its first
+        // poll. Pins the deliberate all-vs-any choice (an `&=`→`=` mutation flips this).
+        assert_eq!(
+            daemon.next_swap(Some(0), &[usage(0.97, 0.40), usage(0.95, 0.10), None]),
+            Some(NextSwap::NoViableTarget),
         );
 
         // No active anchor to swap from → no candidate at all (renders a bare `none`).
