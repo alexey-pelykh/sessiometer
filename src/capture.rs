@@ -84,9 +84,14 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Load the existing config, treating an absent file as an empty roster (the
-/// first capture creates `config.toml`). A file that exists but is malformed is a
-/// hard error — never silently replaced.
+/// Load the existing config so `capture` can add to it.
+///
+/// An absent file is `None` (the first capture creates `config.toml`). A file that
+/// EXISTS — including a well-formed tunables-only one with an *empty* roster — is
+/// `Some(config)`, so its tunables are PRESERVED when the first account is added
+/// (an empty roster no longer fails to load; the "at least one account" rule is the
+/// daemon's [`Config::require_roster`] precondition, not a load-time rejection, #58).
+/// A file that exists but is *malformed* stays a hard error — never silently replaced.
 fn load_existing() -> Result<Option<Config>> {
     match Config::load() {
         Ok(config) => Ok(Some(config)),
@@ -364,6 +369,41 @@ mod tests {
         let stashed = stash.read("Sessiometer/u-1").await.unwrap();
         assert_eq!(stashed.credential.expose(), b"token-1");
         assert_eq!(stashed.oauth_account.account_uuid(), "u-1");
+    }
+
+    #[tokio::test]
+    async fn bootstraps_the_first_account_into_a_tunables_only_config_preserving_tunables() {
+        // Regression (#58): an existing config with custom tunables but an EMPTY
+        // roster (a fresh tunables-only file, or one whose last account was just
+        // `remove`d) must load and accept the first account WITHOUT resetting the
+        // operator's tunables to defaults — the data-loss trap a naive "treat the
+        // empty-roster error as None" fix would have introduced.
+        let stash = FakeAccountStash::empty();
+        let existing = Config {
+            roster: vec![],
+            tunables: Tunables {
+                poll_secs: 120,          // a non-default the operator set
+                session_floor: Some(80), // opt-in guard the operator enabled
+                ..Tunables::default()
+            },
+        };
+
+        let report = run_capture(
+            Credential::new(b"token-1".to_vec()),
+            oauth("u-1"),
+            &stash,
+            Some(existing),
+            Some("work"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, CaptureOutcome::Captured);
+        assert_eq!(report.config.roster.len(), 1);
+        // The operator's tunables survive the bootstrap (NOT reset to defaults:
+        // poll_secs default is 300, session_floor default is None).
+        assert_eq!(report.config.tunables.poll_secs, 120);
+        assert_eq!(report.config.tunables.session_floor, Some(80));
     }
 
     #[tokio::test]

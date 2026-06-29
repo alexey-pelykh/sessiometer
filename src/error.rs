@@ -64,13 +64,16 @@ pub(crate) enum Error {
     #[error("no config file at {path} — run `sessiometer capture` to create one")]
     ConfigNotFound { path: PathBuf },
 
-    /// `sessiometer list` found no roster to show. A friendly, user-facing remap
-    /// of [`Error::ConfigNotFound`] for the read-only `list` view: an absent
-    /// config is the only real empty state (`capture` cannot persist a 0-account
-    /// roster — it fails the `>= 1` load validation), so this reads as "nothing
-    /// captured yet" instead of leaking the lower-level "file missing". A
-    /// malformed config is deliberately NOT remapped — it keeps surfacing as its
-    /// real [`Error::ConfigParse`] / [`Error::ConfigInvalid`]. Secret-free.
+    /// No accounts in the roster to act on. The friendly, user-facing empty state
+    /// for two consumers: the offline `list` view (an absent config, OR a
+    /// well-formed tunables-only file whose roster is empty) and the daemon's
+    /// [`crate::config::Config::require_roster`] precondition (`run` refuses to
+    /// start with nothing to rotate across). Both read as "nothing captured yet"
+    /// instead of leaking a lower-level "file missing" or "invalid config". An
+    /// empty roster is a legitimate state — `capture` loads it to add the first
+    /// account (#58) — so it is NOT a validation error. A *malformed* config is
+    /// deliberately not remapped: it keeps surfacing as its real
+    /// [`Error::ConfigParse`] / [`Error::ConfigInvalid`]. Secret-free.
     #[error("no accounts captured yet — run `sessiometer capture`")]
     RosterEmpty,
 
@@ -81,9 +84,11 @@ pub(crate) enum Error {
     #[error("malformed config: {0}")]
     ConfigParse(String),
 
-    /// A config value is out of range, or the roster is malformed (wrong size,
-    /// duplicate `account_uuid`/`stash`, or an empty field). Carries a precise,
-    /// secret-free message naming the offending field.
+    /// A config value is out of range, or the roster is malformed (duplicate
+    /// `account_uuid`/`stash`, or an empty field). An empty roster is NOT in this
+    /// set — it is a valid state ([`Error::RosterEmpty`] is the daemon/`list`
+    /// empty-state, #58). Carries a precise, secret-free message naming the
+    /// offending field.
     #[error("invalid config: {0}")]
     ConfigInvalid(String),
 
