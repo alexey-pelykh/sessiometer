@@ -39,15 +39,15 @@
 //!   - **ScopeFailed** (`403`) → [`Error::UsageScopeMissing`], surfaced
 //!     **distinctly** from 401 — the hallmark of a non-interactive setup token.
 //!
-//! ## 401 monitor → re-stash trigger seam (issues #13 / #6)
+//! ## 401 streak → dead-credential detection (issue #42)
 //!
-//! [`Monitor401`] counts *consecutive* 401s and resets on any non-401 outcome.
-//! On the `monitor_401_n`-th consecutive 401 it fires the [`ReStashTrigger`]
-//! seam — a signal only. The actual re-stash (canonical re-read) and the back-off
-//! loop are out of scope here (#13 / #6); production wires a [`NoopReStashTrigger`].
-//! The poller never self-refreshes a token.
+//! The poll path is stateless: each poll classifies one HTTP outcome and returns a
+//! [`Usage`] reading or a typed error. Consecutive-401 streak tracking — and the
+//! dead-credential quarantine / emergency-swap / recovery it drives — lives in the
+//! daemon's per-account health state ([`crate::daemon`]), which is the only place a
+//! streak can persist ACROSS polls (a per-poll counter here would reset every tick
+//! and never accumulate). The poller never self-refreshes a token.
 
-use std::cell::Cell;
 use std::process::Stdio;
 
 #[cfg(test)]
@@ -159,136 +159,34 @@ pub(crate) struct HttpResponse {
     body: String,
 }
 
-/// Seam: signals that an account's stored token has been rejected
-/// `monitor_401_n` times in a row and should be re-stashed (a canonical re-read;
-/// issue #13 / #6). A signal only — the implementor performs (or schedules) the
-/// re-stash. The poller never self-refreshes.
-pub(crate) trait ReStashTrigger {
-    fn request_restash(&self);
-}
-
-/// Production trigger: a no-op. Counting and firing happen here in #5; acting on
-/// the signal (the canonical re-read) lands in #13 / #6, which replaces this.
-pub(crate) struct NoopReStashTrigger;
-
-impl ReStashTrigger for NoopReStashTrigger {
-    fn request_restash(&self) {}
-}
-
-/// Consecutive-401 counter behind the re-stash trigger seam.
-///
-/// Increments on each 401 and resets on **any** non-401 outcome (success, 403,
-/// 429, transient, even an I/O failure) — per issue #5's "counter resets on a
-/// non-401 outcome". The trigger fires exactly once per streak, at the crossing
-/// (`count == threshold`): the count keeps climbing past the threshold so the
-/// equality is not re-satisfied until a non-401 resets it.
-struct Monitor401 {
-    /// `monitor_401_n` (config-validated `1..=20`), so the first 401 can never
-    /// trip a zero threshold.
-    threshold: u8,
-    count: Cell<u8>,
-}
-
-impl Monitor401 {
-    fn new(threshold: u8) -> Self {
-        Self {
-            threshold,
-            count: Cell::new(0),
-        }
-    }
-
-    /// Record one poll outcome and fire the trigger on the Nth consecutive 401.
-    fn observe(&self, unauthorized: bool, trigger: &impl ReStashTrigger) {
-        if unauthorized {
-            let count = self.count.get().saturating_add(1);
-            self.count.set(count);
-            if count == self.threshold {
-                trigger.request_restash();
-            }
-        } else {
-            self.count.set(0);
-        }
-    }
-
-    #[cfg(test)]
-    fn count(&self) -> u8 {
-        self.count.get()
-    }
-}
-
-/// Real usage poller: classify the HTTP outcome, parse a success, and drive the
-/// 401 monitor. Generic over the transport and the re-stash trigger so the whole
-/// `usage()` flow is testable against fakes (matching the daemon's seam design).
-pub(crate) struct RealUsageSource<Tp, Tr> {
+/// Real usage poller: classify the HTTP outcome and parse a success. Generic over
+/// the transport so the whole `usage()` flow is testable against a fake. Stateless
+/// — consecutive-401 streak tracking lives in the daemon's per-account health state
+/// (issue #42), the only place a streak can persist across polls.
+pub(crate) struct RealUsageSource<Tp> {
     transport: Tp,
-    trigger: Tr,
-    monitor: Monitor401,
 }
 
-impl<Tp, Tr> RealUsageSource<Tp, Tr> {
-    /// `monitor_401_n` is the consecutive-401 threshold (config tunable).
-    pub(crate) fn new(transport: Tp, trigger: Tr, monitor_401_n: u8) -> Self {
-        Self {
-            transport,
-            trigger,
-            monitor: Monitor401::new(monitor_401_n),
-        }
-    }
-
-    #[cfg(test)]
-    fn trigger(&self) -> &Tr {
-        &self.trigger
-    }
-
-    #[cfg(test)]
-    fn monitor_count(&self) -> u8 {
-        self.monitor.count()
+impl<Tp> RealUsageSource<Tp> {
+    pub(crate) fn new(transport: Tp) -> Self {
+        Self { transport }
     }
 }
 
-impl<Tp, Tr> UsageSource for RealUsageSource<Tp, Tr>
+impl<Tp> UsageSource for RealUsageSource<Tp>
 where
     Tp: UsageTransport,
-    Tr: ReStashTrigger,
 {
     async fn usage(&self) -> Result<Usage> {
-        // A failed transport (I/O, or an unreadable token) is itself a non-401
-        // outcome, so it resets the consecutive-401 counter before propagating.
-        let response = match self.transport.fetch().await {
-            Ok(response) => response,
-            Err(err) => {
-                self.monitor.observe(false, &self.trigger);
-                return Err(err);
-            }
-        };
-
+        let response = self.transport.fetch().await?;
         let status = response.status;
         match classify_status(status) {
-            // Only a 401 advances the monitor; every other arm resets it.
-            UsageStatus::Unauthorized => {
-                self.monitor.observe(true, &self.trigger);
-                Err(Error::UsageUnauthorized)
-            }
-            UsageStatus::Success => {
-                self.monitor.observe(false, &self.trigger);
-                Ok(parse_usage(&response.body)?.to_usage())
-            }
-            UsageStatus::ScopeMissing => {
-                self.monitor.observe(false, &self.trigger);
-                Err(Error::UsageScopeMissing)
-            }
-            UsageStatus::RateLimited => {
-                self.monitor.observe(false, &self.trigger);
-                Err(Error::UsageRateLimited { status })
-            }
-            UsageStatus::ClientError => {
-                self.monitor.observe(false, &self.trigger);
-                Err(Error::UsageRejected { status })
-            }
-            UsageStatus::Transient => {
-                self.monitor.observe(false, &self.trigger);
-                Err(Error::UsageTransient { status })
-            }
+            UsageStatus::Unauthorized => Err(Error::UsageUnauthorized),
+            UsageStatus::Success => Ok(parse_usage(&response.body)?.to_usage()),
+            UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
+            UsageStatus::RateLimited => Err(Error::UsageRateLimited { status }),
+            UsageStatus::ClientError => Err(Error::UsageRejected { status }),
+            UsageStatus::Transient => Err(Error::UsageTransient { status }),
         }
     }
 }
@@ -871,7 +769,7 @@ mod tests {
         assert_eq!(parse_curl_output(b"\n").status, 0);
     }
 
-    // --- RealUsageSource end-to-end (fake transport + recording trigger) ---
+    // --- RealUsageSource end-to-end (fake transport) ---
 
     /// Scripts a sequence of transport results, one per `fetch` call.
     struct FakeUsageTransport {
@@ -902,77 +800,41 @@ mod tests {
         }
     }
 
-    /// Records how many times the re-stash trigger fired.
-    struct RecordingTrigger {
-        fires: Cell<u32>,
-    }
-
-    impl RecordingTrigger {
-        fn new() -> Self {
-            Self {
-                fires: Cell::new(0),
-            }
-        }
-        fn fires(&self) -> u32 {
-            self.fires.get()
-        }
-    }
-
-    impl ReStashTrigger for RecordingTrigger {
-        fn request_restash(&self) {
-            self.fires.set(self.fires.get() + 1);
-        }
-    }
-
-    fn source(
-        responses: Vec<Result<HttpResponse>>,
-        monitor_401_n: u8,
-    ) -> RealUsageSource<FakeUsageTransport, RecordingTrigger> {
-        RealUsageSource::new(
-            FakeUsageTransport::new(responses),
-            RecordingTrigger::new(),
-            monitor_401_n,
-        )
+    fn source(responses: Vec<Result<HttpResponse>>) -> RealUsageSource<FakeUsageTransport> {
+        RealUsageSource::new(FakeUsageTransport::new(responses))
     }
 
     #[tokio::test]
-    async fn a_success_yields_the_reading_and_arms_nothing() {
+    async fn a_success_yields_the_reading() {
         let body =
             r#"{"limits":[{"kind":"session","percent":30},{"kind":"weekly_all","percent":70}]}"#;
-        let src = source(vec![FakeUsageTransport::ok(200, body)], 3);
+        let src = source(vec![FakeUsageTransport::ok(200, body)]);
         let usage = src.usage().await.unwrap();
         assert!((usage.session - 0.30).abs() < 1e-9);
         assert!((usage.weekly - 0.70).abs() < 1e-9);
-        assert_eq!(src.monitor_count(), 0);
-        assert_eq!(src.trigger().fires(), 0);
     }
 
     #[tokio::test]
     async fn a_200_with_an_unparseable_body_is_a_parse_error() {
-        let src = source(vec![FakeUsageTransport::ok(200, "{}")], 3);
+        let src = source(vec![FakeUsageTransport::ok(200, "{}")]);
         assert!(matches!(src.usage().await, Err(Error::UsageParse(_))));
-        // A 200 is still a non-401 outcome: the counter is reset.
-        assert_eq!(src.monitor_count(), 0);
     }
 
     #[tokio::test]
-    async fn forbidden_surfaces_distinctly_and_does_not_arm_the_monitor() {
-        let src = source(vec![FakeUsageTransport::ok(403, "")], 3);
+    async fn forbidden_surfaces_distinctly_from_unauthorized() {
+        // Issue #5 acceptance: a 403 (missing usage scope) surfaces as its own typed
+        // error, never collapsed into the 401 the dead-credential detection counts.
+        let src = source(vec![FakeUsageTransport::ok(403, "")]);
         assert!(matches!(src.usage().await, Err(Error::UsageScopeMissing)));
-        assert_eq!(src.monitor_count(), 0);
-        assert_eq!(src.trigger().fires(), 0);
     }
 
     #[tokio::test]
-    async fn rate_limited_and_server_errors_are_typed_and_reset_the_counter() {
-        let src = source(
-            vec![
-                FakeUsageTransport::ok(429, ""),
-                FakeUsageTransport::ok(503, ""),
-                FakeUsageTransport::ok(400, ""),
-            ],
-            3,
-        );
+    async fn rate_limited_and_server_errors_are_typed() {
+        let src = source(vec![
+            FakeUsageTransport::ok(429, ""),
+            FakeUsageTransport::ok(503, ""),
+            FakeUsageTransport::ok(400, ""),
+        ]);
         assert!(matches!(
             src.usage().await,
             Err(Error::UsageRateLimited { status: 429 })
@@ -985,80 +847,15 @@ mod tests {
             src.usage().await,
             Err(Error::UsageRejected { status: 400 })
         ));
-        assert_eq!(src.trigger().fires(), 0);
     }
 
     #[tokio::test]
-    async fn a_transport_failure_propagates_and_resets_the_counter() {
-        let src = source(
-            vec![
-                FakeUsageTransport::ok(401, ""),
-                Err(Error::Io(std::io::Error::other("boom"))),
-            ],
-            3,
-        );
+    async fn unauthorized_and_a_transport_failure_each_surface_their_typed_error() {
+        let src = source(vec![
+            FakeUsageTransport::ok(401, ""),
+            Err(Error::Io(std::io::Error::other("boom"))),
+        ]);
         assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
-        assert_eq!(src.monitor_count(), 1);
-        // An I/O failure is a non-401 outcome → counter resets.
         assert!(matches!(src.usage().await, Err(Error::Io(_))));
-        assert_eq!(src.monitor_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn consecutive_401s_fire_the_trigger_exactly_at_the_threshold() {
-        let src = source(
-            vec![
-                FakeUsageTransport::ok(401, ""),
-                FakeUsageTransport::ok(401, ""),
-                FakeUsageTransport::ok(401, ""),
-                FakeUsageTransport::ok(401, ""),
-            ],
-            3,
-        );
-        // Below threshold: no fire.
-        assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
-        assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
-        assert_eq!(src.trigger().fires(), 0);
-        // The 3rd consecutive 401 fires the trigger exactly once.
-        assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
-        assert_eq!(src.trigger().fires(), 1);
-        // A 4th 401 does NOT re-fire (one signal per streak).
-        assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
-        assert_eq!(src.trigger().fires(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_non_401_outcome_resets_the_consecutive_streak() {
-        let body =
-            r#"{"limits":[{"kind":"session","percent":1},{"kind":"weekly_all","percent":1}]}"#;
-        let src = source(
-            vec![
-                FakeUsageTransport::ok(401, ""),
-                FakeUsageTransport::ok(401, ""),
-                FakeUsageTransport::ok(200, body), // resets the streak
-                FakeUsageTransport::ok(401, ""),
-                FakeUsageTransport::ok(401, ""),
-            ],
-            3,
-        );
-        for _ in 0..2 {
-            let _ = src.usage().await;
-        }
-        assert_eq!(src.monitor_count(), 2);
-        src.usage().await.unwrap(); // the 200 resets
-        assert_eq!(src.monitor_count(), 0);
-        for _ in 0..2 {
-            let _ = src.usage().await;
-        }
-        // Two fresh 401s after the reset — still below threshold, never fired.
-        assert_eq!(src.monitor_count(), 2);
-        assert_eq!(src.trigger().fires(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_threshold_of_one_fires_on_the_first_401() {
-        let src = source(vec![FakeUsageTransport::ok(401, "")], 1);
-        assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
-        assert_eq!(src.trigger().fires(), 1);
     }
 }

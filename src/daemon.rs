@@ -79,7 +79,7 @@ use crate::observability::{Event, EventLog, SwapReason};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{SplitMix64, Strategy};
-use crate::usage::{CurlTransport, NoopReStashTrigger, RealUsageSource, Usage, UsageSource};
+use crate::usage::{CurlTransport, RealUsageSource, Usage, UsageSource};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
 /// config's `session_trigger` range so a jittered draw can never escape it.
@@ -183,17 +183,17 @@ pub(crate) trait RosterPoller {
 
 /// Production poller: build a [`CurlTransport`]-backed [`RealUsageSource`] per
 /// call — over the canonical store for the active account, or a stash-backed
-/// [`StashCredentialStore`] for any other.
+/// [`StashCredentialStore`] for any other. Stateless: the consecutive-401 streak
+/// that drives dead-credential detection lives in the daemon's per-account health
+/// state (issue #42), not in this per-poll source.
 pub(crate) struct RealRosterPoller {
     stash: RealAccountStash,
-    monitor_401_n: u8,
 }
 
 impl RealRosterPoller {
-    pub(crate) fn new(monitor_401_n: u8) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             stash: RealAccountStash::new(),
-            monitor_401_n,
         }
     }
 }
@@ -203,24 +203,16 @@ impl RosterPoller for RealRosterPoller {
         if active {
             // The active account's token refreshes in place, so the canonical
             // item is the freshest bearer — poll through it.
-            RealUsageSource::new(
-                CurlTransport::new(RealCredentialStore::new()),
-                NoopReStashTrigger,
-                self.monitor_401_n,
-            )
-            .usage()
-            .await
+            RealUsageSource::new(CurlTransport::new(RealCredentialStore::new()))
+                .usage()
+                .await
         } else {
             // A non-active account is polled with its stashed token — the seam #5
             // anticipated: `CurlTransport` is generic over `CredentialStore`.
-            RealUsageSource::new(
-                CurlTransport::new(StashCredentialStore {
-                    stash: &self.stash,
-                    service: account.stash.clone(),
-                }),
-                NoopReStashTrigger,
-                self.monitor_401_n,
-            )
+            RealUsageSource::new(CurlTransport::new(StashCredentialStore {
+                stash: &self.stash,
+                service: account.stash.clone(),
+            }))
             .usage()
             .await
         }
@@ -342,6 +334,10 @@ pub(crate) struct AccountReading {
     /// Whether the account is in the rotation (issue #36) — surfaced so `status`
     /// can mark a parked account. A disabled account is shown but never swapped to.
     pub(crate) enabled: bool,
+    /// Whether the account is QUARANTINED — its credential is dead and needs a
+    /// re-login (issue #42). The durable "needs re-login" status `status` surfaces;
+    /// non-secret (a plain flag on the account's handle).
+    pub(crate) quarantined: bool,
     pub(crate) usage: Option<Usage>,
 }
 
@@ -365,6 +361,10 @@ pub(crate) struct AccountStatusLine {
     /// Whether the account is in the rotation (issue #36); `false` for a parked
     /// account, which `status` marks. Non-secret — a plain flag.
     pub(crate) enabled: bool,
+    /// Whether the account is QUARANTINED — its credential is dead and needs a
+    /// re-login (issue #42). The durable "needs re-login" status; `false` for a
+    /// healthy account. Non-secret — a plain flag.
+    pub(crate) quarantined: bool,
     /// Last-polled session-window usage percent (`0..=100`); `null` if the last
     /// poll for this account failed (never a fabricated `0`).
     pub(crate) session_pct: Option<u8>,
@@ -402,6 +402,7 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 label: account.label.clone(),
                 active: account.active,
                 enabled: account.enabled,
+                quarantined: account.quarantined,
                 session_pct: account.usage.map(|u| to_pct(u.session)),
                 weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
             })
@@ -453,6 +454,17 @@ pub(crate) enum TickAction {
     Held,
     /// Swapped the active credential from roster index `from` to `to`.
     Swapped { from: usize, to: usize },
+    /// EMERGENCY-swapped from a confirmed-DEAD active account `from` to `to`, the
+    /// soonest-reset viable target (issue #42) — bypassing the swap-away trigger and
+    /// the cooldown. Distinct from [`Swapped`](Self::Swapped) so a forced
+    /// dead-credential escape is visible in tests and outcomes.
+    EmergencySwapped { from: usize, to: usize },
+    /// The active account's credential is DEAD (quarantined, #42) but no other
+    /// account is a viable swap target — the daemon holds on the dead active, unable
+    /// to escape. The `credential_dead` signal already fired on the death transition,
+    /// so this state is silent (no repeat-spam). The dead-credential cousin of
+    /// [`NoViableTarget`](Self::NoViableTarget).
+    ActiveDeadNoTarget,
     /// Active is over the trigger but no other account is a viable target: every
     /// other account is weekly-exhausted (or, with the opt-in session floor
     /// enabled, all over it). The all-exhausted terminal state (#11) — the loop
@@ -508,6 +520,34 @@ struct LastSwap {
     at: Instant,
 }
 
+/// Per-account health carried ACROSS ticks — the dead-credential lifecycle state
+/// (issue #42), indexed by roster position. Daemon-level (not per-poll) because the
+/// 401 streak and the recovery probe must accumulate across ticks: a per-poll
+/// counter is rebuilt every cycle and never observes a streak (the prerequisite the
+/// issue fixed). Sized to the roster in [`Daemon::new`].
+#[derive(Default, Clone)]
+struct AccountHealth {
+    /// Consecutive non-scope 401s on this account's stored token. Incremented on a
+    /// 401, reset to 0 on ANY non-401 outcome (success, 403, transient, locked). The
+    /// `consecutive=` field of a `monitor_401` event while still healthy; reaching
+    /// `monitor_401_n` declares the account DEAD ([`quarantined`](Self::quarantined)).
+    consec_401: u32,
+    /// Whether this account is QUARANTINED — its credential is dead (rejected
+    /// `monitor_401_n` times in a row), so the daemon stops polling and selecting it
+    /// for the rotation until the operator re-logs-in. The durable "needs re-login"
+    /// status surfaced by `status` (issue #42), and the edge that fires the
+    /// [`Event::CredentialDead`] / [`Event::CredentialRestored`] signals exactly once
+    /// per transition.
+    quarantined: bool,
+    /// Consecutive successful recovery probes after a quarantined account is
+    /// re-logged-in (issue #42). A quarantined account is polled only when it is the
+    /// active account — which it becomes only after the operator re-logs-in it (a
+    /// canonical-change re-stash, #13) — so each `Live` poll here is a recovery
+    /// probe; reaching `monitor_recovery_m` consecutive un-quarantines it. Reset to 0
+    /// on any non-success, so the M successes must be consecutive.
+    recovery_successes: u32,
+}
+
 /// Per-loop decision state carried across polls.
 #[derive(Default)]
 struct DecisionState {
@@ -522,16 +562,11 @@ struct DecisionState {
     /// near-exhausted accounts cannot ping-pong — and the minimal `last_swap`
     /// shown by `status` (#8).
     last_swap: Option<LastSwap>,
-    /// Per-account consecutive-401 count, indexed by roster position — the
-    /// `consecutive=` field of a `monitor_401` log event (issue #9). Incremented
-    /// when an account's poll returns 401, reset on ANY other outcome (success or a
-    /// non-401 error), mirroring [`crate::usage::Monitor401`]'s streak semantics.
-    ///
-    /// Daemon-level because that per-poll monitor is recreated each poll (so it
-    /// cannot observe a streak *across* ticks). OBSERVABILITY ONLY: it feeds the
-    /// log line and drives no behavior — the re-stash trigger remains the #13 seam.
-    /// Sized to the roster in [`Daemon::new`].
-    consec_401: Vec<u32>,
+    /// Per-account health carried across ticks (issue #42), indexed by roster
+    /// position: the consecutive-401 streak (feeding the `monitor_401` log event and
+    /// the dead-credential threshold), the quarantine flag, and the recovery-probe
+    /// count. Sized to the roster in [`Daemon::new`]. See [`AccountHealth`].
+    health: Vec<AccountHealth>,
     /// Edge-trigger guard for the all-exhausted signal (issue #11): set when an
     /// `all_exhausted` event is emitted, and cleared by [`Daemon::tick`] on any
     /// cycle that is NOT the no-viable-target state. So the signal fires exactly
@@ -593,6 +628,12 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// Jitter RNG seam — process entropy in production, a fixed seed in tests
     /// ([`with_seed`](Self::with_seed)) so per-cycle draws are deterministic.
     rng: SplitMix64,
+    /// Consecutive non-scope 401s before an account's stored credential is treated
+    /// as DEAD and quarantined (issue #42; config `monitor_401_n`, `1..=20`).
+    monitor_401_n: u8,
+    /// Consecutive successful recovery probes before a quarantined account is
+    /// restored to the rotation (issue #42; config `monitor_recovery_m`, `1..=20`).
+    monitor_recovery_m: u8,
     state: DecisionState,
 }
 
@@ -612,8 +653,8 @@ where
         claude_json: PathBuf,
         tunables: &Tunables,
     ) -> Self {
-        // The per-account 401 streak counters (issue #9), one per roster slot.
-        let consec_401 = vec![0; roster.len()];
+        // Per-account health carried across ticks (issue #42), one slot per account.
+        let health = vec![AccountHealth::default(); roster.len()];
         Self {
             roster,
             poller,
@@ -627,8 +668,10 @@ where
             cooldown_strategy: tunables.cooldown_strategy,
             poll_strategy: tunables.poll_strategy,
             rng: SplitMix64::from_entropy(),
+            monitor_401_n: tunables.monitor_401_n,
+            monitor_recovery_m: tunables.monitor_recovery_m,
             state: DecisionState {
-                consec_401,
+                health,
                 ..DecisionState::default()
             },
         }
@@ -760,14 +803,15 @@ where
         // not per-account — see `locked_tick`.)
         let mut readings: Vec<Option<Usage>> = Vec::with_capacity(self.roster.len());
         for i in 0..self.roster.len() {
-            // Skip polling a disabled (parked) account (issue #36): it is never a
-            // swap target and its stashed token may be stale, so a poll would waste
-            // a `curl`. Its reading stays absent (`None`), keeping `readings` indexed
-            // by roster position. The ACTIVE account is always polled even when
-            // disabled, so the normal swap-AWAY trigger still fires — a parked active
-            // account keeps running until its trigger, then swaps away and is never
-            // re-picked (the minimal "active-disabled" resolution, option (a)).
-            if active != Some(i) && !self.roster[i].enabled {
+            // Skip polling a disabled (parked, #36) or QUARANTINED (dead, #42)
+            // non-active account: neither is a swap target and a poll would waste a
+            // `curl` (a quarantined account's stored token is dead). Its reading
+            // stays absent (`None`), keeping `readings` indexed by roster position
+            // and auto-excluding it from `pick_target`. The ACTIVE account is ALWAYS
+            // polled — even when disabled (so its swap-AWAY trigger still fires) or
+            // quarantined (so a dead active is re-probed: a 401 keeps it dead and
+            // drives the emergency swap; a success is a recovery probe, #42).
+            if active != Some(i) && (!self.roster[i].enabled || self.state.health[i].quarantined) {
                 readings.push(None);
                 continue;
             }
@@ -934,40 +978,89 @@ where
         self.stash.write(&account.stash, &refreshed).await.is_ok()
     }
 
-    /// Update the per-account 401 streak and push any poll-outcome event (issue
-    /// #9) for account `i`'s poll `result`. A 401 increments the streak and emits
-    /// `monitor_401`; a 403 emits `usage_scope_fail`. Every NON-401 outcome (a
-    /// success, or any other error) resets the streak. A success — or a transient /
-    /// rate-limited / rejected error — emits no event.
+    /// Fold account `i`'s poll `result` into its per-account health (issue #42) and
+    /// push any poll-outcome event. Classifies the result into a [`PollOutcome`]:
     ///
-    /// A locked keychain is NOT signaled here: the lock is process-global and is
-    /// detected once at top-of-tick ([`locked_tick`](Self::locked_tick),
-    /// edge-triggered, issue #13), so this arm only resets the streak. It is reached
-    /// at all only if the keychain locks AFTER the top-of-tick read but before this
-    /// account's poll, in which case the reading is simply treated as unavailable.
+    /// - **Unauthorized** (401): increment the consecutive-401 streak and reset any
+    ///   recovery probe. While the account is still healthy, emit `monitor_401` with
+    ///   the climbing count; the Nth consecutive (`monitor_401_n`) QUARANTINES it (a
+    ///   dead credential) and emits [`Event::CredentialDead`] — edge-triggered, ONCE
+    ///   on the transition. Once quarantined, further 401s are silent (no spam): the
+    ///   dead state is a durable status, not a repeated log line.
+    /// - **Live** (success): reset the streak. If the account is quarantined, this is
+    ///   a recovery probe — count consecutive successes and, at `monitor_recovery_m`,
+    ///   un-quarantine it and emit [`Event::CredentialRestored`] (edge-triggered,
+    ///   ONCE). A quarantined account is polled only while it is active, and the
+    ///   COMMON way a dead account becomes active is the operator re-logging-in (the
+    ///   #13 canonical-change re-stash) — so recovery normally follows a genuine
+    ///   re-login. The one exception is a dead ACTIVE account with no viable swap
+    ///   target (it stays active and is re-probed): if its OWN token starts answering
+    ///   again, M live polls restore it without a re-login. That is intended — a token
+    ///   returning success M times in a row is a working credential, and leaving such
+    ///   an account stranded in `needs re-login` would make the durable status lie.
+    /// - **ScopeMissing** (403): reset the streak — a 403 token authenticates, so it
+    ///   is NOT dead — and emit `usage_scope_fail` (#5). Resets any recovery probe.
+    /// - **Transient** (5xx / network / 429 / other 4xx / locked / unreadable): reset
+    ///   the streak silently — no liveness signal either way — and reset any recovery
+    ///   probe (only a `Live` poll advances recovery). A locked keychain is
+    ///   process-global and signaled once at top-of-tick (#13), never here.
     fn note_poll_outcome(&mut self, i: usize, result: &Result<Usage>, events: &mut Vec<Event>) {
-        match result {
-            Err(Error::UsageUnauthorized) => {
-                let consecutive = self.state.consec_401[i].saturating_add(1);
-                self.state.consec_401[i] = consecutive;
+        match classify_poll(result) {
+            PollOutcome::Unauthorized => {
+                let consecutive = self.state.health[i].consec_401.saturating_add(1);
+                self.state.health[i].consec_401 = consecutive;
+                // A 401 breaks any in-progress recovery probe.
+                self.state.health[i].recovery_successes = 0;
+                // Already dead → stay silent: the durable status carries the dead
+                // state; CredentialDead already fired on the transition (no spam).
+                if self.state.health[i].quarantined {
+                    return;
+                }
                 events.push(Event::Monitor401 {
                     account: self.roster[i].label.clone(),
                     consecutive,
                 });
+                // The Nth consecutive non-scope 401 declares the credential DEAD.
+                if consecutive >= u32::from(self.monitor_401_n) {
+                    self.state.health[i].quarantined = true;
+                    events.push(Event::CredentialDead {
+                        account: self.roster[i].label.clone(),
+                    });
+                }
             }
-            Err(Error::KeychainLocked { .. }) => {
-                // Silent: the lock is signaled once at top-of-tick (see the doc
-                // above). Here we only reset the streak, like any non-401 outcome.
-                self.state.consec_401[i] = 0;
+            PollOutcome::Live => {
+                self.state.health[i].consec_401 = 0;
+                if self.state.health[i].quarantined {
+                    let m = self.state.health[i].recovery_successes.saturating_add(1);
+                    self.state.health[i].recovery_successes = m;
+                    if m >= u32::from(self.monitor_recovery_m) {
+                        self.state.health[i].quarantined = false;
+                        self.state.health[i].recovery_successes = 0;
+                        events.push(Event::CredentialRestored {
+                            account: self.roster[i].label.clone(),
+                        });
+                    }
+                }
             }
-            Err(Error::UsageScopeMissing) => {
-                self.state.consec_401[i] = 0;
+            PollOutcome::ScopeMissing => {
+                self.state.health[i].consec_401 = 0;
+                self.state.health[i].recovery_successes = 0;
                 events.push(Event::UsageScopeFail {
                     account: self.roster[i].label.clone(),
                 });
             }
-            _ => self.state.consec_401[i] = 0,
+            PollOutcome::Transient => {
+                self.state.health[i].consec_401 = 0;
+                self.state.health[i].recovery_successes = 0;
+            }
         }
+    }
+
+    /// The per-roster-index enabled (in-rotation, issue #36) mask `pick_target`
+    /// consumes — a disabled account is never a viable swap target. Rebuilt per call
+    /// (the roster is small); shared by the normal and the #42 emergency swap path.
+    fn enabled_mask(&self) -> Vec<bool> {
+        self.roster.iter().map(|account| account.enabled).collect()
     }
 
     /// Decide what to do about the active account this cycle, performing the swap
@@ -984,8 +1077,21 @@ where
         let Some(active_idx) = active else {
             return TickAction::SkippedActiveUnknown;
         };
-        // The active account's own reading is unavailable (transient / 401 /
-        // unreadable) → skip; never swap on missing data.
+        // The active account's credential is DEAD (quarantined, #42) — distinct from
+        // a transient skip below. Two sub-cases, by whether it polled this cycle:
+        if self.state.health[active_idx].quarantined {
+            match readings[active_idx] {
+                // Still failing (no reading) → the live session is blocked. Escape it
+                // with an emergency swap, bypassing the swap-away trigger AND cooldown.
+                None => return self.emergency_swap(at, active_idx, readings, events).await,
+                // Polling live again → the credential is recovering (normally the
+                // operator's re-login; note_poll_outcome counts toward restore). Hold:
+                // never swap away mid-recovery, never emergency-swap one that now works.
+                Some(_) => return TickAction::Held,
+            }
+        }
+        // The active account's own reading is unavailable (transient / a 401 below the
+        // dead threshold / unreadable) → skip; never swap on missing data.
         let Some(active_usage) = readings[active_idx] else {
             return TickAction::SkippedActiveUnavailable;
         };
@@ -1025,11 +1131,10 @@ where
         // weekly-exhausted this returns `None`. A disabled account, even with weekly
         // headroom, never counts, so it cannot hold the daemon out of the
         // all-exhausted terminal state (#11).
-        let enabled: Vec<bool> = self.roster.iter().map(|account| account.enabled).collect();
         let Some(target_idx) = pick_target(
             active_idx,
             readings,
-            &enabled,
+            &self.enabled_mask(),
             self.session_floor,
             weekly_trigger,
         ) else {
@@ -1070,25 +1175,7 @@ where
         .await
         {
             Ok(_report) => {
-                self.state.active = Some(target_idx);
-                // Record the swap for the cooldown floor and the `status` display
-                // (#8); `at` is the monotonic instant, the label is non-secret (#15).
-                self.state.last_swap = Some(LastSwap {
-                    to: self.roster[target_idx].label.clone(),
-                    at,
-                });
-                // Prime the canonical watch with the token we just promoted to the
-                // canonical item, so this swap is NOT re-detected as an out-of-band
-                // change next cycle (issue #13). Read it back from the incoming
-                // stash (which still holds it) rather than re-reading the canonical:
-                // if a third writer changed the canonical after our write, committing
-                // the token we INTENDED leaves that change to be detected and
-                // re-stashed next cycle, instead of silently adopting the intruder.
-                if let Ok(incoming_stashed) = self.stash.read(&incoming).await {
-                    self.state
-                        .canonical_watch
-                        .commit(&incoming_stashed.credential);
-                }
+                self.record_swap(target_idx, &incoming, at).await;
                 // Log the swap (issue #9). `swap::decide` returns only a binary
                 // verdict, so the reason is re-derived here from the active reading:
                 // session-first when BOTH dimensions are over their (this-cycle)
@@ -1114,6 +1201,92 @@ where
         }
     }
 
+    /// Record a completed swap to `target_idx` (its incoming stash named `incoming`):
+    /// update the cached active index, the post-swap cooldown floor + `status`
+    /// display (#8), and prime the canonical watch with the token just promoted, so
+    /// this OWN write is not re-detected as an out-of-band change next cycle (#13).
+    /// Read the token back from the incoming stash (which still holds it) rather than
+    /// re-reading the canonical: if a third writer changed the canonical after our
+    /// write, committing the token we INTENDED leaves that change to be detected and
+    /// re-stashed next cycle, instead of silently adopting the intruder. Shared by
+    /// the normal swap and the emergency swap (#42).
+    async fn record_swap(&mut self, target_idx: usize, incoming: &str, at: Instant) {
+        self.state.active = Some(target_idx);
+        self.state.last_swap = Some(LastSwap {
+            to: self.roster[target_idx].label.clone(),
+            at,
+        });
+        if let Ok(incoming_stashed) = self.stash.read(incoming).await {
+            self.state
+                .canonical_watch
+                .commit(&incoming_stashed.credential);
+        }
+    }
+
+    /// Emergency-swap away from a confirmed-DEAD active account (issue #42): the live
+    /// session is blocked, so rotate to the soonest-reset viable target IMMEDIATELY —
+    /// bypassing the swap-away trigger and the post-swap cooldown that gate a normal
+    /// swap. Thrash-safe by construction: it fires ONLY on a quarantined active
+    /// account, and a quarantined account is never itself a viable target (it is
+    /// skipped in polling, so its reading is absent), so there is no ping-pong.
+    /// `pick_target` (the #37 soonest-reset rule) still excludes disabled and
+    /// weekly-exhausted accounts; with no viable target the daemon holds on the dead
+    /// active ([`TickAction::ActiveDeadNoTarget`]) — the `CredentialDead` signal
+    /// already fired, so this stuck state is silent (no repeat-spam).
+    async fn emergency_swap(
+        &mut self,
+        at: Instant,
+        active_idx: usize,
+        readings: &[Option<Usage>],
+        events: &mut Vec<Event>,
+    ) -> TickAction {
+        // The weekly-exhaustion viability filter for `pick_target` — drawn like the
+        // normal path (a fixed strategy consumes no RNG). The session swap-away
+        // trigger and the cooldown are deliberately NOT consulted: an emergency swap
+        // bypasses both (the active credential is dead, not merely over a trigger).
+        let weekly_trigger = self.weekly_trigger_strategy.draw(
+            &mut self.rng,
+            WEEKLY_TRIGGER_PCT_LO,
+            WEEKLY_TRIGGER_PCT_HI,
+        ) / 100.0;
+        let Some(target_idx) = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            self.session_floor,
+            weekly_trigger,
+        ) else {
+            return TickAction::ActiveDeadNoTarget;
+        };
+        // #6 is no-half-swap: an error leaves the canonical item and both stashes
+        // coherent — the dead active stays quarantined and the emergency swap retries
+        // next cycle.
+        let outgoing = self.roster[active_idx].stash.clone();
+        let incoming = self.roster[target_idx].stash.clone();
+        match swap::swap(
+            &self.store,
+            &self.stash,
+            &outgoing,
+            &incoming,
+            &self.claude_json,
+        )
+        .await
+        {
+            Ok(_report) => {
+                self.record_swap(target_idx, &incoming, at).await;
+                events.push(Event::EmergencySwap {
+                    from: self.roster[active_idx].label.clone(),
+                    to: self.roster[target_idx].label.clone(),
+                });
+                TickAction::EmergencySwapped {
+                    from: active_idx,
+                    to: target_idx,
+                }
+            }
+            Err(_) => TickAction::SwapFailed,
+        }
+    }
+
     /// Build the non-secret per-account snapshot for the event log and the socket.
     /// `at` (this cycle's instant) is the base for the `last_swap` relative age.
     fn snapshot(
@@ -1131,6 +1304,7 @@ where
                     label: account.label.clone(),
                     active: active == Some(i),
                     enabled: account.enabled,
+                    quarantined: self.state.health[i].quarantined,
                     usage: readings[i],
                 })
                 .collect(),
@@ -1170,6 +1344,46 @@ where
             Some(backoff) => self.clock.tick(backoff).await,
             None => self.wait_for_next_poll().await,
         }
+    }
+}
+
+/// The health-relevant classification of ONE account's poll this tick — the typed
+/// poll outcome (issue #42) the per-account health state machine consumes. Derived
+/// from the poll `Result` by [`classify_poll`]; distinct from the raw HTTP taxonomy
+/// (`usage`'s status classes) in that it folds every non-liveness-bearing error into
+/// one `Transient` class and separates the two liveness signals — `Live` (the
+/// credential works) from `Unauthorized` (the token was rejected). "Dead" and
+/// "exhausted" are not single-poll outcomes: death is the ACCUMULATION of
+/// `Unauthorized` across ticks (the per-account 401 streak reaching `monitor_401_n`),
+/// and exhaustion is derived from a `Live` reading's usage against the swap triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollOutcome {
+    /// A successful usage reading — the credential is alive. Resets the death streak;
+    /// for a quarantined account, advances the recovery probe.
+    Live,
+    /// HTTP 401 — the stored token was rejected. Advances the consecutive-401 death
+    /// streak; the Nth (`monitor_401_n`) quarantines the account.
+    Unauthorized,
+    /// HTTP 403 — the token authenticated but lacks the usage scope (a non-interactive
+    /// setup token). NON-dead (it authenticated), surfaced distinctly (#5).
+    ScopeMissing,
+    /// Any other failure (5xx / network / 429 / other 4xx / keychain-locked /
+    /// unreadable token / unparseable body): no liveness signal — neither advances
+    /// nor, by itself, distinguishes death. Resets the death streak (a 401 streak
+    /// must be unbroken).
+    Transient,
+}
+
+/// Classify a poll `Result` into its [`PollOutcome`] — the typed poll outcome the
+/// dead-credential health state machine consumes (issue #42). Pure: the single place
+/// the HTTP error taxonomy is mapped onto the liveness/death axis, so the policy is
+/// testable in isolation and `note_poll_outcome` stays a state-transition.
+fn classify_poll(result: &Result<Usage>) -> PollOutcome {
+    match result {
+        Ok(_) => PollOutcome::Live,
+        Err(Error::UsageUnauthorized) => PollOutcome::Unauthorized,
+        Err(Error::UsageScopeMissing) => PollOutcome::ScopeMissing,
+        Err(_) => PollOutcome::Transient,
     }
 }
 
@@ -1250,12 +1464,19 @@ fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
 
 /// The console line for a swap this cycle, or `None` for any non-swap outcome.
 /// Surfaced to the operator watching the foreground `run` (issue #8) — the file
-/// event log records every cycle separately. Sourced solely from labels, so it
-/// can never carry a token or email (issue #15).
+/// event log records every cycle separately. Both swap kinds echo: a normal swap
+/// and the #42 emergency swap away from a dead active credential (the latter named
+/// distinctly, since it means a credential just died and the daemon force-rotated).
+/// Sourced solely from labels, so it can never carry a token or email (issue #15).
 fn swap_report(outcome: &TickOutcome) -> Option<String> {
     match outcome.action {
         TickAction::Swapped { from, to } => Some(format!(
             "swapped: {} → {}",
+            label_at(&outcome.snapshot, from),
+            label_at(&outcome.snapshot, to),
+        )),
+        TickAction::EmergencySwapped { from, to } => Some(format!(
+            "emergency swap (dead credential): {} → {}",
             label_at(&outcome.snapshot, from),
             label_at(&outcome.snapshot, to),
         )),
@@ -1547,6 +1768,7 @@ mod tests {
             session_trigger: trigger,
             weekly_trigger: WEEKLY_TRIGGER,
             monitor_401_n: 3,
+            monitor_recovery_m: 2,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
@@ -3260,6 +3482,7 @@ mod tests {
                     label: "work".to_owned(),
                     active: true,
                     enabled: true,
+                    quarantined: false,
                     usage: Some(Usage {
                         session: 0.97,
                         weekly: 0.40,
@@ -3270,6 +3493,7 @@ mod tests {
                     label: "spare".to_owned(),
                     active: false,
                     enabled: true,
+                    quarantined: false,
                     usage: None,
                 },
             ],
@@ -3301,6 +3525,7 @@ mod tests {
                 label: "work".to_owned(),
                 active: true,
                 enabled: true,
+                quarantined: false,
                 usage: Some(Usage {
                     session: 0.50,
                     weekly: 0.25,
@@ -3372,12 +3597,14 @@ mod tests {
                     label: "work".to_owned(),
                     active: false,
                     enabled: true,
+                    quarantined: false,
                     usage: None,
                 },
                 AccountReading {
                     label: "spare".to_owned(),
                     active: true,
                     enabled: true,
+                    quarantined: false,
                     usage: None,
                 },
             ],
@@ -3393,9 +3620,17 @@ mod tests {
             swap_report(&outcome(TickAction::Swapped { from: 0, to: 1 })).as_deref(),
             Some("swapped: work → spare"),
         );
+        // #42: an emergency swap echoes too, named distinctly so the operator sees a
+        // dead credential forced the rotation.
+        assert_eq!(
+            swap_report(&outcome(TickAction::EmergencySwapped { from: 0, to: 1 })).as_deref(),
+            Some("emergency swap (dead credential): work → spare"),
+        );
         assert_eq!(swap_report(&outcome(TickAction::Held)), None);
         assert_eq!(swap_report(&outcome(TickAction::SkippedCooldown)), None);
         assert_eq!(swap_report(&outcome(TickAction::NoViableTarget)), None);
+        // A dead active account with no viable target holds — no console echo.
+        assert_eq!(swap_report(&outcome(TickAction::ActiveDeadNoTarget)), None);
     }
 
     #[tokio::test]
@@ -3609,12 +3844,20 @@ mod tests {
         );
 
         let mut events = Vec::new();
+        // Issue #42: the per-account 401 streak now lives in `health[i].consec_401`.
+        let streak_of = |d: &FakeDaemon| {
+            d.state
+                .health
+                .iter()
+                .map(|h| h.consec_401)
+                .collect::<Vec<_>>()
+        };
 
         // A 401 on account 0 starts its streak at 1; a second consecutive 401
         // climbs to 2 — one `monitor_401` per occurrence, account 1 untouched.
         daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
         daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
-        assert_eq!(daemon.state.consec_401, vec![2, 0]);
+        assert_eq!(streak_of(&daemon), vec![2, 0]);
         assert_eq!(
             events,
             vec![
@@ -3640,12 +3883,12 @@ mod tests {
             }),
             &mut events,
         );
-        assert_eq!(daemon.state.consec_401, vec![0, 0]);
+        assert_eq!(streak_of(&daemon), vec![0, 0]);
         assert!(events.is_empty());
 
         // After the reset the next 401 restarts the streak at 1 (not 3).
         daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
-        assert_eq!(daemon.state.consec_401, vec![1, 0]);
+        assert_eq!(streak_of(&daemon), vec![1, 0]);
         assert_eq!(
             events,
             vec![Event::Monitor401 {
@@ -3659,14 +3902,14 @@ mod tests {
         // other non-401 outcome. Account 0's streak (1) is left untouched.
         events.clear();
         daemon.note_poll_outcome(1, &Err(Error::KeychainLocked { op: "read" }), &mut events);
-        assert_eq!(daemon.state.consec_401, vec![1, 0]);
+        assert_eq!(streak_of(&daemon), vec![1, 0]);
         assert!(events.is_empty());
 
         // A 403 (missing usage scope) on account 0 emits `usage_scope_fail` and
         // resets its streak — every non-401 outcome clears the streak.
         events.clear();
         daemon.note_poll_outcome(0, &Err(Error::UsageScopeMissing), &mut events);
-        assert_eq!(daemon.state.consec_401, vec![0, 0]);
+        assert_eq!(streak_of(&daemon), vec![0, 0]);
         assert_eq!(
             events,
             vec![Event::UsageScopeFail {
@@ -3677,7 +3920,7 @@ mod tests {
         // A transient error is silent and also resets (no event, streak cleared).
         events.clear();
         daemon.note_poll_outcome(0, &Err(Error::UsageTransient { status: 0 }), &mut events);
-        assert_eq!(daemon.state.consec_401, vec![0, 0]);
+        assert_eq!(streak_of(&daemon), vec![0, 0]);
         assert!(events.is_empty());
     }
 
@@ -3769,7 +4012,14 @@ mod tests {
         // The active account was unavailable every tick, so no swap line appears;
         // the streak is pure observability. Final state: account 0 saw two 401s.
         assert!(!logged.contains("event=swap"), "{logged:?}");
-        assert_eq!(daemon.state.consec_401, vec![2, 0, 0]);
+        let streak_of = |d: &FakeDaemon| {
+            d.state
+                .health
+                .iter()
+                .map(|h| h.consec_401)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(streak_of(&daemon), vec![2, 0, 0]);
     }
 
     #[tokio::test]
@@ -3822,6 +4072,555 @@ mod tests {
             logged.contains("event=swap from=work to=spare reason=weekly session_pct=50"),
             "got: {logged:?}"
         );
+    }
+
+    // --- #42 dead-credential lifecycle -------------------------------------
+    //
+    // The persistent-401 lifecycle: detect (N consecutive 401s → DEAD), quarantine
+    // (skip the dead account, never halt the rotation), emergency-swap (escape a dead
+    // ACTIVE account immediately, bypassing trigger + cooldown), auto-recover (M
+    // consecutive live polls un-quarantine a re-logged-in account), and signal (one
+    // edge-triggered event per transition + a durable "needs re-login" status). The
+    // pure `classify_poll` mapping and the per-account health that carries the streak
+    // ACROSS ticks (the issue's CODE PREREQUISITE) are exercised directly.
+
+    /// A two-account daemon (`work` active, `spare` spare) with both tokens stashed
+    /// and the canonical holding `work`'s — the common fixture for the lifecycle
+    /// tests below. `monitor_401_n` = 3, `monitor_recovery_m` = 2 (the test defaults).
+    async fn lifecycle_daemon() -> FakeDaemon {
+        lifecycle_daemon_with(FakeRosterPoller::new(), tunables(95, 80, 0)).await
+    }
+
+    /// Like [`lifecycle_daemon`] but with a caller-chosen poller + tunables, for the
+    /// tick-driven tests that script per-account poll outcomes.
+    async fn lifecycle_daemon_with(poller: FakeRosterPoller, tun: Tunables) -> FakeDaemon {
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        // Keep the temp `~/.claude.json` alive for the daemon's lifetime by leaking
+        // the guard — these are short-lived unit-test daemons.
+        std::mem::forget(dir);
+        Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+    }
+
+    fn live(session: f64, weekly: f64) -> Result<Usage> {
+        Ok(Usage {
+            session,
+            weekly,
+            weekly_resets_at: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn classify_poll_maps_each_result_to_its_liveness_class() {
+        // The typed poll outcome (issue #42 CODE PREREQUISITE): the HTTP taxonomy is
+        // folded onto the liveness/death axis in exactly one place. Success is Live,
+        // 401 is Unauthorized (the death signal), 403 is its own ScopeMissing class,
+        // and EVERY other failure collapses into the single Transient class.
+        assert_eq!(classify_poll(&live(0.5, 0.5)), PollOutcome::Live);
+        assert_eq!(
+            classify_poll(&Err(Error::UsageUnauthorized)),
+            PollOutcome::Unauthorized
+        );
+        assert_eq!(
+            classify_poll(&Err(Error::UsageScopeMissing)),
+            PollOutcome::ScopeMissing
+        );
+        for err in [
+            Error::UsageTransient { status: 0 },
+            Error::UsageRateLimited { status: 429 },
+            Error::UsageRejected { status: 400 },
+            Error::KeychainLocked { op: "read" },
+            Error::UsageTokenUnreadable,
+            Error::UsageParse("no dimension".to_owned()),
+        ] {
+            assert_eq!(
+                classify_poll(&Err(err)),
+                PollOutcome::Transient,
+                "every non-401/403 failure folds into Transient",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nth_consecutive_401_quarantines_the_account_and_signals_once() {
+        // Detection + edge-trigger + anti-spam, driven directly (a static poller
+        // cannot script a streak that crosses the threshold). Driving `spare`
+        // (non-active) isolates detection from the emergency-swap path.
+        let mut daemon = lifecycle_daemon().await;
+        let mut events = Vec::new();
+
+        // Two 401s climb the streak; below the threshold (3) the account stays alive.
+        daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
+        daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
+        assert!(!daemon.state.health[1].quarantined);
+        assert_eq!(daemon.state.health[1].consec_401, 2);
+
+        // The 3rd consecutive 401 declares the credential DEAD: the climbing
+        // `monitor_401` AND exactly one `credential_dead`, on the false→true edge.
+        events.clear();
+        daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
+        assert!(daemon.state.health[1].quarantined);
+        assert_eq!(
+            events,
+            vec![
+                Event::Monitor401 {
+                    account: "spare".to_owned(),
+                    consecutive: 3,
+                },
+                Event::CredentialDead {
+                    account: "spare".to_owned(),
+                },
+            ]
+        );
+
+        // A 4th 401 on the already-dead account is SILENT — the dead state is a
+        // durable status, not a repeated log line (no spam).
+        events.clear();
+        daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
+        assert!(daemon.state.health[1].quarantined);
+        assert!(
+            events.is_empty(),
+            "an already-dead 401 re-emits nothing: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_non_active_account_is_skipped_while_the_rotation_continues() {
+        // Quarantine-one (never halt): a dead SPARE is skipped in polling — not a
+        // wasted curl, not a swap candidate — while the active account still rotates
+        // to a healthy target. The daemon never halts the whole rotation on one dead
+        // account.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+            account("u-C", "Sessiometer/u-C", "backup"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.10) // active, over the session trigger → wants a swap
+            .unauthorized("u-B") // scripted to 401 — but it is dead, so never polled
+            .ok("u-C", 0.10, 0.10); // the only healthy target
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        // `spare` is already dead from a prior episode.
+        daemon.state.health[1].quarantined = true;
+
+        let outcome = daemon.tick().await;
+
+        // The rotation continues: the active account swaps to the healthy `backup`,
+        // NOT to the dead `spare` (a quarantined account is never a target).
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 2 });
+        // `spare` was skipped, not polled: its 401 script never ran, so its streak
+        // stayed 0 and it emitted no `monitor_401`.
+        assert_eq!(
+            daemon.state.health[1].consec_401, 0,
+            "the dead spare was not polled"
+        );
+        assert!(
+            !outcome.events.iter().any(|e| matches!(
+                e,
+                Event::Monitor401 { account, .. } if account == "spare"
+            )),
+            "a skipped account emits no poll-outcome event: {:?}",
+            outcome.events
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emergency_swap_escapes_a_dead_active_account_bypassing_trigger_and_cooldown() {
+        // Emergency-swap: a confirmed-dead ACTIVE account is escaped IMMEDIATELY to
+        // the soonest-reset viable target, bypassing BOTH the swap-away trigger (the
+        // dead account has no reading to be "over") and the cooldown. A long cooldown
+        // plus a just-completed swap would make a NORMAL over-trigger swap
+        // `SkippedCooldown`; the emergency path overrides it.
+        let mut daemon =
+            lifecycle_daemon_with(FakeRosterPoller::new(), tunables(95, 80, 9_999)).await;
+        let at = daemon.clock.now();
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true;
+        daemon.state.last_swap = Some(LastSwap {
+            to: "work".to_owned(),
+            at, // zero elapsed against a 9_999s cooldown → a normal swap would defer
+        });
+
+        // The dead active has no reading (still 401ing); the spare polled live.
+        let readings = vec![
+            None,
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.10,
+                weekly_resets_at: None,
+            }),
+        ];
+        let mut events = Vec::new();
+        let action = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+
+        assert_eq!(action, TickAction::EmergencySwapped { from: 0, to: 1 });
+        assert_eq!(
+            events,
+            vec![Event::EmergencySwap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            }]
+        );
+        // The swap took effect: the spare is now active.
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_recovering_active_account_is_held_never_swapped_away() {
+        // Thrash-safety / protect-recovery: a quarantined ACTIVE account that is
+        // polling live again is the operator's re-login recovering it. Hold — never
+        // emergency-swap a credential that now works, never swap away mid-recovery.
+        let mut daemon = lifecycle_daemon().await;
+        let at = daemon.clock.now();
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true;
+
+        // The active account polled live (recovering); the spare is also available.
+        let readings = vec![
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.10,
+                weekly_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.10,
+                weekly_resets_at: None,
+            }),
+        ];
+        let mut events = Vec::new();
+        let action = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+
+        assert_eq!(action, TickAction::Held);
+        assert!(
+            events.is_empty(),
+            "a held recovery emits nothing: {events:?}"
+        );
+        // `decide_action` never recovers — only `note_poll_outcome` does — so the
+        // account is still quarantined here.
+        assert!(daemon.state.health[0].quarantined);
+        assert_eq!(daemon.state.active, Some(0), "no swap away mid-recovery");
+    }
+
+    #[tokio::test]
+    async fn a_dead_active_account_with_no_viable_target_holds_silently() {
+        // Emergency-swap with nowhere to go: a dead active account whose only other
+        // account is also unavailable holds (`ActiveDeadNoTarget`) without thrashing
+        // — and silently, because `credential_dead` already fired on the transition.
+        let mut daemon = lifecycle_daemon().await;
+        let at = daemon.clock.now();
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true;
+
+        // No other account has a reading → no viable target.
+        let readings = vec![None, None];
+        let mut events = Vec::new();
+        let action = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+
+        assert_eq!(action, TickAction::ActiveDeadNoTarget);
+        assert!(
+            events.is_empty(),
+            "the stuck dead-active state re-signals nothing: {events:?}"
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap with no target");
+    }
+
+    #[tokio::test]
+    async fn m_consecutive_live_polls_recover_a_quarantined_account_and_signal_once() {
+        // Auto-recovery: a re-logged-in account (active again via the #13 re-stash)
+        // un-quarantines after M consecutive live polls, emitting exactly one
+        // `credential_restored` on the dead→alive edge.
+        let mut daemon = lifecycle_daemon().await;
+        daemon.state.health[0].quarantined = true;
+        let mut events = Vec::new();
+
+        // The first live poll while quarantined is a recovery PROBE — still dead,
+        // and silent (below `monitor_recovery_m` = 2).
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        assert!(daemon.state.health[0].quarantined);
+        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+        assert!(events.is_empty());
+
+        // The 2nd consecutive live reaches the threshold → RESTORED (one event).
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        assert!(!daemon.state.health[0].quarantined);
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 0,
+            "the probe resets on restore"
+        );
+        assert_eq!(
+            events,
+            vec![Event::CredentialRestored {
+                account: "work".to_owned(),
+            }]
+        );
+
+        // A later live on the now-healthy account emits nothing (edge-triggered).
+        events.clear();
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_401_mid_recovery_resets_the_probe_so_recovery_must_restart() {
+        // The recovery streak is consecutive: a 401 partway through breaks it, so a
+        // single later live is NOT enough — a full M=2 fresh live polls are required.
+        let mut daemon = lifecycle_daemon().await;
+        daemon.state.health[0].quarantined = true;
+        let mut events = Vec::new();
+
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events); // probe at 1
+        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+        // A 401 mid-recovery breaks the streak (and is silent — already dead).
+        daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 0,
+            "the 401 reset the probe"
+        );
+        assert!(daemon.state.health[0].quarantined);
+        assert!(events.is_empty());
+
+        // One live after the reset is not enough; the second crosses the threshold.
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        assert!(
+            daemon.state.health[0].quarantined,
+            "one live after a reset is not enough"
+        );
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        assert!(!daemon.state.health[0].quarantined);
+        assert_eq!(
+            events,
+            vec![Event::CredentialRestored {
+                account: "work".to_owned(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_account_surfaces_a_durable_needs_relogin_status() {
+        // Signal — the durable status: a dead account is reported `quarantined` in
+        // the `status` snapshot and on the wire, carrying a stable handle but no
+        // token and no email (#15).
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10); // active holds
+        let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
+        daemon.state.health[1].quarantined = true; // `spare` is dead
+
+        let outcome = daemon.tick().await;
+
+        let spare = &outcome.snapshot.accounts[1];
+        assert_eq!(spare.label, "spare");
+        assert!(
+            spare.quarantined,
+            "the dead account carries a durable status"
+        );
+        // The wire projection carries the flag but never a secret.
+        let json = serde_json::to_string(&status_response(&outcome.snapshot)).unwrap();
+        assert!(json.contains(r#""quarantined":true"#), "got {json}");
+        assert!(!json.contains('@'), "no email on the wire: {json}");
+        assert!(!json.to_lowercase().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn a_dead_spare_is_never_polled_so_it_cannot_spuriously_recover() {
+        // The recovery precondition, enforced structurally: a quarantined NON-active
+        // account is skipped in polling, so it accrues no recovery successes and can
+        // never un-quarantine on its own. It can only recover by first becoming active
+        // — which happens only via the operator's re-login (the #13 re-stash, covered
+        // by the next test). Without that, even an account whose token WOULD poll live
+        // stays dead across ticks.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10) // active, holds
+            .ok("u-B", 0.10, 0.10); // WOULD be live — but the dead spare is never polled
+        let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
+        daemon.state.health[1].quarantined = true; // `spare` died in a prior episode
+
+        for _ in 0..3 {
+            let outcome = daemon.tick().await;
+            assert!(
+                !outcome
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::CredentialRestored { .. })),
+                "a never-polled spare must not recover: {:?}",
+                outcome.events
+            );
+        }
+
+        assert!(
+            daemon.state.health[1].quarantined,
+            "still dead — never polled"
+        );
+        assert_eq!(daemon.state.health[1].recovery_successes, 0);
+        assert_eq!(daemon.state.health[1].consec_401, 0);
+    }
+
+    #[tokio::test]
+    async fn a_relogin_makes_a_dead_account_active_and_m_live_polls_restore_it() {
+        // The full auto-recovery path end-to-end (AC #4), exercising the #13↔#42 seam
+        // the unit tests stub: a dead account (quarantined, already emergency-swapped
+        // away so the spare is active) is re-logged-in by the operator. The #13
+        // canonical-change re-stash makes it active again; THEN — and only then — its
+        // live polls count toward recovery, un-quarantining it after M (2).
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"B-token").await; // `spare` is active post-emergency-swap
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"), // the OLD dead token
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-B");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        // The post-emergency-swap state: `work` is dead and parked off the active slot.
+        daemon.state.active = Some(1);
+        daemon.state.health[0].quarantined = true;
+
+        // Tick 1 primes the canonical watch on `spare`; the dead `work` is skipped.
+        let first = daemon.tick().await;
+        assert!(!first
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::ReStash { .. } | Event::CredentialRestored { .. })));
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 0,
+            "not polled while parked"
+        );
+        assert!(daemon.state.health[0].quarantined);
+
+        // The operator `claude /login`s back into `work`: the canonical becomes its
+        // fresh token and the display switches to it.
+        daemon.store.write(&cred(b"A-reauthed")).await.unwrap();
+        crate::claude_state::write_oauth_account(&json, &oauth("u-A")).unwrap();
+
+        // Tick 2 detects the change, re-stashes `work`, re-resolves it active, and its
+        // first live poll is the first recovery success — still dead (M = 2).
+        let second = daemon.tick().await;
+        assert!(
+            second
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ReStash { account } if account == "work")),
+            "the re-login re-stashes work: {:?}",
+            second.events
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "the re-logged-in account is active again"
+        );
+        assert!(
+            daemon.state.health[0].quarantined,
+            "one live poll is not yet a recovery"
+        );
+        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+
+        // Tick 3: the second consecutive live poll reaches M → RESTORED, once.
+        let third = daemon.tick().await;
+        assert!(
+            !daemon.state.health[0].quarantined,
+            "M live polls un-quarantine it"
+        );
+        assert_eq!(
+            third
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::CredentialRestored { account } if account == "work"))
+                .count(),
+            1,
+            "exactly one credential_restored on the edge: {:?}",
+            third.events
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dead_and_restored_edges_re_arm_across_episodes() {
+        // Edge-trigger re-arm (AC #5): a full dead→restored→dead cycle emits
+        // credential_dead on EACH death edge and credential_restored on the recovery
+        // edge — never stuck, never doubled. Proves the signals are per-transition,
+        // not one-shot-per-process.
+        let mut daemon = lifecycle_daemon().await;
+        let mut events = Vec::new();
+
+        // Episode 1 — death: 3 consecutive 401s.
+        for _ in 0..3 {
+            daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
+        }
+        // Recovery: 2 consecutive live polls.
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        // Episode 2 — death again: the streak re-armed, so 3 fresh 401s re-quarantine.
+        for _ in 0..3 {
+            daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
+        }
+
+        let deaths = events
+            .iter()
+            .filter(|e| matches!(e, Event::CredentialDead { .. }))
+            .count();
+        let restores = events
+            .iter()
+            .filter(|e| matches!(e, Event::CredentialRestored { .. }))
+            .count();
+        assert_eq!(deaths, 2, "one credential_dead per death edge: {events:?}");
+        assert_eq!(
+            restores, 1,
+            "one credential_restored per recovery edge: {events:?}"
+        );
+        assert!(daemon.state.health[0].quarantined, "ends dead in episode 2");
     }
 
     // --- redaction METER (issue #15) ---------------------------------------
@@ -4057,6 +4856,46 @@ mod tests {
             harvest_channels(&outcome, &mut corpus);
         }
 
+        // Scenario 4 — the dead-credential lifecycle (#42): a single 401 on the
+        // active account (threshold 1) declares it DEAD and triggers an emergency
+        // swap in one tick, so `credential_dead`, `emergency_swap`, AND the durable
+        // `quarantined` status (snapshot + wire + text) are all harvested at once.
+        {
+            let poller = FakeRosterPoller::new()
+                .unauthorized(A.0) // active → 401 → dead at threshold 1
+                .ok(B.0, 0.10, 0.20); // the viable escape target
+            let tun = Tunables {
+                monitor_401_n: 1,
+                ..tunables(95, 80, 0)
+            };
+            let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
+            let outcome = daemon.tick().await;
+            assert_eq!(
+                outcome.action,
+                TickAction::EmergencySwapped { from: 0, to: 1 }
+            );
+            harvest_channels(&outcome, &mut corpus);
+        }
+
+        // Scenario 5 — auto-recovery (#42): a re-logged-in account polls live and,
+        // at `monitor_recovery_m` = 1, un-quarantines — harvesting the
+        // `credential_restored` line through the real daemon path.
+        {
+            let poller = FakeRosterPoller::new()
+                .ok(A.0, 0.10, 0.20)
+                .ok(B.0, 0.10, 0.20);
+            let tun = Tunables {
+                monitor_recovery_m: 1,
+                ..tunables(95, 80, 0)
+            };
+            let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
+            daemon.state.active = Some(0);
+            daemon.state.health[0].quarantined = true; // dead, now being re-probed
+            let outcome = daemon.tick().await;
+            assert_eq!(outcome.action, TickAction::Held);
+            harvest_channels(&outcome, &mut corpus);
+        }
+
         // Channel — the offline `list` roster view (label · uuid · stash).
         let roster: Vec<Account> = [A, B, C]
             .iter()
@@ -4101,6 +4940,28 @@ mod tests {
         assert!(
             corpus.contains("event=usage_scope_fail account=backup"),
             "log channel: 403 event missing"
+        );
+        // #42 lifecycle channels: the three edge-triggered events plus the durable
+        // quarantine status, on both the wire and the rendered text.
+        assert!(
+            corpus.contains("event=credential_dead account=work"),
+            "log channel: credential_dead event missing"
+        );
+        assert!(
+            corpus.contains("event=emergency_swap from=work to=spare"),
+            "log channel: emergency_swap event missing"
+        );
+        assert!(
+            corpus.contains("event=credential_restored account=work"),
+            "log channel: credential_restored event missing"
+        );
+        assert!(
+            corpus.contains(r#""quarantined":true"#),
+            "UDS channel: quarantine status missing"
+        );
+        assert!(
+            corpus.contains("· needs re-login"),
+            "status-text channel: quarantine tag missing"
         );
         assert!(
             corpus.contains(r#""session_pct":97"#),

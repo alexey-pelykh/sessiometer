@@ -47,6 +47,9 @@ const DEFAULT_SESSION_TRIGGER: u8 = 95;
 const DEFAULT_WEEKLY_TRIGGER: u8 = 98;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
+/// Default consecutive recovery-probe successes before a quarantined (dead)
+/// account is restored to the rotation (issue #42).
+const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
 
 /// One captured account in the roster. Keyed by non-secret fields only.
 ///
@@ -101,13 +104,18 @@ pub(crate) struct Tunables {
     /// Separate from `session_trigger` (no cross-field constraint), typically set
     /// higher; the daemon swaps when EITHER dimension reaches its own trigger.
     pub(crate) weekly_trigger: u8,
-    /// Consecutive 401s before an account is treated as rejected (`1..=20`).
-    /// Consumed by the usage poller's 401 monitor (#5) to emit the
-    /// observability-only `monitor_401` event. A persistent 401 means a DEAD
-    /// credential, whose recovery (quarantine + emergency swap) is issue #42 — NOT
-    /// a re-stash: #13's re-auth re-stash is driven by canonical-change detection
-    /// ([`crate::keychain::CanonicalWatch`]), not by 401s.
+    /// Consecutive non-scope 401s before an account is treated as DEAD (`1..=20`).
+    /// Consumed by the daemon's per-account health state (issue #42): the Nth
+    /// consecutive 401 on an account's stored token quarantines it (stop polling /
+    /// selecting it) and, if it is the active account, triggers an emergency swap.
+    /// Distinct from #13's re-auth re-stash, which is driven by canonical-change
+    /// detection ([`crate::keychain::CanonicalWatch`]), not by 401s.
     pub(crate) monitor_401_n: u8,
+    /// Consecutive recovery-probe successes before a quarantined (dead) account is
+    /// restored to the rotation (`1..=20`, issue #42). After the operator re-logs-in
+    /// a quarantined account (a canonical-change re-stash, #13), the account must
+    /// poll successfully this many times in a row before it is un-quarantined.
+    pub(crate) monitor_recovery_m: u8,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
     /// cycle instead of sleeping a fixed interval.
@@ -136,6 +144,7 @@ impl Default for Tunables {
             session_trigger: DEFAULT_SESSION_TRIGGER,
             weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
             monitor_401_n: DEFAULT_MONITOR_401_N,
+            monitor_recovery_m: DEFAULT_MONITOR_RECOVERY_M,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
@@ -273,6 +282,7 @@ impl Config {
         range("poll_secs", t.poll_secs, 5, 3600)?;
         range("cooldown_secs", t.cooldown_secs, 0, 3600)?;
         range("monitor_401_n", t.monitor_401_n, 1, 20)?;
+        range("monitor_recovery_m", t.monitor_recovery_m, 1, 20)?;
 
         // Jitter specs (issue #38): each optional and validated to a clear load
         // error (parse-or-error). Poll jitters normally by default; trigger and
@@ -293,6 +303,7 @@ impl Config {
             session_trigger: t.session_trigger as u8,
             weekly_trigger: t.weekly_trigger as u8,
             monitor_401_n: t.monitor_401_n as u8,
+            monitor_recovery_m: t.monitor_recovery_m as u8,
             poll_strategy: Strategy {
                 base: t.poll_secs as f64,
                 jitter: poll_jitter,
@@ -403,8 +414,16 @@ impl Config {
              # dimension reaches its own trigger.\n",
         );
         out.push_str(&format!("weekly_trigger = {}\n", t.weekly_trigger));
-        out.push_str("# Consecutive 401s before an account is treated as rejected (1..=20).\n");
+        out.push_str(
+            "# Consecutive non-scope 401s before an account is treated as DEAD and\n\
+             # quarantined (1..=20).\n",
+        );
         out.push_str(&format!("monitor_401_n = {}\n", t.monitor_401_n));
+        out.push_str(
+            "# Consecutive recovery-probe successes before a quarantined (dead) account\n\
+             # is restored to the rotation after a re-login (1..=20).\n",
+        );
+        out.push_str(&format!("monitor_recovery_m = {}\n", t.monitor_recovery_m));
 
         // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the
         // tunable's valid range, to decorrelate polling/swaps across cycles.
@@ -612,6 +631,8 @@ struct RawTunables {
     weekly_trigger: i64,
     #[serde(default = "default_monitor_401_n")]
     monitor_401_n: i64,
+    #[serde(default = "default_monitor_recovery_m")]
+    monitor_recovery_m: i64,
 }
 
 impl Default for RawTunables {
@@ -623,6 +644,7 @@ impl Default for RawTunables {
             session_trigger: default_session_trigger(),
             weekly_trigger: default_weekly_trigger(),
             monitor_401_n: default_monitor_401_n(),
+            monitor_recovery_m: default_monitor_recovery_m(),
         }
     }
 }
@@ -641,6 +663,9 @@ fn default_weekly_trigger() -> i64 {
 }
 fn default_monitor_401_n() -> i64 {
     i64::from(DEFAULT_MONITOR_401_N)
+}
+fn default_monitor_recovery_m() -> i64 {
+    i64::from(DEFAULT_MONITOR_RECOVERY_M)
 }
 
 /// Permissive deserialization of the optional `[jitter]` table (issue #38): each
@@ -686,6 +711,7 @@ session_floor = 70
 session_trigger = 90
 weekly_trigger = 97
 monitor_401_n = 5
+monitor_recovery_m = 4
 
 [[account]]
 account_uuid = "11111111-1111-1111-1111-111111111111"
@@ -723,6 +749,7 @@ label = "personal"
                 session_trigger: 90,
                 weekly_trigger: 97,
                 monitor_401_n: 5,
+                monitor_recovery_m: 4,
                 // No [jitter] table in VALID → default strategies: poll jitters
                 // normally (base from poll_secs), trigger/weekly_trigger/cooldown
                 // are fixed at their respective bases.
@@ -882,6 +909,8 @@ label = "personal"
             ("cooldown_secs", "3601"),
             ("monitor_401_n", "0"),
             ("monitor_401_n", "21"),
+            ("monitor_recovery_m", "0"),
+            ("monitor_recovery_m", "21"),
         ] {
             let toml = with_tunables(&format!("{key} = {value}"));
             assert!(
@@ -1142,6 +1171,7 @@ label = "personal"
             "session_trigger",
             "weekly_trigger",
             "monitor_401_n",
+            "monitor_recovery_m",
         ] {
             assert!(text.contains(key), "rendered config must mention {key}");
         }
@@ -1177,6 +1207,8 @@ label = "personal"
             "cooldown_secs = 3600",
             "monitor_401_n = 1",
             "monitor_401_n = 20",
+            "monitor_recovery_m = 1",
+            "monitor_recovery_m = 20",
         ] {
             assert!(
                 Config::parse(&with_tunables(fragment)).is_ok(),

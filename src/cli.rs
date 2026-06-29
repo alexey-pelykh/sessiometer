@@ -126,7 +126,7 @@ async fn run() -> Result<()> {
     // account stash, the real clock, and `~/.claude.json` for display reconcile.
     let mut daemon = Daemon::new(
         config.roster.clone(),
-        RealRosterPoller::new(config.tunables.monitor_401_n),
+        RealRosterPoller::new(),
         RealCredentialStore::new(),
         RealAccountStash::new(),
         RealClock::new(),
@@ -226,9 +226,16 @@ pub(crate) fn render_status(response: &StatusResponse) -> String {
         // `*` marks the active account (as the event log does); a leading space
         // keeps the other labels aligned under it.
         let marker = if account.active { "*" } else { " " };
-        // A parked account is marked inline (issue #36); an enabled one adds
-        // nothing, so existing status output is unchanged.
-        let state = if account.enabled { "" } else { " · disabled" };
+        // Inline state tags: a parked account is marked `disabled` (issue #36) and a
+        // dead-credential account `needs re-login` (issue #42, the durable quarantine
+        // status). A healthy enabled account adds nothing, so its line is unchanged.
+        let mut state = String::new();
+        if !account.enabled {
+            state.push_str(" · disabled");
+        }
+        if account.quarantined {
+            state.push_str(" · needs re-login");
+        }
         out.push_str(&format!(
             "{} {} · session {} · weekly {}{}\n",
             marker,
@@ -644,6 +651,33 @@ spare · 22222222 · Sessiometer/22222222-2222\n\
     }
 
     #[test]
+    fn render_status_marks_a_quarantined_account_needs_relogin() {
+        // Issue #42: a dead-credential account carries the durable `needs re-login`
+        // tag in `status`, while a healthy account's line is unchanged. The tag is a
+        // plain string — no token, no email reaches the printed surface (#15).
+        let mut spare = status_line("spare", false, None, None);
+        spare.quarantined = true;
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
+            last_swap: None,
+        };
+        let out = render_status(&response);
+        assert!(
+            out.contains("* work · session 50% · weekly 25%\n"),
+            "the healthy active account is unmarked: {out:?}"
+        );
+        assert!(
+            out.contains("  spare · session n/a · weekly n/a · needs re-login\n"),
+            "the dead account carries the durable re-login tag: {out:?}"
+        );
+        assert!(
+            !out.contains('@'),
+            "no email on the printed surface: {out:?}"
+        );
+        assert!(!out.to_lowercase().contains("token"));
+    }
+
+    #[test]
     fn apply_enabled_flips_the_resolved_account_and_reports_change() {
         let mut roster = vec![acct("work", "u1", "s1"), acct("spare", "u2", "s2")];
         // Resolve `spare` by label and disable it; the other account is untouched.
@@ -759,6 +793,7 @@ spare · 22222222 · Sessiometer/22222222-2222\n\
             session_pct: session,
             weekly_pct: weekly,
             enabled: true,
+            quarantined: false,
         }
     }
 
