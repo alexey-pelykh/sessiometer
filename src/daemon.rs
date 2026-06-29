@@ -203,7 +203,7 @@ impl Shutdown for RealShutdown {
 
 /// Per-account usage seam: poll one roster account, routing the active account
 /// through the canonical credential and every other through its stash. The test
-/// fake ([`tests::FakeRosterPoller`]) returns scripted per-account readings.
+/// fake (`FakeRosterPoller`) returns scripted per-account readings.
 pub(crate) trait RosterPoller {
     /// Poll `account`'s usage. `active` selects the token source: the canonical
     /// keychain item for the active account (whose token is the freshest), or the
@@ -588,7 +588,7 @@ fn control_reply(
 const MAX_CONTROL_LINE_BYTES: u64 = 8 * 1024;
 
 /// Upper bound on one whole control exchange (read request + write reply). Mirrors
-/// the `use`-side `MANUAL_SWAP_NOTIFY_TIMEOUT` so a peer that never completes its line
+/// the `use`-side `CONTROL_SOCKET_TIMEOUT` so a peer that never completes its line
 /// cannot hold the serve arm; the run-loop select also drops this future at the next
 /// poll tick, so this is the tighter, dedicated time bound (issue #64).
 const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -897,7 +897,7 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`next_poll_interval`](Self::next_poll_interval).
     poll_strategy: Strategy,
     /// Jitter RNG seam — process entropy in production, a fixed seed in tests
-    /// ([`with_seed`](Self::with_seed)) so per-cycle draws are deterministic.
+    /// (`with_seed`) so per-cycle draws are deterministic.
     rng: SplitMix64,
     /// Consecutive non-scope 401s before an account's stored credential is treated
     /// as DEAD and quarantined (issue #42; config `monitor_401_n`, `1..=20`).
@@ -973,7 +973,7 @@ where
     /// `flock` at `path` (blocking, bounded, fail-closed) so the daemon and a manual
     /// `use` swap can never interleave into a split state. Production sets the real
     /// `paths::swap_lock()`; a test may point it at a throwaway file. Builder-style
-    /// to mirror [`with_seed`](Self::with_seed) and keep `new`'s 7 args stable.
+    /// to mirror `with_seed` and keep `new`'s 7 args stable.
     pub(crate) fn with_swap_lock(mut self, path: PathBuf) -> Self {
         self.swap_lock_path = Some(path);
         self
@@ -2121,12 +2121,18 @@ fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
 fn swap_report(outcome: &TickOutcome) -> Option<String> {
     match outcome.action {
         TickAction::Swapped { from, to } => Some(format!(
-            "swapped: {} → {}",
+            // `off <from> onto <to>` rather than `<from> → <to>` (issue #89): the
+            // bare arrow reads ambiguously, but `to` is the account just made
+            // active (swapped ONTO) and `from` the one swapped OFF — spell it out
+            // so the operator can never misread the direction.
+            "swapped off {} onto {}",
             label_at(&outcome.snapshot, from),
             label_at(&outcome.snapshot, to),
         )),
         TickAction::EmergencySwapped { from, to } => Some(format!(
-            "emergency swap (dead credential): {} → {}",
+            // Same off/onto phrasing (#89), still named distinctly — the trailing
+            // cause tells the operator a credential just died and forced this.
+            "emergency-swapped off {} onto {} (dead credential)",
             label_at(&outcome.snapshot, from),
             label_at(&outcome.snapshot, to),
         )),
@@ -5258,19 +5264,83 @@ mod tests {
         };
         assert_eq!(
             swap_report(&outcome(TickAction::Swapped { from: 0, to: 1 })).as_deref(),
-            Some("swapped: work → spare"),
+            Some("swapped off work onto spare"),
         );
         // #42: an emergency swap echoes too, named distinctly so the operator sees a
         // dead credential forced the rotation.
         assert_eq!(
             swap_report(&outcome(TickAction::EmergencySwapped { from: 0, to: 1 })).as_deref(),
-            Some("emergency swap (dead credential): work → spare"),
+            Some("emergency-swapped off work onto spare (dead credential)"),
         );
         assert_eq!(swap_report(&outcome(TickAction::Held)), None);
         assert_eq!(swap_report(&outcome(TickAction::SkippedCooldown)), None);
         assert_eq!(swap_report(&outcome(TickAction::NoViableTarget)), None);
         // A dead active account with no viable target holds — no console echo.
         assert_eq!(swap_report(&outcome(TickAction::ActiveDeadNoTarget)), None);
+    }
+
+    #[tokio::test]
+    async fn swap_log_lines_name_to_as_the_now_active_account_from_as_swapped_away() {
+        // DECIDER (issue #89): the from→to direction on BOTH operator surfaces — the
+        // foreground console echo (`swap_report`) AND the durable `event=swap` log line
+        // — must match the PHYSICAL outcome of a real swap: `to` is the account the
+        // daemon just made active (swapped ONTO), `from` the one it swapped OFF. Drive
+        // a genuine swap (`work` active and over the session trigger → the viable target
+        // `spare`) and tie both rendered lines back to `state.active`, so a future
+        // inversion of either surface — or of the `Event::Swap` / `TickAction` source —
+        // fails HERE instead of silently misleading the operator. (#15: labels only.)
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40) // active, over the session trigger
+            .ok("u-B", 0.05, 0.05); // the only viable target
+        let tun = tunables(95, 80, 0);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+
+        let outcome = warmed_tick(&mut daemon).await;
+
+        // The physical outcome: `work` (index 0) was swapped OFF; `spare` (index 1) is
+        // now active. `to` must name the now-active account on every surface.
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "physical outcome: `spare` (index 1) is now the active account"
+        );
+
+        // Surface 1 — the foreground console echo: off=<swapped-away>, onto=<now-active>.
+        assert_eq!(
+            swap_report(&outcome).as_deref(),
+            Some("swapped off work onto spare"),
+            "console echo must name the swapped-away account, then the now-active one",
+        );
+
+        // Surface 2 — the durable event log agrees: from=<swapped-away> to=<now-active>.
+        let swap_event = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::Swap { .. }))
+            .expect("a swap surfaces a structured Event::Swap (#9)");
+        let log_line = swap_event.to_log_line(std::time::SystemTime::UNIX_EPOCH);
+        assert!(
+            log_line.contains("event=swap from=work to=spare"),
+            "event log must name from=<swapped-away> to=<now-active>; got `{log_line}`",
+        );
     }
 
     #[tokio::test]
@@ -6907,7 +6977,7 @@ mod tests {
             "status-text channel missing"
         );
         assert!(
-            corpus.contains("swapped: work → spare"),
+            corpus.contains("swapped off work onto spare"),
             "foreground channel: swap report missing"
         );
         assert!(
@@ -7184,7 +7254,7 @@ mod tests {
             "status-text channel is missing"
         );
         assert!(
-            corpus.contains("swapped: spare → work"),
+            corpus.contains("swapped off spare onto work"),
             "foreground channel: the B→A swap report is missing"
         );
         assert!(
