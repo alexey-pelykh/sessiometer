@@ -164,12 +164,14 @@ fn default_poll_jitter() -> Jitter {
     }
 }
 
-/// The validated configuration: a non-empty roster plus tunables.
+/// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
-    /// Captured accounts (at least one, unique `account_uuid` + `stash`; no fixed
-    /// upper bound — #35). Consumed by the swap engine (#6 / #7) and by `list` /
-    /// `status` (#17 / #9).
+    /// Captured accounts (unique `account_uuid` + `stash`; no fixed upper bound —
+    /// #35, and possibly empty — the daemon's "at least one" precondition is
+    /// [`Config::require_roster`], not a parse-time rule, so `capture` can load a
+    /// tunables-only file to add the first account). Consumed by the swap engine
+    /// (#6 / #7) and by `list` / `status` (#17 / #9).
     #[allow(dead_code)]
     pub(crate) roster: Vec<Account>,
     /// Poll/swap tunables.
@@ -183,7 +185,10 @@ impl Config {
     /// nothing to run until `capture` writes one), [`Error::ConfigParse`] /
     /// [`Error::ConfigInvalid`] / [`Error::ConfigFloorAboveTrigger`] for a file
     /// that exists but is malformed. Never silently substitutes defaults for a
-    /// malformed file.
+    /// malformed file. A well-formed file with an *empty* roster loads
+    /// successfully (tunables preserved) — the "at least one account" rule is the
+    /// daemon's [`Config::require_roster`] precondition, so `capture` can load a
+    /// tunables-only file to add the first account.
     pub(crate) fn load() -> Result<Self> {
         Self::load_path(&paths::config_file()?)
     }
@@ -234,6 +239,24 @@ impl Config {
     #[allow(dead_code)]
     pub(crate) fn swap_threshold(&self) -> f64 {
         f64::from(self.tunables.session_trigger) / 100.0
+    }
+
+    /// Ensure the roster holds at least one account — the daemon's precondition.
+    ///
+    /// The non-empty-roster invariant belongs to the *daemon* (`run` has nothing to
+    /// rotate across with an empty roster), not to parsing: `capture` and the
+    /// roster-editing commands must load a possibly-empty config precisely to
+    /// populate it (a brand-new tunables-only file, or one whose last account was
+    /// just `remove`d). Enforcing it here — at the one consumer that requires it —
+    /// lets `capture` bootstrap the first account while `run` still refuses to start
+    /// on an empty roster. Maps to the friendly [`Error::RosterEmpty`], the same
+    /// empty-state the offline `list` view reports.
+    pub(crate) fn require_roster(&self) -> Result<()> {
+        if self.roster.is_empty() {
+            Err(Error::RosterEmpty)
+        } else {
+            Ok(())
+        }
     }
 
     /// Stage one: deserialize TOML into the permissive raw form, then validate.
@@ -322,21 +345,20 @@ impl Config {
             },
         };
 
-        // The roster needs at least one account but has no fixed upper bound: the
-        // operator rotates across as many accounts as they capture (#35). Only the
-        // lower bound is enforced; there is deliberately no ceiling.
+        // The roster has neither a lower nor an upper bound at PARSE time. An empty
+        // roster is a valid intermediate state — a fresh tunables-only file, or one
+        // whose last account was just `remove`d — and `capture` must be able to load
+        // such a file to add the first account (otherwise it can never bootstrap).
+        // The "at least one account" rule is the DAEMON's precondition, enforced by
+        // its consumer via [`Config::require_roster`] (called from `run`), NOT here.
+        // And there is deliberately no upper bound: the operator rotates across as
+        // many accounts as they capture (#35).
         //
         // Poll-cost note (document, don't cap): the daemon polls every roster
         // account with its own `curl` each `poll_secs` tick (see
         // `daemon::Daemon::tick`), so a larger roster grows per-tick work and
         // outbound request volume linearly. The operator self-limits by choice
         // (smaller roster, or a larger `poll_secs`); the tool enforces no ceiling.
-        if raw.account.is_empty() {
-            return Err(Error::ConfigInvalid(
-                "roster must have at least one account".into(),
-            ));
-        }
-
         let mut uuids = HashSet::new();
         let mut stashes = HashSet::new();
         let mut roster = Vec::with_capacity(raw.account.len());
@@ -921,11 +943,30 @@ label = "personal"
     }
 
     #[test]
-    fn rejects_empty_roster() {
-        assert!(matches!(
-            Config::parse("[tunables]\npoll_secs = 60\n"),
-            Err(Error::ConfigInvalid(_))
-        ));
+    fn accepts_a_roster_less_config_and_preserves_tunables() {
+        // Regression (the `capture` bootstrap bug, #58): a well-formed tunables-only
+        // file must PARSE (empty roster) and PRESERVE the operator's tunables, so
+        // `capture` can load it to add the first account. The "at least one account"
+        // rule is the daemon's `require_roster` precondition, not a parse rejection.
+        let config = Config::parse("[tunables]\npoll_secs = 120\nsession_floor = 80\n").unwrap();
+        assert!(config.roster.is_empty());
+        assert_eq!(config.tunables.poll_secs, 120);
+        assert_eq!(config.tunables.session_floor, Some(80));
+    }
+
+    #[test]
+    fn require_roster_rejects_an_empty_roster_with_the_friendly_empty_state() {
+        // The daemon's precondition (#58): an empty roster is the friendly
+        // `RosterEmpty` ("nothing captured yet"), the same state the offline `list`
+        // reports — not a raw parse/validation error.
+        let config = Config::parse("[tunables]\npoll_secs = 60\n").unwrap();
+        assert!(matches!(config.require_roster(), Err(Error::RosterEmpty)));
+    }
+
+    #[test]
+    fn require_roster_accepts_a_populated_roster() {
+        let config = Config::parse(VALID).unwrap();
+        assert!(config.require_roster().is_ok());
     }
 
     #[test]

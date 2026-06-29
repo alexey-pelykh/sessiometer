@@ -110,6 +110,11 @@ async fn run() -> Result<()> {
     // Load the real config (roster + tunables); a malformed or absent config is
     // fatal, never silently replaced by defaults (issue #3).
     let config = Config::load()?;
+    // The daemon needs at least one account to rotate across. This is the daemon's
+    // precondition (enforced here, at the consumer), NOT a parse-time rule —
+    // `capture` must be able to load a tunables-only config to populate it (#58).
+    // Fail fast with the friendly empty-state, before binding the socket or log.
+    config.require_roster()?;
 
     paths::ensure_private_dir(&paths::config_dir()?)?;
     paths::ensure_private_dir(&paths::logs_dir()?)?;
@@ -304,6 +309,11 @@ async fn list() -> Result<()> {
 /// other load error (malformed / invalid config) surfaces unchanged.
 fn view(loaded: Result<Config>) -> Result<String> {
     match loaded {
+        // Both empty states read the same: an absent config, OR a well-formed
+        // tunables-only file whose roster is empty (now that `capture` can load
+        // such a file, #58). Either way `list` shows the friendly "nothing captured
+        // yet" rather than a bare "0 accounts".
+        Ok(config) if config.roster.is_empty() => Err(Error::RosterEmpty),
         Ok(config) => Ok(render_roster(&config.roster)),
         Err(Error::ConfigNotFound { .. }) => Err(Error::RosterEmpty),
         Err(other) => Err(other),
@@ -586,6 +596,18 @@ personal · 22222222 · Sessiometer/22222222-2222-2222-2222-222222222222\n\
         assert_eq!(
             Error::RosterEmpty.to_string(),
             "no accounts captured yet — run `sessiometer capture`"
+        );
+    }
+
+    #[test]
+    fn view_maps_a_roster_less_config_to_the_friendly_empty_state() {
+        // #58: a well-formed tunables-only config (empty roster) reads as the same
+        // friendly empty state as an absent file — `capture` can now load such a
+        // file, so `list` must not show a bare "0 accounts".
+        let config = config_with(vec![]);
+        assert!(
+            matches!(view(Ok(config)), Err(Error::RosterEmpty)),
+            "an empty roster must become the friendly empty state"
         );
     }
 
