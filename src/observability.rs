@@ -79,6 +79,11 @@ pub(crate) enum Event {
         reason: SwapReason,
         session_pct: u8,
     },
+    /// `account`'s canonical credential changed underneath the daemon — the
+    /// operator ran `claude /login` and re-authenticated it — so its stash was
+    /// refreshed to the new token (issue #13 re-auth re-stash). `account` is the
+    /// HANDLE (operator label), resolved from the new canonical's identity.
+    ReStash { account: String },
     /// The active account is over a trigger but no other account is a viable swap
     /// target — the all-exhausted terminal state (issue #11). `hold` is the
     /// least-bad account the daemon holds on: the one whose weekly window resets
@@ -91,11 +96,16 @@ pub(crate) enum Event {
         resets_at: Option<i64>,
     },
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
-    /// row. Observability only — the re-stash this eventually warrants is issue #13.
+    /// row. Observability only — a persistent 401 means a dead credential, whose
+    /// quarantine + emergency swap is issue #42 (NOT a re-stash; re-stash is driven
+    /// by canonical-change detection, [`Event::ReStash`]).
     Monitor401 { account: String, consecutive: u32 },
-    /// A poll for `account` could not run because the keychain was locked. The
-    /// wait / back-off behavior is issue #13; this records the occurrence.
-    KeychainLockedWait { account: String },
+    /// The keychain was locked when the daemon went to read the canonical
+    /// credential, so this tick's work is deferred and the daemon backs off (issue
+    /// #13). Edge-triggered: emitted ONCE when the lock is first observed, not every
+    /// tick it stays locked. No `account` — a locked keychain is a process-global
+    /// condition (every account's stash is unreadable), not tied to one account.
+    KeychainLockedWait,
     /// `account`'s token authenticated but lacks the usage scope (HTTP 403) — the
     /// hallmark of a non-interactive setup token (#5). Always `status=403`.
     UsageScopeFail { account: String },
@@ -123,6 +133,9 @@ impl Event {
                     "ts={ts} event=swap from={from} to={to} reason={reason} session_pct={session_pct}"
                 )
             }
+            Event::ReStash { account } => {
+                format!("ts={ts} event=restash account={account}")
+            }
             Event::AllExhausted { hold, resets_at } => match resets_at {
                 Some(secs) => {
                     let resets_at = rfc3339(system_time_from_epoch(*secs));
@@ -136,8 +149,8 @@ impl Event {
             } => {
                 format!("ts={ts} event=monitor_401 account={account} consecutive={consecutive}")
             }
-            Event::KeychainLockedWait { account } => {
-                format!("ts={ts} event=keychain_locked_wait account={account}")
+            Event::KeychainLockedWait => {
+                format!("ts={ts} event=keychain_locked_wait")
             }
             Event::UsageScopeFail { account } => {
                 format!("ts={ts} event=usage_scope_fail account={account} status=403")
@@ -355,15 +368,20 @@ mod tests {
     }
 
     #[test]
-    fn keychain_locked_wait_carries_the_account() {
-        let line = Event::KeychainLockedWait {
+    fn restash_carries_the_account_handle() {
+        let line = Event::ReStash {
             account: "work".to_owned(),
         }
         .to_log_line(at_epoch(0));
-        assert_eq!(
-            line,
-            format!("{TS0} event=keychain_locked_wait account=work")
-        );
+        assert_eq!(line, format!("{TS0} event=restash account=work"));
+    }
+
+    #[test]
+    fn keychain_locked_wait_is_accountless() {
+        // A locked keychain is process-global, so the line carries no account —
+        // just the event name and timestamp (issue #13).
+        let line = Event::KeychainLockedWait.to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=keychain_locked_wait"));
     }
 
     #[test]
@@ -393,13 +411,14 @@ mod tests {
                 hold: "work".to_owned(),
                 resets_at: Some(1_782_777_600),
             },
+            Event::ReStash {
+                account: "work".to_owned(),
+            },
             Event::Monitor401 {
                 account: "work".to_owned(),
                 consecutive: 2,
             },
-            Event::KeychainLockedWait {
-                account: "work".to_owned(),
-            },
+            Event::KeychainLockedWait,
             Event::UsageScopeFail {
                 account: "work".to_owned(),
             },

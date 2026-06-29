@@ -40,7 +40,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 
 #[cfg(test)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use tokio::process::Command;
 use zeroize::{Zeroize, Zeroizing};
@@ -90,9 +90,82 @@ impl Credential {
     /// nothing a holder of both does not already have — unlike a
     /// secret-vs-attacker-guess check, where constant time matters (the reason a
     /// production [`Credential`] deliberately has no `PartialEq`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Also the comparison behind [`CanonicalWatch`] — the production caller that
+    /// retired this method's former `dead_code` allowance.
     pub(crate) fn matches(&self, other: &Credential) -> bool {
         self.0.as_slice() == other.0.as_slice()
+    }
+}
+
+/// Watches the canonical credential for **out-of-band** changes — the reusable
+/// detection primitive behind re-auth re-stash (issue #13) and the
+/// dead-credential recovery path (#42, which consumes this seam unchanged).
+///
+/// It holds the last *committed* canonical blob and answers "did the canonical
+/// change since I last looked?" in two steps, deliberately separated so a handler
+/// can fail and have the change re-fire next cycle:
+///   - [`classify`](CanonicalWatch::classify) compares a freshly-read blob
+///     against the baseline **without** advancing it (idempotent), and
+///   - [`commit`](CanonicalWatch::commit) advances the baseline — called once the
+///     change has been *handled* (the re-stash succeeded), or to prime against the
+///     daemon's OWN write (a swap), so that write is not re-detected as external.
+///
+/// A `Changed` verdict means the canonical was rewritten by something other than
+/// the last thing we committed: a `claude /login` re-auth (a fresh token matching
+/// no stash) or a silent in-place token refresh — both warrant re-stashing the
+/// affected account with the fresh token. The daemon owns the *instance* (it is
+/// poll-loop state); the *type* lives here, next to [`Credential`], so #42 reuses
+/// it without reaching into the daemon module.
+#[derive(Default)]
+pub(crate) struct CanonicalWatch {
+    /// The last committed canonical blob, or `None` before the first commit.
+    last: Option<Credential>,
+}
+
+/// How a freshly-read canonical compares to a [`CanonicalWatch`]'s last committed
+/// observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalChange {
+    /// No prior observation — the baseline is unset. The caller
+    /// [`commit`](CanonicalWatch::commit)s to prime it; never treated as a change
+    /// (nothing to compare against).
+    Primed,
+    /// Byte-identical to the last committed observation — no out-of-band write.
+    Unchanged,
+    /// Differs from the last committed observation — an out-of-band rewrite (a
+    /// `claude /login` re-auth, or a silent in-place token refresh).
+    Changed,
+}
+
+impl CanonicalWatch {
+    /// A watch with no baseline yet (the first [`classify`](Self::classify)
+    /// returns [`CanonicalChange::Primed`]). Production constructs the watch via
+    /// `Default` (inside `DecisionState`); this named constructor is the readable
+    /// form the unit tests use, hence the test-only `dead_code` allowance.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// Classify `current` against the last committed blob **without** advancing
+    /// the baseline. Idempotent: repeated calls return the same verdict until a
+    /// [`commit`](Self::commit) moves the baseline, so a handler that fails (e.g.
+    /// a locked keychain mid-re-stash) leaves the change to re-fire next cycle.
+    pub(crate) fn classify(&self, current: &Credential) -> CanonicalChange {
+        match &self.last {
+            None => CanonicalChange::Primed,
+            Some(prev) if prev.matches(current) => CanonicalChange::Unchanged,
+            Some(_) => CanonicalChange::Changed,
+        }
+    }
+
+    /// Advance the baseline to `current`. Call after a change is handled, after
+    /// priming (the [`CanonicalChange::Primed`] arm), or right after the daemon's
+    /// OWN canonical write (a swap) so that write is not re-detected as an
+    /// external change on the next [`classify`](Self::classify).
+    pub(crate) fn commit(&mut self, current: &Credential) {
+        self.last = Some(current.clone());
     }
 }
 
@@ -398,6 +471,10 @@ impl CredentialStore for RealCredentialStore {
 #[cfg(test)]
 pub(crate) struct FakeCredentialStore {
     slot: RefCell<Option<Credential>>,
+    /// When set, [`read`](CredentialStore::read) returns [`Error::KeychainLocked`]
+    /// — the in-memory analog of a locked login keychain (exit 36), so the daemon's
+    /// locked-path backoff (#13) is testable without a real keychain.
+    locked: Cell<bool>,
 }
 
 #[cfg(test)]
@@ -405,13 +482,23 @@ impl FakeCredentialStore {
     pub(crate) fn empty() -> Self {
         Self {
             slot: RefCell::new(None),
+            locked: Cell::new(false),
         }
+    }
+
+    /// Simulate the login keychain locking (`true`) or unlocking (`false`): while
+    /// locked, `read` returns [`Error::KeychainLocked`] (issue #13).
+    pub(crate) fn set_locked(&self, locked: bool) {
+        self.locked.set(locked);
     }
 }
 
 #[cfg(test)]
 impl CredentialStore for FakeCredentialStore {
     async fn read(&self) -> Result<Credential> {
+        if self.locked.get() {
+            return Err(Error::KeychainLocked { op: "read" });
+        }
         self.slot
             .borrow()
             .clone()
@@ -644,6 +731,73 @@ class: "genp"
         let different = Credential::new(b"other-token".to_vec());
         assert!(a.matches(&same));
         assert!(!a.matches(&different));
+    }
+
+    // --- CanonicalWatch (the re-auth / dead-credential detection primitive, #13/#42) ---
+
+    fn cred(blob: &[u8]) -> Credential {
+        Credential::new(blob.to_vec())
+    }
+
+    #[test]
+    fn canonical_watch_primes_on_the_first_observation() {
+        // No baseline yet → Primed (never a Changed on the very first look), so a
+        // daemon that has just started never spuriously re-stashes.
+        let watch = CanonicalWatch::new();
+        assert_eq!(watch.classify(&cred(b"A-token")), CanonicalChange::Primed);
+    }
+
+    #[test]
+    fn canonical_watch_reports_unchanged_after_committing_the_same_blob() {
+        let mut watch = CanonicalWatch::new();
+        watch.commit(&cred(b"A-token"));
+        assert_eq!(
+            watch.classify(&cred(b"A-token")),
+            CanonicalChange::Unchanged
+        );
+    }
+
+    #[test]
+    fn canonical_watch_reports_changed_for_a_different_blob() {
+        // A fresh `/login` token (matching no prior commit) is a Changed.
+        let mut watch = CanonicalWatch::new();
+        watch.commit(&cred(b"A-token"));
+        assert_eq!(
+            watch.classify(&cred(b"A-relogin-token")),
+            CanonicalChange::Changed
+        );
+    }
+
+    #[test]
+    fn canonical_watch_classify_is_idempotent_until_commit() {
+        // classify does NOT advance the baseline: an unhandled change keeps
+        // reporting Changed until commit moves the baseline (so a failed re-stash
+        // re-fires next cycle). After commit, the same blob is Unchanged.
+        let mut watch = CanonicalWatch::new();
+        watch.commit(&cred(b"A-token"));
+        let fresh = cred(b"A-relogin-token");
+        assert_eq!(watch.classify(&fresh), CanonicalChange::Changed);
+        assert_eq!(watch.classify(&fresh), CanonicalChange::Changed);
+        watch.commit(&fresh);
+        assert_eq!(watch.classify(&fresh), CanonicalChange::Unchanged);
+    }
+
+    #[test]
+    fn canonical_watch_commit_excludes_the_daemons_own_write() {
+        // The Q3 invariant: priming (commit) to the token we just WROTE means our
+        // own swap is not re-detected as an external change…
+        let mut watch = CanonicalWatch::new();
+        watch.commit(&cred(b"A-token"));
+        watch.commit(&cred(b"B-token")); // we wrote B (a swap)
+        assert_eq!(
+            watch.classify(&cred(b"B-token")),
+            CanonicalChange::Unchanged
+        );
+        // …while an external write landing AFTER our commit is still caught.
+        assert_eq!(
+            watch.classify(&cred(b"C-from-a-concurrent-login")),
+            CanonicalChange::Changed
+        );
     }
 
     /// Drives the real `security` CLI end-to-end against a throwaway keychain

@@ -72,9 +72,11 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 use crate::claude_state;
 use crate::config::{Account, Tunables};
 use crate::error::{Error, Result};
-use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
+use crate::keychain::{
+    CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
+};
 use crate::observability::{Event, EventLog, SwapReason};
-use crate::stash::{AccountStash, RealAccountStash};
+use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{SplitMix64, Strategy};
 use crate::usage::{CurlTransport, NoopReStashTrigger, RealUsageSource, Usage, UsageSource};
@@ -95,6 +97,16 @@ const COOLDOWN_SECS_HI: f64 = 3600.0;
 /// Per-cycle clamp bounds for the poll-interval draw, in seconds (config range).
 const POLL_SECS_LO: f64 = 5.0;
 const POLL_SECS_HI: f64 = 3600.0;
+
+/// First back-off after a cycle finds the keychain LOCKED (issue #13) — short, so
+/// a brief lock (the operator mid-unlock) is recovered from within a second.
+const LOCK_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Ceiling for the locked-keychain back-off (issue #13). The wait doubles each
+/// locked cycle from [`LOCK_BACKOFF_BASE`] but never exceeds this, settling at one
+/// read attempt per minute — prompt to resume on unlock, yet not a busy-spin on a
+/// keychain that stays locked. The daemon NEVER auto-unlocks or prompts; a locked
+/// keychain is the operator's to open (a non-interactive read just fails, exit 36).
+const LOCK_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Time seam: the daemon reads "now" and sleeps until the next poll through
 /// this, so a fake can drive time and make the loop run instantly in tests.
@@ -457,6 +469,11 @@ pub(crate) enum TickAction {
     /// A swap was attempted but the engine returned an error; #6 is no-half-swap,
     /// so the state is coherent and the loop retries next cycle.
     SwapFailed,
+    /// The keychain was LOCKED when this cycle went to read the canonical
+    /// credential (issue #13). All work is deferred — no resolve, no poll, no swap
+    /// — and the loop backs off (the wait is carried in
+    /// [`TickOutcome::next_wait`]). The daemon never auto-unlocks or prompts.
+    KeychainLocked,
 }
 
 /// The result of one poll iteration.
@@ -471,6 +488,11 @@ pub(crate) struct TickOutcome {
     pub(crate) events: Vec<Event>,
     /// The per-account readings this cycle, for the control socket (`status`).
     pub(crate) snapshot: StatusSnapshot,
+    /// How long the run loop should wait before the next tick. `None` = the normal
+    /// jittered poll interval (issue #38); `Some(d)` = an explicit wait — the
+    /// locked-keychain back-off (issue #13), which grows the gap between retries
+    /// while the keychain stays locked.
+    pub(crate) next_wait: Option<Duration>,
 }
 
 /// The last swap the loop performed: the handle swapped TO and when. One record
@@ -516,6 +538,26 @@ struct DecisionState {
     /// ONCE per all-exhausted episode — not once per poll while every account
     /// stays exhausted — and fires afresh if the state clears and is re-entered.
     signaled_all_exhausted: bool,
+    /// The out-of-band canonical-change detector (issue #13 re-auth re-stash):
+    /// tracks the last *committed* canonical credential so a rewrite by something
+    /// other than the daemon — a `claude /login` re-auth, or a silent in-place
+    /// token refresh — is detected and the owning account's stash refreshed. The
+    /// daemon's OWN canonical writes (a swap) are committed into it so they are not
+    /// re-detected as external. The *type* lives in [`crate::keychain`] so the
+    /// dead-credential path (#42) reuses it; the daemon owns this instance.
+    canonical_watch: CanonicalWatch,
+    /// Current locked-keychain back-off (issue #13): `None` while the keychain is
+    /// readable, `Some(d)` while locked — grown from [`LOCK_BACKOFF_BASE`] toward
+    /// [`LOCK_BACKOFF_CAP`] each locked cycle and returned as
+    /// [`TickOutcome::next_wait`]. Reset to `None` on the first readable cycle, so
+    /// a later lock episode starts the climb afresh.
+    lock_backoff: Option<Duration>,
+    /// Edge-trigger guard for the keychain-locked signal (issue #13): set when a
+    /// `keychain_locked_wait` event is emitted, cleared on the first readable
+    /// cycle. So the signal fires exactly ONCE per lock episode — not once per
+    /// backed-off retry while the keychain stays locked — mirroring
+    /// `signaled_all_exhausted`.
+    signaled_keychain_locked: bool,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -612,6 +654,12 @@ where
     /// in place) on a normal restart, or it belongs to an un-captured account —
     /// `~/.claude.json` is left untouched (there is nothing to heal). Best-effort
     /// and idempotent.
+    ///
+    /// This IS the issue #13 process-death-mid-swap recovery: the swap commits the
+    /// canonical token before co-writing the display, so a crash in that window
+    /// leaves the keychain authoritative and the display stale — exactly the
+    /// mismatch healed here on the next start. No separate mechanism is needed; the
+    /// keychain-first ordering plus this reconcile make a torn swap self-healing.
     pub(crate) async fn reconcile_on_start(&self) -> Result<()> {
         let canonical = self.store.read().await?;
         for account in &self.roster {
@@ -637,28 +685,22 @@ where
     /// Identify the active account: the roster index whose credential the
     /// canonical keychain item currently holds.
     ///
-    /// Two signals, in order: (1) the canonical token byte-matches a stash — exact
-    /// right after a swap wrote a stashed token verbatim; (2) `~/.claude.json`'s
-    /// displayed `accountUuid` maps to a roster account — the steady-state signal
-    /// once the active account's token has refreshed in place (drifted from its
-    /// stash). `None` if neither resolves; the caller then polls but never swaps.
+    /// Delegates to [`resolve_account_for`](Self::resolve_account_for) when the
+    /// canonical is readable (token-match, then the `~/.claude.json` display
+    /// fallback); when the canonical is unreadable (locked / not-found) it uses the
+    /// displayed identity alone — the same json signal, the only one available
+    /// without a token to match. `None` if neither resolves; the caller then polls
+    /// but never swaps.
     async fn resolve_active(&self) -> Option<usize> {
-        if let Ok(canonical) = self.store.read().await {
-            for (i, account) in self.roster.iter().enumerate() {
-                if let Ok(stashed) = self.stash.read(&account.stash).await {
-                    if stashed.credential.matches(&canonical) {
-                        return Some(i);
-                    }
-                }
+        match self.store.read().await {
+            Ok(canonical) => self.resolve_account_for(&canonical).await,
+            Err(_) => {
+                let oauth = claude_state::read_oauth_account_from(&self.claude_json).ok()?;
+                self.roster
+                    .iter()
+                    .position(|a| a.account_uuid == oauth.account_uuid())
             }
         }
-        if let Ok(oauth) = claude_state::read_oauth_account_from(&self.claude_json) {
-            return self
-                .roster
-                .iter()
-                .position(|a| a.account_uuid == oauth.account_uuid());
-        }
-        None
     }
 
     /// Run one poll iteration: resolve the active account, poll every roster
@@ -666,10 +708,45 @@ where
     pub(crate) async fn tick(&mut self) -> TickOutcome {
         self.state.ticks += 1;
         let at = self.clock.now();
+        let mut events: Vec<Event> = Vec::new();
 
-        // Resolve the active account once; cached and updated on each swap.
+        // Read the canonical credential ONCE at the top of the cycle. It drives
+        // three things, all from this single read: lock detection (defer the whole
+        // cycle and back off, #13), re-auth re-stash detection (the canonical
+        // changed out-of-band, #13), and the active resolution below. A locked
+        // keychain is the one outcome that short-circuits the entire tick.
+        let canonical = match self.store.read().await {
+            Err(Error::KeychainLocked { .. }) => return self.locked_tick(at),
+            Ok(canonical) => {
+                // Readable: clear any lock back-off and re-arm the edge-triggered
+                // lock signal, then heal an out-of-band canonical change (#13).
+                self.state.lock_backoff = None;
+                self.state.signaled_keychain_locked = false;
+                self.reconcile_canonical_change(&canonical, &mut events)
+                    .await;
+                Some(canonical)
+            }
+            Err(_) => {
+                // Unreadable for a non-lock reason (not-found / transient): no
+                // change-detection is possible, but it is not a lock — clear the
+                // back-off and fall through to poll (the loop never swaps on missing
+                // data, so an unknown active simply holds).
+                self.state.lock_backoff = None;
+                self.state.signaled_keychain_locked = false;
+                None
+            }
+        };
+
+        // Resolve the active account once; cached, updated on each swap, and dropped
+        // by a re-auth re-stash above so it is re-resolved here. Reuse the canonical
+        // already read above (the "read ONCE" intent) rather than re-reading it; only
+        // the non-lock unreadable case falls back to the display-only resolve, whose
+        // own store read has just failed anyway.
         if self.state.active.is_none() {
-            self.state.active = self.resolve_active().await;
+            self.state.active = match &canonical {
+                Some(canonical) => self.resolve_account_for(canonical).await,
+                None => self.resolve_active().await,
+            };
         }
         let active = self.state.active;
 
@@ -678,9 +755,9 @@ where
         // (transient / 401 / unreadable) leaves that account's reading absent — it
         // is simply not a candidate this cycle, and the loop never swaps on
         // missing data. The poll OUTCOME also feeds the event log (issue #9): a 401
-        // / keychain-lock / 403 each emits one line, in roster order, and the
-        // per-account 401 streak is maintained here.
-        let mut events: Vec<Event> = Vec::new();
+        // or a 403 each emits one line, in roster order, and the per-account 401
+        // streak is maintained here. (A locked keychain is handled at top-of-tick,
+        // not per-account — see `locked_tick`.)
         let mut readings: Vec<Option<Usage>> = Vec::with_capacity(self.roster.len());
         for i in 0..self.roster.len() {
             // Skip polling a disabled (parked) account (issue #36): it is never a
@@ -712,15 +789,162 @@ where
             action,
             events,
             snapshot,
+            // A normal cycle waits the regular jittered poll interval (#38); only
+            // the locked path (`locked_tick`) overrides this with a back-off.
+            next_wait: None,
         }
+    }
+
+    /// The keychain was LOCKED when this cycle went to read the canonical
+    /// credential (issue #13). Defer ALL work — no resolve, no poll, no swap — and
+    /// back off so the daemon does not hammer a locked keychain. The back-off grows
+    /// exponentially from [`LOCK_BACKOFF_BASE`], doubling each consecutive locked
+    /// cycle up to [`LOCK_BACKOFF_CAP`]. The `keychain_locked_wait` event is
+    /// edge-triggered: emitted ONCE when the lock is first observed (guarded by
+    /// `signaled_keychain_locked`), not every backed-off retry. The daemon NEVER
+    /// auto-unlocks or prompts — a locked keychain is the operator's to open; a
+    /// non-interactive read just fails (exit 36), and the daemon waits it out.
+    fn locked_tick(&mut self, at: Instant) -> TickOutcome {
+        let mut events = Vec::new();
+        if !self.state.signaled_keychain_locked {
+            events.push(Event::KeychainLockedWait);
+            self.state.signaled_keychain_locked = true;
+        }
+        // Grow the back-off: first locked cycle waits BASE, each subsequent one
+        // doubles up to CAP. Stored so the next locked cycle continues the climb.
+        let backoff = match self.state.lock_backoff {
+            None => LOCK_BACKOFF_BASE,
+            Some(prev) => (prev * 2).min(LOCK_BACKOFF_CAP),
+        };
+        self.state.lock_backoff = Some(backoff);
+        // Build an all-absent snapshot so the control socket keeps answering while
+        // locked: every reading is unavailable (the keychain is unreadable), but
+        // `status` still lists the roster and the last swap rather than going dark.
+        let readings = vec![None; self.roster.len()];
+        let snapshot = self.snapshot(at, self.state.active, &readings);
+        TickOutcome {
+            action: TickAction::KeychainLocked,
+            events,
+            snapshot,
+            next_wait: Some(backoff),
+        }
+    }
+
+    /// Detect and heal an OUT-OF-BAND canonical change (issue #13 re-auth re-stash):
+    /// the operator ran `claude /login` (or the active token silently refreshed in
+    /// place), rewriting the canonical credential underneath the daemon. Classify
+    /// the freshly-read `canonical` against the watch; on a `Changed` verdict, find
+    /// the account it now belongs to and refresh that account's stash to the new
+    /// token — so a later swap AWAY and back restores the re-authenticated
+    /// credential, not the stale stashed one.
+    ///
+    /// The watch's two-step protocol (classify, then commit) makes this re-fire
+    /// safe: the baseline advances only once the re-stash SUCCEEDS, so a failure
+    /// (e.g. the keychain locks mid-write) leaves the change to be re-detected and
+    /// retried next cycle. After a successful re-stash the cached active index is
+    /// dropped so it is re-resolved against the new canonical (a `/login` may have
+    /// switched to a different account).
+    async fn reconcile_canonical_change(
+        &mut self,
+        canonical: &Credential,
+        events: &mut Vec<Event>,
+    ) {
+        match self.state.canonical_watch.classify(canonical) {
+            // First observation this run: prime the baseline, detect nothing.
+            CanonicalChange::Primed => self.state.canonical_watch.commit(canonical),
+            // No out-of-band write since we last looked.
+            CanonicalChange::Unchanged => {}
+            CanonicalChange::Changed => match self.resolve_account_for(canonical).await {
+                Some(idx) => {
+                    if self.restash_account(idx, canonical).await {
+                        events.push(Event::ReStash {
+                            account: self.roster[idx].label.clone(),
+                        });
+                        // Handled: advance the baseline so this write is not
+                        // re-detected, and drop the cached active so it is
+                        // re-resolved against the new canonical below.
+                        self.state.canonical_watch.commit(canonical);
+                        self.state.active = None;
+                    }
+                    // else: the re-stash failed (e.g. a locked keychain) — do NOT
+                    // commit; leave the change to re-fire and catch up next cycle.
+                }
+                None => {
+                    // The new canonical maps to no roster account (an un-captured
+                    // login, or an identity we cannot resolve). Nothing to
+                    // re-stash; commit anyway so we do not spin on it every cycle.
+                    self.state.canonical_watch.commit(canonical);
+                }
+            },
+        }
+    }
+
+    /// Identify which roster account the given `canonical` credential belongs to,
+    /// using two signals in order: (1) the canonical token byte-matches an account's
+    /// stash — exact right after a swap or a re-stash; (2) the displayed
+    /// `~/.claude.json` `accountUuid` maps to a roster account — the signal when the
+    /// token has changed in place and no stash matches it yet (a fresh `/login` or
+    /// an in-place refresh). `None` if neither resolves. Shared by
+    /// [`resolve_active`](Self::resolve_active) and the re-auth re-stash path (#13).
+    async fn resolve_account_for(&self, canonical: &Credential) -> Option<usize> {
+        for (i, account) in self.roster.iter().enumerate() {
+            if let Ok(stashed) = self.stash.read(&account.stash).await {
+                if stashed.credential.matches(canonical) {
+                    return Some(i);
+                }
+            }
+        }
+        if let Ok(oauth) = claude_state::read_oauth_account_from(&self.claude_json) {
+            return self
+                .roster
+                .iter()
+                .position(|a| a.account_uuid == oauth.account_uuid());
+        }
+        None
+    }
+
+    /// Refresh account `idx`'s stash to the new `canonical` token (issue #13 re-auth
+    /// re-stash), PRESERVING its `oauthAccount` identity half. The identity is taken
+    /// from the existing stash if present; otherwise from `~/.claude.json` — but
+    /// only when the displayed identity actually belongs to account `idx` (its
+    /// `accountUuid` matches the roster entry), so a wrong identity is never stapled
+    /// onto the refreshed token. Returns `false` (re-stash not performed) when no
+    /// usable identity is available or the stash write fails — the caller then
+    /// leaves the change to re-fire rather than committing the baseline.
+    async fn restash_account(&self, idx: usize, canonical: &Credential) -> bool {
+        let account = &self.roster[idx];
+        // Prefer the identity already stashed for this account: it is authoritative
+        // and does not depend on the best-effort display file.
+        let oauth_account = if let Ok(existing) = self.stash.read(&account.stash).await {
+            existing.oauth_account
+        } else if let Ok(displayed) = claude_state::read_oauth_account_from(&self.claude_json) {
+            // No existing stash: fall back to the displayed identity, but only if it
+            // is THIS account's — never staple a different account's identity on.
+            if account.account_uuid != displayed.account_uuid() {
+                return false;
+            }
+            displayed
+        } else {
+            return false;
+        };
+        let refreshed = StashedAccount {
+            credential: canonical.clone(),
+            oauth_account,
+        };
+        self.stash.write(&account.stash, &refreshed).await.is_ok()
     }
 
     /// Update the per-account 401 streak and push any poll-outcome event (issue
     /// #9) for account `i`'s poll `result`. A 401 increments the streak and emits
-    /// `monitor_401`; a locked keychain emits `keychain_locked_wait`; a 403 emits
-    /// `usage_scope_fail`. Every NON-401 outcome (a success, or any other error)
-    /// resets the streak. A success — or a transient / rate-limited / rejected
-    /// error — emits no event (only the four named conditions are observable here).
+    /// `monitor_401`; a 403 emits `usage_scope_fail`. Every NON-401 outcome (a
+    /// success, or any other error) resets the streak. A success — or a transient /
+    /// rate-limited / rejected error — emits no event.
+    ///
+    /// A locked keychain is NOT signaled here: the lock is process-global and is
+    /// detected once at top-of-tick ([`locked_tick`](Self::locked_tick),
+    /// edge-triggered, issue #13), so this arm only resets the streak. It is reached
+    /// at all only if the keychain locks AFTER the top-of-tick read but before this
+    /// account's poll, in which case the reading is simply treated as unavailable.
     fn note_poll_outcome(&mut self, i: usize, result: &Result<Usage>, events: &mut Vec<Event>) {
         match result {
             Err(Error::UsageUnauthorized) => {
@@ -732,10 +956,9 @@ where
                 });
             }
             Err(Error::KeychainLocked { .. }) => {
+                // Silent: the lock is signaled once at top-of-tick (see the doc
+                // above). Here we only reset the streak, like any non-401 outcome.
                 self.state.consec_401[i] = 0;
-                events.push(Event::KeychainLockedWait {
-                    account: self.roster[i].label.clone(),
-                });
             }
             Err(Error::UsageScopeMissing) => {
                 self.state.consec_401[i] = 0;
@@ -854,6 +1077,18 @@ where
                     to: self.roster[target_idx].label.clone(),
                     at,
                 });
+                // Prime the canonical watch with the token we just promoted to the
+                // canonical item, so this swap is NOT re-detected as an out-of-band
+                // change next cycle (issue #13). Read it back from the incoming
+                // stash (which still holds it) rather than re-reading the canonical:
+                // if a third writer changed the canonical after our write, committing
+                // the token we INTENDED leaves that change to be detected and
+                // re-stashed next cycle, instead of silently adopting the intruder.
+                if let Ok(incoming_stashed) = self.stash.read(&incoming).await {
+                    self.state
+                        .canonical_watch
+                        .commit(&incoming_stashed.credential);
+                }
                 // Log the swap (issue #9). `swap::decide` returns only a binary
                 // verdict, so the reason is re-derived here from the active reading:
                 // session-first when BOTH dimensions are over their (this-cycle)
@@ -924,6 +1159,17 @@ where
     pub(crate) async fn wait_for_next_poll(&mut self) {
         let interval = self.next_poll_interval();
         self.clock.tick(interval).await;
+    }
+
+    /// Sleep until the next tick is due. `next_wait` is the just-finished tick's
+    /// requested wait: `None` → the normal jittered poll interval (issue #38);
+    /// `Some(d)` → an explicit duration, the locked-keychain back-off (issue #13).
+    /// Behind the [`Clock`] seam, so tests drive both paths deterministically.
+    pub(crate) async fn wait_after_tick(&mut self, next_wait: Option<Duration>) {
+        match next_wait {
+            Some(backoff) => self.clock.tick(backoff).await,
+            None => self.wait_for_next_poll().await,
+        }
     }
 }
 
@@ -1070,13 +1316,16 @@ where
         if let Some(report) = swap_report(&outcome) {
             eprintln!("sessiometer: {report}");
         }
+        // The wait this tick requested — a locked-keychain back-off overrides the
+        // normal interval (issue #13); captured before the snapshot is moved.
+        let next_wait = outcome.next_wait;
         // The snapshot the control socket answers from until the next poll.
         let snapshot = outcome.snapshot;
 
-        // Idle until the next poll is due, serving control requests and watching
+        // Idle until the next tick is due, serving control requests and watching
         // for shutdown. A swap (if any) already completed inside `tick`, so a
         // shutdown observed here aborts cleanly before the next tick — no half-swap.
-        let wait = daemon.wait_for_next_poll();
+        let wait = daemon.wait_after_tick(next_wait);
         tokio::pin!(wait);
         loop {
             tokio::select! {
@@ -2082,6 +2331,300 @@ mod tests {
         assert_eq!(daemon.state.active, Some(0));
     }
 
+    // --- locked keychain & re-auth re-stash (issue #13) --------------------
+
+    #[tokio::test]
+    async fn a_locked_keychain_defers_the_whole_tick_and_signals_once() {
+        // #13: a locked keychain defers the ENTIRE cycle — no resolve, no poll, no
+        // swap — emits ONE edge-triggered keychain_locked_wait, and returns a
+        // back-off as the next wait. The daemon never auto-unlocks or prompts; the
+        // back-off is the whole response. A is set over the session trigger so that,
+        // absent the lock, this cycle WOULD swap — proving the lock truly defers it.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        daemon.store.set_locked(true);
+
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::KeychainLocked);
+        // One lock-wait event on the FIRST locked cycle (edge-triggered)…
+        assert_eq!(first.events, vec![Event::KeychainLockedWait]);
+        // …with the back-off starting at the base.
+        assert_eq!(first.next_wait, Some(LOCK_BACKOFF_BASE));
+        // The cycle deferred before resolving: no active account, no swap.
+        assert_eq!(daemon.state.active, None);
+        // status still answers — the roster is listed, every reading absent.
+        assert_eq!(first.snapshot.accounts.len(), 2);
+        assert!(first.snapshot.accounts.iter().all(|a| a.usage.is_none()));
+
+        // A second locked cycle is SILENT (edge-triggered) and the back-off grows.
+        let second = daemon.tick().await;
+        assert_eq!(second.action, TickAction::KeychainLocked);
+        assert!(
+            second.events.is_empty(),
+            "the lock signal is edge-triggered"
+        );
+        assert_eq!(second.next_wait, Some(LOCK_BACKOFF_BASE * 2));
+
+        // The canonical was never written (no auto-unlock, no swap): once the lock
+        // clears, it still holds A's original token.
+        daemon.store.set_locked(false);
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn the_locked_keychain_back_off_doubles_then_caps() {
+        // #13: the deferred-cycle back-off grows exponentially from the base and
+        // saturates at the cap, so a long lock settles at one retry per cap-interval
+        // rather than spinning or growing without bound.
+        let roster = vec![account("u-A", "Sessiometer/u-A", "work")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        daemon.store.set_locked(true);
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            waits.push(daemon.tick().await.next_wait.unwrap());
+        }
+        // Doubling from the 1 s base, capped at the 60 s ceiling:
+        // 1, 2, 4, 8, 16, 32, then 64→capped 60, then 60.
+        assert_eq!(
+            waits,
+            vec![
+                LOCK_BACKOFF_BASE,
+                LOCK_BACKOFF_BASE * 2,
+                LOCK_BACKOFF_BASE * 4,
+                LOCK_BACKOFF_BASE * 8,
+                LOCK_BACKOFF_BASE * 16,
+                LOCK_BACKOFF_BASE * 32,
+                LOCK_BACKOFF_CAP, // 64 s would exceed the cap → clamped
+                LOCK_BACKOFF_CAP,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unlocking_the_keychain_resumes_normal_ticks_and_rearms_the_signal() {
+        // #13: after a lock episode, the first readable cycle clears the back-off
+        // (next_wait None → normal interval) and re-arms the edge-trigger, so a
+        // LATER lock episode signals afresh and restarts the back-off at the base.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        daemon.store.set_locked(true);
+        let locked = daemon.tick().await;
+        assert_eq!(locked.action, TickAction::KeychainLocked);
+        assert_eq!(locked.events, vec![Event::KeychainLockedWait]);
+
+        // Unlock: the next cycle reads normally, resolves the active account, holds,
+        // and restores the normal interval.
+        daemon.store.set_locked(false);
+        let resumed = daemon.tick().await;
+        assert_eq!(resumed.action, TickAction::Held);
+        assert_eq!(resumed.next_wait, None);
+        assert_eq!(daemon.state.active, Some(0));
+
+        // A second lock episode signals again (the readable cycle re-armed the edge)
+        // and the back-off restarts at the base, not where the first episode left off.
+        daemon.store.set_locked(true);
+        let relocked = daemon.tick().await;
+        assert_eq!(relocked.events, vec![Event::KeychainLockedWait]);
+        assert_eq!(relocked.next_wait, Some(LOCK_BACKOFF_BASE));
+    }
+
+    #[tokio::test]
+    async fn a_reauth_rewrites_the_canonical_and_the_daemon_restashes_the_account() {
+        // #13 core: tick 1 primes the watch on A's token. The operator then re-auths
+        // A via `claude /login`, rewriting the canonical to a FRESH token (display
+        // stays A — same account, refreshed credential). Tick 2 detects the
+        // out-of-band change and re-stashes A with the new token, so A's stash tracks
+        // the live credential; tick 3 sees no further change and does not re-fire.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // A stays below the trigger throughout: the point is the re-stash, not a swap.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // Tick 1 primes the watch on the current canonical — no re-stash.
+        let first = daemon.tick().await;
+        assert_eq!(first.action, TickAction::Held);
+        assert!(
+            !first
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ReStash { .. })),
+            "the first observation primes, it does not re-stash"
+        );
+        assert_eq!(daemon.state.active, Some(0));
+
+        // The operator re-auths A: `claude /login` rewrites the canonical token.
+        daemon
+            .store
+            .write(&cred(b"A-reauthed-token"))
+            .await
+            .unwrap();
+
+        // Tick 2 detects the change and re-stashes A with the new token.
+        let second = daemon.tick().await;
+        assert_eq!(
+            second.events,
+            vec![Event::ReStash {
+                account: "work".to_owned(),
+            }]
+        );
+        let a = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(a.credential.expose(), b"A-reauthed-token");
+        // The identity half is preserved, and A is still the resolved active account.
+        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+        assert_eq!(daemon.state.active, Some(0));
+
+        // Tick 3: no further change → the committed baseline means no repeat re-stash.
+        let third = daemon.tick().await;
+        assert!(
+            !third
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ReStash { .. })),
+            "a committed change must not re-fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reauth_to_a_different_account_restashes_it_and_reresolves_active() {
+        // #13: the operator `claude /login`s into account B while A was active, so
+        // the canonical becomes B's fresh token AND the display switches to B. The
+        // daemon re-stashes B with the new token (resolved via the display, since no
+        // stash matches the fresh token yet) and re-resolves the active account to B.
+        let roster = vec![
+            account("u-A", "Sessiometer/u-A", "work"),
+            account("u-B", "Sessiometer/u-B", "spare"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-old-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+
+        // Tick 1 primes on A and resolves A as active.
+        daemon.tick().await;
+        assert_eq!(daemon.state.active, Some(0));
+
+        // `/login` to B: the canonical becomes B's fresh token and the display
+        // switches to B (what Claude Code writes to `~/.claude.json`).
+        daemon.store.write(&cred(b"B-reauthed")).await.unwrap();
+        crate::claude_state::write_oauth_account(&json, &oauth("u-B")).unwrap();
+
+        // Tick 2 detects the change, re-stashes B (resolved via the display), and
+        // re-resolves the active account to B.
+        let second = daemon.tick().await;
+        assert_eq!(
+            second.events,
+            vec![Event::ReStash {
+                account: "spare".to_owned(),
+            }]
+        );
+        let b = daemon.stash.read("Sessiometer/u-B").await.unwrap();
+        assert_eq!(b.credential.expose(), b"B-reauthed");
+        assert_eq!(b.oauth_account.account_uuid(), "u-B");
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
     #[tokio::test]
     async fn tick_reports_no_viable_target_when_every_other_account_is_over_the_floor() {
         let roster = vec![
@@ -2844,6 +3387,7 @@ mod tests {
             action,
             events: Vec::new(),
             snapshot: snapshot.clone(),
+            next_wait: None,
         };
         assert_eq!(
             swap_report(&outcome(TickAction::Swapped { from: 0, to: 1 })).as_deref(),
@@ -3110,17 +3654,13 @@ mod tests {
             }]
         );
 
-        // A locked keychain on account 1 emits `keychain_locked_wait`; being a
-        // non-401 outcome it holds account 1 at 0 and leaves account 0's streak.
+        // A locked keychain is detected at top-of-tick now, not per-account (issue
+        // #13), so this arm emits NOTHING — it only resets the streak, like any
+        // other non-401 outcome. Account 0's streak (1) is left untouched.
         events.clear();
         daemon.note_poll_outcome(1, &Err(Error::KeychainLocked { op: "read" }), &mut events);
         assert_eq!(daemon.state.consec_401, vec![1, 0]);
-        assert_eq!(
-            events,
-            vec![Event::KeychainLockedWait {
-                account: "spare".to_owned(),
-            }]
-        );
+        assert!(events.is_empty());
 
         // A 403 (missing usage scope) on account 0 emits `usage_scope_fail` and
         // resets its streak — every non-401 outcome clears the streak.
@@ -3143,11 +3683,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_loop_logs_one_line_per_poll_rejection_each_tick() {
-        // Issue #9 acceptance: each token-rejection (401), keychain-lock, and 403
-        // (missing usage scope) emits EXACTLY one structured line per occurrence. A
-        // roster where every account fails a different way, run for two ticks, must
-        // write two lines per account — and the 401 streak must climb 1 → 2 in the
-        // log, proving `note_poll_outcome` is wired into the loop and serialized.
+        // Issue #9 acceptance (as amended by #13): each PER-ACCOUNT poll rejection
+        // — a 401 and a 403 (missing usage scope) — emits EXACTLY one structured
+        // line per occurrence. A per-account keychain-lock is now SILENT here: the
+        // lock is process-global and signaled once at top-of-tick (#13), not per
+        // poll. A roster where one account 401s, one hits a (now-silent) lock, and
+        // one 403s, run for two ticks, writes two lines per EMITTING account — and
+        // the 401 streak must climb 1 → 2, proving `note_poll_outcome` is wired into
+        // the loop and serialized.
         let roster = vec![
             account("u-A", "Sessiometer/u-A", "work"),
             account("u-B", "Sessiometer/u-B", "spare"),
@@ -3188,10 +3731,11 @@ mod tests {
 
         assert_eq!(daemon.state.ticks, 2);
 
-        // Two ticks × three failing accounts = six event lines, each stamped, none
-        // carrying secret material (handles only — never a token or email).
+        // Two ticks × two EMITTING accounts (401 + 403) = four event lines, each
+        // stamped, none carrying secret material (handles only — never a token or
+        // email). The locked account contributes nothing per-account (#13).
         let logged = std::fs::read_to_string(&log_path).unwrap();
-        assert_eq!(logged.lines().count(), 6, "six lines: {logged:?}");
+        assert_eq!(logged.lines().count(), 4, "four lines: {logged:?}");
         assert!(
             logged.lines().all(|l| l.starts_with("ts=")),
             "stamped: {logged:?}"
@@ -3207,15 +3751,13 @@ mod tests {
             logged.contains("event=monitor_401 account=work consecutive=2"),
             "{logged:?}"
         );
-        // The lock and 403 lines render once per tick; the 403 carries `status=403`.
-        assert_eq!(
-            logged
-                .lines()
-                .filter(|l| l.contains("event=keychain_locked_wait account=spare"))
-                .count(),
-            2,
-            "{logged:?}"
+        // The per-account keychain-lock is silent now (#13): NO lock line appears,
+        // even though account `spare`'s poll returned a locked error every tick.
+        assert!(
+            !logged.contains("event=keychain_locked_wait"),
+            "a per-account lock must not emit a line: {logged:?}"
         );
+        // The 403 line renders once per tick and carries `status=403`.
         assert_eq!(
             logged
                 .lines()
@@ -3486,17 +4028,32 @@ mod tests {
             harvest_channels(&outcome, &mut corpus);
         }
 
-        // Scenario 3 — fault injection: a 401, a locked keychain, and a 403 each
-        // emit their poll-outcome event in one tick.
+        // Scenario 3a — poll-rejection fault injection: a 401 (active) and a 403
+        // each emit their poll-outcome event in one tick. Account B's poll hits a
+        // per-account lock, which is now silent (#13) and contributes no event.
         {
             let poller = FakeRosterPoller::new()
                 .unauthorized(A.0) // monitor_401
-                .keychain_locked(B.0) // keychain_locked_wait
+                .keychain_locked(B.0) // silent per-account (#13)
                 .scope_missing(C.0); // usage_scope_fail (403)
             let tun = tunables(95, 80, 0);
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
             let outcome = daemon.tick().await;
             assert_eq!(outcome.action, TickAction::SkippedActiveUnavailable);
+            harvest_channels(&outcome, &mut corpus);
+        }
+
+        // Scenario 3b — a globally LOCKED keychain (#13): the top-of-tick canonical
+        // read fails, the whole cycle defers, and the accountless
+        // keychain_locked_wait event plus the all-absent status snapshot are
+        // harvested — proving the locked-path channels leak nothing either.
+        {
+            let poller = FakeRosterPoller::new();
+            let tun = tunables(95, 80, 0);
+            let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
+            daemon.store.set_locked(true);
+            let outcome = daemon.tick().await;
+            assert_eq!(outcome.action, TickAction::KeychainLocked);
             harvest_channels(&outcome, &mut corpus);
         }
 
@@ -3538,7 +4095,7 @@ mod tests {
             "log channel: 401 event missing"
         );
         assert!(
-            corpus.contains("event=keychain_locked_wait account=spare"),
+            corpus.contains("event=keychain_locked_wait"),
             "log channel: keychain-lock event missing"
         );
         assert!(

@@ -102,8 +102,11 @@ pub(crate) struct Tunables {
     /// higher; the daemon swaps when EITHER dimension reaches its own trigger.
     pub(crate) weekly_trigger: u8,
     /// Consecutive 401s before an account is treated as rejected (`1..=20`).
-    /// Consumed by the usage poller's 401 monitor (#5); the re-stash it triggers
-    /// lands in #13 / #6.
+    /// Consumed by the usage poller's 401 monitor (#5) to emit the
+    /// observability-only `monitor_401` event. A persistent 401 means a DEAD
+    /// credential, whose recovery (quarantine + emergency swap) is issue #42 — NOT
+    /// a re-stash: #13's re-auth re-stash is driven by canonical-change detection
+    /// ([`crate::keychain::CanonicalWatch`]), not by 401s.
     pub(crate) monitor_401_n: u8,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each

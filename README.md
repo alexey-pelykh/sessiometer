@@ -54,6 +54,54 @@ it persists across daemon restarts; `list` and `status` mark a parked account as
 `disabled`. The change takes effect at the next daemon start (a running daemon
 loads the roster once).
 
+## Removing an account
+
+Delete an account from the rotation **and erase its stashed credential** — the
+destructive counterpart to `disable`. Where parking keeps the entry and its
+stash, removal drops the roster entry and deletes the account's keychain stash,
+so it is gone for good:
+
+```sh
+# Drop `work` from the rotation and erase its stash:
+sessiometer remove work
+```
+
+Accounts resolve by their `list` label. The roster entry is removed from
+`config.toml` **first**, then the stash is deleted — so an interrupted removal
+leaves at most an unreferenced (harmless) keychain item, never a roster entry
+pointing at a missing stash. The change takes effect at the next daemon start.
+
+Removing the **active** account is allowed: it touches only `sessiometer`'s
+roster entry and stash, never the live `Claude Code-credentials` item, so the
+running Claude Code session keeps working. The daemon then simply resolves no
+active account (polling only, never swapping) until you `capture` another account
+or sign in again.
+
+## Edge cases & resilience
+
+`sessiometer` is built to ride out the keychain and credential edge cases a
+long-running rotation hits:
+
+- **Locked keychain.** While the login keychain is locked, the daemon cannot read
+  the canonical credential, so it **defers** polling and swapping and **backs
+  off** — the wait between retries grows to at most ~60 s — logging the wait once.
+  It never tries to unlock the keychain or prompt for a password; unlock it
+  yourself and the daemon resumes on its next retry.
+- **Re-authentication is picked up automatically.** If you `claude /login` an
+  account again (refreshing its token, or switching the active account), the
+  daemon detects the changed canonical credential and **re-stashes** the affected
+  account, so the rotation always tracks the live token rather than a stale one.
+- **Crash mid-swap self-heals.** A swap writes the credential before updating the
+  display, and the daemon reconciles the two on its next start — so a process
+  death partway through a swap leaves the keychain authoritative and is repaired
+  automatically when you run it again.
+- **Concurrent swap + re-login race (known limitation).** If you run
+  `claude /login` at the exact moment the daemon is mid-swap, the two writers race
+  on the canonical credential. Last-writer-wins, and the daemon reconciles on its
+  next start (the keychain is authoritative); in the worst case one swap is
+  effectively undone by the concurrent login and re-running heals the state. This
+  is an accepted `0.1.0` limitation.
+
 ## Roster size and poll cost
 
 There is **no fixed limit** on how many accounts the roster holds — capture as
