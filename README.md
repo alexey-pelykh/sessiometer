@@ -42,6 +42,31 @@ sessiometer run
 sessiometer status
 ```
 
+## Switching the active account
+
+Switch the active account **on demand**, without waiting for the daemon to swap
+on a usage trigger — the same out-of-band swap, run once by you:
+
+```sh
+# Switch to `spare` now (resolves by list label OR account-uuid):
+sessiometer use spare
+
+# Force the switch, overriding the pre-swap checks below:
+sessiometer use spare --force
+```
+
+By default `use` runs a **pre-swap gate** and refuses — with a specific reason
+and **without writing anything** — when the target is not a sound destination:
+its weekly window is exhausted, it is quarantined and needs a re-login, or a swap
+cooldown is still active. Switching to the account that is **already active** is a
+no-op success. Each refusal exits with its own status code, so a script can tell
+them apart.
+
+`--force` overrides those **policy** checks (and warns when you force onto an
+exhausted or quarantined account), but it never bypasses **safety**: if the login
+keychain is locked the switch still aborts at once, writing nothing. `use` works
+whether or not the daemon is running.
+
 ## Parking an account
 
 Take an account out of the rotation without losing its captured credential — a

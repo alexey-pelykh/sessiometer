@@ -35,18 +35,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::error::Result;
 use crate::paths;
 
-/// Which usage dimension tripped its swap-away trigger this cycle — the `reason=`
-/// of an [`Event::Swap`].
+/// Why a swap happened — the `reason=` of an [`Event::Swap`].
 ///
-/// Re-derived at swap time from the readings (the binary [`crate::swap::decide`]
-/// does not carry which dimension fired); when BOTH dimensions are at/over their
-/// triggers, the daemon reports [`SwapReason::Session`] — session-first precedence.
+/// The two AUTONOMOUS reasons are re-derived at swap time from the readings (the
+/// binary [`crate::swap::decide`] does not carry which dimension fired); when BOTH
+/// dimensions are at/over their triggers, the daemon reports [`SwapReason::Session`]
+/// — session-first precedence. The two MANUAL reasons (issue #63) are operator-driven,
+/// NOT usage-triggered: [`SwapReason::Manual`] is a `sessiometer use <account>` whose
+/// pre-swap gate passed, and [`SwapReason::Forced`] is one whose policy gate was
+/// bypassed with `--force`. A manual swap records `session_pct=0` (it was not driven
+/// by session usage — this `reason=` is what distinguishes it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwapReason {
     /// The session-window trigger fired (or both did — session takes precedence).
     Session,
     /// The weekly-window trigger fired while session was below its own.
     Weekly,
+    /// An operator `sessiometer use <account>` whose pre-swap gate PASSED (#63).
+    Manual,
+    /// An operator `sessiometer use <account> --force` whose policy gate was
+    /// BYPASSED (#63). Safety behavior is never bypassed — only policy.
+    Forced,
 }
 
 impl SwapReason {
@@ -55,6 +64,8 @@ impl SwapReason {
         match self {
             SwapReason::Session => "session",
             SwapReason::Weekly => "weekly",
+            SwapReason::Manual => "manual",
+            SwapReason::Forced => "forced",
         }
     }
 }
@@ -244,6 +255,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year + i64::from(month <= 2), month as u32, day as u32)
 }
 
+/// The path of the structured event log: `sessiometer.log` under the native log
+/// directory (`~/Library/Logs/sessiometer/`, #1).
+///
+/// Factored out as the single source of truth for the filename so its two
+/// consumers cannot drift: [`EventLog::open`] (which writes it) and the one-shot
+/// `use` verb's cooldown gate (#63), which reads the durable swap record from the
+/// same file via [`last_swap_at`].
+pub(crate) fn log_path() -> Result<std::path::PathBuf> {
+    Ok(paths::logs_dir()?.join("sessiometer.log"))
+}
+
 /// The structured event log at `~/Library/Logs/sessiometer/sessiometer.log`
 /// (`0600`).
 pub(crate) struct EventLog {
@@ -254,9 +276,14 @@ impl EventLog {
     /// Open the event log, creating the log directory (`0700`) and file (`0600`)
     /// if needed.
     pub(crate) fn open() -> Result<Self> {
-        let dir = paths::logs_dir()?;
-        paths::ensure_private_dir(&dir)?;
-        let file = paths::create_private_file(&dir.join("sessiometer.log"))?;
+        let path = log_path()?;
+        // `log_path()` is always `<logs_dir>/sessiometer.log`, so the parent is the
+        // native log directory — ensure it (`0700`) before creating the file.
+        paths::ensure_private_dir(
+            path.parent()
+                .expect("log_path() always has a logs-dir parent"),
+        )?;
+        let file = paths::create_private_file(&path)?;
         Ok(Self { file })
     }
 
@@ -278,6 +305,34 @@ impl EventLog {
             file: paths::create_private_file(path)?,
         })
     }
+}
+
+/// The wall-clock instant of the MOST RECENT swap recorded in the event log at
+/// `path`, or `None` when the log is absent/unreadable or records no swap.
+///
+/// The durable, daemon-INDEPENDENT swap record the one-shot `use` verb (#63)
+/// consults for its cooldown gate (#10): the daemon's in-memory `last_swap` is not
+/// persisted (it is surfaced only over the live control socket), so the structured
+/// log — which records every swap through [`Event::to_log_line`] — is the only
+/// source a standalone command can read. Both a normal `event=swap` (now including
+/// the `use` verb's own `reason=manual|forced`) and an `event=emergency_swap` update
+/// the daemon's cooldown floor, so both count here. Best-effort: an unreadable file
+/// or an unparseable timestamp yields `None`, so a one-shot manual swap is never
+/// blocked by a missing or corrupt log (the cooldown then reads as inactive).
+pub(crate) fn last_swap_at(path: &std::path::Path) -> Option<SystemTime> {
+    let text = std::fs::read_to_string(path).ok()?;
+    // Scan from the END: the log is append-only chronological, so the last swap
+    // line is the most recent swap. The surrounding spaces anchor the event key so
+    // a label that merely contains the text cannot be mistaken for it.
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| line.contains(" event=swap ") || line.contains(" event=emergency_swap "))?;
+    let raw_ts = line.strip_prefix("ts=")?.split(' ').next()?;
+    let epoch = crate::usage::epoch_from_rfc3339(raw_ts)?;
+    // The log only ever writes post-epoch instants; guard the cast so a malformed
+    // pre-epoch stamp degrades to `None` rather than wrapping into a wrong instant.
+    (epoch >= 0).then(|| UNIX_EPOCH + Duration::from_secs(epoch as u64))
 }
 
 #[cfg(test)]
@@ -547,5 +602,75 @@ mod tests {
         let _log = EventLog::at(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // --- the `use` verb's new swap reasons + cooldown source (issue #63) -----
+
+    #[test]
+    fn swap_line_renders_the_manual_and_forced_reasons() {
+        // The operator-driven `use` verb emits the STANDARD swap event with the new
+        // reason tokens; a manual swap records session_pct=0 (not session-triggered
+        // — the reason is what distinguishes it).
+        for (reason, token) in [
+            (SwapReason::Manual, "manual"),
+            (SwapReason::Forced, "forced"),
+        ] {
+            let line = Event::Swap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+                reason,
+                session_pct: 0,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!("{TS0} event=swap from=work to=spare reason={token} session_pct=0")
+            );
+        }
+    }
+
+    #[test]
+    fn last_swap_at_is_none_for_an_absent_or_swapless_log() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file → None (best-effort: a one-shot swap is never blocked by a
+        // missing log; the cooldown then reads as inactive).
+        assert_eq!(last_swap_at(&dir.path().join("absent.log")), None);
+        // A present log with NO swap line → None.
+        let path = dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&path).unwrap();
+        log.emit(&Event::Monitor401 {
+            account: "work".to_owned(),
+            consecutive: 1,
+        })
+        .unwrap();
+        log.emit(&Event::KeychainLockedWait).unwrap();
+        assert_eq!(last_swap_at(&path), None);
+    }
+
+    #[test]
+    fn last_swap_at_returns_the_most_recent_swap_instant() {
+        // The log is append-only chronological; `last_swap_at` returns the LAST
+        // swap's `ts`, parsed back through the same RFC 3339 the writer rendered.
+        // A manual `reason=manual` swap (#63) and an `emergency_swap` both count;
+        // a later NON-swap line (monitor_401) is ignored. Hand-written so the
+        // instants are deterministic (`emit` stamps with the live clock).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        let content = "\
+ts=1970-01-01T00:00:10Z event=swap from=a to=b reason=session session_pct=97\n\
+ts=1970-01-01T00:00:30Z event=swap from=b to=c reason=manual session_pct=0\n\
+ts=1970-01-01T00:00:40Z event=monitor_401 account=c consecutive=1\n";
+        std::fs::write(&path, content).unwrap();
+        // The most recent SWAP line is the manual swap at epoch 30 — not the later
+        // monitor_401 line, and not the earlier session swap at epoch 10.
+        assert_eq!(last_swap_at(&path), Some(at_epoch(30)));
+
+        // An `emergency_swap` is also a swap for cooldown purposes.
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:01:00Z event=emergency_swap from=a to=b\n",
+        )
+        .unwrap();
+        assert_eq!(last_swap_at(&path), Some(at_epoch(60)));
     }
 }

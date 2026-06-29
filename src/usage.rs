@@ -423,7 +423,12 @@ fn epoch_from_resets_at(raw: &str) -> Option<i64> {
 /// (treated as UTC); a fractional-seconds part is dropped. `None` on any deviation
 /// from the expected `YYYY-MM-DDTHH:MM:SS` shape, so a surprising format degrades
 /// to "reset time unknown" rather than a wrong instant.
-fn epoch_from_rfc3339(s: &str) -> Option<i64> {
+///
+/// `pub(crate)` so [`crate::observability::last_swap_at`] can parse the event log's
+/// `ts=` field back to an instant through this SAME canonical parser (the log
+/// renders it via `observability::rfc3339`), rather than hand-rolling a second
+/// copy of the leap-year arithmetic for the cooldown gate (#63).
+pub(crate) fn epoch_from_rfc3339(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once('T').or_else(|| s.split_once(' '))?;
 
     let mut date_parts = date.split('-');

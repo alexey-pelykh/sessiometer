@@ -43,6 +43,27 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                 "run" => run().await,
                 "status" => status().await,
                 "list" => list().await,
+                // `use <account> [--force]` switches the active account on demand
+                // (issue #63), reusing the swap engine (#6). The target is the first
+                // non-flag positional (resolved by label OR account-uuid, #17); the
+                // `--force` flag may appear on either side of it and bypasses the
+                // policy gate. There is deliberately no "cycle to the next account"
+                // fallback for a missing target (out of scope, #63) — it surfaces as
+                // `UseTargetRequired`. Extra positionals are ignored, matching the
+                // other subcommands.
+                "use" => {
+                    let mut target = None;
+                    let mut force = false;
+                    for arg in args.by_ref() {
+                        let arg = arg.to_string_lossy();
+                        if arg == "--force" {
+                            force = true;
+                        } else if target.is_none() {
+                            target = Some(arg.into_owned());
+                        }
+                    }
+                    crate::use_account::use_account(target, force).await
+                }
                 // `disable`/`enable <label>` flip an account's rotation flag and
                 // persist (issue #36). Mirror `capture`'s optional-positional parse;
                 // a missing label surfaces as `RotationLabelRequired`.
@@ -83,6 +104,7 @@ fn print_usage() {
          run        Run the foreground daemon (poll + swap)\n    \
          status     Show the roster and the last swap\n    \
          list       List captured accounts\n    \
+         use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
          enable <label>       Return a parked account to the rotation\n    \
          remove <label>       Delete an account: drop it from the rotation and erase its stash\n    \

@@ -227,6 +227,66 @@ pub(crate) enum Error {
     #[error("daemon not running — start it with `sessiometer run`")]
     DaemonNotRunning,
 
+    // --- Manual account selection (`sessiometer use`, issue #63) -------------
+    //
+    // The one-shot `use <account>` verb's own exit conditions, EXTENDING the
+    // existing taxonomy (no parallel scheme): a missing/unresolvable/ambiguous
+    // target, a pre-swap gate refusal, and the always-enforced keychain-locked
+    // abort (which now carries its own exit code — see [`Error::exit_code`]). All
+    // are secret-free: each names only the operator's non-secret query/label
+    // (issue #15), never a token or email.
+    /// `sessiometer use` was invoked without the required `<account>`. There is
+    /// deliberately no "cycle to the next account" fallback (out of scope, #63);
+    /// a missing target is an error that names the usage.
+    #[error("a target is required: `sessiometer use <account>`")]
+    UseTargetRequired,
+
+    /// `use <query>` matched no roster account by label OR account-uuid. The
+    /// resolver never guesses (issue #17): an unresolvable target is a hard error
+    /// with ZERO writes. `query` is the operator's non-secret input.
+    #[error("no account matches `{query}` — run `sessiometer list` to see the roster")]
+    UseTargetNotFound { query: String },
+
+    /// `use <query>` matched MORE THAN ONE roster account (a duplicated label).
+    /// The resolver refuses to guess (issue #17): disambiguate with the
+    /// account-uuid. ZERO writes. `query` is the operator's non-secret input.
+    #[error("`{query}` is ambiguous: {count} accounts match — disambiguate with the account-uuid")]
+    UseTargetAmbiguous { query: String, count: usize },
+
+    /// `use` could not identify the active account to swap AWAY from: no account
+    /// is logged in to Claude Code, or the logged-in `oauthAccount.accountUuid`
+    /// matches no roster entry. The swap re-stashes the outgoing account, so its
+    /// roster identity must be known — mirrors the daemon's "can't identify active
+    /// ⇒ don't swap". ZERO writes. Secret-free.
+    #[error(
+        "cannot determine the active account to swap away from \
+         (no logged-in account matches the roster — run `sessiometer list`)"
+    )]
+    ActiveAccountUnresolved,
+
+    /// The pre-swap gate REFUSED `use <label>` (without `--force`) because the
+    /// target's WEEKLY window is exhausted (issue #11/#37 viability). ZERO writes;
+    /// `--force` overrides. `label` is the target's non-secret handle.
+    #[error(
+        "refusing to swap to `{label}`: its weekly window is exhausted — use `--force` to override"
+    )]
+    UseTargetWeeklyExhausted { label: String },
+
+    /// The pre-swap gate REFUSED `use` (without `--force`) because a swap COOLDOWN
+    /// is currently active (issue #10 anti-oscillation). ZERO writes; `--force`
+    /// overrides. Secret-free.
+    #[error("refusing to swap: a swap cooldown is active — use `--force` to override")]
+    UseCooldownActive,
+
+    /// The pre-swap gate REFUSED `use <label>` (without `--force`) because the
+    /// target is QUARANTINED — its stored credential is dead and needs a re-login
+    /// (issue #42 viability). ZERO writes; `--force` overrides (warn-and-proceed).
+    /// `label` is the target's non-secret handle.
+    #[error(
+        "refusing to swap to `{label}`: it is quarantined and needs re-login — use `--force` to override"
+    )]
+    UseTargetQuarantined { label: String },
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -236,12 +296,25 @@ impl Error {
     /// The process exit code for this error.
     ///
     /// A held single-instance lock exits `3` ([`Error::AlreadyRunning`], issue
-    /// #7) so a second `run` is distinguishable from a generic failure (`1`);
-    /// every other error is a generic failure. The mapping lives here so the
-    /// `main` exit-code branch (and any future supervisor) stays a thin lookup.
+    /// #7) so a second `run` is distinguishable from a generic failure (`1`). The
+    /// one-shot `use` verb (issue #63) EXTENDS this same taxonomy — no parallel
+    /// scheme — so a caller (or supervisor) can tell its distinct outcomes apart:
+    /// a locked keychain (`4`, the always-enforced abort), an unresolvable (`5`)
+    /// or ambiguous (`6`) target, and a pre-swap gate refusal without `--force`
+    /// (`7`). Every other error is a generic failure (`1`). The mapping lives here
+    /// so the `main` exit-code branch stays a thin lookup.
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Error::AlreadyRunning => 3,
+            Error::KeychainLocked { .. } => 4,
+            Error::UseTargetNotFound { .. } => 5,
+            Error::UseTargetAmbiguous { .. } => 6,
+            // The pre-swap gate refused without `--force` — weekly-exhausted,
+            // cooldown, or quarantined all share one "gate-refused" code, each
+            // with its own specific message.
+            Error::UseTargetWeeklyExhausted { .. }
+            | Error::UseCooldownActive
+            | Error::UseTargetQuarantined { .. } => 7,
             _ => 1,
         }
     }
@@ -263,5 +336,83 @@ mod tests {
         assert_eq!(Error::CredentialNotFound.exit_code(), 1);
         assert_eq!(Error::Unimplemented("x").exit_code(), 1);
         assert_eq!(Error::Io(std::io::Error::other("boom")).exit_code(), 1);
+    }
+
+    #[test]
+    fn use_verb_extends_the_exit_code_taxonomy_with_distinct_codes() {
+        // Issue #63: the `use` verb's new conditions each get their own code,
+        // extending the existing taxonomy (no parallel scheme) so a caller can
+        // tell them apart from a generic failure (`1`) and from each other.
+        assert_eq!(Error::KeychainLocked { op: "read" }.exit_code(), 4);
+        assert_eq!(
+            Error::UseTargetNotFound {
+                query: "ghost".into()
+            }
+            .exit_code(),
+            5
+        );
+        assert_eq!(
+            Error::UseTargetAmbiguous {
+                query: "dup".into(),
+                count: 2
+            }
+            .exit_code(),
+            6
+        );
+        // The three gate-refusal reasons share one "gate-refused-without-force" code.
+        assert_eq!(
+            Error::UseTargetWeeklyExhausted {
+                label: "spare".into()
+            }
+            .exit_code(),
+            7
+        );
+        assert_eq!(Error::UseCooldownActive.exit_code(), 7);
+        assert_eq!(
+            Error::UseTargetQuarantined {
+                label: "spare".into()
+            }
+            .exit_code(),
+            7
+        );
+        // A missing argument and an unresolvable active account are precondition
+        // errors, not part of the named new taxonomy → generic `1`.
+        assert_eq!(Error::UseTargetRequired.exit_code(), 1);
+        assert_eq!(Error::ActiveAccountUnresolved.exit_code(), 1);
+    }
+
+    #[test]
+    fn use_verb_error_messages_carry_no_secret_sigil() {
+        // Issue #15: every `use` error names only the operator's non-secret
+        // query/label, never a token or email.
+        let messages = [
+            Error::UseTargetRequired.to_string(),
+            Error::UseTargetNotFound {
+                query: "ghost".into(),
+            }
+            .to_string(),
+            Error::UseTargetAmbiguous {
+                query: "dup".into(),
+                count: 2,
+            }
+            .to_string(),
+            Error::ActiveAccountUnresolved.to_string(),
+            Error::UseTargetWeeklyExhausted {
+                label: "spare".into(),
+            }
+            .to_string(),
+            Error::UseCooldownActive.to_string(),
+            Error::UseTargetQuarantined {
+                label: "spare".into(),
+            }
+            .to_string(),
+        ];
+        for message in messages {
+            assert!(!message.contains('@'), "no email: {message}");
+            assert!(
+                !message.to_lowercase().contains("token"),
+                "no token: {message}"
+            );
+        }
     }
 }
