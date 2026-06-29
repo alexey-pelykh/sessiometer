@@ -96,6 +96,40 @@ sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
 The output is sourced solely from non-secret fields (labels, percentages, reset
 instants, a swap age), so it never prints a token or email (issue #15).
 
+## Watching the daemon (diagnostics)
+
+`run` writes to two operator-facing channels, neither of which ever carries a
+token or email (issue #15):
+
+- **The event log** — durable, edge-triggered STATE CHANGES (a swap, a re-stash, a
+  dead credential, entering the all-exhausted state, …), one `key=val` line each,
+  appended to `~/Library/Logs/sessiometer/sessiometer.log` (surfaced in Console.app).
+  Always on.
+- **The diagnostic channel** — per-cycle DETAIL for debugging a live `run`, on
+  **stderr**, **off by default**.
+
+Pass `-v` (or `--verbose`) to opt into the diagnostic channel:
+
+```sh
+sessiometer run -v
+```
+
+It then prints, every cycle, the outcome of each account's poll — including the
+`rate_limited` / `transient` outcomes the event log records no event for — the
+per-tick decision and any back-off, plus the daemon's start (with the effective
+config), its stop, and the moment it **leaves** the all-exhausted state:
+
+```text
+ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 session_floor=off session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
+ts=2026-06-30T00:00:00Z diag=poll account=work outcome=rate_limited
+ts=2026-06-30T00:00:00Z diag=tick decision=skip_active_unavailable backoff_secs=120
+ts=2026-06-30T00:00:30Z diag=poll account=work outcome=live
+ts=2026-06-30T00:00:30Z diag=tick decision=hold
+```
+
+Both channels carry handles, enums, percentages, and timestamps only — and a CI
+redaction meter scans every rendered line of each (issues #9, #15, #77).
+
 ## Switching the active account
 
 Switch the active account **on demand**, without waiting for the daemon to swap
