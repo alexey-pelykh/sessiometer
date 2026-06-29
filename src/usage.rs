@@ -333,8 +333,9 @@ fn parse_curl_output(stdout: &[u8]) -> HttpResponse {
 ///
 /// Tolerant of the two documented response shapes for each window:
 ///   - a top-level object — `five_hour` (session) / `seven_day` (weekly) — with a
-///     `utilization` fraction, or
-///   - a `limits[]` entry whose `kind` matches the window, with a `percent`.
+///     `utilization` percentage (`0..=100`), or
+///   - a `limits[]` entry whose `kind` matches the window, with a `percent`
+///     (also `0..=100`).
 ///
 /// A window that cannot be found is a hard [`Error::UsageParse`] (never a
 /// fabricated `0`): the loop must skip, not swap, on missing data.
@@ -358,7 +359,11 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
 
 /// Find one window's `(fraction, resets_at)`, trying the top-level
 /// `{top_key: {...}}` object first, then a `limits[]` entry whose `kind` is one
-/// of `kinds` (skipping any entry explicitly `is_active: false`).
+/// of `kinds`. Among matching `limits[]` entries an active one (`is_active` true
+/// or absent) is preferred, but an explicitly inactive entry is used as a
+/// fallback rather than dropped: `is_active: false` means "not the currently
+/// binding limit" — the live API marks `weekly_all` so — NOT "absent" (issue
+/// #66). Dropping it entirely would lose a window whenever it is the only match.
 fn dimension(root: &Value, top_key: &str, kinds: &[&str]) -> Option<(f64, Option<String>)> {
     if let Some(obj) = root.get(top_key) {
         if let Some(fraction) = fraction_of(obj) {
@@ -366,32 +371,43 @@ fn dimension(root: &Value, top_key: &str, kinds: &[&str]) -> Option<(f64, Option
         }
     }
     let limits = root.get("limits").and_then(Value::as_array)?;
+    // An active matching entry wins; an inactive one is kept only as a fallback
+    // (is_active:false = "not the binding limit", not "absent" — issue #66).
+    let mut fallback: Option<(f64, Option<String>)> = None;
     for entry in limits {
+        let kind = entry.get("kind").and_then(Value::as_str);
+        if !kind.is_some_and(|kind| kinds.contains(&kind)) {
+            continue;
+        }
+        let Some(fraction) = fraction_of(entry) else {
+            continue;
+        };
         let active = entry
             .get("is_active")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let kind = entry.get("kind").and_then(Value::as_str);
-        if active && kind.is_some_and(|kind| kinds.contains(&kind)) {
-            if let Some(fraction) = fraction_of(entry) {
-                return Some((fraction, resets_at_of(entry)));
-            }
+        if active {
+            return Some((fraction, resets_at_of(entry)));
+        }
+        if fallback.is_none() {
+            fallback = Some((fraction, resets_at_of(entry)));
         }
     }
-    None
+    fallback
 }
 
 /// Read a usage fraction in `[0.0, 1.0]` from an object: a `utilization`
-/// fraction as-is, else a `percent` (`0..=100`) divided by 100. Clamped, so a
-/// stray `> 100` (or `> 1.0`) reading can never exceed a full window.
+/// percentage or a `percent`, each divided by 100. Both fields are on the same
+/// `0..=100` scale — `utilization` is the top-level window's spelling, `percent`
+/// the `limits[]` entry's (issue #66) — and `utilization` is tried first, with
+/// `percent` the fallback when it is absent. Clamped, so a stray `> 100` reading
+/// can never exceed a full window.
 fn fraction_of(obj: &Value) -> Option<f64> {
-    if let Some(utilization) = obj.get("utilization").and_then(Value::as_f64) {
-        return Some(utilization.clamp(0.0, 1.0));
-    }
-    if let Some(percent) = obj.get("percent").and_then(Value::as_f64) {
-        return Some((percent / 100.0).clamp(0.0, 1.0));
-    }
-    None
+    let percent = obj
+        .get("utilization")
+        .and_then(Value::as_f64)
+        .or_else(|| obj.get("percent").and_then(Value::as_f64))?;
+    Some((percent / 100.0).clamp(0.0, 1.0))
 }
 
 /// Read `resets_at` as the API rendered it — a string verbatim, or a number
@@ -548,13 +564,42 @@ mod tests {
 
     #[test]
     fn parses_the_top_level_window_shape_with_utilization() {
+        // `utilization` is a 0..=100 percentage (issue #66): 10.0 → 0.10 fraction.
         let body = r#"{
-            "five_hour": {"utilization": 0.10, "resets_at": "2026-06-26T18:00:00Z"},
-            "seven_day": {"utilization": 0.55, "resets_at": "2026-06-30T00:00:00Z"}
+            "five_hour": {"utilization": 10.0, "resets_at": "2026-06-26T18:00:00Z"},
+            "seven_day": {"utilization": 55.0, "resets_at": "2026-06-30T00:00:00Z"}
         }"#;
         let report = parse_usage(body).unwrap();
         assert!((report.session - 0.10).abs() < 1e-9);
         assert!((report.weekly - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_the_live_response_shape_utilization_on_a_0_to_100_scale() {
+        // Regression fixture (issue #66): the verbatim shape captured from a live
+        // `GET /api/oauth/usage` (HTTP 200). `utilization` is on a 0..=100 scale
+        // — matching the sibling `limits[].percent` — NOT a 0..=1 fraction, so
+        // `82.0` is 82 % (fraction 0.82), not a saturated full window. Before the
+        // fix, `fraction_of` clamped `82.0 → 1.0`, reporting every account `100 %`.
+        let body = r#"{
+            "five_hour": { "utilization": 82.0, "resets_at": "2026-06-29T13:40:00.475727+00:00" },
+            "seven_day": { "utilization": 15.0, "resets_at": "2026-07-06T00:00:00.475752+00:00" },
+            "limits": [
+                { "kind": "session",   "percent": 82, "is_active": true  },
+                { "kind": "weekly_all", "percent": 15, "is_active": false }
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!(
+            (report.session - 0.82).abs() < 1e-9,
+            "session fraction was {}",
+            report.session
+        );
+        assert!(
+            (report.weekly - 0.15).abs() < 1e-9,
+            "weekly fraction was {}",
+            report.weekly
+        );
     }
 
     #[test]
@@ -572,8 +617,9 @@ mod tests {
     }
 
     #[test]
-    fn skips_inactive_limit_entries() {
-        // The inactive session entry must be ignored in favor of the active one.
+    fn prefers_an_active_limit_entry_over_an_inactive_duplicate() {
+        // When the same kind appears twice, the active entry wins over the
+        // inactive one (issue #66: inactive is a fallback, not a hard skip).
         let body = r#"{
             "limits": [
                 {"kind": "session", "percent": 99, "is_active": false},
@@ -586,12 +632,31 @@ mod tests {
     }
 
     #[test]
-    fn percent_is_normalized_and_clamped() {
-        // percent 150 clamps to a full window; utilization passes through clamped.
+    fn falls_back_to_an_inactive_limit_when_no_active_one_exists() {
+        // `is_active: false` means "not the currently-binding limit", NOT "absent"
+        // (issue #66). When the ONLY matching entry is inactive, read it rather
+        // than fabricating a missing-dimension error — the live API marks
+        // `weekly_all` inactive, and here no top-level `seven_day` masks it.
+        let body = r#"{
+            "limits": [
+                {"kind": "session", "percent": 40, "is_active": true},
+                {"kind": "weekly_all", "percent": 15, "is_active": false}
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.session - 0.40).abs() < 1e-9);
+        assert!((report.weekly - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_over_full_reading_clamps_to_a_full_window() {
+        // Both spellings are a 0..=100 percentage (issue #66); an over-100 stray
+        // reading clamps to a single full window, never beyond — whether it
+        // arrives as `percent` or `utilization`.
         let body = r#"{
             "limits": [
                 {"kind": "session", "percent": 150},
-                {"kind": "weekly_all", "utilization": 1.5}
+                {"kind": "weekly_all", "utilization": 150}
             ]
         }"#;
         let report = parse_usage(body).unwrap();
@@ -602,8 +667,8 @@ mod tests {
     #[test]
     fn resets_at_tolerates_a_numeric_timestamp() {
         let body = r#"{
-            "five_hour": {"utilization": 0.1, "resets_at": 1750960800},
-            "seven_day": {"utilization": 0.2}
+            "five_hour": {"utilization": 10.0, "resets_at": 1750960800},
+            "seven_day": {"utilization": 20.0}
         }"#;
         let report = parse_usage(body).unwrap();
         assert_eq!(report.session_resets_at.as_deref(), Some("1750960800"));
