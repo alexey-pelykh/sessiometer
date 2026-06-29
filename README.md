@@ -45,29 +45,30 @@ sessiometer status
 ## Checking status
 
 `sessiometer status` queries the running daemon and prints each account as one
-row of an aligned, border-less table — greppable, one record per line:
+row of an aligned, header-less, border-less table — greppable, one record per line:
 
 ```text
-ACCOUNT  SESSION  WEEKLY  RESETS  STATUS
-* work   97%      40%     4h
-  spare  10%      20%     1h12m
-  dead   n/a      n/a     n/a     needs re-login
+* work   97% 12m  40% 5d
+  spare  10% 2h   20% 3d
+  dead   n/a n/a  n/a n/a  needs re-login
 
 next swap: spare
 ```
 
 - `*` marks the **active** account.
-- `SESSION` / `WEEKLY` are the last-polled usage percentages (`n/a` when the last
-  poll for that account failed — never a fabricated `0`).
-- **`RESETS`** is the compact time until the account next regains capacity —
-  shown for **every** account, not only an exhausted one. Normally this is the
-  rolling 5-hour **session** window's reset (e.g. `12m`, `4h`); when an account's
-  **weekly** window is exhausted it is blocked for longer, so `RESETS` shows the
-  **weekly** reset instead (e.g. `3d4h`). `n/a` when the governing reset is
-  unknown.
-- `STATUS` carries inline tags — `disabled` (parked, issue #36) and
-  `needs re-login` (a dead credential, issue #42); the column is omitted when no
-  account carries a tag.
+- Each account carries **two `% reset` pairs**: a **session** pair (the rolling
+  5-hour window — *when work resumes*) then a **weekly** pair (the account-level
+  window — *when the account fully frees up*). There is **no header row**: each
+  `%` sits immediately before its own reset, so the pairing reads by adjacency —
+  `session% session-reset`, then `weekly% weekly-reset`.
+- The percentages are the last-polled usage (`n/a` when the last poll for that
+  account failed — never a fabricated `0`).
+- Each reset is the compact time until that window refills (e.g. `12m`, `2h`,
+  `3d4h`), shown for **every** account, not only an exhausted one — `n/a` when that
+  reset instant is unknown.
+- A trailing **health-text** column carries inline tags — `disabled` (parked,
+  issue #36) and `needs re-login` (a dead credential, issue #42); it is omitted when
+  no account carries a tag.
 
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`
@@ -79,21 +80,22 @@ unlike a remembered "last swap" — it survives a daemon restart and always show
 the next rotation will land.
 
 On a terminal too narrow for the full table the lowest-priority columns drop in
-order — `WEEKLY` first, then `STATUS` — never wrapping a row; `ACCOUNT`,
-`SESSION`, and `RESETS` are always kept. Output that is piped or redirected (not
-a TTY) always keeps the full table, so `sessiometer status | grep work` stays
-complete.
+order — the **weekly pair** (`weekly%` + `weekly-reset`) first and together, then
+the health-text column — never wrapping a row; the label and the **session pair**
+(the soonest, most actionable reset) are always kept. Output that is piped or
+redirected (not a TTY) always keeps the full table, so `sessiometer status | grep
+work` stays complete.
 
-On an interactive terminal each account row is **color-coded by urgency** —
-**green** (healthy, plenty of quota), **yellow** (getting depleted, or heavily
-used but about to reset), **red** (heavily used and not about to reset). The
-color reflects both how *much* is used and how *soon* the account resets; it
-**augments** the row — every percentage and `RESETS` value is fully readable
-without it — and is never the only signal. Color is emitted **only** on an
-interactive TTY: it is suppressed when output is piped or redirected, when
-`--no-color` is passed, or when `NO_COLOR`, `CLICOLOR=0`, or `TERM=dumb` is set
-in the environment — so an escape sequence never reaches a pipe, a redirect, or a
-log.
+On an interactive terminal each **cell** is **color-coded by its own health** —
+**green** / **yellow** / **red**. Each `%` is coloured by its own utilization
+(green = plenty of quota, red = heavily used); each reset is coloured by its own
+**proximity** — a far reset reads green, an imminent one red — so a far weekly
+reset can sit green beside an imminent session reset in red on the same row. The
+colour **augments** the row — every percentage and reset is fully readable without
+it — and is never the only signal. Color is emitted **only** on an interactive
+TTY: it is suppressed when output is piped or redirected, when `--no-color` is
+passed, or when `NO_COLOR`, `CLICOLOR=0`, or `TERM=dumb` is set in the environment
+— so an escape sequence never reaches a pipe, a redirect, or a log.
 
 For the full data regardless of terminal width — both reset instants as raw
 epoch seconds, for scripting — use `--json`:
