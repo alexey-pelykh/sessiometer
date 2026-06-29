@@ -96,10 +96,32 @@ pub(crate) enum Event {
         resets_at: Option<i64>,
     },
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
-    /// row. Observability only — a persistent 401 means a dead credential, whose
-    /// quarantine + emergency swap is issue #42 (NOT a re-stash; re-stash is driven
-    /// by canonical-change detection, [`Event::ReStash`]).
+    /// row — the climbing streak toward the dead-credential threshold (issue #42).
+    /// Emitted per 401 while the account is still healthy; once it crosses
+    /// `monitor_401_n` and is quarantined, the streak stops being logged (the
+    /// [`Event::CredentialDead`] transition is signaled instead, and a quarantined
+    /// account is no longer polled). Distinct from a re-stash, which is driven by
+    /// canonical-change detection ([`Event::ReStash`]).
     Monitor401 { account: String, consecutive: u32 },
+    /// `account`'s stored credential is DEAD: its token was rejected `monitor_401_n`
+    /// times in a row, so the daemon quarantines it — it stops polling and selecting
+    /// it for the rotation until the operator re-logs-in (issue #42). Edge-triggered:
+    /// emitted exactly ONCE on the death transition, never per failed poll. The
+    /// durable "needs re-login" status is surfaced separately by `status`. `account`
+    /// is the HANDLE (operator label) — never a token or email.
+    CredentialDead { account: String },
+    /// The ACTIVE account's credential died, blocking the live session, so the daemon
+    /// emergency-swapped from `from` to `to` — the soonest-reset viable account —
+    /// bypassing the normal swap-away trigger and post-swap cooldown (issue #42).
+    /// Edge-triggered: exactly ONE per emergency swap. `from`/`to` are HANDLES
+    /// (operator labels), never tokens or emails.
+    EmergencySwap { from: String, to: String },
+    /// A quarantined (dead) `account` recovered: the operator re-logged-in (its
+    /// canonical credential changed and was re-stashed, #13) and it then polled
+    /// successfully `monitor_recovery_m` times in a row, so the daemon un-quarantined
+    /// it and returned it to the rotation (issue #42). Edge-triggered: exactly ONCE
+    /// on the recovery transition. `account` is the HANDLE — never a token or email.
+    CredentialRestored { account: String },
     /// The keychain was locked when the daemon went to read the canonical
     /// credential, so this tick's work is deferred and the daemon backs off (issue
     /// #13). Edge-triggered: emitted ONCE when the lock is first observed, not every
@@ -148,6 +170,15 @@ impl Event {
                 consecutive,
             } => {
                 format!("ts={ts} event=monitor_401 account={account} consecutive={consecutive}")
+            }
+            Event::CredentialDead { account } => {
+                format!("ts={ts} event=credential_dead account={account}")
+            }
+            Event::EmergencySwap { from, to } => {
+                format!("ts={ts} event=emergency_swap from={from} to={to}")
+            }
+            Event::CredentialRestored { account } => {
+                format!("ts={ts} event=credential_restored account={account}")
             }
             Event::KeychainLockedWait => {
                 format!("ts={ts} event=keychain_locked_wait")
@@ -368,6 +399,40 @@ mod tests {
     }
 
     #[test]
+    fn credential_dead_carries_only_the_account_handle() {
+        let line = Event::CredentialDead {
+            account: "work".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=credential_dead account=work"));
+    }
+
+    #[test]
+    fn emergency_swap_carries_the_from_and_to_handles() {
+        let line = Event::EmergencySwap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=emergency_swap from=work to=spare")
+        );
+    }
+
+    #[test]
+    fn credential_restored_carries_only_the_account_handle() {
+        let line = Event::CredentialRestored {
+            account: "work".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=credential_restored account=work")
+        );
+    }
+
+    #[test]
     fn restash_carries_the_account_handle() {
         let line = Event::ReStash {
             account: "work".to_owned(),
@@ -417,6 +482,16 @@ mod tests {
             Event::Monitor401 {
                 account: "work".to_owned(),
                 consecutive: 2,
+            },
+            Event::CredentialDead {
+                account: "work".to_owned(),
+            },
+            Event::EmergencySwap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            },
+            Event::CredentialRestored {
+                account: "work".to_owned(),
             },
             Event::KeychainLockedWait,
             Event::UsageScopeFail {
