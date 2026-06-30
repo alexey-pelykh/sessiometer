@@ -627,6 +627,74 @@ pub(crate) async fn refresh_account<S: AccountStash>(
     .await
 }
 
+/// Reap orphaned isolated-refresh artifacts left behind by a crashed cycle (issue
+/// #103).
+///
+/// The engine's RAII guard ([`IsolatedSession`]) deletes the isolated keychain item +
+/// dir both on the happy path ([`teardown`](IsolatedSession::teardown)) and on early
+/// exit (`Drop` — a hard error, a panic, a timer-kill). What RAII CANNOT cover is a
+/// `SIGKILL` / abort / power-loss: the process dies with no chance to run `Drop`,
+/// stranding an isolated keychain item that still holds a live credential (and its
+/// dir). At daemon `run` start the single-instance lock is held and no refresh cycle is
+/// in flight, so any isolated artifact belonging to a roster account is — by
+/// construction — such an orphan, safe to delete.
+///
+/// For each `account_uuid` the reap reconstructs the EXACT `(item, dir)` pair
+/// [`refresh_account`] creates — an `IsolatedKeychainItem` over
+/// [`paths::isolated_refresh_dir`] — reusing the #100/#102 derivation verbatim rather
+/// than re-deriving a (possibly divergent) normalization, so it addresses precisely the
+/// engine's own items. Because the only keychain service it ever names is that
+/// roster-derived one, it can never touch another `CLAUDE_CONFIG_DIR` profile the user
+/// runs (the issue's safety AC).
+///
+/// Best-effort, like teardown: a per-account failure (a momentarily-locked keychain, an
+/// FS error) is logged and the sweep moves on — a reap failure must never block the
+/// daemon from starting, and the orphan is retried on the next start.
+pub(crate) async fn reap_orphans(account_uuids: &[String]) {
+    for account_uuid in account_uuids {
+        if let Err(err) = reap_orphan(account_uuid).await {
+            eprintln!(
+                "sessiometer: isolated-refresh orphan reap skipped for {account_uuid}: {err}"
+            );
+        }
+    }
+}
+
+/// Reap one account's isolated-refresh orphan: delete its isolated keychain item and
+/// remove its dir, reconstructing both exactly as [`refresh_account`] does so the
+/// targets are byte-identical to the artifacts the engine creates.
+async fn reap_orphan(account_uuid: &str) -> Result<()> {
+    let iso_dir = paths::isolated_refresh_dir(account_uuid)?;
+    let item = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
+    reap_isolated(&item, &iso_dir).await
+}
+
+/// Delete an isolated keychain `item` and remove its `dir` (issue #103). Generic over
+/// the [`IsolatedKeychain`] seam so the hermetic tests drive a fake and the macOS
+/// real-CLI test drives a throwaway-keychain item, while production passes the real
+/// item + dir from [`reap_orphan`].
+///
+/// Both deletes are idempotent — an already-absent item ([`delete`](IsolatedKeychain::delete)
+/// maps `errSecItemNotFound` to `Ok`) and an already-absent dir are each success, so a
+/// non-orphaned account is a clean no-op. Both are ATTEMPTED regardless of the other's
+/// outcome — they are independent orphans, so a momentarily-locked keychain must not
+/// strand the dir — and the first error (if any) is surfaced for the caller's log.
+async fn reap_isolated<K: IsolatedKeychain>(item: &K, dir: &Path) -> Result<()> {
+    let item_result = item.delete().await;
+    let dir_result = remove_dir_if_present(dir);
+    item_result.and(dir_result)
+}
+
+/// Remove `dir` and its contents, treating an already-absent dir as success — the FS
+/// half of an idempotent isolated-orphan reap.
+fn remove_dir_if_present(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1193,6 +1261,174 @@ mod tests {
             "Drop must delete the isolated keychain item"
         );
         assert!(!iso_dir.exists(), "Drop must remove the isolated dir");
+    }
+
+    // --- orphan reap (#103): SIGKILL / power-loss leaves no live isolated item ----
+    //
+    // Teardown (above) covers graceful exit; the reap covers the gap teardown CANNOT —
+    // a crashed cycle whose `Drop` never ran. `reap_isolated` is the generic core,
+    // driven by the fake seam here and the real `/usr/bin/security` CLI in `real_cli`.
+
+    #[tokio::test]
+    async fn reap_isolated_deletes_a_stranded_item_and_its_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_dir = tmp.path().join("refresh/u-1");
+        paths::create_isolated_dir(&iso_dir).unwrap();
+        // An orphan: a secret-bearing isolated item + its dir, both present at start.
+        let keychain = FakeIsolatedKeychain::empty();
+        keychain.seed(b"secret-bearing-orphan").await.unwrap();
+
+        reap_isolated(&keychain, &iso_dir).await.unwrap();
+
+        assert!(
+            keychain.item.borrow().is_none(),
+            "the reap must delete the stranded isolated item"
+        );
+        assert!(
+            !iso_dir.exists(),
+            "the reap must remove the stranded isolated dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_isolated_is_an_idempotent_no_op_when_nothing_is_stranded() {
+        // The common case: a clean prior shutdown left no orphan. An absent item
+        // (the fake starts empty) and an absent dir (never created) are both success.
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_dir = tmp.path().join("refresh/u-1");
+        let keychain = FakeIsolatedKeychain::empty();
+
+        reap_isolated(&keychain, &iso_dir).await.unwrap();
+
+        assert!(keychain.item.borrow().is_none());
+        assert!(!iso_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn reap_isolated_removes_the_dir_even_when_the_item_delete_fails() {
+        // Independent orphans: a momentarily-locked keychain (delete → Err) must not
+        // strand the dir. The reap attempts both and surfaces the delete error.
+        struct LockedDelete;
+        impl IsolatedKeychain for LockedDelete {
+            async fn seed(&self, _blob: &[u8]) -> Result<()> {
+                Err(Error::KeychainLocked { op: "seed" })
+            }
+            async fn read_back(&self) -> Result<Credential> {
+                Err(Error::CredentialNotFound)
+            }
+            async fn delete(&self) -> Result<()> {
+                Err(Error::KeychainLocked {
+                    op: "isolated delete",
+                })
+            }
+            fn delete_blocking(&self) {}
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_dir = tmp.path().join("refresh/u-1");
+        paths::create_isolated_dir(&iso_dir).unwrap();
+
+        let result = reap_isolated(&LockedDelete, &iso_dir).await;
+
+        assert!(
+            matches!(result, Err(Error::KeychainLocked { .. })),
+            "a failed item delete must be surfaced"
+        );
+        assert!(
+            !iso_dir.exists(),
+            "the dir must be removed even when the item delete fails"
+        );
+    }
+
+    #[test]
+    fn the_reap_targets_only_roster_derived_isolated_services() {
+        // Safety AC: the reap addresses ONLY the service derived from a roster account's
+        // OWN isolated dir, so it can never touch another `CLAUDE_CONFIG_DIR` profile.
+        // Each service is `service_for_config_dir(isolated_refresh_dir(uuid))` — the
+        // SAME derivation `refresh_account` seeds under (no re-normalization).
+        use crate::keychain::service_for_config_dir;
+
+        let svc = |uuid: &str| {
+            let dir = paths::isolated_refresh_dir(uuid).unwrap();
+            service_for_config_dir(dir.as_os_str()).unwrap()
+        };
+
+        let a = svc("11111111-1111-1111-1111-111111111111");
+        let b = svc("22222222-2222-2222-2222-222222222222");
+        // Distinct accounts → distinct isolated items (no cross-account clobber).
+        assert_ne!(a, b);
+        // Every derived service is the suffixed isolated name, never the bare canonical.
+        assert!(a.starts_with("Claude Code-credentials-"));
+        assert_ne!(a, "Claude Code-credentials");
+        // A foreign config dir the user might run CC under hashes to a DIFFERENT suffix,
+        // so its item is never in the reap's roster-derived target set.
+        let foreign =
+            service_for_config_dir(std::ffi::OsStr::new("/Users/someone/.claude")).unwrap();
+        assert_ne!(a, foreign);
+        assert_ne!(b, foreign);
+    }
+
+    /// The reap end-to-end against the real `/usr/bin/security` CLI on a throwaway
+    /// keychain (issue #103): seed an orphan exactly as the engine would, then prove
+    /// `reap_isolated` deletes the real item and removes the dir. macOS-only — the CLI
+    /// is the system under test (mirrors `keychain`'s isolated-item round-trip).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn reap_isolated_reaps_a_real_seeded_orphan() {
+        use crate::keychain::IsolatedKeychainItem;
+        use std::ffi::OsString;
+        use std::process::Command as StdCommand;
+
+        const SECURITY: &str = "/usr/bin/security";
+        let tmp = tempfile::tempdir().unwrap();
+        let kc = tmp.path().join("test.keychain-db");
+        assert!(StdCommand::new(SECURITY)
+            .args(["create-keychain", "-p", ""])
+            .arg(&kc)
+            .status()
+            .expect("spawn create-keychain")
+            .success());
+        assert!(StdCommand::new(SECURITY)
+            .args(["unlock-keychain", "-p", ""])
+            .arg(&kc)
+            .status()
+            .expect("spawn unlock-keychain")
+            .success());
+
+        // The orphan dir + the isolated item the engine would create for it. The dir
+        // path doubles as the config dir → the #100-suffixed service, exactly as
+        // `IsolatedKeychainItem::new` derives in production.
+        let iso_dir = tmp.path().join("refresh/u-1");
+        paths::create_isolated_dir(&iso_dir).unwrap();
+        let item = IsolatedKeychainItem::for_keychain(
+            iso_dir.as_os_str(),
+            OsString::from("reap-acct"),
+            kc.clone(),
+        )
+        .unwrap();
+        item.seed(br#"{"claudeAiOauth":{"refreshToken":"sk-ant-ort-ORPHAN"}}"#)
+            .await
+            .expect("seed the orphan item");
+        // Sanity: the orphan really is present before the reap.
+        item.read_back().await.expect("orphan present pre-reap");
+
+        reap_isolated(&item, &iso_dir)
+            .await
+            .expect("reap the orphan");
+
+        assert!(
+            matches!(item.read_back().await, Err(Error::CredentialNotFound)),
+            "the reap must delete the real isolated item"
+        );
+        assert!(
+            !iso_dir.exists(),
+            "the reap must remove the real isolated dir"
+        );
+
+        let _ = StdCommand::new(SECURITY)
+            .arg("delete-keychain")
+            .arg(&kc)
+            .status();
     }
 
     // --- redaction METER (#15): a cycle over a real secret leaks nothing ----------
