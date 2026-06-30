@@ -113,6 +113,39 @@ sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
 The output is sourced solely from non-secret fields (labels, percentages, reset
 instants, a next-swap candidate label), so it never prints a token or email (issue #15).
 
+## Listing accounts (offline)
+
+`sessiometer list` prints the captured roster — one `label` + full `account_uuid`
+per line — **without a running daemon**. Unlike `status` (which queries the live
+`run` loop), `list` reads only `config.toml`, the credential **store**, and the
+event log, so it answers *even when the daemon is down* — frequently exactly when a
+wedged daemon is itself a credential problem and you most need to look (issue #120).
+
+```text
+work    11111111-1111-1111-1111-111111111111  · expires in 2h · last refresh: refreshed
+spare   22222222-2222-2222-2222-222222222222  · expired · last refresh: dead — claude /login
+backup  33333333-3333-3333-3333-333333333333 · disabled · expires in 3d
+
+3 accounts
+```
+
+Each row trails the **static auth subset** the daemon would otherwise surface live:
+
+- **`expires in <time>`** — the stored access token's freshness, derived from its
+  `expiresAt` against the wall clock (the same compact `2h` / `3d` units `status`
+  uses); **`expired`** once that instant has passed.
+- **`last refresh: <outcome>`** — the **last-persisted** outcome of the automatic
+  refresh tick (issue #105/#106) for that account, in the same token the event log
+  records (`refreshed`, `no_change`, `dead`, …); a **`dead`** credential trails the
+  actionable **`claude /login`** cue, matching `status`.
+
+Each tag is **omitted when its datum is unavailable** — an unreadable stash (locked
+keychain) drops the expiry, and an account the refresh tick has never touched drops
+the refresh tag — so a config-only roster reads as the plain `label` + `uuid` view.
+The reads are **daemon-independent and read-only**: no daemon, no `/usage` call, no
+live refresh, and — like `status` — only non-secret fields (a timestamp-derived
+duration and a bare outcome token), never a token or email (issue #15).
+
 ## Watching the daemon (diagnostics)
 
 `run` writes to two operator-facing channels, neither of which ever carries a

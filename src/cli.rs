@@ -19,7 +19,9 @@ use crate::daemon::{
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
-use crate::observability::{CredentialHealth, Diagnostic, DiagnosticLog, EventLog, Verbosity};
+use crate::observability::{
+    CredentialHealth, Diagnostic, DiagnosticLog, EventLog, RefreshEventOutcome, Verbosity,
+};
 use crate::paths;
 use crate::refresh;
 use crate::refresh_tick::{RealRefreshEngine, RefreshTick};
@@ -1187,36 +1189,98 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// List captured accounts — the offline, read-only roster view (issue #17).
+/// List captured accounts — the offline, read-only roster view (issue #17), enriched
+/// with the static per-account auth subset (issue #120).
 ///
-/// Reads `config.toml` and nothing else: no daemon, no keychain, no network (the
-/// static counterpart to `status`, which needs a live `run`). An absent config is
-/// the empty state, surfaced as the friendly [`Error::RosterEmpty`]; a malformed
-/// config still surfaces as its real parse/validation error. The output is
-/// sourced solely from the roster's non-secret fields, so it can never print a
+/// Reads `config.toml` for the roster, then — daemon-independently — the credential
+/// STORE (each account's stash) for the access-token expiry and the event log for the
+/// last-persisted refresh outcome: NO daemon, NO `/usage`, no network (the static
+/// counterpart to `status`, which needs a live `run`). An absent config is the empty
+/// state, surfaced as the friendly [`Error::RosterEmpty`]; a malformed config still
+/// surfaces as its real parse/validation error. The store/log reads are best-effort —
+/// an unreadable stash or log simply omits that account's tag, never failing the view.
+/// The output is sourced solely from the roster's non-secret fields plus a
+/// timestamp-derived duration and a bare refresh-outcome token, so it can never print a
 /// token or email (issue #15 redaction).
 async fn list() -> Result<()> {
-    print!("{}", view(Config::load())?);
+    let roster = resolve_roster(Config::load())?;
+    // The static auth subset (issue #120): a credential-STORE + event-log read, both
+    // daemon-independent (no `run`, no `/usage`). Gathered AFTER the roster resolves so
+    // the empty / malformed-config exits below never touch the keychain.
+    let auth = gather_auth_subset(&roster).await;
+    print!("{}", render_roster(&roster, &auth, now_epoch()));
     Ok(())
 }
 
-/// Resolve a load outcome into the text `list` prints, or the error it exits on.
+/// Resolve a load outcome into the roster `list` renders, or the error it exits on.
 ///
-/// Split from [`list`] so the load-outcome → output mapping is unit-testable
-/// without touching the filesystem: a present roster renders; an absent config
-/// ([`Error::ConfigNotFound`]) becomes the friendly [`Error::RosterEmpty`]; every
-/// other load error (malformed / invalid config) surfaces unchanged.
-fn view(loaded: Result<Config>) -> Result<String> {
+/// Split from [`list`] so the load-outcome → roster mapping is unit-testable without
+/// touching the filesystem: a present roster passes through; an absent config
+/// ([`Error::ConfigNotFound`]) becomes the friendly [`Error::RosterEmpty`]; every other
+/// load error (malformed / invalid config) surfaces unchanged. The per-account auth
+/// subset (issue #120) is layered on in [`list`] / [`render_roster`], not here — this
+/// stays pure config policy.
+fn resolve_roster(loaded: Result<Config>) -> Result<Vec<Account>> {
     match loaded {
         // Both empty states read the same: an absent config, OR a well-formed
         // tunables-only file whose roster is empty (now that `capture` can load
         // such a file, #58). Either way `list` shows the friendly "nothing captured
         // yet" rather than a bare "0 accounts".
         Ok(config) if config.roster.is_empty() => Err(Error::RosterEmpty),
-        Ok(config) => Ok(render_roster(&config.roster)),
+        Ok(config) => Ok(config.roster),
         Err(Error::ConfigNotFound { .. }) => Err(Error::RosterEmpty),
         Err(other) => Err(other),
     }
+}
+
+/// One account's offline, daemon-INDEPENDENT auth subset for the `list` view (issue
+/// #120): the stored access-token expiry and the last-persisted refresh outcome.
+///
+/// The static counterpart of the live `status` health rollup (#119): `status` needs the
+/// daemon to compute its cross-tick verdict, but a wedged daemon is frequently itself a
+/// credential problem — exactly when the offline view must still answer "is this token
+/// fresh, and did its last refresh work?". Both fields are NON-SECRET by construction —
+/// `expires_at_ms` is the integer `refresh::stored_expires_at` extracts (never the
+/// token), `last_refresh` a bare enum read back from the redaction-metered event log —
+/// and each is `None` when unavailable (stash unreadable / no refresh ever recorded),
+/// which [`render_roster`] renders by omitting the corresponding tag.
+pub(crate) struct AuthSubset {
+    /// `claudeAiOauth.expiresAt` (epoch milliseconds, CC's native unit) of the stored
+    /// access token, or `None` when the stash is unreadable (locked keychain, absent
+    /// item) or carries no parseable expiry.
+    pub(crate) expires_at_ms: Option<i64>,
+    /// The account's most recent persisted [`RefreshEventOutcome`], or `None` when the
+    /// event log records no refresh for it (the common case while the opt-in `[refresh]`
+    /// tick, #105, is off).
+    pub(crate) last_refresh: Option<RefreshEventOutcome>,
+}
+
+/// Read the offline auth subset for each roster account (issue #120), returned PARALLEL
+/// to `roster` (same length, same order) for [`render_roster`].
+///
+/// Daemon-independent and read-only, the only I/O the issue authorizes: a credential-
+/// STORE read per account ([`refresh::stored_expires_at`] — a `security` read of the
+/// account's own stash, the SAME access the refresh sweep / `poke` already make, so no
+/// new keychain-prompt surface) plus ONE pass over the event log for the last refresh
+/// outcome per handle ([`crate::observability::last_refresh_outcomes`]). No daemon, no
+/// `/usage`, no live refresh. Best-effort: an unreadable stash or log degrades that
+/// field to `None`, so `list` stays a non-failing read-only view.
+async fn gather_auth_subset(roster: &[Account]) -> Vec<AuthSubset> {
+    // One log read for the whole roster (last outcome per handle) — not one read per
+    // account. An unresolvable log path degrades straight to an empty map (→ no refresh
+    // tags), rather than reading a sentinel empty path.
+    let last_refresh = crate::observability::log_path()
+        .map(|path| crate::observability::last_refresh_outcomes(&path))
+        .unwrap_or_default();
+    let stash = RealAccountStash::new();
+    let mut subsets = Vec::with_capacity(roster.len());
+    for account in roster {
+        subsets.push(AuthSubset {
+            expires_at_ms: refresh::stored_expires_at(&stash, &account.stash()).await,
+            last_refresh: last_refresh.get(&account.label).copied(),
+        });
+    }
+    subsets
 }
 
 /// Render the roster as two space-aligned columns — each account's `label`, then
@@ -1229,14 +1293,26 @@ fn view(loaded: Result<Config>) -> Result<String> {
 /// fixed size (#35), so the total carries no "of N" denominator — just the count
 /// (pluralized for grammar).
 ///
+/// Each row then trails the inline auth tags (issue #120), parallel to `auth` (same
+/// length, same order as `roster`) and measured against `now_secs`: ` · expires in 2h`
+/// (or ` · expired`) from the stored access-token expiry, and ` · last refresh: <token>`
+/// from the last-persisted refresh outcome. A tag is OMITTED when its datum is
+/// unavailable (unreadable stash / never refreshed), so a config-only roster with the
+/// refresh tick off reads exactly as the pre-#120 view. These join the existing
+/// ` · disabled` rotation tag (#36) as more ` · `-delimited tags on the same row.
+///
 /// Sourced solely from each [`Account`]'s two non-secret display fields — `label`
-/// and `account_uuid` — never a token or email (issue #15 redaction). A label is
+/// and `account_uuid` — plus the auth tags, which are a timestamp-derived duration and
+/// a bare enum token: never a token or email (issue #15 redaction). A label is
 /// operator-provided free text: one that happens to contain an `@` is the
 /// operator's own value, not a leak.
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
-/// can route this exact `list`-view surface through its scan.
-pub(crate) fn render_roster(roster: &[Account]) -> String {
+/// can route this exact `list`-view surface — auth tags included — through its scan.
+pub(crate) fn render_roster(roster: &[Account], auth: &[AuthSubset], now_secs: i64) -> String {
+    // `auth` is built parallel to `roster` by `gather_auth_subset`; the zip below pairs
+    // them positionally, so a length mismatch would silently drop trailing rows.
+    debug_assert_eq!(roster.len(), auth.len(), "auth subset must parallel roster");
     // Pad the label column to the widest label (by char count, matching the
     // `{:<width$}` fill) so the uuid column aligns. The offline `list` never
     // renders an empty roster (that maps to the friendly `RosterEmpty`), but
@@ -1247,19 +1323,70 @@ pub(crate) fn render_roster(roster: &[Account]) -> String {
         .max()
         .unwrap_or(0);
     let mut out = String::new();
-    for account in roster {
+    for (account, auth) in roster.iter().zip(auth) {
         // A parked account is marked inline (issue #36); an enabled one adds
         // nothing.
         let state = if account.enabled { "" } else { " · disabled" };
+        let tags = auth_tags(auth, now_secs);
         out.push_str(&format!(
-            "{:<width$}  {}{}\n",
-            account.label, account.account_uuid, state,
+            "{:<width$}  {}{}{}\n",
+            account.label, account.account_uuid, state, tags,
         ));
     }
     let n = roster.len();
     let noun = if n == 1 { "account" } else { "accounts" };
     out.push_str(&format!("\n{n} {noun}\n"));
     out
+}
+
+/// The trailing ` · `-delimited auth tags for one `list` row (issue #120): the
+/// `expiresAt`-derived freshness, then the last-persisted refresh outcome — each part
+/// included only when its datum is available, so an account with neither adds nothing
+/// (the pre-#120 row). Pure over the [`AuthSubset`] + `now_secs`, so the rendering is
+/// unit-testable without a keychain or log.
+fn auth_tags(auth: &AuthSubset, now_secs: i64) -> String {
+    let mut tags = String::new();
+    if let Some(expiry) = expiry_tag(auth.expires_at_ms, now_secs) {
+        tags.push_str(" · ");
+        tags.push_str(&expiry);
+    }
+    if let Some(refresh) = refresh_tag(auth.last_refresh) {
+        tags.push_str(" · ");
+        tags.push_str(&refresh);
+    }
+    tags
+}
+
+/// The `expiresAt`-derived freshness for one account (issue #120): `expires in <compact>`
+/// for a future expiry — the same two-largest-unit clock `status` renders (#94, via
+/// [`humanize_until`]) — `expired` for one already at/past `now_secs`, or `None` when the
+/// stored expiry is unreadable (so [`auth_tags`] omits it). The stored `expiresAt` is
+/// epoch MILLISECONDS (CC's native unit); reduce it to whole seconds at the boundary
+/// before differencing against `now_secs`, matching the event log's `ms / 1000` render.
+fn expiry_tag(expires_at_ms: Option<i64>, now_secs: i64) -> Option<String> {
+    let secs = expires_at_ms? / 1000;
+    if secs <= now_secs {
+        Some("expired".to_owned())
+    } else {
+        Some(format!("expires in {}", humanize_until(secs - now_secs)))
+    }
+}
+
+/// The last-persisted refresh-outcome tag for one account (issue #120), or `None` when
+/// no refresh was ever recorded (so [`auth_tags`] omits it). Rendered in the SAME token
+/// the event log writes ([`RefreshEventOutcome::as_str`]) so it cross-references a
+/// `sessiometer.log` the operator may grep. A `dead` outcome trails the actionable
+/// `claude /login` cue — the offline echo of `status`'s dead-credential cue (#119) —
+/// since a daemon-down `list` is exactly where an operator meets a dead refresh token.
+fn refresh_tag(last_refresh: Option<RefreshEventOutcome>) -> Option<String> {
+    let outcome = last_refresh?;
+    let mut tag = format!("last refresh: {}", outcome.as_str());
+    if outcome == RefreshEventOutcome::Dead {
+        // The exact command `status`'s health cell prints (#119), so both views point
+        // an operator at the same fix.
+        tag.push_str(" — claude /login");
+    }
+    Some(tag)
 }
 
 /// `disable`/`enable <label>` — take an account out of the rotation, or return it
@@ -1396,6 +1523,27 @@ mod tests {
         }
     }
 
+    /// A parallel `AuthSubset` slice of "nothing known" (both fields `None`), sized to
+    /// `n` — the pre-#120 render baseline: such a subset adds no tags, so a row reads
+    /// exactly as before. Lets the format / redaction tests pin the columns without a
+    /// keychain or event log.
+    fn no_auth(n: usize) -> Vec<AuthSubset> {
+        (0..n)
+            .map(|_| AuthSubset {
+                expires_at_ms: None,
+                last_refresh: None,
+            })
+            .collect()
+    }
+
+    /// One known auth subset, for the issue-#120 tag tests.
+    fn auth(expires_at_ms: Option<i64>, last_refresh: Option<RefreshEventOutcome>) -> AuthSubset {
+        AuthSubset {
+            expires_at_ms,
+            last_refresh,
+        }
+    }
+
     /// A `Config` around `roster`, with placeholder tunables `list` never reads.
     fn config_with(roster: Vec<Account>) -> Config {
         Config {
@@ -1416,10 +1564,15 @@ mod tests {
 
     #[test]
     fn renders_each_account_then_the_count_total() {
-        let out = render_roster(&[
-            acct("work", "11111111-1111-1111-1111-111111111111"),
-            acct("personal", "22222222-2222-2222-2222-222222222222"),
-        ]);
+        // With no auth subset available (#120), a row reads exactly as the pre-#120 view.
+        let out = render_roster(
+            &[
+                acct("work", "11111111-1111-1111-1111-111111111111"),
+                acct("personal", "22222222-2222-2222-2222-222222222222"),
+            ],
+            &no_auth(2),
+            0,
+        );
         assert_eq!(
             out,
             "work      11111111-1111-1111-1111-111111111111\n\
@@ -1441,7 +1594,7 @@ personal  22222222-2222-2222-2222-222222222222\n\
                 )
             })
             .collect();
-        let out = render_roster(&roster);
+        let out = render_roster(&roster, &no_auth(roster.len()), 0);
         assert!(out.ends_with("\n6 accounts\n"), "got: {out:?}");
         assert!(
             !out.contains("slots"),
@@ -1450,20 +1603,23 @@ personal  22222222-2222-2222-2222-222222222222\n\
     }
 
     #[test]
-    fn view_renders_a_present_roster() {
+    fn resolve_roster_returns_a_present_roster_for_render() {
+        // The load-outcome → roster mapping (the unit-testable seam #120 split from the
+        // I/O-bearing `list`): a present roster passes through, and `render_roster` with
+        // no auth subset reads as the pre-#120 single-account view ("1 account" singular).
         let config = config_with(vec![acct("work", "11111111-aaaa")]);
-        let out = view(Ok(config)).expect("a present roster is not an error");
-        // A single-account roster reads "1 account" (singular), not "1 accounts".
+        let roster = resolve_roster(Ok(config)).expect("a present roster is not an error");
+        let out = render_roster(&roster, &no_auth(roster.len()), 0);
         assert_eq!(out, "work  11111111-aaaa\n\n1 account\n");
     }
 
     #[test]
-    fn view_maps_an_absent_config_to_the_friendly_empty_state() {
+    fn resolve_roster_maps_an_absent_config_to_the_friendly_empty_state() {
         let loaded = Err(Error::ConfigNotFound {
             path: PathBuf::from("/nonexistent/config.toml"),
         });
         assert!(
-            matches!(view(loaded), Err(Error::RosterEmpty)),
+            matches!(resolve_roster(loaded), Err(Error::RosterEmpty)),
             "an absent config must become the friendly empty state"
         );
         // The friendly message points at the next step and never leaks the path.
@@ -1474,36 +1630,46 @@ personal  22222222-2222-2222-2222-222222222222\n\
     }
 
     #[test]
-    fn view_maps_a_roster_less_config_to_the_friendly_empty_state() {
+    fn resolve_roster_maps_a_roster_less_config_to_the_friendly_empty_state() {
         // #58: a well-formed tunables-only config (empty roster) reads as the same
         // friendly empty state as an absent file — `capture` can now load such a
         // file, so `list` must not show a bare "0 accounts".
         let config = config_with(vec![]);
         assert!(
-            matches!(view(Ok(config)), Err(Error::RosterEmpty)),
+            matches!(resolve_roster(Ok(config)), Err(Error::RosterEmpty)),
             "an empty roster must become the friendly empty state"
         );
     }
 
     #[test]
-    fn view_does_not_conflate_a_malformed_config_with_the_empty_state() {
+    fn resolve_roster_does_not_conflate_a_malformed_config_with_the_empty_state() {
         let loaded = Err(Error::ConfigParse("expected `=`".into()));
         assert!(
-            matches!(view(loaded), Err(Error::ConfigParse(_))),
+            matches!(resolve_roster(loaded), Err(Error::ConfigParse(_))),
             "a malformed config must surface as its real error, not the empty state"
         );
     }
 
     #[test]
     fn output_never_carries_an_email_or_token_sigil() {
-        // #15 redaction: the formatter sources only the two non-secret roster
-        // fields it shows (`label`, `account_uuid`), so it never auto-introduces a
-        // token or email. (A label the operator sets to an email is their own
+        // #15 redaction: the formatter sources only the two non-secret roster fields it
+        // shows (`label`, `account_uuid`) plus the #120 auth tags (a timestamp-derived
+        // duration and a bare outcome token), so it never auto-introduces a token or
+        // email — proven here with a POPULATED auth subset (future expiry + dead refresh,
+        // the most field-rich row). (A label the operator sets to an email is their own
         // value, not a leak — see issue #69.)
-        let out = render_roster(&[acct("work", "11111111-1111-1111-1111-111111111111")]);
+        let out = render_roster(
+            &[acct("work", "11111111-1111-1111-1111-111111111111")],
+            &[auth(Some(7_200_000), Some(RefreshEventOutcome::Dead))],
+            1,
+        );
         assert!(
             !out.contains('@'),
             "list output must not contain an email: {out:?}"
+        );
+        assert!(
+            !out.to_lowercase().contains("token"),
+            "list output must not contain a token: {out:?}"
         );
     }
 
@@ -1514,7 +1680,7 @@ personal  22222222-2222-2222-2222-222222222222\n\
         let mut work = acct("work", "11111111-1111");
         work.enabled = false;
         let spare = acct("spare", "22222222-2222");
-        let out = render_roster(&[work, spare]);
+        let out = render_roster(&[work, spare], &no_auth(2), 0);
         assert_eq!(
             out,
             "work   11111111-1111 · disabled\n\
@@ -1522,6 +1688,83 @@ spare  22222222-2222\n\
 \n\
 2 accounts\n"
         );
+    }
+
+    // --- offline auth subset (issue #120) ----------------------------------
+
+    #[test]
+    fn render_roster_trails_expiry_freshness_and_last_refresh_tags() {
+        // The enriched row (#120): the `expiresAt`-derived freshness, then the
+        // last-persisted refresh outcome, each a ` · `-delimited tag after the uuid.
+        // now=0; expiry 7200s out → "2h"; a `refreshed` outcome.
+        let out = render_roster(
+            &[acct("work", "11111111-1111")],
+            &[auth(Some(7_200_000), Some(RefreshEventOutcome::Refreshed))],
+            0,
+        );
+        assert_eq!(
+            out,
+            "work  11111111-1111 · expires in 2h · last refresh: refreshed\n\n1 account\n"
+        );
+    }
+
+    #[test]
+    fn render_roster_omits_tags_when_the_auth_subset_is_unavailable() {
+        // Both fields `None` (unreadable stash / no refresh recorded) → no tags, so the
+        // row is byte-identical to the pre-#120 view. The common config-only case.
+        let out = render_roster(&[acct("work", "11111111-1111")], &no_auth(1), 0);
+        assert_eq!(out, "work  11111111-1111\n\n1 account\n");
+    }
+
+    #[test]
+    fn render_roster_pairs_a_disabled_tag_with_the_auth_tags() {
+        // The rotation tag (#36) and the auth tags (#120) coexist as successive ` · `
+        // tags on one row, in that order.
+        let mut work = acct("work", "11111111-1111");
+        work.enabled = false;
+        let out = render_roster(
+            &[work],
+            &[auth(Some(7_200_000), Some(RefreshEventOutcome::NoChange))],
+            0,
+        );
+        assert_eq!(
+            out,
+            "work  11111111-1111 · disabled · expires in 2h · last refresh: no_change\n\n1 account\n"
+        );
+    }
+
+    #[test]
+    fn expiry_tag_marks_a_past_or_boundary_expiry_as_expired() {
+        // `expiresAt` is epoch MS; reduce to seconds, then compare to now_secs. A future
+        // expiry humanizes; one already at/past `now` reads `expired` (never "expires in
+        // now"); an unreadable expiry yields no tag.
+        assert_eq!(
+            expiry_tag(Some(7_200_000), 0).as_deref(),
+            Some("expires in 2h")
+        );
+        // Boundary: expiry second == now second → expired (`<=`).
+        assert_eq!(expiry_tag(Some(5_000), 5).as_deref(), Some("expired"));
+        assert_eq!(expiry_tag(Some(1_000), 5).as_deref(), Some("expired"));
+        assert_eq!(expiry_tag(None, 5), None);
+    }
+
+    #[test]
+    fn refresh_tag_renders_the_log_token_and_logins_a_dead_credential() {
+        // The tag reuses the event log's token (so it cross-references `sessiometer.log`),
+        // and a `dead` outcome trails the actionable `claude /login` cue (#119 parity).
+        assert_eq!(
+            refresh_tag(Some(RefreshEventOutcome::Refreshed)).as_deref(),
+            Some("last refresh: refreshed")
+        );
+        assert_eq!(
+            refresh_tag(Some(RefreshEventOutcome::RefreshedNotReStashed)).as_deref(),
+            Some("last refresh: refreshed_not_restashed")
+        );
+        assert_eq!(
+            refresh_tag(Some(RefreshEventOutcome::Dead)).as_deref(),
+            Some("last refresh: dead — claude /login")
+        );
+        assert_eq!(refresh_tag(None), None);
     }
 
     #[test]
