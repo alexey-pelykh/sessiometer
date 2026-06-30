@@ -112,6 +112,15 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     let label = args.next().map(|s| s.to_string_lossy().into_owned());
                     remove_account(label).await
                 }
+                // `poke [<account>]` runs Claude Code once in an isolated config dir so
+                // it refreshes a PARKED account's stored credential (issue #104), a thin
+                // one-shot over the #102 engine. The target is an optional positional
+                // (label OR account-uuid); omitting it sweeps every near-expiry parked
+                // account. Same optional-positional parse as `capture`; extras ignored.
+                "poke" => {
+                    let target = args.next().map(|s| s.to_string_lossy().into_owned());
+                    crate::poke::poke(target).await
+                }
                 "-h" | "--help" => {
                     print_usage();
                     Ok(())
@@ -138,6 +147,7 @@ fn print_usage() {
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
          enable <label>       Return a parked account to the rotation\n    \
          remove <label>       Delete an account: drop it from the rotation and erase its stash\n    \
+         poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)\n    \
          --help     Print this help"
     );
 }

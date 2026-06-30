@@ -594,17 +594,14 @@ where
 }
 
 /// Run one isolated refresh for the parked account stashed at `stash_service`, whose
-/// identity is `account_uuid` — the production entry point (the engine's "two thin
-/// callers" wire this in later). Derives the isolated dir + service from `account_uuid`,
-/// constructs the real isolated keychain + spawner, and runs [`refresh_cycle`] under the
-/// swap lock.
+/// identity is `account_uuid` — the production entry point. Derives the isolated dir +
+/// service from `account_uuid`, constructs the real isolated keychain + spawner, and
+/// runs [`refresh_cycle`] under the swap lock.
 ///
-/// Not yet wired (the engine's "two thin callers" land later), so it is dead in BOTH
-/// the prod and test builds — `#[allow(dead_code)]` unconditionally (vs the
-/// `not(test)`-only allow used by items the tests already exercise). As an allowed
-/// root it also keeps its production-only callees ([`now_ms`], [`SpawnClaude::new`],
-/// [`crate::keychain::IsolatedKeychainItem::new`]) from tripping the lint.
-#[allow(dead_code)]
+/// Wired by the one-shot `poke` command (issue #104, the first of the engine's thin
+/// callers); the periodic refresh tick (#105) is the second. As a real call root it
+/// also keeps its production-only callees ([`now_ms`], [`SpawnClaude::new`],
+/// [`crate::keychain::IsolatedKeychainItem::new`]) reachable.
 pub(crate) async fn refresh_account<S: AccountStash>(
     stash: &S,
     stash_service: &str,
@@ -625,6 +622,19 @@ pub(crate) async fn refresh_account<S: AccountStash>(
         now_ms(),
     )
     .await
+}
+
+/// Read the stored credential's `expiresAt` (epoch milliseconds) for the account
+/// stashed at `service`, or `None` if the stash is unreadable (locked keychain, absent
+/// item) or the credential carries no parseable `expiresAt`.
+///
+/// **Non-secret**: returns only the integer expiry, never the token — so a caller can
+/// select *near-expiry* parked accounts (the `poke` all-accounts mode, issue #104)
+/// without ever handling raw credential bytes itself. The raw blob is read, parsed for
+/// the one timestamp, and dropped here.
+pub(crate) async fn stored_expires_at<S: AccountStash>(stash: &S, service: &str) -> Option<i64> {
+    let snapshot = stash.read(service).await.ok()?;
+    expires_at(snapshot.credential.expose())
 }
 
 /// Reap orphaned isolated-refresh artifacts left behind by a crashed cycle (issue

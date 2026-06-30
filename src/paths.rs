@@ -243,6 +243,70 @@ pub(crate) fn login_keychain() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Keychains/login.keychain-db"))
 }
 
+/// Resolve the `claude` binary to spawn for an isolated refresh (issue #102 step 4):
+/// `$CLAUDE_BIN` if it names an existing file, else the first `claude` found on
+/// `$PATH`. The result is absolute (the spawn pins an absolute binary — a PATH entry
+/// may be a wrapper that execs a patched copy, the #101 provenance note), so a caller
+/// can validate it once before spawning. [`Error::ClaudeBinaryNotFound`] if neither
+/// yields an existing file. Used by the one-shot `poke` (issue #104) and, later, the
+/// periodic refresh tick (#105).
+pub(crate) fn claude_binary() -> Result<PathBuf> {
+    claude_binary_from(
+        std::env::var_os("CLAUDE_BIN"),
+        std::env::var_os("PATH"),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )
+}
+
+/// The pure resolution policy for [`claude_binary`], taking the `$CLAUDE_BIN` /
+/// `$PATH` values + `cwd` as arguments so the override / PATH-scan / not-found
+/// branches are testable without mutating process-global env. An empty / unset
+/// `$CLAUDE_BIN` falls through to the PATH scan; a `$CLAUDE_BIN` that is set but does
+/// NOT name an existing file is an error (the operator pointed us at a specific
+/// binary — don't silently substitute a different one).
+fn claude_binary_from(
+    claude_bin: Option<OsString>,
+    path: Option<OsString>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    if let Some(bin) = claude_bin {
+        if !bin.is_empty() {
+            let candidate = absolutize(PathBuf::from(bin), cwd);
+            return if candidate.is_file() {
+                Ok(candidate)
+            } else {
+                Err(Error::ClaudeBinaryNotFound)
+            };
+        }
+    }
+    if let Some(path) = path {
+        for dir in std::env::split_paths(&path) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            // Absolutize BEFORE the existence check: a relative PATH entry must resolve
+            // against `cwd` (the engine pins an absolute binary), and `is_file` on a
+            // relative path would otherwise probe the process cwd, not `cwd`.
+            let candidate = absolutize(dir.join("claude"), cwd);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(Error::ClaudeBinaryNotFound)
+}
+
+/// Make `path` absolute against `cwd` (a `$PATH` entry or `$CLAUDE_BIN` may be
+/// relative); an already-absolute path is returned unchanged. Deliberately NO
+/// symlink resolution — a `claude` wrapper on PATH must be spawned as-is (#101).
+fn absolutize(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 /// Create `path` (and any missing parents) `0700` and assert it is owned by the
 /// current uid. Idempotent: if the directory already exists it re-tightens the
 /// mode and re-checks ownership.
@@ -566,5 +630,79 @@ mod tests {
         let path = tmp.path().join("absent.json");
         assert!(write_preserving_mode(&path, b"x").is_err());
         assert!(!path.exists());
+    }
+
+    // --- claude_binary_from --------------------------------------------------
+
+    #[test]
+    fn claude_binary_prefers_an_existing_claude_bin_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("claude");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let got = claude_binary_from(
+            Some(bin.as_os_str().to_owned()),
+            Some(OsString::from("/nonexistent")),
+            Path::new("/cwd"),
+        )
+        .unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn claude_binary_errors_when_the_override_is_missing() {
+        // Set but not an existing file — don't silently substitute a PATH `claude`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path_dir = tmp.path().join("bin");
+        fs::create_dir(&path_dir).unwrap();
+        fs::write(path_dir.join("claude"), b"#!/bin/sh\n").unwrap();
+        let err = claude_binary_from(
+            Some(OsString::from("/no/such/claude")),
+            Some(path_dir.as_os_str().to_owned()),
+            Path::new("/cwd"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ClaudeBinaryNotFound));
+    }
+
+    #[test]
+    fn claude_binary_scans_path_when_no_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        fs::create_dir(&dir_a).unwrap();
+        fs::create_dir(&dir_b).unwrap();
+        let bin = dir_b.join("claude");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        // `a` has no `claude`; the scan finds it in `b`.
+        let path = std::env::join_paths([dir_a.as_os_str(), dir_b.as_os_str()]).unwrap();
+        let got = claude_binary_from(None, Some(path), Path::new("/cwd")).unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn claude_binary_errors_when_absent_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_dir = tmp.path().join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+        let err = claude_binary_from(
+            None,
+            Some(empty_dir.as_os_str().to_owned()),
+            Path::new("/cwd"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ClaudeBinaryNotFound));
+    }
+
+    #[test]
+    fn claude_binary_absolutizes_a_relative_path_entry() {
+        // A relative PATH dir resolves against cwd — the engine pins an absolute binary.
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = std::path::PathBuf::from("relbin");
+        let abs = tmp.path().join("relbin");
+        fs::create_dir(&abs).unwrap();
+        fs::write(abs.join("claude"), b"#!/bin/sh\n").unwrap();
+        let got = claude_binary_from(None, Some(rel.as_os_str().to_owned()), tmp.path()).unwrap();
+        assert_eq!(got, abs.join("claude"));
+        assert!(got.is_absolute());
     }
 }

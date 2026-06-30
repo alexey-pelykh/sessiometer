@@ -18,6 +18,7 @@ mod error;
 mod keychain;
 mod observability;
 mod paths;
+mod poke;
 mod redaction;
 mod refresh;
 mod sha256;

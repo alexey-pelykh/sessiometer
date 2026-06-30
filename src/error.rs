@@ -355,6 +355,27 @@ pub(crate) enum Error {
     #[error("another swap is in progress — could not acquire the swap lock; retry shortly")]
     SwapLockBusy,
 
+    // --- One-shot `poke` (issue #104) ----------------------------------------
+    /// `poke <account>` named the ACTIVE account. The isolated-refresh engine
+    /// refreshes only PARKED (non-active) accounts (`src/refresh.rs` Caller
+    /// contract): a concurrent promotion of the refreshed account to active cannot
+    /// be observed by the engine's CAS re-stash, so the active account is never a
+    /// safe target. REFUSED with ZERO effect; `label` is the target's non-secret
+    /// handle (issue #15). The all-accounts mode skips the active account silently
+    /// instead — this fires only when an operator names it explicitly.
+    #[error("refusing to poke `{label}`: it is the active account — poke only refreshes parked accounts")]
+    PokeTargetActive { label: String },
+
+    /// The `claude` binary the isolated refresh spawns (issue #102 step 4) could
+    /// not be located: `$CLAUDE_BIN` is unset (or not an existing file) and no
+    /// `claude` is on `$PATH`. Secret-free — a missing executable, never a
+    /// credential.
+    #[error(
+        "could not locate the `claude` binary — install Claude Code so `claude` is on \
+         your PATH, or set `$CLAUDE_BIN` to its absolute path"
+    )]
+    ClaudeBinaryNotFound,
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),

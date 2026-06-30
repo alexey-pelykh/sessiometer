@@ -218,6 +218,32 @@ running Claude Code session keeps working. The daemon then simply resolves no
 active account (polling only, never swapping) until you `capture` another account
 or sign in again.
 
+## Keeping a parked credential fresh
+
+A parked account's stored credential can go stale while it sits out of the active
+session. `poke` keeps it fresh by running Claude Code once for that account in a
+dedicated, throwaway `CLAUDE_CONFIG_DIR`: it seeds a copy of the account's stashed
+credential into an isolated keychain item, runs `claude -p` pointed at that config
+dir so **Claude Code refreshes its own credential** there, reads the refreshed
+credential back, re-stashes it, and tears the isolated dir and item down. `poke` is
+only the trigger — Claude Code performs the refresh — and the live
+`Claude Code-credentials` item the active session reads is never touched.
+
+```sh
+# Refresh one parked account (resolves by `list` label OR account-uuid):
+sessiometer poke spare
+
+# Refresh every parked account whose stored token is near expiry:
+sessiometer poke
+```
+
+`poke` refreshes **parked** accounts only: it never touches the active account
+(naming it is refused, and the all-accounts sweep skips it), so the live session's
+credential is left alone. A cycle reports one redacted line per account —
+`refreshed`, `no change`, `dead` (needs re-login), or `error` — naming only the
+account's `list` label, never a token. It needs the `claude` binary on your `PATH`
+(or `$CLAUDE_BIN` set to its absolute path).
+
 ## Edge cases & resilience
 
 `sessiometer` is built to ride out the keychain and credential edge cases a
