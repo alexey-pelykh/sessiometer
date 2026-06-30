@@ -325,8 +325,8 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
     serde_json::from_str(line.trim_end()).map_err(|err| Error::Io(std::io::Error::other(err)))
 }
 
-/// Render a [`StatusResponse`] as the text `status` prints: an aligned,
-/// header-less table (issue #94), one record per line, then the next-swap footer
+/// Render a [`StatusResponse`] as the text `status` prints: an aligned table with a
+/// labelled header row (issue #99), one record per line, then the next-swap footer
 /// (#88). Pure (no clock, no I/O) so the response→text mapping is unit-testable —
 /// the caller passes `now` (epoch seconds) so each account's "resets in" and
 /// urgency are deterministic, `cols` (the terminal width, or `None` when stdout is
@@ -335,15 +335,19 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 ///
 /// Columns, in display order: `account` then the SESSION pair (`session% `
 /// `session-reset`), then the WEEKLY pair (`weekly% ` `weekly-reset`), then the
-/// health-text tags (issue #94). There is NO header row: each `%` sits immediately
-/// before its OWN reset, so the pairing is disambiguated by adjacency, not a label.
-/// A reset's lead gap is a single space (tying it to its `%`); independent columns
-/// are two spaces apart. When the full table is wider than `cols`, the lowest-priority
-/// columns drop — the WEEKLY pair (`weekly%` + `weekly-reset`) FIRST and ATOMICALLY
-/// (never a `%` stranded without its reset), then the health-text column — never
-/// wrapping a row; `account` + the SESSION pair (the soonest, most actionable reset)
-/// are always kept. A `None` width (piped / redirected) keeps the full table, so
-/// `status | grep` and `status > file` stay the complete, greppable surface.
+/// health-text tags (issue #94). A labelled header row (issue #99) tops the table —
+/// `ACCOUNT`, the grouped `SESSION%` + `RESET`, the grouped `WEEKLY%` + `RESET`, then
+/// `HEALTH` — measured into the SAME column widths as the data so the labels line up;
+/// the pairing is also read by adjacency (each `%` sits immediately before its OWN
+/// reset), so the two reset columns share the `RESET` label. A reset's lead gap is a
+/// single space (tying it to its `%`); independent columns are two spaces apart. When
+/// the full table is wider than `cols`, the lowest-priority columns drop — the WEEKLY
+/// pair (`weekly%` + `weekly-reset`) FIRST and ATOMICALLY (never a `%` stranded
+/// without its reset), then the health-text column, each taking its own header label
+/// with it — never wrapping a row; `account` + the SESSION pair (the soonest, most
+/// actionable reset) and their labels are always kept. A `None` width (piped /
+/// redirected) keeps the full table, so `status | grep` and `status > file` stay the
+/// complete, greppable surface.
 ///
 /// When `color` is set each CELL is tinted by its OWN health (issue #84), so one
 /// glance reads several independent signals per account: `account` by the overall
@@ -381,30 +385,35 @@ pub(crate) fn render_status(
     // then the WEEKLY pair, then the health-text tags. Each column carries a lead
     // gap (the spaces BEFORE it): `0` for the first column, `1` to tie a reset
     // tightly to the `%` it pairs with, `2` between independent columns — so each
-    // `%` reads immediately followed by its own reset without a header. A drop
-    // priority of `None` always keeps the column; the WEEKLY pair shares priority 1
-    // so both leave atomically (never a `%` without its reset); the health-text
-    // column is priority 2 (drops next). The health-text column is included only
-    // when some account carries a tag — an all-healthy roster shows none.
+    // `%` reads immediately followed by its own reset, the pairing the header row
+    // (issue #99) also labels. A drop priority of `None` always keeps the column; the
+    // WEEKLY pair shares priority 1 so both leave atomically (never a `%` without its
+    // reset); the health-text column is priority 2 (drops next). The health-text
+    // column is included only when some account carries a tag — an all-healthy roster
+    // shows none.
     let mut columns: Vec<Column> = vec![
-        Column::keep(|row| &row.account, |row| row.account_severity, 0),
+        Column::keep("ACCOUNT", |row| &row.account, |row| row.account_severity, 0),
         Column::keep(
+            "SESSION%",
             |row| &row.session,
             |row| row.session_severity,
             STATUS_COL_GAP,
         ),
         Column::keep(
+            "RESET",
             |row| &row.session_reset,
             |row| row.session_reset_severity,
             STATUS_PAIR_GAP,
         ),
         Column::droppable(
+            "WEEKLY%",
             1,
             |row| &row.weekly,
             |row| row.weekly_severity,
             STATUS_COL_GAP,
         ),
         Column::droppable(
+            "RESET",
             1,
             |row| &row.weekly_reset,
             |row| row.weekly_reset_severity,
@@ -414,8 +423,9 @@ pub(crate) fn render_status(
     if rows.iter().any(|row| !row.status.is_empty()) {
         // The health-text column carries its own tags (`disabled`, `needs re-login`);
         // it is never tinted (issue #84) — the tags are their own signal, so its
-        // severity getter is always `None`.
+        // severity getter is always `None`. Its header is `HEALTH` (issue #99).
         columns.push(Column::droppable(
+            "HEALTH",
             2,
             |row| &row.status,
             |_| None,
@@ -442,8 +452,18 @@ pub(crate) fn render_status(
     let widths = column_widths(&columns, &rows);
     let lead_gaps: Vec<usize> = columns.iter().map(|col| col.lead_gap).collect();
     let mut out = String::new();
-    // No header row (issue #94): the layout is header-less, disambiguated by each
-    // `%` sitting immediately before its own reset.
+    // Header row (issue #99): a plain, uncolored label per column, padded to the SAME
+    // measured widths as the data so labels and values line up. Printed in the text
+    // view regardless of the colour gate or TTY (it is never in `--json`, the separate
+    // full-data contract). Skipped only for an empty roster — a lone header labelling
+    // no data would mislead. Whichever columns survive the narrow-terminal drop above
+    // carry their labels with them, so a dropped WEEKLY pair takes its `WEEKLY%`/`RESET`
+    // labels too while `ACCOUNT` + the always-kept SESSION pair keep theirs.
+    if !rows.is_empty() {
+        let headers: Vec<&str> = columns.iter().map(|col| col.header).collect();
+        let uncolored: Vec<Option<&str>> = vec![None; columns.len()];
+        out.push_str(&render_cells(&headers, &widths, &uncolored, &lead_gaps));
+    }
     for row in &rows {
         let cells: Vec<&str> = columns.iter().map(|col| (col.get)(row)).collect();
         // Each cell is tinted by its OWN health when the gate is open (issue #84), so
@@ -480,8 +500,8 @@ pub(crate) fn render_status(
 /// `list`).
 const STATUS_COL_GAP: usize = 2;
 /// Tighter gap that ties a reset to the `%` it pairs with (issue #94): one space, so
-/// `session% session-reset` reads as one pair and the header-less table stays
-/// disambiguated by adjacency.
+/// `session% session-reset` reads as one pair, disambiguated by adjacency and labelled
+/// by the header row (issue #99 — each window's reset under its own `RESET` label).
 const STATUS_PAIR_GAP: usize = 1;
 
 /// One account projected to its `status`-table cells (issue #72). Pre-rendered
@@ -724,18 +744,21 @@ fn proximity_severity(reset_at: Option<i64>, now: i64) -> Option<Severity> {
     })
 }
 
-/// One `status`-table column (issue #94): a borrow of the matching [`StatusRow`]
-/// cell, the per-cell urgency getter for the color overlay (issue #84), a `lead_gap`
-/// (the spaces rendered BEFORE this column — `0` for the first column, `1` to tie a
-/// reset tightly to the `%` it pairs with, `2` between independent columns), and a
-/// drop priority (`None` = always keep; `Some(n)` = droppable, lower `n` drops first
-/// under a narrow terminal — all columns sharing the lowest present priority drop
-/// together, so a `%`+reset PAIR leaves atomically). There is no header field: the
-/// table is header-less (issue #94), so a column is identified only by position and
-/// the adjacency of each `%` to its own reset. `severity` returns this column's own
+/// One `status`-table column (issue #94): a `header` label (issue #99), a borrow of
+/// the matching [`StatusRow`] cell, the per-cell urgency getter for the color overlay
+/// (issue #84), a `lead_gap` (the spaces rendered BEFORE this column — `0` for the
+/// first column, `1` to tie a reset tightly to the `%` it pairs with, `2` between
+/// independent columns), and a drop priority (`None` = always keep; `Some(n)` =
+/// droppable, lower `n` drops first under a narrow terminal — all columns sharing the
+/// lowest present priority drop together, so a `%`+reset PAIR leaves atomically). The
+/// `header` is a plain (uncolored) label printed in the header row and measured into
+/// the column width alongside the cells (issue #99), so it lines up with the data; the
+/// adjacency of each `%` to its own reset still disambiguates the pairing, so the two
+/// reset columns can share the `RESET` label. `severity` returns this column's own
 /// health for a row, or `None` for a column that is never tinted (the health-text
-/// tags) or a cell with no reading.
+/// tags) or a cell with no reading — the header itself is always rendered uncolored.
 struct Column {
+    header: &'static str,
     get: fn(&StatusRow) -> &str,
     severity: fn(&StatusRow) -> Option<Severity>,
     lead_gap: usize,
@@ -744,11 +767,13 @@ struct Column {
 
 impl Column {
     fn keep(
+        header: &'static str,
         get: fn(&StatusRow) -> &str,
         severity: fn(&StatusRow) -> Option<Severity>,
         lead_gap: usize,
     ) -> Self {
         Column {
+            header,
             get,
             severity,
             lead_gap,
@@ -756,12 +781,14 @@ impl Column {
         }
     }
     fn droppable(
+        header: &'static str,
         priority: u8,
         get: fn(&StatusRow) -> &str,
         severity: fn(&StatusRow) -> Option<Severity>,
         lead_gap: usize,
     ) -> Self {
         Column {
+            header,
             get,
             severity,
             lead_gap,
@@ -770,11 +797,12 @@ impl Column {
     }
 }
 
-/// Each included column's render width: the widest of its cells, measured in DISPLAY
-/// WIDTH ([`display_width`]) — terminal columns, not `char` count — so a wide (CJK)
-/// or zero-width glyph in a label sizes the column correctly and the next column
-/// still lines up (issue #73). The table is header-less (issue #94), so only the
-/// cells size each column.
+/// Each included column's render width: the widest of its HEADER label (issue #99)
+/// and its cells, measured in DISPLAY WIDTH ([`display_width`]) — terminal columns,
+/// not `char` count — so a wide (CJK) or zero-width glyph in a label sizes the column
+/// correctly and the next column still lines up (issue #73). The header participates
+/// in the measurement so a label wider than every cell (e.g. `SESSION%` over `82%`)
+/// still gets its own room and the header and data stay aligned.
 fn column_widths(columns: &[Column], rows: &[StatusRow]) -> Vec<usize> {
     columns
         .iter()
@@ -783,6 +811,7 @@ fn column_widths(columns: &[Column], rows: &[StatusRow]) -> Vec<usize> {
                 .map(|row| display_width((col.get)(row)))
                 .max()
                 .unwrap_or(0)
+                .max(display_width(col.header))
         })
         .collect()
 }
@@ -803,8 +832,9 @@ fn table_width(columns: &[Column], rows: &[StatusRow]) -> usize {
 ///
 /// The lead gap is the spacing BEFORE a column (issue #94): `0` for the first column,
 /// `1` to tie a reset to the `%` it pairs with, `2` between independent columns — so
-/// each `%` reads immediately followed by its own reset even though the table is
-/// header-less. Padding is computed on DISPLAY WIDTH ([`display_width`]) — not
+/// each `%` reads immediately followed by its own reset. The same routine renders both
+/// the header row (issue #99) and the data rows, so the labels and values share one
+/// set of gaps and widths. Padding is computed on DISPLAY WIDTH ([`display_width`]) — not
 /// `char`/byte count, which Rust's `{:<width$}` fill would use — so a wide-glyph cell
 /// lands the next column correctly. `colors` carries one entry PER cell (issue #84):
 /// when a cell's entry is `Some(sgr)` that cell's text is wrapped in the ANSI color,
@@ -1569,12 +1599,15 @@ spare  22222222-2222\n\
     const NOW: i64 = 1_782_777_600;
 
     #[test]
-    fn render_status_renders_an_aligned_header_less_paired_table_with_a_next_swap_candidate() {
-        // The header-less paired layout (issue #94): each `%` is immediately followed
-        // by its OWN reset (a single space ties the pair; two spaces separate the
-        // SESSION pair from the WEEKLY pair), aligned in columns, one record per line,
-        // then the forward-looking next-swap footer (#88). Healthy roster (no tags) →
-        // no health-text column. The exact match proves there is NO header row.
+    fn render_status_renders_an_aligned_paired_table_with_a_labelled_header_and_next_swap() {
+        // The paired layout (issue #94) under a labelled header (issue #99): a header
+        // row (`ACCOUNT`, grouped `SESSION%`+`RESET`, grouped `WEEKLY%`+`RESET`) tops
+        // the table, each `%` immediately followed by its OWN reset (a single space
+        // ties the pair; two spaces separate the SESSION pair from the WEEKLY pair),
+        // aligned in columns — header and data measured into the SAME widths — one
+        // record per line, then the forward-looking next-swap footer (#88). Healthy
+        // roster (no tags) → no health-text column, so no `HEALTH` label. The exact
+        // match proves the header row, the paired column order, and the alignment.
         let mut work = status_line_resets(
             "work",
             Some(97),
@@ -1601,14 +1634,66 @@ spare  22222222-2222\n\
                 to: "spare".to_owned(),
             }),
         };
+        // Header labels are wider than their data, so the header sizes the columns
+        // (e.g. `SESSION%` = 8 over `97%` = 3); the data left-aligns under each label.
         let expected = concat!(
-            "* work   97% 12m  40% 5d\n",
-            "  spare  10% 2h   20% 3d\n",
-            "  third  n/a n/a  n/a n/a\n",
+            "ACCOUNT  SESSION% RESET  WEEKLY% RESET\n",
+            "* work   97%      12m    40%     5d\n",
+            "  spare  10%      2h     20%     3d\n",
+            "  third  n/a      n/a    n/a     n/a\n",
             "\n",
             "next swap: spare\n",
         );
         assert_eq!(render_status(&response, NOW, None, false), expected);
+    }
+
+    #[test]
+    fn render_status_header_is_a_single_plain_line_present_in_both_colour_modes() {
+        // Issue #99: the header prints in the text view regardless of the colour gate
+        // (TTY or not), is exactly one greppable line, and is plain (no SGR) in BOTH
+        // modes — the per-cell tint lives on the data rows only. The `--json` full-data
+        // contract is a SEPARATE surface (serialized field names), so it never carries
+        // these display labels.
+        let response = StatusResponse {
+            accounts: vec![status_line_resets(
+                "work",
+                Some(50),
+                Some(40),
+                false,
+                Some(NOW + 12 * 60),
+                Some(NOW + 5 * 86_400),
+            )],
+            next_swap: Some(NextSwap::Target {
+                to: "spare".to_owned(),
+            }),
+        };
+        for color in [false, true] {
+            let out = render_status(&response, NOW, None, color);
+            let header = out.lines().next().expect("a header row");
+            assert_eq!(
+                header, "ACCOUNT  SESSION% RESET  WEEKLY% RESET",
+                "the header prints regardless of colour={color}: {out:?}"
+            );
+            // Exactly one header line — greppable, one record per line below it.
+            assert_eq!(
+                out.lines().filter(|l| l.contains("SESSION%")).count(),
+                1,
+                "the header is a single line (colour={color}): {out:?}"
+            );
+            // Plain even under colour: the header line carries no escape byte.
+            assert!(
+                !header.contains('\x1b'),
+                "the header is uncolored (colour={color}): {header:?}"
+            );
+        }
+        // The `--json` surface is serialized field names, not these display labels.
+        let json = serde_json::to_string(&response).unwrap();
+        for label in ["ACCOUNT", "SESSION%", "WEEKLY%", "HEALTH"] {
+            assert!(
+                !json.contains(label),
+                "the header label {label:?} is text-view only, never in --json: {json}"
+            );
+        }
     }
 
     #[test]
@@ -1672,13 +1757,22 @@ spare  22222222-2222\n\
             "the weekly-exhausted account shows BOTH resets, not just the weekly: {}",
             line("third")
         );
-        // No header row (issue #94): the column labels of the pre-#94 table are gone.
-        for header in ["ACCOUNT", "SESSION", "WEEKLY", "RESETS", "STATUS"] {
-            assert!(
-                !out.contains(header),
-                "no header row, found {header:?}: {out}"
-            );
-        }
+        // Header row (issue #99): the FIRST line labels the columns — `ACCOUNT`, then
+        // the grouped `SESSION%`+`RESET` and `WEEKLY%`+`RESET` pairs (each window's
+        // reset shares the `RESET` label, disambiguated by adjacency to its `%`). No
+        // tags here → no `HEALTH` column. This restores a header #94 had removed.
+        let header = out.lines().next().expect("a header row");
+        assert!(
+            header.starts_with("ACCOUNT")
+                && header.contains("SESSION%")
+                && header.contains("WEEKLY%")
+                && header.matches("RESET").count() == 2,
+            "header labels the columns in paired order: {header:?}"
+        );
+        assert!(
+            !header.contains("HEALTH"),
+            "no HEALTH label when no account carries a tag: {header:?}"
+        );
         // Greppable: one record per line — each label on exactly one line.
         for label in ["work", "spare", "third"] {
             assert_eq!(out.lines().filter(|l| l.contains(label)).count(), 1);
@@ -1687,8 +1781,8 @@ spare  22222222-2222\n\
 
     #[test]
     fn render_status_marks_disabled_and_quarantined_in_a_status_column() {
-        // A tag on any account adds the health-text column (issue #94 — no header,
-        // so its presence is the tag text itself); both tags can hold at once.
+        // A tag on any account adds the health-text column (issue #94), labelled
+        // `HEALTH` (issue #99); both tags can hold at once.
         let mut quarantined = status_line("dead", false, None, None);
         quarantined.enabled = false;
         quarantined.quarantined = true;
@@ -1712,8 +1806,9 @@ spare  22222222-2222\n\
         // Issue #94 degradation order: drop the WEEKLY pair (weekly% + weekly-reset)
         // FIRST and ATOMICALLY, then the health-text column — always keeping the label
         // + the SESSION pair (the soonest, most actionable reset); never wrap a row.
-        // Cells are identified by their content (no header to grep): weekly% `25%`,
-        // weekly-reset `3d`, health-text `disabled`, session pair `50%`/`2h`.
+        // Data cells are identified by their content (`25%`, `3d`, `disabled`, `50%`,
+        // `2h`); the header (issue #99) carries only labels, and each dropped column
+        // takes its label with it.
         let response = StatusResponse {
             accounts: vec![{
                 let mut a = status_line_resets(
@@ -1729,17 +1824,24 @@ spare  22222222-2222\n\
             }],
             next_swap: None,
         };
-        // Full table = account(6) session%(3) session-reset(2) weekly%(3)
-        // weekly-reset(2) health-text(8) + gaps(0+2+1+2+1+2=8) = 32; dropping the
-        // weekly pair → 24; dropping health-text too → 14.
+        // The header now sizes each column (issue #99): account(7=`ACCOUNT`)
+        // session%(8=`SESSION%`) session-reset(5=`RESET`) weekly%(7=`WEEKLY%`)
+        // weekly-reset(5=`RESET`) health-text(8=`disabled`) + gaps(0+2+1+2+1+2=8) = 48;
+        // dropping the weekly pair → 33; dropping health-text too → 23.
         let full = render_status(&response, NOW, Some(200), false);
         assert!(
             full.contains("25%") && full.contains("3d") && full.contains("disabled"),
             "full table keeps both pairs and the health-text: {full}"
         );
-        // Narrow (24 ≤ 28 < 32): the WEEKLY pair drops first, atomically — NEITHER
-        // weekly% nor weekly-reset survives; health-text + the session pair stay.
-        let narrow = render_status(&response, NOW, Some(28), false);
+        let full_header = full.lines().next().unwrap();
+        assert!(
+            full_header.contains("WEEKLY%") && full_header.contains("HEALTH"),
+            "the full header carries every label: {full_header:?}"
+        );
+        // Narrow (33 ≤ 40 < 48): the WEEKLY pair drops first, atomically — NEITHER
+        // weekly% nor weekly-reset survives, and its `WEEKLY%`/`RESET` labels drop with
+        // it; health-text + the session pair (and their labels) stay.
+        let narrow = render_status(&response, NOW, Some(40), false);
         assert!(
             !narrow.contains("25%") && !narrow.contains("3d"),
             "the weekly pair drops first and atomically (no stranded %): {narrow}"
@@ -1748,8 +1850,17 @@ spare  22222222-2222\n\
             narrow.contains("disabled") && narrow.contains("50%") && narrow.contains("2h"),
             "health-text and the session pair outlive the weekly pair: {narrow}"
         );
-        // Narrower (14 ≤ 20 < 24): health-text drops next; label + session pair remain.
-        let tiny = render_status(&response, NOW, Some(20), false);
+        let narrow_header = narrow.lines().next().unwrap();
+        assert!(
+            narrow_header.starts_with("ACCOUNT")
+                && narrow_header.contains("SESSION%")
+                && narrow_header.contains("HEALTH")
+                && !narrow_header.contains("WEEKLY%"),
+            "the WEEKLY label drops with its columns; ACCOUNT + SESSION% kept: {narrow_header:?}"
+        );
+        // Narrower (23 ≤ 28 < 33): health-text drops next; label + session pair (and
+        // their labels) remain.
+        let tiny = render_status(&response, NOW, Some(28), false);
         assert!(
             !tiny.contains("25%") && !tiny.contains("3d") && !tiny.contains("disabled"),
             "weekly pair and health-text both gone: {tiny}"
@@ -1758,8 +1869,16 @@ spare  22222222-2222\n\
             tiny.contains("work") && tiny.contains("50%") && tiny.contains("2h"),
             "label + session pair are always kept: {tiny}"
         );
+        let tiny_header = tiny.lines().next().unwrap();
+        assert!(
+            tiny_header.starts_with("ACCOUNT")
+                && tiny_header.contains("SESSION%")
+                && !tiny_header.contains("WEEKLY%")
+                && !tiny_header.contains("HEALTH"),
+            "only ACCOUNT + the SESSION group labels remain: {tiny_header:?}"
+        );
         assert_eq!(tiny.lines().filter(|l| l.contains("work")).count(), 1);
-        // Even a width too small for the essentials (14 > 5): they are NEVER dropped
+        // Even a width too small for the essentials (23 > 5): they are NEVER dropped
         // and the row is NEVER wrapped — it simply overflows, staying one greppable
         // record per line (the terminal soft-wraps it visually).
         let overflow = render_status(&response, NOW, Some(5), false);
@@ -2184,12 +2303,18 @@ spare  22222222-2222\n\
         // table — proving color augments (every state + percentage still present)
         // and that padding was computed BEFORE coloring (alignment survives strip).
         assert_eq!(strip_ansi(&colored), plain);
-        // No header row (issue #94): the first line is the first ACCOUNT, not a
-        // column-label header.
-        let first_plain = strip_ansi(colored.lines().next().unwrap());
+        // Header row (issue #99): the FIRST line is the plain column-label header, and
+        // — proven by the strip-equality above — it carries NO colour even with the gate
+        // open (it has no escape byte at all), so the per-cell tint lives only on the
+        // data rows below it.
+        let first_line = colored.lines().next().unwrap();
         assert!(
-            !first_plain.starts_with("ACCOUNT") && first_plain.contains("calm"),
-            "first line is an account row, not a header: {first_plain:?}"
+            first_line.starts_with("ACCOUNT") && !first_line.contains('\x1b'),
+            "first line is the plain, uncolored header: {first_line:?}"
+        );
+        assert!(
+            colored.lines().any(|l| l.contains("calm")),
+            "the account rows follow the header: {colored:?}"
         );
     }
 
@@ -2307,8 +2432,8 @@ spare  22222222-2222\n\
     #[test]
     fn multibyte_label_rows_stay_aligned_on_display_width() {
         // A wide (CJK) label is two display cells per glyph; padding on display
-        // width keeps the SESSION column under its header where `.chars().count()`
-        // would misalign it.
+        // width keeps the SESSION column aligned where `.chars().count()` would
+        // misalign it — and keeps the `SESSION%` header (issue #99) over its data too.
         let response = StatusResponse {
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -2317,16 +2442,24 @@ spare  22222222-2222\n\
             next_swap: None,
         };
         let out = render_status(&response, NOW, None, false);
-        // Each row's SESSION value begins at the same DISPLAY column.
-        let session_col = |needle: &str| {
+        // Each row's value begins at the same DISPLAY column as the `needle`.
+        let col_of = |needle: &str| {
             let line = out.lines().find(|l| l.contains(needle)).unwrap();
             let idx = line.find(needle).unwrap();
             display_width(&line[..idx])
         };
         assert_eq!(
-            session_col("50%"),
-            session_col("10%"),
+            col_of("50%"),
+            col_of("10%"),
             "wide-label and ascii rows align the SESSION column on display width:\n{out}"
+        );
+        // The header's SESSION% label sits at the SAME display column as its data,
+        // even though the wide-glyph label widened the ACCOUNT column (issue #99 — the
+        // header is measured into the same display-width columns as the rows).
+        assert_eq!(
+            col_of("SESSION%"),
+            col_of("50%"),
+            "the SESSION% header aligns with its data column on display width:\n{out}"
         );
     }
 

@@ -45,21 +45,26 @@ sessiometer status
 ## Checking status
 
 `sessiometer status` queries the running daemon and prints each account as one
-row of an aligned, header-less, border-less table — greppable, one record per line:
+row of an aligned, border-less table under a labelled header — greppable, one
+record per line:
 
 ```text
-* work   97% 12m  40% 5d
-  spare  10% 2h   20% 3d
-  dead   n/a n/a  n/a n/a  needs re-login
+ACCOUNT  SESSION% RESET  WEEKLY% RESET  HEALTH
+* work   97%      12m    40%     5d
+  spare  10%      2h     20%     3d
+  dead   n/a      n/a    n/a     n/a    needs re-login
 
 next swap: spare
 ```
 
+- A **header row** labels the columns: `ACCOUNT`, then the grouped `SESSION%` +
+  `RESET`, then the grouped `WEEKLY%` + `RESET`, then `HEALTH`. It is plain
+  (uncolored) and aligned with the data; each window's reset shares the `RESET`
+  label, disambiguated by sitting beside its own `%`.
 - `*` marks the **active** account.
 - Each account carries **two `% reset` pairs**: a **session** pair (the rolling
   5-hour window — *when work resumes*) then a **weekly** pair (the account-level
-  window — *when the account fully frees up*). There is **no header row**: each
-  `%` sits immediately before its own reset, so the pairing reads by adjacency —
+  window — *when the account fully frees up*), in that paired order —
   `session% session-reset`, then `weekly% weekly-reset`.
 - The percentages are the last-polled usage (`n/a` when the last poll for that
   account failed — never a fabricated `0`).
@@ -81,10 +86,10 @@ the next rotation will land.
 
 On a terminal too narrow for the full table the lowest-priority columns drop in
 order — the **weekly pair** (`weekly%` + `weekly-reset`) first and together, then
-the health-text column — never wrapping a row; the label and the **session pair**
-(the soonest, most actionable reset) are always kept. Output that is piped or
-redirected (not a TTY) always keeps the full table, so `sessiometer status | grep
-work` stays complete.
+the health-text column, each taking its header label with it — never wrapping a
+row; the `ACCOUNT` label and the **session pair** (the soonest, most actionable
+reset) and their labels are always kept. Output that is piped or redirected (not a
+TTY) always keeps the full table, so `sessiometer status | grep work` stays complete.
 
 On an interactive terminal each **cell** is **color-coded by its own health** —
 **green** / **yellow** / **red**. Each `%` is coloured by its own utilization
