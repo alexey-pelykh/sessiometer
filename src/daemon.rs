@@ -758,12 +758,13 @@ struct AccountHealth {
     /// [`Event::CredentialDead`] / [`Event::CredentialRestored`] signals exactly once
     /// per transition.
     quarantined: bool,
-    /// Consecutive successful recovery probes after a quarantined account is
-    /// re-logged-in (issue #42). A quarantined account is polled only when it is the
-    /// active account — which it becomes only after the operator re-logs-in it (a
-    /// canonical-change re-stash, #13) — so each `Live` poll here is a recovery
-    /// probe; reaching `monitor_recovery_m` consecutive un-quarantines it. Reset to 0
-    /// on any non-success, so the M successes must be consecutive.
+    /// Consecutive successful recovery probes on a quarantined account that recovers
+    /// WITHOUT a re-login (issue #42). A re-login un-quarantines on the spot (the #13
+    /// re-stash now clears the flag directly, issue #107), so this counter advances
+    /// only on the spontaneous-revival path: a dead ACTIVE account with no viable swap
+    /// target stays active and is re-probed, and if its OWN token starts answering
+    /// again, reaching `monitor_recovery_m` consecutive `Live` polls un-quarantines it.
+    /// Reset to 0 on any non-success, so the M successes must be consecutive.
     recovery_successes: u32,
 }
 
@@ -1337,6 +1338,13 @@ where
     /// retried next cycle. After a successful re-stash the cached active index is
     /// dropped so it is re-resolved against the new canonical (a `/login` may have
     /// switched to a different account).
+    ///
+    /// If the re-stashed account was QUARANTINED (issue #107), the re-login also
+    /// un-quarantines it immediately and emits [`Event::CredentialRestored`] — a
+    /// just-re-authenticated credential is live, so it must not linger in
+    /// `needs re-login` for `monitor_recovery_m` more polls. The slower
+    /// M-consecutive-live-poll recovery in [`note_poll_outcome`](Self::note_poll_outcome)
+    /// stays for the spontaneous-revival path (no re-login).
     async fn reconcile_canonical_change(
         &mut self,
         canonical: &Credential,
@@ -1353,6 +1361,25 @@ where
                         events.push(Event::ReStash {
                             account: self.roster[idx].label.clone(),
                         });
+                        // A re-login of a quarantined account un-quarantines it ON THE
+                        // SPOT (issue #107): a just-re-authenticated canonical IS a live
+                        // credential, so stranding it in `needs re-login` for
+                        // `monitor_recovery_m` more polls would make the durable status
+                        // lie for ~a poll interval. Edge-triggered: clear the flag, drop
+                        // any in-flight recovery probe, and emit `CredentialRestored`
+                        // exactly once on the dead→alive transition. If the new token is
+                        // somehow dead after all, the normal `monitor_401_n` path
+                        // re-quarantines it. The M-consecutive-live-poll recovery in
+                        // `note_poll_outcome` remains for the spontaneous-revival path (a
+                        // dead ACTIVE account whose own token answers again WITHOUT a
+                        // re-login).
+                        if self.state.health[idx].quarantined {
+                            self.state.health[idx].quarantined = false;
+                            self.state.health[idx].recovery_successes = 0;
+                            events.push(Event::CredentialRestored {
+                                account: self.roster[idx].label.clone(),
+                            });
+                        }
                         // Handled: advance the baseline so this write is not
                         // re-detected, and drop the cached active so it is
                         // re-resolved against the new canonical below.
@@ -1439,14 +1466,14 @@ where
     /// - **Live** (success): reset the streak. If the account is quarantined, this is
     ///   a recovery probe — count consecutive successes and, at `monitor_recovery_m`,
     ///   un-quarantine it and emit [`Event::CredentialRestored`] (edge-triggered,
-    ///   ONCE). A quarantined account is polled only while it is active, and the
-    ///   COMMON way a dead account becomes active is the operator re-logging-in (the
-    ///   #13 canonical-change re-stash) — so recovery normally follows a genuine
-    ///   re-login. The one exception is a dead ACTIVE account with no viable swap
-    ///   target (it stays active and is re-probed): if its OWN token starts answering
-    ///   again, M live polls restore it without a re-login. That is intended — a token
-    ///   returning success M times in a row is a working credential, and leaving such
-    ///   an account stranded in `needs re-login` would make the durable status lie.
+    ///   ONCE). This M-poll path is now the SPONTANEOUS-REVIVAL case only: a re-login
+    ///   un-quarantines immediately in
+    ///   [`reconcile_canonical_change`](Self::reconcile_canonical_change) (issue #107),
+    ///   so the account reaching here is a dead ACTIVE one with no viable swap target
+    ///   (it stays active and is re-probed) whose OWN token starts answering again
+    ///   WITHOUT a re-login. That is intended — a token returning success M times in a
+    ///   row is a working credential, and leaving such an account stranded in
+    ///   `needs re-login` would make the durable status lie.
     /// - **ScopeMissing** (403): reset the streak — a 403 token authenticates, so it
     ///   is NOT dead — and emit `usage_scope_fail` (#5). Resets any recovery probe.
     /// - **Transient** (5xx / network / 429 / other 4xx / locked / unreadable): reset
@@ -1533,9 +1560,11 @@ where
                 // Still failing (no reading) → the live session is blocked. Escape it
                 // with an emergency swap, bypassing the swap-away trigger AND cooldown.
                 None => return self.emergency_swap(at, active_idx, readings, events).await,
-                // Polling live again → the credential is recovering (normally the
-                // operator's re-login; note_poll_outcome counts toward restore). Hold:
-                // never swap away mid-recovery, never emergency-swap one that now works.
+                // Polling live again → the credential is spontaneously reviving (a
+                // re-login would already have un-quarantined it upstream in
+                // reconcile_canonical_change, #107; note_poll_outcome counts these live
+                // polls toward the M-poll restore). Hold: never swap away mid-recovery,
+                // never emergency-swap one that now works.
                 Some(_) => return TickAction::Held,
             }
         }
@@ -6267,9 +6296,11 @@ mod tests {
 
     #[tokio::test]
     async fn m_consecutive_live_polls_recover_a_quarantined_account_and_signal_once() {
-        // Auto-recovery: a re-logged-in account (active again via the #13 re-stash)
-        // un-quarantines after M consecutive live polls, emitting exactly one
-        // `credential_restored` on the dead→alive edge.
+        // Spontaneous-revival auto-recovery (no re-login): a dead ACTIVE account whose
+        // own token starts answering again un-quarantines after M consecutive live
+        // polls, emitting exactly one `credential_restored` on the dead→alive edge. (A
+        // re-login takes the immediate #107 path in reconcile_canonical_change instead —
+        // see `a_relogin_un_quarantines_a_dead_account_immediately_on_restash`.)
         let mut daemon = lifecycle_daemon().await;
         daemon.state.health[0].quarantined = true;
         let mut events = Vec::new();
@@ -6395,12 +6426,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_relogin_makes_a_dead_account_active_and_m_live_polls_restore_it() {
-        // The full auto-recovery path end-to-end (AC #4), exercising the #13↔#42 seam
-        // the unit tests stub: a dead account (quarantined, already emergency-swapped
-        // away so the spare is active) is re-logged-in by the operator. The #13
-        // canonical-change re-stash makes it active again; THEN — and only then — its
-        // live polls count toward recovery, un-quarantining it after M (2).
+    async fn a_relogin_un_quarantines_a_dead_account_immediately_on_restash() {
+        // Issue #107 (AC #1, #2, #4): the full re-login recovery path end-to-end,
+        // exercising the #13↔#42 seam. A dead account (quarantined, already
+        // emergency-swapped away so the spare is active) is re-logged-in by the
+        // operator. The #13 canonical-change re-stash now un-quarantines it ON THE SPOT
+        // — `status` stops lying on the NEXT tick, with NO M-poll delay — emitting
+        // exactly one `credential_restored` on the dead→alive edge. Distinct from the
+        // spontaneous-revival path
+        // (`m_consecutive_live_polls_recover_a_quarantined_account_and_signal_once`),
+        // which still needs M live polls because no re-login event marks the token fresh.
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"B-token").await; // `spare` is active post-emergency-swap
         let stash = stash_with(&[
@@ -6426,16 +6461,13 @@ mod tests {
         daemon.state.active = Some(1);
         daemon.state.health[0].quarantined = true;
 
-        // Tick 1 primes the canonical watch on `spare`; the dead `work` is skipped.
+        // Tick 1 primes the canonical watch on `spare`; the dead `work` is skipped and
+        // stays dead — no re-login has happened yet.
         let first = daemon.tick().await;
         assert!(!first
             .events
             .iter()
             .any(|e| matches!(e, Event::ReStash { .. } | Event::CredentialRestored { .. })));
-        assert_eq!(
-            daemon.state.health[0].recovery_successes, 0,
-            "not polled while parked"
-        );
         assert!(daemon.state.health[0].quarantined);
 
         // The operator `claude /login`s back into `work`: the canonical becomes its
@@ -6443,8 +6475,10 @@ mod tests {
         daemon.store.write(&cred(b"A-reauthed")).await.unwrap();
         crate::claude_state::write_oauth_account(&json, &oauth("u-A")).unwrap();
 
-        // Tick 2 detects the change, re-stashes `work`, re-resolves it active, and its
-        // first live poll is the first recovery success — still dead (M = 2).
+        // Tick 2 detects the change, re-stashes `work`, re-resolves it active, AND
+        // un-quarantines it immediately — no M-poll wait (#107). The same-tick poll that
+        // runs after the re-stash sees an already-healthy account, so it does NOT emit a
+        // second restore (edge-triggered, exactly once).
         let second = daemon.tick().await;
         assert!(
             second
@@ -6454,56 +6488,41 @@ mod tests {
             "the re-login re-stashes work: {:?}",
             second.events
         );
+        assert!(
+            !daemon.state.health[0].quarantined,
+            "the re-login un-quarantines work on the spot — no M-poll delay (#107)"
+        );
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 0,
+            "an immediate restore leaves no recovery probe pending"
+        );
         assert_eq!(
             daemon.state.active,
             Some(0),
             "the re-logged-in account is active again"
         );
-        assert!(
-            daemon.state.health[0].quarantined,
-            "one live poll is not yet a recovery"
-        );
-        assert_eq!(daemon.state.health[0].recovery_successes, 1);
-
-        // Tick 3: now that `work` is active again the staggered schedule (#80) is
-        // [work, spare]; this tick the round-robin cursor lands on the SPARE, so
-        // `work` is not re-polled and its recovery streak HOLDS at 1 — un-broken (a
-        // poll of another account never resets a per-account recovery streak), just
-        // not advanced.
-        let third = daemon.tick().await;
-        assert!(
-            daemon.state.health[0].quarantined,
-            "still recovering — work was not the account polled this tick"
-        );
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 1,
-            "polling the spare does not advance work's recovery"
-        );
-        assert!(
-            !third
-                .events
-                .iter()
-                .any(|e| matches!(e, Event::CredentialRestored { .. })),
-            "no restore until work itself is re-polled: {:?}",
-            third.events
-        );
-
-        // Tick 4: the cursor wraps back to `work`; its second consecutive live poll
-        // reaches M → RESTORED, once.
-        let fourth = daemon.tick().await;
-        assert!(
-            !daemon.state.health[0].quarantined,
-            "M live polls un-quarantine it"
-        );
-        assert_eq!(
-            fourth
+            second
                 .events
                 .iter()
                 .filter(|e| matches!(e, Event::CredentialRestored { account } if account == "work"))
                 .count(),
             1,
-            "exactly one credential_restored on the edge: {:?}",
-            fourth.events
+            "exactly one credential_restored on the un-quarantine edge: {:?}",
+            second.events
+        );
+
+        // Tick 3: `work` is healthy and active; no canonical change and no quarantine →
+        // no further restore (the edge does not re-fire on an already-alive account).
+        let third = daemon.tick().await;
+        assert!(!daemon.state.health[0].quarantined);
+        assert!(
+            !third
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CredentialRestored { .. })),
+            "no repeat restore on an already-healthy account: {:?}",
+            third.events
         );
     }
 

@@ -141,9 +141,11 @@ pub(crate) struct Tunables {
     /// detection ([`crate::keychain::CanonicalWatch`]), not by 401s.
     pub(crate) monitor_401_n: u8,
     /// Consecutive recovery-probe successes before a quarantined (dead) account is
-    /// restored to the rotation (`1..=20`, issue #42). After the operator re-logs-in
-    /// a quarantined account (a canonical-change re-stash, #13), the account must
-    /// poll successfully this many times in a row before it is un-quarantined.
+    /// restored to the rotation (`1..=20`, issue #42). This governs the
+    /// spontaneous-revival path only: a dead ACTIVE account whose own token starts
+    /// answering again (WITHOUT a re-login) must poll successfully this many times in a
+    /// row before it is un-quarantined. A re-login un-quarantines immediately instead
+    /// (the #13 canonical-change re-stash clears the flag directly, issue #107).
     pub(crate) monitor_recovery_m: u8,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
@@ -473,7 +475,8 @@ impl Config {
         out.push_str(&format!("monitor_401_n = {}\n", t.monitor_401_n));
         out.push_str(
             "# Consecutive recovery-probe successes before a quarantined (dead) account\n\
-             # is restored to the rotation after a re-login (1..=20).\n",
+             # whose own token starts working again (without a re-login) is restored to\n\
+             # the rotation (1..=20). A re-login restores it immediately.\n",
         );
         out.push_str(&format!("monitor_recovery_m = {}\n", t.monitor_recovery_m));
 
