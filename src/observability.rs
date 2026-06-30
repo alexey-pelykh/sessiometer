@@ -111,8 +111,11 @@ pub(crate) enum RefreshEventOutcome {
 }
 
 impl RefreshEventOutcome {
-    /// The `outcome=` token.
-    fn as_str(self) -> &'static str {
+    /// The `outcome=` token. `pub(crate)` so the offline `list` view (issue #120) can
+    /// render the last-persisted outcome it reads back via [`last_refresh_outcomes`]
+    /// in the SAME vocabulary the log writes — an operator who greps `sessiometer.log`
+    /// for `outcome=` sees the identical token `list` shows.
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             RefreshEventOutcome::Refreshed => "refreshed",
             RefreshEventOutcome::RefreshedNotReStashed => "refreshed_not_restashed",
@@ -120,6 +123,23 @@ impl RefreshEventOutcome {
             RefreshEventOutcome::Dead => "dead",
             RefreshEventOutcome::Error => "error",
         }
+    }
+
+    /// Parse an `outcome=` token back into its variant — the inverse of [`as_str`],
+    /// for reading the last-persisted refresh outcome out of the event log (issue
+    /// #120). `None` for an unrecognized token (a truncated / future / corrupt line),
+    /// so a malformed record is skipped rather than mis-classified.
+    ///
+    /// [`as_str`]: RefreshEventOutcome::as_str
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "refreshed" => RefreshEventOutcome::Refreshed,
+            "refreshed_not_restashed" => RefreshEventOutcome::RefreshedNotReStashed,
+            "no_change" => RefreshEventOutcome::NoChange,
+            "dead" => RefreshEventOutcome::Dead,
+            "error" => RefreshEventOutcome::Error,
+            _ => return None,
+        })
     }
 }
 
@@ -487,6 +507,53 @@ pub(crate) fn last_swap_at(path: &std::path::Path) -> Option<SystemTime> {
     // The log only ever writes post-epoch instants; guard the cast so a malformed
     // pre-epoch stamp degrades to `None` rather than wrapping into a wrong instant.
     (epoch >= 0).then(|| UNIX_EPOCH + Duration::from_secs(epoch as u64))
+}
+
+/// The LAST-persisted refresh outcome per account in the event log at `path`, keyed by
+/// account HANDLE — the daemon-INDEPENDENT read the offline `list` view (issue #120)
+/// surfaces alongside each account's stored-token expiry.
+///
+/// The `status` view computes its 4-state rollup live in the daemon (issue #119); when
+/// the daemon is down — often exactly when a wedged credential needs inspecting — that
+/// path is unavailable, so `list` reads the durable record the refresh sweep already
+/// wrote: each [`Event::Refresh`] line (`event=refresh account={handle} outcome={token}`,
+/// issue #106). The SAME file-read sibling of [`last_swap_at`] — scan the append-only,
+/// chronological log; the last `refresh` line for a handle is its most recent outcome.
+///
+/// One pass (not one read per account): later lines overwrite earlier, so each handle
+/// ends mapped to its newest outcome. The account field is anchored between the literal
+/// ` event=refresh account=` prefix and the ` outcome=` that always immediately follows
+/// it (the [`Event::to_log_line`] grammar), so a handle is matched verbatim — a handle
+/// that merely *contains* ` outcome=` truncates to "no recognized outcome" (skipped)
+/// rather than mis-attributing. Best-effort like [`last_swap_at`]: an absent/unreadable
+/// log yields an empty map, so `list` simply omits the refresh tag.
+///
+/// Non-secret: the event log is itself a redaction-metered surface (issue #15) — every
+/// line is a handle / enum / timestamp — so the returned handles and outcomes carry no
+/// token or email.
+pub(crate) fn last_refresh_outcomes(
+    path: &std::path::Path,
+) -> std::collections::HashMap<String, RefreshEventOutcome> {
+    let mut outcomes = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return outcomes;
+    };
+    for line in text.lines() {
+        // ts=… event=refresh account={handle} outcome={token}[ expires_before=…][ expires_after=…]
+        let Some((_, rest)) = line.split_once(" event=refresh account=") else {
+            continue;
+        };
+        let Some((handle, after)) = rest.split_once(" outcome=") else {
+            continue;
+        };
+        let token = after.split(' ').next().unwrap_or(after);
+        if let Some(outcome) = RefreshEventOutcome::from_token(token) {
+            // Last line wins: the log is chronological, so the final insert per handle
+            // is its most recent refresh outcome.
+            outcomes.insert(handle.to_owned(), outcome);
+        }
+    }
+    outcomes
 }
 
 /// Operator-facing diagnostic verbosity (issue #77) for the `run` daemon. Default
@@ -1147,6 +1214,85 @@ ts=1970-01-01T00:00:40Z event=monitor_401 account=c consecutive=1\n";
         )
         .unwrap();
         assert_eq!(last_swap_at(&path), Some(at_epoch(60)));
+    }
+
+    #[test]
+    fn refresh_outcome_token_round_trips() {
+        // Issue #120: `from_token` is the exact inverse of `as_str`, so the offline
+        // `list` view reads back precisely the variant the log wrote. An unrecognized
+        // token (a truncated / future / corrupt line) is `None`, never mis-classified.
+        for outcome in [
+            RefreshEventOutcome::Refreshed,
+            RefreshEventOutcome::RefreshedNotReStashed,
+            RefreshEventOutcome::NoChange,
+            RefreshEventOutcome::Dead,
+            RefreshEventOutcome::Error,
+        ] {
+            assert_eq!(
+                RefreshEventOutcome::from_token(outcome.as_str()),
+                Some(outcome)
+            );
+        }
+        assert_eq!(RefreshEventOutcome::from_token("bogus"), None);
+        assert_eq!(RefreshEventOutcome::from_token(""), None);
+    }
+
+    #[test]
+    fn last_refresh_outcomes_maps_each_handle_to_its_latest_outcome() {
+        // Issue #120: the daemon-independent read the offline `list` view surfaces.
+        // The log is append-only chronological, so per handle the LAST `refresh` line
+        // wins; a non-refresh line is ignored, and the optional expiry fields after
+        // `outcome=` do not bleed into the parsed token.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        let content = "\
+ts=1970-01-01T00:00:10Z event=refresh account=work outcome=no_change\n\
+ts=1970-01-01T00:00:20Z event=refresh account=spare outcome=refreshed expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T02:00:00Z\n\
+ts=1970-01-01T00:00:30Z event=monitor_401 account=work consecutive=1\n\
+ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead\n";
+        std::fs::write(&path, content).unwrap();
+        let outcomes = last_refresh_outcomes(&path);
+        // `work`'s latest refresh is the `dead` at epoch 40 — not the earlier `no_change`,
+        // and the intervening `monitor_401` line is not a refresh.
+        assert_eq!(outcomes.get("work"), Some(&RefreshEventOutcome::Dead));
+        // `spare`'s only refresh is `refreshed`; the trailing `expires_*` fields are
+        // stripped, leaving the bare outcome token.
+        assert_eq!(outcomes.get("spare"), Some(&RefreshEventOutcome::Refreshed));
+        assert_eq!(outcomes.len(), 2);
+    }
+
+    #[test]
+    fn last_refresh_outcomes_is_empty_for_an_absent_or_refreshless_log() {
+        let dir = tempfile::tempdir().unwrap();
+        // Absent file → empty (best-effort: `list` simply omits the refresh tag).
+        assert!(last_refresh_outcomes(&dir.path().join("absent.log")).is_empty());
+        // A present log with NO refresh line → empty.
+        let path = dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&path).unwrap();
+        log.emit(&Event::CredentialDead {
+            account: "work".to_owned(),
+        })
+        .unwrap();
+        assert!(last_refresh_outcomes(&path).is_empty());
+    }
+
+    #[test]
+    fn last_refresh_outcomes_matches_a_handle_with_a_space_verbatim() {
+        // A handle is operator free text that may contain spaces; the account field is
+        // anchored between ` event=refresh account=` and the ` outcome=` that always
+        // follows it, so `my work` is matched whole rather than truncated at the space.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:00:10Z event=refresh account=my work outcome=refreshed\n",
+        )
+        .unwrap();
+        let outcomes = last_refresh_outcomes(&path);
+        assert_eq!(
+            outcomes.get("my work"),
+            Some(&RefreshEventOutcome::Refreshed)
+        );
     }
 
     // --- Diagnostic::to_log_line (the diagnostic channel's redaction surface, #77) ---

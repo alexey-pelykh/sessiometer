@@ -8029,6 +8029,28 @@ mod tests {
         }
     }
 
+    /// The MAXIMAL-mix #120 auth subset the offline `list` view trails, for the
+    /// redaction-meter corpus: a future expiry + `refreshed`, a past expiry + `dead`
+    /// (the `claude /login` cue), and a both-unavailable row — so the metered output
+    /// covers every auth-tag shape. `now` is the corpus clock; `* 1000` lifts seconds to
+    /// the epoch milliseconds `expires_at_ms` carries.
+    fn meter_auth_subset(now: i64) -> Vec<crate::cli::AuthSubset> {
+        vec![
+            crate::cli::AuthSubset {
+                expires_at_ms: Some((now + 7_200) * 1000),
+                last_refresh: Some(RefreshEventOutcome::Refreshed),
+            },
+            crate::cli::AuthSubset {
+                expires_at_ms: Some((now - 3_600) * 1000),
+                last_refresh: Some(RefreshEventOutcome::Dead),
+            },
+            crate::cli::AuthSubset {
+                expires_at_ms: None,
+                last_refresh: None,
+            },
+        ]
+    }
+
     /// A daemon whose every credential input carries the fixture's secrets: the
     /// canonical store and each per-account stash hold the secret blob, and each
     /// stashed identity (plus `~/.claude.json`) carries the secret email. Returns
@@ -8322,12 +8344,23 @@ mod tests {
             harvest_channels(&outcome, &mut corpus);
         }
 
-        // Channel — the offline `list` roster view (label, full uuid).
+        // Channel — the offline `list` roster view (label, full uuid) ENRICHED with the
+        // #120 auth subset: each row's `expiresAt`-derived freshness + last-persisted
+        // refresh outcome. The auth fields are a timestamp and a bare enum token, so they
+        // must clear the same #15 bar as the rest of the view; `meter_auth_subset` is the
+        // maximal mix (future + past expiry, the `dead`/`claude /login` cue, an empty
+        // subset) harvested through the SAME `render_roster` production renders. `NOW` is
+        // the fixed corpus clock.
+        const NOW: i64 = 1_782_777_600;
         let roster: Vec<Account> = [A, B, C]
             .iter()
             .map(|(uuid, label)| account(uuid, label))
             .collect();
-        corpus.push_str(&crate::cli::render_roster(&roster));
+        corpus.push_str(&crate::cli::render_roster(
+            &roster,
+            &meter_auth_subset(NOW),
+            NOW,
+        ));
 
         // Channel — the diagnostic lifecycle Start summary (issue #77). The per-poll /
         // per-tick diagnostic lines are harvested per-cycle by `harvest_channels`
@@ -8690,11 +8723,16 @@ mod tests {
 
         // --- the remaining operator channels: the offline `list` view, the UDS error
         // replies, and every Error Display — all secret-free by construction. -------
-        corpus.push_str(&crate::cli::render_roster(&[
-            account(A.0, A.1),
-            account(B.0, B.1),
-            account(C.0, C.1),
-        ]));
+        // The `list` view is ENRICHED with the #120 auth subset (expiry freshness + last
+        // refresh outcome); `meter_auth_subset` is the maximal mix so the metered corpus
+        // covers a future expiry, a past expiry + the `dead`/`claude /login` cue, and an
+        // empty subset.
+        const NOW: i64 = 1_782_777_600;
+        corpus.push_str(&crate::cli::render_roster(
+            &[account(A.0, A.1), account(B.0, B.1), account(C.0, C.1)],
+            &meter_auth_subset(NOW),
+            NOW,
+        ));
         corpus.push('\n');
         corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
         corpus.push('\n');
