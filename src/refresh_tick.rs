@@ -70,6 +70,44 @@ pub(crate) struct SweepOutcome {
     pub(crate) events: Vec<Event>,
     /// `account_uuid`s of quarantined accounts the cycle proved still refreshable.
     pub(crate) restored: Vec<String>,
+    /// One [`RefreshObservation`] per account the sweep READ this cycle (issue #119) —
+    /// the credential clocks the daemon folds into its per-account health state for the
+    /// `status` rollup. Recorded for EVERY non-excluded, allowlisted account whose stash
+    /// the sweep touched (so a healthy far-from-expiry account still surfaces its expiry
+    /// clock), with the refresh-health delta present only on the ones actually refreshed.
+    pub(crate) observations: Vec<RefreshObservation>,
+}
+
+/// One account's credential-clock observation from a sweep (issue #119): the stored
+/// access-token expiry the sweep read, plus — only when the account was actually
+/// refreshed this cycle — the refresh-health delta. The daemon folds these into its
+/// per-account health state ([`crate::daemon`]) for the `status` 4-state rollup; every
+/// field is non-secret (a timestamp, a classification, a boolean — never a token / email).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RefreshObservation {
+    /// The account, keyed by `account_uuid` (the daemon resolves it to a roster slot) —
+    /// the same resolution key `restored` uses; never the email or a token.
+    pub(crate) account_uuid: String,
+    /// The stored access-token `expiresAt` (epoch MS, CC's native unit) the sweep read
+    /// this cycle, or `None` when the stash was unreadable. The daemon converts to epoch
+    /// seconds at the fold boundary.
+    pub(crate) expires_at_ms: Option<i64>,
+    /// The refresh-health delta — `Some` ONLY when this cycle actually ran a refresh (a
+    /// near-expiry or quarantined account); `None` when the sweep merely READ the
+    /// account's expiry without refreshing it (a healthy, far-from-expiry account).
+    pub(crate) refresh: Option<RefreshDelta>,
+}
+
+/// The non-secret refresh-health signal from one completed refresh cycle (issue #119):
+/// the classification plus whether the refresh token rotated. The expiry slide lives in
+/// [`RefreshObservation::expires_at_ms`]; this is the "did it work / did the token value
+/// change" half the rollup's at-risk / dead inputs key off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RefreshDelta {
+    /// The cycle's non-secret classification (the same one the [`Event::Refresh`] carries).
+    pub(crate) outcome: RefreshEventOutcome,
+    /// Whether CC rotated the refresh token value this cycle (the AC-3 durability signal).
+    pub(crate) token_rotated: bool,
 }
 
 /// The per-account isolated-refresh operations [`RefreshTick`] drives, injected as a seam so
@@ -226,13 +264,23 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // Near-expiry within one cadence gates HEALTHY accounts (an unreadable expiry is
             // skipped — a stash the sweep cannot even read is not a routine candidate). A
             // quarantined account is exempt: it is refreshed for the RESTORE check (#106).
+            // A read-only (not near-expiry, not quarantined) account still records a #119
+            // credential-clock observation — just its expiry, with no refresh-health delta —
+            // so a healthy, far-from-expiry account surfaces its expiry clock to the rollup.
             if !is_quarantined && !is_near_expiry(before_ms, now_ms, horizon_ms) {
+                outcome.observations.push(RefreshObservation {
+                    account_uuid: account.account_uuid.clone(),
+                    expires_at_ms: before_ms,
+                    refresh: None,
+                });
                 continue;
             }
             // One whole-cycle, timeout-bounded refresh. Every terminal state is non-fatal
             // (engine Caller contract); the event is redacted to the handle + classification
             // + the non-secret before/after expiry (issue #106, via the single #15 surface).
-            let event =
+            // The same report also yields the #119 observation: the post-cycle expiry plus
+            // the refresh-health delta (classification + token-rotation) the rollup keys off.
+            let (event, observation) =
                 match tokio::time::timeout(self.config.timeout(), self.engine.refresh(account))
                     .await
                 {
@@ -249,13 +297,40 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                         {
                             outcome.restored.push(account.account_uuid.clone());
                         }
-                        refresh_event(&account.label, before_ms, &report)
+                        let observation = RefreshObservation {
+                            account_uuid: account.account_uuid.clone(),
+                            // The post-cycle stored expiry (the event's `expires_after`): a
+                            // re-stashed refresh slid it forward; every other terminal state
+                            // left the stash — and so the expiry — unchanged.
+                            expires_at_ms: expires_after(before_ms, &report),
+                            refresh: Some(RefreshDelta {
+                                outcome: refresh_event_outcome(&report),
+                                token_rotated: report.refresh_token_rotated,
+                            }),
+                        };
+                        (
+                            refresh_event(&account.label, before_ms, &report),
+                            observation,
+                        )
                     }
                     // Secret-free: a hard `Err` / a timeout is an `error` outcome. The engine's
                     // error Display is NOT folded into the structured event — only the class is.
-                    Ok(Err(_)) | Err(_) => error_refresh_event(&account.label, before_ms),
+                    // The stash is untouched, so the rollup sees a refresh failure (→ at-risk)
+                    // with the expiry held at the before, never a misleading slide.
+                    Ok(Err(_)) | Err(_) => (
+                        error_refresh_event(&account.label, before_ms),
+                        RefreshObservation {
+                            account_uuid: account.account_uuid.clone(),
+                            expires_at_ms: before_ms,
+                            refresh: Some(RefreshDelta {
+                                outcome: RefreshEventOutcome::Error,
+                                token_rotated: false,
+                            }),
+                        },
+                    ),
                 };
             outcome.events.push(event);
+            outcome.observations.push(observation);
         }
         outcome
     }
@@ -737,6 +812,62 @@ mod tests {
                 expires_after: Some(soon),
             }]
         );
+    }
+
+    // --- credential-clock observations (issue #119) ------------------------
+
+    #[tokio::test]
+    async fn sweep_records_a_credential_clock_observation_for_every_account_it_reads() {
+        // A sweep surfaces each parked account's credential clocks to the daemon's rollup: a
+        // near-expiry account through its refresh (the post-cycle expiry PLUS a refresh-health
+        // delta), and a far-from-expiry one READ-ONLY (just its expiry, no delta). The
+        // excluded active account is never read, so it records nothing.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000; // within the 1h horizon → refreshed
+        let later = now_ms + 24 * 3_600_000; // far out → read-only
+        let roster = vec![
+            acct("active", "u-A"),
+            acct("near", "u-B"),
+            acct("fresh", "u-C"),
+        ];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_expiry("u-B", Some(soon))
+            .with_expiry("u-C", Some(later))
+            .with_result(
+                "u-B",
+                FakeRefresh::Report(RefreshReport {
+                    outcome: RefreshOutcome::Refreshed,
+                    expires_at_delta_secs: Some(7200), // +2h slide
+                    refresh_token_rotated: true,       // the AC-3 durability signal
+                    re_stashed: true,
+                }),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&["u-A".to_owned()], &[]).await;
+        assert_eq!(
+            outcome.observations,
+            vec![
+                // The refreshed account: post-cycle expiry slid forward, plus the delta the
+                // rollup keys its alive/at-risk + token-rotation views off.
+                RefreshObservation {
+                    account_uuid: "u-B".to_owned(),
+                    expires_at_ms: Some(soon + 7_200_000),
+                    refresh: Some(RefreshDelta {
+                        outcome: RefreshEventOutcome::Refreshed,
+                        token_rotated: true,
+                    }),
+                },
+                // The read-only account: just its (unchanged) expiry, no refresh-health delta.
+                RefreshObservation {
+                    account_uuid: "u-C".to_owned(),
+                    expires_at_ms: Some(later),
+                    refresh: None,
+                },
+            ]
+        );
+        // Only the near-expiry account was actually refreshed; the read-only one was not.
+        assert_eq!(t.engine.refreshed(), vec!["u-B"]);
     }
 
     // --- restore-on-success (issue #106 deliverable #2) --------------------

@@ -19,7 +19,7 @@ use crate::daemon::{
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
-use crate::observability::{Diagnostic, DiagnosticLog, EventLog, Verbosity};
+use crate::observability::{CredentialHealth, Diagnostic, DiagnosticLog, EventLog, Verbosity};
 use crate::paths;
 use crate::refresh;
 use crate::refresh_tick::{RealRefreshEngine, RefreshTick};
@@ -582,9 +582,13 @@ struct StatusRow {
     weekly: String,
     /// Compact time until the WEEKLY window resets, or `n/a` (issue #94).
     weekly_reset: String,
-    /// Inline tags (`disabled`, `needs re-login` / `recovering`), comma-joined; empty
-    /// when none. `recovering` (issue #109) replaces `needs re-login` for a healing
-    /// quarantined account.
+    /// The HEALTH cell (issue #119): the daemon's 4-state credential rollup as ONE glyph
+    /// (🟢 healthy · 🟡 stale · 🟠 at-risk · 🔴 dead), with the `claude /login` cue appended
+    /// for a dead account — softened to `recovering` for a healing quarantined one (#109) —
+    /// and a trailing `disabled` for a parked account (#36, orthogonal to credential health).
+    /// Falls back to the legacy comma-joined tags (`disabled`, `needs re-login` / `recovering`)
+    /// when the daemon sent no rollup (a pre-#119 daemon, `health == None`). Empty only for a
+    /// pre-#119 daemon with no tags.
     status: String,
     /// Per-cell urgency for the color overlay (issue #84): each cell carries its OWN
     /// health, so one row can show several independent colors (a red `session` reset
@@ -608,34 +612,13 @@ impl StatusRow {
         // `*` marks the active account (as the event log does); a leading space
         // keeps the inactive labels aligned under it.
         let marker = if account.active { '*' } else { ' ' };
-        // A parked account is `disabled` (issue #36); a dead-credential one
-        // `needs re-login` (issue #42, the durable quarantine status) — softened to
-        // `recovering` while its credential is answering again and climbing back
-        // (issue #109). Tags can hold at once, so they comma-join rather than overwrite.
-        let mut status = String::new();
-        if !account.enabled {
-            status.push_str("disabled");
-        }
-        if account.quarantined {
-            if !status.is_empty() {
-                status.push_str(", ");
-            }
-            // `recovering` always implies `quarantined`, so it only refines this branch:
-            // a healing account reads `recovering`, not the alarming `needs re-login`,
-            // so an operator does not swap away from it toward a worse account (#109).
-            status.push_str(if account.recovering {
-                "recovering"
-            } else {
-                "needs re-login"
-            });
-        }
         StatusRow {
             account: format!("{marker} {}", account.label),
             session: pct(account.session_pct),
             session_reset: reset_cell(account.session_resets_at, now),
             weekly: pct(account.weekly_pct),
             weekly_reset: reset_cell(account.weekly_resets_at, now),
-            status,
+            status: health_cell(account),
             // Each cell colored by its OWN health (issue #84): `account` → the overall
             // binding-window severity; `session` / `weekly` `%` → each window's own
             // utilization bands (weekly honoring the exhaustion override); each reset →
@@ -648,6 +631,76 @@ impl StatusRow {
             weekly_reset_severity: proximity_severity(account.weekly_resets_at, now),
         }
     }
+}
+
+/// The `status` HEALTH cell for one account (issue #119): the daemon's 4-state credential
+/// rollup as ONE glyph plus the minimal cue an operator needs to act, with the `disabled`
+/// rotation tag (#36) — orthogonal to credential health — appended.
+///
+/// `health == Some(verdict)` (a current daemon) renders the glyph; a DEAD account carries
+/// the actionable `claude /login` cue (AC-1), softened to `recovering` for a healing
+/// quarantined account so the operator neither re-logs-in needlessly nor swaps away from a
+/// recovering — often healthier — account (#109). `health == None` (a pre-#119 daemon that
+/// sent no rollup) falls back to the legacy comma-joined tags, so an old daemon's `status`
+/// is unchanged rather than mis-reading a defaulted glyph over a dead account.
+fn health_cell(account: &AccountStatusLine) -> String {
+    let Some(health) = account.health else {
+        return legacy_health_tags(account);
+    };
+    let mut cell = health_glyph(health).to_owned();
+    if health == CredentialHealth::Dead {
+        // A healing account (#109) reads `recovering`, not the `claude /login` command, so
+        // the operator holds rather than re-authing or swapping away; a genuinely dead one
+        // gets the exact command to run.
+        cell.push(' ');
+        cell.push_str(if account.recovering {
+            "recovering"
+        } else {
+            "claude /login"
+        });
+    }
+    // `disabled` (rotation #36) is independent of credential health — a parked account can
+    // be perfectly healthy — so it trails the glyph rather than replacing it.
+    if !account.enabled {
+        cell.push_str(" disabled");
+    }
+    cell
+}
+
+/// The emoji glyph for a 4-state rollup verdict (issue #119). Self-coloring (the glyph is
+/// content, not an ANSI overlay), so it conveys state even under `--no-color` and through a
+/// pipe; `display_width` already measures each as two terminal cells (the `0x1F300..` wide
+/// block), so the table stays aligned.
+fn health_glyph(health: CredentialHealth) -> &'static str {
+    match health {
+        CredentialHealth::Healthy => "🟢",
+        CredentialHealth::Stale => "🟡",
+        CredentialHealth::AtRisk => "🟠",
+        CredentialHealth::Dead => "🔴",
+    }
+}
+
+/// The pre-#119 HEALTH text for an account whose daemon sent no rollup (`health == None`):
+/// the comma-joined `disabled` (#36) + `needs re-login` / `recovering` (#42/#109) tags the
+/// column carried before the glyph rollup. Kept so a `status` client talking to an older
+/// daemon degrades gracefully rather than showing a defaulted-healthy glyph over a dead
+/// account.
+fn legacy_health_tags(account: &AccountStatusLine) -> String {
+    let mut status = String::new();
+    if !account.enabled {
+        status.push_str("disabled");
+    }
+    if account.quarantined {
+        if !status.is_empty() {
+            status.push_str(", ");
+        }
+        status.push_str(if account.recovering {
+            "recovering"
+        } else {
+            "needs re-login"
+        });
+    }
+    status
 }
 
 /// One urgency band for the `status` color overlay (issue #73), carried per CELL
@@ -1558,6 +1611,95 @@ spare  22222222-2222\n\
         assert!(!out.to_lowercase().contains("token"));
     }
 
+    // --- status: 4-state credential-health rollup (issue #119) --------------
+
+    #[test]
+    fn health_cell_projects_each_rollup_state_to_a_glyph_with_an_actionable_cue() {
+        use CredentialHealth::{AtRisk, Dead, Healthy, Stale};
+        // `health == Some(verdict)`: the daemon's 4-state rollup renders as ONE self-coloring
+        // glyph, plus the minimal cue an operator needs to act.
+        let cell = |health, quarantined, recovering, enabled| {
+            health_cell(&AccountStatusLine {
+                health,
+                quarantined,
+                recovering,
+                enabled,
+                ..status_line("work", false, Some(10), Some(20))
+            })
+        };
+        assert_eq!(cell(Some(Healthy), false, false, true), "🟢");
+        assert_eq!(cell(Some(Stale), false, false, true), "🟡");
+        assert_eq!(cell(Some(AtRisk), false, false, true), "🟠");
+        // A DEAD credential carries the exact recovery command (AC-1) — visibly distinct from
+        // a usage-exhausted but credential-healthy account, which carries no such cue.
+        assert_eq!(cell(Some(Dead), true, false, true), "🔴 claude /login");
+        // A HEALING quarantined account reads `recovering`, NOT the command — so the operator
+        // holds rather than re-authing or swapping away from an often-healthier account (#109).
+        assert_eq!(cell(Some(Dead), true, true, true), "🔴 recovering");
+        // The rotation `disabled` tag (#36) is orthogonal to credential health — a parked
+        // account can be perfectly healthy — so it TRAILS the glyph rather than replacing it.
+        assert_eq!(cell(Some(Healthy), false, false, false), "🟢 disabled");
+        assert_eq!(
+            cell(Some(Dead), true, false, false),
+            "🔴 claude /login disabled"
+        );
+        // `health == None` (a pre-#119 daemon sent no rollup): FALL BACK to the legacy
+        // quarantine text, so an old daemon's `status` is unchanged rather than mis-reading a
+        // defaulted-healthy glyph over a dead account.
+        assert_eq!(cell(None, true, false, true), "needs re-login");
+        assert_eq!(cell(None, false, false, false), "disabled");
+    }
+
+    #[test]
+    fn render_status_shows_the_health_glyph_per_account_and_the_dead_login_cue() {
+        // AC-1 end-to-end: a 4-state glyph per account, the credential-dead one showing 🔴 with
+        // the `claude /login` cue, and the wide emoji (two terminal cells) keeping the table
+        // aligned. The healthy account is also USAGE-EXHAUSTED (maxed session + weekly, weekly
+        // blocked) — yet still 🟢, because the rollup is credential health, ORTHOGONAL to usage:
+        // `claude /login` is shown ONLY for the credential-dead account, never the merely-spent
+        // one ("visibly distinct from usage-exhausted").
+        let healthy_but_spent = AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            weekly_exhausted: true,
+            ..status_line("work", true, Some(99), Some(99))
+        };
+        let dead = AccountStatusLine {
+            health: Some(CredentialHealth::Dead),
+            quarantined: true,
+            ..status_line("spare", false, None, None)
+        };
+        let response = StatusResponse {
+            accounts: vec![healthy_but_spent, dead],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        let work = out.lines().find(|l| l.contains("work")).unwrap();
+        assert!(
+            work.contains("🟢") && !work.contains("claude /login"),
+            "a usage-exhausted but credential-healthy account is 🟢 with no login cue: {work}"
+        );
+        let spare = out.lines().find(|l| l.contains("spare")).unwrap();
+        assert!(
+            spare.contains("🔴 claude /login"),
+            "the dead account shows the red glyph and the actionable cue: {spare}"
+        );
+        // The glyph IS the signal — present even without color, and #15-clean.
+        assert!(!out.contains('@'));
+        assert!(!out.to_lowercase().contains("token"));
+        // The HEALTH column starts at the SAME display offset in both rows — the preceding
+        // columns pad to one width despite the dead row's `n/a` cells and the healthy row's
+        // `%` readings (the last column's own trailing pad is trimmed, so total line widths
+        // legitimately differ; the wide-glyph cell width itself is covered by
+        // `display_width_counts_terminal_cells_not_chars`).
+        let glyph_offset =
+            |line: &str, glyph: &str| display_width(&line[..line.find(glyph).unwrap()]);
+        assert_eq!(
+            glyph_offset(work, "🟢"),
+            glyph_offset(spare, "🔴"),
+            "the HEALTH column is misaligned across rows:\n{out}"
+        );
+    }
+
     #[test]
     fn apply_enabled_flips_the_resolved_account_and_reports_change() {
         let mut roster = vec![acct("work", "u1"), acct("spare", "u2")];
@@ -1679,6 +1821,12 @@ spare  22222222-2222\n\
             session_resets_at: None,
             weekly_resets_at: None,
             weekly_exhausted: false,
+            // The layout / alignment / coloring tests below exercise the legacy
+            // (pre-#119) HEALTH text via `health: None`; the #119 glyph rollup has its
+            // own dedicated tests (`health_cell` + `render_status` with `Some(..)`).
+            access_expires_at: None,
+            refresh_health: None,
+            health: None,
         }
     }
 
@@ -1703,6 +1851,9 @@ spare  22222222-2222\n\
             session_resets_at,
             weekly_resets_at,
             weekly_exhausted,
+            access_expires_at: None,
+            refresh_health: None,
+            health: None,
         }
     }
 
