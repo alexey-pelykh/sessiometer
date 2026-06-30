@@ -19,6 +19,7 @@ mod keychain;
 mod observability;
 mod paths;
 mod redaction;
+mod sha256;
 mod stash;
 mod swap;
 mod timing;

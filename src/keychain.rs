@@ -12,6 +12,14 @@
 //! (`scripts/check-no-security-framework.sh`) keeps the SDK out of the
 //! dependency graph.
 //!
+//! **Service name.** The item's service is `Claude Code-credentials` for the
+//! default config dir, but Claude Code suffixes it with
+//! `-<sha256(CLAUDE_CONFIG_DIR)[..8]>` under a non-default `CLAUDE_CONFIG_DIR`
+//! (replicated byte-for-byte by [`canonical_service_from`], issue #100). Every site
+//! that names the canonical item — read/poll, swap-write, resolve — addresses the
+//! *resolved* name, so a CC instance run under an isolated config dir is managed,
+//! not invisible.
+//!
 //! The mechanism and the facts this module depends on were verified empirically
 //! before implementation — see `build/version-compat.md` (the issue #16 ledger):
 //! the store is the legacy file-based `login.keychain-db`, every call pins that
@@ -47,14 +55,81 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::paths;
+use crate::sha256::sha256_hex;
 
 /// Absolute path to the system `security` tool. Absolute (not bare `security`
 /// resolved through `$PATH`) so a hijacked `PATH` cannot substitute a different
 /// binary for this security-sensitive call.
 const SECURITY: &str = "/usr/bin/security";
 
-/// The generic-password service name Claude Code stores its credential under.
-const SERVICE: &str = "Claude Code-credentials";
+/// The base generic-password service name Claude Code stores its credential
+/// under, for the **default** config dir (`~/.claude` — `CLAUDE_CONFIG_DIR` unset
+/// or empty). Under a non-default config dir CC appends a hash suffix; the full
+/// name is resolved by [`canonical_service_from`].
+const SERVICE_BASE: &str = "Claude Code-credentials";
+
+/// Derive the keychain service suffix for a non-default config-dir `value`,
+/// replicating Claude Code 2.1.181's `-${sha256(value)[..8]}` (its `n1()`).
+///
+/// CC hashes the value **NFC-normalized**. For an ASCII value NFC is the identity,
+/// so the raw bytes hash byte-identically and no Unicode-normalizer dependency is
+/// pulled in (the crate hand-rolls its primitives to keep the dependency graph
+/// minimal — see [`crate::sha256`]). A non-ASCII value could differ between its NFC
+/// form and its raw bytes, so it is **refused** ([`Error::NonAsciiConfigDir`]) rather
+/// than risk computing a suffix that silently addresses the wrong keychain item. The
+/// value is read as bytes (`OsStrExt`), never `to_string_lossy` — a lossy decode
+/// would hash different bytes than CC sees.
+fn service_suffix(value: &OsStr) -> Result<String> {
+    let bytes = value.as_bytes();
+    if !bytes.is_ascii() {
+        return Err(Error::NonAsciiConfigDir);
+    }
+    // CC: `createHash("sha256").update(value).digest("hex").substring(0,8)`.
+    Ok(format!("-{}", &sha256_hex(bytes)[..8]))
+}
+
+/// Resolve the canonical keychain service name from the two config-dir env values,
+/// replicating Claude Code 2.1.181's `n1("-credentials")` exactly so sessiometer
+/// addresses the **same** item a live CC instance does:
+///
+/// - `CLAUDE_SECURESTORAGE_CONFIG_DIR` (`securestorage`) takes precedence when
+///   **defined**: a defined-empty value forces the bare base name, a non-empty value
+///   is the hashed value — and `CLAUDE_CONFIG_DIR` is then NOT consulted (CC's
+///   `n = !t`, `r = t`).
+/// - otherwise `CLAUDE_CONFIG_DIR` (`config_dir`): unset OR empty → bare base name;
+///   non-empty → hashed.
+///
+/// Both unset (the default config dir) → bare `Claude Code-credentials`, unchanged
+/// from the prior behaviour (no regression for current usage). Pure — the env read
+/// lives in [`canonical_service`] — so every arm is unit-testable without mutating
+/// process-global env (mirrors `paths::config_dir_from`). (issue #100)
+fn canonical_service_from(
+    securestorage: Option<&OsStr>,
+    config_dir: Option<&OsStr>,
+) -> Result<String> {
+    let suffix = match securestorage {
+        // SECURESTORAGE defined wins outright: defined-empty → bare; non-empty →
+        // hashed. CONFIG_DIR is never consulted once it is defined.
+        Some(s) if s.is_empty() => String::new(),
+        Some(s) => service_suffix(s)?,
+        // SECURESTORAGE unset → fall through to CONFIG_DIR: unset/empty → bare.
+        None => match config_dir {
+            Some(c) if !c.is_empty() => service_suffix(c)?,
+            _ => String::new(),
+        },
+    };
+    Ok(format!("{SERVICE_BASE}{suffix}"))
+}
+
+/// The canonical service for **this process's** environment — the thin env wrapper
+/// over [`canonical_service_from`] (the env read is kept out of the pure helper so
+/// the helper stays unit-testable without touching process-global env).
+fn canonical_service() -> Result<String> {
+    canonical_service_from(
+        std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR").as_deref(),
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+    )
+}
 
 /// An opaque credential blob (the active account's OAuth tokens).
 ///
@@ -190,6 +265,13 @@ pub(crate) struct RealCredentialStore {
     /// The resolved `acct`, read back from the item once and pinned for all
     /// later calls (issue #2 "resolve once at start").
     acct: OnceLock<OsString>,
+    /// The resolved canonical service name, computed once from the environment
+    /// (issue #100) and pinned for every read/poll, swap-write, and resolve. Lazy +
+    /// cached like [`acct`](Self::acct), but resolution is a pure synchronous env
+    /// read (no keychain round-trip): its only failure is a non-ASCII config dir
+    /// ([`Error::NonAsciiConfigDir`]), so it surfaces at first keychain use rather
+    /// than forcing a fallible `new()` on every construction site.
+    service: OnceLock<String>,
 }
 
 impl RealCredentialStore {
@@ -198,15 +280,21 @@ impl RealCredentialStore {
         Self {
             keychain: None,
             acct: OnceLock::new(),
+            service: OnceLock::new(),
         }
     }
 
-    /// Store pinned to a specific keychain file.
+    /// Store pinned to a specific keychain file. The service is pinned to the bare
+    /// [`SERVICE_BASE`] so the round-trip tests (which seed the item under that name)
+    /// are hermetic regardless of the ambient `CLAUDE_CONFIG_DIR`.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_keychain(path: PathBuf) -> Self {
+        let service = OnceLock::new();
+        let _ = service.set(SERVICE_BASE.to_owned());
         Self {
             keychain: Some(path),
             acct: OnceLock::new(),
+            service,
         }
     }
 
@@ -228,6 +316,22 @@ impl RealCredentialStore {
         // ignore the `Err` and read the stored one back.
         let _ = self.acct.set(resolved);
         Ok(self.acct.get().expect("just set").clone())
+    }
+
+    /// The resolved canonical service name, computed once from the environment and
+    /// cached (issue #100). Mirrors [`acct`](Self::acct) (lazy + cached) but the
+    /// computation is a pure synchronous env read, so this stays sync and its only
+    /// error is a non-ASCII config dir. Returns a borrow — the resolved name is short
+    /// and consumed within each `security`-arg builder.
+    fn service(&self) -> Result<&str> {
+        if let Some(service) = self.service.get() {
+            return Ok(service);
+        }
+        let resolved = canonical_service()?;
+        // A concurrent caller may have set it first; the value is identical, so
+        // ignore the `Err` and read the stored one back.
+        let _ = self.service.set(resolved);
+        Ok(self.service.get().expect("just set"))
     }
 
     /// Read back the item's `acct` attribute as stored, enforcing uniqueness.
@@ -252,18 +356,18 @@ impl RealCredentialStore {
         }
         // The dump is metadata text (attribute names + quoted/hex values), not
         // secret data; lossy decode is safe and never touches a token.
-        parse_resolve(&String::from_utf8_lossy(&output.stdout))
+        parse_resolve(self.service()?, &String::from_utf8_lossy(&output.stdout))
     }
 }
 
 /// `find-generic-password` arguments (after the program name): read the secret
-/// of the resolved item, pinning both `-a <acct>` and the keychain path.
-fn read_args(acct: &OsStr, keychain: &Path) -> Vec<OsString> {
+/// of the resolved item, pinning `-s <service>`, `-a <acct>` and the keychain path.
+fn read_args(service: &str, acct: &OsStr, keychain: &Path) -> Vec<OsString> {
     vec![
         "find-generic-password".into(),
         "-w".into(),
         "-s".into(),
-        SERVICE.into(),
+        service.into(),
         "-a".into(),
         acct.to_owned(),
         keychain.as_os_str().to_owned(),
@@ -292,7 +396,12 @@ fn push_quoted(out: &mut Vec<u8>, token: &[u8]) {
 /// (incl. the blob). Feeding this on stdin keeps the blob off this process's argv
 /// — the spawned `security` carries only `-i` — closing the #2 residual risk
 /// (issue #39). The returned buffer holds the secret, so it is `Zeroizing`.
-fn write_command_line(acct: &OsStr, keychain: &Path, blob: &[u8]) -> Zeroizing<Vec<u8>> {
+fn write_command_line(
+    service: &str,
+    acct: &OsStr,
+    keychain: &Path,
+    blob: &[u8],
+) -> Zeroizing<Vec<u8>> {
     // The interactive reader is line-based: an embedded newline would truncate
     // the command. Real payloads (single-line OAuth JSON) never contain one — and
     // if one ever did, `security` exits non-zero and `finish_write` reports the
@@ -303,7 +412,7 @@ fn write_command_line(acct: &OsStr, keychain: &Path, blob: &[u8]) -> Zeroizing<V
     );
     let mut line = Vec::new();
     line.extend_from_slice(b"add-generic-password -U -s ");
-    push_quoted(&mut line, SERVICE.as_bytes());
+    push_quoted(&mut line, service.as_bytes());
     line.extend_from_slice(b" -a ");
     push_quoted(&mut line, acct.as_bytes());
     line.extend_from_slice(b" -w ");
@@ -408,9 +517,13 @@ fn block_attr(block: &str, name: &str) -> Option<Vec<u8>> {
 }
 
 /// Parse `security dump-keychain` output: find every generic-password item whose
-/// service is `Claude Code-credentials`, then enforce uniqueness — 0 → not found,
+/// service is the resolved `service`, then enforce uniqueness — 0 → not found,
 /// >1 → ambiguous, exactly 1 → that item's `acct`.
-fn parse_resolve(dump: &str) -> Result<OsString> {
+///
+/// `service` is the config-dir-resolved canonical name (issue #100), so under a
+/// non-default `CLAUDE_CONFIG_DIR` this matches the **suffixed** item, not the bare
+/// base.
+fn parse_resolve(service: &str, dump: &str) -> Result<OsString> {
     // One entry per service-matching item (its `acct`, if present). Count ALL
     // matches — including any with an absent `acct` — so a malformed item can
     // never mask an ambiguity by going uncounted.
@@ -420,7 +533,7 @@ fn parse_resolve(dump: &str) -> Result<OsString> {
         if !block.contains("class: \"genp\"") {
             continue;
         }
-        if block_attr(block, "svce").as_deref() == Some(SERVICE.as_bytes()) {
+        if block_attr(block, "svce").as_deref() == Some(service.as_bytes()) {
             matches.push(block_attr(block, "acct"));
         }
     }
@@ -442,7 +555,7 @@ impl CredentialStore for RealCredentialStore {
         let acct = self.acct().await?;
         let keychain = self.keychain_path()?;
         let output = Command::new(SECURITY)
-            .args(read_args(&acct, &keychain))
+            .args(read_args(self.service()?, &acct, &keychain))
             // Non-interactive: a child read can never block on our stdin. (The
             // daemon-context no-prompt / exit-36-on-lock guarantee is #13's
             // scope — `security` may still raise a GUI dialog in a UI session.)
@@ -462,7 +575,7 @@ impl CredentialStore for RealCredentialStore {
         // Build the command (blob included) and feed it to `security -i` on
         // stdin, so the blob never lands on this process's argv (issue #39).
         // `line` is the only heap copy of the escaped secret and is `Zeroizing`.
-        let line = write_command_line(&acct, &keychain, credential.expose());
+        let line = write_command_line(self.service()?, &acct, &keychain, credential.expose());
         let output = run_interactive_write(&line).await?;
         finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
@@ -519,17 +632,104 @@ mod tests {
     fn read_args_pin_service_acct_and_keychain() {
         let kc = Path::new("/tmp/login.keychain-db");
         assert_eq!(
-            read_args(OsStr::new("alice"), kc),
+            read_args(SERVICE_BASE, OsStr::new("alice"), kc),
             vec![
                 OsString::from("find-generic-password"),
                 OsString::from("-w"),
                 OsString::from("-s"),
-                OsString::from(SERVICE),
+                OsString::from(SERVICE_BASE),
                 OsString::from("-a"),
                 OsString::from("alice"),
                 kc.as_os_str().to_owned(),
             ]
         );
+    }
+
+    // --- canonical service-name resolution (issue #100) --------------------
+    //
+    // Replicates Claude Code 2.1.181's `n1("-credentials")`. The suffixes are
+    // ground truth, generated from CC's exact expression
+    // `sha256(value.normalize("NFC")).digest("hex").slice(0,8)` — NFC is the
+    // identity for these ASCII paths — so the assertions prove byte-for-byte
+    // fidelity to a live CC instance, not just self-consistency.
+
+    #[test]
+    fn canonical_service_is_the_bare_base_for_the_default_config_dir() {
+        // Both env values unset → no suffix → the unchanged legacy name (no
+        // regression for current default-config-dir usage).
+        assert_eq!(
+            canonical_service_from(None, None).unwrap(),
+            "Claude Code-credentials"
+        );
+    }
+
+    #[test]
+    fn an_empty_config_dir_is_treated_as_unset() {
+        // `CLAUDE_CONFIG_DIR=` (empty) is falsy in CC's
+        // `!process.env.CLAUDE_CONFIG_DIR` gate → bare base name.
+        assert_eq!(
+            canonical_service_from(None, Some(OsStr::new(""))).unwrap(),
+            "Claude Code-credentials"
+        );
+    }
+
+    #[test]
+    fn a_non_default_config_dir_appends_the_sha256_suffix() {
+        // The issue's own AC example: sha256("/abs/path")[..8] = 6d80187b.
+        assert_eq!(
+            canonical_service_from(None, Some(OsStr::new("/abs/path"))).unwrap(),
+            "Claude Code-credentials-6d80187b"
+        );
+        // A second pinned path, same provenance.
+        assert_eq!(
+            canonical_service_from(None, Some(OsStr::new("/opt/cc"))).unwrap(),
+            "Claude Code-credentials-34fd9c6e"
+        );
+    }
+
+    #[test]
+    fn securestorage_config_dir_takes_precedence_over_config_dir() {
+        // When CLAUDE_SECURESTORAGE_CONFIG_DIR is defined and non-empty it is the
+        // hashed value and CLAUDE_CONFIG_DIR is NOT consulted — so the result equals
+        // hashing the securestorage value alone, and differs from the CONFIG_DIR one.
+        let with_both =
+            canonical_service_from(Some(OsStr::new("/opt/cc")), Some(OsStr::new("/abs/path")))
+                .unwrap();
+        assert_eq!(
+            with_both,
+            canonical_service_from(None, Some(OsStr::new("/opt/cc"))).unwrap()
+        );
+        assert_ne!(
+            with_both,
+            canonical_service_from(None, Some(OsStr::new("/abs/path"))).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_defined_empty_securestorage_config_dir_forces_the_bare_name() {
+        // CC's `n = !t`: a DEFINED-but-empty CLAUDE_SECURESTORAGE_CONFIG_DIR forces
+        // the bare name and never falls through to CLAUDE_CONFIG_DIR, even when the
+        // latter is set and non-empty. The subtle precedence arm.
+        assert_eq!(
+            canonical_service_from(Some(OsStr::new("")), Some(OsStr::new("/abs/path"))).unwrap(),
+            "Claude Code-credentials"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_config_dir_is_refused_rather_than_mis_hashed() {
+        // We hash raw bytes (no Unicode-normalizer dependency); CC hashes the NFC
+        // form. For a non-ASCII value the two could differ, so we refuse rather than
+        // silently address the wrong keychain item.
+        assert!(matches!(
+            canonical_service_from(None, Some(OsStr::new("/Users/café/.claude"))),
+            Err(Error::NonAsciiConfigDir)
+        ));
+        // The precedence path refuses on a non-ASCII securestorage value too.
+        assert!(matches!(
+            canonical_service_from(Some(OsStr::new("/naïve")), None),
+            Err(Error::NonAsciiConfigDir)
+        ));
     }
 
     #[test]
@@ -553,12 +753,12 @@ mod tests {
     #[test]
     fn write_command_line_quotes_every_field_and_keeps_the_blob_off_argv() {
         let kc = Path::new("/tmp/login.keychain-db");
-        let line = write_command_line(OsStr::new("alice"), kc, br#"tok "x" \y"#);
+        let line = write_command_line(SERVICE_BASE, OsStr::new("alice"), kc, br#"tok "x" \y"#);
         // Exactly the `-w` command, every field double-quoted, the blob's `"` and
         // `\` escaped, one trailing newline. The blob lives only inside this
         // stdin line — the spawned process's argv is the constant `-i`.
         let expected = format!(
-            "add-generic-password -U -s \"{SERVICE}\" -a \"alice\" -w \"tok \\\"x\\\" \\\\y\" \"{}\"\n",
+            "add-generic-password -U -s \"{SERVICE_BASE}\" -a \"alice\" -w \"tok \\\"x\\\" \\\\y\" \"{}\"\n",
             kc.display()
         );
         assert_eq!(&line[..], expected.as_bytes());
@@ -652,7 +852,7 @@ attributes:
     #[test]
     fn parse_resolve_returns_the_unique_acct() {
         assert_eq!(
-            parse_resolve(ONE_MATCH).unwrap(),
+            parse_resolve(SERVICE_BASE, ONE_MATCH).unwrap(),
             OsString::from("alexey-pelykh")
         );
     }
@@ -664,7 +864,10 @@ class: "genp"
     "acct"<blob>=0x616C696365
     "svce"<blob>="Claude Code-credentials"
 "#;
-        assert_eq!(parse_resolve(dump).unwrap(), OsString::from("alice"));
+        assert_eq!(
+            parse_resolve(SERVICE_BASE, dump).unwrap(),
+            OsString::from("alice")
+        );
     }
 
     #[test]
@@ -675,7 +878,7 @@ class: "genp"
     "svce"<blob>="Some Other Service"
 "#;
         assert!(matches!(
-            parse_resolve(dump),
+            parse_resolve(SERVICE_BASE, dump),
             Err(Error::CredentialNotFound)
         ));
     }
@@ -692,7 +895,7 @@ class: "genp"
     "svce"<blob>="Claude Code-credentials"
 "#;
         assert!(matches!(
-            parse_resolve(dump),
+            parse_resolve(SERVICE_BASE, dump),
             Err(Error::CredentialAmbiguous { count: 2 })
         ));
     }
@@ -710,7 +913,7 @@ class: "genp"
     "svce"<blob>="Claude Code-credentials"
 "#;
         assert!(matches!(
-            parse_resolve(dump),
+            parse_resolve(SERVICE_BASE, dump),
             Err(Error::CredentialAmbiguous { count: 2 })
         ));
     }
@@ -836,7 +1039,7 @@ class: "genp"
                     "add-generic-password",
                     "-U",
                     "-s",
-                    SERVICE,
+                    SERVICE_BASE,
                     "-a",
                     acct,
                     "-w",
@@ -939,7 +1142,12 @@ class: "genp"
 
             let (_dir, kc) = fresh_keychain();
             const SENTINEL: &str = "SENTINEL-oauth-blob-must-never-reach-argv-39";
-            let line = write_command_line(OsStr::new("ps-acct"), &kc, SENTINEL.as_bytes());
+            let line = write_command_line(
+                SERVICE_BASE,
+                OsStr::new("ps-acct"),
+                &kc,
+                SENTINEL.as_bytes(),
+            );
 
             let mut child = StdCommand::new(SECURITY)
                 .arg("-i")
@@ -981,7 +1189,7 @@ class: "genp"
                     "find-generic-password",
                     "-w",
                     "-s",
-                    SERVICE,
+                    SERVICE_BASE,
                     "-a",
                     "ps-acct",
                 ])
