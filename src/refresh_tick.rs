@@ -51,8 +51,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::{Account, RefreshConfig};
 use crate::daemon::{Clock, RefreshTicker};
 use crate::error::Result;
+use crate::observability::{Event, RefreshEventOutcome};
 use crate::refresh::{self, RefreshOutcome, RefreshReport};
 use crate::stash::RealAccountStash;
+
+/// What one [`RefreshTick::sweep`](RefreshTicker::sweep) produced (issue #106): the
+/// per-cycle [`Event::Refresh`] log lines, plus the `account_uuid`s of QUARANTINED
+/// accounts whose refresh succeeded and so should be RESTORED to eligible.
+///
+/// Both are handed back to the daemon (which owns the event log and the health machine)
+/// rather than acted on here: the tick is a hermetic seam with no `EventLog` handle and
+/// no view of the quarantine state. The daemon emits the events and applies the restores
+/// ([`crate::daemon`]'s run loop) — keeping each `restored` flip paired with its
+/// [`Event::CredentialRestored`] in the one place that owns the health machine.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SweepOutcome {
+    /// One [`Event::Refresh`] per refreshed account, in sweep order.
+    pub(crate) events: Vec<Event>,
+    /// `account_uuid`s of quarantined accounts the cycle proved still refreshable.
+    pub(crate) restored: Vec<String>,
+}
 
 /// The per-account isolated-refresh operations [`RefreshTick`] drives, injected as a seam so
 /// the whole selection → refresh flow runs hermetically against an in-memory fake in tests —
@@ -170,15 +188,28 @@ impl<E, K> RefreshTick<E, K> {
 }
 
 impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
-    /// Sweep the roster and run one isolated-refresh cycle per DUE account (issue #105).
-    /// `excluded` is the daemon-supplied set (active + imminent swap target uuids); `now_ms`
+    /// Sweep the roster and run one isolated-refresh cycle per DUE account (issue #105),
+    /// returning the [`SweepOutcome`] the daemon emits + applies (issue #106).
+    ///
+    /// `excluded` is the daemon-supplied parked-only set (active + imminent swap target
+    /// uuids); `quarantined` is the daemon's currently-dead ("needs re-login") set. A
+    /// quarantined account BYPASSES the near-expiry filter — the point is to test whether
+    /// its refresh token still works, regardless of where its (possibly server-revoked)
+    /// stored token sits relative to its timestamp expiry — and a successful refresh of one
+    /// is reported in [`SweepOutcome::restored`] for the daemon to un-quarantine. `now_ms`
     /// is the wall clock for the near-expiry horizon. Per-account errors and timeouts are
-    /// non-fatal — logged (redacted) and stepped past.
-    async fn run_sweep(&self, excluded: &[String], now_ms: i64) {
+    /// non-fatal — recorded as an `error` refresh event and stepped past.
+    async fn run_sweep(
+        &self,
+        excluded: &[String],
+        quarantined: &[String],
+        now_ms: i64,
+    ) -> SweepOutcome {
         // The near-expiry horizon = one cadence: refresh anything that would not survive to
         // the next tick. `* 1000` → ms (the unit CC's `expiresAt` uses).
         let horizon_ms = (self.config.cadence_secs as i64).saturating_mul(1000);
         let allowlist = !self.config.accounts.is_empty();
+        let mut outcome = SweepOutcome::default();
         for account in &self.roster {
             // Parked only: the daemon excludes the active account + imminent swap target.
             if excluded.iter().any(|uuid| uuid == &account.account_uuid) {
@@ -188,28 +219,45 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             if allowlist && !self.account_listed(account) {
                 continue;
             }
-            // Near-expiry within one cadence (an unreadable expiry is skipped — a stash the
-            // sweep cannot even read is not a refresh candidate).
-            if !is_near_expiry(
-                self.engine.stored_expires_at(account).await,
-                now_ms,
-                horizon_ms,
-            ) {
+            let is_quarantined = quarantined.iter().any(|uuid| uuid == &account.account_uuid);
+            // The stored expiry BEFORE the cycle: the event's `expires_before` AND the
+            // near-expiry input — read once here and reused for the event.
+            let before_ms = self.engine.stored_expires_at(account).await;
+            // Near-expiry within one cadence gates HEALTHY accounts (an unreadable expiry is
+            // skipped — a stash the sweep cannot even read is not a routine candidate). A
+            // quarantined account is exempt: it is refreshed for the RESTORE check (#106).
+            if !is_quarantined && !is_near_expiry(before_ms, now_ms, horizon_ms) {
                 continue;
             }
             // One whole-cycle, timeout-bounded refresh. Every terminal state is non-fatal
-            // (engine Caller contract); the line is redacted to the label + classification.
-            let outcome =
+            // (engine Caller contract); the event is redacted to the handle + classification
+            // + the non-secret before/after expiry (issue #106, via the single #15 surface).
+            let event =
                 match tokio::time::timeout(self.config.timeout(), self.engine.refresh(account))
                     .await
                 {
-                    Ok(Ok(report)) => outcome_label(&report).to_owned(),
-                    // Secret-free: every `Error` Display is redaction-safe (issue #15).
-                    Ok(Err(err)) => format!("error ({err})"),
-                    Err(_elapsed) => "error (timed out)".to_owned(),
+                    Ok(Ok(report)) => {
+                        // RESTORE a quarantined account ONLY when THIS cycle persisted the fresh
+                        // token (`Refreshed` AND `re_stashed`): then the canonical demonstrably
+                        // holds a token we know is good. On a CAS-discarded refresh (`Refreshed`
+                        // but not `re_stashed`) a concurrent swap/login changed the stash and is
+                        // authoritative — it OWNS the un-quarantine (the #42 poll once it polls
+                        // active, or #107's re-login), so we do not second-guess its credential.
+                        if is_quarantined
+                            && report.outcome == RefreshOutcome::Refreshed
+                            && report.re_stashed
+                        {
+                            outcome.restored.push(account.account_uuid.clone());
+                        }
+                        refresh_event(&account.label, before_ms, &report)
+                    }
+                    // Secret-free: a hard `Err` / a timeout is an `error` outcome. The engine's
+                    // error Display is NOT folded into the structured event — only the class is.
+                    Ok(Err(_)) | Err(_) => error_refresh_event(&account.label, before_ms),
                 };
-            eprintln!("sessiometer: refresh {}: {}", account.label, outcome);
+            outcome.events.push(event);
         }
+        outcome
     }
 }
 
@@ -225,14 +273,15 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
         self.clock.tick(delay).await;
     }
 
-    async fn sweep(&mut self, excluded: &[String]) {
+    async fn sweep(&mut self, excluded: &[String], quarantined: &[String]) -> SweepOutcome {
         if !self.enabled {
-            return;
+            return SweepOutcome::default();
         }
-        self.run_sweep(excluded, now_ms()).await;
+        let outcome = self.run_sweep(excluded, quarantined, now_ms()).await;
         // Anchor the cadence from the END of the sweep, so a long sweep does not let the
         // next one start early.
         self.last_refresh = Some(self.clock.now());
+        outcome
     }
 }
 
@@ -247,17 +296,60 @@ fn is_near_expiry(expires_at_ms: Option<i64>, now_ms: i64, horizon_ms: i64) -> b
     }
 }
 
-/// The non-secret one-line classification for a completed cycle's report (issue #15: the
-/// cycle's outcome, never a token). Mirrors `poke`'s `outcome_label`.
-fn outcome_label(report: &RefreshReport) -> &'static str {
+/// Build the per-cycle [`Event::Refresh`] (issue #106) from a completed cycle's `report`
+/// and the stored `before_ms` expiry read before the cycle. The event is the durable,
+/// #15-metered replacement for #105's ad-hoc per-cycle `eprintln` — every field is a
+/// handle / enum / timestamp, so a secret cannot reach the line.
+///
+/// `pub(crate)` so the engine's redaction-METER test ([`crate::refresh`]) can scan THIS
+/// exact production builder's output over a real-secret cycle — a hand-rolled replica would
+/// silently miss a future secret-bearing field added here (issue #106 deliverable 3).
+pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &RefreshReport) -> Event {
+    Event::Refresh {
+        account: label.to_owned(),
+        outcome: refresh_event_outcome(report),
+        expires_before: before_ms,
+        expires_after: expires_after(before_ms, report),
+    }
+}
+
+/// The [`Event::Refresh`] for a cycle that did not complete — a hard engine `Err` or a
+/// whole-cycle timeout: an `error` outcome with the stored expiry unchanged. The engine's
+/// error Display is deliberately NOT folded in — the structured event carries only the
+/// non-secret class, and that field discipline is what keeps the channel #15-clean.
+fn error_refresh_event(label: &str, before_ms: Option<i64>) -> Event {
+    Event::Refresh {
+        account: label.to_owned(),
+        outcome: RefreshEventOutcome::Error,
+        expires_before: before_ms,
+        expires_after: before_ms,
+    }
+}
+
+/// Map a completed cycle's [`RefreshReport`] to the non-secret [`RefreshEventOutcome`]
+/// (issue #106) — the classification #105's removed `eprintln` summarized, now folded into
+/// the structured event. `Refreshed` splits on whether the CAS re-stash stored the token.
+fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutcome {
     match report.outcome {
-        RefreshOutcome::Refreshed if report.re_stashed => "refreshed",
-        RefreshOutcome::Refreshed => {
-            "refreshed but not re-stashed (a concurrent change took precedence)"
+        RefreshOutcome::Refreshed if report.re_stashed => RefreshEventOutcome::Refreshed,
+        RefreshOutcome::Refreshed => RefreshEventOutcome::RefreshedNotReStashed,
+        RefreshOutcome::NoChange => RefreshEventOutcome::NoChange,
+        RefreshOutcome::Dead => RefreshEventOutcome::Dead,
+        RefreshOutcome::Error => RefreshEventOutcome::Error,
+    }
+}
+
+/// The stored token's `expiresAt` AFTER the cycle (epoch ms). ONLY a re-stashed refresh
+/// actually moved the stored expiry — by the engine-reported `expires_at_delta_secs` slide;
+/// every other terminal state (a refresh the CAS discarded, NoChange, Dead, Error) left the
+/// stash untouched, so the after equals the `before`. `None` only when the before was
+/// unreadable on a slide (the absolute after cannot then be placed).
+fn expires_after(before_ms: Option<i64>, report: &RefreshReport) -> Option<i64> {
+    match report.expires_at_delta_secs {
+        Some(delta_secs) if report.re_stashed => {
+            before_ms.map(|before| before.saturating_add(delta_secs.saturating_mul(1000)))
         }
-        RefreshOutcome::NoChange => "no change",
-        RefreshOutcome::Dead => "dead — needs re-login",
-        RefreshOutcome::Error => "error",
+        _ => before_ms,
     }
 }
 
@@ -453,7 +545,7 @@ mod tests {
             .with_expiry("u-C", Some(later));
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
         // The daemon excludes the active account u-A.
-        t.sweep(&["u-A".to_owned()]).await;
+        t.sweep(&["u-A".to_owned()], &[]).await;
         assert_eq!(t.engine.refreshed(), vec!["u-B"]);
         // The cadence anchor advances after a sweep.
         assert!(t.last_refresh.is_some());
@@ -474,7 +566,7 @@ mod tests {
             .with_expiry("u-C", Some(soon));
         // Allowlist only "spare" (by label) and u-C (by uuid); all are near-expiry & parked.
         let mut t = tick(roster, cfg(3600, 60, &["spare", "u-C"]), engine);
-        t.sweep(&[]).await;
+        t.sweep(&[], &[]).await;
         assert_eq!(t.engine.refreshed(), vec!["u-B", "u-C"]);
     }
 
@@ -492,7 +584,7 @@ mod tests {
             .with_expiry("u-C", Some(soon));
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
         // Daemon excludes BOTH the active account AND the imminent swap target (u-B).
-        t.sweep(&["u-A".to_owned(), "u-B".to_owned()]).await;
+        t.sweep(&["u-A".to_owned(), "u-B".to_owned()], &[]).await;
         assert_eq!(t.engine.refreshed(), vec!["u-C"]);
     }
 
@@ -510,7 +602,7 @@ mod tests {
                 FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
             );
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
-        t.sweep(&[]).await; // …the sweep must still reach the second.
+        t.sweep(&[], &[]).await; // …the sweep must still reach the second.
         assert_eq!(t.engine.refreshed(), vec!["u-A", "u-B"]);
     }
 
@@ -531,7 +623,7 @@ mod tests {
         let mut config = cfg(3600, 60, &[]);
         config.timeout_secs = 5;
         let mut t = tick(roster, config, engine);
-        t.sweep(&[]).await;
+        t.sweep(&[], &[]).await;
         // The hung account was attempted then timed out; the sweep still reached u-B.
         assert_eq!(t.engine.refreshed(), vec!["u-A", "u-B"]);
     }
@@ -551,8 +643,202 @@ mod tests {
                 now: Instant::now(),
             },
         );
-        t.sweep(&[]).await;
+        t.sweep(&[], &[]).await;
         assert!(t.engine.refreshed().is_empty());
         assert!(t.last_refresh.is_none());
+    }
+
+    // --- refresh events (issue #106) ---------------------------------------
+
+    #[tokio::test]
+    async fn sweep_emits_a_refresh_event_per_cycle_with_before_and_after() {
+        // A successful, re-stashed refresh: the event carries the handle, the `refreshed`
+        // outcome, and the before/after expiry — after = before + the engine's slide delta.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result(
+                "u-A",
+                FakeRefresh::Report(RefreshReport {
+                    outcome: RefreshOutcome::Refreshed,
+                    expires_at_delta_secs: Some(7200), // +2h slide
+                    refresh_token_rotated: false,
+                    re_stashed: true,
+                }),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Refreshed,
+                expires_before: Some(soon),
+                expires_after: Some(soon + 7_200_000), // before + 7200 s in ms
+            }]
+        );
+        assert!(
+            outcome.restored.is_empty(),
+            "a healthy account is not a restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_event_records_a_cas_discarded_refresh_without_moving_the_expiry() {
+        // Refreshed but NOT re-stashed (a concurrent change took precedence): the outcome
+        // distinguishes it, and `expires_after` stays at `before` (this cycle stored nothing).
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result(
+                "u-A",
+                FakeRefresh::Report(RefreshReport {
+                    outcome: RefreshOutcome::Refreshed,
+                    expires_at_delta_secs: Some(7200),
+                    refresh_token_rotated: false,
+                    re_stashed: false,
+                }),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                expires_before: Some(soon),
+                expires_after: Some(soon), // unchanged — the CAS discarded the fresh token
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_records_an_error_event_for_a_hard_failure() {
+        // A hard engine `Err` is an `error` event with the stored expiry unchanged — the
+        // error Display never reaches the structured event (only the class does).
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::HardError);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Error,
+                expires_before: Some(soon),
+                expires_after: Some(soon),
+            }]
+        );
+    }
+
+    // --- restore-on-success (issue #106 deliverable #2) --------------------
+
+    #[tokio::test]
+    async fn sweep_restores_a_quarantined_account_whose_refresh_token_still_works() {
+        // A quarantined ("needs re-login") account whose stored expiry is FAR from now — the
+        // near-expiry filter would skip a healthy account here — is still refreshed because
+        // it is quarantined, and a successful refresh reports it for restore.
+        let now_ms = now_ms();
+        let far = now_ms + 30 * 24 * 3_600_000; // a month out — NOT near expiry
+        let roster = vec![acct("dead", "u-Q")];
+        let engine = FakeEngine::new().with_expiry("u-Q", Some(far)).with_result(
+            "u-Q",
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+        );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &["u-Q".to_owned()]).await;
+        // Refreshed despite not being near expiry (the quarantine bypass)…
+        assert_eq!(t.engine.refreshed(), vec!["u-Q"]);
+        // …and reported for restore.
+        assert_eq!(outcome.restored, vec!["u-Q".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_restore_a_quarantined_account_that_stays_dead() {
+        // A quarantined account whose refresh token is truly dead is refreshed (the restore
+        // attempt) but NOT reported for restore — its event records `dead`.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("dead", "u-Q")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-Q", Some(soon))
+            .with_result(
+                "u-Q",
+                FakeRefresh::Report(report(RefreshOutcome::Dead, false)),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &["u-Q".to_owned()]).await;
+        assert_eq!(t.engine.refreshed(), vec!["u-Q"]);
+        assert!(
+            outcome.restored.is_empty(),
+            "a still-dead account is not restored"
+        );
+        assert!(matches!(
+            outcome.events.as_slice(),
+            [Event::Refresh {
+                outcome: RefreshEventOutcome::Dead,
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_restore_a_quarantined_account_whose_refresh_was_cas_discarded() {
+        // Refreshed but NOT re-stashed: a concurrent swap/login changed the stash and is
+        // authoritative, so it OWNS the un-quarantine — this cycle must NOT report a restore
+        // off a token it did not persist (it could be a concurrently-written dead credential).
+        // The event still records the distinct `refreshed_not_restashed` classification.
+        let now_ms = now_ms();
+        let far = now_ms + 30 * 24 * 3_600_000; // far from expiry — refreshed only via the quarantine bypass
+        let roster = vec![acct("dead", "u-Q")];
+        let engine = FakeEngine::new().with_expiry("u-Q", Some(far)).with_result(
+            "u-Q",
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed, false)),
+        );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &["u-Q".to_owned()]).await;
+        assert_eq!(t.engine.refreshed(), vec!["u-Q"]); // the restore was attempted…
+        assert!(
+            outcome.restored.is_empty(),
+            "a CAS-discarded refresh does not restore — the concurrent writer owns it"
+        );
+        assert!(matches!(
+            outcome.events.as_slice(),
+            [Event::Refresh {
+                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                ..
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn sweep_never_refreshes_an_excluded_account_even_if_quarantined() {
+        // The active account can be both excluded AND quarantined; exclusion wins (the engine
+        // Caller contract forbids touching the active account) — no refresh, no restore.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("active", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result(
+                "u-A",
+                FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&["u-A".to_owned()], &["u-A".to_owned()]).await;
+        assert!(
+            t.engine.refreshed().is_empty(),
+            "exclusion wins over quarantine"
+        );
+        assert!(outcome.restored.is_empty());
+        assert!(outcome.events.is_empty());
     }
 }

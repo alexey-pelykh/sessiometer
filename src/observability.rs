@@ -84,6 +84,43 @@ impl SwapReason {
     }
 }
 
+/// How the periodic isolated-refresh tick classified one cycle — the `outcome=` of an
+/// [`Event::Refresh`] (issue #106).
+///
+/// A NON-SECRET projection of the engine's refresh report (its outcome classification
+/// plus whether the CAS re-stash stored the fresh token); the report's secret-bearing
+/// internals (the token blobs it inspects) never reach this enum. The tick maps the
+/// report to this; rendering it here keeps the event log the single redaction surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshEventOutcome {
+    /// Claude Code refreshed the parked token and the CAS re-stash stored it.
+    Refreshed,
+    /// CC refreshed the token (so the refresh token was still valid — the credential is
+    /// alive) but a concurrent swap / login took precedence, so it was not re-stashed.
+    RefreshedNotReStashed,
+    /// CC returned the seeded token unchanged — no refresh happened.
+    NoChange,
+    /// CC cleared the refresh token in place — the credential is dead and needs an
+    /// operator re-login.
+    Dead,
+    /// The cycle ran but produced no usable result (a spawn / read-back / lock failure,
+    /// or a whole-cycle timeout).
+    Error,
+}
+
+impl RefreshEventOutcome {
+    /// The `outcome=` token.
+    fn as_str(self) -> &'static str {
+        match self {
+            RefreshEventOutcome::Refreshed => "refreshed",
+            RefreshEventOutcome::RefreshedNotReStashed => "refreshed_not_restashed",
+            RefreshEventOutcome::NoChange => "no_change",
+            RefreshEventOutcome::Dead => "dead",
+            RefreshEventOutcome::Error => "error",
+        }
+    }
+}
+
 /// One observable daemon state change, rendered as a single `key=val` log line by
 /// [`Event::to_log_line`].
 ///
@@ -156,6 +193,19 @@ pub(crate) enum Event {
     /// `account`'s token authenticated but lacks the usage scope (HTTP 403) — the
     /// hallmark of a non-interactive setup token (#5). Always `status=403`.
     UsageScopeFail { account: String },
+    /// The periodic isolated-refresh tick (#105) ran one cycle for the PARKED `account`
+    /// (issue #106): `outcome` is the non-secret classification, and `expires_before` /
+    /// `expires_after` are the stored token's `expiresAt` (epoch milliseconds) before and
+    /// after the cycle — each `None` only when the stored expiry was unreadable. `account`
+    /// is the HANDLE (operator label), never a token or email; the expiry is a plain
+    /// timestamp. A cycle that refreshes a quarantined account back to life additionally
+    /// drives a separate [`Event::CredentialRestored`] (the restore, applied daemon-side).
+    Refresh {
+        account: String,
+        outcome: RefreshEventOutcome,
+        expires_before: Option<i64>,
+        expires_after: Option<i64>,
+    },
 }
 
 impl Event {
@@ -210,6 +260,37 @@ impl Event {
             }
             Event::UsageScopeFail { account } => {
                 format!("ts={ts} event=usage_scope_fail account={account} status=403")
+            }
+            Event::Refresh {
+                account,
+                outcome,
+                expires_before,
+                expires_after,
+            } => {
+                let outcome = outcome.as_str();
+                // Each expiry is omitted when unreadable (an empty value after `=` would
+                // split the key=val grammar — mirrors `all_exhausted`'s optional
+                // `resets_at`). The epoch-ms timestamp is rendered to whole-second RFC 3339
+                // through the SAME formatter as the line `ts` and `resets_at`.
+                let before = match expires_before {
+                    Some(ms) => {
+                        format!(
+                            " expires_before={}",
+                            rfc3339(system_time_from_epoch(ms / 1000))
+                        )
+                    }
+                    None => String::new(),
+                };
+                let after = match expires_after {
+                    Some(ms) => {
+                        format!(
+                            " expires_after={}",
+                            rfc3339(system_time_from_epoch(ms / 1000))
+                        )
+                    }
+                    None => String::new(),
+                };
+                format!("ts={ts} event=refresh account={account} outcome={outcome}{before}{after}")
             }
         }
     }
@@ -758,6 +839,67 @@ mod tests {
     }
 
     #[test]
+    fn refresh_line_carries_handle_outcome_and_optional_expiries() {
+        // A successful refresh: handle + outcome token + the before/after expiry rendered
+        // to RFC 3339 (epoch ms → whole-second UTC), so the slide forward is visible.
+        let refreshed = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Refreshed,
+            expires_before: Some(1_782_777_600_000),
+            expires_after: Some(1_782_781_200_000), // +1h
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            refreshed,
+            format!(
+                "{TS0} event=refresh account=spare outcome=refreshed \
+                 expires_before=2026-06-30T00:00:00Z expires_after=2026-06-30T01:00:00Z"
+            )
+        );
+
+        // An unreadable expiry: both fields are OMITTED (never an empty value that would
+        // split the key=val grammar), leaving a well-formed line.
+        let unknown = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Error,
+            expires_before: None,
+            expires_after: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            unknown,
+            format!("{TS0} event=refresh account=spare outcome=error")
+        );
+        assert!(!unknown.contains("expires_"), "got: {unknown}");
+    }
+
+    #[test]
+    fn refresh_renders_each_outcome_token() {
+        for (outcome, token) in [
+            (RefreshEventOutcome::Refreshed, "refreshed"),
+            (
+                RefreshEventOutcome::RefreshedNotReStashed,
+                "refreshed_not_restashed",
+            ),
+            (RefreshEventOutcome::NoChange, "no_change"),
+            (RefreshEventOutcome::Dead, "dead"),
+            (RefreshEventOutcome::Error, "error"),
+        ] {
+            let line = Event::Refresh {
+                account: "work".to_owned(),
+                outcome,
+                expires_before: None,
+                expires_after: None,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!("{TS0} event=refresh account=work outcome={token}")
+            );
+        }
+    }
+
+    #[test]
     fn no_event_line_carries_an_email_or_token_sigil() {
         // #15: every field is a handle / enum / number / timestamp, so a token or
         // email can never reach a rendered line. Handles here are plain labels.
@@ -792,6 +934,12 @@ mod tests {
             Event::KeychainLockedWait,
             Event::UsageScopeFail {
                 account: "work".to_owned(),
+            },
+            Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Refreshed,
+                expires_before: Some(1_782_777_600_000),
+                expires_after: Some(1_782_781_200_000),
             },
         ];
         for event in &events {
