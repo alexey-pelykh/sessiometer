@@ -1149,6 +1149,10 @@ mod tests {
             active: false,
             enabled: true,
             quarantined,
+            // The viability gate keys off `quarantined` (a recovering account is still
+            // dead, still refused) — `recovering` (#109) is display-only, so a fixed
+            // `false` here keeps these gate tests focused on the verdict they assert.
+            recovering: false,
             session_pct: weekly_pct,
             weekly_pct,
             session_resets_at: None,

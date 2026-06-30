@@ -421,9 +421,9 @@ pub(crate) fn render_status(
         ),
     ];
     if rows.iter().any(|row| !row.status.is_empty()) {
-        // The health-text column carries its own tags (`disabled`, `needs re-login`);
-        // it is never tinted (issue #84) — the tags are their own signal, so its
-        // severity getter is always `None`. Its header is `HEALTH` (issue #99).
+        // The health-text column carries its own tags (`disabled`, `needs re-login` /
+        // `recovering`); it is never tinted (issue #84) — the tags are their own signal,
+        // so its severity getter is always `None`. Its header is `HEALTH` (issue #99).
         columns.push(Column::droppable(
             "HEALTH",
             2,
@@ -518,7 +518,9 @@ struct StatusRow {
     weekly: String,
     /// Compact time until the WEEKLY window resets, or `n/a` (issue #94).
     weekly_reset: String,
-    /// Inline tags (`disabled`, `needs re-login`), comma-joined; empty when none.
+    /// Inline tags (`disabled`, `needs re-login` / `recovering`), comma-joined; empty
+    /// when none. `recovering` (issue #109) replaces `needs re-login` for a healing
+    /// quarantined account.
     status: String,
     /// Per-cell urgency for the color overlay (issue #84): each cell carries its OWN
     /// health, so one row can show several independent colors (a red `session` reset
@@ -543,8 +545,9 @@ impl StatusRow {
         // keeps the inactive labels aligned under it.
         let marker = if account.active { '*' } else { ' ' };
         // A parked account is `disabled` (issue #36); a dead-credential one
-        // `needs re-login` (issue #42, the durable quarantine status). Both can
-        // hold at once, so they comma-join rather than overwrite.
+        // `needs re-login` (issue #42, the durable quarantine status) — softened to
+        // `recovering` while its credential is answering again and climbing back
+        // (issue #109). Tags can hold at once, so they comma-join rather than overwrite.
         let mut status = String::new();
         if !account.enabled {
             status.push_str("disabled");
@@ -553,7 +556,14 @@ impl StatusRow {
             if !status.is_empty() {
                 status.push_str(", ");
             }
-            status.push_str("needs re-login");
+            // `recovering` always implies `quarantined`, so it only refines this branch:
+            // a healing account reads `recovering`, not the alarming `needs re-login`,
+            // so an operator does not swap away from it toward a worse account (#109).
+            status.push_str(if account.recovering {
+                "recovering"
+            } else {
+                "needs re-login"
+            });
         }
         StatusRow {
             account: format!("{marker} {}", account.label),
@@ -1449,6 +1459,41 @@ spare  22222222-2222\n\
     }
 
     #[test]
+    fn render_status_marks_a_recovering_account_recovering_not_needs_relogin() {
+        // Issue #109: a quarantined account whose credential is answering again (mid
+        // spontaneous-revival) reads `recovering`, NOT the alarming `needs re-login` —
+        // so an operator does not swap away from a healing account toward a worse one.
+        // A genuinely dead account (quarantined, not recovering) still reads
+        // `needs re-login`. Mirrors `render_status_marks_a_quarantined_account_needs_relogin`.
+        let mut healing = status_line("healing", false, Some(30), Some(30));
+        healing.quarantined = true;
+        healing.recovering = true;
+        let mut dead = status_line("dead", false, None, None);
+        dead.quarantined = true; // quarantined but NOT recovering — still dead
+        let response = StatusResponse {
+            accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        let healing = out.lines().find(|l| l.contains("healing")).unwrap();
+        assert!(
+            healing.contains("recovering") && !healing.contains("re-login"),
+            "a healing account reads `recovering`, never `needs re-login`: {healing}"
+        );
+        let dead = out.lines().find(|l| l.contains("dead")).unwrap();
+        assert!(
+            dead.contains("needs re-login") && !dead.contains("recovering"),
+            "a genuinely dead account still reads `needs re-login`: {dead}"
+        );
+        // The tag is a plain string — no token, no email reaches the surface (#15).
+        assert!(
+            !out.contains('@'),
+            "no email on the printed surface: {out:?}"
+        );
+        assert!(!out.to_lowercase().contains("token"));
+    }
+
+    #[test]
     fn apply_enabled_flips_the_resolved_account_and_reports_change() {
         let mut roster = vec![acct("work", "u1"), acct("spare", "u2")];
         // Resolve `spare` by label and disable it; the other account is untouched.
@@ -1565,6 +1610,7 @@ spare  22222222-2222\n\
             weekly_pct: weekly,
             enabled: true,
             quarantined: false,
+            recovering: false,
             session_resets_at: None,
             weekly_resets_at: None,
             weekly_exhausted: false,
@@ -1588,6 +1634,7 @@ spare  22222222-2222\n\
             weekly_pct: weekly,
             enabled: true,
             quarantined: false,
+            recovering: false,
             session_resets_at,
             weekly_resets_at,
             weekly_exhausted,
