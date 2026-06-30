@@ -889,6 +889,7 @@ mod tests {
         Config {
             roster: vec![acct("work", "u-A"), acct("spare", "u-B")],
             tunables: Tunables::default(),
+            refresh: crate::config::RefreshConfig::default(),
         }
     }
 

@@ -33,7 +33,7 @@
 //! and prints.
 
 use crate::claude_state::{read_oauth_account, OauthAccount};
-use crate::config::{Account, Config, Tunables};
+use crate::config::{Account, Config, RefreshConfig, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::paths;
@@ -120,9 +120,12 @@ async fn run_capture(
     existing: Option<Config>,
     label: Option<&str>,
 ) -> Result<CaptureReport> {
-    let (mut roster, tunables) = match existing {
-        Some(config) => (config.roster, config.tunables),
-        None => (Vec::new(), Tunables::default()),
+    // Preserve the existing tunables AND the periodic-refresh schedule across a capture
+    // (issue #58, extended for #105): adding an account to a config that already carries
+    // custom tunables / a `[refresh]` block must not reset either to defaults.
+    let (mut roster, tunables, refresh) = match existing {
+        Some(config) => (config.roster, config.tunables, config.refresh),
+        None => (Vec::new(), Tunables::default(), RefreshConfig::default()),
     };
 
     let (stash_name, outcome) = plan_capture(&mut roster, oauth.account_uuid(), label)?;
@@ -145,7 +148,11 @@ async fn run_capture(
         .clone();
 
     Ok(CaptureReport {
-        config: Config { roster, tunables },
+        config: Config {
+            roster,
+            tunables,
+            refresh,
+        },
         outcome,
         label,
         count,
@@ -393,6 +400,7 @@ mod tests {
                 session_floor: Some(80), // opt-in guard the operator enabled
                 ..Tunables::default()
             },
+            refresh: RefreshConfig::default(),
         };
 
         let report = run_capture(
@@ -419,6 +427,7 @@ mod tests {
         let existing = Config {
             roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
+            refresh: RefreshConfig::default(),
         };
 
         let report = run_capture(
@@ -447,6 +456,7 @@ mod tests {
         let existing = Config {
             roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
+            refresh: RefreshConfig::default(),
         };
 
         let report = run_capture(

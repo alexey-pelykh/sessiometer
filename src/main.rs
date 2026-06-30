@@ -21,6 +21,7 @@ mod paths;
 mod poke;
 mod redaction;
 mod refresh;
+mod refresh_tick;
 mod sha256;
 mod stash;
 mod swap;

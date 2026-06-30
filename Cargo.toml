@@ -21,3 +21,7 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test-util` (feature-merged into the tokio dependency above for test/bench builds only)
+# gives `#[tokio::test(start_paused = true)]` — the paused-time driver the refresh-tick
+# timeout test (#105) uses to fire the whole-cycle bound without waiting real seconds.
+tokio = { version = "1.52.3", features = ["test-util"] }

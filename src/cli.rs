@@ -8,7 +8,7 @@
 //! `run` loop (#7), the live `status` control-socket client (#8), and the offline
 //! `list` roster view (#17).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::net::{UnixListener, UnixStream};
 
@@ -22,6 +22,7 @@ use crate::keychain::RealCredentialStore;
 use crate::observability::{Diagnostic, DiagnosticLog, EventLog, Verbosity};
 use crate::paths;
 use crate::refresh;
+use crate::refresh_tick::{RealRefreshEngine, RefreshTick};
 use crate::stash::{AccountStash, RealAccountStash};
 
 /// Parse `argv` and run the requested subcommand.
@@ -247,7 +248,46 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         .collect();
     refresh::reap_orphans(&roster_uuids).await;
 
-    let result = run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control).await;
+    // The periodic isolated-refresh tick (issue #105): opt-in, driven from `run_loop`'s idle
+    // path off the poll→usage→swap seam. Resolve the spawn binary ONLY when enabled — a
+    // resolution failure DISABLES the tick (logged) rather than failing the daemon, whose
+    // core job is polling/swapping. When disabled the tick is wholly inert.
+    let refresh_enabled = config.refresh.enabled;
+    let claude_binary = if refresh_enabled {
+        match paths::claude_binary_with_override(config.refresh.claude_bin.as_deref()) {
+            Ok(bin) => Some(bin),
+            Err(err) => {
+                eprintln!(
+                    "sessiometer: periodic refresh disabled — cannot resolve the claude binary: {err}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut refresh_tick = RefreshTick::new(
+        config.roster.clone(),
+        config.refresh.clone(),
+        refresh_enabled && claude_binary.is_some(),
+        RealRefreshEngine::new(
+            RealAccountStash::new(),
+            // Unused while the tick is disabled (the effective-enabled flag above gates every
+            // spawn); a placeholder keeps the engine total.
+            claude_binary.unwrap_or_else(|| PathBuf::from("claude")),
+        ),
+        RealClock::new(),
+    );
+
+    let result = run_loop(
+        &mut daemon,
+        &mut log,
+        &mut diag,
+        &mut shutdown,
+        &control,
+        &mut refresh_tick,
+    )
+    .await;
     // A clean shutdown (`Ok`) → the lifecycle stop marker. An error exit is NOT a
     // clean stop (it surfaces via `main`'s error print), so it emits none.
     if result.is_ok() {
@@ -1317,6 +1357,7 @@ mod tests {
                 // placeholder (issue #38).
                 ..Tunables::default()
             },
+            refresh: crate::config::RefreshConfig::default(),
         }
     }
 
