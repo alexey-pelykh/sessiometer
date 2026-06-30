@@ -87,9 +87,10 @@ use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
 use crate::observability::{
-    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, PollClass, SwapReason,
+    CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, PollClass,
+    RefreshEventOutcome, SwapReason,
 };
-use crate::refresh_tick::SweepOutcome;
+use crate::refresh_tick::{RefreshObservation, SweepOutcome};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
@@ -434,8 +435,32 @@ pub(crate) struct StatusSnapshot {
     pub(crate) next_swap: Option<NextSwap>,
 }
 
+/// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
+/// daemon's reduced projection of the refresh observations its per-account health state
+/// carries — whether the last refresh kept the credential alive, whether CC rotated the
+/// refresh-token VALUE, and the consecutive-failure streak. `None` (the whole struct) until
+/// the refresh engine has observed the account at least once (e.g. the `[refresh]` feature
+/// is off, or the account has not yet been swept). Every field is a boolean / count — never
+/// a token or expiry (the #15 discipline). Derives `Deserialize` so the `status` client can
+/// read it back; `#[serde(default)]` on the carrying field handles a pre-#119 daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RefreshHealth {
+    /// Whether the LAST observed refresh kept the credential ALIVE (`refreshed` /
+    /// `no_change`), as opposed to a `dead` (refresh token cleared) or `error` (cycle
+    /// failed) outcome.
+    pub(crate) last_ok: bool,
+    /// Whether CC ROTATED the refresh-token value on the last refresh (the AC-3 durability
+    /// signal) — the boolean only, never either token value. Named `rotated` (not
+    /// `token_rotated`) so the `--json` field carries no `token` substring that a coarse
+    /// #15 leak-proxy (`!contains("token")`) could false-positive on.
+    pub(crate) rotated: bool,
+    /// Consecutive refresh FAILURES (`dead` / `error` outcomes), reset to 0 by the next
+    /// alive refresh — the rollup's at-risk input.
+    pub(crate) consecutive_failures: u32,
+}
+
 /// One account's latest reading.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct AccountReading {
     pub(crate) label: String,
     pub(crate) active: bool,
@@ -461,6 +486,19 @@ pub(crate) struct AccountReading {
     /// projection stays threshold-free; `false` when the last poll failed.
     pub(crate) weekly_exhausted: bool,
     pub(crate) usage: Option<Usage>,
+    /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `None` until
+    /// the refresh engine has observed this account's stash. An absolute instant (not a
+    /// relative duration, like `session_resets_at`) carried RAW on the wire, from which a
+    /// consumer (`--json` | `jq`) can derive an "expires in" against its own clock; the lean
+    /// text view projects only the rollup glyph, not a clock cell. Non-secret — a timestamp.
+    pub(crate) access_expires_at: Option<i64>,
+    /// The non-secret refresh-health inputs (issue #119), or `None` until a refresh has been
+    /// observed. The rollup's at-risk / dead inputs plus the `--json` durability signal.
+    pub(crate) refresh_health: Option<RefreshHealth>,
+    /// The daemon-computed 4-state credential-health rollup (issue #119) — the verdict the
+    /// thin `status` client projects to a glyph. Computed in [`Daemon::snapshot`] from this
+    /// account's health state and the wall clock.
+    pub(crate) health: CredentialHealth,
 }
 
 /// The control socket's `status` reply — handles + percentages + the forward-looking
@@ -521,6 +559,28 @@ pub(crate) struct AccountStatusLine {
     /// otherwise the sooner SESSION reset governs (issue #72). Non-secret — a flag.
     #[serde(default)]
     pub(crate) weekly_exhausted: bool,
+    /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `null` until
+    /// the refresh engine has observed this account. An absolute instant (not a relative
+    /// duration, like `session_resets_at`) carried RAW for a consumer (`--json` | `jq`) to
+    /// derive an "expires in" against its own clock; the lean text view projects only the
+    /// rollup glyph, not a clock cell. Non-secret — a timestamp, never the token.
+    /// `#[serde(default)]` per the added-field convention: a pre-#119 daemon that omits it
+    /// decodes to `None`.
+    #[serde(default)]
+    pub(crate) access_expires_at: Option<i64>,
+    /// The non-secret refresh-health inputs (issue #119) — last refresh ok? token rotated?
+    /// consecutive failures — or `null` until a refresh has been observed (e.g. `[refresh]`
+    /// off). The `--json` durability signal; also feeds the daemon's rollup. `#[serde(default)]`:
+    /// a pre-#119 daemon omits it → `None`.
+    #[serde(default)]
+    pub(crate) refresh_health: Option<RefreshHealth>,
+    /// The daemon-computed 4-state credential-health rollup (issue #119): the verdict the
+    /// thin read-only client projects to a glyph (🟢/🟡/🟠/🔴). `Option` for backward
+    /// compatibility — `#[serde(default)]` makes a pre-#119 daemon (which omits the field)
+    /// decode to `None`, and the client then FALLS BACK to the legacy quarantine-based text
+    /// rather than mis-reading a defaulted `healthy` over a dead account.
+    #[serde(default)]
+    pub(crate) health: Option<CredentialHealth>,
 }
 
 /// The next swap candidate shown by `status` (issue #88): who the daemon would
@@ -577,6 +637,12 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 session_resets_at: account.usage.and_then(|u| u.session_resets_at),
                 weekly_resets_at: account.usage.and_then(|u| u.weekly_resets_at),
                 weekly_exhausted: account.weekly_exhausted,
+                // The credential clocks + the daemon-computed rollup (issue #119), already
+                // resolved at snapshot build; `health` is wrapped `Some` since a current
+                // daemon always sends a verdict (the `Option` is purely pre-#119 wire compat).
+                access_expires_at: account.access_expires_at,
+                refresh_health: account.refresh_health,
+                health: Some(account.health),
             })
             .collect(),
         // Already computed at snapshot build (issue #88); copy it to the wire.
@@ -587,6 +653,76 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
 /// A usage fraction in `[0.0, 1.0]` as a rounded, clamped `0..=100` percent.
 fn to_pct(fraction: f64) -> u8 {
     (fraction * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+/// Current wall-clock as epoch SECONDS, the unit the #119 credential rollup and wire use
+/// (`access_expires_at`, like `session_resets_at`). `0` on the pre-1970 impossible case —
+/// a best-effort, never-panic read, mirroring [`crate::observability`]'s log timestamps.
+/// NOT the [`Clock`] seam (which is monotonic, for poll intervals): the rollup needs a
+/// wall instant to compare against a stored `expiresAt`. Used only on the DISPLAY /
+/// event-emission path (never a swap decision), so a direct read keeps the deterministic
+/// decision logic on the injectable clock while the rollup logic stays a pure function of
+/// an explicit `now_secs` (unit-tested directly).
+fn wall_clock_now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The daemon-side 4-state credential-health rollup (issue #119) — a PURE function of one
+/// account's health inputs and the wall clock, so it is unit-tested directly and computed
+/// identically for the display snapshot and the transition-event diff. The thin `status`
+/// client just projects the returned verdict to a glyph.
+///
+/// A SEVERITY ladder (most-severe wins), matching the issue's 🟢→🟡→🟠→🔴 ordering:
+/// - **Dead** — `quarantined` (the #42 401-streak verdict) OR the last refresh outcome was
+///   `Dead` (the refresh token was cleared in place). Both genuinely need `claude /login`;
+///   surfacing a refresh-detected death as 🔴 too is more honest than hiding it (this is a
+///   DISPLAY rollup — it never flips the quarantine machinery).
+/// - **AtRisk** — the refresh safety-net is failing (`consecutive_refresh_failures > 0`):
+///   a streak of `Error` cycles means the mechanism that prevents staleness/death is
+///   struggling, so the account trends toward dead even while its token may still work.
+/// - **Stale** — the stored access token has EXPIRED (`access_expires_at <= now_secs`) but
+///   the refresh token is still valid (not dead, not failing): a transient window the next
+///   refresh recovers.
+/// - **Healthy** — none of the above.
+fn credential_health(
+    quarantined: bool,
+    last_refresh_outcome: Option<RefreshEventOutcome>,
+    consecutive_refresh_failures: u32,
+    access_expires_at: Option<i64>,
+    now_secs: i64,
+) -> CredentialHealth {
+    if quarantined || last_refresh_outcome == Some(RefreshEventOutcome::Dead) {
+        CredentialHealth::Dead
+    } else if consecutive_refresh_failures > 0 {
+        CredentialHealth::AtRisk
+    } else if access_expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
+        CredentialHealth::Stale
+    } else {
+        CredentialHealth::Healthy
+    }
+}
+
+/// Reduce one account's stored refresh observations into the non-secret [`RefreshHealth`]
+/// the wire surfaces (issue #119), or `None` when no refresh has been observed yet. `last_ok`
+/// collapses the full outcome to alive-vs-not (`Refreshed` / `NoChange` ⇒ ok; `Dead` /
+/// `Error` ⇒ not), the rollup's finer `Dead`-vs-`Error` distinction having already been
+/// applied by [`credential_health`].
+fn refresh_health_view(health: &AccountHealth) -> Option<RefreshHealth> {
+    let outcome = health.last_refresh_outcome?;
+    Some(RefreshHealth {
+        last_ok: matches!(
+            outcome,
+            RefreshEventOutcome::Refreshed
+                | RefreshEventOutcome::RefreshedNotReStashed
+                | RefreshEventOutcome::NoChange
+        ),
+        rotated: health.refresh_token_rotated.unwrap_or(false),
+        consecutive_failures: health.consecutive_refresh_failures,
+    })
 }
 
 /// Build the one-line reply to a control request line, plus any [`ControlSignal`]
@@ -814,6 +950,28 @@ struct AccountHealth {
     /// here below `monitor_recovery_m` forever; see
     /// [`deactivate_recovery_probe`](Daemon::deactivate_recovery_probe).
     recovery_successes: u32,
+    /// The last-observed stored access-token `expiresAt` as epoch SECONDS (issue #119),
+    /// folded from a refresh sweep's [`RefreshObservation`] (the engine reads it in MS;
+    /// converted at the fold). `None` until the refresh engine has observed this account
+    /// (e.g. `[refresh]` is off). The rollup's `Stale` (expired) input + the wire clock.
+    access_expires_at: Option<i64>,
+    /// The last-observed refresh classification (issue #119): drives the rollup's `Dead`
+    /// (a cleared refresh token) check and the `--json` `last_ok` projection. `None` until
+    /// a refresh has been observed. Stored as the full enum (not the reduced `last_ok`)
+    /// because the rollup must distinguish a terminal `Dead` from a transient `Error`.
+    last_refresh_outcome: Option<RefreshEventOutcome>,
+    /// Whether CC rotated the refresh-token value on the last observed refresh (issue #119,
+    /// the AC-3 durability signal). `None` until a refresh has been observed.
+    refresh_token_rotated: Option<bool>,
+    /// Consecutive refresh FAILURES (`Dead` / `Error` outcomes) carried across sweeps (issue
+    /// #119), reset to 0 by the next alive refresh — the rollup's `AtRisk` input.
+    consecutive_refresh_failures: u32,
+    /// The previously-emitted credential-health rollup verdict (issue #119), for
+    /// edge-triggered transition events: the run loop diffs the freshly-computed rollup
+    /// against this and emits one [`Event::CredentialHealth`] per CHANGE. `None` means
+    /// UNSEEDED — the first computation seeds it WITHOUT emitting (there is no prior state
+    /// to transition from), so a fresh daemon does not log a startup storm.
+    last_health: Option<CredentialHealth>,
 }
 
 /// Per-loop decision state carried across polls.
@@ -1233,8 +1391,9 @@ where
         // actual masking difference is a DISABLED (parked) swapped-away account — its last
         // reading is shown rather than masked to `None`, harmless, and `next_swap` excludes it
         // from targeting via the enabled-filter regardless. The sibling `locked_tick` already
-        // snapshots from `self.state.active`.
-        let snapshot = self.snapshot(self.state.active, &readings);
+        // snapshots from `self.state.active`. The wall clock (epoch seconds) for the #119
+        // credential rollup is read here (display-only, off the deterministic decision path).
+        let snapshot = self.snapshot(self.state.active, &readings, wall_clock_now_secs());
         TickOutcome {
             action,
             events,
@@ -1367,7 +1526,10 @@ where
         // next-swap candidate reads `awaiting usage data` for any live spare (#88) — an
         // honest "no swap right now", since a lock merely defers the data behind it.
         let readings = vec![None; self.roster.len()];
-        let snapshot = self.snapshot(self.state.active, &readings);
+        // A locked tick reads no credentials and changes no health state, so the #119
+        // rollup it projects is the carried last-known verdict (the wall clock only
+        // governs the access-token expiry crossover, harmless to evaluate here).
+        let snapshot = self.snapshot(self.state.active, &readings, wall_clock_now_secs());
         // Diagnostic (issue #77): a locked tick polls NOTHING (it short-circuits
         // before the poll loop), so there are no per-poll lines — just the decision
         // line naming the deferral and the back-off wait it imposed.
@@ -2076,29 +2238,128 @@ where
         })
     }
 
+    /// Fold one [`RefreshObservation`] the refresh sweep reported (issue #119) into the
+    /// owning account's carried health state — the credential clocks the `status` rollup
+    /// projects. The engine's `expiresAt` is MS (CC's native unit); it is converted to the
+    /// epoch SECONDS the rollup and wire use HERE, at the fold boundary. A `None` uuid (an
+    /// account the daemon no longer holds) is ignored, mirroring [`Self::apply_refresh_restore`].
+    ///
+    /// The expiry clock updates on EVERY observation (refreshed or read-only). The
+    /// refresh-health fields update only when the sweep actually refreshed the account
+    /// (`observation.refresh` is `Some`): a `Dead` / `Error` outcome advances the
+    /// consecutive-failure streak; any alive outcome resets it — so the streak the rollup's
+    /// `AtRisk` keys off counts only CONSECUTIVE failures.
+    fn apply_refresh_observation(&mut self, observation: &RefreshObservation) {
+        let Some(idx) = self
+            .roster
+            .iter()
+            .position(|a| a.account_uuid == observation.account_uuid)
+        else {
+            return;
+        };
+        let health = &mut self.state.health[idx];
+        // ms → s at the boundary; the rollup/wire are uniform epoch seconds.
+        health.access_expires_at = observation.expires_at_ms.map(|ms| ms / 1000);
+        if let Some(delta) = observation.refresh {
+            health.last_refresh_outcome = Some(delta.outcome);
+            health.refresh_token_rotated = Some(delta.token_rotated);
+            match delta.outcome {
+                RefreshEventOutcome::Dead | RefreshEventOutcome::Error => {
+                    health.consecutive_refresh_failures =
+                        health.consecutive_refresh_failures.saturating_add(1);
+                }
+                RefreshEventOutcome::Refreshed
+                | RefreshEventOutcome::RefreshedNotReStashed
+                | RefreshEventOutcome::NoChange => {
+                    health.consecutive_refresh_failures = 0;
+                }
+            }
+        }
+    }
+
+    /// Recompute every account's 4-state credential-health rollup (issue #119) against
+    /// `now_secs` and emit one [`Event::CredentialHealth`] per account whose verdict CHANGED
+    /// since the last call — the edge-triggered health timeline the issue's AC-3 requires
+    /// ("exactly one redacted event per transition"). The very first computation per account
+    /// SEEDS [`AccountHealth::last_health`] WITHOUT emitting (no prior state to transition
+    /// from), so a fresh daemon never logs a startup storm.
+    ///
+    /// Driven from the run loop AFTER folding the sweep's restores + observations, so a
+    /// transition reflects both the quarantine machinery (#42, updated in `tick`) and the
+    /// refresh clocks (#119, updated post-idle). Independent of — and complementary to — the
+    /// #42 [`Event::CredentialDead`] / [`Event::CredentialRestored`] edges: those signal the
+    /// quarantine sub-state and drive recovery, while this is the operator-facing rollup edge
+    /// (it also captures the Healthy↔Stale↔AtRisk transitions #42 never sees, and a
+    /// refresh-detected death the 401 path never quarantines).
+    fn note_health_transitions(&mut self, now_secs: i64) -> Vec<Event> {
+        let mut events = Vec::new();
+        for i in 0..self.roster.len() {
+            let health = &self.state.health[i];
+            let verdict = credential_health(
+                health.quarantined,
+                health.last_refresh_outcome,
+                health.consecutive_refresh_failures,
+                health.access_expires_at,
+                now_secs,
+            );
+            // Emit only on a CHANGE from a SEEDED baseline; the first observation (None)
+            // seeds silently.
+            if let Some(prev) = self.state.health[i].last_health {
+                if prev != verdict {
+                    events.push(Event::CredentialHealth {
+                        account: self.roster[i].label.clone(),
+                        state: verdict,
+                    });
+                }
+            }
+            self.state.health[i].last_health = Some(verdict);
+        }
+        events
+    }
+
     /// Build the non-secret per-account snapshot for the event log and the socket.
-    fn snapshot(&self, active: Option<usize>, readings: &[Option<Usage>]) -> StatusSnapshot {
+    fn snapshot(
+        &self,
+        active: Option<usize>,
+        readings: &[Option<Usage>],
+        now_secs: i64,
+    ) -> StatusSnapshot {
         StatusSnapshot {
             accounts: self
                 .roster
                 .iter()
                 .enumerate()
-                .map(|(i, account)| AccountReading {
-                    label: account.label.clone(),
-                    active: active == Some(i),
-                    enabled: account.enabled,
-                    quarantined: self.state.health[i].quarantined,
-                    // Mid-recovery iff dead AND its credential is currently answering
-                    // again (issue #109) — a refinement of `quarantined`, so `status`
-                    // can soften `needs re-login` to `recovering` for a healing account.
-                    recovering: self.state.health[i].quarantined
-                        && self.state.health[i].recovery_successes > 0,
-                    // The daemon's own viability verdict, deterministic (base, not
-                    // jittered, trigger) so the displayed "resets in" matches when
-                    // `use` would accept the account again (issue #72).
-                    weekly_exhausted: readings[i]
-                        .is_some_and(|usage| usage.weekly >= self.weekly_trigger_base),
-                    usage: readings[i],
+                .map(|(i, account)| {
+                    let health = &self.state.health[i];
+                    AccountReading {
+                        label: account.label.clone(),
+                        active: active == Some(i),
+                        enabled: account.enabled,
+                        quarantined: health.quarantined,
+                        // Mid-recovery iff dead AND its credential is currently answering
+                        // again (issue #109) — a refinement of `quarantined`, so `status`
+                        // can soften `needs re-login` to `recovering` for a healing account.
+                        recovering: health.quarantined && health.recovery_successes > 0,
+                        // The daemon's own viability verdict, deterministic (base, not
+                        // jittered, trigger) so the displayed "resets in" matches when
+                        // `use` would accept the account again (issue #72).
+                        weekly_exhausted: readings[i]
+                            .is_some_and(|usage| usage.weekly >= self.weekly_trigger_base),
+                        usage: readings[i],
+                        // The credential clocks + the daemon-computed 4-state rollup (issue
+                        // #119), projected from this account's carried health state. The
+                        // rollup is computed HERE (daemon-side) against `now_secs`; the thin
+                        // client just renders the verdict's glyph + the raw clocks.
+                        access_expires_at: health.access_expires_at,
+                        refresh_health: refresh_health_view(health),
+                        health: credential_health(
+                            health.quarantined,
+                            health.last_refresh_outcome,
+                            health.consecutive_refresh_failures,
+                            health.access_expires_at,
+                            now_secs,
+                        ),
+                    }
                 })
                 .collect(),
             // The forward-looking next-swap candidate (issue #88), computed from the
@@ -2493,6 +2754,10 @@ where
         // loop (where `&mut daemon` is held by `wait`) and un-quarantined AFTER it, when
         // `&mut daemon` is free again — the same post-idle pattern as the manual-swap adoption.
         let mut refresh_restored: Vec<String> = Vec::new();
+        // The credential-clock observations the sweep read (issue #119): collected here and
+        // folded into the per-account health state AFTER the idle block (the fold needs
+        // `&mut daemon`), exactly like the restores above.
+        let mut refresh_observations: Vec<RefreshObservation> = Vec::new();
 
         // Idle until the next tick is due, serving control requests and watching
         // for shutdown. A swap (if any) already completed inside `tick`, so a
@@ -2539,6 +2804,9 @@ where
                                     }
                                 }
                                 refresh_restored.extend(sweep.restored);
+                                // The #119 credential-clock observations, deferred like the
+                                // restores: folding them mutates the health machine.
+                                refresh_observations.extend(sweep.observations);
                             }
                         }
                     }
@@ -2556,6 +2824,23 @@ where
                 if let Err(err) = log.emit(&event) {
                     eprintln!("sessiometer: event log write failed: {err}");
                 }
+            }
+        }
+        // Fold the sweep's credential-clock observations into the health state (issue #119),
+        // now that `&mut daemon` is free, BEFORE diffing the rollup so a transition reflects
+        // this cycle's refresh.
+        for observation in &refresh_observations {
+            daemon.apply_refresh_observation(observation);
+        }
+        // Diff every account's 4-state rollup against its last-emitted verdict and log one
+        // edge-triggered `credential_health` per CHANGE (issue #119, AC-3). Runs EVERY
+        // iteration — not only on a sweep — so a time-driven transition (the access token
+        // crossing its expiry) and a quarantine-driven one (the #42 path, even with the
+        // refresh feature OFF) are both caught; the first computation per account seeds the
+        // baseline silently. Best-effort like every other log emission here.
+        for event in daemon.note_health_transitions(wall_clock_now_secs()) {
+            if let Err(err) = log.emit(&event) {
+                eprintln!("sessiometer: event log write failed: {err}");
             }
         }
         match idle {
@@ -5474,6 +5759,7 @@ mod tests {
                         weekly_resets_at: None,
                         session_resets_at: None,
                     }),
+                    ..Default::default()
                 },
                 AccountReading {
                     label: "spare".to_owned(),
@@ -5483,6 +5769,7 @@ mod tests {
                     recovering: false,
                     weekly_exhausted: false,
                     usage: None,
+                    ..Default::default()
                 },
             ],
             // A viable candidate rides the wire as a label (#88).
@@ -5510,6 +5797,268 @@ mod tests {
         assert!(!json.to_lowercase().contains("token"));
     }
 
+    // --- credential-health rollup (issue #119) -----------------------------
+
+    #[test]
+    fn credential_health_rolls_up_the_four_states_by_severity() {
+        use RefreshEventOutcome::{Error, NoChange, Refreshed};
+        const NOW: i64 = 1_782_777_600;
+
+        // Healthy — not quarantined, no refresh failure, token not yet expired.
+        assert_eq!(
+            credential_health(false, Some(Refreshed), 0, Some(NOW + 60), NOW),
+            CredentialHealth::Healthy
+        );
+        // Healthy is also the graceful-degradation default when no clock has been observed
+        // (the `[refresh]` feature is off, so there is no expiry / refresh outcome to judge).
+        assert_eq!(
+            credential_health(false, None, 0, None, NOW),
+            CredentialHealth::Healthy
+        );
+
+        // Stale — the access token has expired (`<= now`) but the refresh net is still
+        // alive: a transient window the next refresh recovers. The boundary is inclusive.
+        assert_eq!(
+            credential_health(false, Some(NoChange), 0, Some(NOW), NOW),
+            CredentialHealth::Stale
+        );
+        assert_eq!(
+            credential_health(false, Some(Refreshed), 0, Some(NOW - 1), NOW),
+            CredentialHealth::Stale
+        );
+
+        // AtRisk — the refresh safety-net is failing (a streak of errors), even while the
+        // access token itself has not yet expired.
+        assert_eq!(
+            credential_health(false, Some(Error), 1, Some(NOW + 60), NOW),
+            CredentialHealth::AtRisk
+        );
+
+        // Dead — quarantined (the #42 401-streak verdict)…
+        assert_eq!(
+            credential_health(true, None, 0, None, NOW),
+            CredentialHealth::Dead
+        );
+        // …or the refresh token was cleared in place (a refresh-detected death), surfaced
+        // as 🔴 too rather than hidden — this is a DISPLAY rollup, it never quarantines.
+        assert_eq!(
+            credential_health(
+                false,
+                Some(RefreshEventOutcome::Dead),
+                0,
+                Some(NOW + 60),
+                NOW
+            ),
+            CredentialHealth::Dead
+        );
+
+        // Severity ladder (Dead > AtRisk > Stale > Healthy): a quarantined account whose
+        // token is ALSO expired and whose refresh is ALSO failing still reads Dead; an
+        // at-risk account whose token is ALSO expired reads AtRisk, not Stale.
+        assert_eq!(
+            credential_health(true, Some(Error), 3, Some(NOW - 10), NOW),
+            CredentialHealth::Dead
+        );
+        assert_eq!(
+            credential_health(false, Some(Error), 2, Some(NOW - 10), NOW),
+            CredentialHealth::AtRisk
+        );
+    }
+
+    #[test]
+    fn refresh_health_view_is_none_until_observed_then_reduces_the_outcome() {
+        // No refresh observed yet (`[refresh]` off, or not yet swept) → None, so the wire
+        // omits the field rather than fabricating a verdict.
+        assert_eq!(refresh_health_view(&AccountHealth::default()), None);
+
+        // An alive outcome reduces to `last_ok: true`, carrying the rotation flag (the AC-3
+        // durability signal) and the failure streak.
+        let alive = AccountHealth {
+            last_refresh_outcome: Some(RefreshEventOutcome::NoChange),
+            refresh_token_rotated: Some(true),
+            consecutive_refresh_failures: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_health_view(&alive),
+            Some(RefreshHealth {
+                last_ok: true,
+                rotated: true,
+                consecutive_failures: 0,
+            })
+        );
+
+        // A dead/error outcome reduces to `last_ok: false`, surfacing the failure streak the
+        // rollup's at-risk input keys off.
+        let failing = AccountHealth {
+            last_refresh_outcome: Some(RefreshEventOutcome::Error),
+            refresh_token_rotated: Some(false),
+            consecutive_refresh_failures: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_health_view(&failing),
+            Some(RefreshHealth {
+                last_ok: false,
+                rotated: false,
+                consecutive_failures: 3,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_refresh_observation_folds_ms_expiry_and_tracks_consecutive_failures() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        // `RefreshDelta` lives in `refresh_tick` and is not imported at module scope (only
+        // the daemon's fold consumes it); name it in full here.
+        use crate::refresh_tick::RefreshDelta;
+        let observe = |outcome, rotated, ms| RefreshObservation {
+            account_uuid: "u-A".to_owned(),
+            expires_at_ms: Some(ms),
+            refresh: Some(RefreshDelta {
+                outcome,
+                token_rotated: rotated,
+            }),
+        };
+
+        // A read-only observation (`refresh: None`) updates ONLY the expiry — folded from
+        // the engine's milliseconds to the rollup's epoch seconds at this boundary.
+        daemon.apply_refresh_observation(&RefreshObservation {
+            account_uuid: "u-A".to_owned(),
+            expires_at_ms: Some(1_782_777_600_000),
+            refresh: None,
+        });
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(1_782_777_600)
+        );
+        assert_eq!(daemon.state.health[0].last_refresh_outcome, None);
+        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 0);
+
+        // Failing refreshes advance the consecutive-failure streak and record the outcome.
+        daemon.apply_refresh_observation(&observe(
+            RefreshEventOutcome::Error,
+            false,
+            1_782_777_600_000,
+        ));
+        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 1);
+        daemon.apply_refresh_observation(&observe(
+            RefreshEventOutcome::Dead,
+            false,
+            1_782_777_600_000,
+        ));
+        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 2);
+        assert_eq!(
+            daemon.state.health[0].last_refresh_outcome,
+            Some(RefreshEventOutcome::Dead)
+        );
+
+        // Any alive refresh resets the streak to zero — so the at-risk input counts only
+        // CONSECUTIVE failures — and slides the expiry forward.
+        daemon.apply_refresh_observation(&observe(
+            RefreshEventOutcome::Refreshed,
+            true,
+            1_782_784_800_000,
+        ));
+        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 0);
+        assert_eq!(daemon.state.health[0].refresh_token_rotated, Some(true));
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(1_782_784_800)
+        );
+
+        // An observation for a uuid the daemon no longer holds is ignored (no panic, no
+        // spurious mutation) — mirroring `apply_refresh_restore`; the siblings stay pristine.
+        daemon.apply_refresh_observation(&RefreshObservation {
+            account_uuid: "u-GONE".to_owned(),
+            expires_at_ms: Some(0),
+            refresh: None,
+        });
+        assert_eq!(daemon.state.health[1].access_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn note_health_transitions_seeds_silently_then_emits_one_event_per_change() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        const NOW: i64 = 1_782_777_600;
+
+        // The FIRST computation per account SEEDS the baseline WITHOUT emitting — a fresh
+        // daemon logs no startup storm. All three start healthy (not quarantined, no clocks).
+        assert!(daemon.note_health_transitions(NOW).is_empty());
+        assert_eq!(
+            daemon.state.health[0].last_health,
+            Some(CredentialHealth::Healthy)
+        );
+
+        // A genuine change emits EXACTLY ONE redacted event (AC-3) — the handle and the new
+        // state — and only for the account that changed.
+        daemon.state.health[0].quarantined = true; // → Dead
+        assert_eq!(
+            daemon.note_health_transitions(NOW),
+            vec![Event::CredentialHealth {
+                account: "work".to_owned(),
+                state: CredentialHealth::Dead,
+            }]
+        );
+
+        // No change ⇒ no event (edge-triggered, not level-triggered).
+        assert!(daemon.note_health_transitions(NOW).is_empty());
+
+        // Recovery flips it back — another single transition event.
+        daemon.state.health[0].quarantined = false; // → Healthy
+        assert_eq!(
+            daemon.note_health_transitions(NOW),
+            vec![Event::CredentialHealth {
+                account: "work".to_owned(),
+                state: CredentialHealth::Healthy,
+            }]
+        );
+    }
+
+    #[test]
+    fn redaction_meter_covers_the_new_credential_clock_fields() {
+        use crate::redaction::meter::{assert_clean, Secrets};
+        // The full-loop meter test runs no sweep, so its corpus never carries a populated
+        // `refresh_health` / `access_expires_at`. Exercise those new wire fields here with
+        // non-default values — the expiry is the SAME instant embedded in the fixture blob's
+        // `expiresAt`, so a path that leaked the surrounding token alongside the expiry would
+        // surface it — and prove the value-based meter (#15) still reads clean.
+        let secrets = Secrets::meter_fixture();
+        let snapshot = StatusSnapshot {
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                enabled: true,
+                access_expires_at: Some(1_782_777_600),
+                refresh_health: Some(RefreshHealth {
+                    last_ok: true,
+                    rotated: true,
+                    consecutive_failures: 0,
+                }),
+                health: CredentialHealth::Stale,
+                ..Default::default()
+            }],
+            next_swap: None,
+        };
+        let response = status_response(&snapshot);
+        let mut corpus = serde_json::to_string(&response).unwrap();
+        corpus.push('\n');
+        // The text surface too (it carries the 🟡 glyph for this Stale account).
+        corpus.push_str(&crate::cli::render_status(
+            &response,
+            1_782_700_000,
+            None,
+            false,
+        ));
+
+        // Cardinality (#15 non-vacuous gate): the new fields actually reached the scanned
+        // corpus before the clean verdict below is trusted.
+        assert!(corpus.contains(r#""access_expires_at":1782777600"#));
+        assert!(corpus.contains(r#""refresh_health":{"#));
+        assert!(corpus.contains(r#""health":"stale""#));
+        assert_clean(&corpus, &secrets);
+    }
+
     #[tokio::test]
     async fn serve_control_answers_status_with_exactly_one_line() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5528,6 +6077,7 @@ mod tests {
                     weekly_resets_at: None,
                     session_resets_at: None,
                 }),
+                ..Default::default()
             }],
             next_swap: None,
         };
@@ -5774,6 +6324,7 @@ mod tests {
                     recovering: false,
                     weekly_exhausted: false,
                     usage: None,
+                    ..Default::default()
                 },
                 AccountReading {
                     label: "spare".to_owned(),
@@ -5783,6 +6334,7 @@ mod tests {
                     recovering: false,
                     weekly_exhausted: false,
                     usage: None,
+                    ..Default::default()
                 },
             ],
             next_swap: None,
@@ -6349,6 +6901,7 @@ mod tests {
                 expires_after: Some(1_003_600),
             }],
             restored: vec!["u-B".to_owned()],
+            observations: Vec::new(),
         });
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
@@ -7258,7 +7811,7 @@ mod tests {
             Some(live(0.10, 0.10).unwrap()),
             Some(live(0.20, 0.20).unwrap()),
         ];
-        let snapshot = daemon.snapshot(Some(0), &readings);
+        let snapshot = daemon.snapshot(Some(0), &readings, 0);
         let work = &snapshot.accounts[0];
         assert_eq!(work.label, "work");
         assert!(
@@ -7887,8 +8440,13 @@ mod tests {
             "UDS channel: quarantine status missing"
         );
         assert!(
-            corpus.contains("needs re-login"),
-            "status-text channel: quarantine tag missing"
+            // The status-TEXT rendering of a dead credential (#119): the 🔴 rollup glyph
+            // plus the actionable `claude /login` cue (AC-1) now stand in for the pre-rollup
+            // `needs re-login` tag. Unique to the text channel — the wire carries the verdict
+            // as the `"health":"dead"` enum, not this operator-facing command — so it proves
+            // the status-text channel contributed (a non-vacuous #15 gate).
+            corpus.contains("🔴 claude /login"),
+            "status-text channel: dead-credential cue missing"
         );
         assert!(
             corpus.contains(r#""session_pct":97"#),

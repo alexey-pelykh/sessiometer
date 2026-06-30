@@ -1160,6 +1160,12 @@ mod tests {
             session_resets_at: None,
             weekly_resets_at: None,
             weekly_exhausted,
+            // The #119 credential-health rollup is DISPLAY-only — `cached_viability_of`
+            // keys off `quarantined` / `weekly_exhausted` / reading-presence, never the
+            // rollup — so these are inert here.
+            access_expires_at: None,
+            refresh_health: None,
+            health: None,
         }
     }
 

@@ -46,6 +46,8 @@ use std::fs::File;
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Result;
 use crate::paths;
 
@@ -117,6 +119,48 @@ impl RefreshEventOutcome {
             RefreshEventOutcome::NoChange => "no_change",
             RefreshEventOutcome::Dead => "dead",
             RefreshEventOutcome::Error => "error",
+        }
+    }
+}
+
+/// The 4-state per-account CREDENTIAL-health rollup `status` surfaces (issue #119): the
+/// daemon-computed verdict the thin read-only `status` client just projects to a glyph
+/// (🟢/🟡/🟠/🔴). Lives HERE — the base observability module, with no `daemon`
+/// dependency — so the [`Event::CredentialHealth`] transition event can name it without
+/// a `daemon` ↔ `observability` dependency cycle; `daemon` (which computes it) and `cli`
+/// (which renders it) both import it.
+///
+/// Non-secret by construction: a bare classification, never a token, an expiry, or an
+/// email — the same #15 discipline as [`RefreshEventOutcome`]. Variants are ordered by
+/// SEVERITY (`Healthy` < `Stale` < `AtRisk` < `Dead`), matching the issue's green →
+/// yellow → orange → red ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CredentialHealth {
+    /// Access token valid and the refresh path working (or unobserved). 🟢
+    #[default]
+    Healthy,
+    /// The stored access token has EXPIRED but the refresh token is still valid — a
+    /// transient window the next refresh recovers. 🟡 (least severe non-healthy state).
+    Stale,
+    /// The refresh safety-net is FAILING (a streak of refresh errors): the mechanism that
+    /// prevents staleness/death is struggling, so the account trends toward dead even
+    /// while its token may still work for now. 🟠
+    AtRisk,
+    /// The credential is DEAD — quarantined (the #42 401-streak verdict) OR its refresh
+    /// token was cleared in place — and needs an operator `claude /login`. 🔴
+    Dead,
+}
+
+impl CredentialHealth {
+    /// The `state=` token for the [`Event::CredentialHealth`] log line. Matches the
+    /// `snake_case` serde rename so the event log and the `--json` wire agree.
+    fn as_str(self) -> &'static str {
+        match self {
+            CredentialHealth::Healthy => "healthy",
+            CredentialHealth::Stale => "stale",
+            CredentialHealth::AtRisk => "at_risk",
+            CredentialHealth::Dead => "dead",
         }
     }
 }
@@ -206,6 +250,17 @@ pub(crate) enum Event {
         expires_before: Option<i64>,
         expires_after: Option<i64>,
     },
+    /// `account`'s 4-state credential-health rollup (issue #119) TRANSITIONED to `state`
+    /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
+    /// the state holds), so the event log carries the per-account health timeline. The
+    /// daemon computes the rollup ([`crate::daemon`]) and diffs it across cycles; the
+    /// very first observation SEEDS the baseline silently (no transition to report).
+    /// `account` is the HANDLE (operator label); `state` is a bare classification —
+    /// never a token, expiry, or email (the #15 single-surface guarantee).
+    CredentialHealth {
+        account: String,
+        state: CredentialHealth,
+    },
 }
 
 impl Event {
@@ -291,6 +346,10 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=refresh account={account} outcome={outcome}{before}{after}")
+            }
+            Event::CredentialHealth { account, state } => {
+                let state = state.as_str();
+                format!("ts={ts} event=credential_health account={account} state={state}")
             }
         }
     }
@@ -941,6 +1000,10 @@ mod tests {
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_781_200_000),
             },
+            Event::CredentialHealth {
+                account: "work".to_owned(),
+                state: CredentialHealth::Dead,
+            },
         ];
         for event in &events {
             let line = event.to_log_line(at_epoch(0));
@@ -948,6 +1011,29 @@ mod tests {
             assert!(!line.to_lowercase().contains("token"), "no token: {line}");
             // Exactly one line — no embedded newline could split or forge a record.
             assert_eq!(line.lines().count(), 1, "single line: {line}");
+        }
+    }
+
+    #[test]
+    fn credential_health_line_carries_the_handle_and_state_token() {
+        // Issue #119: the health-transition event is the handle + a bare 4-state token —
+        // never a token, an expiry, or an email. Each rollup state renders its `snake_case`
+        // token, matching the `--json` wire serialization of `CredentialHealth`.
+        for (state, token) in [
+            (CredentialHealth::Healthy, "healthy"),
+            (CredentialHealth::Stale, "stale"),
+            (CredentialHealth::AtRisk, "at_risk"),
+            (CredentialHealth::Dead, "dead"),
+        ] {
+            let line = Event::CredentialHealth {
+                account: "work".to_owned(),
+                state,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!("{TS0} event=credential_health account=work state={token}")
+            );
         }
     }
 
