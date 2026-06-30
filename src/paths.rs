@@ -12,7 +12,7 @@
 
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -57,6 +57,96 @@ fn home_dir() -> Result<PathBuf> {
         }
         Ok(PathBuf::from(OsString::from_vec(bytes)))
     }
+}
+
+/// The current user's login name from the password database
+/// (`getpwuid(getuid())->pw_name`), resolved the same way as [`home_dir`] — never
+/// from `$USER`, which may be unset or spoofed.
+///
+/// This is the `acct` attribute Claude Code stores its credential item under (CC's
+/// `vO()` == `whoami`; `build/version-compat.md`). The isolated-refresh engine
+/// (issue #102) seeds and reads its isolated keychain item under the SAME `acct`,
+/// so a `claude` it spawns locates the seeded item.
+pub(crate) fn username() -> Result<OsString> {
+    let uid = current_uid();
+    // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. The crate
+    // runs on a single-threaded executor (`#[tokio::main(flavor = "current_thread")]`)
+    // and `getpwuid` (here and in [`home_dir`]) is the crate's ONLY `getpw*` caller, so
+    // no concurrent `getpw*` can race or invalidate the shared buffer — this holds for
+    // this function's mid-runtime callers too (the #102 refresh engine resolves the
+    // `acct` per cycle), not only at startup. `pw_name` is copied into an owned
+    // `OsString` before any later `getpw*` (e.g. a subsequent `home_dir`) could run.
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return Err(Error::UserUnresolved);
+        }
+        let name = (*pw).pw_name;
+        if name.is_null() {
+            return Err(Error::UserUnresolved);
+        }
+        let bytes = CStr::from_ptr(name).to_bytes().to_vec();
+        if bytes.is_empty() {
+            return Err(Error::UserUnresolved);
+        }
+        Ok(OsString::from_vec(bytes))
+    }
+}
+
+/// The ephemeral isolated-refresh directory for account `uuid`:
+/// `<support_dir>/refresh/<uuid>` (issue #102). Native-local under [`support_dir`]
+/// (not the XDG-overridable [`config_dir`]) — it is the isolated `CLAUDE_CONFIG_DIR`
+/// whose path-hash names the isolated keychain item, so it must resolve identically
+/// for the engine and the `claude` it spawns regardless of a per-shell
+/// `XDG_CONFIG_HOME`.
+pub(crate) fn isolated_refresh_dir(uuid: &str) -> Result<PathBuf> {
+    Ok(support_dir()?.join("refresh").join(uuid))
+}
+
+/// Create the ephemeral isolated-refresh directory `path` (issue #102) as a fresh,
+/// private (`0700`, owner-checked) directory, REFUSING a pre-existing symlink.
+///
+/// Stricter than [`ensure_private_dir`]: a spawned `claude` writes its `.claude.json`
+/// into this dir, and the dir's path-hash names the keychain item it refreshes, so a
+/// symlink planted at this path could redirect those writes outside our `0700` tree.
+/// The leaf is therefore created FRESH — any pre-existing *real* directory (a stale
+/// dir left by a crashed prior cycle) is removed first, and a pre-existing *symlink*
+/// is refused ([`Error::UnsafeIsolatedDir`]) rather than followed. After creation the
+/// leaf is re-checked with `symlink_metadata` (`lstat` — never follows a link) to be a
+/// real directory owned by the current uid. The parent (`<support>/refresh`) is
+/// ensured private first.
+pub(crate) fn create_isolated_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    // `symlink_metadata` (lstat) classifies the leaf itself, not a link's target.
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Error::UnsafeIsolatedDir {
+                path: path.to_path_buf(),
+            });
+        }
+        // A stale real directory from a prior crashed cycle — remove it so the seed
+        // and `.claude.json` start from a clean, owner-fresh state.
+        Ok(_) => fs::remove_dir_all(path)?,
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::Io(err)),
+    }
+    // `create_dir` (not `_all`) makes the leaf fresh and fails if it reappeared; it
+    // never follows a symlink (a TOCTOU-planted link at this point fails the create
+    // or is caught by the post-create lstat below).
+    fs::create_dir(path)?;
+    fs::set_permissions(path, Permissions::from_mode(DIR_MODE))?;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(Error::UnsafeIsolatedDir {
+            path: path.to_path_buf(),
+        });
+    }
+    if meta.uid() != current_uid() {
+        return Err(Error::ForeignOwnership(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 /// Pure derivation of the config directory, so the env/home policy is testable
@@ -308,6 +398,77 @@ mod tests {
         let support = support_dir().unwrap();
         assert_eq!(swap_lock().unwrap(), support.join("swap.lock"));
         assert_ne!(swap_lock().unwrap(), daemon_lock().unwrap());
+    }
+
+    #[test]
+    fn username_resolves_a_non_empty_login_name() {
+        // The login name backs the isolated item's `acct` (#102); it must resolve
+        // to a non-empty value from the password database (never `$USER`).
+        let name = username().unwrap();
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn isolated_refresh_dir_is_native_local_under_refresh() {
+        // The isolated CLAUDE_CONFIG_DIR (#102) lives under the native-local support
+        // dir, never the XDG-overridable config dir, so its path-hash is stable.
+        let dir = isolated_refresh_dir("11111111-1111-1111-1111-111111111111").unwrap();
+        assert!(dir.ends_with(
+            "Library/Application Support/sessiometer/refresh/11111111-1111-1111-1111-111111111111"
+        ));
+        assert!(dir.starts_with(support_dir().unwrap()));
+    }
+
+    #[test]
+    fn create_isolated_dir_makes_a_fresh_0700_owned_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("refresh/u-1");
+        create_isolated_dir(&dir).unwrap();
+
+        let meta = fs::symlink_metadata(&dir).unwrap();
+        assert!(meta.file_type().is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, DIR_MODE);
+        assert_eq!(meta.uid(), current_uid());
+    }
+
+    #[test]
+    fn create_isolated_dir_replaces_a_stale_real_directory() {
+        // A crashed prior cycle can leave a stale dir (possibly with leftover files);
+        // the next cycle must start clean — the stale dir is removed and recreated.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("refresh/u-1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("stale.json"), b"leftover").unwrap();
+
+        create_isolated_dir(&dir).unwrap();
+
+        assert!(dir.exists());
+        assert!(
+            !dir.join("stale.json").exists(),
+            "stale contents must be cleared"
+        );
+    }
+
+    #[test]
+    fn create_isolated_dir_refuses_a_pre_existing_symlink() {
+        // A symlink planted at the leaf path is REFUSED, not followed — it could
+        // redirect the seeded .claude.json / the spawn's writes out of our 0700 tree.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("refresh");
+        fs::create_dir_all(&parent).unwrap();
+        let target = tmp.path().join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        let link = parent.join("u-1");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = create_isolated_dir(&link).unwrap_err();
+        assert!(matches!(err, Error::UnsafeIsolatedDir { .. }));
+        // The symlink (and its target) are untouched — refused, never followed.
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(target.exists());
     }
 
     #[test]

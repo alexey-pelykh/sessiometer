@@ -131,6 +131,19 @@ fn canonical_service() -> Result<String> {
     )
 }
 
+/// The canonical keychain service name a Claude Code instance run under
+/// `config_dir` as its `CLAUDE_CONFIG_DIR` reads/writes —
+/// `Claude Code-credentials-<sha256(NFC(config_dir))[..8]>` (the bare base for an
+/// empty value). The `config_dir`-as-argument form of [`canonical_service`], built
+/// by the SAME #100 derivation ([`canonical_service_from`]) — never re-derived — so
+/// the isolated-refresh engine (issue #102) addresses exactly the item a `claude` it
+/// spawns under that isolated config dir will read and refresh. (`securestorage` is
+/// modelled as unset: the engine never sets `CLAUDE_SECURESTORAGE_CONFIG_DIR` for the
+/// spawn, and unsets any inherited one, so only `CLAUDE_CONFIG_DIR` governs.)
+pub(crate) fn service_for_config_dir(config_dir: &OsStr) -> Result<String> {
+    canonical_service_from(None, Some(config_dir))
+}
+
 /// An opaque credential blob (the active account's OAuth tokens).
 ///
 /// The inner buffer is zeroized when the last owner is dropped, and the type
@@ -624,6 +637,161 @@ impl CredentialStore for FakeCredentialStore {
     }
 }
 
+/// Seam: the isolated keychain item a spawned `claude` refreshes for the
+/// isolated-refresh engine (issue #102) — the generic-password item at the
+/// config-dir-suffixed service ([`service_for_config_dir`]), keyed by the macOS login
+/// name (`acct`) Claude Code reads with ([`paths::username`]).
+///
+/// Distinct from [`CredentialStore`] (the single CANONICAL active item, whose `acct`
+/// is resolved by uniqueness): the isolated item's `acct` is KNOWN up front, and it is
+/// seeded, read back, and deleted within one short-lived cycle, never resolved. Both
+/// writes ride the `apple-tool:` identity (`/usr/bin/security`), like the canonical
+/// item, so a spawned CC's own `apple-tool:` save leaves the partition list intact and
+/// sessiometer's read-back stays silent (no heal-write — `build/version-compat.md`
+/// issue #101 AC-2).
+#[allow(dead_code)]
+pub(crate) trait IsolatedKeychain {
+    /// Seed the isolated item with `blob` — `add-generic-password -U` fed to
+    /// `security -i` on stdin, so the blob never lands on this process's argv (#39),
+    /// under the `apple-tool:` identity (#101 AC-2).
+    async fn seed(&self, blob: &[u8]) -> Result<()>;
+    /// Read the (CC-refreshed) blob back — `find-generic-password -w`, silent under
+    /// the preserved `apple-tool:` partition (#101 AC-2).
+    async fn read_back(&self) -> Result<Credential>;
+    /// Delete the isolated item — `delete-generic-password`; an already-absent item is
+    /// success (teardown is idempotent). The async happy-path teardown.
+    async fn delete(&self) -> Result<()>;
+    /// Best-effort SYNCHRONOUS delete for an RAII teardown on the drop / panic /
+    /// timer-kill path, where `await` is unavailable. Errors are swallowed — `Drop`
+    /// cannot surface them; the async [`delete`](Self::delete) is the primary path.
+    fn delete_blocking(&self);
+}
+
+/// Real isolated keychain item, driving `/usr/bin/security` against the login
+/// keychain (issue #102). Reuses the canonical item's off-argv `security -i` write
+/// and `-w` read primitives, addressing the config-dir-suffixed service under the
+/// macOS login-name `acct`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct IsolatedKeychainItem {
+    /// The config-dir-suffixed service ([`service_for_config_dir`]) of the spawned
+    /// `claude`'s isolated `CLAUDE_CONFIG_DIR`.
+    service: String,
+    /// The macOS login name CC reads/writes the item under.
+    acct: OsString,
+    /// Keychain to operate on. `None` is production (the login keychain); `Some` pins
+    /// a throwaway keychain for the real-CLI round-trip test.
+    keychain: Option<PathBuf>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl IsolatedKeychainItem {
+    /// Production isolated store for a `claude` spawned under `config_dir`: the
+    /// service is derived from `config_dir` by #100, the `acct` is the login name,
+    /// and operations target the login keychain.
+    pub(crate) fn new(config_dir: &OsStr) -> Result<Self> {
+        Ok(Self {
+            service: service_for_config_dir(config_dir)?,
+            acct: paths::username()?,
+            keychain: None,
+        })
+    }
+
+    /// Isolated store pinned to a specific keychain file with an explicit `acct`
+    /// (real-CLI round-trip test only — drives the real `security` against a
+    /// throwaway keychain, never the login keychain).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_keychain(
+        config_dir: &OsStr,
+        acct: OsString,
+        keychain: PathBuf,
+    ) -> Result<Self> {
+        Ok(Self {
+            service: service_for_config_dir(config_dir)?,
+            acct,
+            keychain: Some(keychain),
+        })
+    }
+
+    /// The keychain path to pin on every call.
+    fn keychain_path(&self) -> Result<PathBuf> {
+        match &self.keychain {
+            Some(kc) => Ok(kc.clone()),
+            None => paths::login_keychain(),
+        }
+    }
+
+    /// `delete-generic-password` arguments: the isolated item by `(service, acct)`,
+    /// pinning the keychain. No `-w` / payload — delete needs only the non-secret
+    /// identifiers, so (unlike seed) there is nothing to keep off argv.
+    fn delete_args(&self, keychain: &Path) -> Vec<OsString> {
+        vec![
+            "delete-generic-password".into(),
+            "-s".into(),
+            self.service.as_str().into(),
+            "-a".into(),
+            self.acct.clone(),
+            keychain.as_os_str().to_owned(),
+        ]
+    }
+}
+
+impl IsolatedKeychain for IsolatedKeychainItem {
+    async fn seed(&self, blob: &[u8]) -> Result<()> {
+        let keychain = self.keychain_path()?;
+        let line = write_command_line(&self.service, &self.acct, &keychain, blob);
+        let output = run_interactive_write(&line).await?;
+        finish_write(output.status.success(), output.status.code().unwrap_or(-1))
+    }
+
+    async fn read_back(&self) -> Result<Credential> {
+        let keychain = self.keychain_path()?;
+        let output = Command::new(SECURITY)
+            .args(read_args(&self.service, &self.acct, &keychain))
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        finish_read(
+            output.stdout,
+            output.status.success(),
+            output.status.code().unwrap_or(-1),
+        )
+    }
+
+    async fn delete(&self) -> Result<()> {
+        let keychain = self.keychain_path()?;
+        let output = Command::new(SECURITY)
+            .args(self.delete_args(&keychain))
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let code = output.status.code().unwrap_or(-1);
+        // 44 == errSecItemNotFound: the item is already gone → idempotent success.
+        if code == 44 {
+            Ok(())
+        } else {
+            Err(keychain_error("isolated delete", code))
+        }
+    }
+
+    fn delete_blocking(&self) {
+        let Ok(keychain) = self.keychain_path() else {
+            return;
+        };
+        // Best-effort, synchronous (Drop cannot await): every outcome — deleted,
+        // already-absent, or a transient failure — is swallowed, since the async
+        // `delete` is the primary path and Drop has no channel to surface an error.
+        let _ = std::process::Command::new(SECURITY)
+            .args(self.delete_args(&keychain))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +896,27 @@ mod tests {
         // The precedence path refuses on a non-ASCII securestorage value too.
         assert!(matches!(
             canonical_service_from(Some(OsStr::new("/naïve")), None),
+            Err(Error::NonAsciiConfigDir)
+        ));
+    }
+
+    #[test]
+    fn service_for_config_dir_reuses_the_100_derivation_for_the_isolated_engine() {
+        // The isolated-refresh engine (#102) addresses a `claude`'s isolated config
+        // dir by the SAME #100 suffix — never re-derived. It is exactly
+        // `canonical_service_from(None, Some(dir))` (securestorage modelled as unset),
+        // matching the spike's pinned vectors (`build/version-compat.md`).
+        assert_eq!(
+            service_for_config_dir(OsStr::new("/abs/path")).unwrap(),
+            "Claude Code-credentials-6d80187b"
+        );
+        assert_eq!(
+            service_for_config_dir(OsStr::new("/opt/cc")).unwrap(),
+            canonical_service_from(None, Some(OsStr::new("/opt/cc"))).unwrap()
+        );
+        // A non-ASCII isolated dir is refused, not mis-hashed — same guard as #100.
+        assert!(matches!(
+            service_for_config_dir(OsStr::new("/Users/café/refresh")),
             Err(Error::NonAsciiConfigDir)
         ));
     }
@@ -1202,6 +1391,51 @@ class: "genp"
                 stored.pop();
             }
             assert_eq!(stored, SENTINEL.as_bytes());
+            delete(&kc);
+        }
+
+        /// The isolated-refresh engine's keychain primitive (issue #102), end-to-end
+        /// against the real `security` CLI on a throwaway keychain: seed → read-back
+        /// (silent, byte-exact, off-argv) → delete (idempotent). Targets the
+        /// config-dir-suffixed service, not the bare canonical name.
+        #[tokio::test]
+        async fn isolated_item_seeds_reads_back_and_deletes_idempotently() {
+            let (_dir, kc) = fresh_keychain();
+            // An arbitrary isolated config dir → its #100-suffixed service; an
+            // explicit acct keeps the test hermetic (no dependence on the live login
+            // name). The service must be the SUFFIXED name, never the bare base.
+            let config_dir = OsStr::new("/tmp/sessiometer-iso-roundtrip");
+            let item = IsolatedKeychainItem::for_keychain(
+                config_dir,
+                OsString::from("iso-acct"),
+                kc.clone(),
+            )
+            .unwrap();
+            assert_ne!(
+                service_for_config_dir(config_dir).unwrap(),
+                SERVICE_BASE,
+                "the isolated service must be suffixed, never the bare canonical"
+            );
+
+            // A blob carrying shell metacharacters, to prove the off-argv `security -i`
+            // seed path is byte-exact for the isolated item too.
+            let blob = br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-X $y `z` ;|&","refreshToken":"sk-ant-ort-X","expiresAt":9999999999999}}"#;
+            item.seed(blob).await.expect("seed isolated item");
+
+            let got = item.read_back().await.expect("read the isolated item back");
+            assert_eq!(got.expose(), blob, "isolated read-back must be byte-exact");
+
+            // Delete removes it; a second delete is an idempotent success (44 → Ok).
+            item.delete().await.expect("delete isolated item");
+            assert!(matches!(
+                item.read_back().await,
+                Err(Error::CredentialNotFound)
+            ));
+            item.delete().await.expect("re-delete is idempotent");
+
+            // The synchronous Drop-path delete is also tolerant of an absent item.
+            item.delete_blocking();
+
             delete(&kc);
         }
     }

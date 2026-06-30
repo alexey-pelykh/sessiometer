@@ -36,6 +36,22 @@ pub(crate) enum Error {
     #[error("directory {0} is not owned by the current user")]
     ForeignOwnership(PathBuf),
 
+    /// The current user's login name could not be resolved from the password
+    /// database (`getpwuid(getuid())->pw_name`, see [`crate::paths`]). The
+    /// isolated-refresh engine (issue #102) seeds its keychain item under this
+    /// `acct` (the name Claude Code reads with), so it cannot proceed without it.
+    #[error("could not resolve the login name for the current user")]
+    UserUnresolved,
+
+    /// The ephemeral isolated-refresh directory (`<support>/refresh/<account-uuid>`,
+    /// issue #102) could not be created as a safe private directory: a pre-existing
+    /// entry at that path is a symlink, refused rather than followed — a planted
+    /// symlink could redirect the seeded `.claude.json` or the spawned `claude`'s
+    /// writes outside our `0700` tree. The path is a filesystem location, never a
+    /// secret.
+    #[error("refusing to use the isolated-refresh directory {path}: it is a symlink, not a private directory")]
+    UnsafeIsolatedDir { path: PathBuf },
+
     /// No `Claude Code-credentials` item is present in the keychain — an account
     /// must be captured before it can be read or swapped.
     #[error("no Claude Code credential found in the keychain (capture an account first)")]
