@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
 use crate::observability::{Diagnostic, DiagnosticLog, EventLog, Verbosity};
 use crate::paths;
+use crate::refresh;
 use crate::stash::{AccountStash, RealAccountStash};
 
 /// Parse `argv` and run the requested subcommand.
@@ -223,6 +224,19 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         monitor_401_n: config.tunables.monitor_401_n,
         monitor_recovery_m: config.tunables.monitor_recovery_m,
     });
+    // Reap any isolated-refresh artifacts (issue #103) a crashed cycle (SIGKILL /
+    // power-loss — no RAII teardown) may have stranded: the single-instance lock above
+    // guarantees no cycle is in flight, so a present isolated item/dir for a roster
+    // account is an orphan still holding a live credential. Best-effort and
+    // roster-scoped — a sibling of `run_loop`'s reconcile-on-start, kept HERE rather
+    // than inside `run_loop` so the hermetic loop tests never spawn `/usr/bin/security`.
+    let roster_uuids: Vec<String> = config
+        .roster
+        .iter()
+        .map(|account| account.account_uuid.clone())
+        .collect();
+    refresh::reap_orphans(&roster_uuids).await;
+
     let result = run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control).await;
     // A clean shutdown (`Ok`) → the lifecycle stop marker. An error exit is NOT a
     // clean stop (it surfaces via `main`'s error print), so it emits none.
