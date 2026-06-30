@@ -1444,15 +1444,18 @@ mod tests {
     // --- redaction METER (#15): a cycle over a real secret leaks nothing ----------
 
     #[tokio::test]
-    async fn a_cycle_over_a_secret_blob_leaks_no_secret_in_its_report() {
+    async fn a_cycle_over_a_secret_blob_leaks_no_secret_on_any_output_channel() {
         // Seed the stash with the redaction fixture's REAL secret blob (sk-ant- tokens
-        // + a distinctive email), run a full refresh cycle, and prove the engine's only
-        // output — the RefreshReport, including its Debug rendering — carries none of it.
+        // + a distinctive email), run a full refresh cycle, and prove the cycle's OUTPUT
+        // channels carry none of it. This is the corpus's one real-secret cycle (the
+        // spawned child's stdout/stderr are nulled at the source — see the spawn config
+        // above — so they are not a channel); every channel a real cycle feeds is scanned
+        // here (issue #106 deliverable 3: an unexercised channel is unmetered).
         let secrets = crate::redaction::meter::Secrets::meter_fixture();
         let stash = seeded_stash(secrets.blob(), "u-1").await;
         let keychain = FakeIsolatedKeychain::empty();
         // CC "refreshes" the fixture blob: slide the expiry and rotate to ANOTHER
-        // secret token — both must stay out of the report.
+        // secret token — both must stay out of every output.
         let spawner = FakeSpawn::new(
             keychain.item.clone(),
             CcBehavior::Refresh {
@@ -1464,7 +1467,20 @@ mod tests {
         let report = run_cycle(&stash, keychain, &spawner).await.unwrap();
         assert_eq!(report.outcome, RefreshOutcome::Refreshed);
 
-        // The report's full Debug rendering must be clean under the #15 meter.
+        // Channel 1 — the engine's in-process output: the RefreshReport's full Debug rendering.
         crate::redaction::meter::assert_clean(&format!("{report:?}"), &secrets);
+
+        // Channel 2 — the durable per-cycle event line (issue #106): the tick builds an
+        // `Event::Refresh` from THIS real-secret cycle's report and the daemon emits it to the
+        // event log. Scan the EXACT production builder's rendered line — a hand-rolled replica
+        // would silently miss a future secret-bearing field added to `refresh_event`. `before`
+        // is a non-secret stored timestamp the daemon supplies; its value is immaterial here.
+        let line = crate::refresh_tick::refresh_event("work", Some(NOW_MS), &report)
+            .to_log_line(UNIX_EPOCH);
+        assert!(
+            line.contains("event=refresh"),
+            "built the event line: {line}"
+        );
+        crate::redaction::meter::assert_clean(&line, &secrets);
     }
 }

@@ -89,6 +89,7 @@ use crate::keychain::{
 use crate::observability::{
     DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, PollClass, SwapReason,
 };
+use crate::refresh_tick::SweepOutcome;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
@@ -316,9 +317,12 @@ pub(crate) trait RefreshTicker {
     /// idle iteration, and a control read between waits simply restarts it.
     async fn until_due(&mut self);
     /// Run ONE refresh sweep over the due parked accounts, EXCLUDING the `excluded` uuids
-    /// (the active account + the imminent swap target the daemon supplies). Records the sweep
-    /// for cadence gating. Per-account failures are non-fatal (the engine Caller contract).
-    async fn sweep(&mut self, excluded: &[String]);
+    /// (the active account + the imminent swap target the daemon supplies). `quarantined` is
+    /// the daemon's currently-dead ("needs re-login") set: those accounts are refreshed even
+    /// when not near expiry, and a successful one is reported for RESTORE (issue #106).
+    /// Records the sweep for cadence gating. Per-account failures are non-fatal (the engine
+    /// Caller contract). Returns the per-cycle [`SweepOutcome`] for the daemon to emit + apply.
+    async fn sweep(&mut self, excluded: &[String], quarantined: &[String]) -> SweepOutcome;
 }
 
 /// Production control: accept one client at a time on the bound socket and answer
@@ -2002,9 +2006,15 @@ where
     ///     (#6), so the engine's CAS re-stash cannot observe the promotion (#102) — exclude it
     ///     ahead of time. The mid-swap window itself is covered by the swap lock the engine
     ///     holds; this excludes only the *predictable* targets.
-    ///   - **quarantined (dead)** accounts: refreshing a dead credential is futile until an
-    ///     operator re-login (#42), and a dead stash sits permanently near its (stale) expiry,
-    ///     so without this exclusion it would draw a wasted isolated-spawn every cadence.
+    ///
+    /// Quarantined (dead) accounts are NO LONGER excluded (issue #106 reverses #105's
+    /// "futile to refresh" exclusion): a dead credential may still be REFRESHABLE — its
+    /// refresh token can work even after its access token began failing — so refreshing it is
+    /// exactly the RESTORE path. They are supplied separately by [`refresh_quarantined`](Self::refresh_quarantined),
+    /// which the tick uses to bypass the near-expiry filter and to report a recovered account
+    /// for un-quarantine. The bounded cost — one wasted isolated-spawn per cadence for a
+    /// TRULY-dead account, until an operator re-login — is accepted to close the gap where a
+    /// less-recently-used parked account silently stays unusable.
     ///
     /// Returns owned uuids so the run loop can hand them to the tick without borrowing the
     /// daemon across the idle wait.
@@ -2026,13 +2036,44 @@ where
                 excluded.push(self.roster[target].account_uuid.clone());
             }
         }
-        // Quarantined (dead) accounts — futile to refresh until a re-login (#42).
-        for (i, account) in self.roster.iter().enumerate() {
-            if self.state.health[i].quarantined {
-                excluded.push(account.account_uuid.clone());
-            }
-        }
         excluded
+    }
+
+    /// The roster `account_uuid`s the daemon currently holds QUARANTINED ("needs re-login",
+    /// issue #42) — handed to the refresh tick so it can attempt the RESTORE path (#106):
+    /// refresh them even when not near expiry (a server-revoked token may sit far from its
+    /// stored timestamp expiry) and report a successful one for un-quarantine. An account
+    /// here that is ALSO in [`refresh_exclusions`](Self::refresh_exclusions) (a dead ACTIVE
+    /// account) is still skipped — the tick checks exclusion first (the engine Caller contract
+    /// wins), so the active credential is never touched.
+    ///
+    /// Owned uuids, like [`refresh_exclusions`](Self::refresh_exclusions), so the run loop
+    /// need not borrow the daemon across the idle wait.
+    fn refresh_quarantined(&self) -> Vec<String> {
+        self.roster
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.state.health[*i].quarantined)
+            .map(|(_, account)| account.account_uuid.clone())
+            .collect()
+    }
+
+    /// Apply one RESTORE the refresh tick reported (issue #106): un-quarantine the account
+    /// with `uuid` whose isolated refresh succeeded, returning the edge-triggered
+    /// [`Event::CredentialRestored`] for the run loop to log — or `None` if the account is
+    /// no longer quarantined (a concurrent re-login already restored it, #107) or the uuid is
+    /// unknown. Pairs the health flip with its event in the daemon, exactly as the #42 poll
+    /// and #107 re-login recovery paths do; the tick only signals which accounts recovered.
+    fn apply_refresh_restore(&mut self, uuid: &str) -> Option<Event> {
+        let idx = self.roster.iter().position(|a| a.account_uuid == uuid)?;
+        if !self.state.health[idx].quarantined {
+            return None;
+        }
+        self.state.health[idx].quarantined = false;
+        self.state.health[idx].recovery_successes = 0;
+        Some(Event::CredentialRestored {
+            account: self.roster[idx].label.clone(),
+        })
     }
 
     /// Build the non-secret per-account snapshot for the event log and the socket.
@@ -2442,10 +2483,16 @@ where
         let snapshot = outcome.snapshot;
 
         // The accounts the periodic refresh tick (#105) must not touch this idle period —
-        // the active account and the imminent swap target (plus any dead account). Computed
-        // from the POST-tick state HERE, before the idle borrows `&mut daemon`; the tick owns
-        // its own roster copy + clock, so the sweep below needs nothing from `daemon`.
+        // the active account and the imminent swap target — and the quarantined ("needs
+        // re-login") accounts it SHOULD attempt for the RESTORE path (issue #106). Both are
+        // computed from the POST-tick state HERE, before the idle borrows `&mut daemon`; the
+        // tick owns its own roster copy + clock, so the sweep below needs nothing from it.
         let refresh_excluded = daemon.refresh_exclusions();
+        let refresh_quarantined = daemon.refresh_quarantined();
+        // Accounts the sweep proved still refreshable (issue #106): collected inside the idle
+        // loop (where `&mut daemon` is held by `wait`) and un-quarantined AFTER it, when
+        // `&mut daemon` is free again — the same post-idle pattern as the manual-swap adoption.
+        let mut refresh_restored: Vec<String> = Vec::new();
 
         // Idle until the next tick is due, serving control requests and watching
         // for shutdown. A swap (if any) already completed inside `tick`, so a
@@ -2479,13 +2526,38 @@ where
                         tokio::select! {
                             biased;
                             _ = shutdown.requested() => break Idle::Shutdown,
-                            () = refresh.sweep(&refresh_excluded) => {}
+                            sweep = refresh.sweep(&refresh_excluded, &refresh_quarantined) => {
+                                // Emit each per-cycle refresh event (issue #106) to the event
+                                // log — the SAME best-effort path the tick's events ride; `log`
+                                // is not borrowed by `wait`, so it is free to use here. The
+                                // RESTORES are deferred: un-quarantining mutates the health
+                                // machine (needs `&mut daemon`, held by `wait`), so they are
+                                // collected here and applied after the idle block.
+                                for event in &sweep.events {
+                                    if let Err(err) = log.emit(event) {
+                                        eprintln!("sessiometer: event log write failed: {err}");
+                                    }
+                                }
+                                refresh_restored.extend(sweep.restored);
+                            }
                         }
                     }
                     _ = &mut wait => break Idle::Elapsed,
                 }
             }
         };
+        // Apply the RESTORES the sweep reported (issue #106), now that the idle block has
+        // dropped its `&mut daemon` borrow: un-quarantine each recovered account and log its
+        // edge-triggered `credential_restored`. Applied on every idle exit (shutdown included
+        // — the restore genuinely happened, so the log record is honest; the durable effect is
+        // the re-stashed fresh token, which persists regardless of the in-memory flip).
+        for uuid in &refresh_restored {
+            if let Some(event) = daemon.apply_refresh_restore(uuid) {
+                if let Err(err) = log.emit(&event) {
+                    eprintln!("sessiometer: event log write failed: {err}");
+                }
+            }
+        }
         match idle {
             Idle::Shutdown => return Ok(()),
             // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick
@@ -2505,7 +2577,7 @@ mod tests {
     use crate::keychain::FakeCredentialStore;
     // `Verbosity` is named only in test code here (the diagnostic SINK gating lives
     // in `cli`); import it test-scoped so a non-test build sees no unused import.
-    use crate::observability::Verbosity;
+    use crate::observability::{RefreshEventOutcome, Verbosity};
     use crate::stash::{FakeAccountStash, StashedAccount};
     use crate::timing::Jitter;
     use std::cell::{Cell, RefCell};
@@ -2707,7 +2779,9 @@ mod tests {
         async fn until_due(&mut self) {
             std::future::pending::<()>().await;
         }
-        async fn sweep(&mut self, _excluded: &[String]) {}
+        async fn sweep(&mut self, _excluded: &[String], _quarantined: &[String]) -> SweepOutcome {
+            SweepOutcome::default()
+        }
     }
 
     /// A [`RefreshTicker`] that becomes due exactly ONCE — then never again — and records the
@@ -2718,6 +2792,8 @@ mod tests {
     struct OnceRefreshTicker {
         fired: Cell<bool>,
         swept: RefCell<Vec<Vec<String>>>,
+        swept_quarantined: RefCell<Vec<Vec<String>>>,
+        outcome: RefCell<SweepOutcome>,
     }
 
     impl OnceRefreshTicker {
@@ -2725,7 +2801,16 @@ mod tests {
             Self {
                 fired: Cell::new(false),
                 swept: RefCell::new(Vec::new()),
+                swept_quarantined: RefCell::new(Vec::new()),
+                outcome: RefCell::new(SweepOutcome::default()),
             }
+        }
+        /// Pre-load the [`SweepOutcome`] the single sweep returns — its refresh events to log
+        /// and the restores to apply (issue #106).
+        fn returning(outcome: SweepOutcome) -> Self {
+            let ticker = Self::new();
+            *ticker.outcome.borrow_mut() = outcome;
+            ticker
         }
     }
 
@@ -2737,8 +2822,12 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         }
-        async fn sweep(&mut self, excluded: &[String]) {
+        async fn sweep(&mut self, excluded: &[String], quarantined: &[String]) -> SweepOutcome {
             self.swept.borrow_mut().push(excluded.to_vec());
+            self.swept_quarantined
+                .borrow_mut()
+                .push(quarantined.to_vec());
+            std::mem::take(&mut *self.outcome.borrow_mut())
         }
     }
 
@@ -2764,8 +2853,8 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         }
-        async fn sweep(&mut self, _excluded: &[String]) {
-            std::future::pending::<()>().await;
+        async fn sweep(&mut self, _excluded: &[String], _quarantined: &[String]) -> SweepOutcome {
+            std::future::pending::<SweepOutcome>().await
         }
     }
 
@@ -5588,23 +5677,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_exclusions_name_the_active_target_and_dead_accounts_only() {
-        // Issue #105: the periodic refresh tick touches PARKED accounts only, so the daemon
-        // hands it the uuids to skip — computed from the authoritative swap state the tick has
-        // no view of:
-        //   - the ACTIVE account (the live session's credential — never refresh it),
+    async fn refresh_exclusions_name_the_active_and_imminent_target_not_dead_accounts() {
+        // Issues #105 + #106: the periodic refresh tick touches PARKED accounts only, so the
+        // daemon hands it the uuids to skip — computed from the authoritative swap state the
+        // tick has no view of:
+        //   - the ACTIVE account (the live session's credential — never refresh it), and
         //   - the IMMINENT swap target (the same account `next_swap` surfaces; a swap promotes
         //     it by reading its stash WITHOUT rewriting it (#6), so the engine's CAS re-stash
-        //     (#102) could not observe the promotion — exclude it ahead of the window), and
-        //   - every QUARANTINED (dead, #42) account (futile to refresh until an operator
-        //     re-login; without this it would draw a wasted isolated-spawn every cadence).
-        // A HEALTHY parked account that is NOT the imminent target is left OUT — it is exactly
-        // what the tick exists to keep fresh.
+        //     (#102) could not observe the promotion — exclude it ahead of the window).
+        // A QUARANTINED (dead, #42) account is NO LONGER excluded (#106 reverses #105): it is
+        // a RESTORE candidate, reported separately by `refresh_quarantined`. A HEALTHY parked
+        // account that is NOT the imminent target is left out of BOTH sets — it is exactly
+        // what the tick exists to keep fresh on the routine near-expiry path.
         let roster = vec![
             account("u-A", "work"),    // active
             account("u-B", "spare"),   // viable, soonest reset -> imminent swap target
-            account("u-C", "backup"),  // quarantined (dead)
-            account("u-D", "reserve"), // healthy parked, later reset -> NOT excluded
+            account("u-C", "backup"),  // quarantined (dead) -> restore candidate, NOT excluded
+            account("u-D", "reserve"), // healthy parked, later reset -> in neither set
         ];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -5659,15 +5748,18 @@ mod tests {
         daemon.state.health[2].quarantined = true; // `backup` is dead
 
         let excluded = daemon.refresh_exclusions();
+        let quarantined = daemon.refresh_quarantined();
 
-        // Active (u-A), the imminent target (u-B), and the dead account (u-C) — in that order
-        // (active, target, then quarantined in roster order) — but NEVER the healthy parked
-        // `reserve` (u-D), the one account the tick may proactively refresh.
-        assert_eq!(
-            excluded,
-            vec!["u-A".to_owned(), "u-B".to_owned(), "u-C".to_owned()],
+        // Excluded = active (u-A) + the imminent target (u-B) ONLY — NOT the dead `backup`
+        // (u-C, now a restore candidate) and NOT the healthy parked `reserve` (u-D).
+        assert_eq!(excluded, vec!["u-A".to_owned(), "u-B".to_owned()]);
+        assert!(
+            !excluded.contains(&"u-C".to_owned()),
+            "dead account is no longer excluded"
         );
         assert!(!excluded.contains(&"u-D".to_owned()));
+        // The dead account is reported for the RESTORE path instead (#106).
+        assert_eq!(quarantined, vec!["u-C".to_owned()]);
     }
 
     #[test]
@@ -6204,6 +6296,98 @@ mod tests {
             "shutdown must interrupt the wedged sweep, not deadlock"
         );
         result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_loop_emits_refresh_events_and_applies_restores() {
+        // Issue #106: the run loop drains a sweep's `SweepOutcome` — it EMITS each per-cycle
+        // refresh event to the event log, and APPLIES each reported restore (un-quarantining the
+        // recovered account + logging its edge-triggered `credential_restored`). A quarantined
+        // PARKED account (`spare`) is never re-polled by the swap path (#42 revival can't fire)
+        // and not re-logged-in (#107 can't fire) — the exact gap #106 closes: it would stay stuck
+        // forever even though its refresh token still works. Here the sweep reports it recovered
+        // and the loop flips it back to eligible.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // holds-only — no swap perturbs the idle path
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        // `spare` is quarantined ("needs re-login", #42) but its refresh token still works — the
+        // parked-and-stuck account #106 rescues. The single warm-up tick polls only the active
+        // `work`, so this flag survives untouched into the idle sweep.
+        daemon.state.health[1].quarantined = true;
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        // after(4): one sweep fires in idle-iter-1, then idle-iter-2 sees shutdown — the same
+        // cadence as `run_loop_runs_a_refresh_sweep_in_the_idle_path`.
+        let mut shutdown = FakeShutdown::after(4);
+        let control = NoControl;
+        // The sweep reports `spare` refreshed: one refresh event to log + one restore to apply.
+        let mut ticker = OnceRefreshTicker::returning(SweepOutcome {
+            events: vec![Event::Refresh {
+                account: "spare".to_owned(),
+                outcome: RefreshEventOutcome::Refreshed,
+                expires_before: Some(1_000_000),
+                expires_after: Some(1_003_600),
+            }],
+            restored: vec!["u-B".to_owned()],
+        });
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut ticker,
+        )
+        .await
+        .unwrap();
+
+        // The daemon handed the sweep its quarantined set — the RESTORE candidates — so the tick
+        // could attempt them even though they sit far from near-expiry.
+        let swept_q = ticker.swept_quarantined.borrow();
+        assert_eq!(swept_q.len(), 1, "exactly one sweep ran: {swept_q:?}");
+        assert!(
+            swept_q[0].contains(&"u-B".to_owned()),
+            "the quarantined parked account is offered to the sweep: {:?}",
+            swept_q[0]
+        );
+
+        // The per-cycle refresh event rode the event log, and the reported restore both
+        // un-quarantined `spare` in memory AND logged its edge-triggered `credential_restored`.
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            logged.contains("event=refresh account=spare outcome=refreshed"),
+            "the refresh event reached the log: {logged:?}"
+        );
+        assert!(
+            logged.contains("event=credential_restored account=spare"),
+            "the restore logged its credential_restored: {logged:?}"
+        );
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "the restored account is un-quarantined"
+        );
     }
 
     #[tokio::test]
@@ -7610,6 +7794,22 @@ mod tests {
         );
         corpus.push('\n');
 
+        // Channel — the per-cycle refresh event (issue #106), emitted only in the run-loop
+        // idle path; like the Start summary above it is planted here rather than tick-harvested.
+        // Its fields are a handle / enum / timestamps, and the builder that maps a real cycle's
+        // report into it is metered over a REAL secret in `refresh`'s engine test; here the
+        // rendered LINE joins the all-channels corpus so the clean verdict below covers it too.
+        corpus.push_str(
+            &Event::Refresh {
+                account: B.1.to_owned(),
+                outcome: RefreshEventOutcome::Refreshed,
+                expires_before: Some(1_782_777_600_000),
+                expires_after: Some(1_782_784_800_000),
+            }
+            .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
+        );
+        corpus.push('\n');
+
         // Channel — the UDS error replies (malformed request / unknown command) and
         // the `manual-swapped` ack / unauthorized replies (#64), all secret-free.
         corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
@@ -7677,6 +7877,10 @@ mod tests {
         assert!(
             corpus.contains("event=credential_restored account=work"),
             "log channel: credential_restored event missing"
+        );
+        assert!(
+            corpus.contains("event=refresh account=spare outcome=refreshed"),
+            "log channel: refresh event missing"
         );
         assert!(
             corpus.contains(r#""quarantined":true"#),
