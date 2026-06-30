@@ -764,7 +764,11 @@ struct AccountHealth {
     /// only on the spontaneous-revival path: a dead ACTIVE account with no viable swap
     /// target stays active and is re-probed, and if its OWN token starts answering
     /// again, reaching `monitor_recovery_m` consecutive `Live` polls un-quarantines it.
-    /// Reset to 0 on any non-success, so the M successes must be consecutive.
+    /// Reset to 0 on any non-success (so the M successes must be consecutive) AND when
+    /// the account leaves the active slot mid-recovery via a manual `use` swap (issue
+    /// #108) — a non-active account is never polled, so an un-reset probe would freeze
+    /// here below `monitor_recovery_m` forever; see
+    /// [`deactivate_recovery_probe`](Daemon::deactivate_recovery_probe).
     recovery_successes: u32,
 }
 
@@ -1380,6 +1384,14 @@ where
                                 account: self.roster[idx].label.clone(),
                             });
                         }
+                        // If this out-of-band change swapped AWAY from a DIFFERENT
+                        // account that was mid-recovery, drop its now-frozen recovery
+                        // probe (issue #108) — the daemon-notices-it-itself fallback to
+                        // the `adopt_manual_swap` seam. `idx` is the swap-TO account (the
+                        // new active, re-resolved below); `deactivate_recovery_probe`
+                        // skips it as `next` and acts only on a departing `prev`.
+                        let prev_active = self.state.active;
+                        self.deactivate_recovery_probe(prev_active, Some(idx));
                         // Handled: advance the baseline so this write is not
                         // re-detected, and drop the cached active so it is
                         // re-resolved against the new canonical below.
@@ -1725,6 +1737,57 @@ where
         .await
     }
 
+    /// Drop an in-flight recovery probe on an account that just LEFT the active slot
+    /// via a manual `use` swap (issue #108). The spontaneous-revival recovery in
+    /// [`note_poll_outcome`](Self::note_poll_outcome) advances ONLY while an account is
+    /// ACTIVE: a quarantined NON-active account is excluded from the poll schedule
+    /// ([`build_poll_schedule`](Self::build_poll_schedule)) — the deliberately-tested
+    /// `a_dead_spare_is_never_polled_so_it_cannot_spuriously_recover` invariant. So when
+    /// the operator swaps AWAY from an account mid-recovery (`quarantined &&
+    /// recovery_successes > 0`), its probe would otherwise FREEZE below
+    /// `monitor_recovery_m` forever — a phantom partial-progress counter that can never
+    /// complete, leaving the account durably `needs re-login` while LOOKING mid-recovery.
+    /// Reset the probe to 0 so the state is HONEST: a non-active quarantined account is
+    /// simply a dead spare like any other, with no recovery in flight.
+    ///
+    /// This does NOT poll or otherwise recover the de-activated account — by design a
+    /// non-active quarantined account recovers only by becoming ACTIVE again (the
+    /// operator `use`s it back, or the daemon emergency-swaps to it as the last viable
+    /// target, and the M-poll probe then runs from scratch) OR by a re-login, which
+    /// un-quarantines on the spot in
+    /// [`reconcile_canonical_change`](Self::reconcile_canonical_change) (issue #107).
+    /// Those are the two recovery paths a dead spare has always had; #108 only removes
+    /// the misleading frozen counter, it does not add a third path. The AC1 split is
+    /// therefore: a *refreshed* (byte-changed) valid credential recovers via the #107
+    /// canonical-change path the moment it becomes canonical; this reset governs the
+    /// *same-bytes* spontaneous-revival case, where there is NO canonical change to react
+    /// to and re-probing a never-changed dead token would just re-confirm it dead (why a
+    /// "re-probe the stash" mechanism would not have helped this case).
+    ///
+    /// Invoked on BOTH manual-swap active transitions so the invariant lives at the
+    /// transition, not at one caller: [`adopt_manual_swap`](Self::adopt_manual_swap) (the
+    /// control-socket path, which commits the canonical-watch baseline and so is NOT
+    /// re-observed by `reconcile_canonical_change`) and
+    /// [`reconcile_canonical_change`](Self::reconcile_canonical_change) (the
+    /// daemon-notices-it-itself fallback). The daemon's OWN swaps cannot trigger it: an
+    /// auto-swap away from a recovering active account is HELD
+    /// ([`decide_action`](Self::decide_action)), and an emergency swap fires only when the
+    /// active reading is absent — a non-live poll that already reset the probe. The
+    /// `recovery_successes > 0` guard makes it a safe no-op on any other transition (a
+    /// healthy account leaving the slot, or the same account staying active).
+    fn deactivate_recovery_probe(&mut self, prev: Option<usize>, next: Option<usize>) {
+        let Some(prev) = prev else { return };
+        // The SAME account staying active (an in-place refresh / re-login of it) is not
+        // a swap-away — leave any probe untouched (a re-login is handled upstream).
+        if next == Some(prev) {
+            return;
+        }
+        let health = &mut self.state.health[prev];
+        if health.quarantined && health.recovery_successes > 0 {
+            health.recovery_successes = 0;
+        }
+    }
+
     /// Adopt a manual `use` swap signalled over the control socket (issue #64).
     ///
     /// `use` rewrote the canonical credential out-of-band and then notified us; this
@@ -1744,7 +1807,15 @@ where
         // unreadable keychain leaves active to the next tick's own resolve, but the
         // cooldown is armed regardless below — the load-bearing manual-hold effect.
         if let Ok(canonical) = self.store.read().await {
-            self.state.active = self.resolve_account_for(&canonical).await;
+            let prev_active = self.state.active;
+            let next_active = self.resolve_account_for(&canonical).await;
+            self.state.active = next_active;
+            // If this manual swap moved AWAY from an account that was mid-recovery, drop
+            // its now-frozen recovery probe so its dead-spare state is honest (issue
+            // #108). This is the load-bearing seam: `adopt_manual_swap` commits the
+            // canonical-watch baseline below, so `reconcile_canonical_change` will see
+            // this write as `Unchanged` and never re-observe it.
+            self.deactivate_recovery_probe(prev_active, next_active);
             self.state.canonical_watch.commit(&canonical);
         }
         // Record it as the latest swap: arms the cooldown (#10). The cooldown arming
@@ -6267,6 +6338,88 @@ mod tests {
         // account is still quarantined here.
         assert!(daemon.state.health[0].quarantined);
         assert_eq!(daemon.state.active, Some(0), "no swap away mid-recovery");
+    }
+
+    #[tokio::test]
+    async fn a_manual_swap_away_mid_recovery_drops_the_phantom_recovery_probe() {
+        // Issue #108: `decide_action` HOLDS the daemon's OWN swap away from a recovering
+        // active account (`a_recovering_active_account_is_held_never_swapped_away`), but a
+        // manual `use` bypasses that hold. Swapping AWAY from an account mid-recovery
+        // turns it into a non-active dead spare — never polled (`build_poll_schedule`) —
+        // so its recovery probe would FREEZE below M forever, a phantom partial-progress
+        // counter that leaves it durably `needs re-login` while LOOKING mid-recovery.
+        // Adopting the manual swap drops the probe so the dead-spare state is honest:
+        // still quarantined, no in-flight recovery. This is the control-socket door
+        // (`adopt_manual_swap`).
+        let mut daemon = lifecycle_daemon().await;
+        // `work` (active) is mid-recovery: quarantined, but its OWN token started
+        // answering again — 1 of `monitor_recovery_m` = 2 live polls accrued.
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true;
+        daemon.state.health[0].recovery_successes = 1;
+
+        // The operator runs `use spare`: the canonical now holds spare's token and the
+        // control socket signals the daemon to adopt the manual choice.
+        daemon.store.write(&cred(b"B-token")).await.unwrap();
+        daemon.adopt_manual_swap().await;
+
+        assert_eq!(daemon.state.active, Some(1), "the manual choice is adopted");
+        assert!(
+            daemon.state.health[0].quarantined,
+            "still dead — a swap-away never recovers an account"
+        );
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 0,
+            "the frozen probe is dropped — no phantom partial progress (#108)"
+        );
+        // The departed account is now indistinguishable from any other dead spare: still
+        // quarantined, but with no in-flight recovery on a slot that is never polled.
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_seam_also_drops_a_mid_recovery_probe_on_a_detected_swap_away() {
+        // Issue #108, second door: when the daemon NOTICES the out-of-band canonical
+        // change itself (no control-socket signal reached `adopt_manual_swap`) the same
+        // reset must fire. `reconcile_canonical_change` re-resolves active to the swap-TO
+        // account and drops the departing mid-recovery account's frozen probe, while
+        // leaving the swap-TO account untouched.
+        let mut daemon = lifecycle_daemon().await;
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true;
+        daemon.state.health[0].recovery_successes = 1;
+
+        let mut events = Vec::new();
+        // Prime the watch on `work`'s current canonical (A-token): first observation,
+        // no change detected, nothing reset.
+        daemon
+            .reconcile_canonical_change(&cred(b"A-token"), &mut events)
+            .await;
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 1,
+            "priming the watch changes no health"
+        );
+
+        // The canonical now holds spare's token — an out-of-band manual swap the daemon
+        // detects on its own. Reconcile re-stashes spare and drops work's frozen probe.
+        daemon
+            .reconcile_canonical_change(&cred(b"B-token"), &mut events)
+            .await;
+
+        assert!(
+            daemon.state.health[0].quarantined,
+            "work is still dead — a detected swap-away never recovers it"
+        );
+        assert_eq!(
+            daemon.state.health[0].recovery_successes, 0,
+            "the frozen probe is dropped on the reconcile seam too (#108)"
+        );
+        assert_eq!(
+            daemon.state.active, None,
+            "active is dropped for re-resolution against the new canonical"
+        );
+        // The swap-TO account (`spare`) is healthy and untouched by the probe reset.
+        assert!(!daemon.state.health[1].quarantined);
+        assert_eq!(daemon.state.health[1].recovery_successes, 0);
     }
 
     #[tokio::test]
