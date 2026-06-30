@@ -21,7 +21,7 @@
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -57,6 +57,29 @@ const DEFAULT_MONITOR_401_N: u8 = 3;
 /// Default consecutive recovery-probe successes before a quarantined (dead)
 /// account is restored to the rotation (issue #42).
 const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
+
+/// Default seconds between periodic isolated-refresh ticks (issue #105). **Provisional**:
+/// the refresh-token TTL is unproven (#101 deliberately ran no real refresh), so this is
+/// NOT pinned to a specific `TTL/3` — it is a conservative one-hour default that keeps a
+/// parked token fresh across a wide range of plausible access-token lifetimes without
+/// churning refresh-token rotations, and doubles as the near-expiry SELECTION horizon (an
+/// account is due when its stored token would expire before the next tick — see
+/// [`RefreshConfig::cadence`]). Re-tune once the engine's own first-run telemetry
+/// (`expiresAt`-delta + RT-rotation, the #102 [`crate::refresh::RefreshReport`]) pins the
+/// server TTL; the #104 `poke` all-accounts horizon used the same one hour for the same reason.
+const DEFAULT_REFRESH_CADENCE_SECS: u64 = 3600;
+/// Default seconds the daemon must sit idle (no poll/usage/swap tick) before a refresh
+/// tick fires (issue #105). **Provisional** like the cadence: one minute keeps the refresh
+/// off the freshly-finished poll→usage→swap seam — it runs in the quiet part of the idle
+/// gap — without waiting out a whole poll interval. Re-tune with the cadence.
+const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
+/// Default seconds bounding ONE account's whole isolated-refresh cycle (issue #105). The
+/// engine's internal `claude -p` spawn budget is ~40 s (#102); ninety seconds leaves
+/// comfortable headroom for the seed, read-back and CAS re-stash around it, so a healthy
+/// cycle is never truncated while a wedged one (a stuck keychain) still cannot stall the
+/// daemon's return to polling. Cancelling mid-cycle is safe — the engine's RAII teardown
+/// always runs (#102) and a forfeited token is bounded/recoverable (the engine Caller contract).
+const DEFAULT_REFRESH_TIMEOUT_SECS: u64 = 90;
 
 /// The keychain service-name namespace every account's stash lives under; the
 /// full name is `Sessiometer/<account_uuid>` ([`Account::stash`]). Kept as one
@@ -195,6 +218,84 @@ fn default_poll_jitter() -> Jitter {
     }
 }
 
+/// The periodic isolated-refresh schedule (issue #105) — the in-daemon counterpart of the
+/// one-shot `poke` (#104), wiring the #102 refresh engine into the `run` loop's idle path.
+///
+/// **Opt-in**: `enabled` defaults `false`, so a daemon refreshes nothing unless an operator
+/// turns it on. When on, between poll→usage→swap ticks the daemon keeps PARKED accounts'
+/// stored tokens fresh by letting Claude Code refresh them in an isolated `CLAUDE_CONFIG_DIR`
+/// (the engine's whole job), never touching the live session's canonical credential.
+///
+/// The tick honors the engine's Caller contract: it refreshes parked accounts only (the
+/// active account and the imminent swap target are excluded; the swap lock the engine holds
+/// enforces the mid-swap case), and a refresh `Err` is non-fatal — logged, with the
+/// dead-credential recovery path (#13/#42) absorbing a forfeited token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefreshConfig {
+    /// Whether the periodic refresh tick runs at all. **Off by default** (opt-in): the
+    /// refresh-token TTL is unproven (#101) and each refresh may rotate it, so an operator
+    /// turns this on deliberately.
+    pub(crate) enabled: bool,
+    /// The parked accounts the tick is allowed to refresh, each named by its `list` label OR
+    /// `account_uuid` (the same resolution `poke` and `use` key on). **Empty = all** parked
+    /// accounts. A non-empty list narrows the candidate set; the near-expiry horizon still
+    /// gates within it (a listed account is refreshed only when actually due). An entry that
+    /// matches no roster account is ignored (the selection is best-effort — a stale entry
+    /// never stops the daemon).
+    pub(crate) accounts: Vec<String>,
+    /// Seconds between refresh ticks AND the near-expiry selection horizon (issue #105): an
+    /// account is *due* when its stored token would expire within one cadence of now — i.e.
+    /// it would not survive until the next tick — so the cadence IS the configurable,
+    /// TTL-aware threshold (#104 left the all-accounts horizon provisional for #105 to own).
+    /// **Provisional default** ([`DEFAULT_REFRESH_CADENCE_SECS`]) pending #101's TTL.
+    pub(crate) cadence_secs: u64,
+    /// Seconds the daemon must sit idle (since the last poll→usage→swap tick) before a refresh
+    /// fires (issue #105) — so the refresh runs in the quiet part of the idle gap, off the
+    /// seam. **Provisional default** ([`DEFAULT_REFRESH_IDLE_AFTER_SECS`]).
+    pub(crate) idle_after_secs: u64,
+    /// Seconds bounding ONE account's whole isolated-refresh cycle (issue #105); a cycle that
+    /// exceeds it is cancelled (engine RAII teardown still runs) and reported as a non-fatal
+    /// error. Default ([`DEFAULT_REFRESH_TIMEOUT_SECS`]) leaves headroom over the engine's
+    /// ~40 s `claude -p` spawn budget.
+    pub(crate) timeout_secs: u64,
+    /// The `claude` binary the engine spawns, overriding the `$CLAUDE_BIN` / `$PATH`
+    /// resolution (issue #105) — `None` (the default) defers to that resolution. Resolved
+    /// (absolutized, validated to exist) before any spawn by
+    /// [`crate::paths::claude_binary_with_override`].
+    pub(crate) claude_bin: Option<PathBuf>,
+}
+
+impl Default for RefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            accounts: Vec::new(),
+            cadence_secs: DEFAULT_REFRESH_CADENCE_SECS,
+            idle_after_secs: DEFAULT_REFRESH_IDLE_AFTER_SECS,
+            timeout_secs: DEFAULT_REFRESH_TIMEOUT_SECS,
+            claude_bin: None,
+        }
+    }
+}
+
+impl RefreshConfig {
+    /// The refresh cadence — which is also the near-expiry selection horizon — as a
+    /// [`Duration`].
+    pub(crate) fn cadence(&self) -> Duration {
+        Duration::from_secs(self.cadence_secs)
+    }
+
+    /// The post-tick idle the daemon must accrue before a refresh fires, as a [`Duration`].
+    pub(crate) fn idle_after(&self) -> Duration {
+        Duration::from_secs(self.idle_after_secs)
+    }
+
+    /// The per-account whole-cycle timeout, as a [`Duration`].
+    pub(crate) fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+}
+
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -207,6 +308,8 @@ pub(crate) struct Config {
     pub(crate) roster: Vec<Account>,
     /// Poll/swap tunables.
     pub(crate) tunables: Tunables,
+    /// The periodic isolated-refresh schedule (issue #105); opt-in, disabled by default.
+    pub(crate) refresh: RefreshConfig,
 }
 
 impl Config {
@@ -419,7 +522,32 @@ impl Config {
             });
         }
 
-        Ok(Config { roster, tunables })
+        // The periodic isolated-refresh schedule (issue #105). Bounds-checked like the
+        // tunables; `enabled` / `accounts` / `claude_bin` are free-form (a bad `claude_bin`
+        // surfaces at spawn-resolution time, an unmatched `accounts` entry at selection).
+        // An empty/whitespace `claude_bin` collapses to `None` — same as omitting it — so a
+        // stray `claude_bin = ""` defers to `$CLAUDE_BIN`/`$PATH` rather than erroring.
+        let r = raw.refresh;
+        range("refresh.cadence_secs", r.cadence_secs, 60, 86_400)?;
+        range("refresh.idle_after_secs", r.idle_after_secs, 0, 3_600)?;
+        range("refresh.timeout_secs", r.timeout_secs, 10, 600)?;
+        let refresh = RefreshConfig {
+            enabled: r.enabled,
+            accounts: r.accounts,
+            cadence_secs: r.cadence_secs as u64,
+            idle_after_secs: r.idle_after_secs as u64,
+            timeout_secs: r.timeout_secs as u64,
+            claude_bin: r
+                .claude_bin
+                .filter(|bin| !bin.trim().is_empty())
+                .map(PathBuf::from),
+        };
+
+        Ok(Config {
+            roster,
+            tunables,
+            refresh,
+        })
     }
 
     /// Render the config back to TOML with the inline tunable-documenting
@@ -505,6 +633,52 @@ impl Config {
             "cooldown = {}\n",
             render_jitter(&t.cooldown_strategy.jitter)
         ));
+
+        // The periodic isolated-refresh schedule (issue #105). Opt-in and OFF by default;
+        // the cadence/idle defaults are provisional pending the refresh-token TTL (#101).
+        let r = &self.refresh;
+        out.push_str("\n[refresh]\n");
+        out.push_str(
+            "# Periodically let Claude Code refresh PARKED accounts' stored tokens in an\n\
+             # isolated config dir (the in-daemon counterpart of `poke`), off the\n\
+             # poll/usage/swap seam — the live session's credential is never touched. The\n\
+             # active account and the imminent swap target are always excluded. OFF by\n\
+             # default (opt-in): each refresh may rotate the refresh token, whose durable\n\
+             # lifetime is not yet pinned.\n",
+        );
+        out.push_str(&format!("enabled = {}\n", r.enabled));
+        out.push_str(
+            "# Parked accounts to keep fresh, by `list` label or account-uuid. Empty = all\n\
+             # parked accounts (the near-expiry horizon still applies to each).\n",
+        );
+        out.push_str(&format!("accounts = {}\n", render_str_array(&r.accounts)));
+        out.push_str(
+            "# Seconds between refresh ticks AND the near-expiry horizon (60..=86400): an\n\
+             # account is refreshed when its stored token would expire within one cadence\n\
+             # (i.e. before the next tick). Provisional default pending the token TTL.\n",
+        );
+        out.push_str(&format!("cadence_secs = {}\n", r.cadence_secs));
+        out.push_str(
+            "# Seconds the daemon must sit idle (no poll/swap) before a refresh fires\n\
+             # (0..=3600) — keeps it in the quiet part of the idle gap. Provisional.\n",
+        );
+        out.push_str(&format!("idle_after_secs = {}\n", r.idle_after_secs));
+        out.push_str(
+            "# Seconds bounding one account's whole refresh cycle (10..=600); a slower\n\
+             # cycle is cancelled and reported (non-fatal). Keep above the ~40s spawn.\n",
+        );
+        out.push_str(&format!("timeout_secs = {}\n", r.timeout_secs));
+        out.push_str(
+            "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave\n\
+             # empty) to resolve from $CLAUDE_BIN then $PATH.\n",
+        );
+        match &r.claude_bin {
+            Some(bin) => out.push_str(&format!(
+                "claude_bin = {}\n",
+                basic_string(&bin.to_string_lossy())
+            )),
+            None => out.push_str("# claude_bin = \"/absolute/path/to/claude\"\n"),
+        }
 
         for account in &self.roster {
             out.push_str("\n[[account]]\n");
@@ -613,6 +787,23 @@ fn render_jitter(jitter: &Jitter) -> String {
     }
 }
 
+/// Render a list of strings as a single-line TOML array of basic strings, e.g.
+/// `["work", "spare"]` (issue #105 `[refresh].accounts`). Each element goes through
+/// [`basic_string`], so labels/uuids needing escapes round-trip; an empty list renders
+/// `[]`.
+#[allow(dead_code)]
+fn render_str_array(items: &[String]) -> String {
+    let mut out = String::from("[");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&basic_string(item));
+    }
+    out.push(']');
+    out
+}
+
 /// Render `s` as a TOML basic string (quoted, with the required escapes). Used
 /// by [`Config::render`] for roster fields, which (unlike the integer tunables)
 /// may contain characters needing escaping.
@@ -653,6 +844,8 @@ struct RawConfig {
     tunables: RawTunables,
     #[serde(default)]
     jitter: RawJitter,
+    #[serde(default)]
+    refresh: RawRefresh,
 }
 
 #[derive(Deserialize)]
@@ -732,6 +925,50 @@ fn default_monitor_401_n() -> i64 {
 }
 fn default_monitor_recovery_m() -> i64 {
     i64::from(DEFAULT_MONITOR_RECOVERY_M)
+}
+
+/// Permissive deserialization of the optional `[refresh]` table (issue #105): every key
+/// optional with a documented default, integers kept wide so an out-of-range value reaches
+/// [`Config::validate`] with a clear message rather than a bare `serde` type error.
+/// `deny_unknown_fields` rejects a stray key as a parse error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRefresh {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    accounts: Vec<String>,
+    #[serde(default = "default_refresh_cadence_secs")]
+    cadence_secs: i64,
+    #[serde(default = "default_refresh_idle_after_secs")]
+    idle_after_secs: i64,
+    #[serde(default = "default_refresh_timeout_secs")]
+    timeout_secs: i64,
+    #[serde(default)]
+    claude_bin: Option<String>,
+}
+
+impl Default for RawRefresh {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            accounts: Vec::new(),
+            cadence_secs: default_refresh_cadence_secs(),
+            idle_after_secs: default_refresh_idle_after_secs(),
+            timeout_secs: default_refresh_timeout_secs(),
+            claude_bin: None,
+        }
+    }
+}
+
+fn default_refresh_cadence_secs() -> i64 {
+    DEFAULT_REFRESH_CADENCE_SECS as i64
+}
+fn default_refresh_idle_after_secs() -> i64 {
+    DEFAULT_REFRESH_IDLE_AFTER_SECS as i64
+}
+fn default_refresh_timeout_secs() -> i64 {
+    DEFAULT_REFRESH_TIMEOUT_SECS as i64
 }
 
 /// Permissive deserialization of the optional `[jitter]` table (issue #38): each
@@ -1048,6 +1285,151 @@ label = "personal"
         let reparsed = Config::parse(&original.render()).unwrap();
         assert_eq!(original.tunables, reparsed.tunables);
         assert_eq!(original.roster, reparsed.roster);
+        // The (default) refresh schedule round-trips too (issue #105).
+        assert_eq!(original.refresh, reparsed.refresh);
+    }
+
+    // --- [refresh] schedule (issue #105) ------------------------------------
+
+    #[test]
+    fn refresh_defaults_when_table_absent() {
+        // No [refresh] table → the opt-in feature is OFF with provisional defaults.
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.refresh, RefreshConfig::default());
+        assert!(!config.refresh.enabled);
+        assert!(config.refresh.accounts.is_empty());
+        assert_eq!(config.refresh.cadence_secs, DEFAULT_REFRESH_CADENCE_SECS);
+        assert_eq!(
+            config.refresh.idle_after_secs,
+            DEFAULT_REFRESH_IDLE_AFTER_SECS
+        );
+        assert_eq!(config.refresh.timeout_secs, DEFAULT_REFRESH_TIMEOUT_SECS);
+        assert_eq!(config.refresh.claude_bin, None);
+    }
+
+    #[test]
+    fn parses_a_custom_refresh_table() {
+        let toml = format!(
+            "{VALID}\n[refresh]\n\
+             enabled = true\n\
+             accounts = [\"work\", \"22222222-2222-2222-2222-222222222222\"]\n\
+             cadence_secs = 7200\n\
+             idle_after_secs = 120\n\
+             timeout_secs = 60\n\
+             claude_bin = \"/opt/claude/bin/claude\"\n"
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.refresh,
+            RefreshConfig {
+                enabled: true,
+                accounts: vec![
+                    "work".to_owned(),
+                    "22222222-2222-2222-2222-222222222222".to_owned()
+                ],
+                cadence_secs: 7200,
+                idle_after_secs: 120,
+                timeout_secs: 60,
+                claude_bin: Some(PathBuf::from("/opt/claude/bin/claude")),
+            }
+        );
+        // The cadence is also the near-expiry horizon, exposed as a Duration.
+        assert_eq!(config.refresh.cadence(), Duration::from_secs(7200));
+        assert_eq!(config.refresh.idle_after(), Duration::from_secs(120));
+        assert_eq!(config.refresh.timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn refresh_missing_key_takes_its_default() {
+        // A partial [refresh] table fills only the named keys; the rest default.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.refresh.enabled);
+        assert_eq!(config.refresh.cadence_secs, DEFAULT_REFRESH_CADENCE_SECS);
+        assert_eq!(config.refresh.timeout_secs, DEFAULT_REFRESH_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn refresh_unknown_field_is_rejected() {
+        // deny_unknown_fields: a stray key is a parse error, not a silent ignore.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\nthreshold_secs = 99\n");
+        assert!(matches!(Config::parse(&toml), Err(Error::ConfigParse(_))));
+    }
+
+    #[test]
+    fn refresh_cadence_out_of_range_is_rejected() {
+        // Below the 60 s floor and above the 1-day ceiling both fail, naming the field.
+        for bad in ["cadence_secs = 30", "cadence_secs = 100000"] {
+            let toml = format!("{VALID}\n[refresh]\n{bad}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(&err, Error::ConfigInvalid(msg) if msg.contains("refresh.cadence_secs")),
+                "expected a refresh.cadence_secs range error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_idle_after_and_timeout_ranges_are_enforced() {
+        let idle = format!("{VALID}\n[refresh]\nidle_after_secs = 5000\n");
+        assert!(
+            matches!(Config::parse(&idle), Err(Error::ConfigInvalid(msg)) if msg.contains("refresh.idle_after_secs"))
+        );
+        // 0 idle is allowed (refresh as soon as the tick settles).
+        let zero = format!("{VALID}\n[refresh]\nidle_after_secs = 0\n");
+        assert_eq!(Config::parse(&zero).unwrap().refresh.idle_after_secs, 0);
+        let timeout = format!("{VALID}\n[refresh]\ntimeout_secs = 5\n");
+        assert!(
+            matches!(Config::parse(&timeout), Err(Error::ConfigInvalid(msg)) if msg.contains("refresh.timeout_secs"))
+        );
+    }
+
+    #[test]
+    fn empty_claude_bin_collapses_to_none() {
+        // A stray `claude_bin = ""` defers to $CLAUDE_BIN/$PATH (None), like omitting it.
+        let toml = format!("{VALID}\n[refresh]\nclaude_bin = \"   \"\n");
+        assert_eq!(Config::parse(&toml).unwrap().refresh.claude_bin, None);
+    }
+
+    #[test]
+    fn refresh_round_trips_render_then_parse() {
+        // A fully-customised refresh schedule survives render → parse byte-equivalently.
+        let toml = format!(
+            "{VALID}\n[refresh]\n\
+             enabled = true\n\
+             accounts = [\"work\"]\n\
+             cadence_secs = 5400\n\
+             idle_after_secs = 90\n\
+             timeout_secs = 120\n\
+             claude_bin = \"/usr/local/bin/claude\"\n"
+        );
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.refresh, reparsed.refresh);
+    }
+
+    #[test]
+    fn rendered_default_refresh_is_off_with_commented_claude_bin() {
+        // The rendered default [refresh] block is disabled and leaves claude_bin commented
+        // (so a fresh `capture` writes an inert, self-documenting block) yet round-trips.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(
+            text.contains("[refresh]"),
+            "render must emit [refresh]: {text}"
+        );
+        assert!(
+            text.contains("enabled = false"),
+            "default refresh must render disabled: {text}"
+        );
+        assert!(
+            text.contains("# claude_bin ="),
+            "an unset claude_bin must render commented: {text}"
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap().refresh,
+            RefreshConfig::default()
+        );
     }
 
     #[test]

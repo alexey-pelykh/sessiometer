@@ -298,6 +298,29 @@ pub(crate) trait Control {
     async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal>;
 }
 
+/// Periodic-refresh seam (issue #105): the run loop drives the in-daemon isolated-refresh
+/// tick from its idle path, off the poll→usage→swap seam. The production impl
+/// ([`crate::refresh_tick::RefreshTick`]) keeps PARKED accounts' stored tokens fresh through
+/// the #102 engine — and is wholly inert when the feature is off: its `until_due` never
+/// resolves, so a feature-off daemon (or a hermetic test wired with a no-op ticker) behaves
+/// exactly as it did before #105.
+///
+/// Two methods so the run loop can serve the control socket WHILE waiting for the tick to
+/// fall due, yet protect an in-flight sweep from being cancelled by a control read (only
+/// shutdown interrupts a sweep): [`until_due`](RefreshTicker::until_due) is the wait;
+/// [`sweep`](RefreshTicker::sweep) is the bounded work.
+pub(crate) trait RefreshTicker {
+    /// Resolve when a refresh sweep is due (the ticker's own cadence/idle gating, on its own
+    /// [`Clock`] seam). MUST never resolve when the feature is disabled, so it never wins the
+    /// idle select and adds no clock activity. Re-armable: the run loop awaits it afresh each
+    /// idle iteration, and a control read between waits simply restarts it.
+    async fn until_due(&mut self);
+    /// Run ONE refresh sweep over the due parked accounts, EXCLUDING the `excluded` uuids
+    /// (the active account + the imminent swap target the daemon supplies). Records the sweep
+    /// for cadence gating. Per-account failures are non-fatal (the engine Caller contract).
+    async fn sweep(&mut self, excluded: &[String]);
+}
+
 /// Production control: accept one client at a time on the bound socket and answer
 /// from the latest snapshot.
 pub(crate) struct UnixControl {
@@ -1969,6 +1992,49 @@ where
         })
     }
 
+    /// The roster `account_uuid`s the periodic refresh tick (issue #105) must NOT refresh —
+    /// the inputs to the engine's "parked accounts only" Caller contract, computed daemon-side
+    /// from the authoritative swap state (the tick has none of its own):
+    ///
+    ///   - the **active** account (the live session's credential — never touch it), and
+    ///   - the **imminent swap target** ([`pick_target`]'s current choice, the same account
+    ///     `next_swap` shows): a swap that promotes it reads its stash WITHOUT rewriting it
+    ///     (#6), so the engine's CAS re-stash cannot observe the promotion (#102) — exclude it
+    ///     ahead of time. The mid-swap window itself is covered by the swap lock the engine
+    ///     holds; this excludes only the *predictable* targets.
+    ///   - **quarantined (dead)** accounts: refreshing a dead credential is futile until an
+    ///     operator re-login (#42), and a dead stash sits permanently near its (stale) expiry,
+    ///     so without this exclusion it would draw a wasted isolated-spawn every cadence.
+    ///
+    /// Returns owned uuids so the run loop can hand them to the tick without borrowing the
+    /// daemon across the idle wait.
+    fn refresh_exclusions(&self) -> Vec<String> {
+        let mut excluded = Vec::new();
+        if let Some(active) = self.state.active {
+            excluded.push(self.roster[active].account_uuid.clone());
+            // The imminent swap target from the latest carried readings — the same selection
+            // `next_swap` surfaces. `pick_target` already excludes the active account.
+            let readings = self.decision_readings(Some(active));
+            let enabled = self.enabled_mask();
+            if let Some(target) = pick_target(
+                active,
+                &readings,
+                &enabled,
+                self.session_floor,
+                self.weekly_trigger_base,
+            ) {
+                excluded.push(self.roster[target].account_uuid.clone());
+            }
+        }
+        // Quarantined (dead) accounts — futile to refresh until a re-login (#42).
+        for (i, account) in self.roster.iter().enumerate() {
+            if self.state.health[i].quarantined {
+                excluded.push(account.account_uuid.clone());
+            }
+        }
+        excluded
+    }
+
     /// Build the non-secret per-account snapshot for the event log and the socket.
     fn snapshot(&self, active: Option<usize>, readings: &[Option<Usage>]) -> StatusSnapshot {
         StatusSnapshot {
@@ -2294,12 +2360,13 @@ fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
 /// (complete-or-abort; #6 is no-half-swap). The lifecycle markers (`diag=start` /
 /// `diag=stop`) bracket this call in [`crate::cli`], which owns the process
 /// lifecycle; this loop emits only the per-tick diagnostics.
-pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl, W>(
+pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl, R, W>(
     daemon: &mut Daemon<P, C, S, K>,
     log: &mut EventLog,
     diag: &mut DiagnosticLog<W>,
     shutdown: &mut Sh,
     control: &Ctl,
+    refresh: &mut R,
 ) -> Result<()>
 where
     P: RosterPoller,
@@ -2308,6 +2375,7 @@ where
     K: Clock,
     Sh: Shutdown,
     Ctl: Control,
+    R: RefreshTicker,
     W: Write,
 {
     // Reconcile-on-start is best-effort: a failure is logged and the loop still
@@ -2373,6 +2441,12 @@ where
         // The snapshot the control socket answers from until the next poll.
         let snapshot = outcome.snapshot;
 
+        // The accounts the periodic refresh tick (#105) must not touch this idle period —
+        // the active account and the imminent swap target (plus any dead account). Computed
+        // from the POST-tick state HERE, before the idle borrows `&mut daemon`; the tick owns
+        // its own roster copy + clock, so the sweep below needs nothing from `daemon`.
+        let refresh_excluded = daemon.refresh_exclusions();
+
         // Idle until the next tick is due, serving control requests and watching
         // for shutdown. A swap (if any) already completed inside `tick`, so a
         // shutdown observed here aborts cleanly before the next tick — no half-swap.
@@ -2392,6 +2466,22 @@ where
                         Some(ControlSignal::ManualSwapped) => break Idle::ManualSwapped,
                         None => continue,
                     },
+                    // The periodic isolated-refresh tick (issue #105), in the idle path off
+                    // the poll→usage→swap seam. `until_due` resolves only when a refresh is
+                    // due — and NEVER when the feature is off (the no-op ticker) — so this arm
+                    // is inert by default. When it fires, run the sweep under a NESTED select
+                    // so ONLY a shutdown can interrupt it: a control read must not cancel an
+                    // in-flight refresh (the swap-lock-holding engine is cancel-safe, but a
+                    // status query should neither forfeit a token nor be able to starve the
+                    // sweep). `wait` is pinned OUTSIDE this loop, so a sweep does not reset the
+                    // poll cadence; after it the loop idles on until the wait elapses.
+                    () = refresh.until_due() => {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.requested() => break Idle::Shutdown,
+                            () = refresh.sweep(&refresh_excluded) => {}
+                        }
+                    }
                     _ = &mut wait => break Idle::Elapsed,
                 }
             }
@@ -2418,7 +2508,7 @@ mod tests {
     use crate::observability::Verbosity;
     use crate::stash::{FakeAccountStash, StashedAccount};
     use crate::timing::Jitter;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
     // --- Fakes -------------------------------------------------------------
@@ -2604,6 +2694,78 @@ mod tests {
     impl Control for NoControl {
         async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
             std::future::pending().await
+        }
+    }
+
+    /// The inert [`RefreshTicker`] for the hermetic run-loop tests (issue #105): never due,
+    /// sweeps nothing — so the periodic-refresh arm never wins the idle select and these
+    /// tests behave exactly as they did before #105. Production wires the real
+    /// [`crate::refresh_tick::RefreshTick`] (disabled by default).
+    struct NoopRefreshTicker;
+
+    impl RefreshTicker for NoopRefreshTicker {
+        async fn until_due(&mut self) {
+            std::future::pending::<()>().await;
+        }
+        async fn sweep(&mut self, _excluded: &[String]) {}
+    }
+
+    /// A [`RefreshTicker`] that becomes due exactly ONCE — then never again — and records the
+    /// exclusion set each sweep is handed. The periodic-refresh analog of [`OnceManualSwap`]:
+    /// it drives the live `until_due → sweep` idle wiring (#105) that [`NoopRefreshTicker`]
+    /// deliberately leaves inert, so a run-loop test can prove the sweep runs and receives the
+    /// daemon's exclusions.
+    struct OnceRefreshTicker {
+        fired: Cell<bool>,
+        swept: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl OnceRefreshTicker {
+        fn new() -> Self {
+            Self {
+                fired: Cell::new(false),
+                swept: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RefreshTicker for OnceRefreshTicker {
+        async fn until_due(&mut self) {
+            // Ready the first time, pending forever after — so the sweep fires once, then the
+            // idle select falls through to `wait`/shutdown on every later iteration.
+            if self.fired.replace(true) {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn sweep(&mut self, excluded: &[String]) {
+            self.swept.borrow_mut().push(excluded.to_vec());
+        }
+    }
+
+    /// A [`RefreshTicker`] whose sweep WEDGES (never resolves) after becoming due once — to
+    /// prove the run loop's nested select lets a shutdown cut an in-flight sweep instead of
+    /// deadlocking on a stuck refresh cycle. (`timeout_secs` bounds a real wedge in production;
+    /// here the test asserts the shutdown path directly.)
+    struct HangingRefreshTicker {
+        fired: Cell<bool>,
+    }
+
+    impl HangingRefreshTicker {
+        fn new() -> Self {
+            Self {
+                fired: Cell::new(false),
+            }
+        }
+    }
+
+    impl RefreshTicker for HangingRefreshTicker {
+        async fn until_due(&mut self) {
+            if self.fired.replace(true) {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn sweep(&mut self, _excluded: &[String]) {
+            std::future::pending::<()>().await;
         }
     }
 
@@ -5425,6 +5587,89 @@ mod tests {
         assert!(!json.contains("last_swap"), "got {json}");
     }
 
+    #[tokio::test]
+    async fn refresh_exclusions_name_the_active_target_and_dead_accounts_only() {
+        // Issue #105: the periodic refresh tick touches PARKED accounts only, so the daemon
+        // hands it the uuids to skip — computed from the authoritative swap state the tick has
+        // no view of:
+        //   - the ACTIVE account (the live session's credential — never refresh it),
+        //   - the IMMINENT swap target (the same account `next_swap` surfaces; a swap promotes
+        //     it by reading its stash WITHOUT rewriting it (#6), so the engine's CAS re-stash
+        //     (#102) could not observe the promotion — exclude it ahead of the window), and
+        //   - every QUARANTINED (dead, #42) account (futile to refresh until an operator
+        //     re-login; without this it would draw a wasted isolated-spawn every cadence).
+        // A HEALTHY parked account that is NOT the imminent target is left OUT — it is exactly
+        // what the tick exists to keep fresh.
+        let roster = vec![
+            account("u-A", "work"),    // active
+            account("u-B", "spare"),   // viable, soonest reset -> imminent swap target
+            account("u-C", "backup"),  // quarantined (dead)
+            account("u-D", "reserve"), // healthy parked, later reset -> NOT excluded
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+            ("Sessiometer/u-D", b"D-token", "u-D"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let tun = tunables(95, 80, 0); // session floor 0.80
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // Seed the post-tick state the exclusion set reads from: active = `work`, and carried
+        // readings that make `spare` (reset 200) the soonest-reset viable target ahead of
+        // `reserve` (reset 500). `backup` is dead — its masked-away reading is irrelevant.
+        daemon.state.active = Some(0);
+        daemon.state.last_readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: Some(100), // soonest overall — but it is the active account
+                session_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.50, // below the 0.80 floor -> viable
+                weekly: 0.10,
+                weekly_resets_at: Some(200), // soonest among the viable -> the target
+                session_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.10,
+                weekly_resets_at: Some(300),
+                session_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.10, // also viable…
+                weekly: 0.10,
+                weekly_resets_at: Some(500), // …but a later reset, so never the target
+                session_resets_at: None,
+            }),
+        ];
+        daemon.state.health[2].quarantined = true; // `backup` is dead
+
+        let excluded = daemon.refresh_exclusions();
+
+        // Active (u-A), the imminent target (u-B), and the dead account (u-C) — in that order
+        // (active, target, then quarantined in roster order) — but NEVER the healthy parked
+        // `reserve` (u-D), the one account the tick may proactively refresh.
+        assert_eq!(
+            excluded,
+            vec!["u-A".to_owned(), "u-B".to_owned(), "u-C".to_owned()],
+        );
+        assert!(!excluded.contains(&"u-D".to_owned()));
+    }
+
     #[test]
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
@@ -5709,9 +5954,16 @@ mod tests {
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
-        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
-            .await
-            .unwrap();
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
 
         // The fake clock makes the cadence deterministic: exactly 3 ticks ran.
         assert_eq!(daemon.state.ticks, 3);
@@ -5748,9 +6000,16 @@ mod tests {
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
-        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
-            .await
-            .unwrap();
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             daemon.state.ticks, 0,
@@ -5805,9 +6064,16 @@ mod tests {
         let control = OnceManualSwap::new();
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
-        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
-            .await
-            .unwrap();
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
 
         // The signal reached `adopt_manual_swap` through the idle select: it
         // re-resolved active from the canonical (A) and armed the cooldown — the only
@@ -5817,6 +6083,127 @@ mod tests {
             "the ManualSwapped signal must arm the cooldown via adoption"
         );
         assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[tokio::test]
+    async fn run_loop_runs_a_refresh_sweep_in_the_idle_path() {
+        // Issue #105: an ENABLED ticker's `until_due` resolves inside the idle select, and the
+        // run loop then runs its `sweep` — handing it the daemon's live exclusion set (with the
+        // active account among the uuids to skip, the "parked only" contract). This is the one
+        // run-loop test that drives the live `until_due → sweep` wiring; every other passes the
+        // inert `NoopRefreshTicker`, whose `until_due` never resolves.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // holds-only — no swap perturbs the idle path
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // after(4): #1 start-up check, #2 idle-iter-1 outer (refresh wins → sweep), #3 the
+        // sweep's NESTED shutdown arm (pends, so the sweep runs), #4 idle-iter-2 outer →
+        // shutdown. So the sweep fires once, then the loop stops cleanly.
+        let mut shutdown = FakeShutdown::after(4);
+        let control = NoControl;
+        let mut ticker = OnceRefreshTicker::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut ticker,
+        )
+        .await
+        .unwrap();
+
+        // The sweep ran exactly once, and the daemon handed it the active account (u-A) to
+        // skip — the refresh tick reached the idle path with the right exclusions.
+        let swept = ticker.swept.borrow();
+        assert_eq!(swept.len(), 1, "exactly one sweep ran: {swept:?}");
+        assert!(
+            swept[0].contains(&"u-A".to_owned()),
+            "the active account is excluded from the sweep: {:?}",
+            swept[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_lets_shutdown_interrupt_an_in_flight_refresh_sweep() {
+        // Issue #105: the refresh arm runs its sweep under a NESTED select whose only other arm
+        // is shutdown — so a SIGINT/SIGTERM cuts an in-flight (here deliberately wedged) sweep
+        // and the loop returns, rather than deadlocking on a stuck refresh cycle. A control read
+        // is NOT in that nested select, so it cannot interrupt a sweep (no token forfeit, no
+        // starvation). A regression that awaited `sweep` directly — dropping the nested shutdown
+        // arm — would hang here; the `timeout` turns that hang into a clean failure.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // after(3): #1 start-up check, #2 idle-iter-1 outer (refresh wins → enter nested), #3
+        // the sweep's NESTED shutdown arm fires → break. The wedged sweep is cut by shutdown.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = NoControl;
+        let mut ticker = HangingRefreshTicker::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        // Reaching the assertion at all is the proof; the timeout guards against the regression
+        // (a directly-awaited sweep) deadlocking the suite instead of failing cleanly.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_loop(
+                &mut daemon,
+                &mut log,
+                &mut diag,
+                &mut shutdown,
+                &control,
+                &mut ticker,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "shutdown must interrupt the wedged sweep, not deadlock"
+        );
+        result.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -5856,9 +6243,16 @@ mod tests {
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
-        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
-            .await
-            .unwrap();
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
 
         // The warm-up-completing tick's swap landed fully: canonical = B, display = B,
         // active = B.
@@ -6051,9 +6445,16 @@ mod tests {
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
-        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
-            .await
-            .unwrap();
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(daemon.state.ticks, 4);
 
@@ -6148,9 +6549,16 @@ mod tests {
         let control = NoControl;
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
-        run_loop(&mut daemon, &mut log, &mut diag, &mut shutdown, &control)
-            .await
-            .unwrap();
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
 
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(logged.lines().count(), 1, "one event line: {logged:?}");

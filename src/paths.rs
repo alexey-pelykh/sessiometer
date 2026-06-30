@@ -264,6 +264,29 @@ pub(crate) fn claude_binary() -> Result<PathBuf> {
 /// `$CLAUDE_BIN` falls through to the PATH scan; a `$CLAUDE_BIN` that is set but does
 /// NOT name an existing file is an error (the operator pointed us at a specific
 /// binary — don't silently substitute a different one).
+/// Resolve the `claude` binary the isolated-refresh engine spawns, honoring the
+/// `[refresh].claude_bin` config override (issue #105) ahead of the `$CLAUDE_BIN` / `$PATH`
+/// resolution [`claude_binary`] performs.
+///
+/// `config_bin` is `Some` only when the operator set `[refresh].claude_bin` (an empty value
+/// is collapsed to `None` at config-load). When set it WINS and is validated exactly like a
+/// `$CLAUDE_BIN` override — absolutized against the current dir, then required to name an
+/// existing file — so a configured-but-missing binary is [`Error::ClaudeBinaryNotFound`],
+/// never a silent fall-through to a different `claude` on `$PATH` (the operator named a
+/// specific binary; honor it or fail). When `None`, defers to [`claude_binary`].
+pub(crate) fn claude_binary_with_override(config_bin: Option<&Path>) -> Result<PathBuf> {
+    match config_bin {
+        // A configured override is the sole candidate: pass no `$PATH`, so a missing one is
+        // an error rather than a scan that substitutes a different binary.
+        Some(bin) => claude_binary_from(
+            Some(bin.as_os_str().to_owned()),
+            None,
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ),
+        None => claude_binary(),
+    }
+}
+
 fn claude_binary_from(
     claude_bin: Option<OsString>,
     path: Option<OsString>,
@@ -704,5 +727,28 @@ mod tests {
         let got = claude_binary_from(None, Some(rel.as_os_str().to_owned()), tmp.path()).unwrap();
         assert_eq!(got, abs.join("claude"));
         assert!(got.is_absolute());
+    }
+
+    // --- claude_binary_with_override (issue #105) ---------------------------
+
+    #[test]
+    fn override_prefers_a_present_config_bin() {
+        // A `[refresh].claude_bin` pointing at an existing absolute file resolves to it,
+        // ahead of any `$CLAUDE_BIN` / `$PATH` (absolute, so cwd-independent).
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("claude");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let got = claude_binary_with_override(Some(&bin)).unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn override_errors_on_a_missing_config_bin() {
+        // A configured-but-missing override fails rather than silently scanning `$PATH`
+        // for a different `claude` — the operator named a specific binary.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-claude");
+        let err = claude_binary_with_override(Some(&missing)).unwrap_err();
+        assert!(matches!(err, Error::ClaudeBinaryNotFound));
     }
 }

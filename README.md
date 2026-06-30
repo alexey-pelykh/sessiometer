@@ -244,6 +244,48 @@ credential is left alone. A cycle reports one redacted line per account —
 account's `list` label, never a token. It needs the `claude` binary on your `PATH`
 (or `$CLAUDE_BIN` set to its absolute path).
 
+## Refreshing parked credentials automatically
+
+`poke` is the manual trigger; the daemon can also run that same refresh **on a
+cadence** so a spare is always ready to swap to without a stale-token round-trip.
+The periodic tick is **off by default** (opt-in) and runs entirely in the daemon's
+**idle path** — between polls, off the poll → usage → swap seam — so it never
+competes with the work that keeps the active session alive. Each refresh happens in
+an isolated `CLAUDE_CONFIG_DIR` (exactly as `poke`), so the live
+`Claude Code-credentials` item is never touched, and the **active account and the
+imminent swap target are always excluded** — it refreshes parked accounts only. A
+refresh failure (or a cycle that overruns its timeout) is non-fatal: it is logged,
+redacted, and the daemon returns to polling.
+
+Turn it on and tune it in the `[refresh]` table of `config.toml`:
+
+```toml
+[refresh]
+enabled = true            # opt-in; false (the default) leaves the tick wholly inert
+accounts = []             # parked accounts by `list` label or account-uuid; [] = all near-expiry
+cadence_secs = 3600       # seconds between ticks AND the near-expiry horizon (60..=86400)
+idle_after_secs = 60      # idle seconds (no poll/swap) required before a refresh fires (0..=3600)
+timeout_secs = 90         # whole-cycle bound for one account's refresh (10..=600)
+# claude_bin = "/absolute/path/to/claude"   # overrides $CLAUDE_BIN/$PATH; omit to resolve normally
+```
+
+An account is **due** when its stored token would expire within one `cadence_secs`
+of now — i.e. it would not survive until the next tick — so the cadence doubles as
+the near-expiry horizon (no second knob). Changes take effect at the next daemon
+start. If the `claude` binary cannot be resolved when the tick is enabled, the tick
+is disabled with a warning rather than failing the daemon.
+
+`idle_after_secs` is measured from the last poll, and the daemon polls one account
+roughly every `poll_secs ÷ (accounts in rotation)` — so keep `idle_after_secs`
+**below** that spacing, or the next poll always preempts the refresh and it never
+fires. With the defaults (`poll_secs = 300`) that leaves room for rosters up to five
+accounts; larger rosters should lower `idle_after_secs` to fit the gap.
+
+> **Defaults are provisional.** The refresh token's durable lifetime is not yet
+> pinned, so the shipped cadence/idle defaults are deliberately conservative and may
+> change once the engine's own first-run telemetry establishes the real TTL. Pick a
+> `cadence_secs` comfortably shorter than your observed token lifetime.
+
 ## Edge cases & resilience
 
 `sessiometer` is built to ride out the keychain and credential edge cases a
