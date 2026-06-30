@@ -72,8 +72,9 @@ next swap: spare
   `3d4h`), shown for **every** account, not only an exhausted one — `n/a` when that
   reset instant is unknown.
 - A trailing **health-text** column carries inline tags — `disabled` (parked,
-  issue #36) and `needs re-login` (a dead credential, issue #42); it is omitted when
-  no account carries a tag.
+  issue #36) and `needs re-login` (a dead credential, issue #42), the latter softened
+  to `recovering` while that credential is answering again and climbing back toward
+  health (issue #109); it is omitted when no account carries a tag.
 
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`

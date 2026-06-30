@@ -419,6 +419,13 @@ pub(crate) struct AccountReading {
     /// re-login (issue #42). The durable "needs re-login" status `status` surfaces;
     /// non-secret (a plain flag on the account's handle).
     pub(crate) quarantined: bool,
+    /// Whether a quarantined account is mid-RECOVERY — its credential is currently
+    /// answering again (`quarantined && recovery_successes > 0`), climbing toward the
+    /// un-quarantine threshold on the spontaneous-revival path (issue #109). A refinement
+    /// of `quarantined` (always implies it), surfaced so `status` can render `recovering`
+    /// instead of the alarming `needs re-login` for a healing account. Derived from the
+    /// health counter (where it lives); non-secret — a plain flag, no raw count exposed.
+    pub(crate) recovering: bool,
     /// Whether the account's WEEKLY window is EXHAUSTED — `weekly >= weekly_trigger`
     /// (the base, un-jittered threshold; issue #11/#37), the daemon's own viability
     /// verdict. When true the account is blocked until its weekly reset, so `status`
@@ -456,6 +463,15 @@ pub(crate) struct AccountStatusLine {
     /// re-login (issue #42). The durable "needs re-login" status; `false` for a
     /// healthy account. Non-secret — a plain flag.
     pub(crate) quarantined: bool,
+    /// Whether a quarantined account is mid-RECOVERY — its credential is answering
+    /// again and climbing toward un-quarantine (issue #109). Refines `quarantined`
+    /// (true only when it is): lets `status` render `recovering` instead of the
+    /// alarming `needs re-login` for a healing account, so an operator does not swap
+    /// away from a recovering — and often healthier — account. Non-secret — a derived
+    /// flag, no raw count. `#[serde(default)]` per the added-field convention (cf.
+    /// `session_resets_at`): a pre-#109 daemon that omits it decodes to `false`.
+    #[serde(default)]
+    pub(crate) recovering: bool,
     /// Last-polled session-window usage percent (`0..=100`); `null` if the last
     /// poll for this account failed (never a fabricated `0`).
     pub(crate) session_pct: Option<u8>,
@@ -528,6 +544,7 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 active: account.active,
                 enabled: account.enabled,
                 quarantined: account.quarantined,
+                recovering: account.recovering,
                 session_pct: account.usage.map(|u| to_pct(u.session)),
                 weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
                 session_resets_at: account.usage.and_then(|u| u.session_resets_at),
@@ -1952,6 +1969,11 @@ where
                     active: active == Some(i),
                     enabled: account.enabled,
                     quarantined: self.state.health[i].quarantined,
+                    // Mid-recovery iff dead AND its credential is currently answering
+                    // again (issue #109) — a refinement of `quarantined`, so `status`
+                    // can soften `needs re-login` to `recovering` for a healing account.
+                    recovering: self.state.health[i].quarantined
+                        && self.state.health[i].recovery_successes > 0,
                     // The daemon's own viability verdict, deterministic (base, not
                     // jittered, trigger) so the displayed "resets in" matches when
                     // `use` would accept the account again (issue #72).
@@ -5125,6 +5147,7 @@ mod tests {
                     active: true,
                     enabled: true,
                     quarantined: false,
+                    recovering: false,
                     weekly_exhausted: false,
                     usage: Some(Usage {
                         session: 0.97,
@@ -5138,6 +5161,7 @@ mod tests {
                     active: false,
                     enabled: true,
                     quarantined: false,
+                    recovering: false,
                     weekly_exhausted: false,
                     usage: None,
                 },
@@ -5177,6 +5201,7 @@ mod tests {
                 active: true,
                 enabled: true,
                 quarantined: false,
+                recovering: false,
                 weekly_exhausted: false,
                 usage: Some(Usage {
                     session: 0.50,
@@ -5341,6 +5366,7 @@ mod tests {
                     active: false,
                     enabled: true,
                     quarantined: false,
+                    recovering: false,
                     weekly_exhausted: false,
                     usage: None,
                 },
@@ -5349,6 +5375,7 @@ mod tests {
                     active: true,
                     enabled: true,
                     quarantined: false,
+                    recovering: false,
                     weekly_exhausted: false,
                     usage: None,
                 },
@@ -6537,9 +6564,55 @@ mod tests {
             spare.quarantined,
             "the dead account carries a durable status"
         );
-        // The wire projection carries the flag but never a secret.
+        // The wire projection carries the flag but never a secret. A genuinely dead
+        // account (quarantined, NOT mid-recovery) projects `recovering: false` (#109).
+        assert!(!spare.recovering, "a dead account is not yet recovering");
         let json = serde_json::to_string(&status_response(&outcome.snapshot)).unwrap();
         assert!(json.contains(r#""quarantined":true"#), "got {json}");
+        assert!(json.contains(r#""recovering":false"#), "got {json}");
+        assert!(!json.contains('@'), "no email on the wire: {json}");
+        assert!(!json.to_lowercase().contains("token"));
+    }
+
+    #[tokio::test]
+    async fn a_mid_recovery_account_surfaces_recovering_on_the_wire() {
+        // Issue #109: a quarantined account whose credential is answering again —
+        // `recovery_successes > 0` but below the un-quarantine threshold — is reported
+        // `recovering` in the snapshot and on the wire, a refinement of `quarantined`
+        // (still true) that lets `status` soften `needs re-login` to `recovering`.
+        // Non-secret like every other status field (#15). Built through the real
+        // `note_poll_outcome` → `snapshot` derivation, not a hand-set flag.
+        let mut daemon = lifecycle_daemon().await;
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true; // `work` is dead…
+
+        // …but its OWN token answers one live probe: still quarantined (below
+        // monitor_recovery_m = 2), now mid-recovery.
+        let mut events = Vec::new();
+        daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
+        assert!(daemon.state.health[0].quarantined);
+        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+
+        // The snapshot derives `recovering` from that health; the healthy spare does not.
+        let readings = vec![
+            Some(live(0.10, 0.10).unwrap()),
+            Some(live(0.20, 0.20).unwrap()),
+        ];
+        let snapshot = daemon.snapshot(Some(0), &readings);
+        let work = &snapshot.accounts[0];
+        assert_eq!(work.label, "work");
+        assert!(
+            work.quarantined && work.recovering,
+            "a healing account is quarantined AND recovering"
+        );
+        assert!(
+            !snapshot.accounts[1].recovering,
+            "the healthy spare is not recovering"
+        );
+
+        // The wire carries the derived flag but never a secret.
+        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(json.contains(r#""recovering":true"#), "got {json}");
         assert!(!json.contains('@'), "no email on the wire: {json}");
         assert!(!json.to_lowercase().contains("token"));
     }
