@@ -181,3 +181,76 @@ path is rejected). Not adopted.
   escaped command is `Zeroizing` (wiped on drop).
 
 CC 2.1.181 · macOS 26.5.1 / 25F80 · sessiometer #39.
+
+---
+
+# Issue #100 — keychain service name under a non-default `CLAUDE_CONFIG_DIR`
+
+sessiometer hard-coded the bare service `Claude Code-credentials`. Claude Code suffixes that name
+under a non-default `CLAUDE_CONFIG_DIR`, so a CC instance in an isolated config dir was invisible
+to every keychain site (read/poll, swap-write, resolve). This records the **exact** derivation, read
+from the CC 2.1.181 binary itself — `~/.local/share/claude/versions/2.1.181`, 2026-06-30 — because
+the issue's prose described a different (wrong) normalization.
+
+## Finding — the derivation is `sha256(raw env value)[..8]`, NOT an expanded path ✅
+
+The service name is built by CC's `n1("-credentials")` (decoded from the binary):
+
+```js
+function n1(e=""){                                      // e = "-credentials" for the credential item
+  let t=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
+      n=t!==void 0?!t:!process.env.CLAUDE_CONFIG_DIR,    // suffix-ABSENT gate
+      r=t!==void 0?t.normalize("NFC"):sr(),              // value HASHED
+      o=n?"":`-${createHash("sha256").update(r).digest("hex").substring(0,8)}`;
+  return `Claude Code${OAUTH_FILE_SUFFIX}${e}${o}`       // OAUTH_FILE_SUFFIX="" for standard OAuth
+}
+sr = ()=>(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(),".claude")).normalize("NFC")
+```
+
+So `service = "Claude Code-credentials" + suffix`, where:
+
+- suffix = `""` when `CLAUDE_CONFIG_DIR` is **unset or empty** (and `CLAUDE_SECURESTORAGE_CONFIG_DIR`
+  unset) — the default config dir, unchanged from prior usage (no regression).
+- else suffix = `-` + lowercase-hex `sha256( NFC(value) )`, **first 8 chars**.
+- The hashed `value` is the **raw env-var string**, NFC-normalized — **no path expansion of any
+  kind**: no `~` expansion, no relative→absolute, no trailing-slash strip, no realpath/symlink. (The
+  issue's "AC sketch" claimed all of those; the binary disproves it. The hash is over the literal
+  `CLAUDE_CONFIG_DIR` bytes, NFC-normalized, nothing more.)
+- `CLAUDE_SECURESTORAGE_CONFIG_DIR` takes **precedence** when defined: a non-empty value is the
+  hashed value (and `CLAUDE_CONFIG_DIR` is not consulted); a **defined-empty** value forces the bare
+  name. Replicated faithfully — a CC instance with it set would otherwise be mis-targeted.
+- `OAUTH_FILE_SUFFIX` is non-empty (`-local-oauth` / `-custom-oauth`) **only** for a custom OAuth
+  client id (`CLAUDE_CODE_OAUTH_CLIENT_ID`) — out of scope here, as in the issue.
+
+## Ground truth (CC's exact expression, via `node`)
+
+`sha256(value.normalize("NFC")).digest("hex").slice(0,8)` — NFC is the identity for ASCII paths:
+
+| `CLAUDE_CONFIG_DIR` | service name |
+|---|---|
+| unset / empty | `Claude Code-credentials` |
+| `/abs/path` | `Claude Code-credentials-6d80187b` |
+| `/opt/cc` | `Claude Code-credentials-34fd9c6e` |
+
+Pinned as `keychain::tests` assertions, so the Rust derivation is proven byte-for-byte against CC,
+not merely self-consistent.
+
+## NFC — hash raw bytes, refuse non-ASCII (no Unicode-normalizer dependency)
+
+CC hashes the **NFC** form. For an ASCII config-dir path NFC is the identity, so hashing the raw
+bytes is byte-exact — and the crate hand-rolls its primitives (`sha256`, hex) to keep the dependency
+graph minimal, so pulling a Unicode-normalizer crate for the rare non-ASCII tail is disproportionate.
+A non-ASCII value could differ between its NFC form and its raw bytes, so rather than silently
+address the **wrong** keychain item, resolution **refuses** with `Error::NonAsciiConfigDir`. The value
+is read as bytes (`OsStrExt`), never `to_string_lossy` — a lossy decode would hash different bytes
+than CC sees.
+
+## Verification
+
+`canonical_service_from` is pure (the env read lives in `canonical_service`), so every arm — default,
+empty, suffixed (`/abs/path`, `/opt/cc`), `CLAUDE_SECURESTORAGE_CONFIG_DIR` precedence, defined-empty,
+non-ASCII refusal — is unit-tested without mutating process env. The `security`-CLI round-trip test
+(`keychain::tests::real_cli`) still passes against the bare base name (its `for_keychain` store pins
+the base, hermetic against ambient `CLAUDE_CONFIG_DIR`).
+
+CC 2.1.181 · macOS 26.5.1 / 25F80 · sessiometer #100.

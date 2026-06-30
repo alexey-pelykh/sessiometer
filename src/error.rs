@@ -60,6 +60,20 @@ pub(crate) enum Error {
     #[error("keychain {op} via `security` failed (exit status {code})")]
     Keychain { op: &'static str, code: i32 },
 
+    /// `CLAUDE_CONFIG_DIR` (or `CLAUDE_SECURESTORAGE_CONFIG_DIR`) holds a non-ASCII
+    /// value, which sessiometer cannot map to Claude Code's keychain service name.
+    /// CC hashes the **NFC-normalized** config-dir path; for an ASCII path NFC is
+    /// the identity, so the raw bytes hash byte-identically and no Unicode-normalizer
+    /// dependency is pulled in (issue #100). A non-ASCII path could differ between
+    /// its NFC form and its raw bytes, so rather than compute a suffix that may
+    /// silently address the **wrong** keychain item, resolution refuses. The
+    /// offending value is a filesystem path and is deliberately NOT echoed.
+    #[error(
+        "CLAUDE_CONFIG_DIR (or CLAUDE_SECURESTORAGE_CONFIG_DIR) contains non-ASCII characters, \
+         which sessiometer cannot map to Claude Code's keychain service name"
+    )]
+    NonAsciiConfigDir,
+
     /// No `config.toml` exists yet at the expected path. Carries the path (a
     /// filesystem location, never a secret) so the message can name it.
     #[error("no config file at {path} — run `sessiometer capture` to create one")]
