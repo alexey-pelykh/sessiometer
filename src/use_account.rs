@@ -402,11 +402,12 @@ fn cooldown_active(last_swap_at: Option<SystemTime>, now: SystemTime, cooldown: 
 }
 
 /// Resolve `query` to a single roster INDEX by label OR account-uuid — the same
-/// resolution the offline `list` view keys on (#17). The resolver NEVER guesses:
-/// zero matches is [`Error::UseTargetNotFound`], more than one (a duplicated label)
-/// is [`Error::UseTargetAmbiguous`]. Each account is counted once even if both its
+/// resolution the offline `list` view keys on (#17), shared with the one-shot `poke`
+/// command (issue #104). The resolver NEVER guesses: zero matches is
+/// [`Error::UseTargetNotFound`], more than one (a duplicated label) is
+/// [`Error::UseTargetAmbiguous`]. Each account is counted once even if both its
 /// fields equal `query`.
-fn resolve_target(roster: &[Account], query: &str) -> Result<usize> {
+pub(crate) fn resolve_target(roster: &[Account], query: &str) -> Result<usize> {
     let matches: Vec<usize> = roster
         .iter()
         .enumerate()
