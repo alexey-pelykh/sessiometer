@@ -1195,7 +1195,19 @@ where
             decision: action.decision_class(),
             backoff_secs: next_wait.map(|wait| wait.as_secs()),
         });
-        let snapshot = self.snapshot(active, &readings);
+        // Snapshot from the POST-swap active index (`self.state.active`), NOT the local
+        // `active` captured at top-of-tick (`let active = self.state.active`): when
+        // `decide_action` above performed a swap it advanced `self.state.active` (via
+        // `record_swap`), so the stale local `Copy` would mark the swapped-AWAY account as
+        // `*` over the control socket for one whole poll interval, until the next tick
+        // rebuilt the snapshot (#117). `readings` stays keyed on the pre-swap `active`, which
+        // is consistent: a quarantined swapped-away account already carries `None` either way
+        // (a quarantined active holding a reading returns `Held`, never swaps), so the only
+        // actual masking difference is a DISABLED (parked) swapped-away account — its last
+        // reading is shown rather than masked to `None`, harmless, and `next_swap` excludes it
+        // from targeting via the enabled-filter regardless. The sibling `locked_tick` already
+        // snapshots from `self.state.active`.
+        let snapshot = self.snapshot(self.state.active, &readings);
         TickOutcome {
             action,
             events,
@@ -3218,6 +3230,62 @@ mod tests {
         assert_eq!(displayed_uuid(&json).as_deref(), Some("u-C"));
         // …and the in-memory active advanced to C, so the next read polls C.
         assert_eq!(daemon.state.active, Some(2));
+    }
+
+    #[tokio::test]
+    async fn swap_tick_snapshot_marks_the_now_active_account_not_the_swapped_away_one() {
+        // #117: the SAME tick that performs a swap must build its `status` snapshot from
+        // the POST-swap active index, so the control socket serves the now-active account
+        // as `*` immediately — not the swapped-AWAY account for one poll interval. The
+        // regression: `Daemon::tick` captured `active` (a `Copy`) BEFORE `decide_action`
+        // performed the swap, then built the snapshot from that stale copy, while the
+        // sibling `locked_tick` already passed the live `self.state.active`. Drive a real
+        // swap (`work` index 0 over the session trigger → the only viable target `spare`
+        // index 1) and pin the snapshot's per-account `active` flag to the PHYSICAL
+        // outcome — the gap the existing swap tests left (they assert `state.active` and
+        // the `~/.claude.json` write, never the snapshot flag the `status` CLI reads).
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40) // active, over the session trigger
+            .ok("u-B", 0.05, 0.05); // the only viable target
+        let tun = tunables(95, 80, 0);
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        let outcome = warmed_tick(&mut daemon).await;
+
+        // Precondition: a real swap occurred OFF `work` (0) ONTO `spare` (1).
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        assert_eq!(daemon.state.active, Some(1));
+
+        // The snapshot served THIS tick must already reflect the swap: `*` on `spare`,
+        // not on `work`. Pre-fix this asserted the inverse (work active, spare not).
+        let work = &outcome.snapshot.accounts[0];
+        let spare = &outcome.snapshot.accounts[1];
+        assert_eq!(work.label, "work");
+        assert_eq!(spare.label, "spare");
+        assert!(
+            spare.active,
+            "the swapped-ONTO account must be active in the swap-tick snapshot",
+        );
+        assert!(
+            !work.active,
+            "the swapped-AWAY account must NOT be active in the swap-tick snapshot",
+        );
     }
 
     #[tokio::test]
