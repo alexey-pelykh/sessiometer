@@ -151,15 +151,26 @@ impl RefreshEventOutcome {
 /// (which renders it) both import it.
 ///
 /// Non-secret by construction: a bare classification, never a token, an expiry, or an
-/// email — the same #15 discipline as [`RefreshEventOutcome`]. Variants are ordered by
-/// SEVERITY (`Healthy` < `Stale` < `AtRisk` < `Dead`), matching the issue's green →
-/// yellow → orange → red ladder.
+/// email — the same #15 discipline as [`RefreshEventOutcome`]. The four SEVERITY variants
+/// are ordered `Healthy` < `Stale` < `AtRisk` < `Dead`, matching the issue's green →
+/// yellow → orange → red ladder; `Unknown` (issue #137) is OFF that severity axis — a
+/// non-active account with NO positive-liveness evidence (never successfully polled, no
+/// refresh telemetry, no refresh-sourced expiry), reported honestly rather than as a false
+/// 🟢. It sits just above `Healthy` in declaration order, the "unverified" caution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CredentialHealth {
-    /// Access token valid and the refresh path working (or unobserved). 🟢
+    /// Access token valid and the refresh path working. 🟢 Requires a POSITIVE liveness
+    /// signal (a fresh successful poll, refresh telemetry, or a refresh-sourced expiry);
+    /// absence of a NEGATIVE signal alone is not health (issue #137) — that is `Unknown`.
     #[default]
     Healthy,
+    /// No positive-liveness EVIDENCE yet (issue #137): a non-active account never
+    /// successfully polled, `[refresh]` off (no telemetry, no refresh-sourced expiry, no
+    /// fresh reading). Distinct from `Healthy` — the daemon cannot vouch for the credential,
+    /// so it says so rather than a false 🟢 that would jump straight to 🔴 the moment the
+    /// #42 401-streak quarantines it. ⚪
+    Unknown,
     /// The stored access token has EXPIRED but the refresh token is still valid — a
     /// transient window the next refresh recovers. 🟡 (least severe non-healthy state).
     Stale,
@@ -178,6 +189,7 @@ impl CredentialHealth {
     fn as_str(self) -> &'static str {
         match self {
             CredentialHealth::Healthy => "healthy",
+            CredentialHealth::Unknown => "unknown",
             CredentialHealth::Stale => "stale",
             CredentialHealth::AtRisk => "at_risk",
             CredentialHealth::Dead => "dead",
@@ -1202,6 +1214,7 @@ mod tests {
         // token, matching the `--json` wire serialization of `CredentialHealth`.
         for (state, token) in [
             (CredentialHealth::Healthy, "healthy"),
+            (CredentialHealth::Unknown, "unknown"),
             (CredentialHealth::Stale, "stale"),
             (CredentialHealth::AtRisk, "at_risk"),
             (CredentialHealth::Dead, "dead"),
