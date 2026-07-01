@@ -338,7 +338,10 @@ async fn poll_viability<P: RosterPoller>(
     weekly_trigger: f64,
 ) -> Result<Viability> {
     match poller.poll(account, false).await {
-        Ok(usage) if usage.weekly >= weekly_trigger => Ok(Viability::WeeklyExhausted),
+        // Only the weekly dimension of the reading drives the viability verdict; the
+        // sample-only fields on the `PolledReading` are irrelevant here (this is the
+        // one-shot `use`-command probe, not the daemon's sampling poll loop).
+        Ok(reading) if reading.usage.weekly >= weekly_trigger => Ok(Viability::WeeklyExhausted),
         Ok(_) => Ok(Viability::Viable),
         // A dead stored token: the daemon-independent "quarantined / needs re-login"
         // signal (#42). 401 (rejected) and 403 (missing usage scope) both mean the
@@ -722,7 +725,7 @@ mod tests {
     use crate::config::Tunables;
     use crate::keychain::{Credential, FakeCredentialStore};
     use crate::stash::{FakeAccountStash, StashedAccount};
-    use crate::usage::Usage;
+    use crate::usage::{PolledReading, Usage};
 
     // --- fakes + fixtures ---------------------------------------------------
 
@@ -763,14 +766,17 @@ mod tests {
     }
 
     impl RosterPoller for FakePoller {
-        async fn poll(&self, _account: &Account, _active: bool) -> Result<Usage> {
+        async fn poll(&self, _account: &Account, _active: bool) -> Result<PolledReading> {
             self.calls.set(self.calls.get() + 1);
             match self.probe {
-                Probe::Live { weekly } => Ok(Usage {
-                    session: 0.10,
-                    weekly,
-                    weekly_resets_at: None,
-                    session_resets_at: None,
+                Probe::Live { weekly } => Ok(PolledReading {
+                    usage: Usage {
+                        session: 0.10,
+                        weekly,
+                        weekly_resets_at: None,
+                        session_resets_at: None,
+                    },
+                    severity: None,
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),
