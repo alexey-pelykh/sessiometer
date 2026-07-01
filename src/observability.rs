@@ -231,6 +231,70 @@ impl LoginEventOutcome {
     }
 }
 
+/// Whether an `export` carried credential material or only the roster/config — the `mode=` of the
+/// redacted [`Event::Export`] (issue #150). A bare classification (never a handle, token, or
+/// email): the SAME #15 discipline as the other outcome enums here. Maps from the `export` verb's
+/// `--no-secrets` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportMode {
+    /// A full export: every account's credential + `oauthAccount` material travels (+ the roster).
+    Full,
+    /// A config-only export (`--no-secrets`): the roster + tunables travel, but no credential
+    /// material — each imported account then needs a re-`login`.
+    ConfigOnly,
+}
+
+impl ExportMode {
+    /// The `mode=` token. Snake_case, matching every other token in this module's `key=val`
+    /// grammar — the issue's illustrative `config-only` is spelled `config_only` for that house
+    /// consistency (a hyphen would not split the grammar, but the underscore matches the rest).
+    fn as_str(self) -> &'static str {
+        match self {
+            ExportMode::Full => "full",
+            ExportMode::ConfigOnly => "config_only",
+        }
+    }
+}
+
+/// The whole-`import` verdict — the `outcome=` of the redacted [`Event::Import`] (issue #150),
+/// DERIVED from the per-account outcome counts rather than stored. A rollup of what happened:
+/// `ok` (nothing failed), `partial` (some failed, some landed / were skipped), or `failed` (every
+/// account failed). Non-secret — a bare verdict token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportRollup {
+    /// No account failed (all imported / skipped / overwritten, or an empty artifact).
+    Ok,
+    /// At least one account failed AND at least one did not (imported / skipped / overwritten).
+    Partial,
+    /// Every account failed — none imported, skipped, or overwritten.
+    Failed,
+}
+
+impl ImportRollup {
+    /// Roll the per-account outcome counts up into the whole-import verdict. `skipped` counts as a
+    /// NON-failure — an already-present account intentionally left untouched by the conflict policy
+    /// is a success, not a failure — so a mix of skips and failures is `Partial`, and only an
+    /// all-failed import (nothing imported / skipped / overwritten) is `Failed`.
+    fn from_counts(imported: u32, skipped: u32, overwritten: u32, failed: u32) -> Self {
+        if failed == 0 {
+            ImportRollup::Ok
+        } else if imported + skipped + overwritten == 0 {
+            ImportRollup::Failed
+        } else {
+            ImportRollup::Partial
+        }
+    }
+
+    /// The `outcome=` token.
+    fn as_str(self) -> &'static str {
+        match self {
+            ImportRollup::Ok => "ok",
+            ImportRollup::Partial => "partial",
+            ImportRollup::Failed => "failed",
+        }
+    }
+}
+
 /// One observable daemon state change, rendered as a single `key=val` log line by
 /// [`Event::to_log_line`].
 ///
@@ -360,6 +424,29 @@ pub(crate) enum Event {
     /// non-PII handle (as #135's post-harvest `Login` uses), never a token or email — and `None`
     /// (the field omitted) when the display identity could not be read.
     UncapturedLogin { account_uuid: Option<String> },
+    /// A `sessiometer export` wrote a migration artifact (issue #150) — the single redacted audit
+    /// line the verb emits. `accounts` is the roster size exported, `encrypted` whether the
+    /// artifact is passphrase-encrypted (vs `--plaintext`), and `mode` whether credential material
+    /// travelled ([`ExportMode::Full`]) or only the roster/config (`--no-secrets`,
+    /// [`ExportMode::ConfigOnly`]). Carries NO account field — aggregate count + a bool + a mode
+    /// token only, so nothing account-specific (never a handle, token, or email) reaches the line.
+    Export {
+        accounts: u32,
+        encrypted: bool,
+        mode: ExportMode,
+    },
+    /// A `sessiometer import` rehydrated accounts from a migration artifact (issue #150) — the
+    /// single redacted audit line the verb emits. Carries the per-account outcome COUNTS only:
+    /// `imported` (new), `skipped` (already present, left untouched), `overwritten` (replaced), and
+    /// `failed` (a credential write / read-back verify failed). The line derives `accounts=` (their
+    /// sum) and the `outcome=` rollup ([`ImportRollup`]) from them. NO account field — aggregate
+    /// counts only, so nothing account-specific (never a handle, token, or email) reaches the line.
+    Import {
+        imported: u32,
+        skipped: u32,
+        overwritten: u32,
+        failed: u32,
+    },
 }
 
 impl Event {
@@ -487,6 +574,36 @@ impl Event {
                 Some(uuid) => format!("ts={ts} event=uncaptured_login acct={uuid}"),
                 None => format!("ts={ts} event=uncaptured_login"),
             },
+            Event::Export {
+                accounts,
+                encrypted,
+                mode,
+            } => {
+                // Aggregate-only: a count, a bool, and a mode token — no account field, so nothing
+                // account-specific reaches the line (the #15 guarantee holds here trivially, the
+                // export event having no per-account field at all).
+                let mode = mode.as_str();
+                format!(
+                    "ts={ts} event=export accounts={accounts} encrypted={encrypted} mode={mode}"
+                )
+            }
+            Event::Import {
+                imported,
+                skipped,
+                overwritten,
+                failed,
+            } => {
+                // `accounts=` is the total processed — every account gets exactly one outcome, so
+                // the sum — and `outcome=` the rollup derived from the counts. Aggregate-only: no
+                // account field, so no per-account identity reaches the line.
+                let accounts = imported + skipped + overwritten + failed;
+                let outcome =
+                    ImportRollup::from_counts(*imported, *skipped, *overwritten, *failed).as_str();
+                format!(
+                    "ts={ts} event=import accounts={accounts} outcome={outcome} \
+                     imported={imported} skipped={skipped} overwritten={overwritten} failed={failed}"
+                )
+            }
         }
     }
 }
@@ -1550,6 +1667,136 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead\n";
             outcomes.get("my work"),
             Some(&RefreshEventOutcome::Refreshed)
         );
+    }
+
+    // --- export / import events (issue #150) --------------------------------
+
+    #[test]
+    fn export_line_carries_accounts_encrypted_and_mode() {
+        // A full, encrypted export: the roster size, the encrypted bool, and mode=full — no
+        // account field at all (aggregate-only).
+        let full = Event::Export {
+            accounts: 3,
+            encrypted: true,
+            mode: ExportMode::Full,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            full,
+            format!("{TS0} event=export accounts=3 encrypted=true mode=full")
+        );
+
+        // A config-only, plaintext export: mode=config_only + encrypted=false.
+        let config_only = Event::Export {
+            accounts: 2,
+            encrypted: false,
+            mode: ExportMode::ConfigOnly,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            config_only,
+            format!("{TS0} event=export accounts=2 encrypted=false mode=config_only")
+        );
+    }
+
+    #[test]
+    fn import_line_derives_accounts_and_the_ok_rollup() {
+        // A clean import: nothing failed → outcome=ok, and accounts= is the count sum. The line
+        // carries the full per-account breakdown incl. failed=0.
+        let line = Event::Import {
+            imported: 2,
+            skipped: 1,
+            overwritten: 1,
+            failed: 0,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=import accounts=4 outcome=ok \
+                 imported=2 skipped=1 overwritten=1 failed=0"
+            )
+        );
+    }
+
+    #[test]
+    fn import_line_renders_partial_and_failed_rollups() {
+        // Some landed, some failed → partial.
+        let partial = Event::Import {
+            imported: 1,
+            skipped: 0,
+            overwritten: 0,
+            failed: 1,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            partial,
+            format!(
+                "{TS0} event=import accounts=2 outcome=partial \
+                 imported=1 skipped=0 overwritten=0 failed=1"
+            )
+        );
+
+        // Every account failed → failed.
+        let failed = Event::Import {
+            imported: 0,
+            skipped: 0,
+            overwritten: 0,
+            failed: 3,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            failed,
+            format!(
+                "{TS0} event=import accounts=3 outcome=failed \
+                 imported=0 skipped=0 overwritten=0 failed=3"
+            )
+        );
+    }
+
+    #[test]
+    fn import_rollup_treats_skipped_as_a_non_failure() {
+        // The rollup logic directly (the derivation the line depends on):
+        // - no failures anywhere → ok
+        assert_eq!(ImportRollup::from_counts(0, 0, 0, 0), ImportRollup::Ok);
+        assert_eq!(ImportRollup::from_counts(2, 3, 0, 0), ImportRollup::Ok);
+        // - all failed → failed
+        assert_eq!(ImportRollup::from_counts(0, 0, 0, 4), ImportRollup::Failed);
+        // - a skip alongside a failure is PARTIAL, not failed: the skip is an intentional
+        //   success (the conflict policy applied), so the import did not wholly fail.
+        assert_eq!(ImportRollup::from_counts(0, 1, 0, 1), ImportRollup::Partial);
+        // - a landed account alongside a failure → partial
+        assert_eq!(ImportRollup::from_counts(1, 0, 0, 2), ImportRollup::Partial);
+        assert_eq!(ImportRollup::from_counts(0, 0, 1, 1), ImportRollup::Partial);
+    }
+
+    #[test]
+    fn export_and_import_lines_carry_no_pii() {
+        // The #15 guarantee for the #150 events: the export/import lines carry ONLY aggregate
+        // counts, a bool, and a fixed vocabulary token — never a handle, email, or token. There
+        // is no per-account field through which a secret could reach the line at all.
+        let export = Event::Export {
+            accounts: 5,
+            encrypted: true,
+            mode: ExportMode::Full,
+        }
+        .to_log_line(at_epoch(0));
+        let import = Event::Import {
+            imported: 5,
+            skipped: 0,
+            overwritten: 0,
+            failed: 0,
+        }
+        .to_log_line(at_epoch(0));
+        for line in [&export, &import] {
+            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(!line.contains("token"), "no token may appear: {line}");
+            assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
+            assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
+            // No per-account identity field: the events are aggregate-only.
+            assert!(!line.contains("account="), "no account handle: {line}");
+            assert!(!line.contains("acct="), "no account handle: {line}");
+        }
     }
 
     // --- Diagnostic::to_log_line (the diagnostic channel's redaction surface, #77) ---

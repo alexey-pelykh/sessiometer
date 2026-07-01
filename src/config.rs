@@ -114,6 +114,30 @@ const DEFAULT_STATS_PERIOD: &str = "week";
 /// bad value fails at config-load with a clear message rather than at `stats`-run.
 const STATS_PERIODS: [&str; 4] = ["day", "week", "month", "lifetime"];
 
+/// Default Argon2id memory cost (KiB) for a WRITTEN encrypted export artifact (issue #150).
+/// Mirrors migration.rs's built-in [`crate::migration::KdfCost::PRODUCTION`] memory cost,
+/// kept in sync by the `migration_kdf_defaults_match_the_crypto` test. Bounded `8..=1_048_576`
+/// (8 KiB..1 GiB) — the upper bound is migration.rs's decrypt-time memory guard, so an artifact
+/// written at any in-range cost still decrypts.
+const DEFAULT_MIGRATION_KDF_MEMORY_KIB: u32 = 65_536;
+/// Default Argon2id time cost (iterations) for a written encrypted export (issue #150). Mirrors
+/// [`crate::migration::KdfCost::PRODUCTION`]'s iterations, bounded `1..=16` (the upper bound is
+/// migration.rs's decrypt-time iteration guard).
+const DEFAULT_MIGRATION_KDF_ITERATIONS: u32 = 3;
+/// The FIXED Argon2id lane count (issue #150) — NOT an operator tunable. The `argon2` crate
+/// derives single-threaded unless its rayon-backed `parallel` feature is enabled (which we
+/// avoid), so a lane count above 1 would only add cost without the intended parallel defense
+/// (see migration.rs). Threaded into every derived [`crate::migration::KdfCost`] so the config
+/// maps to the built-in production cost exactly; there is deliberately no `kdf_parallelism` key.
+const MIGRATION_KDF_PARALLELISM: u32 = 1;
+/// Default import conflict policy token (issue #150): SKIP an account already on the target
+/// (leave it untouched) unless `--overwrite`. The safe default — an import never clobbers an
+/// existing account unless the operator opts in.
+const DEFAULT_MIGRATION_CONFLICT_POLICY: &str = "skip";
+/// The valid `[migration].conflict_policy` tokens (issue #150), validated at load so a typo
+/// fails fast rather than at import-run.
+const MIGRATION_CONFLICT_POLICIES: [&str; 2] = ["skip", "overwrite"];
+
 /// The keychain service-name namespace every account's stash lives under; the
 /// full name is `Sessiometer/<account_uuid>` ([`Account::stash`]). Kept as one
 /// shared constant so the prefix has a single definition (issue #70).
@@ -425,6 +449,84 @@ impl StatsConfig {
     }
 }
 
+/// The import conflict policy (issue #150): what `import` does when an account carried in a
+/// migration artifact is already present on the target roster. The operator-facing DEFAULT
+/// lives in [`MigrationConfig::conflict_policy`]; the `--overwrite` CLI flag always forces
+/// [`Overwrite`](ConflictPolicy::Overwrite). Non-secret — a bare policy classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ConflictPolicy {
+    /// Leave an already-present account byte-for-byte untouched (its stash AND roster entry).
+    /// The safe default — an import never clobbers an existing account unless opted in.
+    #[default]
+    Skip,
+    /// Replace an already-present account's roster entry + credential stash from the artifact.
+    Overwrite,
+}
+
+impl ConflictPolicy {
+    /// The config token for this policy — the value [`Config::render`] writes and
+    /// [`Config::validate`] parses back (the `skip` | `overwrite` vocabulary).
+    fn as_str(self) -> &'static str {
+        match self {
+            ConflictPolicy::Skip => "skip",
+            ConflictPolicy::Overwrite => "overwrite",
+        }
+    }
+}
+
+/// The migration subsystem's settings (issue #150): the Argon2id KDF cost used when WRITING an
+/// encrypted `export` artifact, and the default `import` conflict policy. The operator-facing
+/// tunables for the migration verbs, mirroring `[stats]` (#161) / `[refresh]` (#105) / `[login]`
+/// (#135).
+///
+/// All keys are optional with documented, BOUNDED defaults, so a config with no `[migration]`
+/// table (or none at all) uses [`MigrationConfig::default`] — the same opt-out contract as the
+/// other blocks. Nothing here is secret: a KDF cost is a plain integer, a conflict policy a
+/// fixed vocabulary token — never an account handle, email, or token. The KDF cost bounds sit
+/// WITHIN migration.rs's decrypt-time cost guards, so an artifact written at any in-range cost
+/// still decrypts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationConfig {
+    /// Argon2id memory cost (KiB) used when `export` writes an ENCRYPTED artifact
+    /// (`8..=1_048_576`, i.e. 8 KiB..1 GiB). Higher = more resistant to offline brute-force, at
+    /// more time + memory to encrypt AND decrypt. The cost is recorded IN each artifact, so
+    /// changing it never breaks reading an already-written file (issue #146 forward-compat).
+    pub(crate) kdf_memory_kib: u32,
+    /// Argon2id time cost (iterations) used when `export` writes an encrypted artifact
+    /// (`1..=16`). The second cost knob alongside `kdf_memory_kib`; higher = slower to derive.
+    pub(crate) kdf_iterations: u32,
+    /// The default `import` conflict policy when it runs WITHOUT `--overwrite`: an account
+    /// already on the target is [`Skip`](ConflictPolicy::Skip)ped (the safe default) or
+    /// [`Overwrite`](ConflictPolicy::Overwrite)n. `--overwrite` always forces overwrite.
+    pub(crate) conflict_policy: ConflictPolicy,
+}
+
+impl Default for MigrationConfig {
+    fn default() -> Self {
+        Self {
+            kdf_memory_kib: DEFAULT_MIGRATION_KDF_MEMORY_KIB,
+            kdf_iterations: DEFAULT_MIGRATION_KDF_ITERATIONS,
+            conflict_policy: ConflictPolicy::Skip,
+        }
+    }
+}
+
+impl MigrationConfig {
+    /// The Argon2id cost this config directs `export` to derive an encrypted artifact's key at
+    /// (issue #150) — the migration-subsystem analogue of [`StatsConfig::retention_policy`]. Only
+    /// memory + time are operator-tunable; the lane count is fixed at the production
+    /// [`MIGRATION_KDF_PARALLELISM`] (the `argon2` crate is single-threaded without its `parallel`
+    /// feature, so exposing lanes would be a misleading knob). The default maps to exactly
+    /// [`crate::migration::KdfCost::PRODUCTION`], kept so by `migration_kdf_defaults_match_the_crypto`.
+    pub(crate) fn kdf_cost(&self) -> crate::migration::KdfCost {
+        crate::migration::KdfCost {
+            memory_kib: self.kdf_memory_kib,
+            iterations: self.kdf_iterations,
+            parallelism: MIGRATION_KDF_PARALLELISM,
+        }
+    }
+}
+
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -446,6 +548,10 @@ pub(crate) struct Config {
     /// offline `stats` verb's default period. The daemon derives its [`RetentionPolicy`] from
     /// this ([`StatsConfig::retention_policy`]) to compact + roll the sample store.
     pub(crate) stats: StatsConfig,
+    /// The migration subsystem's settings (issue #150): the Argon2id KDF cost `export` writes an
+    /// encrypted artifact at ([`MigrationConfig::kdf_cost`]) and the default `import` conflict
+    /// policy. Consumed by the `export` / `import` verbs, never by the daemon.
+    pub(crate) migration: MigrationConfig,
 }
 
 impl Config {
@@ -739,12 +845,37 @@ impl Config {
             default_period: s.default_period,
         };
 
+        // The migration subsystem's settings (issue #150). The KDF cost knobs are bounds-checked
+        // to sit WITHIN migration.rs's decrypt-time cost guards (memory `> 1<<20`, iterations
+        // `> 16`), so an artifact written at any in-range cost still decrypts. The conflict policy
+        // is validated against its fixed `skip|overwrite` vocabulary so a typo fails at load, not
+        // at import-run. No cross-field rules — the lane count is fixed at production (not a key).
+        let m = raw.migration;
+        range("migration.kdf_memory_kib", m.kdf_memory_kib, 8, 1_048_576)?;
+        range("migration.kdf_iterations", m.kdf_iterations, 1, 16)?;
+        let conflict_policy = match m.conflict_policy.as_str() {
+            "skip" => ConflictPolicy::Skip,
+            "overwrite" => ConflictPolicy::Overwrite,
+            _ => {
+                return Err(Error::ConfigInvalid(format!(
+                    "migration.conflict_policy must be one of {MIGRATION_CONFLICT_POLICIES:?}, got {:?}",
+                    m.conflict_policy
+                )));
+            }
+        };
+        let migration = MigrationConfig {
+            kdf_memory_kib: m.kdf_memory_kib as u32,
+            kdf_iterations: m.kdf_iterations as u32,
+            conflict_policy,
+        };
+
         Ok(Config {
             roster,
             tunables,
             refresh,
             login,
             stats,
+            migration,
         })
     }
 
@@ -947,6 +1078,35 @@ impl Config {
             basic_string(&s.default_period)
         ));
 
+        // The migration subsystem (issue #150): the Argon2id KDF cost `export` writes an
+        // encrypted artifact at, and the default `import` conflict policy. Renders after
+        // [stats], before [[account]] — the last tunables block.
+        let mi = &self.migration;
+        out.push_str("\n[migration]\n");
+        out.push_str(
+            "# Defaults for `export` / `import`. The KDF cost is recorded IN each encrypted\n\
+             # artifact, so changing it never breaks reading a file already written.\n",
+        );
+        out.push_str(
+            "# Argon2id memory cost in KiB when `export` encrypts an artifact (8..=1048576,\n\
+             # i.e. 8KiB..1GiB). Higher resists offline brute-force harder, at more time and\n\
+             # memory to encrypt AND decrypt.\n",
+        );
+        out.push_str(&format!("kdf_memory_kib = {}\n", mi.kdf_memory_kib));
+        out.push_str(
+            "# Argon2id time cost in iterations when `export` encrypts an artifact (1..=16).\n",
+        );
+        out.push_str(&format!("kdf_iterations = {}\n", mi.kdf_iterations));
+        out.push_str(
+            "# Default `import` conflict policy when --overwrite is omitted: skip (leave an\n\
+             # account already on the target untouched) | overwrite (replace it). --overwrite\n\
+             # on the command line always forces overwrite.\n",
+        );
+        out.push_str(&format!(
+            "conflict_policy = {}\n",
+            basic_string(mi.conflict_policy.as_str())
+        ));
+
         for account in &self.roster {
             out.push_str("\n[[account]]\n");
             out.push_str(&format!(
@@ -1117,6 +1277,8 @@ struct RawConfig {
     login: RawLogin,
     #[serde(default)]
     stats: RawStats,
+    #[serde(default)]
+    migration: RawMigration,
 }
 
 #[derive(Deserialize)]
@@ -1307,6 +1469,42 @@ fn default_stats_daily_retention_secs() -> i64 {
 }
 fn default_stats_period() -> String {
     DEFAULT_STATS_PERIOD.to_owned()
+}
+
+/// Permissive deserialization target for the optional `[migration]` table (issue #150): the
+/// KDF cost kept wide (`i64`) so an out-of-range value reaches [`Config::validate`] with a clear
+/// bounds message rather than a bare `serde` type error, and the conflict policy kept a `String`
+/// so an unknown token is a validation error naming the vocabulary, not a `serde` enum failure.
+/// `deny_unknown_fields` rejects a stray key as a parse error, like the other tables.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMigration {
+    #[serde(default = "default_migration_kdf_memory_kib")]
+    kdf_memory_kib: i64,
+    #[serde(default = "default_migration_kdf_iterations")]
+    kdf_iterations: i64,
+    #[serde(default = "default_migration_conflict_policy")]
+    conflict_policy: String,
+}
+
+impl Default for RawMigration {
+    fn default() -> Self {
+        Self {
+            kdf_memory_kib: default_migration_kdf_memory_kib(),
+            kdf_iterations: default_migration_kdf_iterations(),
+            conflict_policy: default_migration_conflict_policy(),
+        }
+    }
+}
+
+fn default_migration_kdf_memory_kib() -> i64 {
+    i64::from(DEFAULT_MIGRATION_KDF_MEMORY_KIB)
+}
+fn default_migration_kdf_iterations() -> i64 {
+    i64::from(DEFAULT_MIGRATION_KDF_ITERATIONS)
+}
+fn default_migration_conflict_policy() -> String {
+    DEFAULT_MIGRATION_CONFLICT_POLICY.to_owned()
 }
 
 /// Permissive deserialization of the optional `[jitter]` table (issue #38): each
@@ -1627,6 +1825,8 @@ label = "personal"
         assert_eq!(original.refresh, reparsed.refresh);
         // …and the (default) [login] settings (issue #135).
         assert_eq!(original.login, reparsed.login);
+        // …and the (default) [migration] settings (issue #150).
+        assert_eq!(original.migration, reparsed.migration);
     }
 
     // --- [refresh] schedule (issue #105) ------------------------------------
@@ -2375,5 +2575,152 @@ label = "personal"
                 .daily_window_secs,
             0
         );
+    }
+
+    // --- [migration] block (issue #150) -------------------------------------
+
+    #[test]
+    fn migration_defaults_when_the_table_is_absent() {
+        // A config with no `[migration]` table (VALID has none) loads the documented defaults —
+        // the same opt-out contract as `[stats]` / `[refresh]` / `[login]`.
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.migration, MigrationConfig::default());
+        assert_eq!(config.migration.kdf_memory_kib, 65_536);
+        assert_eq!(config.migration.kdf_iterations, 3);
+        assert_eq!(config.migration.conflict_policy, ConflictPolicy::Skip);
+    }
+
+    #[test]
+    fn parses_a_full_migration_override() {
+        // Every key set to a non-default the operator chose, all within bounds.
+        let toml = format!(
+            "{VALID}\n[migration]\n\
+             kdf_memory_kib = 131072\n\
+             kdf_iterations = 4\n\
+             conflict_policy = \"overwrite\"\n"
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.migration,
+            MigrationConfig {
+                kdf_memory_kib: 131_072,
+                kdf_iterations: 4,
+                conflict_policy: ConflictPolicy::Overwrite,
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_migration_table_fills_only_named_keys() {
+        // Like the other blocks, a partial table sets only the named key; the rest default.
+        let toml = format!("{VALID}\n[migration]\nconflict_policy = \"overwrite\"\n");
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.migration.conflict_policy, ConflictPolicy::Overwrite);
+        assert_eq!(config.migration.kdf_memory_kib, 65_536); // untouched → default
+        assert_eq!(config.migration.kdf_iterations, 3);
+    }
+
+    #[test]
+    fn rendered_default_config_round_trips_the_migration_block() {
+        // The rendered default config carries a `[migration]` block that reparses to the same
+        // settings — the render → parse round-trip the other blocks hold to.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(
+            text.contains("[migration]"),
+            "render must emit [migration]: {text}"
+        );
+        assert!(
+            text.contains("kdf_memory_kib ="),
+            "render must document the KDF cost: {text}"
+        );
+        assert!(
+            text.contains("conflict_policy ="),
+            "render must document the conflict policy: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.migration, config.migration);
+    }
+
+    #[test]
+    fn rendered_migration_round_trips_operator_overrides() {
+        // Operator-set non-defaults survive render → parse unchanged (defaults + overrides, the
+        // issue's round-trip AC). Uses the exact range bounds to prove they render/reparse.
+        let mut config = Config::parse(VALID).unwrap();
+        config.migration = MigrationConfig {
+            kdf_memory_kib: 1_048_576, // the upper bound
+            kdf_iterations: 16,        // the upper bound
+            conflict_policy: ConflictPolicy::Overwrite,
+        };
+        let text = config.render();
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.migration, config.migration);
+
+        // …and the lower bounds round-trip too.
+        config.migration = MigrationConfig {
+            kdf_memory_kib: 8,
+            kdf_iterations: 1,
+            conflict_policy: ConflictPolicy::Skip,
+        };
+        let reparsed = Config::parse(&config.render()).unwrap();
+        assert_eq!(reparsed.migration, config.migration);
+    }
+
+    #[test]
+    fn rejects_each_out_of_range_migration_kdf_cost() {
+        for (key, value) in [
+            ("kdf_memory_kib", "7"),       // below the 8 KiB floor
+            ("kdf_memory_kib", "1048577"), // above the 1 GiB decrypt-time guard
+            ("kdf_iterations", "0"),       // below 1
+            ("kdf_iterations", "17"),      // above the 16 decrypt-time guard
+        ] {
+            let toml = format!("{VALID}\n[migration]\n{key} = {value}\n");
+            assert!(
+                matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
+                "migration.{key} = {value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_migration_conflict_policy() {
+        let toml = format!("{VALID}\n[migration]\nconflict_policy = \"merge\"\n");
+        assert!(matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))));
+    }
+
+    #[test]
+    fn rejects_an_unknown_migration_key() {
+        // `deny_unknown_fields` rejects a stray key as a parse error, like the other tables. In
+        // particular there is deliberately no `kdf_parallelism` key (lanes are fixed).
+        let toml = format!("{VALID}\n[migration]\nkdf_parallelism = 2\n");
+        assert!(matches!(Config::parse(&toml), Err(Error::ConfigParse(_))));
+    }
+
+    #[test]
+    fn migration_kdf_defaults_match_the_crypto() {
+        // The `[migration]` KDF defaults are the operator-facing source of truth for the cost
+        // `export` derives an encrypted artifact's key at — so the default `[migration]` maps to
+        // exactly migration.rs's built-in production cost (`KdfCost::PRODUCTION`). Guards the two
+        // from drifting apart (the sibling of `stats_defaults_match_the_store_retention_policy`).
+        assert_eq!(
+            MigrationConfig::default().kdf_cost(),
+            crate::migration::KdfCost::PRODUCTION
+        );
+    }
+
+    #[test]
+    fn migration_kdf_cost_maps_memory_and_time_and_fixes_parallelism() {
+        // The operator's memory + time knobs thread into the derived cost; the lane count is
+        // fixed at the production 1 (not a config key), so `export` maps to a valid single-lane
+        // Argon2id cost regardless of the operator's memory/time choice.
+        let migration = MigrationConfig {
+            kdf_memory_kib: 131_072,
+            kdf_iterations: 5,
+            conflict_policy: ConflictPolicy::Skip,
+        };
+        let cost = migration.kdf_cost();
+        assert_eq!(cost.memory_kib, 131_072);
+        assert_eq!(cost.iterations, 5);
+        assert_eq!(cost.parallelism, 1, "the lane count is fixed at production");
     }
 }
