@@ -330,6 +330,13 @@ pub(crate) async fn login_account(
     // re-checks the same gate — that is the hermetically-tested contract.
     require_tty(std::io::stdout().is_terminal())?;
 
+    // Reap a prior crashed login's stranded isolated item + dir (issue #133) BEFORE starting a fresh
+    // capture — the login-start half of the reaper folded into the daemon startup reaper (#103).
+    // `create_isolated_dir` below already clears a stale DIR, but not the orphaned keychain ITEM;
+    // this sweeps both, so a fresh login never runs beside a leftover credential-bearing orphan.
+    // Best-effort — never blocks the login.
+    crate::refresh::reap_login_orphan().await;
+
     let iso_dir = paths::isolated_login_dir()?;
     let binary = paths::claude_binary_with_override(config_bin)?;
     let shared_store = RealCredentialStore::new();

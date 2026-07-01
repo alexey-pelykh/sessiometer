@@ -249,6 +249,11 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         .map(|account| account.account_uuid.clone())
         .collect();
     refresh::reap_orphans(&roster_uuids).await;
+    // …and the login isolation root (issue #133): a crashed `claude /login` (SIGKILL / power-loss —
+    // no RAII teardown) can strand a credential-bearing isolated item + dir under `<support>/login`.
+    // Folded in beside the roster reap under the same single-instance lock (no login is in flight),
+    // scan-based (the fixed login dir is not roster-keyed). Best-effort — never blocks daemon start.
+    refresh::reap_login_orphan().await;
 
     // The periodic isolated-refresh tick (issue #105): opt-in, driven from `run_loop`'s idle
     // path off the poll→usage→swap seam. Resolve the spawn binary ONLY when enabled — a
