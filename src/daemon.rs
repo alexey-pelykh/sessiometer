@@ -62,10 +62,12 @@
 //! daemon would rotate to next, #88) is computed here, and every swap /
 //! all-exhausted / token-rejection / lock-wait is recorded to the structured event
 //! log (#9, via
-//! [`crate::observability`]). The post-swap cooldown that bounds oscillation (#10)
-//! is wired into the decision below — a re-swap is refused until the per-cycle
-//! jittered cooldown has elapsed, and the swap-target session floor is opt-in (off
-//! by default). When EVERY account is weekly-exhausted there is no viable target
+//! [`crate::observability`]). Oscillation is prevented at its source by the always-on
+//! session gate (a session-saturated account is never a swap target, mirroring the
+//! weekly-exhaustion exclusion); the post-swap cooldown (#10) additionally PACES swaps
+//! — a re-swap is refused until the per-cycle jittered cooldown has elapsed — and the
+//! swap-target session floor is an opt-in reserve on top (off by default). When EVERY
+//! account is weekly-exhausted there is no viable target
 //! ([`TickAction::NoViableTarget`], #11): the loop enters the all-exhausted
 //! terminal state — it HOLDS (no swap, so no thrash) and emits a single
 //! edge-triggered `all_exhausted` event naming the least-bad account (the soonest
@@ -81,7 +83,7 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::claude_state;
-use crate::config::{Account, Tunables};
+use crate::config::{Account, Config, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
@@ -287,6 +289,15 @@ pub(crate) enum ControlSignal {
     /// cooldown-only signal — it carries no credential and no write target, and
     /// never becomes a write command.
     ManualSwapped,
+    /// A roster write on disk (`capture` / `login` / `remove`) committed and notified
+    /// the daemon (issue #139). The run loop reloads it
+    /// ([`Daemon::adopt_roster_reload`]): re-read `config.toml` and reconcile the
+    /// in-memory roster (add onboarded/relogged-in accounts, drop removed ones),
+    /// preserving per-account health/decision state for accounts that persist. Like
+    /// [`ManualSwapped`](ControlSignal::ManualSwapped) it carries no payload — the
+    /// authoritative new roster is the on-disk `config.toml`, re-read from scratch — so
+    /// a duplicate or out-of-order notification at worst re-reads an unchanged file.
+    RosterReloadRequested,
 }
 
 /// Control seam: serve control-socket connections. The production impl
@@ -786,6 +797,20 @@ fn control_reply(
                 (r#"{"error":"unauthorized"}"#.to_owned(), None)
             }
         }
+        // `roster-reload` (issue #139) is state-affecting — it makes the daemon adopt a
+        // new on-disk roster — so, like `manual-swapped`, it is honored ONLY for an
+        // authenticated same-user peer; an unauthenticated one gets an error and
+        // produces NO signal (a stranger can never make the daemon re-read its config).
+        Ok(request) if request.cmd == "roster-reload" => {
+            if peer_authenticated {
+                (
+                    r#"{"ok":true}"#.to_owned(),
+                    Some(ControlSignal::RosterReloadRequested),
+                )
+            } else {
+                (r#"{"error":"unauthorized"}"#.to_owned(), None)
+            }
+        }
         Ok(_) => (r#"{"error":"unknown command"}"#.to_owned(), None),
         Err(_) => (r#"{"error":"malformed request"}"#.to_owned(), None),
     }
@@ -843,6 +868,50 @@ where
         Ok(result) => result,
         Err(_elapsed) => Ok(None),
     }
+}
+
+/// Upper bound on the client-side `roster-reload` notify exchange (issue #139) — the
+/// CLI-verb counterpart of the server's [`CONTROL_EXCHANGE_TIMEOUT`]. Mirrors the
+/// `use`-side manual-hold notify (#64): a missing / wedged daemon must never hang the
+/// `capture` / `login` / `remove` verb, so the whole connect→send→ack exchange is
+/// time-boxed and any failure degrades to a logged best-effort skip.
+const ROSTER_RELOAD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Notify a running daemon that the on-disk roster changed (issue #139), so it
+/// re-reads `config.toml` and reconciles its in-memory rotation WITHOUT a restart.
+/// The CLI-verb counterpart of the daemon's `roster-reload` control handler
+/// ([`control_reply`]); sends one newline-delimited `{"cmd":"roster-reload"}` request
+/// and reads the one-line ack so the daemon has RECEIVED it before returning.
+///
+/// BEST-EFFORT by contract, exactly like the `use` manual-hold notify (#64): the
+/// on-disk `config.toml` is authoritative (the write already succeeded), so a notify
+/// failure — no daemon running (connect refused / socket absent), a timeout, an I/O
+/// error — is for the CALLER to log and ignore, never fatal. Bounded by
+/// [`ROSTER_RELOAD_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
+/// verb. Carries NO credential and NO write target — a pure reload signal (the daemon
+/// re-reads the authoritative file itself).
+pub(crate) async fn notify_roster_reload(socket: &Path) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket).await?;
+        let mut buffered = tokio::io::BufReader::new(stream);
+        buffered.write_all(b"{\"cmd\":\"roster-reload\"}\n").await?;
+        buffered.flush().await?;
+        // Read the one-line ack so the daemon has processed the request before we
+        // return; the content is irrelevant (any failure is non-fatal for the caller).
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        Ok::<(), Error>(())
+    };
+    tokio::time::timeout(ROSTER_RELOAD_NOTIFY_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "roster-reload notify timed out",
+            ))
+        })?
 }
 
 /// What the loop decided to do this cycle — logged, and asserted on in tests.
@@ -1027,9 +1096,11 @@ struct DecisionState {
     /// swap. `None` until first resolved (then the loop polls but never swaps).
     active: Option<usize>,
     /// The last swap performed, or `None` until the first. Drives the post-swap
-    /// cooldown (anti-oscillation, #10): a re-swap is refused until this cycle's
-    /// jittered `cooldown` has elapsed since this swap, so two near-exhausted accounts
-    /// cannot ping-pong. (The forward-looking `status` candidate is #88's `next_swap`,
+    /// cooldown (#10): a re-swap is refused until this cycle's jittered `cooldown` has
+    /// elapsed since this swap, PACING swaps — it does not by itself prevent a ping-pong
+    /// with a persistent cause; the always-on session gate in `pick_target` is what
+    /// prevents two session-saturated accounts from oscillating. (The forward-looking
+    /// `status` candidate is #88's `next_swap`,
     /// computed fresh from readings — not this record.)
     last_swap: Option<LastSwap>,
     /// Per-account health carried across ticks (issue #42), indexed by roster
@@ -1133,11 +1204,19 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// verdict (issue #72) must be deterministic and match the user-facing
     /// viability rule, so it keys off this base, not a per-cycle draw.
     weekly_trigger_base: f64,
+    /// Base SESSION swap-away threshold as a fraction (`session_trigger / 100`),
+    /// un-jittered — the session-dimension counterpart of [`Self::weekly_trigger_base`].
+    /// The always-on session anti-thrash gate in [`pick_target`] keys off this on the
+    /// deterministic display paths ([`Self::next_swap`], [`Self::refresh_exclusions`]),
+    /// so the "next swap" candidate never flickers with per-cycle session-trigger
+    /// jitter; the live swap path (`decide_action`) uses the per-cycle drawn trigger.
+    session_trigger_base: f64,
     /// Opt-in swap-target session guard (#10): `Some(fraction)` only swaps TO an
     /// account whose session usage is below it (`session_floor / 100`); `None` (the
     /// default) disables the guard, leaving target choice to the soonest-reset rule
-    /// alone (issue #37) — the configuration under which the cooldown alone bounds
-    /// oscillation.
+    /// (issue #37) constrained by the always-on session gate (`session < session_trigger`)
+    /// — which is what prevents session-saturated oscillation; the floor is a STRICTER
+    /// reserve layered on top.
     session_floor: Option<f64>,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `0..=3600` s each cycle. Replaces
@@ -1164,6 +1243,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// swap routes through [`swap::swap_locked`] and a contended acquire defers the
     /// swap (fail-closed) rather than risk a torn write.
     swap_lock_path: Option<PathBuf>,
+    /// The `config.toml` path re-read on a runtime roster-reload (issue #139), or
+    /// `None` to disable the reload (the hermetic-test default — a test with no
+    /// on-disk config wires the pure [`reconcile_roster`](Self::reconcile_roster)
+    /// directly instead). Production sets the real [`crate::paths::config_file`] via
+    /// [`with_config_path`](Self::with_config_path); when `None`, an inbound
+    /// `roster-reload` signal is a logged best-effort no-op (there is nothing to read).
+    config_path: Option<PathBuf>,
     state: DecisionState,
 }
 
@@ -1202,6 +1288,7 @@ where
             // deterministic threshold the `status` `weekly_exhausted` verdict keys
             // off (issue #72), NOT the per-cycle jittered swap-decision draw.
             weekly_trigger_base: f64::from(tunables.weekly_trigger) / 100.0,
+            session_trigger_base: f64::from(tunables.session_trigger) / 100.0,
             session_floor: tunables.session_floor.map(|floor| f64::from(floor) / 100.0),
             cooldown_strategy: tunables.cooldown_strategy,
             poll_strategy: tunables.poll_strategy,
@@ -1211,6 +1298,9 @@ where
             // No cross-process swap lock by default; production opts in via
             // `with_swap_lock`. See the field's docs for why tests stay lock-free.
             swap_lock_path: None,
+            // No runtime roster-reload by default (issue #139); production opts in via
+            // `with_config_path`. A hermetic test drives `reconcile_roster` directly.
+            config_path: None,
             state: DecisionState {
                 health,
                 last_readings,
@@ -1227,6 +1317,17 @@ where
     /// to mirror `with_seed` and keep `new`'s 7 args stable.
     pub(crate) fn with_swap_lock(mut self, path: PathBuf) -> Self {
         self.swap_lock_path = Some(path);
+        self
+    }
+
+    /// Wire the `config.toml` path re-read on a runtime roster-reload (issue #139):
+    /// an inbound `roster-reload` control signal then re-reads this file and
+    /// reconciles the in-memory roster. Production sets the real
+    /// [`crate::paths::config_file`]; a test may point it at a throwaway file it rewrites
+    /// mid-run to drive the reload end-to-end. Builder-style to mirror `with_swap_lock`
+    /// / `with_seed` and keep `new`'s args stable.
+    pub(crate) fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
         self
     }
 
@@ -1884,9 +1985,11 @@ where
         if !self.state.warmed_up {
             return TickAction::Held;
         }
-        // Over the trigger. Cooldown (anti-oscillation, #10): refuse a re-swap
-        // until this cycle's (jittered) cooldown has elapsed since the last swap,
-        // so two near-exhausted accounts cannot ping-pong.
+        // Over the trigger. Cooldown (#10): refuse a re-swap until this cycle's
+        // (jittered) cooldown has elapsed since the last swap. This PACES swaps; it
+        // cannot by itself stop a ping-pong with a persistent cause — the always-on
+        // session gate in `pick_target` is what prevents two session-saturated accounts
+        // from oscillating (it excludes each as a target of the other).
         let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
             &mut self.rng,
             COOLDOWN_SECS_LO,
@@ -1908,14 +2011,18 @@ where
             readings,
             &self.enabled_mask(),
             self.session_floor,
+            session_trigger,
             weekly_trigger,
         ) else {
-            // No viable target — every other account is weekly-exhausted (or, with
-            // the opt-in floor enabled, over it). The all-exhausted TERMINAL state
-            // (issue #11): HOLD, do NOT swap (swapping among exhausted accounts only
-            // thrashes), and emit ONE edge-triggered signal naming the least-bad
-            // account — the one whose weekly window resets soonest, so the operator
-            // knows when relief arrives. The active account is left exactly as is.
+            // No viable target — every other account is weekly-exhausted, session-
+            // saturated (over the always-on session gate), or over the opt-in floor.
+            // The all-exhausted TERMINAL state (issue #11): HOLD, do NOT swap (swapping
+            // among exhausted accounts only thrashes), and emit ONE edge-triggered
+            // signal naming the least-bad account by soonest weekly reset, so the
+            // operator knows when relief arrives. (For the session-saturated case relief
+            // actually arrives at the sooner SESSION reset; keying the hint off session
+            // when the block is session-wide is a follow-up — the minimal gate keeps the
+            // existing weekly-reset hint.) The active account is left exactly as is.
             // The signal is edge-triggered: emit only on ENTERING the state, so the
             // payload is computed once per episode, not every poll while it holds.
             if !self.state.signaled_all_exhausted {
@@ -2095,6 +2202,118 @@ where
         self.state.last_swap = Some(LastSwap { at });
     }
 
+    /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
+    ///
+    /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
+    /// on disk and notified us; re-read that authoritative file and reconcile the
+    /// in-memory roster to it via [`reconcile_roster`](Self::reconcile_roster).
+    /// BEST-EFFORT by contract, mirroring [`adopt_manual_swap`](Self::adopt_manual_swap):
+    /// the on-disk file is authoritative, so a read failure — a malformed or briefly
+    /// absent file — leaves the current in-memory roster INTACT and is logged, never
+    /// fatal. A torn/partial read cannot occur: `Config::save` writes a temp file and
+    /// `rename`s it over `config.toml` atomically, so this read observes either the
+    /// whole old or the whole new file (issue #139 acceptance). A `None` `config_path`
+    /// (the hermetic-test default) is a silent no-op.
+    ///
+    /// No lock is taken: the run loop drives `tick`, the control serve, and this
+    /// adoption on a SINGLE task, so no daemon swap can interleave with the reconcile;
+    /// and `config.toml` is written only by the CLI verbs (never by a daemon swap,
+    /// which touches the keychain + `~/.claude.json`), so the re-read races nothing the
+    /// daemon itself writes.
+    async fn adopt_roster_reload(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return; // reload disabled (no config path wired) — nothing to do.
+        };
+        match Config::load_path(&path) {
+            Ok(config) => self.reconcile_roster(config.roster),
+            // Best-effort: keep the current in-memory roster on any read/parse failure
+            // (a transient absent file, or a malformed edit) rather than dropping the
+            // rotation. The next reload notification re-attempts.
+            Err(err) => eprintln!("sessiometer: roster-reload skipped: {err}"),
+        }
+    }
+
+    /// Reconcile the in-memory roster (and its per-account decision state) to
+    /// `new_roster` — the pure core of the runtime roster-reload (issue #139),
+    /// hermetically testable with no I/O.
+    ///
+    /// Accounts are matched by the immutable `account_uuid` (never by roster position,
+    /// which shifts as accounts are added/removed):
+    ///   - an account present in BOTH keeps its carried per-account state — health
+    ///     (#42 quarantine/recovery streaks), the last-known usage reading (#80) and
+    ///     the `polled_once` warm-up flag — so a `capture`/`login`/`remove` of ANOTHER
+    ///     account never resets a healthy account's decision state;
+    ///   - an account NEW on disk (an onboard, or a relogin of one never rostered) is
+    ///     appended with DEFAULT state (unpolled, no reading, healthy) — it joins the
+    ///     rotation and is polled on subsequent ticks, becoming a swap target only once
+    ///     it has a reading;
+    ///   - an account GONE from disk (a `remove`) is dropped along with its state.
+    ///
+    /// The active account is re-resolved by `account_uuid`: it keeps its (possibly
+    /// shifted) new index when it persists, or becomes `None` when it was removed — the
+    /// next [`tick`](Self::tick) then re-resolves active from the canonical credential,
+    /// or polls-without-swapping if the active account is no longer rostered. The
+    /// staggered poll schedule (#80) is reset (its entries were OLD roster indices);
+    /// [`next_poll_index`](Self::next_poll_index) rebuilds it at the next cycle start.
+    /// The warm-up latch (#80) is left as-is: once warmed up, a freshly-onboarded
+    /// unpolled account is simply not yet a swap target (it has no reading), so it need
+    /// not re-gate the whole rotation. State NOT indexed by roster position — the
+    /// cooldown (#10), the canonical watch (#13), the tick counter — is deliberately
+    /// untouched: a roster change is not a swap and must not re-arm or clear them.
+    fn reconcile_roster(&mut self, new_roster: Vec<Account>) {
+        // Capture the active account's identity from the CURRENT roster before it is
+        // replaced, so active can be re-resolved by uuid against the new roster.
+        let active_uuid = self
+            .state
+            .active
+            .and_then(|i| self.roster.get(i))
+            .map(|account| account.account_uuid.clone());
+
+        // Re-key each account's carried decision state by uuid: preserve it for an
+        // account that persists, default it for a newly-onboarded one. (Rosters are a
+        // handful of accounts, so the per-account `position` scan is inconsequential.)
+        let mut health = Vec::with_capacity(new_roster.len());
+        let mut last_readings = Vec::with_capacity(new_roster.len());
+        let mut polled_once = Vec::with_capacity(new_roster.len());
+        for account in &new_roster {
+            match self
+                .roster
+                .iter()
+                .position(|old| old.account_uuid == account.account_uuid)
+            {
+                Some(old_idx) => {
+                    health.push(self.state.health[old_idx].clone());
+                    last_readings.push(self.state.last_readings[old_idx]);
+                    polled_once.push(self.state.polled_once[old_idx]);
+                }
+                None => {
+                    health.push(AccountHealth::default());
+                    last_readings.push(None);
+                    polled_once.push(false);
+                }
+            }
+        }
+
+        // Re-resolve active by uuid: kept (its new index) if it persists, else `None`.
+        let active = active_uuid.and_then(|uuid| {
+            new_roster
+                .iter()
+                .position(|account| account.account_uuid == uuid)
+        });
+
+        // Commit the reconciled roster + parallel state together, so no tick ever
+        // observes a roster/state length mismatch.
+        self.roster = new_roster;
+        self.state.health = health;
+        self.state.last_readings = last_readings;
+        self.state.polled_once = polled_once;
+        self.state.active = active;
+        // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
+        // fresh one (active-first, then enabled non-quarantined) at the next cycle start.
+        self.state.poll_schedule.clear();
+        self.state.poll_pos = 0;
+    }
+
     /// Emergency-swap away from a confirmed-DEAD active account (issue #42): the live
     /// session is blocked, so rotate to the soonest-reset viable target IMMEDIATELY —
     /// bypassing the swap-away trigger and the post-swap cooldown that gate a normal
@@ -2102,7 +2321,9 @@ where
     /// account, and a quarantined account is never itself a viable target (it is
     /// skipped in polling, so its reading is absent), so there is no ping-pong.
     /// `pick_target` (the #37 soonest-reset rule) still excludes disabled and
-    /// weekly-exhausted accounts; with no viable target the daemon holds on the dead
+    /// weekly-exhausted accounts, but its always-on session gate is bypassed here
+    /// (`f64::INFINITY`) — liveness beats session headroom when the active is dead;
+    /// with no viable target the daemon holds on the dead
     /// active ([`TickAction::ActiveDeadNoTarget`]) — the `CredentialDead` signal
     /// already fired, so this stuck state is silent (no repeat-spam).
     async fn emergency_swap(
@@ -2126,6 +2347,15 @@ where
             readings,
             &self.enabled_mask(),
             self.session_floor,
+            // No always-on session gate on the emergency path: the active credential is
+            // DEAD, so liveness beats optimality — escape to a live account even if it is
+            // over the session trigger. (An opt-in `session_floor`, passed just above, is
+            // still honored: a configured reserve is not breached even in the emergency;
+            // with the default floor OFF, any live account qualifies.) This cannot
+            // ping-pong: the dead active is quarantined (never a viable target), and once
+            // a session-fresh target exists the normal path's session gate moves off the
+            // saturated account cleanly.
+            f64::INFINITY,
             weekly_trigger,
         ) else {
             return TickAction::ActiveDeadNoTarget;
@@ -2155,11 +2385,12 @@ where
     /// who [`pick_target`] would choose right now, or why there is no candidate. THE
     /// candidate is computed daemon-side — the CLI never re-derives the selection rule
     /// (it cannot: the wire carries only rounded percents, not the raw `Usage` /
-    /// `session_floor` / `weekly_trigger` `pick_target` consumes). Uses the BASE
-    /// (un-jittered) weekly trigger [`Self::weekly_trigger_base`] — the same threshold
-    /// the snapshot's per-account `weekly_exhausted` flag keys off — so the candidate
-    /// and the displayed exhaustion state can never disagree, and the candidate does
-    /// not flicker with the per-cycle swap-decision jitter.
+    /// `session_floor` / triggers `pick_target` consumes). Uses the BASE (un-jittered)
+    /// session and weekly triggers ([`Self::session_trigger_base`],
+    /// [`Self::weekly_trigger_base`]) — the same thresholds the snapshot's per-account
+    /// exhaustion flags key off — so the candidate and the displayed exhaustion state
+    /// can never disagree, and the candidate does not flicker with the per-cycle
+    /// swap-decision jitter.
     ///
     /// `None` only when there is no active account to swap FROM (no anchor). Otherwise
     /// the three cases mirror `pick_target`'s verdict: a viable [`NextSwap::Target`]; a
@@ -2175,6 +2406,7 @@ where
             readings,
             &enabled,
             self.session_floor,
+            self.session_trigger_base,
             self.weekly_trigger_base,
         ) {
             return Some(NextSwap::Target {
@@ -2246,6 +2478,7 @@ where
                 &readings,
                 &enabled,
                 self.session_floor,
+                self.session_trigger_base,
                 self.weekly_trigger_base,
             ) {
                 excluded.push(self.roster[target].account_uuid.clone());
@@ -2632,9 +2865,10 @@ fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
 
 /// Pick the viable swap target whose weekly window resets SOONEST (issue #37):
 /// among accounts other than `active` that are enabled (issue #36), whose reading
-/// is available, that are NOT weekly-exhausted (weekly usage below `weekly_trigger`,
+/// is available, that are NOT session-saturated (session usage below
+/// `session_trigger`) and NOT weekly-exhausted (weekly usage below `weekly_trigger`,
 /// issue #11) — and, when the opt-in `floor` is `Some`, whose session usage is
-/// below it (#10) — the one with the earliest weekly `resets_at`. An account with a
+/// below it too (#10) — the one with the earliest weekly `resets_at`. An account with a
 /// known reset is preferred over one without (an unknown reset sorts last); an
 /// exact tie — or an all-unknown field — keeps the earliest roster index. `None`
 /// when none qualifies: with every enabled other account weekly-exhausted that is
@@ -2654,18 +2888,32 @@ fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
 /// hold then omits a timestamp). The viability FILTER is unchanged; only the choice
 /// AMONG viable accounts changed.
 ///
-/// Two exclusions are load-bearing. The weekly-exhaustion exclusion: a target
-/// at/above its weekly trigger would re-trip [`swap::decide`] next cycle and
-/// thrash, so it can never be a useful destination — excluding it is what turns
-/// "all enabled accounts weekly-exhausted" into a no-viable-target verdict instead
-/// of a swap. The disabled exclusion (#36): a parked account is never a destination
-/// even with ample headroom, and — being excluded here rather than relying on its
-/// (skipped) poll — it can never hold the daemon out of the #11 terminal state.
+/// Three exclusions are load-bearing; two are the symmetric anti-thrash guards.
+/// The weekly-exhaustion exclusion (#11): a target at/above its weekly trigger
+/// would re-trip [`swap::decide`]'s weekly dimension next cycle and thrash, so it
+/// can never be a useful destination — excluding it is what turns "all enabled
+/// accounts weekly-exhausted" into a no-viable-target verdict instead of a swap.
+/// The session-saturation exclusion is its exact mirror on the OTHER trigger
+/// dimension: [`swap::decide`] swaps away on `session >= session_trigger` OR
+/// `weekly >= weekly_trigger`, so a target at/above EITHER trigger re-trips next
+/// cycle. Guarding only weekly left a session-saturated but weekly-viable account
+/// eligible, and the soonest-reset rule — anti-correlated with session headroom,
+/// since the account nearest its weekly reset is the most-cycled one — would pick
+/// exactly such a target, producing an indefinite session ping-pong between the two
+/// soonest-reset accounts. The `session < session_trigger` filter closes that: the
+/// acquire predicate is now at least as strict as the negation of the release
+/// predicate on BOTH dimensions. It is always-on, distinct from the opt-in `floor`
+/// (#10) — a STRICTER reserve layered on top (effective ceiling
+/// `min(session_trigger, floor)`). The disabled exclusion (#36): a parked account
+/// is never a destination even with ample headroom, and — being excluded here
+/// rather than relying on its (skipped) poll — it can never hold the daemon out of
+/// the #11 terminal state.
 fn pick_target(
     active: usize,
     readings: &[Option<Usage>],
     enabled: &[bool],
     floor: Option<f64>,
+    session_trigger: f64,
     weekly_trigger: f64,
 ) -> Option<usize> {
     readings
@@ -2675,6 +2923,11 @@ fn pick_target(
         .filter(|&(i, _)| enabled[i])
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
         .filter(|&(_, usage)| usage.weekly < weekly_trigger)
+        // Always-on session anti-thrash gate: exclude a target at/above the session
+        // trigger — it would immediately re-trip [`swap::decide`]'s session dimension
+        // and thrash (the exact mirror of the weekly filter above). Distinct from the
+        // opt-in `floor` below, which tightens this ceiling further when set.
+        .filter(|&(_, usage)| usage.session < session_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
         // unknown one (`false` < `true`), then by the reset epoch ascending;
@@ -2788,6 +3041,9 @@ where
         Elapsed,
         /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
         ManualSwapped,
+        /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
+        /// — reload + reconcile the in-memory roster, then re-tick.
+        RosterReloadRequested,
     }
 
     // De-burst start-up (issue #76): wait a small jittered delay before the FIRST
@@ -2867,6 +3123,12 @@ where
                     // (None) just continues serving until the wait elapses.
                     signal = control.serve(&snapshot) => match signal {
                         Some(ControlSignal::ManualSwapped) => break Idle::ManualSwapped,
+                        // A `roster-reload` (#139) breaks the idle to reconcile the
+                        // in-memory roster to the freshly-written config; a `status`
+                        // read (None) just continues serving until the wait elapses.
+                        Some(ControlSignal::RosterReloadRequested) => {
+                            break Idle::RosterReloadRequested
+                        }
                         None => continue,
                     },
                     // The periodic isolated-refresh tick (issue #105), in the idle path off
@@ -2940,6 +3202,10 @@ where
             // holds on the operator's choice, and re-resolve active from the
             // canonical — BEFORE looping back to re-tick.
             Idle::ManualSwapped => daemon.adopt_manual_swap().await,
+            // Reload + reconcile the in-memory roster to the freshly-written
+            // `config.toml` (#139) — the onboarded / relogged-in / removed account is
+            // adopted into the live rotation — BEFORE looping back to re-tick.
+            Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
             Idle::Elapsed => {}
         }
     }
@@ -3260,6 +3526,33 @@ mod tests {
         }
     }
 
+    /// A control seam that yields `RosterReloadRequested` exactly once, then never
+    /// resolves (issue #139) — so the run loop reloads the roster on its first idle,
+    /// then idles normally on every later poll. The roster-reload analog of
+    /// [`OnceManualSwap`]: drives the live `Idle::RosterReloadRequested =>
+    /// adopt_roster_reload` wiring that `NoControl` never does.
+    struct OnceRosterReload {
+        fired: Cell<bool>,
+    }
+
+    impl OnceRosterReload {
+        fn new() -> Self {
+            Self {
+                fired: Cell::new(false),
+            }
+        }
+    }
+
+    impl Control for OnceRosterReload {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                Some(ControlSignal::RosterReloadRequested)
+            }
+        }
+    }
+
     // --- builders ----------------------------------------------------------
 
     fn account(uuid: &str, label: &str) -> Account {
@@ -3367,6 +3660,22 @@ mod tests {
 
     type FakeDaemon = Daemon<FakeRosterPoller, FakeCredentialStore, FakeAccountStash, FakeClock>;
 
+    /// Write a minimal valid `config.toml` at `path` carrying `accounts` as `(uuid,
+    /// label)` pairs — the on-disk fixture the runtime roster-reload (#139) re-reads.
+    /// Tunables are omitted (they default via `#[serde(default)]`), so this exercises
+    /// the exact `Config::load_path` path `adopt_roster_reload` takes. Written in one
+    /// `std::fs::write`, so a reader sees a complete file (production's atomic rename
+    /// gives the same all-or-nothing guarantee).
+    fn write_roster_config(path: &Path, accounts: &[(&str, &str)]) {
+        let mut toml = String::new();
+        for (uuid, label) in accounts {
+            toml.push_str(&format!(
+                "[[account]]\naccount_uuid = \"{uuid}\"\nlabel = \"{label}\"\nenabled = true\n\n"
+            ));
+        }
+        std::fs::write(path, toml).unwrap();
+    }
+
     /// Drive the staggered daemon (issue #80) through one full warm-up cycle — one
     /// tick per in-rotation account — and return the LAST tick's outcome. By then
     /// every account has a fresh last-known reading and the warm-up latch is set, so
@@ -3396,6 +3705,12 @@ mod tests {
     // the weekly-exhaustion exclusion (#11) is a no-op for the ones that pin the
     // floor / selection behavior; the #11 tests use readings at/above it.
     const WK: f64 = 0.98;
+
+    // A session trigger matching the default (`DEFAULT_SESSION_TRIGGER`), for the
+    // always-on session anti-thrash gate. The selection/floor tests below keep every
+    // viable winner's session below it, so the gate is a no-op for them; the dedicated
+    // `pick_target_excludes_session_saturated_accounts` test exercises it.
+    const SESS: f64 = 0.95;
 
     /// An all-enabled flag slice sized to `readings` (issue #36): the pre-#36
     /// pick_target tests pin the floor / selection / weekly-exhaustion behavior with
@@ -3437,7 +3752,7 @@ mod tests {
         // Index 1 (reset 200) beats the most-headroom index 2 (reset 500); index 0 is
         // active and index 3 fails the floor, so neither earlier reset is eligible.
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
             Some(1)
         );
     }
@@ -3460,7 +3775,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
             Some(2)
         );
     }
@@ -3488,7 +3803,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
             None
         );
     }
@@ -3519,7 +3834,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
             Some(1)
         );
     }
@@ -3550,7 +3865,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
             Some(2)
         );
     }
@@ -3581,16 +3896,54 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
             Some(1)
         );
     }
 
     #[test]
-    fn pick_target_with_no_floor_admits_any_available_other() {
-        // #10: with the session floor OFF (None), an account is a viable target on
-        // its reset alone — even one whose session usage is high (which an enabled
-        // floor would exclude).
+    fn pick_target_excludes_session_saturated_accounts() {
+        // The session-dimension mirror of #11's weekly exclusion: an account at/above
+        // the SESSION trigger is not a viable target, even with the floor OFF and ample
+        // weekly headroom — swapping there re-trips swap::decide's session dimension
+        // next cycle and thrashes. This is the fix for the observed fr <-> pelykh.com
+        // ping-pong: the soonest-reset account is session-saturated, so a session-fresh
+        // account wins despite its later reset (rather than the two saturated accounts
+        // flapping between each other).
+        let readings = vec![
+            Some(Usage {
+                session: 0.50,
+                weekly: 0.10,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }), // active (excluded)
+            Some(Usage {
+                session: 0.95, // at the session trigger -> not viable, however soon it resets
+                weekly: 0.10,
+                weekly_resets_at: Some(100), // soonest reset, but session-saturated
+                session_resets_at: None,
+            }),
+            Some(Usage {
+                session: 0.05, // the only session-fresh other
+                weekly: 0.20,
+                weekly_resets_at: Some(300), // later reset, but viable
+                session_resets_at: None,
+            }),
+        ];
+        // Floor OFF: index 1 is still excluded by the always-on session gate (0.95 is
+        // NOT < 0.95), so the session-fresh index 2 wins despite its later reset.
+        assert_eq!(
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn pick_target_floor_tightens_below_the_always_on_session_gate() {
+        // The opt-in session_floor (#10) is a STRICTER reserve layered on the always-on
+        // session gate: with the floor OFF a target need only clear the gate
+        // (session < trigger); an enabled floor also excludes accounts that pass the
+        // gate but sit at/above the floor. Effective ceiling = min(session_trigger, floor).
         let readings = vec![
             Some(Usage {
                 session: 0.97,
@@ -3599,9 +3952,9 @@ mod tests {
                 session_resets_at: None,
             }), // index 0 = active (excluded)
             Some(Usage {
-                session: 0.95, // high session — an enabled floor would exclude this…
+                session: 0.85, // clears the 0.95 gate, so viable with the floor off…
                 weekly: 0.10,
-                weekly_resets_at: Some(200), // …but with no floor it is the soonest-reset viable target
+                weekly_resets_at: Some(200), // …and the soonest-reset viable target
                 session_resets_at: None,
             }),
             Some(Usage {
@@ -3609,16 +3962,16 @@ mod tests {
                 weekly: 0.60,
                 weekly_resets_at: Some(300),
                 session_resets_at: None,
-            }), // low session but resets later
+            }), // session-fresh, resets later
         ];
-        // No floor → index 1 wins as the soonest-reset viable target despite its high session…
+        // Floor OFF → index 1 clears the gate (0.85 < 0.95) and wins on soonest reset…
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
             Some(1)
         );
-        // …whereas an enabled 80% floor excludes index 1 and falls to index 2.
+        // …whereas an enabled 80% floor excludes index 1 (0.85 >= 0.80) and falls to index 2.
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), Some(0.80), WK),
+            pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
             Some(2)
         );
     }
@@ -3649,7 +4002,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
             Some(2)
         );
     }
@@ -3679,7 +4032,7 @@ mod tests {
             }),
         ];
         assert_eq!(
-            pick_target(0, &readings, &all_on(&readings), None, WK),
+            pick_target(0, &readings, &all_on(&readings), None, SESS, WK),
             None
         );
     }
@@ -3709,7 +4062,7 @@ mod tests {
             }),
         ];
         let enabled = [true, false, true]; // …but index 1 is parked
-        assert_eq!(pick_target(0, &readings, &enabled, None, WK), Some(2));
+        assert_eq!(pick_target(0, &readings, &enabled, None, SESS, WK), Some(2));
     }
 
     #[test]
@@ -3738,7 +4091,7 @@ mod tests {
             }),
         ];
         let enabled = [true, true, false];
-        assert_eq!(pick_target(0, &readings, &enabled, None, WK), None);
+        assert_eq!(pick_target(0, &readings, &enabled, None, SESS, WK), None);
     }
 
     // --- soonest_weekly_reset (pure, #11) ---------------------------------
@@ -5305,10 +5658,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_high_accounts_swap_at_most_once_per_cooldown_window() {
-        // Issue #10 acceptance (non-oscillation): with the session floor OFF (the
-        // default) and two accounts both hovering 94–96%, the cooldown ALONE bounds
-        // oscillation — ≤ 1 swap per cooldown window, and never A→B→A within it.
+    async fn two_session_saturated_accounts_hold_the_gate_prevents_oscillation() {
+        // Session-gate acceptance (the fr <-> pelykh.com fix): with the floor OFF (the
+        // default) and TWO accounts both over the 95 session trigger, NEITHER is a
+        // viable target for the other — the always-on session gate excludes a session-
+        // saturated destination (it would re-trip swap::decide's session dimension). So
+        // the daemon HOLDS on every tick: no swap, and therefore no A→B→A. The gate
+        // PREVENTS the oscillation at its source; it is not merely paced by the cooldown
+        // (the superseded #10 "cooldown alone bounds oscillation" behavior this test
+        // used to assert).
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -5317,8 +5675,8 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
-        // Both hover high (over the 95 trigger), low weekly so each is a viable
-        // target for the other — the setup that WOULD ping-pong without a cooldown.
+        // Both hover high (over the 95 trigger), low weekly — the setup that WOULD
+        // ping-pong under the old no-session-gate rule.
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.95, 0.20)
             .ok("u-B", 0.96, 0.20);
@@ -5335,32 +5693,25 @@ mod tests {
             &tun,
         );
 
-        // First cycle (window opens): warm up the readings, then A — over the trigger
-        // with no prior swap — swaps A→B (issue #80 warm-up).
+        // A is active and over the trigger, but B is session-saturated too, so B is
+        // NOT a viable target — the daemon holds instead of swapping A→B.
         assert_eq!(
             warmed_tick(&mut daemon).await.action,
-            TickAction::Swapped { from: 0, to: 1 }
+            TickAction::NoViableTarget
         );
 
-        // Every later tick WITHIN the 100 s window: B is now active and also over
-        // the trigger, with A wide open as a target — yet each re-swap is refused by
-        // the cooldown. No second swap in the window → in particular no A→B→A.
-        for offset in [20u64, 40, 60, 80] {
-            daemon.clock.advance(Duration::from_secs(20));
+        // It keeps holding across the whole window AND well past the 100 s cooldown:
+        // no swap ever fires, so there is nothing to ping-pong. Were the cooldown the
+        // only guard (the old behavior), a swap would have fired on the first tick and
+        // again past +100 s; the gate makes both impossible.
+        for step in 1..=8u64 {
+            daemon.clock.advance(Duration::from_secs(20)); // +20s .. +160s (past cooldown)
             assert_eq!(
                 daemon.tick().await.action,
-                TickAction::SkippedCooldown,
-                "a re-swap at +{offset}s (within the 100 s cooldown) must be refused"
+                TickAction::NoViableTarget,
+                "two session-saturated accounts must HOLD (no swap) at tick {step}"
             );
         }
-
-        // Past the cooldown the swap-back is allowed — oscillation is BOUNDED by the
-        // cooldown, not frozen.
-        daemon.clock.advance(Duration::from_secs(40)); // now at +120 s
-        assert_eq!(
-            daemon.tick().await.action,
-            TickAction::Swapped { from: 1, to: 0 }
-        );
     }
 
     // --- manual-hold: adopt a manual `use` swap (issue #64) ----------------
@@ -6992,6 +7343,382 @@ mod tests {
             "the ManualSwapped signal must arm the cooldown via adoption"
         );
         assert_eq!(daemon.state.active, Some(0));
+    }
+
+    // --- runtime roster-reload (issue #139) --------------------------------
+
+    /// A minimal daemon for the pure [`reconcile_roster`] tests (#139): reconcile
+    /// touches no seam (no poll / store / clock / json read), so inert fixtures and a
+    /// throwaway `claude_json` path suffice. State is seeded directly on `daemon.state`.
+    fn reconcile_daemon(roster: Vec<Account>) -> FakeDaemon {
+        let tun = tunables(95, 80, 100);
+        Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            FakeCredentialStore::empty(),
+            FakeAccountStash::empty(),
+            FakeClock::frozen(),
+            PathBuf::from("unused-by-reconcile"),
+            &tun,
+        )
+    }
+
+    /// A carried usage reading for seeding `last_readings` in the reconcile tests.
+    fn reading(session: f64, weekly: f64) -> Usage {
+        Usage {
+            session,
+            weekly,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        }
+    }
+
+    fn roster_uuids(daemon: &FakeDaemon) -> Vec<String> {
+        daemon
+            .roster
+            .iter()
+            .map(|a| a.account_uuid.clone())
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_roster_onboards_a_new_account_and_preserves_the_rest() {
+        // AC: after an onboard, the daemon's in-memory roster reflects the new account
+        // — appended with DEFAULT state — while every persisting account keeps its
+        // carried health / reading / warm-up state (a capture of ANOTHER account must
+        // not reset a healthy one).
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true; // A carries a distinctive health mark
+        daemon.state.last_readings[1] = Some(reading(0.30, 0.40)); // B carries a reading
+        daemon.state.polled_once = vec![true, true];
+
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+
+        // The new account is now in the live roster…
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
+        // …with every parallel state array grown to match (no length skew).
+        assert_eq!(daemon.state.health.len(), 3);
+        assert_eq!(daemon.state.last_readings.len(), 3);
+        assert_eq!(daemon.state.polled_once.len(), 3);
+        // Persisting accounts keep their carried state.
+        assert!(daemon.state.health[0].quarantined, "A's health preserved");
+        assert_eq!(
+            daemon.state.last_readings[1],
+            Some(reading(0.30, 0.40)),
+            "B's reading preserved"
+        );
+        // The onboarded account joins with DEFAULT state (unpolled, no reading, healthy).
+        assert!(!daemon.state.health[2].quarantined);
+        assert_eq!(daemon.state.last_readings[2], None);
+        assert!(!daemon.state.polled_once[2]);
+        // Active (A) is unchanged — an append never shifts existing indices.
+        assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[test]
+    fn reconcile_roster_preserves_state_on_a_relogin_that_updates_the_label() {
+        // A relogin of an EXISTING account (same account_uuid) updates the roster
+        // CONTENT (e.g. a renamed label) without duplicating the entry, and preserves
+        // the account's carried decision state. (Un-quarantine on relogin is the
+        // daemon's separate canonical-change path #107, not reconcile's job.)
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.last_readings[1] = Some(reading(0.11, 0.22));
+        daemon.state.health[1].recovery_successes = 2;
+
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            account("u-B", "spare-renamed"),
+        ]);
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B"], "no duplicate");
+        assert_eq!(daemon.roster[1].label, "spare-renamed", "label updated");
+        assert_eq!(
+            daemon.state.last_readings[1],
+            Some(reading(0.11, 0.22)),
+            "carried reading preserved across the relogin"
+        );
+        assert_eq!(
+            daemon.state.health[1].recovery_successes, 2,
+            "health preserved"
+        );
+    }
+
+    #[test]
+    fn reconcile_roster_picks_up_an_enabled_flip() {
+        // A `disable` / `enable` (#36) flips an account's `enabled` flag on disk; the
+        // reload adopts the new flag (rotation membership) while preserving the
+        // account's carried decision state — so the flip takes effect in the live
+        // rotation without a restart, not merely at the next daemon start.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.last_readings[1] = Some(reading(0.10, 0.20));
+
+        // `disable spare` on disk → the reloaded roster carries B parked.
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            disabled_account("u-B", "spare"),
+        ]);
+
+        assert!(
+            !daemon.roster[1].enabled,
+            "B is now parked in the live roster"
+        );
+        assert_eq!(
+            daemon.state.last_readings[1],
+            Some(reading(0.10, 0.20)),
+            "B's carried reading is preserved across the flip"
+        );
+    }
+
+    #[test]
+    fn reconcile_roster_drops_a_removed_account_and_its_state() {
+        // A `remove` on disk drops the account (and its state) from the live rotation;
+        // the survivors keep their carried state, re-keyed by uuid across the gap.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+        daemon.state.active = Some(0);
+        daemon.state.last_readings[0] = Some(reading(0.10, 0.10)); // A reading
+        daemon.state.health[2].recovery_successes = 3; // C health mark
+
+        daemon.reconcile_roster(vec![account("u-A", "work"), account("u-C", "third")]);
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-C"], "B dropped");
+        assert_eq!(daemon.state.health.len(), 2);
+        // A (still index 0) keeps its reading; C (now index 1) keeps its health mark.
+        assert_eq!(daemon.state.last_readings[0], Some(reading(0.10, 0.10)));
+        assert_eq!(
+            daemon.state.health[1].recovery_successes, 3,
+            "C re-keyed by uuid"
+        );
+        assert_eq!(daemon.state.active, Some(0), "active A preserved");
+    }
+
+    #[test]
+    fn reconcile_roster_remaps_active_across_an_index_shift() {
+        // The active account is re-resolved by uuid, not by stale index: removing an
+        // EARLIER account shifts the active account's index, and reconcile follows it.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+        daemon.state.active = Some(2); // C is active at index 2
+
+        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]); // A removed
+
+        // C is now at index 1 — active tracks the uuid, not the old slot.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[test]
+    fn reconcile_roster_drops_active_to_none_when_the_active_account_is_removed() {
+        // Removing the ACTIVE account leaves active `None` — the next tick re-resolves
+        // active from the canonical credential (polls-without-swapping meanwhile).
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.active = Some(0); // A active
+
+        daemon.reconcile_roster(vec![account("u-B", "spare")]); // A removed
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-B"]);
+        assert_eq!(daemon.state.active, None);
+    }
+
+    #[test]
+    fn reconcile_roster_to_an_empty_roster_clears_active_and_state() {
+        // Reachable edge: removing the LAST account (a `remove` of the final entry)
+        // reconciles to an empty roster — every parallel array empties and active drops
+        // to `None`. A degenerate-but-valid runtime state (the daemon then polls
+        // nothing); it must not panic on the length-zero reshape.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+        daemon.state.active = Some(0);
+        daemon.state.last_readings[0] = Some(reading(0.10, 0.10));
+
+        daemon.reconcile_roster(vec![]);
+
+        assert!(daemon.roster.is_empty());
+        assert!(daemon.state.health.is_empty());
+        assert!(daemon.state.last_readings.is_empty());
+        assert!(daemon.state.polled_once.is_empty());
+        assert_eq!(daemon.state.active, None);
+    }
+
+    #[test]
+    fn reconcile_roster_resets_the_stale_poll_schedule() {
+        // The staggered poll schedule holds OLD roster indices; reconcile clears it so
+        // `next_poll_index` rebuilds a fresh one (over the new roster) next cycle,
+        // rather than indexing the reshaped roster with a stale cursor.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.poll_schedule = vec![0, 1];
+        daemon.state.poll_pos = 1;
+
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+
+        assert!(daemon.state.poll_schedule.is_empty(), "schedule reset");
+        assert_eq!(daemon.state.poll_pos, 0, "cursor reset");
+    }
+
+    #[test]
+    fn control_reply_roster_reload_authenticated_signals_a_reload() {
+        // Issue #139: an authenticated same-user peer's `roster-reload` acks and yields
+        // the `RosterReloadRequested` signal the run loop acts on.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"roster-reload"}"#, &snap, true);
+        assert_eq!(reply, r#"{"ok":true}"#);
+        assert_eq!(signal, Some(ControlSignal::RosterReloadRequested));
+    }
+
+    #[test]
+    fn control_reply_roster_reload_unauthenticated_is_refused_with_no_signal() {
+        // Issue #139: `roster-reload` is state-affecting, so an UNauthenticated peer is
+        // refused and produces NO signal — a stranger can never make the daemon re-read
+        // its config (mirrors the `manual-swapped` #64 auth gate).
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"roster-reload"}"#, &snap, false);
+        assert_eq!(reply, r#"{"error":"unauthorized"}"#);
+        assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_reads_the_new_roster_from_disk() {
+        // AC (end-to-end, no torn read): with a config path wired, the reload re-reads
+        // the freshly-written `config.toml` and reconciles the in-memory roster to it —
+        // onboarding the new account while preserving a persisting account's state. The
+        // on-disk file is written whole, exactly as production's atomic rename leaves it.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(
+            &config_path,
+            &[("u-A", "work"), ("u-B", "spare"), ("u-C", "third")],
+        );
+
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
+                .with_config_path(config_path);
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true; // A's state must survive the reload
+
+        daemon.adopt_roster_reload().await;
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
+        assert!(daemon.state.health[0].quarantined, "A's state preserved");
+        assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_keeps_the_current_roster_on_a_malformed_config() {
+        // Best-effort: a malformed / mid-edit `config.toml` never drops the live
+        // rotation — the current in-memory roster is kept and the reload is skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, b"]not valid toml[").unwrap();
+
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
+                .with_config_path(config_path);
+
+        daemon.adopt_roster_reload().await;
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "roster unchanged on a bad read"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_is_a_noop_without_a_config_path() {
+        // With no config path wired (the hermetic default), a reload signal is a silent
+        // no-op — there is nothing to read, and the roster is left as-is.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+
+        daemon.adopt_roster_reload().await;
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
+    }
+
+    #[tokio::test]
+    async fn run_loop_adopts_a_roster_reload_signal_through_the_idle_select() {
+        // Issue #139: the run loop's idle select must route a `RosterReloadRequested`
+        // control signal into `adopt_roster_reload` — proving the whole daemon-side
+        // chain (signal → idle break → disk re-read → reconcile) end-to-end, the one
+        // wiring `NoControl`-based tests leave undriven. A regression turning the
+        // `Some(RosterReloadRequested) => break` arm into a `continue` would leave the
+        // in-memory roster at its startup two accounts and fail this test.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(
+            &config_path,
+            &[("u-A", "work"), ("u-B", "spare"), ("u-C", "third")],
+        );
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_json_dir, json) = claude_json("u-A");
+        // Holds-only readings so no swap perturbs the idle path.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path);
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "startup roster is the two captured accounts"
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // Tick 1 → idle delivers `RosterReloadRequested` (reload) → tick 2 → shutdown.
+        // after(3): 1 start-up check (pends) + 2 idle shutdown-checks.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = OnceRosterReload::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
+
+        // The signal reached `adopt_roster_reload` through the idle select: the daemon
+        // re-read `config.toml` and the third account is now in the LIVE rotation — no
+        // restart.
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B", "u-C"],
+            "the onboarded account joined the live rotation without a restart"
+        );
     }
 
     #[tokio::test]
@@ -8933,17 +9660,20 @@ mod tests {
         )
         .unwrap();
 
-        // A and B both hover over the 95 session trigger with low weekly usage, so each
-        // is a viable target for the other — the setup that WOULD ping-pong without a
-        // cooldown. C is WEEKLY-EXHAUSTED (0.99 ≥ the 0.98 weekly trigger) → never a
-        // viable target, so a correct loop must SELECT A or B and EXCLUDE C.
+        // B (active) is over the 95 session trigger; A is session-FRESH (0.20, well
+        // under the trigger) with low weekly, so A is the viable target. C is
+        // WEEKLY-EXHAUSTED (0.99 ≥ the 0.98 weekly trigger) → never a viable target. A
+        // correct loop must SELECT the session-fresh A and EXCLUDE C. (The always-on
+        // session gate makes a session-saturated account a non-viable target — see
+        // `pick_target_excludes_session_saturated_accounts` — so the destination must be
+        // a genuinely fresh account, not a second near-exhausted one.)
         const C_RESET: i64 = 1_900_000_000; // far future; C is excluded regardless
         let poller = FakeRosterPoller::new()
-            .ok(A.0, 0.96, 0.20)
+            .ok(A.0, 0.20, 0.20)
             .ok(B.0, 0.96, 0.20)
             .ok_resets(C.0, 0.50, 0.99, C_RESET);
-        // Floor OFF (the #10 default — the cooldown ALONE bounds oscillation); cooldown
-        // 100 s; session trigger 95; no jitter, so every draw is deterministic.
+        // Floor OFF (the #10 default); cooldown 100 s; session trigger 95; no jitter, so
+        // every draw is deterministic.
         let tun = tunables_floor_off(95, 100);
 
         let mut daemon: FakeDaemon = Daemon::new(
@@ -9001,43 +9731,28 @@ mod tests {
         );
         harvest_channels(&outcome, &mut corpus);
 
-        // --- no oscillation: every tick WITHIN the 100 s cooldown is refused, even
-        // though A is now active and ALSO over the trigger — so never an A→B→A. ----
-        for offset in [20u64, 40, 60, 80] {
-            daemon.clock.advance(Duration::from_secs(20));
+        // --- no oscillation: A is now active and session-FRESH (0.20, under the 95
+        // trigger), so `swap::decide` returns Hold on every later tick BEFORE `pick_target`
+        // is ever consulted — the loop is stable and cannot revisit B, and NO swap-back
+        // fires even well past the 100 s cooldown. (This full-loop acceptance test covers
+        // the healthy swap + stable hold; the always-on session gate itself is guarded
+        // directly — on the fails-if-reverted path — by
+        // `pick_target_excludes_session_saturated_accounts` and
+        // `two_session_saturated_accounts_hold_the_gate_prevents_oscillation`.) ---------
+        for step in 1..=8u64 {
+            daemon.clock.advance(Duration::from_secs(20)); // +20s .. +160s (past cooldown)
             let outcome = daemon.tick().await;
             assert_eq!(
                 outcome.action,
-                TickAction::SkippedCooldown,
-                "a re-swap at +{offset}s (inside the 100 s cooldown) must be refused"
+                TickAction::Held,
+                "A is session-fresh and stable: tick {step} must HOLD, never oscillate"
             );
             assert!(
                 daemon.store.read().await.unwrap().matches(&cred(&a_blob)),
-                "no oscillation: the canonical still holds A's token inside the window"
+                "no oscillation: the canonical still holds A's token"
             );
             harvest_channels(&outcome, &mut corpus);
         }
-
-        // --- A → B: past the cooldown the swap-back is allowed, completing the
-        // B→A→B cycle — oscillation is BOUNDED by the cooldown, not frozen. --------
-        daemon.clock.advance(Duration::from_secs(40)); // now at +120 s, past the window
-        let outcome = daemon.tick().await;
-        assert_eq!(
-            outcome.action,
-            TickAction::Swapped { from: 0, to: 1 },
-            "past the cooldown A (active, over trigger) swaps back to the viable B"
-        );
-        assert!(
-            daemon.store.read().await.unwrap().matches(&cred(&b_blob)),
-            "propagate: the canonical item holds B's token again"
-        );
-        assert_eq!(
-            displayed_uuid(&json).as_deref(),
-            Some(B.0),
-            "propagate: the display shows B again — a full B→A→B cycle"
-        );
-        assert_eq!(daemon.state.active, Some(1), "the cached active is B again");
-        harvest_channels(&outcome, &mut corpus);
 
         // --- the remaining operator channels: the offline `list` view, the UDS error
         // replies, and every Error Display — all secret-free by construction. -------
@@ -9076,10 +9791,6 @@ mod tests {
         assert!(
             corpus.contains("event=swap from=spare to=work"),
             "log channel: the B→A swap event is missing"
-        );
-        assert!(
-            corpus.contains("event=swap from=work to=spare"),
-            "log channel: the A→B swap-back event is missing"
         );
         assert!(
             corpus.contains(r#""session_pct":96"#),

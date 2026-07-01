@@ -78,8 +78,9 @@ next swap: spare
 
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`
-when no other account is a sound swap destination — every one is weekly-exhausted, over
-the opt-in swap-target session floor, or quarantined and needs a re-login — and
+when no other account is a sound swap destination — every one is weekly-exhausted,
+session-saturated (over its swap-away session trigger), over the opt-in swap-target
+session floor, or quarantined and needs a re-login — and
 `none (awaiting usage data)` right after the daemon starts, before it has polled the
 other accounts. It is **forward-looking** and recomputed every cycle, so —
 unlike a remembered "last swap" — it survives a daemon restart and always shows where
@@ -225,8 +226,8 @@ sessiometer enable work
 
 Accounts resolve by their `list` label. The state is stored in `config.toml`, so
 it persists across daemon restarts; `list` and `status` mark a parked account as
-`disabled`. The change takes effect at the next daemon start (a running daemon
-loads the roster once).
+`disabled`. A running daemon picks up the change in its live rotation right away —
+no restart needed.
 
 ## Removing an account
 
@@ -243,7 +244,8 @@ sessiometer remove work
 Accounts resolve by their `list` label. The roster entry is removed from
 `config.toml` **first**, then the stash is deleted — so an interrupted removal
 leaves at most an unreferenced (harmless) keychain item, never a roster entry
-pointing at a missing stash. The change takes effect at the next daemon start.
+pointing at a missing stash. A running daemon picks up the removal in its live
+rotation right away — no restart needed.
 
 Removing the **active** account is allowed: it touches only `sessiometer`'s
 roster entry and stash, never the live `Claude Code-credentials` item, so the
@@ -341,6 +343,13 @@ long-running rotation hits:
   account again (refreshing its token, or switching the active account), the
   daemon detects the changed canonical credential and **re-stashes** the affected
   account, so the rotation always tracks the live token rather than a stale one.
+- **On-disk roster changes are picked up at runtime.** After `capture`, `login`,
+  `remove`, or `disable`/`enable` writes `config.toml`, a running daemon **reloads
+  its roster** and reflects the change in the live rotation — and in `status` —
+  **without a restart**. Persisting accounts keep their in-flight health and usage
+  readings; a newly-onboarded account joins the rotation and is polled on the next
+  cycles. Best-effort: with no daemon running there is nothing to update, and the
+  next start loads the current roster anyway.
 - **Crash mid-swap self-heals.** A swap writes the credential before updating the
   display, and the daemon reconciles the two on its next start — so a process
   death partway through a swap leaves the keychain authoritative and is repaired
