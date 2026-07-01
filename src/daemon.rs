@@ -7354,6 +7354,32 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_roster_picks_up_an_enabled_flip() {
+        // A `disable` / `enable` (#36) flips an account's `enabled` flag on disk; the
+        // reload adopts the new flag (rotation membership) while preserving the
+        // account's carried decision state — so the flip takes effect in the live
+        // rotation without a restart, not merely at the next daemon start.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.last_readings[1] = Some(reading(0.10, 0.20));
+
+        // `disable spare` on disk → the reloaded roster carries B parked.
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            disabled_account("u-B", "spare"),
+        ]);
+
+        assert!(
+            !daemon.roster[1].enabled,
+            "B is now parked in the live roster"
+        );
+        assert_eq!(
+            daemon.state.last_readings[1],
+            Some(reading(0.10, 0.20)),
+            "B's carried reading is preserved across the flip"
+        );
+    }
+
+    #[test]
     fn reconcile_roster_drops_a_removed_account_and_its_state() {
         // A `remove` on disk drops the account (and its state) from the live rotation;
         // the survivors keep their carried state, re-keyed by uuid across the gap.

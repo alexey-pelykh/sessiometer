@@ -1465,8 +1465,9 @@ fn refresh_tag(last_refresh: Option<RefreshEventOutcome>) -> Option<String> {
 /// (issue #36). A reversible park, distinct from removal (#13): the account keeps
 /// its roster entry and its stash; only its `enabled` flag flips. Resolve the
 /// account by its non-secret label, set the flag, and persist via [`Config::save`]
-/// so the change survives a daemon restart (config-backed). Takes effect at the
-/// next daemon start — a running daemon loads the roster once.
+/// so the change survives a daemon restart (config-backed). A running daemon is
+/// notified to reload (#139), so the flip takes effect in the live rotation without
+/// a restart (best-effort — no daemon running is a no-op, the next start loads it).
 ///
 /// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
 /// account is [`Error::AccountLabelNotFound`]. `enabled` selects the verb so one
@@ -1480,6 +1481,10 @@ async fn set_enabled(label: Option<String>, enabled: bool) -> Result<()> {
     // already-parked account is a friendly no-op, not a needless disk write.
     if matches!(outcome, FlipOutcome::Changed) {
         config.save()?;
+        // Tell a running daemon to pick up the enable/disable now (#139) — best-effort;
+        // the account joins / leaves the live rotation without a restart. Skipped on a
+        // no-op flip (nothing changed on disk, so nothing to reload).
+        crate::capture::notify_daemon_roster_reload().await;
     }
     println!("{}", flip_confirmation(outcome, &label, enabled));
     Ok(())
