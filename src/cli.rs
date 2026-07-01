@@ -9,16 +9,18 @@
 //! `list` roster view (#17).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config};
 use crate::daemon::{
     run_loop, AccountStatusLine, Daemon, InstanceLock, NextSwap, RealClock, RealRosterPoller,
     RealShutdown, StatusResponse, UnixControl,
 };
 use crate::error::{Error, Result};
-use crate::keychain::RealCredentialStore;
+use crate::keychain::{Credential, RealCredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
     CredentialHealth, Diagnostic, DiagnosticLog, EventLog, RefreshEventOutcome, Verbosity,
@@ -26,7 +28,9 @@ use crate::observability::{
 use crate::paths;
 use crate::refresh;
 use crate::refresh_tick::{RealRefreshEngine, RefreshTick};
-use crate::stash::{AccountStash, RealAccountStash};
+use crate::sha256::sha256_hex;
+use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
+use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
 
 /// Parse `argv` and run the requested subcommand.
 pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
@@ -242,6 +246,47 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     )
                     .await
                 }
+                // `import <PATH> [--overwrite] [--passphrase-file <path> | --passphrase-stdin]`
+                // — the INVERSE of `export` (issue #149): read a migration artifact, decrypt
+                // it if encrypted (passphrase via an interactive no-echo prompt, or
+                // `--passphrase-file`/`--passphrase-stdin` — NEVER argv, cf. #39; a plaintext
+                // artifact needs none), and rehydrate the roster + per-account credential
+                // stashes through the EXISTING local write path (`security -i`). Conflict
+                // policy: an account already present on the target is SKIPPED by default and
+                // REPLACED under `--overwrite`, reported per-account. The `PATH` is required
+                // (the passphrase may ride stdin, so the artifact never does); the first
+                // non-flag token is it, extras ignored — matching the other subcommands.
+                "import" => {
+                    let mut path: Option<PathBuf> = None;
+                    let mut overwrite = false;
+                    let mut passphrase_file: Option<PathBuf> = None;
+                    let mut passphrase_stdin = false;
+                    while let Some(arg) = args.next() {
+                        match arg.to_string_lossy().as_ref() {
+                            "--overwrite" => overwrite = true,
+                            "--passphrase-stdin" => passphrase_stdin = true,
+                            "--passphrase-file" => {
+                                passphrase_file = args.next().map(PathBuf::from);
+                            }
+                            v if v.starts_with("--passphrase-file=") => {
+                                passphrase_file =
+                                    Some(PathBuf::from(&v["--passphrase-file=".len()..]));
+                            }
+                            v if v.starts_with('-') => {
+                                // Unknown flag: ignore, matching the other subcommands.
+                            }
+                            _ if path.is_none() => path = Some(PathBuf::from(&arg)),
+                            _ => {} // extra positional ignored, matching the others
+                        }
+                    }
+                    let path = path.ok_or(Error::MigrationImportPathRequired)?;
+                    import(
+                        path,
+                        overwrite,
+                        import_passphrase(passphrase_file, passphrase_stdin),
+                    )
+                    .await
+                }
                 "-h" | "--help" => {
                     print_usage();
                     Ok(())
@@ -272,6 +317,7 @@ fn print_usage() {
          poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)\n    \
          stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)\n    \
          export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout\n    \
+         import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite\n    \
          --help     Print this help"
     );
 }
@@ -1442,8 +1488,10 @@ async fn list() -> Result<()> {
     Ok(())
 }
 
-/// How an encrypted export sources its passphrase. NEVER an argv value (issues #39 /
-/// #148): only an interactive no-echo terminal prompt, a file, or standard input.
+/// How an encrypted export/import sources its passphrase. NEVER an argv value (issues
+/// #39 / #148 / #149): only an interactive no-echo terminal prompt, a file, or standard
+/// input. Shared by both `export` (encrypt) and `import` (decrypt) for symmetry — the
+/// direction-specific prompt wording is supplied by the caller to [`read`](Self::read).
 enum PassphraseSource {
     /// Prompt on the controlling terminal with echo disabled (the default).
     Prompt,
@@ -1456,9 +1504,12 @@ enum PassphraseSource {
 impl PassphraseSource {
     /// Acquire the passphrase from this source, funnelling through the #147 input
     /// paths so the bytes are held in a `Zeroizing` buffer and never pass through argv.
-    fn read(&self) -> Result<Passphrase> {
+    /// `prompt` is used only by the interactive [`Prompt`](Self::Prompt) variant (the
+    /// file / stdin paths read silently), so the caller words it for the direction —
+    /// "encrypt the export" vs "decrypt the import".
+    fn read(&self, prompt: &str) -> Result<Passphrase> {
         match self {
-            PassphraseSource::Prompt => Passphrase::prompt("Passphrase to encrypt the export: "),
+            PassphraseSource::Prompt => Passphrase::prompt(prompt),
             PassphraseSource::File(path) => Passphrase::from_file(path),
             PassphraseSource::Stdin => Passphrase::from_stdin(),
         }
@@ -1520,7 +1571,7 @@ async fn export(path: Option<PathBuf>, no_secrets: bool, encryption: Encryption)
             MigrationArtifact::plaintext(payload).to_bytes()
         }
         Encryption::Encrypted(source) => {
-            let passphrase = source.read()?;
+            let passphrase = source.read("Passphrase to encrypt the export: ")?;
             MigrationArtifact::encrypt(&payload, &passphrase)?.to_bytes()
         }
     };
@@ -1576,6 +1627,298 @@ fn write_export(path: Option<&Path>, bytes: &[u8]) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Resolve the parsed `import` flags into a [`PassphraseSource`]. A `--passphrase-file` /
+/// `--passphrase-stdin` source is honored, defaulting to the interactive prompt. The
+/// source is only CONSUMED when the artifact turns out to be encrypted (a plaintext one
+/// needs no passphrase), so these flags are inert for a plaintext import.
+fn import_passphrase(passphrase_file: Option<PathBuf>, passphrase_stdin: bool) -> PassphraseSource {
+    if let Some(path) = passphrase_file {
+        PassphraseSource::File(path)
+    } else if passphrase_stdin {
+        PassphraseSource::Stdin
+    } else {
+        PassphraseSource::Prompt
+    }
+}
+
+/// `import <PATH>` — rehydrate local state from a migration artifact (issue #149), the
+/// INVERSE of [`export`].
+///
+/// Reads the artifact, decrypts it under a passphrase (#147) when encrypted (a plaintext
+/// artifact needs none), then merges its accounts into the local roster under the conflict
+/// policy: an account already present on the target is SKIPPED (left untouched) unless
+/// `overwrite`. Each credential-carrying account is restored through the EXISTING keychain
+/// stash write (`security -i`, off-argv, #39) and read-back-verified; a config-only account
+/// (from `export --no-secrets`) lands as a roster entry to be re-authenticated by `login`
+/// (#135). Writes serialize under the swap lock (#64); the roster is saved atomically once,
+/// so a partial failure never dangles a half-written roster and the import is safely
+/// re-runnable. Any per-account failure exits non-zero after committing the successes.
+///
+/// Diagnostics name accounts by their non-secret label only — never a token or email; the
+/// passphrase is read through the #147 no-argv paths and never logged.
+async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) -> Result<()> {
+    let bytes = std::fs::read(&path)?;
+    let artifact = MigrationArtifact::from_bytes(&bytes)?;
+    // Decrypt only when encrypted — a plaintext artifact never reads (or prompts for) a
+    // passphrase. The decrypt path holds the plaintext in a zeroized-on-drop buffer (#147).
+    let payload = if artifact.is_encrypted() {
+        let passphrase = passphrase.read("Passphrase to decrypt the import: ")?;
+        artifact.decrypt(&passphrase)?
+    } else {
+        artifact.into_plaintext_payload()?
+    };
+
+    // Ensure the native-local support dir (0700) that houses `swap.lock` exists before
+    // acquiring the lock (mirrors `capture`/`use`, #64).
+    paths::ensure_private_dir(&paths::support_dir()?)?;
+    let swap_lock = paths::swap_lock()?;
+
+    // Load the target config; a fresh machine (no config yet) is the `None` base.
+    let local = match Config::load() {
+        Ok(config) => Some(config),
+        Err(Error::ConfigNotFound { .. }) => None,
+        Err(other) => return Err(other),
+    };
+
+    let (config, outcomes) = apply_import(
+        Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
+        &payload,
+        local,
+        &RealAccountStash::new(),
+        overwrite,
+    )
+    .await?;
+
+    // Persist the merged roster atomically (temp + rename, 0600) — OUTSIDE the swap lock
+    // (config.toml is never swap-contended), mirroring `reconcile_login` (#135). One
+    // write → a partial failure above leaves no half-written roster.
+    config.save()?;
+    // Tell a running daemon to pick up the imported accounts now (#139) — best-effort.
+    crate::capture::notify_daemon_roster_reload().await;
+
+    println!("{}", import_report(&outcomes));
+
+    // Surface any per-account failure LOUDLY with a non-zero exit — the successful
+    // accounts were still committed to the roster (honest partial result), and the
+    // per-account report above names which landed and which failed.
+    let failed = outcomes
+        .iter()
+        .filter(|o| o.outcome == ImportOutcome::Failed)
+        .count();
+    if failed > 0 {
+        return Err(Error::MigrationImportIncomplete { failed });
+    }
+    Ok(())
+}
+
+/// Merge a migration [`Payload`] into the local roster under the conflict policy —
+/// PURE of the real config path, generic over the stash so tests drive it with a fake
+/// in-memory `FakeAccountStash` (mirrors [`gather_payload`] on the export side).
+///
+/// `local` is the target's current config (`None` on a fresh machine). The returned
+/// [`Config`] is the merged result the caller persists; the [`AccountImport`] vec is the
+/// per-account outcome report. The swap lock (`lock`, `Some` in production) is acquired
+/// BEFORE any keychain write and held across all of them, then dropped before return so
+/// the caller's `config.save()` runs unlocked; it is skipped entirely for a config-only
+/// artifact (no keychain write to serialize). A `lock` of `None` is the hermetic test
+/// path.
+async fn apply_import<S: AccountStash>(
+    lock: Option<(&Path, Duration)>,
+    payload: &Payload,
+    local: Option<Config>,
+    stash: &S,
+    overwrite: bool,
+) -> Result<(Config, Vec<AccountImport>)> {
+    // The roster + tunables the artifact carries, held to the same invariants as any
+    // on-disk config (unique non-empty account_uuid, tunable ranges).
+    let incoming = Config::from_toml_str(payload.config_toml())?;
+
+    // Base config: preserve the LOCAL config when present — its tunables/refresh/login
+    // and existing roster are authoritative (the per-account merge below only touches the
+    // roster; a whole-config merge policy is the separate #150). On a fresh target adopt
+    // the incoming tunables but start from an empty roster, so every account flows through
+    // the conflict policy + integrity check below.
+    let mut result = match local {
+        Some(local) => local,
+        None => Config {
+            roster: Vec::new(),
+            ..incoming.clone()
+        },
+    };
+
+    // Per-account secret material, indexed by uuid — EMPTY for a config-only artifact,
+    // in which case every account below imports as a roster-only "needs re-login" (#135).
+    let secrets: std::collections::HashMap<&str, &ManagedAccount> = payload
+        .accounts()
+        .iter()
+        .map(|managed| (managed.account_uuid(), managed))
+        .collect();
+
+    // Acquire the single-writer swap lock (#64) around the keychain writes — only when
+    // the artifact actually carries credentials (a config-only import writes no keychain
+    // item, so it needs no lock). Acquired BEFORE any write; a contended acquire fails
+    // closed (`SwapLockBusy`) with ZERO writes. Held until this fn returns.
+    let _guard = match (lock, secrets.is_empty()) {
+        (Some((path, max_wait)), false) => Some(SwapLock::acquire(path, max_wait).await?),
+        _ => None,
+    };
+
+    let mut outcomes = Vec::with_capacity(incoming.roster.len());
+    for incoming_account in &incoming.roster {
+        let existing = result
+            .roster
+            .iter()
+            .position(|account| account.account_uuid == incoming_account.account_uuid);
+
+        // Conflict policy: an account already on the target is SKIPPED — left
+        // byte-for-byte untouched (its stash AND roster entry) — unless `overwrite`.
+        if existing.is_some() && !overwrite {
+            outcomes.push(AccountImport::skipped(&incoming_account.label));
+            continue;
+        }
+
+        // Restore the credential stash if the artifact carries one for this account.
+        // Stash-BEFORE-roster (like `capture`/`reconcile_login`): a write or read-back
+        // failure leaves the account OUT of the roster (never a roster entry pointing at
+        // an unstashed account), reported `failed`, and the remaining accounts continue.
+        // A config-only account (no secret) writes nothing and lands as a roster entry
+        // only → "needs re-login".
+        if let Some(managed) = secrets.get(incoming_account.account_uuid.as_str()) {
+            if write_and_verify(stash, &incoming_account.stash(), managed)
+                .await
+                .is_err()
+            {
+                outcomes.push(AccountImport::failed(&incoming_account.label));
+                continue;
+            }
+        }
+
+        let outcome = match existing {
+            Some(idx) => {
+                result.roster[idx] = incoming_account.clone();
+                AccountImport::overwritten(&incoming_account.label)
+            }
+            None => {
+                result.roster.push(incoming_account.clone());
+                AccountImport::imported(&incoming_account.label)
+            }
+        };
+        outcomes.push(outcome);
+    }
+
+    Ok((result, outcomes))
+}
+
+/// Restore one account's credential material into its keychain stash and VERIFY the
+/// write landed (issue #149's outcome-integrity requirement).
+///
+/// Writes both halves through the existing off-argv stash write ([`AccountStash::write`]
+/// → `security -i`, #39), then reads them back and confirms each half hash-matches what
+/// was written. The comparison is over sha256 digests, never the bytes, so nothing secret
+/// is printed or otherwise materialized for the check; a mismatch (a store that did not
+/// persist the bytes, a locked keychain at read-back) is [`Error::MigrationImportVerifyFailed`].
+async fn write_and_verify<S: AccountStash>(
+    stash: &S,
+    service: &str,
+    managed: &ManagedAccount,
+) -> Result<()> {
+    let account = StashedAccount {
+        credential: Credential::new(managed.credential().to_vec()),
+        oauth_account: OauthAccount::from_object_bytes(managed.oauth_account())?,
+    };
+    stash.write(service, &account).await?;
+
+    let readback = stash.read(service).await?;
+    let credential_ok =
+        sha256_hex(account.credential.expose()) == sha256_hex(readback.credential.expose());
+    let oauth_ok = sha256_hex(account.oauth_account.raw_json())
+        == sha256_hex(readback.oauth_account.raw_json());
+    if credential_ok && oauth_ok {
+        Ok(())
+    } else {
+        Err(Error::MigrationImportVerifyFailed)
+    }
+}
+
+/// One account's `import` outcome, for the per-account report (issue #149). Non-secret
+/// (an outcome label, not account material), so `Debug` is safe here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportOutcome {
+    /// A new account: roster entry added (+ stash written when the artifact carried one).
+    Imported,
+    /// Already present on the target and left untouched (no `--overwrite`).
+    Skipped,
+    /// Already present and replaced under `--overwrite`.
+    Overwritten,
+    /// A credential write or its read-back verification failed; NOT added to the roster.
+    Failed,
+}
+
+impl ImportOutcome {
+    /// The report word for this outcome.
+    fn word(self) -> &'static str {
+        match self {
+            ImportOutcome::Imported => "imported",
+            ImportOutcome::Skipped => "skipped",
+            ImportOutcome::Overwritten => "overwritten",
+            ImportOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// One line of the per-account import report. Identifies the account by its non-secret
+/// LABEL only (as `list`/`status`/`remove` do — issue #15), never a token or email.
+struct AccountImport {
+    label: String,
+    outcome: ImportOutcome,
+}
+
+impl AccountImport {
+    fn imported(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            outcome: ImportOutcome::Imported,
+        }
+    }
+    fn skipped(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            outcome: ImportOutcome::Skipped,
+        }
+    }
+    fn overwritten(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            outcome: ImportOutcome::Overwritten,
+        }
+    }
+    fn failed(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            outcome: ImportOutcome::Failed,
+        }
+    }
+}
+
+/// Render the per-account import report: one `outcome \`label\`` line per account, then a
+/// count summary. Labels only (non-secret); no token or email ever appears. Returned as a
+/// String so it is unit-testable and the caller prints it.
+fn import_report(outcomes: &[AccountImport]) -> String {
+    let mut out = String::new();
+    for entry in outcomes {
+        out.push_str(&format!("{} `{}`\n", entry.outcome.word(), entry.label));
+    }
+    let count = |want: ImportOutcome| outcomes.iter().filter(|o| o.outcome == want).count();
+    out.push_str(&format!(
+        "import complete: {} imported, {} skipped, {} overwritten, {} failed",
+        count(ImportOutcome::Imported),
+        count(ImportOutcome::Skipped),
+        count(ImportOutcome::Overwritten),
+        count(ImportOutcome::Failed),
+    ));
+    out
 }
 
 /// Resolve a load outcome into the roster `list` renders, or the error it exits on.
@@ -3903,5 +4246,309 @@ spare  22222222-2222\n\
             export_encryption(true, Some(file), true),
             Encryption::Plaintext
         ));
+    }
+
+    // --- `import` verb (issue #149) -----------------------------------------
+
+    /// Build a full (credential-carrying) `Payload` from a roster of `(label, uuid)`
+    /// pairs, each with a known token + email — the artifact side of an import test.
+    fn import_payload(accounts: &[(&str, &str, &[u8], &str)]) -> Payload {
+        let roster: Vec<Account> = accounts
+            .iter()
+            .map(|(label, uuid, _, _)| acct(label, uuid))
+            .collect();
+        let managed: Vec<ManagedAccount> = accounts
+            .iter()
+            .map(|(_, uuid, token, email)| {
+                let stashed = export_stashed(token, uuid, email);
+                ManagedAccount::new(
+                    (*uuid).to_owned(),
+                    stashed.credential.expose().to_vec(),
+                    stashed.oauth_account.raw_json().to_vec(),
+                )
+            })
+            .collect();
+        Payload::new(config_with(roster).render(), managed)
+    }
+
+    /// A stash whose `write` always fails — proves a write failure is surfaced (the
+    /// account is reported `failed` and left OUT of the roster), never swallowed.
+    struct FailingWriteStash;
+    impl AccountStash for FailingWriteStash {
+        async fn write(&self, _service: &str, _account: &StashedAccount) -> Result<()> {
+            Err(Error::Io(std::io::Error::other(
+                "simulated keychain write failure",
+            )))
+        }
+        async fn read(&self, service: &str) -> Result<StashedAccount> {
+            Err(Error::StashIncomplete {
+                service: service.to_owned(),
+            })
+        }
+        async fn delete(&self, _service: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A stash that ACCEPTS writes but reads back DIFFERENT bytes — proves the read-back
+    /// hash-compare (outcome integrity) catches a write that did not actually persist.
+    struct LyingReadStash;
+    impl AccountStash for LyingReadStash {
+        async fn write(&self, _service: &str, _account: &StashedAccount) -> Result<()> {
+            Ok(())
+        }
+        async fn read(&self, _service: &str) -> Result<StashedAccount> {
+            Ok(StashedAccount {
+                credential: Credential::new(b"NOT-WHAT-WAS-WRITTEN".to_vec()),
+                oauth_account: OauthAccount::from_object_bytes(br#"{"accountUuid":"other"}"#)
+                    .unwrap(),
+            })
+        }
+        async fn delete(&self, _service: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A full export → import round-trip restores every account byte-faithfully: the
+    /// encrypted artifact the export writes, once decrypted (#147) and applied, lands
+    /// each account's roster entry AND both keychain stash halves byte-identical to the
+    /// source — through the SAME off-argv stash write the daemon uses.
+    #[tokio::test]
+    async fn import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully() {
+        // Export side: gather a two-account payload, encrypt it, serialize (crypto is #147).
+        let (src_config, src_stash) = export_config_and_stash().await;
+        let payload = gather_payload(&src_config, &src_stash, false)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pp_path = dir.path().join("pp");
+        std::fs::write(&pp_path, b"correct horse battery staple\n").unwrap();
+        let pp = Passphrase::from_file(&pp_path).unwrap();
+        let bytes = MigrationArtifact::encrypt(&payload, &pp)
+            .unwrap()
+            .to_bytes();
+
+        // Import side: parse → decrypt → apply into a FRESH target (no local config).
+        let restored = MigrationArtifact::from_bytes(&bytes)
+            .unwrap()
+            .decrypt(&pp)
+            .unwrap();
+        let target = crate::stash::FakeAccountStash::empty();
+        let (config, outcomes) = apply_import(None, &restored, None, &target, false)
+            .await
+            .unwrap();
+
+        // Every account imported into the roster...
+        assert_eq!(config.roster.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|o| o.outcome == ImportOutcome::Imported));
+        // ...and each stash restored byte-for-byte (both halves).
+        for (uuid, token, email) in [(UUID_A, TOKEN_A, EMAIL_A), (UUID_B, TOKEN_B, EMAIL_B)] {
+            let back = target.read(&format!("Sessiometer/{uuid}")).await.unwrap();
+            assert_eq!(
+                back.credential.expose(),
+                token,
+                "credential restored byte-for-byte"
+            );
+            assert_eq!(
+                back.oauth_account.raw_json(),
+                export_stashed(token, uuid, email).oauth_account.raw_json(),
+                "oauthAccount restored byte-for-byte"
+            );
+        }
+    }
+
+    /// The conflict policy: an account already present on the target is SKIPPED by
+    /// default — its stash left byte-for-byte untouched — and REPLACED under `--overwrite`.
+    #[tokio::test]
+    async fn an_existing_account_is_skipped_by_default_and_replaced_under_overwrite() {
+        let local = config_with(vec![acct("alice", UUID_A)]);
+        let target = crate::stash::FakeAccountStash::empty();
+        // The target already holds account A with its ORIGINAL credential.
+        target
+            .write(
+                &local.roster[0].stash(),
+                &export_stashed(b"ORIGINAL-CRED-AAAA", UUID_A, EMAIL_A),
+            )
+            .await
+            .unwrap();
+        // The artifact carries account A with a DIFFERENT (incoming) credential.
+        let payload = import_payload(&[("alice", UUID_A, TOKEN_A, EMAIL_A)]);
+        let service = local.roster[0].stash();
+
+        // Default: SKIP — reported skipped, stash untouched.
+        let (config, outcomes) = apply_import(None, &payload, Some(local.clone()), &target, false)
+            .await
+            .unwrap();
+        assert_eq!(config.roster.len(), 1);
+        assert_eq!(outcomes[0].outcome, ImportOutcome::Skipped);
+        assert_eq!(
+            target.read(&service).await.unwrap().credential.expose(),
+            b"ORIGINAL-CRED-AAAA",
+            "skip must leave the stash byte-for-byte untouched"
+        );
+
+        // `--overwrite`: REPLACE — reported overwritten, stash now the incoming credential.
+        let (config, outcomes) = apply_import(None, &payload, Some(local.clone()), &target, true)
+            .await
+            .unwrap();
+        assert_eq!(config.roster.len(), 1);
+        assert_eq!(outcomes[0].outcome, ImportOutcome::Overwritten);
+        assert_eq!(
+            target.read(&service).await.unwrap().credential.expose(),
+            TOKEN_A,
+            "overwrite must replace the stash with the incoming credential"
+        );
+    }
+
+    /// An encrypted artifact fails CLEANLY without the passphrase: it reports itself
+    /// encrypted (so `import` knows to prompt), a wrong passphrase fails closed with zero
+    /// plaintext, and it is not readable as plaintext.
+    #[tokio::test]
+    async fn an_encrypted_artifact_fails_cleanly_without_the_passphrase() {
+        let (src_config, src_stash) = export_config_and_stash().await;
+        let payload = gather_payload(&src_config, &src_stash, false)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pp_path = dir.path().join("pp");
+        std::fs::write(&pp_path, b"the real passphrase\n").unwrap();
+        let pp = Passphrase::from_file(&pp_path).unwrap();
+        let bytes = MigrationArtifact::encrypt(&payload, &pp)
+            .unwrap()
+            .to_bytes();
+
+        let artifact = MigrationArtifact::from_bytes(&bytes).unwrap();
+        assert!(
+            artifact.is_encrypted(),
+            "an encrypted artifact must report itself so import prompts for a passphrase"
+        );
+        assert!(
+            artifact.clone().into_plaintext_payload().is_err(),
+            "an encrypted artifact must not be readable as plaintext"
+        );
+        let wrong_path = dir.path().join("wrong");
+        std::fs::write(&wrong_path, b"not the passphrase\n").unwrap();
+        let wrong = Passphrase::from_file(&wrong_path).unwrap();
+        assert!(
+            artifact.decrypt(&wrong).is_err(),
+            "a wrong passphrase must fail closed (no plaintext)"
+        );
+    }
+
+    /// A credential write failure is surfaced, not swallowed: the account is reported
+    /// `failed` and left OUT of the roster (no entry pointing at an unstashed account),
+    /// while the rest of the import proceeds.
+    #[tokio::test]
+    async fn a_credential_write_failure_is_surfaced_not_swallowed() {
+        let payload = import_payload(&[("alice", UUID_A, TOKEN_A, EMAIL_A)]);
+        let (config, outcomes) = apply_import(None, &payload, None, &FailingWriteStash, false)
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].outcome, ImportOutcome::Failed);
+        assert!(
+            config.roster.is_empty(),
+            "a failed account must not land in the roster"
+        );
+        let report = import_report(&outcomes);
+        assert!(
+            report.contains("failed `alice`") && report.contains("1 failed"),
+            "the failure must be reported loudly, per-account and in the summary"
+        );
+    }
+
+    /// Outcome integrity: a write that does NOT actually persist (the store reads back
+    /// different bytes) is caught by the read-back hash-compare and reported `failed` —
+    /// an import never CLAIMS success for a credential it did not truly write.
+    #[tokio::test]
+    async fn a_write_that_does_not_persist_is_caught_by_read_back_verification() {
+        let payload = import_payload(&[("alice", UUID_A, TOKEN_A, EMAIL_A)]);
+        let (config, outcomes) = apply_import(None, &payload, None, &LyingReadStash, false)
+            .await
+            .unwrap();
+        assert_eq!(outcomes[0].outcome, ImportOutcome::Failed);
+        assert!(
+            config.roster.is_empty(),
+            "a credential that fails read-back verification must not be claimed as imported"
+        );
+    }
+
+    /// A config-only artifact (an `export --no-secrets`) imports each account as a roster
+    /// entry to be re-authenticated by `login` (#135) — no keychain stash is written.
+    #[tokio::test]
+    async fn a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash() {
+        let payload = Payload::new(
+            config_with(vec![acct("alice", UUID_A), acct("bob", UUID_B)]).render(),
+            Vec::new(),
+        );
+        let target = crate::stash::FakeAccountStash::empty();
+        let (config, outcomes) = apply_import(None, &payload, None, &target, false)
+            .await
+            .unwrap();
+
+        assert_eq!(config.roster.len(), 2);
+        assert!(outcomes
+            .iter()
+            .all(|o| o.outcome == ImportOutcome::Imported));
+        assert_eq!(
+            target.len(),
+            0,
+            "a config-only import writes no keychain stash (accounts are needs-re-login)"
+        );
+    }
+
+    /// The passphrase is sourced only indirectly (file / stdin / interactive prompt) —
+    /// no argv path carries the secret value (issues #39 / #149), symmetric with export.
+    #[test]
+    fn import_passphrase_source_is_never_an_argv_value() {
+        let file = PathBuf::from("/some/passphrase/file");
+        assert!(matches!(
+            import_passphrase(Some(file), false),
+            PassphraseSource::File(_)
+        ));
+        assert!(matches!(
+            import_passphrase(None, true),
+            PassphraseSource::Stdin
+        ));
+        assert!(matches!(
+            import_passphrase(None, false),
+            PassphraseSource::Prompt
+        ));
+    }
+
+    /// The per-account report names accounts by their non-secret LABEL only — never a
+    /// token or an email (issue #15 redaction discipline), even for a full artifact
+    /// carrying both.
+    #[tokio::test]
+    async fn the_import_report_names_labels_only_never_a_token_or_email() {
+        let (src_config, src_stash) = export_config_and_stash().await;
+        let payload = gather_payload(&src_config, &src_stash, false)
+            .await
+            .unwrap();
+        let target = crate::stash::FakeAccountStash::empty();
+        let (_config, outcomes) = apply_import(None, &payload, None, &target, false)
+            .await
+            .unwrap();
+        let report = import_report(&outcomes);
+
+        assert!(
+            report.contains("imported `alice`") && report.contains("imported `bob`"),
+            "the report carries the non-secret labels"
+        );
+        for token in [TOKEN_A, TOKEN_B] {
+            assert!(
+                !contains_bytes(report.as_bytes(), token),
+                "no credential token may appear in the report"
+            );
+        }
+        for email in [EMAIL_A, EMAIL_B] {
+            assert!(
+                !report.contains(email),
+                "no account email may appear in the report"
+            );
+        }
     }
 }

@@ -248,6 +248,20 @@ impl Payload {
             accounts,
         }
     }
+
+    /// The rendered `config.toml` (roster + tunables + refresh) the artifact carries.
+    /// The read-side companion of [`new`](Payload::new)'s `config_toml` argument, the
+    /// seam the `import` verb (issue #149) parses back into a [`crate::config::Config`].
+    pub(crate) fn config_toml(&self) -> &str {
+        &self.config_toml
+    }
+
+    /// The per-account secret material, one entry per roster `[[account]]` that carries
+    /// a credential (EMPTY for a config-only / `--no-secrets` artifact). The read-side
+    /// companion of [`new`](Payload::new)'s `accounts` argument.
+    pub(crate) fn accounts(&self) -> &[ManagedAccount] {
+        &self.accounts
+    }
 }
 
 impl ManagedAccount {
@@ -263,6 +277,26 @@ impl ManagedAccount {
             credential,
             oauth_account,
         }
+    }
+
+    /// The roster key (`account_uuid`) this stash belongs to — matches a `[[account]]`
+    /// entry in [`Payload::config_toml`]. The read-side companion the `import` verb
+    /// (issue #149) keys the conflict policy on. Non-secret.
+    pub(crate) fn account_uuid(&self) -> &str {
+        &self.account_uuid
+    }
+
+    /// The raw `Claude Code-credentials` bearer blob, as opaque bytes — restored
+    /// verbatim into the target's keychain stash on import ([`crate::stash`]). SECRET:
+    /// never logged; hashed, not printed, for read-back verification.
+    pub(crate) fn credential(&self) -> &[u8] {
+        &self.credential
+    }
+
+    /// The account's `oauthAccount` identity JSON, as opaque bytes — restored into the
+    /// stash on import. SECRET (carries the account email): never logged.
+    pub(crate) fn oauth_account(&self) -> &[u8] {
+        &self.oauth_account
     }
 }
 
@@ -339,6 +373,31 @@ impl MigrationArtifact {
         let artifact: MigrationArtifact = serde_json::from_slice(bytes).map_err(redact)?;
         artifact.validate()?;
         Ok(artifact)
+    }
+
+    /// Whether the body is ciphertext (needs a passphrase to [`decrypt`](Self::decrypt))
+    /// or plaintext (readable directly via [`into_plaintext_payload`](Self::into_plaintext_payload)).
+    /// The `import` verb (issue #149) reads this to decide whether to acquire a passphrase
+    /// at all — a plaintext artifact needs none.
+    pub(crate) fn is_encrypted(&self) -> bool {
+        self.header.encrypted
+    }
+
+    /// Consume a PLAINTEXT artifact and return its [`Payload`] by value.
+    ///
+    /// The counterpart of [`decrypt`](Self::decrypt) for the `encrypted: false` case:
+    /// no key, no passphrase. [`from_bytes`](Self::from_bytes) already cross-checked the
+    /// `encrypted` flag against the body, so a well-formed plaintext artifact always
+    /// yields `Ok`; the `Ciphertext` arm is a defensive [`Error::MigrationInvalid`] for a
+    /// caller that skipped the [`is_encrypted`](Self::is_encrypted) check. Moves (never
+    /// clones) the secret-bearing payload out.
+    pub(crate) fn into_plaintext_payload(self) -> Result<Payload> {
+        match self.body {
+            Body::Plaintext(payload) => Ok(payload),
+            Body::Ciphertext(_) => Err(Error::MigrationInvalid(
+                "expected a plaintext artifact — this one is encrypted",
+            )),
+        }
     }
 
     /// Structural invariants beyond what the type system enforces: the magic marker,

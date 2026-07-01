@@ -394,6 +394,16 @@ impl Config {
         Self::parse(&text)
     }
 
+    /// Parse and validate a config from its rendered TOML TEXT (not a file) — the seam
+    /// the `import` verb (issue #149) uses to read the roster + tunables carried verbatim
+    /// inside a migration artifact's `config_toml` ([`crate::migration::Payload::config_toml`]).
+    /// Mirrors [`load_path`](Config::load_path) minus the file read, funnelling through the
+    /// same [`parse`](Config::parse) validation so an artifact's config is held to the
+    /// identical invariants (unique non-empty `account_uuid`, tunable ranges).
+    pub(crate) fn from_toml_str(text: &str) -> Result<Self> {
+        Self::parse(text)
+    }
+
     /// Persist this config to `config.toml` (`0600`, parent `0700`), with the
     /// inline tunable-documenting comments. The write path for `capture` (#4).
     #[allow(dead_code)]

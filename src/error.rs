@@ -478,6 +478,32 @@ pub(crate) enum Error {
     #[error("unsupported or malformed migration crypto parameters: {0}")]
     MigrationCryptoParams(&'static str),
 
+    // --- Migration import (issue #149) ----------------------------------------
+    //
+    // The `import` verb's own outcomes (see [`crate::cli`]). All secret-free: they
+    // carry a count or a static reason, never an account label, token, or email.
+    /// `import` was invoked without the required `<file>` argument. The artifact path
+    /// is mandatory — the passphrase may ride stdin (`--passphrase-stdin`), so the
+    /// artifact itself is never read from stdin. Secret-free.
+    #[error("import requires a migration artifact path: sessiometer import <file>")]
+    MigrationImportPathRequired,
+
+    /// An imported credential failed READ-BACK verification: the stash was written but
+    /// a re-read did not hash-match what was written (a locked keychain at read-back, or
+    /// a store that did not persist the bytes). The account is reported `failed` and left
+    /// out of the roster rather than claimed as imported. Carries no bytes — only the
+    /// hashes are compared, never logged. Secret-free.
+    #[error("an imported credential failed read-back verification")]
+    MigrationImportVerifyFailed,
+
+    /// One or more accounts could not be imported (a write or read-back failure). The
+    /// successfully-imported accounts were still committed to the roster (honest partial
+    /// result); this non-zero exit surfaces the failure loudly for a caller/script. The
+    /// per-account report names which landed and which failed. Carries only the failed
+    /// COUNT — no label, token, or email. Secret-free.
+    #[error("{failed} account(s) could not be imported — see the per-account report above")]
+    MigrationImportIncomplete { failed: usize },
+
     // --- Usage-sample datastore (issue #155) ----------------------------------
     //
     // The local usage-sample store's own outcomes (see [`crate::usage_store`]).
