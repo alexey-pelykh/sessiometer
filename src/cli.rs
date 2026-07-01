@@ -398,6 +398,19 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     } else {
         None
     };
+    // Issue #162: the poll path's refresh-then-retry reuses the SAME #102 engine, so a
+    // usage 401 (usually a merely-expired access token) attempts one isolated refresh +
+    // re-poll BEFORE it counts toward the #42 dead-credential streak — closing the
+    // false-death window the ~10×-slower periodic sweep (#105) structurally cannot. Gated
+    // on the SAME effective switch as the periodic tick (a resolvable `claude` binary);
+    // with refresh off the seam stays unset and the poll path behaves exactly as before.
+    // `as_ref` + `clone` so `claude_binary` is still owned for the tick's engine below.
+    if let Some(bin) = claude_binary.as_ref() {
+        daemon = daemon.with_refresh_engine(Box::new(RealRefreshEngine::new(
+            RealAccountStash::new(),
+            bin.clone(),
+        )));
+    }
     let mut refresh_tick = RefreshTick::new(
         config.roster.clone(),
         config.refresh.clone(),
