@@ -45,7 +45,7 @@
 //!     and the re-stash ([`AccountStash::write`]) both ride `/usr/bin/security`
 //!     (`security -i`, off-argv — #39), never the Security.framework SDK.
 //!   - **secrets zeroized + redaction-safe** — every blob the engine holds is a
-//!     [`Credential`] / `Zeroizing` (wiped on drop); the only value it returns is a
+//!     [`crate::keychain::Credential`] / `Zeroizing` (wiped on drop); the only value it returns is a
 //!     non-secret [`RefreshReport`] (a classification + an integer delta + booleans),
 //!     proven leak-free by the redaction-METER test below.
 //!   - **lock held only around steps 1 & 7** — never across the spawn (the lock would
@@ -95,58 +95,22 @@
 //! engine's own production telemetry (above).
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use tokio::process::Command;
 use zeroize::Zeroizing;
 
 use crate::error::Result;
-use crate::keychain::{Credential, IsolatedKeychain};
+use crate::isolated_spawn::{ClaudeRefresh, IsolatedSession, SpawnClaude};
+use crate::keychain::IsolatedKeychain;
 use crate::paths;
 use crate::stash::{AccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
-
-/// The benign prompt handed to `claude -p`: it exists only to make CC start up,
-/// read the seeded credential, and refresh it — the model output is discarded.
-const BENIGN_PROMPT: &str = "say pong";
-
-/// How long to let the spawned `claude` run before killing it. Comfortably exceeds a
-/// cold start + one on-demand token refresh; on timeout the child is killed and the
-/// read-back classifies whatever the item holds (a refresh may already have landed).
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
-
-/// Env vars **unset** on the spawn so the child `claude` refreshes the SEEDED isolated
-/// item and nothing else — the security-critical scrub (issue #102 step 4). Each entry
-/// is a credential source or a config-dir override that, if inherited, would defeat the
-/// isolation:
-///   - `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` — an ambient bearer in the
-///     daemon's env: CC would authenticate with it instead of reading (and refreshing)
-///     the seeded item, so the refresh would silently no-op.
-///   - `CLAUDE_SECURESTORAGE_CONFIG_DIR` — takes PRECEDENCE over `CLAUDE_CONFIG_DIR` in
-///     CC's keychain service-name derivation (#100, [`crate::keychain`]), so an inherited
-///     one would mis-target the read away from the item we seeded.
-///
-/// Kept as a named list (not inline `env_remove` calls) so the
-/// `the_spawn_scrubs_every_credential_and_config_override_env` test can assert the set
-/// against accidental deletion — a dropped entry is a silent isolation regression.
-const SPAWN_ENV_REMOVE: &[&str] = &[
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-];
 
 /// A minimal isolated `.claude.json` (0600). Headless `claude -p` needs no onboarding
 /// / theme / trust keys (#101 AC-5) and auto-writes its own minimal file; this empty
 /// object is belt-and-suspenders so the isolated dir is never wholly empty.
 const MINIMAL_CLAUDE_JSON: &[u8] = b"{}\n";
-
-/// Retries on the isolated item's teardown delete (a transient locked keychain may
-/// clear); the final attempt falls back to the synchronous best-effort delete.
-const TEARDOWN_DELETE_RETRIES: u32 = 3;
-/// Wait between teardown delete retries.
-const TEARDOWN_DELETE_RETRY_WAIT: Duration = Duration::from_millis(100);
 
 /// How the engine classified one refresh cycle (issue #102 step 6).
 #[cfg_attr(not(test), allow(dead_code))]
@@ -201,145 +165,6 @@ impl RefreshReport {
             expires_at_delta_secs: None,
             refresh_token_rotated: false,
             re_stashed: false,
-        }
-    }
-}
-
-/// Seam: spawns the `claude -p` that performs CC's own credential refresh in the
-/// isolated config dir (issue #102 step 4). The real impl drives the `claude` binary;
-/// the test impl simulates CC by mutating the (fake) isolated item.
-#[allow(dead_code)]
-pub(crate) trait ClaudeRefresh {
-    /// Run `claude -p <benign>` with `CLAUDE_CONFIG_DIR=config_dir`, no token env, all
-    /// stdio nulled, killed after [`SPAWN_TIMEOUT`]. `Ok` whether it exited cleanly or
-    /// was killed (the read-back classifies the result); `Err` only if it could not be
-    /// spawned at all.
-    async fn run(&self, config_dir: &Path) -> Result<()>;
-}
-
-/// Production spawner: the pinned `claude` binary (the engine pins the binary it
-/// spawns, per #101 provenance — a wrapper may exec a patched copy).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct SpawnClaude {
-    binary: PathBuf,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl SpawnClaude {
-    pub(crate) fn new(binary: PathBuf) -> Self {
-        Self { binary }
-    }
-}
-
-impl ClaudeRefresh for SpawnClaude {
-    async fn run(&self, config_dir: &Path) -> Result<()> {
-        let mut command = Command::new(&self.binary);
-        // Point CC at the isolated config dir; its path-hash names the keychain item we
-        // seeded. The DISABLE_* vars keep a headless refresh from auto-updating / phoning
-        // home mid-cycle.
-        command
-            .arg("-p")
-            .arg(BENIGN_PROMPT)
-            .env("CLAUDE_CONFIG_DIR", config_dir)
-            .env("DISABLE_AUTOUPDATER", "1")
-            .env("DISABLE_TELEMETRY", "1")
-            .env("DISABLE_ERROR_REPORTING", "1")
-            .env("DISABLE_BUG_COMMAND", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // The security-critical scrub: drop every ambient credential / config-dir
-        // override so CC reads (and refreshes) the SEEDED item, never a token from the
-        // daemon's env (see [`SPAWN_ENV_REMOVE`]).
-        for var in SPAWN_ENV_REMOVE {
-            command.env_remove(var);
-        }
-        let mut child = command.spawn()?;
-        // Bound the runtime: on timeout, kill and proceed — the read-back decides the
-        // outcome (a refresh may already have landed before the kill).
-        match tokio::time::timeout(SPAWN_TIMEOUT, child.wait()).await {
-            Ok(_status) => Ok(()),
-            Err(_elapsed) => {
-                let _ = child.kill().await;
-                Ok(())
-            }
-        }
-    }
-}
-
-/// RAII guard for one isolated-refresh session (issue #102 steps 2 & 8): owns the
-/// ephemeral isolated directory and the isolated keychain seam, and tears BOTH down.
-///
-/// The happy path calls [`teardown`](Self::teardown) (async — the item delete is
-/// retried, then the dir removed) which DISARMS the guard; if instead the cycle returns
-/// early (a hard error, a panic, or a timer-kill before teardown), `Drop` runs a
-/// best-effort SYNCHRONOUS teardown. Either way the isolated item and dir never outlive
-/// the cycle.
-struct IsolatedSession<K: IsolatedKeychain> {
-    keychain: K,
-    dir: PathBuf,
-    armed: bool,
-}
-
-impl<K: IsolatedKeychain> IsolatedSession<K> {
-    /// Arm a session over an ALREADY-CREATED isolated `dir` and its keychain seam.
-    fn arm(keychain: K, dir: PathBuf) -> Self {
-        Self {
-            keychain,
-            dir,
-            armed: true,
-        }
-    }
-
-    /// Seed the isolated keychain item (delegates to the owned seam).
-    async fn seed(&self, blob: &[u8]) -> Result<()> {
-        self.keychain.seed(blob).await
-    }
-
-    /// Read the refreshed blob back (delegates to the owned seam).
-    async fn read_back(&self) -> Result<Credential> {
-        self.keychain.read_back().await
-    }
-
-    /// The isolated directory (the spawned `claude`'s `CLAUDE_CONFIG_DIR`).
-    fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Explicit async teardown (the happy path): delete the isolated item (retried,
-    /// falling back to the synchronous delete), remove the dir, then DISARM so `Drop`
-    /// is a no-op. Best-effort — teardown never fails the cycle's result.
-    ///
-    /// The guard stays ARMED until the deletes complete, so if this future is dropped
-    /// (cancelled — e.g. a daemon shutdown aborting the task) mid-teardown, `Drop` still
-    /// runs the synchronous cleanup rather than leaking the secret-bearing isolated item
-    /// and its dir. Both deletes are idempotent (a not-found item / absent dir is
-    /// success), so a partial async teardown followed by the sync `Drop` cleanup is fine.
-    async fn teardown(mut self) {
-        let mut deleted = false;
-        for _ in 0..TEARDOWN_DELETE_RETRIES {
-            if self.keychain.delete().await.is_ok() {
-                deleted = true;
-                break;
-            }
-            tokio::time::sleep(TEARDOWN_DELETE_RETRY_WAIT).await;
-        }
-        if !deleted {
-            self.keychain.delete_blocking();
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
-        // Disarm LAST: only once cleanup has actually run does `Drop` become a no-op.
-        self.armed = false;
-    }
-}
-
-impl<K: IsolatedKeychain> Drop for IsolatedSession<K> {
-    fn drop(&mut self) {
-        if self.armed {
-            // Synchronous best-effort (Drop cannot await): delete the item, remove the
-            // dir. Errors are swallowed — there is no channel to surface them.
-            self.keychain.delete_blocking();
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 }
@@ -714,10 +539,13 @@ mod tests {
 
     use crate::claude_state::OauthAccount;
     use crate::error::Error;
+    use crate::keychain::Credential;
     use crate::stash::FakeAccountStash;
-    // `Credential`, `IsolatedKeychain`, `StashedAccount`, `AccountStash`, `Value`,
-    // `Path`, `Duration`, `SwapLock`, `SWAP_LOCK_MAX_WAIT` all arrive via `super::*`
-    // (a child module sees its parent's `use`d names), so they are not re-imported.
+    // `IsolatedKeychain`, `StashedAccount`, `AccountStash`, `Value`, `Path`, `Duration`,
+    // `SwapLock`, `SWAP_LOCK_MAX_WAIT` all arrive via `super::*` (a child module sees its
+    // parent's `use`d names), so they are not re-imported. `Credential` is imported
+    // explicitly above — the non-test parent no longer names it (its last user,
+    // `IsolatedSession`, moved to `crate::isolated_spawn` in #131).
 
     const STASH: &str = "Sessiometer/u-1";
     // A fixed injected clock (epoch ms) so the back-dated seed is deterministic.
@@ -905,25 +733,10 @@ mod tests {
     }
 
     // --- pure helpers ------------------------------------------------------------
-
-    #[test]
-    fn the_spawn_scrubs_every_credential_and_config_override_env() {
-        // The security-critical scrub (issue #102 step 4): the spawned `claude` must
-        // inherit NONE of these, or it would authenticate with an ambient token (the
-        // two bearer envs) or read the wrong keychain item (the securestorage override)
-        // instead of refreshing the SEEDED isolated item. A dropped entry is a silent
-        // isolation regression, so each is asserted present in the scrub list.
-        for required in [
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-        ] {
-            assert!(
-                SPAWN_ENV_REMOVE.contains(&required),
-                "{required} must be scrubbed from the spawn env"
-            );
-        }
-    }
+    //
+    // The spawn env scrub (`SPAWN_ENV_REMOVE`) and the `IsolatedSession` teardown moved to
+    // `crate::isolated_spawn` (#131); their guards — the both-parametrizations scrub test and the
+    // armed-Drop teardown test — live there now, alongside the shared seam they protect.
 
     #[test]
     fn backdate_sets_a_forcing_expiry_and_keeps_the_token() {
@@ -1249,29 +1062,10 @@ mod tests {
         assert_eq!(kept.credential.expose(), original.as_slice());
     }
 
-    #[tokio::test]
-    async fn dropping_an_armed_session_synchronously_tears_down_the_item_and_dir() {
-        // The RAII backstop in isolation: every OTHER teardown test routes through the
-        // explicit `teardown().await` (which disarms the guard). This covers the path that
-        // only the guard's `Drop` can — a still-ARMED session dropped on a panic /
-        // future-cancellation / timer-kill — the sole thing stopping the secret-bearing
-        // isolated item + dir from outliving the cycle.
-        let tmp = tempfile::tempdir().unwrap();
-        let iso_dir = tmp.path().join("refresh/u-1");
-        paths::create_isolated_dir(&iso_dir).unwrap();
-        let keychain = FakeIsolatedKeychain::empty();
-        keychain.seed(b"secret-bearing-item").await.unwrap();
-        {
-            // Armed and never torn down explicitly — leaving this scope drops it ARMED,
-            // exercising the synchronous `Drop` cleanup.
-            let _session = IsolatedSession::arm(keychain.clone(), iso_dir.clone());
-        }
-        assert!(
-            keychain.item.borrow().is_none(),
-            "Drop must delete the isolated keychain item"
-        );
-        assert!(!iso_dir.exists(), "Drop must remove the isolated dir");
-    }
+    // The armed-`Drop` teardown test (the RAII backstop for a session dropped on
+    // panic / cancellation / timer-kill) moved with `IsolatedSession` to
+    // `crate::isolated_spawn` (#131). The cycle's teardown-on-error is still covered here by
+    // `a_hard_failure_still_tears_down_the_isolated_session`.
 
     // --- orphan reap (#103): SIGKILL / power-loss leaves no live isolated item ----
     //

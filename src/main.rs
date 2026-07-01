@@ -15,6 +15,7 @@ mod cli;
 mod config;
 mod daemon;
 mod error;
+mod isolated_spawn;
 mod keychain;
 mod observability;
 mod paths;
