@@ -81,7 +81,7 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::claude_state;
-use crate::config::{Account, Tunables};
+use crate::config::{Account, Config, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
@@ -287,6 +287,15 @@ pub(crate) enum ControlSignal {
     /// cooldown-only signal — it carries no credential and no write target, and
     /// never becomes a write command.
     ManualSwapped,
+    /// A roster write on disk (`capture` / `login` / `remove`) committed and notified
+    /// the daemon (issue #139). The run loop reloads it
+    /// ([`Daemon::adopt_roster_reload`]): re-read `config.toml` and reconcile the
+    /// in-memory roster (add onboarded/relogged-in accounts, drop removed ones),
+    /// preserving per-account health/decision state for accounts that persist. Like
+    /// [`ManualSwapped`](ControlSignal::ManualSwapped) it carries no payload — the
+    /// authoritative new roster is the on-disk `config.toml`, re-read from scratch — so
+    /// a duplicate or out-of-order notification at worst re-reads an unchanged file.
+    RosterReloadRequested,
 }
 
 /// Control seam: serve control-socket connections. The production impl
@@ -786,6 +795,20 @@ fn control_reply(
                 (r#"{"error":"unauthorized"}"#.to_owned(), None)
             }
         }
+        // `roster-reload` (issue #139) is state-affecting — it makes the daemon adopt a
+        // new on-disk roster — so, like `manual-swapped`, it is honored ONLY for an
+        // authenticated same-user peer; an unauthenticated one gets an error and
+        // produces NO signal (a stranger can never make the daemon re-read its config).
+        Ok(request) if request.cmd == "roster-reload" => {
+            if peer_authenticated {
+                (
+                    r#"{"ok":true}"#.to_owned(),
+                    Some(ControlSignal::RosterReloadRequested),
+                )
+            } else {
+                (r#"{"error":"unauthorized"}"#.to_owned(), None)
+            }
+        }
         Ok(_) => (r#"{"error":"unknown command"}"#.to_owned(), None),
         Err(_) => (r#"{"error":"malformed request"}"#.to_owned(), None),
     }
@@ -843,6 +866,50 @@ where
         Ok(result) => result,
         Err(_elapsed) => Ok(None),
     }
+}
+
+/// Upper bound on the client-side `roster-reload` notify exchange (issue #139) — the
+/// CLI-verb counterpart of the server's [`CONTROL_EXCHANGE_TIMEOUT`]. Mirrors the
+/// `use`-side manual-hold notify (#64): a missing / wedged daemon must never hang the
+/// `capture` / `login` / `remove` verb, so the whole connect→send→ack exchange is
+/// time-boxed and any failure degrades to a logged best-effort skip.
+const ROSTER_RELOAD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Notify a running daemon that the on-disk roster changed (issue #139), so it
+/// re-reads `config.toml` and reconciles its in-memory rotation WITHOUT a restart.
+/// The CLI-verb counterpart of the daemon's `roster-reload` control handler
+/// ([`control_reply`]); sends one newline-delimited `{"cmd":"roster-reload"}` request
+/// and reads the one-line ack so the daemon has RECEIVED it before returning.
+///
+/// BEST-EFFORT by contract, exactly like the `use` manual-hold notify (#64): the
+/// on-disk `config.toml` is authoritative (the write already succeeded), so a notify
+/// failure — no daemon running (connect refused / socket absent), a timeout, an I/O
+/// error — is for the CALLER to log and ignore, never fatal. Bounded by
+/// [`ROSTER_RELOAD_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
+/// verb. Carries NO credential and NO write target — a pure reload signal (the daemon
+/// re-reads the authoritative file itself).
+pub(crate) async fn notify_roster_reload(socket: &Path) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket).await?;
+        let mut buffered = tokio::io::BufReader::new(stream);
+        buffered.write_all(b"{\"cmd\":\"roster-reload\"}\n").await?;
+        buffered.flush().await?;
+        // Read the one-line ack so the daemon has processed the request before we
+        // return; the content is irrelevant (any failure is non-fatal for the caller).
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        Ok::<(), Error>(())
+    };
+    tokio::time::timeout(ROSTER_RELOAD_NOTIFY_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "roster-reload notify timed out",
+            ))
+        })?
 }
 
 /// What the loop decided to do this cycle — logged, and asserted on in tests.
@@ -1164,6 +1231,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// swap routes through [`swap::swap_locked`] and a contended acquire defers the
     /// swap (fail-closed) rather than risk a torn write.
     swap_lock_path: Option<PathBuf>,
+    /// The `config.toml` path re-read on a runtime roster-reload (issue #139), or
+    /// `None` to disable the reload (the hermetic-test default — a test with no
+    /// on-disk config wires the pure [`reconcile_roster`](Self::reconcile_roster)
+    /// directly instead). Production sets the real [`crate::paths::config_file`] via
+    /// [`with_config_path`](Self::with_config_path); when `None`, an inbound
+    /// `roster-reload` signal is a logged best-effort no-op (there is nothing to read).
+    config_path: Option<PathBuf>,
     state: DecisionState,
 }
 
@@ -1211,6 +1285,9 @@ where
             // No cross-process swap lock by default; production opts in via
             // `with_swap_lock`. See the field's docs for why tests stay lock-free.
             swap_lock_path: None,
+            // No runtime roster-reload by default (issue #139); production opts in via
+            // `with_config_path`. A hermetic test drives `reconcile_roster` directly.
+            config_path: None,
             state: DecisionState {
                 health,
                 last_readings,
@@ -1227,6 +1304,17 @@ where
     /// to mirror `with_seed` and keep `new`'s 7 args stable.
     pub(crate) fn with_swap_lock(mut self, path: PathBuf) -> Self {
         self.swap_lock_path = Some(path);
+        self
+    }
+
+    /// Wire the `config.toml` path re-read on a runtime roster-reload (issue #139):
+    /// an inbound `roster-reload` control signal then re-reads this file and
+    /// reconciles the in-memory roster. Production sets the real
+    /// [`crate::paths::config_file`]; a test may point it at a throwaway file it rewrites
+    /// mid-run to drive the reload end-to-end. Builder-style to mirror `with_swap_lock`
+    /// / `with_seed` and keep `new`'s args stable.
+    pub(crate) fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
         self
     }
 
@@ -2095,6 +2183,118 @@ where
         self.state.last_swap = Some(LastSwap { at });
     }
 
+    /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
+    ///
+    /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
+    /// on disk and notified us; re-read that authoritative file and reconcile the
+    /// in-memory roster to it via [`reconcile_roster`](Self::reconcile_roster).
+    /// BEST-EFFORT by contract, mirroring [`adopt_manual_swap`](Self::adopt_manual_swap):
+    /// the on-disk file is authoritative, so a read failure — a malformed or briefly
+    /// absent file — leaves the current in-memory roster INTACT and is logged, never
+    /// fatal. A torn/partial read cannot occur: `Config::save` writes a temp file and
+    /// `rename`s it over `config.toml` atomically, so this read observes either the
+    /// whole old or the whole new file (issue #139 acceptance). A `None` `config_path`
+    /// (the hermetic-test default) is a silent no-op.
+    ///
+    /// No lock is taken: the run loop drives `tick`, the control serve, and this
+    /// adoption on a SINGLE task, so no daemon swap can interleave with the reconcile;
+    /// and `config.toml` is written only by the CLI verbs (never by a daemon swap,
+    /// which touches the keychain + `~/.claude.json`), so the re-read races nothing the
+    /// daemon itself writes.
+    async fn adopt_roster_reload(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return; // reload disabled (no config path wired) — nothing to do.
+        };
+        match Config::load_path(&path) {
+            Ok(config) => self.reconcile_roster(config.roster),
+            // Best-effort: keep the current in-memory roster on any read/parse failure
+            // (a transient absent file, or a malformed edit) rather than dropping the
+            // rotation. The next reload notification re-attempts.
+            Err(err) => eprintln!("sessiometer: roster-reload skipped: {err}"),
+        }
+    }
+
+    /// Reconcile the in-memory roster (and its per-account decision state) to
+    /// `new_roster` — the pure core of the runtime roster-reload (issue #139),
+    /// hermetically testable with no I/O.
+    ///
+    /// Accounts are matched by the immutable `account_uuid` (never by roster position,
+    /// which shifts as accounts are added/removed):
+    ///   - an account present in BOTH keeps its carried per-account state — health
+    ///     (#42 quarantine/recovery streaks), the last-known usage reading (#80) and
+    ///     the `polled_once` warm-up flag — so a `capture`/`login`/`remove` of ANOTHER
+    ///     account never resets a healthy account's decision state;
+    ///   - an account NEW on disk (an onboard, or a relogin of one never rostered) is
+    ///     appended with DEFAULT state (unpolled, no reading, healthy) — it joins the
+    ///     rotation and is polled on subsequent ticks, becoming a swap target only once
+    ///     it has a reading;
+    ///   - an account GONE from disk (a `remove`) is dropped along with its state.
+    ///
+    /// The active account is re-resolved by `account_uuid`: it keeps its (possibly
+    /// shifted) new index when it persists, or becomes `None` when it was removed — the
+    /// next [`tick`](Self::tick) then re-resolves active from the canonical credential,
+    /// or polls-without-swapping if the active account is no longer rostered. The
+    /// staggered poll schedule (#80) is reset (its entries were OLD roster indices);
+    /// [`next_poll_index`](Self::next_poll_index) rebuilds it at the next cycle start.
+    /// The warm-up latch (#80) is left as-is: once warmed up, a freshly-onboarded
+    /// unpolled account is simply not yet a swap target (it has no reading), so it need
+    /// not re-gate the whole rotation. State NOT indexed by roster position — the
+    /// cooldown (#10), the canonical watch (#13), the tick counter — is deliberately
+    /// untouched: a roster change is not a swap and must not re-arm or clear them.
+    fn reconcile_roster(&mut self, new_roster: Vec<Account>) {
+        // Capture the active account's identity from the CURRENT roster before it is
+        // replaced, so active can be re-resolved by uuid against the new roster.
+        let active_uuid = self
+            .state
+            .active
+            .and_then(|i| self.roster.get(i))
+            .map(|account| account.account_uuid.clone());
+
+        // Re-key each account's carried decision state by uuid: preserve it for an
+        // account that persists, default it for a newly-onboarded one. (Rosters are a
+        // handful of accounts, so the per-account `position` scan is inconsequential.)
+        let mut health = Vec::with_capacity(new_roster.len());
+        let mut last_readings = Vec::with_capacity(new_roster.len());
+        let mut polled_once = Vec::with_capacity(new_roster.len());
+        for account in &new_roster {
+            match self
+                .roster
+                .iter()
+                .position(|old| old.account_uuid == account.account_uuid)
+            {
+                Some(old_idx) => {
+                    health.push(self.state.health[old_idx].clone());
+                    last_readings.push(self.state.last_readings[old_idx]);
+                    polled_once.push(self.state.polled_once[old_idx]);
+                }
+                None => {
+                    health.push(AccountHealth::default());
+                    last_readings.push(None);
+                    polled_once.push(false);
+                }
+            }
+        }
+
+        // Re-resolve active by uuid: kept (its new index) if it persists, else `None`.
+        let active = active_uuid.and_then(|uuid| {
+            new_roster
+                .iter()
+                .position(|account| account.account_uuid == uuid)
+        });
+
+        // Commit the reconciled roster + parallel state together, so no tick ever
+        // observes a roster/state length mismatch.
+        self.roster = new_roster;
+        self.state.health = health;
+        self.state.last_readings = last_readings;
+        self.state.polled_once = polled_once;
+        self.state.active = active;
+        // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
+        // fresh one (active-first, then enabled non-quarantined) at the next cycle start.
+        self.state.poll_schedule.clear();
+        self.state.poll_pos = 0;
+    }
+
     /// Emergency-swap away from a confirmed-DEAD active account (issue #42): the live
     /// session is blocked, so rotate to the soonest-reset viable target IMMEDIATELY —
     /// bypassing the swap-away trigger and the post-swap cooldown that gate a normal
@@ -2788,6 +2988,9 @@ where
         Elapsed,
         /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
         ManualSwapped,
+        /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
+        /// — reload + reconcile the in-memory roster, then re-tick.
+        RosterReloadRequested,
     }
 
     // De-burst start-up (issue #76): wait a small jittered delay before the FIRST
@@ -2867,6 +3070,12 @@ where
                     // (None) just continues serving until the wait elapses.
                     signal = control.serve(&snapshot) => match signal {
                         Some(ControlSignal::ManualSwapped) => break Idle::ManualSwapped,
+                        // A `roster-reload` (#139) breaks the idle to reconcile the
+                        // in-memory roster to the freshly-written config; a `status`
+                        // read (None) just continues serving until the wait elapses.
+                        Some(ControlSignal::RosterReloadRequested) => {
+                            break Idle::RosterReloadRequested
+                        }
                         None => continue,
                     },
                     // The periodic isolated-refresh tick (issue #105), in the idle path off
@@ -2940,6 +3149,10 @@ where
             // holds on the operator's choice, and re-resolve active from the
             // canonical — BEFORE looping back to re-tick.
             Idle::ManualSwapped => daemon.adopt_manual_swap().await,
+            // Reload + reconcile the in-memory roster to the freshly-written
+            // `config.toml` (#139) — the onboarded / relogged-in / removed account is
+            // adopted into the live rotation — BEFORE looping back to re-tick.
+            Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
             Idle::Elapsed => {}
         }
     }
@@ -3260,6 +3473,33 @@ mod tests {
         }
     }
 
+    /// A control seam that yields `RosterReloadRequested` exactly once, then never
+    /// resolves (issue #139) — so the run loop reloads the roster on its first idle,
+    /// then idles normally on every later poll. The roster-reload analog of
+    /// [`OnceManualSwap`]: drives the live `Idle::RosterReloadRequested =>
+    /// adopt_roster_reload` wiring that `NoControl` never does.
+    struct OnceRosterReload {
+        fired: Cell<bool>,
+    }
+
+    impl OnceRosterReload {
+        fn new() -> Self {
+            Self {
+                fired: Cell::new(false),
+            }
+        }
+    }
+
+    impl Control for OnceRosterReload {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                Some(ControlSignal::RosterReloadRequested)
+            }
+        }
+    }
+
     // --- builders ----------------------------------------------------------
 
     fn account(uuid: &str, label: &str) -> Account {
@@ -3366,6 +3606,22 @@ mod tests {
     }
 
     type FakeDaemon = Daemon<FakeRosterPoller, FakeCredentialStore, FakeAccountStash, FakeClock>;
+
+    /// Write a minimal valid `config.toml` at `path` carrying `accounts` as `(uuid,
+    /// label)` pairs — the on-disk fixture the runtime roster-reload (#139) re-reads.
+    /// Tunables are omitted (they default via `#[serde(default)]`), so this exercises
+    /// the exact `Config::load_path` path `adopt_roster_reload` takes. Written in one
+    /// `std::fs::write`, so a reader sees a complete file (production's atomic rename
+    /// gives the same all-or-nothing guarantee).
+    fn write_roster_config(path: &Path, accounts: &[(&str, &str)]) {
+        let mut toml = String::new();
+        for (uuid, label) in accounts {
+            toml.push_str(&format!(
+                "[[account]]\naccount_uuid = \"{uuid}\"\nlabel = \"{label}\"\nenabled = true\n\n"
+            ));
+        }
+        std::fs::write(path, toml).unwrap();
+    }
 
     /// Drive the staggered daemon (issue #80) through one full warm-up cycle — one
     /// tick per in-rotation account — and return the LAST tick's outcome. By then
@@ -6992,6 +7248,356 @@ mod tests {
             "the ManualSwapped signal must arm the cooldown via adoption"
         );
         assert_eq!(daemon.state.active, Some(0));
+    }
+
+    // --- runtime roster-reload (issue #139) --------------------------------
+
+    /// A minimal daemon for the pure [`reconcile_roster`] tests (#139): reconcile
+    /// touches no seam (no poll / store / clock / json read), so inert fixtures and a
+    /// throwaway `claude_json` path suffice. State is seeded directly on `daemon.state`.
+    fn reconcile_daemon(roster: Vec<Account>) -> FakeDaemon {
+        let tun = tunables(95, 80, 100);
+        Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            FakeCredentialStore::empty(),
+            FakeAccountStash::empty(),
+            FakeClock::frozen(),
+            PathBuf::from("unused-by-reconcile"),
+            &tun,
+        )
+    }
+
+    /// A carried usage reading for seeding `last_readings` in the reconcile tests.
+    fn reading(session: f64, weekly: f64) -> Usage {
+        Usage {
+            session,
+            weekly,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        }
+    }
+
+    fn roster_uuids(daemon: &FakeDaemon) -> Vec<String> {
+        daemon
+            .roster
+            .iter()
+            .map(|a| a.account_uuid.clone())
+            .collect()
+    }
+
+    #[test]
+    fn reconcile_roster_onboards_a_new_account_and_preserves_the_rest() {
+        // AC: after an onboard, the daemon's in-memory roster reflects the new account
+        // — appended with DEFAULT state — while every persisting account keeps its
+        // carried health / reading / warm-up state (a capture of ANOTHER account must
+        // not reset a healthy one).
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true; // A carries a distinctive health mark
+        daemon.state.last_readings[1] = Some(reading(0.30, 0.40)); // B carries a reading
+        daemon.state.polled_once = vec![true, true];
+
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+
+        // The new account is now in the live roster…
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
+        // …with every parallel state array grown to match (no length skew).
+        assert_eq!(daemon.state.health.len(), 3);
+        assert_eq!(daemon.state.last_readings.len(), 3);
+        assert_eq!(daemon.state.polled_once.len(), 3);
+        // Persisting accounts keep their carried state.
+        assert!(daemon.state.health[0].quarantined, "A's health preserved");
+        assert_eq!(
+            daemon.state.last_readings[1],
+            Some(reading(0.30, 0.40)),
+            "B's reading preserved"
+        );
+        // The onboarded account joins with DEFAULT state (unpolled, no reading, healthy).
+        assert!(!daemon.state.health[2].quarantined);
+        assert_eq!(daemon.state.last_readings[2], None);
+        assert!(!daemon.state.polled_once[2]);
+        // Active (A) is unchanged — an append never shifts existing indices.
+        assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[test]
+    fn reconcile_roster_preserves_state_on_a_relogin_that_updates_the_label() {
+        // A relogin of an EXISTING account (same account_uuid) updates the roster
+        // CONTENT (e.g. a renamed label) without duplicating the entry, and preserves
+        // the account's carried decision state. (Un-quarantine on relogin is the
+        // daemon's separate canonical-change path #107, not reconcile's job.)
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.last_readings[1] = Some(reading(0.11, 0.22));
+        daemon.state.health[1].recovery_successes = 2;
+
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            account("u-B", "spare-renamed"),
+        ]);
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B"], "no duplicate");
+        assert_eq!(daemon.roster[1].label, "spare-renamed", "label updated");
+        assert_eq!(
+            daemon.state.last_readings[1],
+            Some(reading(0.11, 0.22)),
+            "carried reading preserved across the relogin"
+        );
+        assert_eq!(
+            daemon.state.health[1].recovery_successes, 2,
+            "health preserved"
+        );
+    }
+
+    #[test]
+    fn reconcile_roster_drops_a_removed_account_and_its_state() {
+        // A `remove` on disk drops the account (and its state) from the live rotation;
+        // the survivors keep their carried state, re-keyed by uuid across the gap.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+        daemon.state.active = Some(0);
+        daemon.state.last_readings[0] = Some(reading(0.10, 0.10)); // A reading
+        daemon.state.health[2].recovery_successes = 3; // C health mark
+
+        daemon.reconcile_roster(vec![account("u-A", "work"), account("u-C", "third")]);
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-C"], "B dropped");
+        assert_eq!(daemon.state.health.len(), 2);
+        // A (still index 0) keeps its reading; C (now index 1) keeps its health mark.
+        assert_eq!(daemon.state.last_readings[0], Some(reading(0.10, 0.10)));
+        assert_eq!(
+            daemon.state.health[1].recovery_successes, 3,
+            "C re-keyed by uuid"
+        );
+        assert_eq!(daemon.state.active, Some(0), "active A preserved");
+    }
+
+    #[test]
+    fn reconcile_roster_remaps_active_across_an_index_shift() {
+        // The active account is re-resolved by uuid, not by stale index: removing an
+        // EARLIER account shifts the active account's index, and reconcile follows it.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+        daemon.state.active = Some(2); // C is active at index 2
+
+        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]); // A removed
+
+        // C is now at index 1 — active tracks the uuid, not the old slot.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[test]
+    fn reconcile_roster_drops_active_to_none_when_the_active_account_is_removed() {
+        // Removing the ACTIVE account leaves active `None` — the next tick re-resolves
+        // active from the canonical credential (polls-without-swapping meanwhile).
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.active = Some(0); // A active
+
+        daemon.reconcile_roster(vec![account("u-B", "spare")]); // A removed
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-B"]);
+        assert_eq!(daemon.state.active, None);
+    }
+
+    #[test]
+    fn reconcile_roster_to_an_empty_roster_clears_active_and_state() {
+        // Reachable edge: removing the LAST account (a `remove` of the final entry)
+        // reconciles to an empty roster — every parallel array empties and active drops
+        // to `None`. A degenerate-but-valid runtime state (the daemon then polls
+        // nothing); it must not panic on the length-zero reshape.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+        daemon.state.active = Some(0);
+        daemon.state.last_readings[0] = Some(reading(0.10, 0.10));
+
+        daemon.reconcile_roster(vec![]);
+
+        assert!(daemon.roster.is_empty());
+        assert!(daemon.state.health.is_empty());
+        assert!(daemon.state.last_readings.is_empty());
+        assert!(daemon.state.polled_once.is_empty());
+        assert_eq!(daemon.state.active, None);
+    }
+
+    #[test]
+    fn reconcile_roster_resets_the_stale_poll_schedule() {
+        // The staggered poll schedule holds OLD roster indices; reconcile clears it so
+        // `next_poll_index` rebuilds a fresh one (over the new roster) next cycle,
+        // rather than indexing the reshaped roster with a stale cursor.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.poll_schedule = vec![0, 1];
+        daemon.state.poll_pos = 1;
+
+        daemon.reconcile_roster(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+
+        assert!(daemon.state.poll_schedule.is_empty(), "schedule reset");
+        assert_eq!(daemon.state.poll_pos, 0, "cursor reset");
+    }
+
+    #[test]
+    fn control_reply_roster_reload_authenticated_signals_a_reload() {
+        // Issue #139: an authenticated same-user peer's `roster-reload` acks and yields
+        // the `RosterReloadRequested` signal the run loop acts on.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"roster-reload"}"#, &snap, true);
+        assert_eq!(reply, r#"{"ok":true}"#);
+        assert_eq!(signal, Some(ControlSignal::RosterReloadRequested));
+    }
+
+    #[test]
+    fn control_reply_roster_reload_unauthenticated_is_refused_with_no_signal() {
+        // Issue #139: `roster-reload` is state-affecting, so an UNauthenticated peer is
+        // refused and produces NO signal — a stranger can never make the daemon re-read
+        // its config (mirrors the `manual-swapped` #64 auth gate).
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"roster-reload"}"#, &snap, false);
+        assert_eq!(reply, r#"{"error":"unauthorized"}"#);
+        assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_reads_the_new_roster_from_disk() {
+        // AC (end-to-end, no torn read): with a config path wired, the reload re-reads
+        // the freshly-written `config.toml` and reconciles the in-memory roster to it —
+        // onboarding the new account while preserving a persisting account's state. The
+        // on-disk file is written whole, exactly as production's atomic rename leaves it.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(
+            &config_path,
+            &[("u-A", "work"), ("u-B", "spare"), ("u-C", "third")],
+        );
+
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
+                .with_config_path(config_path);
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true; // A's state must survive the reload
+
+        daemon.adopt_roster_reload().await;
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
+        assert!(daemon.state.health[0].quarantined, "A's state preserved");
+        assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_keeps_the_current_roster_on_a_malformed_config() {
+        // Best-effort: a malformed / mid-edit `config.toml` never drops the live
+        // rotation — the current in-memory roster is kept and the reload is skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, b"]not valid toml[").unwrap();
+
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
+                .with_config_path(config_path);
+
+        daemon.adopt_roster_reload().await;
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "roster unchanged on a bad read"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_is_a_noop_without_a_config_path() {
+        // With no config path wired (the hermetic default), a reload signal is a silent
+        // no-op — there is nothing to read, and the roster is left as-is.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+
+        daemon.adopt_roster_reload().await;
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
+    }
+
+    #[tokio::test]
+    async fn run_loop_adopts_a_roster_reload_signal_through_the_idle_select() {
+        // Issue #139: the run loop's idle select must route a `RosterReloadRequested`
+        // control signal into `adopt_roster_reload` — proving the whole daemon-side
+        // chain (signal → idle break → disk re-read → reconcile) end-to-end, the one
+        // wiring `NoControl`-based tests leave undriven. A regression turning the
+        // `Some(RosterReloadRequested) => break` arm into a `continue` would leave the
+        // in-memory roster at its startup two accounts and fail this test.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(
+            &config_path,
+            &[("u-A", "work"), ("u-B", "spare"), ("u-C", "third")],
+        );
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_json_dir, json) = claude_json("u-A");
+        // Holds-only readings so no swap perturbs the idle path.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path);
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "startup roster is the two captured accounts"
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // Tick 1 → idle delivers `RosterReloadRequested` (reload) → tick 2 → shutdown.
+        // after(3): 1 start-up check (pends) + 2 idle shutdown-checks.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = OnceRosterReload::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+        )
+        .await
+        .unwrap();
+
+        // The signal reached `adopt_roster_reload` through the idle select: the daemon
+        // re-read `config.toml` and the third account is now in the LIVE rotation — no
+        // restart.
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B", "u-C"],
+            "the onboarded account joined the live rotation without a restart"
+        );
     }
 
     #[tokio::test]

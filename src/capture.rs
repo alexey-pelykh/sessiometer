@@ -91,6 +91,9 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     .await?;
 
     report.config.save()?;
+    // Tell a running daemon to pick up the new roster now (#139) — best-effort, so no
+    // daemon (or a wedged one) never blocks capture; the disk write is authoritative.
+    notify_daemon_roster_reload().await;
     println!(
         "{}",
         confirmation(report.outcome, &report.label, report.count)
@@ -178,6 +181,33 @@ pub(crate) async fn login(label: Option<String>) -> Result<()> {
 fn emit_login_event(account: Option<String>, outcome: LoginEventOutcome) {
     if let Ok(mut log) = EventLog::open() {
         let _ = log.emit(&Event::Login { account, outcome });
+    }
+}
+
+/// Best-effort notify a running daemon that the on-disk roster changed (issue #139):
+/// resolve the control socket and send `roster-reload` so the daemon reconciles its
+/// in-memory rotation to the freshly-written `config.toml` WITHOUT a restart. Called by
+/// every roster-write verb — [`capture`], the [`reconcile_login`] path (`login`), and
+/// `remove` — AFTER the `config.toml` save committed, so the daemon re-reads the
+/// authoritative new file.
+///
+/// BEST-EFFORT, exactly like the `use` manual-hold notify (#64): the on-disk write is
+/// authoritative (the roster change already succeeded), so a failure — no daemon
+/// running (connect refused / socket absent), a timeout, an unresolvable socket path —
+/// is logged and ignored, never failing the verb. With no daemon running there is
+/// nothing to keep stale: the next `run` loads the fresh roster at startup.
+pub(crate) async fn notify_daemon_roster_reload() {
+    let socket = match paths::control_socket() {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!(
+                "sessiometer: roster-reload notify skipped (cannot resolve control socket): {err}"
+            );
+            return;
+        }
+    };
+    if let Err(err) = crate::daemon::notify_roster_reload(&socket).await {
+        eprintln!("sessiometer: roster-reload notify skipped (is the daemon running?): {err}");
     }
 }
 
@@ -530,6 +560,9 @@ pub(crate) async fn reconcile_login(
     .await?;
 
     report.config.save()?;
+    // Tell a running daemon to pick up the onboarded / relogged-in account now (#139) —
+    // best-effort, the login already committed to disk.
+    notify_daemon_roster_reload().await;
     Ok((report.outcome, report.label, report.count))
 }
 

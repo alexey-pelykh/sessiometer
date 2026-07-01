@@ -270,7 +270,11 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         paths::claude_json()?,
         &config.tunables,
     )
-    .with_swap_lock(paths::swap_lock()?);
+    .with_swap_lock(paths::swap_lock()?)
+    // Re-read this on a runtime roster-reload (#139): a `capture` / `login` / `remove`
+    // notifies the daemon over the control socket, which then reconciles the in-memory
+    // rotation to the freshly-written `config.toml` without a restart.
+    .with_config_path(paths::config_file()?);
     let mut shutdown = RealShutdown::new()?;
 
     eprintln!(
@@ -1551,6 +1555,9 @@ async fn remove_account(label: Option<String>) -> Result<()> {
     // Then delete the now-unreferenced stash — both halves, idempotent. The
     // service name is derived from the removed account's uuid (issue #70).
     RealAccountStash::new().delete(&removed.stash()).await?;
+    // Tell a running daemon to drop the removed account from its live rotation now
+    // (#139) — best-effort, so it never swaps to an account whose stash is gone.
+    crate::capture::notify_daemon_roster_reload().await;
     println!("{}", remove_confirmation(&label));
     Ok(())
 }
