@@ -376,6 +376,32 @@ pub(crate) enum Error {
     )]
     ClaudeBinaryNotFound,
 
+    // --- Isolated interactive-login capture (issue #132) ----------------------
+    /// The login-capture engine spawns `claude /login` inheriting the operator's
+    /// terminal so the OAuth URL + prompts render directly to them (issue #132) —
+    /// which requires a real TTY on stdout. When stdout is NOT a terminal (a pipe,
+    /// a file, a CI runner), the engine ABORTS rather than allocate a mediated pty
+    /// the operator could not interact with. Secret-free — a precondition failure,
+    /// never a credential.
+    #[error(
+        "cannot capture an interactive login: stdout is not a terminal — run `capture-login` \
+         from an interactive terminal (it drives `claude /login` on your own TTY)"
+    )]
+    LoginRequiresTty,
+
+    /// SAFETY ALARM (issue #132): the shared `Claude Code-credentials` item that a
+    /// live Claude Code session reads per-request changed DURING an isolated login
+    /// capture — its baseline hash before the spawn no longer matches after. The
+    /// isolation premise (the spawned `claude /login` writes ONLY the suffixed
+    /// isolated item — `build/version-compat.md` #130) was violated, so the engine
+    /// refuses to harvest and surfaces the breach loudly. Secret-free — the mutation
+    /// is detected via non-secret sha256 hashes, never by exposing either blob.
+    #[error(
+        "aborting login capture: the shared `Claude Code-credentials` item changed during the \
+         isolated login — refusing to proceed (the live session's credential must stay untouched)"
+    )]
+    SharedCredentialMutated,
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
