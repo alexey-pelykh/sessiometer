@@ -1,6 +1,9 @@
 ## Project-specific
 *.local.*
 
+# Agent/operation scratch space (roadmaps, command output, escalations, intent files)
+.tmp/
+
 # Environment variables and secrets
 .env
 .env.local
