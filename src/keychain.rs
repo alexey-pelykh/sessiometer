@@ -255,6 +255,14 @@ impl CanonicalWatch {
     pub(crate) fn commit(&mut self, current: &Credential) {
         self.last = Some(current.clone());
     }
+
+    /// The last committed canonical blob (a read-only clone), or `None` before the first
+    /// commit. The external-login watch (issue #140) snapshots this before the idle to tell an
+    /// out-of-band write it reads during the idle from the daemon's own last-committed
+    /// canonical — WITHOUT advancing the baseline (that stays [`commit`](Self::commit)'s job).
+    pub(crate) fn baseline(&self) -> Option<Credential> {
+        self.last.clone()
+    }
 }
 
 /// Seam: reads/writes the active credential. The real impl drives the macOS
@@ -1189,6 +1197,28 @@ class: "genp"
         assert_eq!(
             watch.classify(&cred(b"C-from-a-concurrent-login")),
             CanonicalChange::Changed
+        );
+    }
+
+    #[test]
+    fn canonical_watch_baseline_exposes_the_last_committed_blob() {
+        // Issue #140: the external-login watch snapshots the last-committed baseline (read-only)
+        // to compare an idle-time canonical read against. `None` before the first commit; the
+        // committed blob after; a later commit advances it — and reading it never advances it.
+        let mut watch = CanonicalWatch::new();
+        assert!(
+            watch.baseline().is_none(),
+            "no baseline before the first commit"
+        );
+        watch.commit(&cred(b"A-token"));
+        assert_eq!(watch.baseline().unwrap().expose(), b"A-token");
+        watch.commit(&cred(b"B-token"));
+        assert_eq!(watch.baseline().unwrap().expose(), b"B-token");
+        // Read-only: taking the baseline does not move it, so the next classify is unaffected.
+        let _ = watch.baseline();
+        assert_eq!(
+            watch.classify(&cred(b"B-token")),
+            CanonicalChange::Unchanged
         );
     }
 

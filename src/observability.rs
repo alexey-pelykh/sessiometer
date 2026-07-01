@@ -351,6 +351,15 @@ pub(crate) enum Event {
     /// `since` is the epoch second the current gap streak began (rendered to RFC 3339), fixed
     /// across a streak's re-emissions so the line reads "gapping since X".
     UsageGap { account: String, since: i64 },
+    /// An out-of-band `claude /login` rewrote the canonical credential to a token that maps to
+    /// NO roster account — an UN-CAPTURED login the daemon detected but does NOT auto-onboard
+    /// (issue #140 scope decision: `sessiometer login` is the sanctioned capture path). Surfaced
+    /// so the operator knows to run it. Edge-triggered: emitted ONCE per distinct un-captured
+    /// login (the daemon commits the canonical baseline after surfacing, so the same blob is not
+    /// re-detected). `account_uuid` is the displayed `accountUuid` when readable — a redacted,
+    /// non-PII handle (as #135's post-harvest `Login` uses), never a token or email — and `None`
+    /// (the field omitted) when the display identity could not be read.
+    UncapturedLogin { account_uuid: Option<String> },
 }
 
 impl Event {
@@ -470,6 +479,14 @@ impl Event {
                 let since = rfc3339(system_time_from_epoch(*since));
                 format!("ts={ts} event=usage_gap acct={account} since={since}")
             }
+            Event::UncapturedLogin { account_uuid } => match account_uuid {
+                // The `acct=` handle is omitted when the display identity was unreadable — an
+                // empty value would split the `key=val` grammar (mirrors `all_exhausted`'s
+                // optional `resets_at`). The uuid is a redacted, non-PII handle (never a token
+                // or email — the #15 single-surface guarantee).
+                Some(uuid) => format!("ts={ts} event=uncaptured_login acct={uuid}"),
+                None => format!("ts={ts} event=uncaptured_login"),
+            },
         }
     }
 }
@@ -1205,6 +1222,29 @@ mod tests {
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
             assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
         }
+    }
+
+    #[test]
+    fn uncaptured_login_renders_with_and_without_the_uuid() {
+        // Issue #140: an un-captured login surfaces the displayed uuid as an `acct=` handle when
+        // readable, and omits the field entirely when it is not (an empty value would split the
+        // `key=val` grammar — the same optional-field discipline as `all_exhausted`'s `resets_at`).
+        let with_uuid = Event::UncapturedLogin {
+            account_uuid: Some("u-Z".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(with_uuid, format!("{TS0} event=uncaptured_login acct=u-Z"));
+
+        let without_uuid = Event::UncapturedLogin { account_uuid: None }.to_log_line(at_epoch(0));
+        assert_eq!(without_uuid, format!("{TS0} event=uncaptured_login"));
+
+        // The #15 single-surface guarantee: the only free field is the redacted uuid handle —
+        // never an email or token.
+        assert!(!with_uuid.contains('@'), "no email may appear: {with_uuid}");
+        assert!(
+            !with_uuid.contains("token"),
+            "no token may appear: {with_uuid}"
+        );
     }
 
     #[test]
