@@ -25,8 +25,9 @@
 //!   `day`, daily otherwise), the time-ordered points a chart plots.
 //!
 //! The human render is terminal CHARTS on an interactive TTY (issue #159) and the NUMERIC
-//! text table (the summary table + a roster line + the resolved-window echo in local time)
-//! when stdout is not one — a pipe / redirect keeps the plain, greppable numbers. `--json`
+//! text table (the summary table + a neutral summary band + a roster line + the
+//! resolved-window echo in local time) when stdout is not one — a pipe / redirect keeps the
+//! plain, greppable numbers. Both views foot with the same summary band (issue #160). `--json`
 //! emits the versioned, stable `schema:1` wire contract (full series + summary + neutral
 //! descriptor enums; redacted handles only), never charted, never coloured.
 //!
@@ -35,10 +36,12 @@
 //! The terminal CHARTS (issue #159) live in the `rendering: terminal charts` section below:
 //! they render the same `series` / `summary` the base verb computed — nothing is
 //! re-aggregated, the store is not re-read — presentation-only, so the `--json` wire is
-//! byte-for-byte the #158 contract (no chart glyph reaches it). Still to come is the neutral
-//! SIGNAL summary (#160), which annotates the `summary` off the neutral per-account
-//! descriptor enums (`band`, `coverage_class`) the wire already carries and deliberately
-//! adds no recommendation field. `HistoryStore::read_rollup` also exposes the lifetime daily
+//! byte-for-byte the #158 contract (no chart glyph reaches it). The neutral SIGNAL summary
+//! (issue #160) is the `rendering: neutral summary band` section: it foots BOTH human views
+//! with a symmetric, facts-only band derived from the neutral per-account descriptor enums
+//! (`band`, `coverage_class`) the wire already carries — no projection, no recommendation,
+//! and (like the charts) no new wire field, so `--json` stays byte-for-byte stable.
+//! `HistoryStore::read_rollup` also exposes the lifetime daily
 //! tier as a seam for deep-history charts (that tier is roster-wide, so it cannot back a
 //! per-account series; here it only anchors the `lifetime` window start).
 //!
@@ -542,11 +545,11 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 
 // --- rendering: numeric text ------------------------------------------------
 
-/// Render the numeric text view: the window echo, the per-account summary table, and the
-/// roster line. This is the NON-TTY surface (issue #159): a piped / redirected `stats`
-/// renders exactly this — plain, greppable, zero ANSI, no chart glyph — while an
-/// interactive TTY gets [`render_charts`]. Carries no recommendation (issue #160): just
-/// numbers.
+/// Render the numeric text view: the window echo, the per-account summary table, the
+/// neutral summary band (issue #160), and the roster line. This is the NON-TTY surface
+/// (issue #159): a piped / redirected `stats` renders exactly this — plain, greppable, zero
+/// ANSI, no chart glyph — while an interactive TTY gets [`render_charts`]. Reports only
+/// magnitudes and neutral descriptors — no recommendation, no forecast (issue #160).
 fn render_text(report: &Report) -> String {
     let mut out = String::new();
     let label = format_window_label(&report.window, report.offset);
@@ -584,6 +587,13 @@ fn render_text(report: &Report) -> String {
     }
 
     out.push('\n');
+    // The neutral summary band (issue #160), then the roster line. The numeric text is the
+    // NON-TTY surface, so the band renders WITHOUT colour (zero ANSI on a pipe).
+    let band = render_summary(report, false);
+    if !band.is_empty() {
+        out.push_str(&band);
+        out.push('\n');
+    }
     out.push_str(&roster_line(&summary.roster));
     out
 }
@@ -645,6 +655,129 @@ fn fmt_dur(secs: i64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+// --- rendering: neutral summary band (issue #160) ---------------------------
+//
+// A concise, NEUTRAL summary of the period, footing the human views (the numeric text
+// table and the charts) just above the roster line. It reports MAGNITUDES and neutral
+// descriptor words only — no projection, no recommendation, no value judgement (the
+// `summary_render_carries_no_banned_token` guard test enforces that vocabulary against a
+// central banned list). Underuse and saturation are SYMMETRIC: both are equal-weight
+// deviations from the balanced middle, drawn with the SAME emphasis — underuse is not
+// "green for good", saturation is not "red for alarm". Colour merely augments; the
+// descriptor WORD carries the full signal, so a no-colour reader loses nothing. The final
+// wording is PROVISIONAL pending a brand/framing review (issue #160) — centralised in
+// [`SignalBand::label`] for a one-line swap — and it never reaches the `--json` wire,
+// which keeps the finer #159 `band` / `coverage_class` enums byte-for-byte unchanged.
+
+/// A neutral, SYMMETRIC utilisation signal collapsed from the wire's [`Band`]: the two
+/// deviations from the balanced middle carry identical weight — neither is "good" nor
+/// "bad", neither is an alarm. Human-render only; the `--json` wire keeps the finer
+/// [`Band`], so this is the summary band's presentation of the SAME underlying magnitude
+/// (the two can never disagree on a reading — see [`SignalBand::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalBand {
+    /// Below the balanced middle — collapses [`Band::Idle`] / [`Band::Low`].
+    Underused,
+    /// The balanced middle — [`Band::Moderate`].
+    Balanced,
+    /// Above the balanced middle — collapses [`Band::High`] / [`Band::AtCap`].
+    Saturated,
+}
+
+impl SignalBand {
+    /// Collapse a session-peak fraction into the symmetric signal THROUGH the wire
+    /// [`Band`], so the summary band and the JSON `band` field are always consistent on the
+    /// same reading (one threshold definition, two presentations).
+    fn of(session_peak: f64) -> Self {
+        match Band::of(session_peak) {
+            Band::Idle | Band::Low => Self::Underused,
+            Band::Moderate => Self::Balanced,
+            Band::High | Band::AtCap => Self::Saturated,
+        }
+    }
+
+    /// The PROVISIONAL descriptor word (final copy pending a brand/framing review, issue
+    /// #160). Neutral magnitude vocabulary only — no imperative, forecast, or value
+    /// judgement. Centralised here so a copy change is a one-line swap.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Underused => "underused",
+            Self::Balanced => "balanced",
+            Self::Saturated => "saturated",
+        }
+    }
+
+    /// The SYMMETRIC emphasis SGR: BOTH deviations share ONE "notable" colour (identical
+    /// visual weight — underuse and saturation are equal-weight departures from balanced),
+    /// while the balanced middle is un-emphasised. An empty string means no colour wrap.
+    /// Emitted only when the shared colour gate is open (issue #15: carries no secret).
+    fn sgr(self) -> &'static str {
+        match self {
+            Self::Underused | Self::Saturated => "33",
+            Self::Balanced => "",
+        }
+    }
+}
+
+/// The neutral summary band for the human views (issue #160): a per-account symmetric
+/// signal line, then the lowest-utilisation callout. Returns an EMPTY string when there is
+/// nothing to summarise (an empty roster), so a caller can append it unconditionally. Pure
+/// over `color` (the shared gate), so the band is golden-testable with and without ANSI.
+/// Facts only — magnitudes and neutral descriptors, never a recommendation or forecast.
+fn render_summary(report: &Report, color: bool) -> String {
+    // OBSERVED accounts only — gap honesty. An account can be in the summary with `seen ==
+    // 0` (it held the active credential but the daemon polled a different one), its readings
+    // zeroed rather than measured; banding that as "underused" or ranking its fabricated 0%
+    // as the lowest would invent a low reading the aggregator deliberately never does. The
+    // band summarises what was MEASURED, so an unmeasured account is simply not in it.
+    let observed: Vec<(&String, &AccountStats)> = report
+        .summary
+        .per_account
+        .iter()
+        .filter(|(_, a)| a.seen > 0)
+        .collect();
+    if observed.is_empty() {
+        return String::new();
+    }
+
+    // Per-account signal, symmetric emphasis. The band is keyed on the session PEAK — the
+    // same basis as the wire's #159 `band` — so the two views classify a reading alike.
+    let signals: Vec<String> = observed
+        .iter()
+        .map(|(handle, a)| {
+            let band = SignalBand::of(a.session.peak);
+            let word = band.label();
+            match (color, band.sgr()) {
+                (true, sgr) if !sgr.is_empty() => format!("{handle} \x1b[{sgr}m{word}\x1b[0m"),
+                _ => format!("{handle} {word}"),
+            }
+        })
+        .collect();
+
+    // Lowest-utilisation account: the smallest session MEAN among the observed — a
+    // magnitude, not a verdict. The handle breaks ties, so the pick is deterministic.
+    let lowest = observed
+        .iter()
+        .min_by(|a, b| {
+            a.1.session
+                .mean
+                .total_cmp(&b.1.session.mean)
+                .then_with(|| a.0.cmp(b.0))
+        })
+        .map(|(handle, a)| {
+            format!(
+                "lowest utilisation: {handle} (session mean {}%)",
+                pct(a.session.mean)
+            )
+        });
+
+    let mut out = format!("signal  {}\n", signals.join(" · "));
+    if let Some(lowest) = lowest {
+        out.push_str(&format!("        {lowest}\n"));
+    }
+    out
 }
 
 // --- rendering: local-time window echo --------------------------------------
@@ -1345,6 +1478,14 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
         out.push_str(&block);
     }
     out.push('\n');
+    // The neutral summary band (issue #160), then the roster line. Honours the shared
+    // colour gate (symmetric emphasis when open; the descriptor word still carries the
+    // signal when closed).
+    let band = render_summary(report, color);
+    if !band.is_empty() {
+        out.push_str(&band);
+        out.push('\n');
+    }
     out.push_str(&roster_line(&report.summary.roster));
     out
 }
@@ -2191,5 +2332,467 @@ mod tests {
             "at_cap",
             "over-cap readings are reported, not clamped"
         );
+    }
+
+    // --- issue #160: neutral summary band + framing guard =============================
+
+    /// Three accounts spanning the whole symmetric signal: `aa` under the balanced middle
+    /// (peak 0.15 → underused), `bb` in it (peak 0.60 → balanced), `cc` above it (peak 0.95
+    /// → saturated). `aa` also has the lowest session mean, so it is the lowest-utilisation
+    /// callout. Sorted handles make the render deterministic.
+    fn three_band_report() -> Report {
+        charts_report(
+            &[
+                ("aa", stat(3, ds(0.10, 0.15, 0.12), 0.0, 0.30)),
+                ("bb", stat(3, ds(0.45, 0.60, 0.55), 0.0, 0.30)),
+                ("cc", stat(3, ds(0.70, 0.95, 0.90), 0.0, 0.40)),
+            ],
+            &[],
+        )
+    }
+
+    /// A minimal, fully-deterministic report exercising every `--json` wire field once —
+    /// one account (band `high`, coverage `complete`), one series bucket, a session swap,
+    /// and a UTC (offset 0) `day` window. Small enough to freeze byte-for-byte.
+    fn wire_golden_report() -> Report {
+        let acct = AccountStats {
+            seen: 3,
+            expected: 3.0,
+            coverage: 1.0,
+            session: ds(0.50, 0.90, 0.85),
+            weekly: ds(0.30, 0.40, 0.38),
+            cap_hits: 1,
+            time_at_cap_secs: 300,
+            contribution_share: 1.0,
+        };
+        let roster = RosterStats {
+            swap_count: 1,
+            swaps: crate::usage_stats::SwapBreakdown {
+                session: 1,
+                ..Default::default()
+            },
+            all_high_episodes: 0,
+            all_high_secs: 0,
+        };
+        let bucket = |start, end| UsageReport {
+            period: Period::new(start, end),
+            per_account: [("work".to_string(), acct)].into_iter().collect(),
+            roster,
+        };
+        Report {
+            window: Window {
+                start: epoch("2026-07-01T00:00:00Z"),
+                end: epoch("2026-07-01T12:00:00Z"),
+                kind: WindowKind::Period(PeriodSpec::Day),
+            },
+            accounts: vec![],
+            summary: bucket(0, 6 * HOUR_SECS),
+            series: vec![bucket(0, 6 * HOUR_SECS)],
+            offset: 0,
+        }
+    }
+
+    // --- the framing guard: a CENTRAL banned vocabulary + its scanner ----------------
+
+    /// The editorialising / recommendation / forecast vocabulary the neutral summary band
+    /// (issue #160) must NEVER contain — a value judgement (`healthy`, `danger`), an
+    /// imperative (`add`, `upgrade`), a recommendation (`should`, `recommend`), or a
+    /// projection (`forecast`, `predict`). CENTRAL + explicit so the guard stays
+    /// maintainable: one list, one scanner, extended in a single place. Neutral MAGNITUDE
+    /// words the wire legitimately uses (`idle`/`low`/`moderate`/`high`/`at_cap`) are
+    /// deliberately absent — they describe, they do not editorialise.
+    const BANNED_TOKENS: &[&str] = &[
+        // Imperatives / recommended actions (issue #160: "add / buy / upgrade / cancel /
+        // bypass / need more").
+        "add",
+        "buy",
+        "upgrade",
+        "cancel",
+        "bypass",
+        "need",
+        "purchase",
+        "remove",
+        "disable",
+        "enable",
+        "fix",
+        "avoid",
+        "reduce",
+        "increase",
+        "throttle",
+        "rotate",
+        // Value judgements (caller: "healthy / at risk / warning / danger / good / bad").
+        "healthy",
+        "unhealthy",
+        "risk",
+        "risky",
+        "warning",
+        "warn",
+        "danger",
+        "dangerous",
+        "good",
+        "bad",
+        "critical",
+        "severe",
+        "poor",
+        "safe",
+        "unsafe",
+        "optimal",
+        // Recommendation framing (caller: "you should").
+        "should",
+        "must",
+        "ought",
+        "recommend",
+        "recommended",
+        "recommendation",
+        "suggest",
+        "suggestion",
+        "consider",
+        "advise",
+        "advice",
+        // Projections / forecasts (issue #160: "no projections / forecasts").
+        "forecast",
+        "predict",
+        "prediction",
+        "projected",
+        "projection",
+        "anticipate",
+        "imminent",
+        "soon",
+    ];
+
+    /// The first banned token appearing in `text`, or `None` when it is clean. Strips ANSI
+    /// SGR runs first (so a colour-wrapped word tokenises intact), then matches whole
+    /// lowercase WORDS on non-alphanumeric boundaries — so `at-risk`, `At Risk`, and
+    /// `risk!` all trip `risk`, while `saturated` or an account handle never false-trips.
+    fn scan_banned(text: &str) -> Option<&'static str> {
+        let mut plain = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Drop the SGR sequence up to and including its `m` terminator.
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        let words: std::collections::HashSet<String> = plain
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        BANNED_TOKENS.iter().copied().find(|b| words.contains(*b))
+    }
+
+    /// Every object key in `v`, recursively — the surface the `--json` banned-token scan
+    /// covers (the wire's VALUES are numbers and neutral descriptor enums; the KEYS are the
+    /// authored field names).
+    fn json_keys(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    out.push(k.clone());
+                    json_keys(child, out);
+                }
+            }
+            serde_json::Value::Array(arr) => arr.iter().for_each(|e| json_keys(e, out)),
+            _ => {}
+        }
+    }
+
+    // --- AC: symmetric emphasis, facts only, deterministic render --------------------
+
+    #[test]
+    fn summary_band_is_neutral_symmetric_and_deterministic() {
+        // The whole band, frozen: a per-account signal line (underused · balanced ·
+        // saturated) then the lowest-utilisation callout — MAGNITUDES and neutral
+        // descriptors only, no imperative, no forecast, no verdict.
+        assert_eq!(
+            render_summary(&three_band_report(), false),
+            "signal  aa underused · bb balanced · cc saturated\n        lowest utilisation: aa (session mean 10%)\n",
+        );
+    }
+
+    #[test]
+    fn summary_band_gives_underuse_and_saturation_identical_emphasis() {
+        // AC 1 — symmetric emphasis. At the vocabulary level the two DEVIATIONS share one
+        // urgency-colour code (identical visual weight) while the balanced middle is
+        // un-emphasised: underuse is not "green for good", saturation not "red for alarm".
+        assert_eq!(
+            SignalBand::Underused.sgr(),
+            SignalBand::Saturated.sgr(),
+            "underuse and saturation carry the SAME emphasis"
+        );
+        assert!(
+            !SignalBand::Underused.sgr().is_empty(),
+            "the deviations are emphasised"
+        );
+        assert!(SignalBand::Balanced.sgr().is_empty(), "the middle is not");
+
+        // And in the rendered band: both deviation words are wrapped in the identical SGR,
+        // the middle word is plain — proof the colour half is symmetric too.
+        let colored = render_summary(&three_band_report(), true);
+        assert!(colored.contains("aa \x1b[33munderused\x1b[0m"));
+        assert!(colored.contains("cc \x1b[33msaturated\x1b[0m"));
+        assert!(
+            colored.contains("· bb balanced ·"),
+            "balanced is not colour-wrapped"
+        );
+    }
+
+    #[test]
+    fn signal_band_collapses_the_wire_band_symmetrically() {
+        // The summary signal is a symmetric collapse of the #159 wire `band`: both the
+        // idle/low floor and the high/at_cap ceiling become single-word deviations flanking
+        // the balanced middle, keyed on the SAME thresholds (so the two never disagree).
+        for peak in [0.0, 0.19, 0.20, 0.49] {
+            assert_eq!(SignalBand::of(peak), SignalBand::Underused, "peak {peak}");
+        }
+        for peak in [0.50, 0.79] {
+            assert_eq!(SignalBand::of(peak), SignalBand::Balanced, "peak {peak}");
+        }
+        for peak in [0.80, 0.99, 1.00, 1.50] {
+            assert_eq!(SignalBand::of(peak), SignalBand::Saturated, "peak {peak}");
+        }
+    }
+
+    #[test]
+    fn summary_band_shows_in_both_human_views_but_never_on_the_json_wire() {
+        // Human surfaces (numeric text + charts) both foot with the band.
+        let text = render_text(&report_fixture());
+        assert!(
+            text.contains("signal  "),
+            "the numeric text carries the band"
+        );
+        assert!(text.contains("lowest utilisation:"));
+        let charts = render_charts(&two_account_charts(), 60, false, false);
+        assert!(
+            charts.contains("signal  "),
+            "the charts view carries the band"
+        );
+
+        // The band is HUMAN-only — none of its vocabulary reaches the schema:1 wire (which
+        // keeps the finer per-account `band`/`coverage_class` enums, byte-stable vs #159).
+        let json = render_json(&report_fixture()).unwrap();
+        for token in [
+            "signal",
+            "underused",
+            "balanced",
+            "saturated",
+            "lowest",
+            "utilisation",
+        ] {
+            assert!(
+                !json.contains(token),
+                "the summary band stays off the json wire: `{token}`"
+            );
+        }
+    }
+
+    // --- AC: the framing guard passes on the real render, bites on injection ---------
+
+    #[test]
+    fn summary_render_carries_no_banned_token_but_the_guard_bites_on_injection() {
+        // The guard PASSES on every real render — multi-account, single, all-gap — across
+        // both human surfaces AND with the colour overlay on (issue #160: facts only).
+        let three = three_band_report();
+        let single = charts_report(&[("solo", stat(1, ds(0.5, 0.5, 0.5), 0.0, 1.0))], &[]);
+        let all_gap = charts_report(&[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))], &[]);
+        for report in [&three, &single, &all_gap] {
+            for surface in [
+                render_summary(report, false),
+                render_summary(report, true),
+                render_text(report),
+                render_charts(report, 80, true, false),
+            ] {
+                assert_eq!(
+                    scan_banned(&surface),
+                    None,
+                    "a real render must contain no banned token: {surface:?}"
+                );
+            }
+        }
+
+        // The `--json` KEYS are neutral too (the wire carries descriptor enums, no verb).
+        let json = render_json(&report_fixture()).unwrap();
+        let mut keys = Vec::new();
+        json_keys(&serde_json::from_str(&json).unwrap(), &mut keys);
+        assert_eq!(scan_banned(&keys.join(" ")), None, "json keys are neutral");
+
+        // The guard BITES: inject a banned word into a real render and it is caught — proof
+        // the test would FAIL if editorialising copy ever slipped into the band.
+        let poisoned = render_summary(&three, false).replace("balanced", "upgrade");
+        assert_eq!(
+            scan_banned(&poisoned),
+            Some("upgrade"),
+            "injection is caught"
+        );
+        // Case-insensitive + word-boundary: a capitalised, punctuation-hugged word trips.
+        assert_eq!(scan_banned("period — you SHOULD."), Some("should"));
+        // The scanner does not over-trip on the neutral descriptor vocabulary itself.
+        assert_eq!(
+            scan_banned("signal aa underused bb balanced cc saturated"),
+            None
+        );
+    }
+
+    // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
+
+    /// The frozen schema:1 wire. #160 is HUMAN-render only — it adds no field, no
+    /// recommendation, no glyph — so this is the #158/#159 contract verbatim.
+    const WIRE_GOLDEN: &str = r#"{
+  "schema": 1,
+  "window": {
+    "start": 1782864000,
+    "end": 1782907200,
+    "label": "last 24h (Jul 1–Jul 1)",
+    "period": "day"
+  },
+  "accounts": [],
+  "series": [
+    {
+      "start": 0,
+      "end": 21600,
+      "roster": {
+        "swap_count": 1,
+        "swaps": {
+          "session": 1,
+          "weekly": 0,
+          "manual": 0,
+          "forced": 0,
+          "emergency": 0
+        },
+        "all_high_episodes": 0,
+        "all_high_secs": 0
+      },
+      "accounts": {
+        "work": {
+          "seen": 3,
+          "coverage": 1.0,
+          "coverage_class": "complete",
+          "session": {
+            "mean": 0.5,
+            "peak": 0.9,
+            "p95": 0.85
+          },
+          "weekly": {
+            "mean": 0.3,
+            "peak": 0.4,
+            "p95": 0.38
+          },
+          "cap_hits": 1,
+          "time_at_cap_secs": 300,
+          "contribution_share": 1.0,
+          "band": "high"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "roster": {
+      "swap_count": 1,
+      "swaps": {
+        "session": 1,
+        "weekly": 0,
+        "manual": 0,
+        "forced": 0,
+        "emergency": 0
+      },
+      "all_high_episodes": 0,
+      "all_high_secs": 0
+    },
+    "accounts": {
+      "work": {
+        "seen": 3,
+        "coverage": 1.0,
+        "coverage_class": "complete",
+        "session": {
+          "mean": 0.5,
+          "peak": 0.9,
+          "p95": 0.85
+        },
+        "weekly": {
+          "mean": 0.3,
+          "peak": 0.4,
+          "p95": 0.38
+        },
+        "cap_hits": 1,
+        "time_at_cap_secs": 300,
+        "contribution_share": 1.0,
+        "band": "high"
+      }
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn json_wire_is_byte_stable_vs_158_159() {
+        assert_eq!(
+            render_json(&wire_golden_report()).unwrap(),
+            WIRE_GOLDEN,
+            "#160 must not perturb the schema:1 wire by a single byte"
+        );
+    }
+
+    // --- AC: degenerate periods render a neutral summary without panic ---------------
+
+    #[test]
+    fn summary_band_renders_empty_single_and_all_gap_without_panic() {
+        // Empty roster → the band is empty (nothing to summarise); the views print their
+        // own "no per-account usage" line, never a panic.
+        let empty = charts_report(&[], &[]);
+        assert_eq!(render_summary(&empty, false), "");
+        assert_eq!(render_summary(&empty, true), "");
+        let _ = render_text(&empty);
+        let _ = render_charts(&empty, 80, true, false);
+
+        // A single account bands off its one reading and is its own lowest-utilisation pick.
+        let single = charts_report(&[("solo", stat(1, ds(0.5, 0.5, 0.5), 0.0, 1.0))], &[]);
+        let band = render_summary(&single, false);
+        assert!(band.contains("solo balanced"));
+        assert!(band.contains("lowest utilisation: solo"));
+
+        // An all-gap account (present in the summary, absent from every bucket) still bands
+        // its summary reading — no panic, no fabricated data, still neutral.
+        let all_gap = charts_report(
+            &[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))],
+            &[&[], &[]],
+        );
+        let band = render_summary(&all_gap, false);
+        assert!(band.contains("ghost underused"));
+        assert_eq!(scan_banned(&band), None);
+    }
+
+    #[test]
+    fn summary_band_excludes_unsampled_accounts_and_never_fabricates_a_low_reading() {
+        // Gap honesty: an account active but never polled (`seen == 0`, zeroed readings) has
+        // UNKNOWN utilisation. The band must not fabricate it as "underused", and the
+        // lowest-utilisation callout must not rank its fabricated 0% mean as the lowest — it
+        // ranges over OBSERVED accounts only.
+        let report = charts_report(
+            &[
+                ("live", stat(4, ds(0.50, 0.55, 0.52), 0.0, 0.5)),
+                ("dark", stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.5)), // active but unsampled
+            ],
+            &[],
+        );
+        let band = render_summary(&report, false);
+        assert!(band.contains("live balanced"));
+        assert!(
+            !band.contains("dark"),
+            "an unsampled account is not banded: {band:?}"
+        );
+        assert!(
+            band.contains("lowest utilisation: live"),
+            "lowest ranges over observed accounts, not the 0% unsampled one: {band:?}"
+        );
+
+        // A roster of ONLY unsampled accounts has nothing measured to summarise → empty band.
+        let all_dark = charts_report(&[("dark", stat(0, ds(0.0, 0.0, 0.0), 0.0, 1.0))], &[]);
+        assert_eq!(render_summary(&all_dark, false), "");
     }
 }
