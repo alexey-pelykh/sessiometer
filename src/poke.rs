@@ -37,13 +37,22 @@
 //! Every output is redacted to non-secret handles (issue #15): a line names only the
 //! account's label and the cycle's classification (refreshed / no change / dead /
 //! error), never a token. The engine's [`RefreshReport`] is itself secret-free.
+//!
+//! A successful refresh does NOT imply the account is healthy: `poke` cannot un-quarantine
+//! a daemon-dead account (#42), so when the daemon's current verdict (read best-effort over
+//! the same control socket `status` uses) marks the poked account dead, the bare `refreshed`
+//! line is replaced with the honest truth — the token was refreshed, but the daemon still
+//! marks it dead — pointing to `claude /login` (issue #163). No daemon reachable, or a
+//! non-dead verdict, keeps the plain wording.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::claude_state;
 use crate::config::{Account, Config};
+use crate::daemon::{AccountStatusLine, StatusResponse};
 use crate::error::{Error, Result};
+use crate::observability::CredentialHealth;
 use crate::paths;
 use crate::refresh::{self, RefreshOutcome, RefreshReport};
 use crate::stash::RealAccountStash;
@@ -117,12 +126,18 @@ pub(crate) async fn poke(target: Option<String>) -> Result<()> {
         stash: RealAccountStash::new(),
         claude_binary: paths::claude_binary()?,
     };
+    // The daemon's current per-account verdict (#163), read best-effort BEFORE the
+    // cycle so a refreshed-but-still-quarantined account is reported honestly rather
+    // than as a misleading bare `refreshed`. `None` when no daemon is reachable — poke
+    // then keeps its plain wording (it never depends on a daemon being up).
+    let daemon_status = daemon_status_best_effort().await;
     run_poke(
         &config.roster,
         target.as_deref(),
         active_uuid.as_deref(),
         now_ms(),
         &engine,
+        daemon_status.as_ref(),
     )
     .await
 }
@@ -155,10 +170,11 @@ async fn run_poke<E: PokeEngine>(
     active_uuid: Option<&str>,
     now_ms: i64,
     engine: &E,
+    daemon_status: Option<&StatusResponse>,
 ) -> Result<()> {
     match target {
-        Some(query) => poke_named(roster, query, active_uuid, engine).await,
-        None => poke_all(roster, active_uuid, now_ms, engine).await,
+        Some(query) => poke_named(roster, query, active_uuid, engine, daemon_status).await,
+        None => poke_all(roster, active_uuid, now_ms, engine, daemon_status).await,
     }
 }
 
@@ -179,6 +195,7 @@ async fn poke_named<E: PokeEngine>(
     query: &str,
     active_uuid: Option<&str>,
     engine: &E,
+    daemon_status: Option<&StatusResponse>,
 ) -> Result<()> {
     let account = &roster[resolve_target(roster, query)?];
     if is_active(account, active_uuid) {
@@ -187,7 +204,11 @@ async fn poke_named<E: PokeEngine>(
         });
     }
     let report = engine.refresh(account).await?;
-    println!("{}", poke_line(&account.label, outcome_label(&report)));
+    let dead = daemon_marks_dead(daemon_status, &account.label);
+    println!(
+        "{}",
+        poke_line(&account.label, &poke_outcome(&report, dead))
+    );
     Ok(())
 }
 
@@ -201,6 +222,7 @@ async fn poke_all<E: PokeEngine>(
     active_uuid: Option<&str>,
     now_ms: i64,
     engine: &E,
+    daemon_status: Option<&StatusResponse>,
 ) -> Result<()> {
     let horizon_ms = NEAR_EXPIRY_HORIZON.as_millis() as i64;
     let mut selected = Vec::new();
@@ -222,7 +244,9 @@ async fn poke_all<E: PokeEngine>(
     println!("poking {} near-expiry parked account(s):", selected.len());
     for account in selected {
         let outcome = match engine.refresh(account).await {
-            Ok(report) => outcome_label(&report).to_owned(),
+            // Each line carries the daemon's own verdict for THIS account (#163), so a
+            // refreshed-but-still-quarantined one in the sweep is as honest as a named poke.
+            Ok(report) => poke_outcome(&report, daemon_marks_dead(daemon_status, &account.label)),
             // Secret-free: every `Error` Display is redaction-safe (issue #15).
             Err(err) => format!("error ({err})"),
         };
@@ -260,10 +284,96 @@ fn outcome_label(report: &RefreshReport) -> &'static str {
     }
 }
 
+/// The honest per-account outcome text for a completed cycle, given the daemon's current
+/// verdict for the account (`dead_per_daemon`, resolved by [`daemon_marks_dead`]).
+///
+/// The ONLY classification a daemon-dead verdict rewrites is the bare `"refreshed"` (a
+/// `Refreshed` cycle that re-stashed): that line reads as "fixed", but `poke` — a separate
+/// CLI process with no daemon IPC — cannot un-quarantine a daemon-dead account (#163), and
+/// the fresh token it just stashed is not even polled while the account stays quarantined
+/// (#42). So it states BOTH truths: the token WAS refreshed, AND the daemon still marks the
+/// account dead, with the recovery cue ([`DAEMON_STILL_DEAD`]).
+///
+/// Every other classification is already honest and is returned unchanged: `dead` /
+/// `no change` / `refreshed but not re-stashed` / `error` each carry their own truth, and
+/// the bare `"refreshed"` itself stands whenever the daemon does NOT mark the account dead
+/// — healthy, `Unknown` ⚪, or no daemon reachable — a true statement of the cycle that just
+/// ran, never a fabricated liveness claim.
+fn poke_outcome(report: &RefreshReport, dead_per_daemon: bool) -> String {
+    if dead_per_daemon && matches!(report.outcome, RefreshOutcome::Refreshed) && report.re_stashed {
+        return DAEMON_STILL_DEAD.to_owned();
+    }
+    outcome_label(report).to_owned()
+}
+
+/// The #163 honest replacement for a bare `"refreshed"` when the daemon still marks the
+/// poked account dead: the token WAS refreshed, but `poke` cannot clear the #42 quarantine
+/// — only an operator `claude /login`, or the daemon's own next refresh sweep, can. Kept a
+/// single message for any dead verdict (a mid-recovery account #109 is covered by the
+/// passive-sweep clause). Non-secret (issue #15): a classification + a recovery cue, no token.
+const DAEMON_STILL_DEAD: &str = "token refreshed, but the daemon still marks this account \
+     dead — run `claude /login` (or it will re-evaluate on its next refresh sweep)";
+
 /// `<label>: <outcome>` — one per-account report line (the label is the non-secret
 /// handle, issue #15).
 fn poke_line(label: &str, outcome: &str) -> String {
     format!("{label}: {outcome}")
+}
+
+/// Whether the daemon's snapshot currently marks `label`'s account DEAD — the exact
+/// verdict `status` projects to 🔴 (mirrors `cli::health_cell`): a current daemon's 4-state
+/// rollup (`health == Some(Dead)`, issue #119/#137), or — a pre-#119 daemon that sent no
+/// rollup (`health == None`) — its legacy `quarantined` flag (#42).
+///
+/// A `None` snapshot (no daemon reachable) or a `label` absent from the snapshot is NOT
+/// dead: an indeterminate verdict `poke` reports with its plain wording (#163 AC-3), never a
+/// fabricated daemon-state claim. Matching is by label — the only account handle the wire
+/// [`AccountStatusLine`] carries (issue #15: never the uuid or email) — the same key `status`
+/// renders by; a renamed/stale label simply misses and degrades to the plain wording.
+fn daemon_marks_dead(daemon_status: Option<&StatusResponse>, label: &str) -> bool {
+    let Some(status) = daemon_status else {
+        return false;
+    };
+    status
+        .accounts
+        .iter()
+        .find(|line| line.label == label)
+        .is_some_and(line_is_dead)
+}
+
+/// Resolve ONE status line's dead-ness the same way `status` does (`cli::health_cell`): the
+/// daemon's 4-state rollup when present (`health == Some(Dead)`), else — a pre-#119 daemon
+/// that sent no rollup (`health == None`) — the legacy `quarantined` flag, so an old daemon
+/// reads correctly rather than as a defaulted-healthy line over a dead account. `Healthy` /
+/// `Unknown` / `Stale` / `AtRisk` are all NOT dead (poke keeps the plain wording for them).
+fn line_is_dead(line: &AccountStatusLine) -> bool {
+    match line.health {
+        Some(health) => health == CredentialHealth::Dead,
+        None => line.quarantined,
+    }
+}
+
+/// Best-effort read of the daemon's per-account verdicts over the control socket — the SAME
+/// `{"cmd":"status"}` snapshot the `status` command projects (issue #8). Returns `None` on
+/// ANY failure (no daemon, an absent/refused socket, a malformed reply): `poke` then keeps
+/// its plain wording rather than crash or fabricate a daemon-state claim (#163 AC-3).
+///
+/// Deliberately fail-QUIET, unlike the `status` command's fail-LOUD `cli::query_status`
+/// (which surfaces [`Error::DaemonNotRunning`] because a human explicitly asked for status):
+/// for `poke`, a missing daemon is an expected, non-error case, so this reader lives here
+/// and swallows every error into `None` rather than reusing the erroring client.
+async fn daemon_status_best_effort() -> Option<StatusResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let path = paths::control_socket().ok()?;
+    let stream = tokio::net::UnixStream::connect(&path).await.ok()?;
+    let mut buffered = tokio::io::BufReader::new(stream);
+    // The same newline-delimited JSON `serve_control` speaks: one request line, one reply.
+    buffered.write_all(b"{\"cmd\":\"status\"}\n").await.ok()?;
+    buffered.flush().await.ok()?;
+    let mut line = String::new();
+    buffered.read_line(&mut line).await.ok()?;
+    serde_json::from_str(line.trim_end()).ok()
 }
 
 /// Current wall-clock as epoch milliseconds (the unit Claude Code's `expiresAt` uses),
@@ -295,6 +405,40 @@ mod tests {
             expires_at_delta_secs: None,
             refresh_token_rotated: false,
             re_stashed,
+        }
+    }
+
+    /// One daemon `status` line for `label`, carrying only the fields poke's #163 verdict
+    /// reads: the 4-state rollup (`health`) and the pre-#119 legacy `quarantined` flag.
+    /// Everything else is a benign default — poke never inspects it.
+    fn status_line(
+        label: &str,
+        health: Option<CredentialHealth>,
+        quarantined: bool,
+    ) -> AccountStatusLine {
+        AccountStatusLine {
+            label: label.to_owned(),
+            active: false,
+            enabled: true,
+            quarantined,
+            recovering: false,
+            session_pct: None,
+            weekly_pct: None,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            weekly_exhausted: false,
+            access_expires_at: None,
+            refresh_health: None,
+            health,
+        }
+    }
+
+    /// A daemon `status` snapshot from a set of account lines — what a running daemon
+    /// returns to poke's best-effort control-socket read.
+    fn status_snapshot(lines: Vec<AccountStatusLine>) -> StatusResponse {
+        StatusResponse {
+            accounts: lines,
+            next_swap: None,
         }
     }
 
@@ -417,6 +561,163 @@ mod tests {
         assert_eq!(poke_line("work", "refreshed"), "work: refreshed");
     }
 
+    // --- #163 daemon-verdict resolution (pure) ------------------------------
+
+    #[test]
+    fn line_is_dead_reads_the_rollup_then_the_legacy_flag() {
+        // A current daemon: the 4-state rollup is authoritative — only `Dead` is dead.
+        assert!(line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::Dead),
+            false
+        )));
+        assert!(!line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::Healthy),
+            false
+        )));
+        assert!(!line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::Unknown),
+            false
+        )));
+        assert!(!line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::Stale),
+            false
+        )));
+        assert!(!line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::AtRisk),
+            false
+        )));
+        // The rollup WINS when present: `Dead` is dead even with the raw `quarantined`
+        // flag unset (a refresh-cleared-in-place credential, #119), and `Healthy` is NOT
+        // dead even if a stale `quarantined` flag lingers — poke reads exactly what
+        // `status` renders.
+        assert!(line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::Dead),
+            false
+        )));
+        assert!(!line_is_dead(&status_line(
+            "a",
+            Some(CredentialHealth::Healthy),
+            true
+        )));
+        // A pre-#119 daemon (no rollup): fall back to the legacy `quarantined` flag.
+        assert!(line_is_dead(&status_line("a", None, true)));
+        assert!(!line_is_dead(&status_line("a", None, false)));
+    }
+
+    #[test]
+    fn daemon_marks_dead_reads_the_named_line_or_degrades_to_not_dead() {
+        let snap = status_snapshot(vec![
+            status_line("work", Some(CredentialHealth::Dead), false),
+            status_line("spare", Some(CredentialHealth::Healthy), false),
+        ]);
+        // Each account's OWN verdict is read, by label.
+        assert!(daemon_marks_dead(Some(&snap), "work"));
+        assert!(!daemon_marks_dead(Some(&snap), "spare"));
+        // No daemon reachable (None) → indeterminate → not dead (plain wording, AC-3).
+        assert!(!daemon_marks_dead(None, "work"));
+        // A label the daemon does not list → indeterminate → not dead.
+        assert!(!daemon_marks_dead(Some(&snap), "ghost"));
+    }
+
+    #[test]
+    fn poke_outcome_augments_only_the_bare_refreshed_and_only_when_dead() {
+        let refreshed = report(RefreshOutcome::Refreshed, true);
+        // The one misleading line: refreshed + re-stashed + daemon-dead → honest truth.
+        assert_eq!(poke_outcome(&refreshed, true), DAEMON_STILL_DEAD);
+        // Same cycle, NOT daemon-dead → the plain wording is unchanged.
+        assert_eq!(poke_outcome(&refreshed, false), "refreshed");
+        // A refresh that did NOT re-stash is already honest (its own distinct wording) —
+        // never rewritten, even under a dead verdict.
+        let not_restashed = report(RefreshOutcome::Refreshed, false);
+        assert_eq!(
+            poke_outcome(&not_restashed, true),
+            "refreshed but not re-stashed (a concurrent change took precedence)"
+        );
+        // Every other classification already carries its own truth → unchanged under a
+        // dead verdict (no double-reporting "dead", no masking "error"/"no change").
+        assert_eq!(
+            poke_outcome(&report(RefreshOutcome::Dead, false), true),
+            "dead — needs re-login"
+        );
+        assert_eq!(
+            poke_outcome(&report(RefreshOutcome::NoChange, false), true),
+            "no change"
+        );
+        assert_eq!(
+            poke_outcome(&report(RefreshOutcome::Error, false), true),
+            "error"
+        );
+    }
+
+    // --- #163 the three reported states, keyed off the daemon verdict -------
+
+    #[test]
+    fn dead_account_poke_reports_the_quarantine_truth_not_bare_refreshed() {
+        // AC-1: a parked account the daemon marks Dead, refreshed successfully → the
+        // output states the token refreshed AND that the daemon still marks it dead,
+        // pointing to `claude /login`.
+        let snap = status_snapshot(vec![status_line(
+            "work",
+            Some(CredentialHealth::Dead),
+            false,
+        )]);
+        let outcome = poke_outcome(
+            &report(RefreshOutcome::Refreshed, true),
+            daemon_marks_dead(Some(&snap), "work"),
+        );
+        assert_ne!(
+            outcome, "refreshed",
+            "must NOT be the misleading bare wording"
+        );
+        assert!(outcome.contains("still marks this account dead"));
+        assert!(outcome.contains("claude /login"));
+    }
+
+    #[test]
+    fn healthy_account_poke_keeps_the_plain_refreshed_wording() {
+        // AC-2: a healthy (non-quarantined) parked account → existing wording unchanged.
+        let snap = status_snapshot(vec![status_line(
+            "work",
+            Some(CredentialHealth::Healthy),
+            false,
+        )]);
+        assert_eq!(
+            poke_outcome(
+                &report(RefreshOutcome::Refreshed, true),
+                daemon_marks_dead(Some(&snap), "work")
+            ),
+            "refreshed"
+        );
+    }
+
+    #[test]
+    fn unknown_or_absent_daemon_is_honest_never_a_fabricated_verdict() {
+        let refreshed = report(RefreshOutcome::Refreshed, true);
+        // AC-3: no daemon reachable (None) → degrade to plain wording; no crash, no
+        // daemon-state claim.
+        assert_eq!(
+            poke_outcome(&refreshed, daemon_marks_dead(None, "work")),
+            "refreshed"
+        );
+        // A running daemon with an Unknown ⚪ verdict (#137) → honest plain wording: the
+        // cycle truth, never a fabricated "live" nor a false "dead".
+        let unknown = status_snapshot(vec![status_line(
+            "work",
+            Some(CredentialHealth::Unknown),
+            false,
+        )]);
+        assert_eq!(
+            poke_outcome(&refreshed, daemon_marks_dead(Some(&unknown), "work")),
+            "refreshed"
+        );
+    }
+
     // --- resolve_active_uuid -------------------------------------------------
 
     #[test]
@@ -457,7 +758,7 @@ mod tests {
             FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
         );
         // Active is u-A; we name the parked u-B by its label.
-        run_poke(&roster, Some("spare"), Some("u-A"), 0, &engine)
+        run_poke(&roster, Some("spare"), Some("u-A"), 0, &engine, None)
             .await
             .unwrap();
         assert_eq!(engine.refreshed(), vec!["u-B"]);
@@ -467,7 +768,7 @@ mod tests {
     async fn named_resolves_by_account_uuid_too() {
         let roster = vec![acct("work", "u-A"), acct("spare", "u-B")];
         let engine = FakePokeEngine::new();
-        run_poke(&roster, Some("u-B"), Some("u-A"), 0, &engine)
+        run_poke(&roster, Some("u-B"), Some("u-A"), 0, &engine, None)
             .await
             .unwrap();
         assert_eq!(engine.refreshed(), vec!["u-B"]);
@@ -477,7 +778,7 @@ mod tests {
     async fn named_refuses_the_active_account_without_refreshing() {
         let roster = vec![acct("work", "u-A"), acct("spare", "u-B")];
         let engine = FakePokeEngine::new();
-        let err = run_poke(&roster, Some("work"), Some("u-A"), 0, &engine)
+        let err = run_poke(&roster, Some("work"), Some("u-A"), 0, &engine, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::PokeTargetActive { ref label } if label == "work"));
@@ -488,7 +789,7 @@ mod tests {
     async fn named_reports_an_unresolvable_target() {
         let roster = vec![acct("work", "u-A")];
         let engine = FakePokeEngine::new();
-        let err = run_poke(&roster, Some("ghost"), None, 0, &engine)
+        let err = run_poke(&roster, Some("ghost"), None, 0, &engine, None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::UseTargetNotFound { ref query } if query == "ghost"));
@@ -499,7 +800,7 @@ mod tests {
     async fn named_propagates_a_hard_refresh_error() {
         let roster = vec![acct("work", "u-A"), acct("spare", "u-B")];
         let engine = FakePokeEngine::new().with_result("u-B", FakeRefresh::HardError);
-        let err = run_poke(&roster, Some("spare"), Some("u-A"), 0, &engine)
+        let err = run_poke(&roster, Some("spare"), Some("u-A"), 0, &engine, None)
             .await
             .unwrap_err();
         // The typed error reaches the operator (non-fatal for the credential, but the
@@ -525,7 +826,7 @@ mod tests {
             .with_expiry("u-A", Some(soon))
             .with_expiry("u-B", Some(soon))
             .with_expiry("u-C", Some(later));
-        run_poke(&roster, None, Some("u-A"), now, &engine)
+        run_poke(&roster, None, Some("u-A"), now, &engine, None)
             .await
             .unwrap();
         // Only the parked, near-expiry account is refreshed.
@@ -540,7 +841,9 @@ mod tests {
         let engine = FakePokeEngine::new()
             .with_expiry("u-A", Some(later))
             .with_expiry("u-B", Some(later));
-        run_poke(&roster, None, None, now, &engine).await.unwrap();
+        run_poke(&roster, None, None, now, &engine, None)
+            .await
+            .unwrap();
         assert!(engine.refreshed().is_empty());
     }
 
@@ -558,7 +861,9 @@ mod tests {
                 "u-B",
                 FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
             );
-        run_poke(&roster, None, None, now, &engine).await.unwrap();
+        run_poke(&roster, None, None, now, &engine, None)
+            .await
+            .unwrap();
         assert_eq!(engine.refreshed(), vec!["u-A", "u-B"]);
     }
 }
