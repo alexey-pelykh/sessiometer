@@ -135,22 +135,32 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     crate::poke::poke(target).await
                 }
                 // `stats [<account>...] [--period day|week|month|lifetime] [--since <when>]
-                // [--json]` — the OFFLINE usage reader (issue #158). It reads the sample
-                // store's own files directly, so it renders with the daemon DOWN and makes
-                // no live socket / keychain / usage-API call (the daemon is the sole writer,
-                // this the sole reader). Positionals filter which accounts show (all by
-                // default); `--period` defaults to `week` and is mutually exclusive with
-                // `--since`. Flags may appear in any order; a value-bearing flag takes the
-                // next token or a `--flag=value` form. Validation lives in `stats::run`.
+                // [--json] [--no-color] [--ascii]` — the OFFLINE usage reader (issue #158),
+                // now with terminal CHARTS (issue #159). It reads the sample store's own
+                // files directly, so it renders with the daemon DOWN and makes no live
+                // socket / keychain / usage-API call (the daemon is the sole writer, this
+                // the sole reader). Positionals filter which accounts show (all by default);
+                // `--period` defaults to `week` and is mutually exclusive with `--since`.
+                // `--no-color` forces the chart colour overlay off and `--ascii` forces the
+                // ASCII glyph ramp (issue #159), mirroring the `status` gate; both are inert
+                // under `--json` (the wire is never coloured and never charted). Flags may
+                // appear in any order; a value-bearing flag takes the next token or a
+                // `--flag=value` form. Validation lives in `stats::run`.
                 "stats" => {
                     let mut accounts = Vec::new();
                     let mut period = None;
                     let mut since = None;
                     let mut json = false;
+                    let mut no_color = false;
+                    let mut ascii = false;
                     while let Some(arg) = args.next() {
                         let arg = arg.to_string_lossy();
                         if arg == "--json" {
                             json = true;
+                        } else if arg == "--no-color" {
+                            no_color = true;
+                        } else if arg == "--ascii" {
+                            ascii = true;
                         } else if arg == "--period" {
                             period = Some(
                                 args.next()
@@ -178,6 +188,8 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                         period,
                         since,
                         json,
+                        no_color,
+                        ascii,
                     })
                     .await
                 }
@@ -1074,7 +1086,10 @@ fn render_cells(
 /// [`crate::redaction`], the civil-date math); it covers the ranges that occur in
 /// real operator labels rather than the full Unicode table, and that is enough to
 /// keep colored and multibyte `status` rows aligned where `char` count would not.
-fn display_width(s: &str) -> usize {
+///
+/// `pub(crate)` so the `stats` charts (issue #159) size their columns on the SAME
+/// terminal-cell width this `status` view does — one wcwidth for the whole crate.
+pub(crate) fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
@@ -1181,7 +1196,11 @@ fn humanize_until(secs: i64) -> String {
 /// not a TTY (piped / redirected) or the query fails. Drives `status`'s
 /// narrow-terminal column degradation (issue #72); the `None` non-interactive case
 /// keeps the full table, so `status | grep` and `status > file` stay complete.
-fn terminal_cols() -> Option<usize> {
+///
+/// `pub(crate)` so the `stats` charts (issue #159) share the SAME width probe: a
+/// `None` there means "not a TTY", the signal that drops the charts for the numeric
+/// table (a piped / redirected `stats` stays the plain, greppable surface).
+pub(crate) fn terminal_cols() -> Option<usize> {
     // SAFETY: `winsize` is plain-old-data we zero-initialize; the ioctl only writes
     // into it through the pointer we pass and returns `0` on success. The same
     // direct-libc idiom the rest of the crate uses (e.g. `getpeereid`, `flock`).
@@ -1199,7 +1218,10 @@ fn terminal_cols() -> Option<usize> {
 /// redirect, a log), so the gate is conservative — color is on ONLY on an
 /// interactive stdout TTY, and any standard opt-out forces it off. Reads the
 /// environment + TTY here; the decision itself is the pure [`color_decision`].
-fn should_colorize(no_color: bool) -> bool {
+///
+/// `pub(crate)` so the `stats` charts (issue #159) gate their ANSI overlay through the
+/// SAME single discipline this `status` view uses — one definition of "may I colour".
+pub(crate) fn should_colorize(no_color: bool) -> bool {
     color_decision(
         no_color,
         std::env::var("NO_COLOR").ok().as_deref(),

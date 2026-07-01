@@ -561,3 +561,106 @@ the explicit `/login`. Run 2 was a controlled probe to isolate the cause: a **se
   against the committed `/abs/path → 6d80187b` test vector.
 
 CC 2.1.197 · macOS 26.5.1 / 25F80 · sessiometer #130.
+
+---
+
+# #145 — cross-machine credential portability ✅ PASS (move semantics)
+
+Go/no-go for issue [#145](https://github.com/alexey-pelykh/sessiometer/issues/145): does a Claude Code
+credential harvested on **machine A** still authenticate — and *refresh* — when written to a **second
+Mac (machine B)**? This is the front-loaded feasibility gate for the export/import migration cluster
+(#148 export, #149 import, #150 events/config). If the credential were machine-bound (e.g. hardware- or
+keychain-ACL-tied), migration would be impossible and #148–#150 would need re-scoping. Two Macs required
+— run as an operator-driven spike, machine B reached over SSH.
+
+## Environment
+
+| Field | Value |
+|---|---|
+| Machine A (source) | this Mac — CC `2.1.197`, macOS `26.5.1` / `25F80` |
+| Machine B (target) | `Majordomos-Mini` — CC `2.1.195`, reached via `ssh` |
+| Run | 2026-07-01 (operator-driven; A-side automated, B-side after operator `security unlock-keychain`) |
+| acct | macOS username on each machine (per #130 — the item `acct` is `whoami`, never the Claude account) |
+| Credential | the operator's **primary** account (recoverable via `/login`) — no throwaway available |
+
+## Result — ✅ PASS (credential is portable)
+
+Method: A-side read the primary `Claude Code-credentials` blob, **aged its `claudeAiOauth.expiresAt` to
+1 h in the past** (to force a refresh), `scp`'d the aged blob + a minimal `oauthAccount`-only
+`.claude.json` to B. B-side (in the SAME `ssh` session as the unlock) wrote the aged blob to an
+**isolated, config-dir-suffixed** item (`Claude Code-credentials-<sha256(dir)[..8]>`, acct = B's
+username) — **never** B's shared login item — seeded the isolated `.claude.json`, then forced
+`claude -p "say pong"` under `CLAUDE_CONFIG_DIR=<isolated dir>`.
+
+| Signal | Observation | Meaning |
+|---|---|---|
+| canary write/delete | `CANARY_OK` | same-session `unlock-keychain` is effective over SSH (a fresh `ssh` lands in a different security session — the unlock MUST share the session) |
+| isolated-item write | `WRITE_OK sha=c3301eb0…` | aged blob written byte-exact (off-argv via `security -i` stdin) |
+| probe | `PROBE rc=0`, `pong=1` | CC authenticated cross-machine and answered |
+| read-back | `READBACK changed=YES` (`c3301eb0…`→`4fac0b28…`) | **CC rewrote the item = a real token refresh happened on machine B** |
+| rejection markers | `invalid_grant=0 unauthorized=0 expired=0 revoked=0` | no auth rejection — the refresh was accepted, not merely a cached access token |
+| teardown | `item_gone=YES iso_gone=YES staged_gone=YES` | isolated item + dir + staged blob all removed; B's shared item never touched |
+
+⇒ **A credential harvested on machine A refreshes successfully on machine B on CC 2.1.195.** The
+credential is **not** machine-bound. **#148–#150 (export/import migration) are UNBLOCKED and viable.**
+
+## Move semantics — the cross-machine refresh invalidates the origin 🟡 (very likely; textbook OAuth)
+
+Because the spike **forced a refresh** on B (aged `expiresAt`), and OAuth 2.0 refresh-token rotation
+issues a new refresh token while **invalidating the one just used**, B's refresh almost certainly
+**killed the origin's copy** of that refresh token. Consistent observations on machine A during the
+spike: the two in-flight `do-all` subprocesses (running on A's shared credential) **died simultaneously**
+at the refresh moment (`stop_sequence`, 0 tokens, ~2 s apart), and A needed a fresh `/login` afterward.
+
+Calibration — this is **strong inference, not cleanly isolated**: synthetic-stop subprocess deaths have
+a nonzero random base rate (two occurred *before* any cross-machine refresh, from API flakiness), and
+the operator's `/login` was **precautionary per pre-spike guidance**, not proven-reactive. But the
+*simultaneity* + textbook rotation semantics make origin-invalidation the overwhelmingly likely model.
+A dedicated one-probe follow-up could isolate it if a design decision hinges on certainty.
+
+⇒ Treat cross-machine credential transfer as **MOVE, not COPY**: once the target refreshes, the source
+credential should be assumed dead. This is fine for *migration* (moving an account to a new machine);
+it is **not** a path to run one account live on two machines simultaneously.
+
+## Harness recipe — what CC 2.1.195 needs to adopt an injected credential
+
+Two harness bugs produced false `Not logged in · Please run /login` results before the PASS; both are
+**recipe**, not portability, failures — worth pinning for the #149 import path:
+
+1. **The item `acct` MUST be the target's macOS username** (load-bearing, the dominant cause). CC reads
+   the credential by `(service, acct=whoami)` (#130). An item stored under an arbitrary acct
+   (`spike145`) is invisible to CC → "Not logged in", *regardless* of blob validity. First reproduced
+   locally on machine A with A's own valid credential — ruling out machine-binding before B was retried.
+2. **Seed `.claude.json` with a real `oauthAccount`** (part of the validated recipe). A bare `{}`
+   (`MINIMAL_CLAUDE_JSON`, which #101's headless refresh path tolerated on CC 2.1.181) gave "Not logged
+   in" here. NOT cleanly isolated from fix (1) — the working recipe changed both at once — so this is
+   "sufficient as tested", not proven strictly necessary on 2.1.195. The `oauthAccount`-seeded config is
+   also the #130/#134 co-write shape, so importing it is consistent with the rest of the system.
+
+## Downstream design impact (propagated to #148–#150)
+
+1. **#149 import writes under the TARGET machine's `whoami`**, not the source's. The exported artifact
+   carries the blob + `oauthAccount` (already the #146 container shape); import resolves the acct locally
+   via the existing `keychain` write path (which pins `acct` = the resolved username), never trusting a
+   source-embedded acct. A brand-new target item (nothing to resolve from) must default acct to `whoami`.
+2. **Import seeds `oauthAccount` into `~/.claude.json`** for display honesty (#134 reconcile already owns
+   this co-write) — a token-only import lands but shows "Not logged in" until the identity is present.
+3. **MOVE semantics** — document that using a migrated credential on the target invalidates it on the
+   source (first refresh). #150's redacted events should make the transfer legible; no attempt to support
+   concurrent two-machine use.
+
+## Security / provenance
+
+- Live, operator-driven; **real** primary credential (no throwaway available), refreshed cross-machine.
+- Secret never printed (blob **hashed** for every check), never on argv (`security -i` stdin write), held
+  only in mode-`600` files; `env -u CLAUDE_SECURESTORAGE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN
+  ANTHROPIC_API_KEY` on the spawn. The isolated suffixed item was the sole write target — B's shared
+  `Claude Code-credentials` login item was **never** touched.
+- **Canary-guarded**: a throwaway write/delete gates the real work, so a still-locked keychain aborts
+  before touching anything real (this fired as `INCONCLUSIVE`, not a false FAIL, on the first attempt).
+- Full teardown verified (item + isolated dir + staged blob all `…_gone=YES`); the operator's login
+  password reached only B's `security`, never the harness.
+- Suffix derivation cross-checked against `keychain::service_for_config_dir` (#100) test vectors
+  (`/abs/path → 6d80187b`) before use.
+
+CC 2.1.195 (B) / 2.1.197 (A) · macOS 26.5.1 / 25F80 · sessiometer #145.
