@@ -18,6 +18,7 @@ mod error;
 mod isolated_spawn;
 mod keychain;
 mod login;
+mod migration;
 mod observability;
 mod paths;
 mod poke;

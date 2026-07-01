@@ -394,6 +394,37 @@ pub(crate) enum Error {
     )]
     SharedCredentialMutated,
 
+    // --- Migration artifact format (issue #146) -------------------------------
+    //
+    // The versioned on-disk migration container's own parse/validation outcomes
+    // (see [`crate::migration`]). All secret-free: a migration file carries an
+    // account's credential + `oauthAccount` material, so — like the `~/.claude.json`
+    // parser — these echo only a position or a static reason, never the bytes.
+    /// The bytes are not a sessiometer migration artifact: the magic marker is
+    /// absent or wrong. Secret-free.
+    #[error("not a sessiometer migration artifact (missing or unrecognized magic)")]
+    MigrationBadMagic,
+
+    /// The migration artifact declares a `format_version` this build does not
+    /// understand. The container structure is version-gated, so an unknown version
+    /// is rejected up front rather than mis-parsed. Carries `found` vs `supported`
+    /// (plain integers, never secrets).
+    #[error("unsupported migration format version {found} (this build supports {supported})")]
+    MigrationUnsupportedVersion { found: u16, supported: u16 },
+
+    /// The migration artifact is not valid JSON (or a field has the wrong shape).
+    /// Only the parser's `line`/`column` are carried — never the surrounding bytes,
+    /// which may hold an account's credential / `oauthAccount` material (issue #15
+    /// redaction), mirroring [`Error::ClaudeStateParse`].
+    #[error("malformed migration artifact: JSON error at line {line} column {column}")]
+    MigrationMalformed { line: usize, column: usize },
+
+    /// The migration artifact parsed but violates a structural invariant (e.g. the
+    /// `encrypted` flag disagrees with the body, or an encrypted artifact is missing
+    /// its KDF/cipher parameters). The wrapped reason is a static, secret-free string.
+    #[error("invalid migration artifact: {0}")]
+    MigrationInvalid(&'static str),
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
