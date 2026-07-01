@@ -124,18 +124,20 @@ impl SpawnPlan {
         }
     }
 
-    /// The interactive-login parametrization: `claude /login`, inherit-terminal stdio, timeout
-    /// plus an extra cancel arm. Constructible now — the both-parametrizations scrub test builds
-    /// it to prove the scrub is applied here too — but wired to no production caller until the
-    /// login-capture engine lands (a later issue), hence `allow(dead_code)` off-test.
+    /// The interactive-login parametrization: `claude /login`, inherit-terminal stdio, and a
+    /// `timeout`-bounded run with an extra SIGINT cancel arm ([`RunBound::TimeoutOrCancel`],
+    /// wired in [`run`](Self::run)). The `timeout` is the caller's tunable login budget (the
+    /// login-capture engine defaults it to 180 s, #132) — comfortably longer than the refresh
+    /// path's fixed [`SPAWN_TIMEOUT`] because a `/login` waits on a human completing a browser
+    /// OAuth handoff, not a headless token refresh. Wired to its production caller (the
+    /// login-capture engine) via [`SpawnClaudeLogin`]; the both-parametrizations scrub test also
+    /// builds it to prove the [`SPAWN_ENV_REMOVE`] scrub applies here too.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn login() -> Self {
+    pub(crate) fn login(timeout: Duration) -> Self {
         Self {
             argv: &["/login"],
             stdio: Stdio3::InheritTerminal,
-            bound: RunBound::TimeoutOrCancel {
-                timeout: SPAWN_TIMEOUT,
-            },
+            bound: RunBound::TimeoutOrCancel { timeout },
         }
     }
 
@@ -179,15 +181,35 @@ impl SpawnPlan {
     /// the child could not be spawned at all.
     pub(crate) async fn run(&self, binary: &Path, config_dir: &OsStr) -> Result<()> {
         let mut child = self.build_command(binary, config_dir).spawn()?;
-        // Both arms bound the runtime with a kill-timeout; the login arm's extra cancel signal is
-        // wired by a later issue (see [`RunBound::TimeoutOrCancel`]). On timeout, kill and proceed
-        // — the read-back decides the outcome (a refresh may already have landed before the kill).
-        let timeout = match self.bound {
-            RunBound::Timeout(timeout) => timeout,
-            RunBound::TimeoutOrCancel { timeout } => timeout,
-        };
-        if tokio::time::timeout(timeout, child.wait()).await.is_err() {
-            let _ = child.kill().await;
+        match self.bound {
+            // The refresh arm: bound by a kill-timeout only. On timeout, kill and proceed — the
+            // read-back decides the outcome (a refresh may already have landed before the kill).
+            RunBound::Timeout(timeout) => {
+                if tokio::time::timeout(timeout, child.wait()).await.is_err() {
+                    let _ = child.kill().await;
+                }
+            }
+            // The interactive-login arm ([`RunBound::TimeoutOrCancel`], #132): race the child
+            // against the timeout AND an operator SIGINT (Ctrl-C). The child is inherit-terminal,
+            // so a tty Ctrl-C reaches it directly and it usually exits on its own; the explicit
+            // `ctrl_c` arm still (a) overrides the default SIGINT-terminates-*this*-process
+            // disposition — so the engine's teardown (isolated item + dir) is never skipped — and
+            // (b) guarantees we regain control and kill the child even if it ignores the signal.
+            // On either bound the child is killed; `Ok` always — the caller's read-back classifies
+            // whether a fresh credential landed (login completed) or not (timeout / cancel).
+            RunBound::TimeoutOrCancel { timeout } => {
+                tokio::select! {
+                    res = child.wait() => {
+                        let _ = res;
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        let _ = child.kill().await;
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        let _ = child.kill().await;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -223,6 +245,46 @@ impl SpawnClaude {
 impl ClaudeRefresh for SpawnClaude {
     async fn run(&self, config_dir: &Path) -> Result<()> {
         SpawnPlan::refresh()
+            .run(&self.binary, config_dir.as_os_str())
+            .await
+    }
+}
+
+/// Seam: spawns the interactive `claude /login` child for the login-capture engine (issue
+/// #132) — the login counterpart of [`ClaudeRefresh`]. The real impl drives the `claude` binary
+/// through [`SpawnPlan::login`] on the operator's inherited terminal; the test impl simulates a
+/// completed login by writing a fresh credential to the (fake) isolated item + an `oauthAccount`
+/// into the isolated `.claude.json`, so the engine is exercised hermetically (no real keychain /
+/// `claude` / browser).
+#[allow(dead_code)]
+pub(crate) trait ClaudeLogin {
+    /// Run the isolated interactive-login spawn (`claude /login`) with
+    /// `CLAUDE_CONFIG_DIR=config_dir`, no token env, the operator's terminal inherited, bounded by
+    /// `timeout` plus an operator SIGINT. `Ok` whether the operator completed the login, let it
+    /// time out, or cancelled it — the caller's read-back of the isolated item classifies which;
+    /// `Err` only if the child could not be spawned at all.
+    async fn run(&self, config_dir: &Path, timeout: Duration) -> Result<()>;
+}
+
+/// Production login spawner: the pinned `claude` binary (the engine pins the binary it spawns,
+/// per #101 provenance — a wrapper may exec a patched copy). A thin adapter over
+/// [`SpawnPlan::login`]. Wired to the login-capture engine's production entry (a later issue),
+/// hence `allow(dead_code)` off-test.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SpawnClaudeLogin {
+    binary: PathBuf,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SpawnClaudeLogin {
+    pub(crate) fn new(binary: PathBuf) -> Self {
+        Self { binary }
+    }
+}
+
+impl ClaudeLogin for SpawnClaudeLogin {
+    async fn run(&self, config_dir: &Path, timeout: Duration) -> Result<()> {
+        SpawnPlan::login(timeout)
             .run(&self.binary, config_dir.as_os_str())
             .await
     }
@@ -351,7 +413,7 @@ mod tests {
             "the refresh spawn must scrub the full credential/config-override set"
         );
         assert_eq!(
-            scrubbed_vars(&SpawnPlan::login()),
+            scrubbed_vars(&SpawnPlan::login(SPAWN_TIMEOUT)),
             expected,
             "the login spawn must scrub the full credential/config-override set — a dropped entry \
              is a silent isolation regression on the login path"
@@ -395,17 +457,40 @@ mod tests {
     /// here (and the both-parametrizations scrub test above exercises the same build path).
     #[test]
     fn login_plan_carries_the_login_parametrization() {
-        let plan = SpawnPlan::login();
+        // A distinct, non-default timeout proves the caller's tunable budget (#132) threads
+        // through into the bound rather than being fixed to the refresh path's SPAWN_TIMEOUT.
+        let timeout = Duration::from_secs(180);
+        let plan = SpawnPlan::login(timeout);
         let command = plan.build_command(Path::new("/nonexistent/claude"), OsStr::new("/tmp/iso"));
         let args: Vec<&OsStr> = command.as_std().get_args().collect();
         assert_eq!(args, [OsStr::new("/login")]);
         assert_eq!(plan.stdio, Stdio3::InheritTerminal);
-        assert_eq!(
-            plan.bound,
-            RunBound::TimeoutOrCancel {
-                timeout: SPAWN_TIMEOUT
-            }
-        );
+        assert_eq!(plan.bound, RunBound::TimeoutOrCancel { timeout });
+    }
+
+    /// AC2 (issue #132), the security invariant made explicit: the login child is invoked as the
+    /// interactive `/login` slash-command and NEVER a token-EMITTING subcommand (`setup-token`,
+    /// or a headless `-p` prompt), so no `sk-ant-*` bearer is ever printed to a stream this
+    /// process could capture. Paired with the inherit-terminal stdio (asserted here too), which
+    /// means the child's OAuth output goes straight to the operator's tty and is never piped into
+    /// an internal sink — there is no channel for a token to cross this process's own stdio.
+    #[test]
+    fn login_never_invokes_a_token_emitting_subcommand() {
+        let plan = SpawnPlan::login(Duration::from_secs(180));
+        let command = plan.build_command(Path::new("/nonexistent/claude"), OsStr::new("/tmp/iso"));
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // The sole argument is the interactive slash-command…
+        assert_eq!(args, ["/login"]);
+        // …and specifically none of the token-emitting shapes.
+        assert!(!args.iter().any(|a| a == "setup-token"));
+        assert!(!args.iter().any(|a| a == "-p" || a == "--print"));
+        // Inherit-terminal stdio: the child's streams are the operator's own, never piped — so
+        // the engine has no buffer into which a printed token could be teed.
+        assert_eq!(plan.stdio, Stdio3::InheritTerminal);
     }
 
     /// In-memory isolated keychain item — the fake seam for the session teardown test.

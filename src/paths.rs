@@ -103,6 +103,26 @@ pub(crate) fn isolated_refresh_dir(uuid: &str) -> Result<PathBuf> {
     Ok(support_dir()?.join("refresh").join(uuid))
 }
 
+/// The ephemeral isolated interactive-login directory: `<support_dir>/login` (issue
+/// #132). Native-local under [`support_dir`] (like [`isolated_refresh_dir`]) — it is
+/// the isolated `CLAUDE_CONFIG_DIR` the captured `claude /login` runs under, whose
+/// path-hash names the suffixed isolated keychain item CC writes the fresh credential
+/// to, so it must resolve identically for the engine and the `claude` it spawns.
+///
+/// Unlike the refresh dir, this is NOT keyed by an account uuid: a fresh login capture
+/// discovers the account only AFTER the login completes (from the isolated
+/// `.claude.json` `oauthAccount`), so there is no uuid to key on up front. A single
+/// fixed `login` leaf suffices — the capture-then-`/login` loop is sequential (one
+/// login at a time), and [`create_isolated_dir`] removes any stale leaf a crashed
+/// prior capture left behind before each run.
+///
+/// Wired by the login-capture engine's production entry (a later issue, #134), hence
+/// the test-only reachability today.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn isolated_login_dir() -> Result<PathBuf> {
+    Ok(support_dir()?.join("login"))
+}
+
 /// Create the ephemeral isolated-refresh directory `path` (issue #102) as a fresh,
 /// private (`0700`, owner-checked) directory, REFUSING a pre-existing symlink.
 ///
@@ -504,6 +524,18 @@ mod tests {
             "Library/Application Support/sessiometer/refresh/11111111-1111-1111-1111-111111111111"
         ));
         assert!(dir.starts_with(support_dir().unwrap()));
+    }
+
+    #[test]
+    fn isolated_login_dir_is_native_local_under_login() {
+        // The isolated login CLAUDE_CONFIG_DIR (#132) is a single fixed leaf under the
+        // native-local support dir (not uuid-keyed — the account is unknown until the
+        // login completes), so its path-hash names the suffixed isolated item stably.
+        let dir = isolated_login_dir().unwrap();
+        assert!(dir.ends_with("Library/Application Support/sessiometer/login"));
+        assert!(dir.starts_with(support_dir().unwrap()));
+        // Distinct from the refresh tree — the two engines never share an isolated dir.
+        assert_ne!(dir, isolated_refresh_dir("login").unwrap());
     }
 
     #[test]

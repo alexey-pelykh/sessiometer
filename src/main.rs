@@ -17,6 +17,7 @@ mod daemon;
 mod error;
 mod isolated_spawn;
 mod keychain;
+mod login;
 mod observability;
 mod paths;
 mod poke;
