@@ -353,6 +353,69 @@ accounts; larger rosters should lower `idle_after_secs` to fit the gap.
 > change once the engine's own first-run telemetry establishes the real TTL. Pick a
 > `cadence_secs` comfortably shorter than your observed token lifetime.
 
+## Configuration
+
+`sessiometer` keeps all of its state in one TOML file,
+`~/Library/Application Support/sessiometer/config.toml` (or
+`$XDG_CONFIG_HOME/sessiometer/config.toml` when `$XDG_CONFIG_HOME` is set). The
+**roster** — the `[[account]]` entries — is managed for you by `capture`, `login`,
+`remove`, and `disable`/`enable`; don't hand-edit it. The tuning blocks below **are**
+safe to hand-edit: every key is optional and falls back to the default shown, an
+out-of-range value is rejected at load with a message naming the key, and a running
+daemon reloads the file on change (no restart). The generated file also carries an
+inline comment on every key, so your own `config.toml` doubles as a reference.
+
+### `[tunables]`
+
+The primary hand-editable block — the poll cadence and the swap thresholds.
+
+| Key | Meaning | Range | Default |
+|-----|---------|-------|---------|
+| `poll_secs` | Seconds between re-polling a given account — the per-account cadence and the base of the rate-limit back-off. | `5..=3600` | `300` |
+| `cooldown_secs` | Seconds to wait after a swap before another swap is allowed. | `0..=3600` | `60` |
+| `session_trigger` | Swap **away** from the active account at or above this session-usage percent. | `50..=99` | `95` |
+| `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
+| `session_floor` | Opt-in guard: only swap **to** an account whose session usage is below this percent. Off unless set. | `0..=session_trigger` | off |
+| `monitor_401_n` | Consecutive non-scope `401`s before an account is treated as dead and quarantined. | `1..=20` | `3` |
+| `monitor_recovery_m` | Consecutive recovery-probe successes before a quarantined account whose own token recovers (without a re-login) is returned to the rotation. | `1..=20` | `2` |
+
+The ranges and defaults above are exactly the ones enforced in
+[`src/config.rs`](src/config.rs) (`Config::validate` and the `DEFAULT_*` constants) —
+the single source of truth this table is drawn from, so it stays in step with the code.
+
+### `[jitter]`
+
+Per-cycle randomization added to a tunable, drawn fresh each cycle and clamped back to
+the tunable's range, so polls and swaps decorrelate across accounts and cycles. One
+optional entry per tunable — `poll`, `trigger`, `weekly_trigger`, `cooldown` — each an
+inline table whose `kind` is `"none"`, `"uniform"` (with a `spread`), or `"normal"`
+(with a `stddev`); magnitudes are TOML floats. Only `poll` jitters by default:
+
+```toml
+[jitter]
+poll = { kind = "normal", stddev = 60.0 }   # default: normal, ~20% of poll_secs
+trigger = { kind = "none" }                 # trigger / weekly_trigger / cooldown default to none
+```
+
+### `[login]`
+
+Settings for `sessiometer login`, the interactive re-auth verb.
+
+| Key | Meaning | Range | Default |
+|-----|---------|-------|---------|
+| `timeout_secs` | Seconds bounding one whole interactive login capture — longer than a refresh, since it waits on a human completing a browser OAuth handoff. | `60..=600` | `180` |
+| `claude_bin` | Absolute path to the `claude` binary to spawn, overriding `$CLAUDE_BIN`/`$PATH`. Omit (or leave empty) to resolve normally. | — | unset |
+
+### Other blocks
+
+- **`[refresh]`** — the daemon's periodic parked-credential refresh; documented under
+  [Refreshing parked credentials automatically](#refreshing-parked-credentials-automatically).
+- **`[stats]`** — retention horizons for the usage-stats store.
+- **`[migration]`** — the KDF cost and conflict-policy defaults for `export` / `import`.
+
+`[stats]` and `[migration]` are hand-editable too; their keys, ranges, and defaults
+are documented by the inline comments in the generated `config.toml`.
+
 ## Exporting state (offline)
 
 `sessiometer export` serializes your local state — the roster and tunables plus each
@@ -447,7 +510,7 @@ each account independently, issuing **one `curl` usage request per roster accoun
 every `poll_secs`**. Per-tick work and outbound request volume therefore grow
 linearly with the roster size. `sessiometer` enforces no ceiling — size the
 roster to what your usage warrants, and if request volume becomes a concern,
-raise `poll_secs` or keep the roster smaller by choice.
+raise [`poll_secs`](#configuration) or keep the roster smaller by choice.
 
 ## Build from source
 
