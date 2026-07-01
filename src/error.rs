@@ -156,14 +156,6 @@ pub(crate) enum Error {
     #[error("the logged-in account is missing its `{field}` — cannot key the roster")]
     OauthAccountFieldMissing { field: &'static str },
 
-    /// A new account was captured without an explicit label. A new account must
-    /// be named by the operator (there is deliberately no server-provided
-    /// fallback: `displayName` can collide across accounts and `emailAddress` is
-    /// redacted, issue #15). Re-capturing an existing account keeps its label, so
-    /// this fires only for a brand-new account. Secret-free.
-    #[error("a label is required for a new account: pass `sessiometer capture <label>`")]
-    LabelRequired,
-
     // --- Account enable/disable (issue #36) ----------------------------------
     /// `sessiometer disable`/`enable` was invoked without the required `<label>`.
     /// Carries the subcommand (a static, secret-free string) so the message names
