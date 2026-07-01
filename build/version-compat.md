@@ -479,3 +479,85 @@ dead-signal and a second live witness for AC-2.
   operator-gated probe — see AC-3.
 
 CC 2.1.181 · macOS 26.5.1 / 25F80 · sessiometer #101.
+
+---
+
+# #130 — isolated-`CLAUDE_CONFIG_DIR` **interactive**-login lifecycle ✅ PASS
+
+Acceptance record for issue [#130](https://github.com/alexey-pelykh/sessiometer/issues/130): a
+one-time empirical check that an **interactive** `claude /login` (browser-OAuth handoff), run under an
+isolated `CLAUDE_CONFIG_DIR`, writes its credential to the **suffixed** keychain item (#100) and leaves
+the shared `Claude Code-credentials` item a live session reads **byte-for-byte unchanged**. The
+front-loaded gate for the interactive-login capture engine (#132). Delta over #101: interactive
+`/login` (real browser handoff + credential-write target) vs #101's non-interactive `claude -p`.
+
+## Environment
+
+| Field | Value |
+|---|---|
+| Claude Code version | `2.1.197` (re-validated on the bump from `2.1.181` at #101) |
+| macOS | `26.5.1` / `25F80` |
+| Run | 2026-07-01 (two operator-driven interactive runs) |
+| acct | macOS username (`whoami`) |
+
+## Result — ✅ PASS (two independent runs)
+
+Suffix derived byte-exactly by sessiometer's own #100 derivation (`printf %s <config-dir> | shasum
+-a256 | cut -c1-8`, cross-checked live against the committed `keychain::tests` `/abs/path → 6d80187b`
+vector). Shared-item integrity checked two ways **without surfacing the secret**: the attribute dump
+(incl. `mdat`) and a `security -w | shasum` blob hash, captured before each run and re-verified after
+teardown.
+
+| AC | Check | Run 1 (`claude /login`) | Run 2 (bare `claude`, seeded) |
+|---|---|---|---|
+| 1a | interactive login → **suffixed** item gets a fresh blob | ✅ blob `de2a3701…` | ✅ blob `45066956…` |
+| 1b | shared `Claude Code-credentials` **byte-for-byte unchanged** | ✅ attr `125cc3f0…` + blob `447f5211…` == baseline | ✅ attr `125cc3f0…` == baseline |
+| 2  | browser OAuth completes under isolation | ✅ both handoffs completed; CC authenticated in the isolated dir |
+
+Teardown (`security delete-generic-password` on the suffixed item + `rm -rf` the dir) ran clean each
+time; the shared item was intact after both.
+
+⇒ **The isolation premise holds for interactive `/login` on CC 2.1.197.** #132 (capture engine) is
+**UNBLOCKED**.
+
+## Onboarding / single-login mechanics (probe) → propagated to #132
+
+Run 1 surfaced an operator-UX wrinkle: a **fresh** isolated dir made `claude /login` run first-start
+onboarding (trust-folder + theme prompts) **and** a **double login** — an onboarding auto-login **then**
+the explicit `/login`. Run 2 was a controlled probe to isolate the cause: a **seeded** `.claude.json`
+(`{"hasCompletedOnboarding":true,"theme":"dark","hasTrustDialogAccepted":true}`) + a **bare** `claude`
+(no `/login`). Observed:
+
+- **No theme prompt** (seed `theme` honored); **no onboarding auto-login** — CC sat idle at `Not logged
+  in · Run /login` until the operator typed `/login` once.
+- ⇒ the run-1 auto-login was **onboarding's own login step**, removed by `hasCompletedOnboarding:true` —
+  **not** a generic auth-gate. **Config-seeding alone removes the extra login; no auth pre-seed is
+  needed** (which would defeat capturing a fresh login anyway).
+- **Trust-folder dialog STILL appeared** — top-level `hasTrustDialogAccepted` does **not** cover it;
+  trust is **CWD-scoped** (the accessed workspace was the operator's terminal cwd), stored per-project.
+
+**#132 design impact (evidence-based):**
+
+1. **Single login while keeping the AC-mandated `/login`:** seed the isolated `.claude.json` with
+   `hasCompletedOnboarding:true` (+ `theme`), then pass `/login`. Onboarding login skipped (0) +
+   explicit `/login` (1) = **one** login; the operator only completes the browser OAuth. (Directly
+   observed: seeded ⇒ no onboarding auto-login; `/login` ⇒ exactly one login. #132's tests should
+   confirm the composed `seeded + /login` case.)
+2. **Seed content differs from the refresh path.** #101 AC-5 seeds `{}` (`MINIMAL_CLAUDE_JSON`) because
+   headless `claude -p` skips onboarding; the **interactive** login path needs the onboarding keys
+   above. If #131's shared seam parametrizes only argv/stdio/cancel-arm, #132 must supply this seed
+   itself (or #131 adds seed-content as a seam parameter).
+3. **Trust dialog** is a separate, CWD-scoped friction — suppress by seeding the per-project trust entry
+   for the launch cwd (or launch from a pre-trusted/neutral dir). Minor (one keystroke); polish, not a
+   blocker.
+
+## Provenance
+
+- Live, operator-driven, on the operator's Mac; **real** interactive OAuth (no fake tokens — this is the
+  interactive-flow gate #101's `claude -p` probes could not cover). Two runs.
+- Shared-item baseline captured before each run and re-verified after teardown; the secret blob was
+  hashed, never printed. Isolation held both times.
+- Suffix derivation identical to `keychain::service_for_config_dir` (#100); bash `shasum` cross-checked
+  against the committed `/abs/path → 6d80187b` test vector.
+
+CC 2.1.197 · macOS 26.5.1 / 25F80 · sessiometer #130.
