@@ -27,6 +27,7 @@ mod refresh;
 mod refresh_tick;
 mod sha256;
 mod stash;
+mod stats;
 mod swap;
 mod timing;
 mod usage;
