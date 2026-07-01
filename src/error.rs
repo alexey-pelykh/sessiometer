@@ -307,11 +307,14 @@ pub(crate) enum Error {
     #[error("`{query}` is ambiguous: {count} accounts match — disambiguate with the account-uuid")]
     UseTargetAmbiguous { query: String, count: usize },
 
-    /// `use` could not identify the active account to swap AWAY from: no account
-    /// is logged in to Claude Code, or the logged-in `oauthAccount.accountUuid`
-    /// matches no roster entry. The swap re-stashes the outgoing account, so its
-    /// roster identity must be known — mirrors the daemon's "can't identify active
-    /// ⇒ don't swap". ZERO writes. Secret-free.
+    /// `use` could not identify the active account to swap AWAY from: the canonical
+    /// keychain token matches no captured stash AND `~/.claude.json`'s logged-in
+    /// `oauthAccount.accountUuid` matches no roster entry either (issue #207 resolves
+    /// the active account token-first, with the display as the fallback). The swap
+    /// re-stashes the outgoing account, so its roster identity must be known —
+    /// mirrors the daemon's "can't identify active ⇒ don't swap". A LOCKED keychain
+    /// does NOT surface here: it aborts earlier as [`KeychainLocked`](Self::KeychainLocked),
+    /// never swallowed to this. ZERO writes. Secret-free.
     #[error(
         "cannot determine the active account to swap away from \
          (no logged-in account matches the roster — run `sessiometer list`)"
