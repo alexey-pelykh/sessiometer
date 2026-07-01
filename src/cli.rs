@@ -19,6 +19,7 @@ use crate::daemon::{
 };
 use crate::error::{Error, Result};
 use crate::keychain::RealCredentialStore;
+use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
     CredentialHealth, Diagnostic, DiagnosticLog, EventLog, RefreshEventOutcome, Verbosity,
 };
@@ -197,6 +198,50 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     })
                     .await
                 }
+                // `export [PATH] [--plaintext] [--no-secrets]
+                // [--passphrase-file <path> | --passphrase-stdin]` — the READ-ONLY
+                // verb that serializes local state (per-account credential stashes +
+                // `oauthAccount` + roster + config) into a migration artifact (issue
+                // #148), driving the #146 container + #147 encryption envelope. With a
+                // `PATH` it writes the file atomically at mode 0600; with none it writes
+                // to stdout. Default encrypts (passphrase via an interactive no-echo
+                // prompt, or `--passphrase-file`/`--passphrase-stdin` — NEVER argv, cf.
+                // #39); `--plaintext` opts out (warned). `--no-secrets` drops the
+                // credential blobs (config-only). Flags may appear in any order and a
+                // value-bearing flag takes the next token or a `--flag=value` form; the
+                // first non-flag token is the PATH, extras ignored.
+                "export" => {
+                    let mut path: Option<PathBuf> = None;
+                    let mut plaintext = false;
+                    let mut no_secrets = false;
+                    let mut passphrase_file: Option<PathBuf> = None;
+                    let mut passphrase_stdin = false;
+                    while let Some(arg) = args.next() {
+                        match arg.to_string_lossy().as_ref() {
+                            "--plaintext" => plaintext = true,
+                            "--no-secrets" => no_secrets = true,
+                            "--passphrase-stdin" => passphrase_stdin = true,
+                            "--passphrase-file" => {
+                                passphrase_file = args.next().map(PathBuf::from);
+                            }
+                            v if v.starts_with("--passphrase-file=") => {
+                                passphrase_file =
+                                    Some(PathBuf::from(&v["--passphrase-file=".len()..]));
+                            }
+                            v if v.starts_with('-') => {
+                                // Unknown flag: ignore, matching the other subcommands.
+                            }
+                            _ if path.is_none() => path = Some(PathBuf::from(&arg)),
+                            _ => {} // extra positional ignored, matching the others
+                        }
+                    }
+                    export(
+                        path,
+                        no_secrets,
+                        export_encryption(plaintext, passphrase_file, passphrase_stdin),
+                    )
+                    .await
+                }
                 "-h" | "--help" => {
                     print_usage();
                     Ok(())
@@ -226,6 +271,7 @@ fn print_usage() {
          remove <label>       Delete an account: drop it from the rotation and erase its stash\n    \
          poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)\n    \
          stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)\n    \
+         export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout\n    \
          --help     Print this help"
     );
 }
@@ -1381,6 +1427,142 @@ async fn list() -> Result<()> {
     let auth = gather_auth_subset(&roster).await;
     print!("{}", render_roster(&roster, &auth, now_epoch()));
     Ok(())
+}
+
+/// How an encrypted export sources its passphrase. NEVER an argv value (issues #39 /
+/// #148): only an interactive no-echo terminal prompt, a file, or standard input.
+enum PassphraseSource {
+    /// Prompt on the controlling terminal with echo disabled (the default).
+    Prompt,
+    /// Read the passphrase's first line from the given file (`--passphrase-file`).
+    File(PathBuf),
+    /// Read the passphrase's first line from standard input (`--passphrase-stdin`).
+    Stdin,
+}
+
+impl PassphraseSource {
+    /// Acquire the passphrase from this source, funnelling through the #147 input
+    /// paths so the bytes are held in a `Zeroizing` buffer and never pass through argv.
+    fn read(&self) -> Result<Passphrase> {
+        match self {
+            PassphraseSource::Prompt => Passphrase::prompt("Passphrase to encrypt the export: "),
+            PassphraseSource::File(path) => Passphrase::from_file(path),
+            PassphraseSource::Stdin => Passphrase::from_stdin(),
+        }
+    }
+}
+
+/// Whether the export body is encrypted (the default) and, if so, how its passphrase
+/// is read; or `Plaintext` for the `--plaintext` opt-out.
+enum Encryption {
+    /// Encrypt the body under a passphrase from the given source (#147).
+    Encrypted(PassphraseSource),
+    /// Write the body in the clear — warned when it carries secrets.
+    Plaintext,
+}
+
+/// Resolve the parsed `export` flags into an [`Encryption`] decision. `--plaintext`
+/// wins outright (no passphrase is read); otherwise a `--passphrase-file` /
+/// `--passphrase-stdin` source is honored, defaulting to the interactive prompt.
+fn export_encryption(
+    plaintext: bool,
+    passphrase_file: Option<PathBuf>,
+    passphrase_stdin: bool,
+) -> Encryption {
+    if plaintext {
+        Encryption::Plaintext
+    } else if let Some(path) = passphrase_file {
+        Encryption::Encrypted(PassphraseSource::File(path))
+    } else if passphrase_stdin {
+        Encryption::Encrypted(PassphraseSource::Stdin)
+    } else {
+        Encryption::Encrypted(PassphraseSource::Prompt)
+    }
+}
+
+/// `export [PATH]` — serialize local state into a migration artifact (issue #148).
+///
+/// READ-ONLY: loads the roster + tunables ([`Config::load`]) and reads each account's
+/// keychain stash, mutating neither. Builds the #146 container — the rendered config
+/// plus, unless `no_secrets`, every account's credential + `oauthAccount` material —
+/// then either encrypts it under a passphrase (#147) or, for [`Encryption::Plaintext`],
+/// leaves it in the clear (warned, unless secret-free). Writes to `path` (atomic,
+/// mode 0600) or, with no `path`, to standard output.
+///
+/// Diagnostics carry no account label, email, or token — the passphrase is read
+/// through the #147 no-argv input paths and never logged.
+async fn export(path: Option<PathBuf>, no_secrets: bool, encryption: Encryption) -> Result<()> {
+    let config = Config::load()?;
+    let stash = RealAccountStash::new();
+    let payload = gather_payload(&config, &stash, no_secrets).await?;
+
+    let bytes = match encryption {
+        Encryption::Plaintext => {
+            // The artifact then holds restorable credentials in the clear. Warn on
+            // stderr — never stdout, which may carry the artifact — unless `--no-secrets`
+            // made it secret-free (nothing to protect, so the warning would misinform).
+            if !no_secrets {
+                eprintln!("{PLAINTEXT_WARNING}");
+            }
+            MigrationArtifact::plaintext(payload).to_bytes()
+        }
+        Encryption::Encrypted(source) => {
+            let passphrase = source.read()?;
+            MigrationArtifact::encrypt(&payload, &passphrase)?.to_bytes()
+        }
+    };
+
+    write_export(path.as_deref(), &bytes)
+}
+
+/// Gather the live state into a migration [`Payload`] — READ-ONLY, generic over the
+/// stash so tests drive it with a fake in-memory `FakeAccountStash`.
+///
+/// `config_toml` is the canonical rendered config (roster + tunables + refresh). With
+/// `no_secrets`, `accounts` is left EMPTY — a config-only artifact: the roster still
+/// travels inside `config_toml`, but no credential material does, so no keychain read
+/// happens at all. Otherwise each roster account's stash is read and its credential +
+/// `oauthAccount` bytes carried.
+async fn gather_payload(
+    config: &Config,
+    stash: &impl AccountStash,
+    no_secrets: bool,
+) -> Result<Payload> {
+    let config_toml = config.render();
+    let accounts = if no_secrets {
+        Vec::new()
+    } else {
+        let mut accounts = Vec::with_capacity(config.roster.len());
+        for account in &config.roster {
+            let stashed = stash.read(&account.stash()).await?;
+            accounts.push(ManagedAccount::new(
+                account.account_uuid.clone(),
+                stashed.credential.expose().to_vec(),
+                stashed.oauth_account.raw_json().to_vec(),
+            ));
+        }
+        accounts
+    };
+    Ok(Payload::new(config_toml, accounts))
+}
+
+/// Write the serialized artifact to `path` or, when `None`, to standard output.
+///
+/// The file path uses [`paths::write_private_file`]: a same-directory temp, `fsync`,
+/// then an atomic `rename(2)` — so a concurrent reader sees the old file or the new
+/// one, never a partial write — and the result is mode 0600 regardless of `--no-secrets`
+/// (a config-only artifact is still never left world-readable; issue #148).
+fn write_export(path: Option<&Path>, bytes: &[u8]) -> Result<()> {
+    match path {
+        Some(path) => paths::write_private_file(path, bytes),
+        None => {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            out.write_all(bytes)?;
+            out.flush()?;
+            Ok(())
+        }
+    }
 }
 
 /// Resolve a load outcome into the roster `list` renders, or the error it exits on.
@@ -3463,5 +3645,250 @@ spare  22222222-2222\n\
             serde_json::from_str(wire).expect("an absent next_swap decodes, not errors");
         assert_eq!(parsed.next_swap, None);
         assert!(parsed.accounts.is_empty());
+    }
+
+    // --- `export` verb (issue #148) -----------------------------------------
+
+    const UUID_A: &str = "11111111-1111-1111-1111-111111111111";
+    const UUID_B: &str = "22222222-2222-2222-2222-222222222222";
+    const TOKEN_A: &[u8] = b"CREDENTIAL-TOKEN-AAAA-abcdef0123456789";
+    const TOKEN_B: &[u8] = b"CREDENTIAL-TOKEN-BBBB-9876543210fedcba";
+    const EMAIL_A: &str = "alice@example.com";
+    const EMAIL_B: &str = "bob@example.com";
+
+    /// A `StashedAccount` carrying a known bearer token + an `oauthAccount` identity
+    /// block (with an email, so leak assertions have a distinctive personal identifier
+    /// to search for).
+    fn export_stashed(token: &[u8], uuid: &str, email: &str) -> crate::stash::StashedAccount {
+        crate::stash::StashedAccount {
+            credential: crate::keychain::Credential::new(token.to_vec()),
+            oauth_account: crate::claude_state::OauthAccount::from_object_bytes(
+                format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{email}"}}"#).as_bytes(),
+            )
+            .expect("valid oauthAccount object"),
+        }
+    }
+
+    /// A two-account roster + a `FakeAccountStash` holding both accounts' secret
+    /// material — the hermetic stand-in for the real config + keychain.
+    async fn export_config_and_stash() -> (Config, crate::stash::FakeAccountStash) {
+        let config = config_with(vec![acct("alice", UUID_A), acct("bob", UUID_B)]);
+        let stash = crate::stash::FakeAccountStash::empty();
+        stash
+            .write(
+                &config.roster[0].stash(),
+                &export_stashed(TOKEN_A, UUID_A, EMAIL_A),
+            )
+            .await
+            .unwrap();
+        stash
+            .write(
+                &config.roster[1].stash(),
+                &export_stashed(TOKEN_B, UUID_B, EMAIL_B),
+            )
+            .await
+            .unwrap();
+        (config, stash)
+    }
+
+    /// Lowercase-hex encode — the on-the-wire form of the artifact's byte fields.
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Whether `needle` occurs anywhere in `haystack`.
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The container that `gather_payload` assembles round-trips losslessly through
+    /// encryption, and the encrypted artifact reveals neither the tokens, the emails,
+    /// nor the passphrase — and is unreadable under the wrong passphrase.
+    #[tokio::test]
+    async fn export_encrypted_round_trips_gathered_state_and_hides_it() {
+        let (config, stash) = export_config_and_stash().await;
+        let payload = gather_payload(&config, &stash, false).await.unwrap();
+
+        // Gather fidelity: the assembled payload equals one built by hand from the same
+        // rendered config + per-account stash bytes (keyed uuid → credential/oauth).
+        let sa = export_stashed(TOKEN_A, UUID_A, EMAIL_A);
+        let sb = export_stashed(TOKEN_B, UUID_B, EMAIL_B);
+        let expected = Payload::new(
+            config.render(),
+            vec![
+                ManagedAccount::new(
+                    UUID_A.to_owned(),
+                    sa.credential.expose().to_vec(),
+                    sa.oauth_account.raw_json().to_vec(),
+                ),
+                ManagedAccount::new(
+                    UUID_B.to_owned(),
+                    sb.credential.expose().to_vec(),
+                    sb.oauth_account.raw_json().to_vec(),
+                ),
+            ],
+        );
+        assert!(
+            payload == expected,
+            "gather_payload must faithfully assemble the container"
+        );
+
+        // Encrypt → serialize → parse → decrypt yields an equal payload. Passphrases
+        // come from files (the #147 no-argv input path), never an argv value.
+        let dir = tempfile::tempdir().unwrap();
+        let pp_path = dir.path().join("pp");
+        std::fs::write(&pp_path, b"correct horse battery staple\n").unwrap();
+        let pp = Passphrase::from_file(&pp_path).unwrap();
+        let bytes = MigrationArtifact::encrypt(&payload, &pp)
+            .unwrap()
+            .to_bytes();
+        let parsed = MigrationArtifact::from_bytes(&bytes).unwrap();
+        assert!(
+            parsed.decrypt(&pp).unwrap() == payload,
+            "encrypted round-trip must be lossless"
+        );
+
+        // Confidentiality: the on-disk bytes reveal neither token (raw or hex form),
+        // neither email, nor the passphrase.
+        assert!(
+            !contains_bytes(&bytes, TOKEN_A),
+            "raw token A must not appear"
+        );
+        assert!(
+            !contains_bytes(&bytes, hex_of(TOKEN_A).as_bytes()),
+            "hex token A must not appear"
+        );
+        assert!(
+            !contains_bytes(&bytes, EMAIL_A.as_bytes()),
+            "email A must not appear"
+        );
+        assert!(
+            !contains_bytes(&bytes, b"correct horse battery staple"),
+            "the passphrase must never appear in the artifact",
+        );
+
+        // Not readable without the passphrase: a wrong passphrase fails closed.
+        let wrong_path = dir.path().join("wrong");
+        std::fs::write(&wrong_path, b"wrong passphrase\n").unwrap();
+        let wrong = Passphrase::from_file(&wrong_path).unwrap();
+        assert!(
+            parsed.decrypt(&wrong).is_err(),
+            "wrong passphrase must fail to decrypt"
+        );
+    }
+
+    /// `--no-secrets` yields a config-only artifact: no credential material for any
+    /// account, and no keychain read happens for it — the roster still travels in the
+    /// config, but no token or email bytes do.
+    #[tokio::test]
+    async fn export_no_secrets_omits_every_credential_blob() {
+        let (config, stash) = export_config_and_stash().await;
+        let payload = gather_payload(&config, &stash, true).await.unwrap();
+
+        // Config-only: identical to a payload with an EMPTY account set.
+        assert!(payload == Payload::new(config.render(), Vec::new()));
+
+        // Serialize it (plaintext container) and assert the credential material is
+        // wholly absent — neither raw token, nor hex token, nor email, for either
+        // account — while the roster (labels/uuids) is present in the config text.
+        let bytes = MigrationArtifact::plaintext(payload).to_bytes();
+        assert!(
+            MigrationArtifact::from_bytes(&bytes).is_ok(),
+            "config-only artifact must parse"
+        );
+        for token in [TOKEN_A, TOKEN_B] {
+            assert!(!contains_bytes(&bytes, token), "no raw credential blob");
+            assert!(
+                !contains_bytes(&bytes, hex_of(token).as_bytes()),
+                "no hex credential blob"
+            );
+        }
+        for email in [EMAIL_A, EMAIL_B] {
+            assert!(
+                !contains_bytes(&bytes, email.as_bytes()),
+                "no oauthAccount email"
+            );
+        }
+        assert!(
+            contains_bytes(&bytes, UUID_A.as_bytes()),
+            "the roster itself is still exported"
+        );
+    }
+
+    /// A `--plaintext` export round-trips structurally and — by design — carries the
+    /// secret material in the clear (the contrast the plaintext warning covers).
+    #[tokio::test]
+    async fn export_plaintext_round_trips_and_carries_secrets_in_the_clear() {
+        let (config, stash) = export_config_and_stash().await;
+        let payload = gather_payload(&config, &stash, false).await.unwrap();
+        let bytes = MigrationArtifact::plaintext(payload).to_bytes();
+
+        assert!(
+            MigrationArtifact::from_bytes(&bytes).is_ok(),
+            "plaintext artifact must parse"
+        );
+        // Unencrypted → the credential blob is present (hex-encoded) — this is exactly
+        // what `PLAINTEXT_WARNING` (surfaced by `export`) warns about.
+        assert!(
+            contains_bytes(&bytes, hex_of(TOKEN_A).as_bytes()),
+            "a plaintext export carries the credential blob in the clear",
+        );
+    }
+
+    /// The file target is written atomically at mode 0600, replacing any prior file
+    /// and leaving no temp residue — so a reader sees the old file or the new one.
+    #[test]
+    fn export_to_file_is_private_atomic_and_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.smmig");
+
+        // A pre-existing file (world-readable) must be fully replaced by the write.
+        std::fs::write(&path, b"OLD CONTENT").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_export(Some(&path), b"NEW ARTIFACT BYTES").unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"NEW ARTIFACT BYTES",
+            "old-or-new, fully replaced"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the artifact file must be 0600, never world-readable"
+        );
+        let mut tmp = path.clone().into_os_string();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "no temp residue left behind"
+        );
+    }
+
+    /// The passphrase is sourced only indirectly (file / stdin / interactive prompt) —
+    /// there is no argv path that carries the secret value (issues #39 / #148).
+    /// `--plaintext` wins outright and reads no passphrase at all.
+    #[test]
+    fn export_passphrase_source_is_never_an_argv_value() {
+        let file = PathBuf::from("/some/passphrase/file");
+        assert!(matches!(
+            export_encryption(false, Some(file.clone()), false),
+            Encryption::Encrypted(PassphraseSource::File(_)),
+        ));
+        assert!(matches!(
+            export_encryption(false, None, true),
+            Encryption::Encrypted(PassphraseSource::Stdin),
+        ));
+        assert!(matches!(
+            export_encryption(false, None, false),
+            Encryption::Encrypted(PassphraseSource::Prompt),
+        ));
+        // `--plaintext` short-circuits: no passphrase source is consulted.
+        assert!(matches!(
+            export_encryption(true, Some(file), true),
+            Encryption::Plaintext
+        ));
     }
 }

@@ -353,6 +353,46 @@ accounts; larger rosters should lower `idle_after_secs` to fit the gap.
 > change once the engine's own first-run telemetry establishes the real TTL. Pick a
 > `cadence_secs` comfortably shorter than your observed token lifetime.
 
+## Exporting state (offline)
+
+`sessiometer export` serializes your local state — the roster and tunables plus each
+account's stashed credential and `oauthAccount` identity — into a single **migration
+artifact**, so you can move a whole setup to another Mac. It is **read-only**: it
+never mutates the keychain or the roster.
+
+```bash
+# Encrypted by default — prompts for a passphrase (no echo), writes a 0600 file:
+sessiometer export ~/sessiometer-state.smmig
+
+# Or stream the artifact to stdout (still prompts on the terminal for the passphrase):
+sessiometer export > state.smmig
+
+# Config-only — the roster + tunables, with NO credential material:
+sessiometer export --no-secrets ~/sessiometer-config.smmig
+```
+
+The passphrase is **never** taken from the command line (it would leak into the
+process table and shell history). Supply it interactively, or non-interactively for
+automation via `--passphrase-stdin` / `--passphrase-file <path>`:
+
+```bash
+sessiometer export --passphrase-stdin state.smmig < passphrase.txt
+```
+
+Flags:
+
+- **(default)** — encrypt the artifact with a passphrase (Argon2id + XChaCha20-Poly1305).
+- **`--plaintext`** — skip encryption. The artifact then holds usable credentials **in
+  the clear**; `export` prints a warning, and you should treat and delete the file like
+  a password. Legitimately paired with `--no-secrets` (nothing to protect).
+- **`--no-secrets`** — export a config-only artifact (roster + tunables), omitting every
+  credential blob — handy to share a configuration without secrets.
+
+A `PATH` argument is written atomically (a same-directory temp, then `rename(2)`) at
+mode `0600`; with no `PATH` the artifact goes to standard output. Cross-machine
+credential portability on macOS is verified (build spike #145), so an exported artifact
+restores on another Mac.
+
 ## Edge cases & resilience
 
 `sessiometer` is built to ride out the keychain and credential edge cases a

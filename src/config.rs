@@ -618,8 +618,10 @@ impl Config {
     /// comments (issue #3 N2). `serde` serialization cannot emit comments, so
     /// the file is rendered by hand; integers need no escaping and roster
     /// strings go through [`basic_string`].
-    #[allow(dead_code)]
-    fn render(&self) -> String {
+    ///
+    /// `pub(crate)` so the `export` verb (issue #148) can serialize the canonical
+    /// config text into a migration artifact ([`crate::migration::Payload`]).
+    pub(crate) fn render(&self) -> String {
         let t = &self.tunables;
         let mut out = String::new();
         out.push_str("# sessiometer configuration.\n");
