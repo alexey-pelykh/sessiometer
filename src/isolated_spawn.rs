@@ -18,8 +18,9 @@
 //!     which already lives behind its own single seam in [`crate::keychain`] and is only *used*
 //!     here.
 //!
-//! (The fourth scaffold piece, the startup orphan-reaper #103, stays with its daemon-start
-//! caller in [`crate::refresh`].)
+//! (The fourth scaffold piece, the startup orphan-reaper #103 — extended to the login isolation
+//! root in #133, both halves the crash-path counterpart of [`IsolatedSession`]'s graceful teardown —
+//! stays with its daemon-start caller in [`crate::refresh`], sharing one reap core across both.)
 //!
 //! [`SpawnPlan`] parametrizes the child by the three axes that differ between callers: **argv**
 //! (`-p <benign>` vs `/login`), **stdio** ([`Stdio3`] — nulled vs inherit-terminal), and **run
