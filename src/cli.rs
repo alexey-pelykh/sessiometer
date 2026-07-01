@@ -134,6 +134,53 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     let target = args.next().map(|s| s.to_string_lossy().into_owned());
                     crate::poke::poke(target).await
                 }
+                // `stats [<account>...] [--period day|week|month|lifetime] [--since <when>]
+                // [--json]` — the OFFLINE usage reader (issue #158). It reads the sample
+                // store's own files directly, so it renders with the daemon DOWN and makes
+                // no live socket / keychain / usage-API call (the daemon is the sole writer,
+                // this the sole reader). Positionals filter which accounts show (all by
+                // default); `--period` defaults to `week` and is mutually exclusive with
+                // `--since`. Flags may appear in any order; a value-bearing flag takes the
+                // next token or a `--flag=value` form. Validation lives in `stats::run`.
+                "stats" => {
+                    let mut accounts = Vec::new();
+                    let mut period = None;
+                    let mut since = None;
+                    let mut json = false;
+                    while let Some(arg) = args.next() {
+                        let arg = arg.to_string_lossy();
+                        if arg == "--json" {
+                            json = true;
+                        } else if arg == "--period" {
+                            period = Some(
+                                args.next()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            );
+                        } else if let Some(v) = arg.strip_prefix("--period=") {
+                            period = Some(v.to_owned());
+                        } else if arg == "--since" {
+                            since = Some(
+                                args.next()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
+                            );
+                        } else if let Some(v) = arg.strip_prefix("--since=") {
+                            since = Some(v.to_owned());
+                        } else if arg.starts_with('-') {
+                            // Unknown flag: ignore, matching the other subcommands.
+                        } else {
+                            accounts.push(arg.into_owned());
+                        }
+                    }
+                    crate::stats::run(crate::stats::StatsArgs {
+                        accounts,
+                        period,
+                        since,
+                        json,
+                    })
+                    .await
+                }
                 "-h" | "--help" => {
                     print_usage();
                     Ok(())
@@ -162,6 +209,7 @@ fn print_usage() {
          enable <label>       Return a parked account to the rotation\n    \
          remove <label>       Delete an account: drop it from the rotation and erase its stash\n    \
          poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)\n    \
+         stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)\n    \
          --help     Print this help"
     );
 }
