@@ -49,16 +49,16 @@ row of an aligned, border-less table under a labelled header — greppable, one
 record per line:
 
 ```text
-ACCOUNT  SESSION% RESET  WEEKLY% RESET  HEALTH
-* work   97%      12m    40%     5d
-  spare  10%      2h     20%     3d
-  dead   n/a      n/a    n/a     n/a    needs re-login
+ACCOUNT  SESSION% RESET  WEEKLY% RESET  AUTH
+* work   97%      12m    40%     5d     🟢
+  spare  10%      2h     20%     3d     🟢
+  dead   n/a      n/a    n/a     n/a    🔴 claude /login
 
 next swap: spare
 ```
 
 - A **header row** labels the columns: `ACCOUNT`, then the grouped `SESSION%` +
-  `RESET`, then the grouped `WEEKLY%` + `RESET`, then `HEALTH`. It is plain
+  `RESET`, then the grouped `WEEKLY%` + `RESET`, then `AUTH`. It is plain
   (uncolored) and aligned with the data; each window's reset shares the `RESET`
   label, disambiguated by sitting beside its own `%`.
 - `*` marks the **active** account.
@@ -71,10 +71,16 @@ next swap: spare
 - Each reset is the compact time until that window refills (e.g. `12m`, `2h`,
   `3d4h`), shown for **every** account, not only an exhausted one — `n/a` when that
   reset instant is unknown.
-- A trailing **health-text** column carries inline tags — `disabled` (parked,
-  issue #36) and `needs re-login` (a dead credential, issue #42), the latter softened
-  to `recovering` while that credential is answering again and climbing back toward
-  health (issue #109); it is omitted when no account carries a tag.
+- A trailing **`AUTH`** column reports each account's **credential-auth state** as one
+  self-coloring glyph — **🟢** healthy (a positive liveness signal), **🟡** stale (the
+  access token has expired but the refresh token still recovers it), **🟠** at-risk (the
+  auto-refresh safety-net is failing), **🔴** dead (needs re-login), **⚪** unknown (no
+  liveness signal yet — unverified, not a false 🟢, issue #137). A **🔴** dead credential
+  trails the actionable **`claude /login`** cue, softened to `recovering` while a dead
+  credential is answering again and climbing back toward health (issue #109); a parked
+  account trails `disabled` (issue #36, orthogonal to credential health). The header
+  reports **auth** standing, not a vague "health" (rate-limit health lives in the `%`
+  columns); the column is omitted only when no account carries a state.
 
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`
@@ -112,6 +118,32 @@ sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
 
 The output is sourced solely from non-secret fields (labels, percentages, reset
 instants, a next-swap candidate label), so it never prints a token or email (issue #15).
+
+For each account's raw **access-token expiry**, pass `-v` (or `--verbose`):
+
+```text
+ACCOUNT  SESSION% RESET  WEEKLY% RESET  AUTH
+* work   97%      12m    40%     5d     🟢
+  spare  10%      2h     20%     3d     🟢
+  dead   n/a      n/a    n/a     n/a    🔴 claude /login
+
+next swap: spare
+
+access token — auto-refreshed by Claude Code, not a re-login deadline:
+  work   expires in 3h
+  spare  expires in 40m
+  dead   unknown
+```
+
+The block trails the table with one line per account — `expires in <time>` (the same
+compact `2h` / `3d4h` units the resets use), `expired` once that instant has passed, or an
+honest `unknown` when no expiry is stored. It is the raw **access-token** TTL: Claude Code
+refreshes this token invisibly, so a lapsed clock is **not** a re-login deadline — that is
+the 🔴 `claude /login` cue in the `AUTH` column. The raw clock is kept out of the default
+table (where it would be misread as a deadline); `--verbose` is the opt-in for it in the
+text view, mirroring `--json`, which already carries the raw `access_expires_at` for every
+account. Like the table, the block is content (it survives a pipe), never colored, and
+sourced only from non-secret fields, so it never prints a token or email (issue #15).
 
 ## Listing accounts (offline)
 
