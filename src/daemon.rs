@@ -552,6 +552,72 @@ pub(crate) trait RefreshTicker {
     async fn sweep(&mut self, excluded: &[String], quarantined: &[String]) -> SweepOutcome;
 }
 
+/// The external-login watch cadence (issue #140): how often the run loop probes the canonical
+/// credential item for an OUT-OF-BAND change (a manual `claude /login`), DECOUPLED from the
+/// usage-poll cadence (`poll_secs`, default 300 s). The probe is a LOCAL keychain read — no
+/// network, no rate-limit — so a short cadence is cheap; 15 s bounds the worst-case
+/// active-account re-auth latency to seconds instead of a full poll interval. A named constant
+/// (not config) keeps issue #140 scoped to the reactivity change; operator-tunable config is a
+/// deliberate future option. Chosen over event-driven keychain watching (kqueue / FSEvents /
+/// `Sec*` callbacks): the macOS keychain DB is fragile to watch and would add substantial
+/// unsafe / FFI surface for little gain over a cheap local poll on the established idle-seam
+/// pattern (#105).
+const EXTERNAL_LOGIN_WATCH_SECS: u64 = 15;
+
+/// External-login watch seam (issue #140): the run loop drives this from its idle path to
+/// notice a manual `claude /login` (or any out-of-band canonical rewrite) on the ACTIVE
+/// account FASTER than the usage-poll cadence. Distinct from [`RefreshTicker`] (#105, the
+/// periodic parked-account refresh) and [`CanonicalWatch`] (the per-tick change classifier):
+/// this is purely a shorter-cadence TRIGGER — it reads the canonical and, when it differs from
+/// the daemon's last-committed baseline ([`Daemon::canonical_baseline`]), the run loop breaks
+/// the idle to re-tick so the existing [`Daemon::reconcile_canonical_change`] does the
+/// authoritative re-stash / re-resolve / surface. It NEVER mutates daemon state itself.
+///
+/// The seam owns its OWN [`CredentialStore`] because the daemon's is borrowed by the idle
+/// `wait` future; both read the SAME canonical item in production. Wholly inert when a hermetic
+/// test wires the no-op watch: [`until_due`](ExternalLoginWatch::until_due) never resolves, so
+/// the arm never wins the idle select and the loop behaves exactly as before #140.
+pub(crate) trait ExternalLoginWatch {
+    /// Resolve when the next canonical probe is due (the watch's own cadence). MUST never
+    /// resolve when disabled, so it never wins the idle select. Re-armable: the run loop awaits
+    /// it afresh each idle iteration.
+    async fn until_due(&mut self);
+    /// Read the canonical credential item via the watch's OWN store. `None` on ANY
+    /// unreadable / locked / absent read — a probe that cannot read simply detects nothing and
+    /// the run loop keeps idling (fail-safe: detection never stalls or crashes the loop).
+    async fn read_canonical(&mut self) -> Option<Credential>;
+}
+
+/// Production external-login watch (issue #140): a short-cadence LOCAL probe of the canonical
+/// item over a [`RealCredentialStore`]. Always-on — the probe is a cheap local keychain read
+/// with no network / rate-limit cost and a strictly better active-account re-auth latency, so
+/// there is no feature gate; a hermetic test that must NOT probe wires the inert no-op watch
+/// instead. Its own store is a second [`RealCredentialStore`] (stateless, resolves the same
+/// canonical item as the daemon's) so the idle `wait`'s `&mut Daemon` borrow is untouched.
+pub(crate) struct ExternalLoginWatcher<C> {
+    store: C,
+}
+
+impl<C> ExternalLoginWatcher<C> {
+    pub(crate) fn new(store: C) -> Self {
+        Self { store }
+    }
+}
+
+impl<C: CredentialStore> ExternalLoginWatch for ExternalLoginWatcher<C> {
+    async fn until_due(&mut self) {
+        tokio::time::sleep(Duration::from_secs(EXTERNAL_LOGIN_WATCH_SECS)).await;
+    }
+
+    async fn read_canonical(&mut self) -> Option<Credential> {
+        // Best-effort: a locked / not-found / transient keychain read yields `None`, so the run
+        // loop detects nothing this probe and keeps idling — a detection failure must never
+        // break the poll/swap loop (mirrors #156's fail-open collector, #162's fail-safe
+        // refresh).
+        self.store.read().await.ok()
+    }
+}
+
 /// Per-account refresh seam the POLL path uses to revive an expired-but-refreshable
 /// access token BEFORE a usage 401 counts toward the #42 dead-credential streak (issue
 /// #162). Distinct from [`RefreshTicker`] (the periodic parked-account sweep, #105): this
@@ -2144,13 +2210,34 @@ where
                     // commit; leave the change to re-fire and catch up next cycle.
                 }
                 None => {
-                    // The new canonical maps to no roster account (an un-captured
-                    // login, or an identity we cannot resolve). Nothing to
-                    // re-stash; commit anyway so we do not spin on it every cycle.
+                    // The new canonical maps to no roster account: an UN-CAPTURED login
+                    // (issue #140 scope decision). SURFACE it, do NOT auto-onboard — the
+                    // daemon cannot isolate this shared-item token or attribute its identity;
+                    // that is the managed `sessiometer login` (#132/#134/#135) path's job. The
+                    // event prompts the operator to run it. Edge-triggered by the commit below:
+                    // the next `classify` sees this same blob as `Unchanged`, so it fires ONCE
+                    // per distinct un-captured login, not every watch cycle. Best-effort
+                    // identity: the displayed `accountUuid` when readable (a redacted, non-PII
+                    // handle, like #135's post-harvest `Login` account), else omitted.
+                    let account_uuid = claude_state::read_oauth_account_from(&self.claude_json)
+                        .ok()
+                        .map(|oauth| oauth.account_uuid().to_owned());
+                    events.push(Event::UncapturedLogin { account_uuid });
+                    // Committed so we do not re-surface it every cycle; nothing to re-stash.
                     self.state.canonical_watch.commit(canonical);
                 }
             },
         }
+    }
+
+    /// The canonical credential the daemon last COMMITTED to its [`CanonicalWatch`] — the
+    /// baseline the external-login watch (issue #140) compares a fresh idle-time read against
+    /// to detect an out-of-band `claude /login`. Snapshotted before the idle block (like the
+    /// refresh exclusions) so the watch arm can distinguish an external write from the daemon's
+    /// own last-committed state WITHOUT borrowing `&mut self` mid-idle. `None` until the first
+    /// tick primes the watch.
+    pub(crate) fn canonical_baseline(&self) -> Option<Credential> {
+        self.state.canonical_watch.baseline()
     }
 
     /// Identify which roster account the given `canonical` credential belongs to,
@@ -3434,13 +3521,14 @@ fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
 /// (complete-or-abort; #6 is no-half-swap). The lifecycle markers (`diag=start` /
 /// `diag=stop`) bracket this call in [`crate::cli`], which owns the process
 /// lifecycle; this loop emits only the per-tick diagnostics.
-pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl, R, W>(
+pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl, R, LW, W>(
     daemon: &mut Daemon<P, C, S, K>,
     log: &mut EventLog,
     diag: &mut DiagnosticLog<W>,
     shutdown: &mut Sh,
     control: &Ctl,
     refresh: &mut R,
+    login_watch: &mut LW,
 ) -> Result<()>
 where
     P: RosterPoller,
@@ -3450,6 +3538,7 @@ where
     Sh: Shutdown,
     Ctl: Control,
     R: RefreshTicker,
+    LW: ExternalLoginWatch,
     W: Write,
 {
     // Reconcile-on-start is best-effort: a failure is logged and the loop still
@@ -3472,6 +3561,11 @@ where
         /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
         /// — reload + reconcile the in-memory roster, then re-tick.
         RosterReloadRequested,
+        /// The external-login watch (#140) saw the canonical credential change out-of-band
+        /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
+        /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
+        /// it within the watch cadence instead of up to a full poll interval later.
+        ExternalLoginDetected,
     }
 
     // De-burst start-up (issue #76): wait a small jittered delay before the FIRST
@@ -3534,6 +3628,13 @@ where
         // `&mut daemon`), exactly like the restores above.
         let mut refresh_observations: Vec<RefreshObservation> = Vec::new();
 
+        // The canonical the daemon last COMMITTED to its watch (issue #140), snapshotted HERE —
+        // before the idle borrows `&mut daemon` — so the external-login watch arm can tell an
+        // out-of-band write it reads DURING the idle from the daemon's own last state, without
+        // needing `&mut daemon` mid-idle. The daemon's own writes (a swap) commit the watch, so
+        // this baseline already reflects them and they are never mis-seen as external.
+        let canonical_baseline = daemon.canonical_baseline();
+
         // Idle until the next tick is due, serving control requests and watching
         // for shutdown. A swap (if any) already completed inside `tick`, so a
         // shutdown observed here aborts cleanly before the next tick — no half-swap.
@@ -3591,6 +3692,28 @@ where
                             }
                         }
                     }
+                    // The external-login watch (issue #140): a dedicated SHORT-cadence, LOCAL
+                    // (no-network) probe of the canonical credential, DECOUPLED from the
+                    // usage-poll cadence, so a manual `claude /login` on the active account is
+                    // reflected within the watch cadence, not up to a full poll interval. The
+                    // probe reads the canonical via the watch's OWN store (the daemon's is
+                    // borrowed by `wait`) and compares against the pre-idle committed baseline;
+                    // a difference is an out-of-band write since the last tick → break to
+                    // re-tick, so `tick`'s `reconcile_canonical_change` does the authoritative
+                    // re-stash / re-resolve / surface. Fail-safe: an unreadable / locked /
+                    // absent probe (`None`), or a byte-identical read, or no baseline yet,
+                    // detects nothing and keeps idling — the loop never stalls. `wait` is pinned
+                    // OUTSIDE this loop, so a probe does not reset the poll cadence.
+                    () = login_watch.until_due() => {
+                        if let Some(current) = login_watch.read_canonical().await {
+                            if canonical_baseline
+                                .as_ref()
+                                .is_some_and(|base| !base.matches(&current))
+                            {
+                                break Idle::ExternalLoginDetected;
+                            }
+                        }
+                    }
                     _ = &mut wait => break Idle::Elapsed,
                 }
             }
@@ -3634,6 +3757,11 @@ where
             // `config.toml` (#139) — the onboarded / relogged-in / removed account is
             // adopted into the live rotation — BEFORE looping back to re-tick.
             Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
+            // The external-login watch (#140) detected an out-of-band canonical change: just
+            // re-tick — the next `tick` reads the canonical and its `reconcile_canonical_change`
+            // does the authoritative re-stash / re-resolve / surface (no pre-tick adoption
+            // needed, unlike a manual swap or a roster reload).
+            Idle::ExternalLoginDetected => {}
             Idle::Elapsed => {}
         }
     }
@@ -3857,6 +3985,105 @@ mod tests {
         }
         async fn sweep(&mut self, _excluded: &[String], _quarantined: &[String]) -> SweepOutcome {
             SweepOutcome::default()
+        }
+    }
+
+    /// The inert [`ExternalLoginWatch`] for the hermetic run-loop tests (issue #140): never due,
+    /// so the external-login-watch arm never wins the idle select and these tests behave exactly
+    /// as they did before #140. Production wires the real [`ExternalLoginWatcher`]; the detection
+    /// tests wire [`OnceExternalLogin`].
+    struct NoopExternalLoginWatch;
+
+    impl ExternalLoginWatch for NoopExternalLoginWatch {
+        async fn until_due(&mut self) {
+            std::future::pending::<()>().await;
+        }
+        async fn read_canonical(&mut self) -> Option<Credential> {
+            None
+        }
+    }
+
+    /// Lets the daemon and the external-login watch (issue #140) share ONE in-memory canonical
+    /// item — as in production, where both read the SAME keychain item. The daemon takes its
+    /// store by value, so an `Rc` clone is how a hermetic test keeps a second handle to write
+    /// through (simulating an external `claude /login`) and observe.
+    impl CredentialStore for Rc<FakeCredentialStore> {
+        async fn read(&self) -> Result<Credential> {
+            (**self).read().await
+        }
+        async fn write(&self, credential: &Credential) -> Result<()> {
+            (**self).write(credential).await
+        }
+    }
+
+    /// An [`ExternalLoginWatch`] that becomes due exactly ONCE — simulating a manual
+    /// `claude /login` mid-idle by writing a fresh token to the SHARED canonical store on that
+    /// first fire — then never resolves again. The external-login analog of [`OnceRosterReload`]:
+    /// drives the live `Idle::ExternalLoginDetected` re-tick wiring (#140) that
+    /// [`NoopExternalLoginWatch`] leaves inert. Because the store is shared with the daemon, the
+    /// re-tick it triggers reads the fresh token too and re-stashes it — end-to-end proof that an
+    /// external change is picked up off the poll cadence.
+    struct OnceExternalLogin {
+        fired: Cell<bool>,
+        store: Rc<FakeCredentialStore>,
+        fresh: Vec<u8>,
+    }
+
+    impl OnceExternalLogin {
+        fn new(store: Rc<FakeCredentialStore>, fresh: &[u8]) -> Self {
+            Self {
+                fired: Cell::new(false),
+                store,
+                fresh: fresh.to_vec(),
+            }
+        }
+    }
+
+    impl ExternalLoginWatch for OnceExternalLogin {
+        async fn until_due(&mut self) {
+            if self.fired.replace(true) {
+                std::future::pending::<()>().await;
+            } else {
+                // Simulate the external `claude /login` rewriting the shared canonical NOW — so
+                // both `read_canonical` below and the daemon's re-tick see the fresh token.
+                self.store.write(&cred(&self.fresh)).await.unwrap();
+            }
+        }
+        async fn read_canonical(&mut self) -> Option<Credential> {
+            self.store.read().await.ok()
+        }
+    }
+
+    /// An [`ExternalLoginWatch`] that becomes due exactly ONCE and returns a PRELOADED
+    /// `read_canonical` result — `Some(unchanged)` for the healthy no-change path, or `None` for
+    /// an unreadable/locked probe (the fail-safe path) — recording that the probe was reached.
+    /// Touches no store: it proves the run loop's detection arm ran and correctly did NOT re-tick
+    /// (no break), without simulating any external write.
+    struct ScriptedExternalLogin {
+        fired: Cell<bool>,
+        result: Option<Credential>,
+        probed: Cell<bool>,
+    }
+
+    impl ScriptedExternalLogin {
+        fn returning(result: Option<Credential>) -> Self {
+            Self {
+                fired: Cell::new(false),
+                result,
+                probed: Cell::new(false),
+            }
+        }
+    }
+
+    impl ExternalLoginWatch for ScriptedExternalLogin {
+        async fn until_due(&mut self) {
+            if self.fired.replace(true) {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn read_canonical(&mut self) -> Option<Credential> {
+            self.probed.set(true);
+            self.result.clone()
         }
     }
 
@@ -5742,6 +5969,69 @@ mod tests {
         assert_eq!(b.credential.expose(), b"B-reauthed");
         assert_eq!(b.oauth_account.account_uuid(), "u-B");
         assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_login_to_an_uncaptured_account_is_surfaced_not_onboarded() {
+        // Issue #140 scope decision: the operator `claude /login`s into a BRAND-NEW account not
+        // in the roster (the canonical becomes its fresh token AND the display switches to its
+        // uuid). The daemon detects the out-of-band change but resolves it to NO roster account,
+        // so it SURFACES an `Uncaptured Login` (with the displayed uuid) prompting `sessiometer
+        // login` — it does NOT auto-onboard it. Edge-triggered: a later tick with the same
+        // canonical does not re-surface it.
+        let roster = vec![account("u-A", "work")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+
+        // Tick 1 primes on A.
+        daemon.tick().await;
+
+        // `/login` to an un-captured account u-Z: canonical becomes Z's token and the display
+        // switches to u-Z (what Claude Code writes to `~/.claude.json`).
+        daemon.store.write(&cred(b"Z-token")).await.unwrap();
+        crate::claude_state::write_oauth_account(&json, &oauth("u-Z")).unwrap();
+
+        // Tick 2 detects the change, cannot map it to the roster, and surfaces it (uuid carried).
+        let second = daemon.tick().await;
+        assert_eq!(
+            second.events,
+            vec![Event::UncapturedLogin {
+                account_uuid: Some("u-Z".to_owned()),
+            }],
+            "an un-captured login is surfaced with its displayed uuid, never onboarded"
+        );
+        // NOT onboarded: the roster is still just A, and no stash was created for u-Z.
+        assert_eq!(
+            daemon.roster.len(),
+            1,
+            "the roster is unchanged (no auto-onboard)"
+        );
+        assert!(
+            daemon.stash.read("Sessiometer/u-Z").await.is_err(),
+            "no stash is created for the un-captured account"
+        );
+
+        // Tick 3: the same canonical is now the committed baseline → no repeat surfacing.
+        let third = daemon.tick().await;
+        assert!(
+            !third
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::UncapturedLogin { .. })),
+            "a committed un-captured login must not re-surface every cycle"
+        );
     }
 
     #[tokio::test]
@@ -7664,6 +7954,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -7710,6 +8001,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -7774,6 +8066,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -8150,6 +8443,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -8161,6 +8455,236 @@ mod tests {
             roster_uuids(&daemon),
             vec!["u-A", "u-B", "u-C"],
             "the onboarded account joined the live rotation without a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_external_login_watch_restashes_off_the_poll_cadence() {
+        // Issue #140: the external-login watch's `until_due` resolves inside the idle select (off
+        // the usage-poll cadence) and, on reading a canonical that differs from the daemon's
+        // last-committed baseline, the run loop breaks the idle to re-tick — so the very next
+        // tick's `reconcile_canonical_change` re-stashes the account. The watch and the daemon
+        // share ONE canonical store (as in production, one keychain item): the watch simulates a
+        // manual `claude /login` by rewriting it mid-idle, and the re-tick it triggers re-stashes
+        // A with the fresh token. The run-loop analog of the direct-tick #13 re-stash test —
+        // proving the pickup happens WITHOUT waiting a full poll interval.
+        let store = Rc::new(FakeCredentialStore::empty());
+        store.write(&cred(b"A-token")).await.unwrap();
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // holds-only — no swap perturbs the idle path
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            poller,
+            store.clone(),
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // after(3): #1 start-up check (pends), #2 idle-iter-1 (watch fires → detect → re-tick),
+        // #3 idle-iter-2 → shutdown. Exactly ONE watch-driven re-tick, then a clean stop.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = NoControl;
+        let mut login_watch = OnceExternalLogin::new(store.clone(), b"A-reauthed");
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut login_watch,
+        )
+        .await
+        .unwrap();
+
+        // The watch broke the idle and the re-tick re-stashed A with the fresh token — the
+        // out-of-band login was picked up off the poll cadence.
+        let a = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-reauthed",
+            "the re-tick the watch triggered re-stashed A with the freshly-logged-in token"
+        );
+        assert_eq!(
+            a.oauth_account.account_uuid(),
+            "u-A",
+            "the identity half is preserved through the re-stash"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_external_login_watch_ignores_an_unchanged_canonical() {
+        // Issue #140 (healthy no-change path unchanged): the watch fires and reads a canonical
+        // BYTE-IDENTICAL to the daemon's baseline — no out-of-band login — so the run loop does
+        // NOT break the idle and no re-stash happens. The probe was reached but correctly did
+        // nothing.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let logpath = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&logpath).unwrap();
+        let mut shutdown = FakeShutdown::after(3);
+        let control = NoControl;
+        // The watch reports the SAME token the daemon primed on — no change.
+        let mut login_watch = ScriptedExternalLogin::returning(Some(cred(b"A-token")));
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut login_watch,
+        )
+        .await
+        .unwrap();
+
+        // The probe ran but the unchanged read produced no re-stash — A's stash is untouched and
+        // no restash line was logged.
+        assert!(
+            login_watch.probed.get(),
+            "the watch's read_canonical was reached in the idle"
+        );
+        let a = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-token",
+            "an unchanged canonical triggers no re-stash"
+        );
+        let logged = std::fs::read_to_string(&logpath).unwrap_or_default();
+        assert!(
+            !logged.contains("event=restash"),
+            "no restash on the no-change path: {logged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_external_login_watch_tolerates_an_unreadable_probe() {
+        // Issue #140 fail-safe (a detection error must not break the loop): the watch fires but
+        // its canonical read fails (locked / absent → `None`), so the run loop detects nothing,
+        // does NOT break, and idles on normally to a clean shutdown — no crash, no stall, no
+        // spurious re-stash. Same fail-open discipline as #156's collector and #162's refresh.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        let mut shutdown = FakeShutdown::after(3);
+        let control = NoControl;
+        // The probe cannot read the canonical this cycle (a locked / absent item → None).
+        let mut login_watch = ScriptedExternalLogin::returning(None);
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut login_watch,
+        )
+        .await
+        .unwrap();
+
+        // The loop exited cleanly, the probe was reached, and the failed read triggered no
+        // re-stash — a detection error neither broke nor perturbed the poll/swap loop.
+        assert!(
+            login_watch.probed.get(),
+            "the watch's read_canonical was reached in the idle"
+        );
+        let a = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-token",
+            "a failed probe triggers no re-stash"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_login_watcher_reads_the_canonical_and_fails_open() {
+        // Issue #140: the PRODUCTION watcher's `read_canonical` returns the current canonical
+        // over its own store, and FAILS OPEN to `None` on a locked or absent read — so a probe
+        // that cannot read simply detects nothing, never an error that could break the loop.
+        let readable = FakeCredentialStore::empty();
+        readable.write(&cred(b"A-token")).await.unwrap();
+        let mut w = ExternalLoginWatcher::new(readable);
+        assert_eq!(
+            w.read_canonical().await.unwrap().expose(),
+            b"A-token",
+            "a readable canonical is returned"
+        );
+
+        // A LOCKED keychain read is swallowed to `None`, not surfaced as an error.
+        let locked = FakeCredentialStore::empty();
+        locked.set_locked(true);
+        let mut w = ExternalLoginWatcher::new(locked);
+        assert!(
+            w.read_canonical().await.is_none(),
+            "a locked read fails open to None"
+        );
+
+        // An ABSENT canonical (no item yet) likewise fails open to `None` — never an error.
+        let mut w = ExternalLoginWatcher::new(FakeCredentialStore::empty());
+        assert!(
+            w.read_canonical().await.is_none(),
+            "an absent canonical fails open to None"
         );
     }
 
@@ -8210,6 +8734,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut ticker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -8275,6 +8800,7 @@ mod tests {
                 &mut shutdown,
                 &control,
                 &mut ticker,
+                &mut NoopExternalLoginWatch,
             ),
         )
         .await;
@@ -8347,6 +8873,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut ticker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -8422,6 +8949,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -8634,6 +9162,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();
@@ -8738,6 +9267,7 @@ mod tests {
             &mut shutdown,
             &control,
             &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
         )
         .await
         .unwrap();

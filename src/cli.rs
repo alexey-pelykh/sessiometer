@@ -16,8 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config};
 use crate::daemon::{
-    run_loop, AccountStatusLine, Daemon, InstanceLock, NextSwap, RealClock, RealRosterPoller,
-    RealShutdown, StatusResponse, UnixControl,
+    run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, RealClock,
+    RealRosterPoller, RealShutdown, StatusResponse, UnixControl,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -477,6 +477,12 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         ),
         RealClock::new(),
     );
+    // The external-login watch (issue #140): a short-cadence LOCAL probe of the canonical item
+    // over its OWN `RealCredentialStore`, driven from `run_loop`'s idle path, so a manual
+    // `claude /login` on the active account is reflected within `EXTERNAL_LOGIN_WATCH_SECS`
+    // instead of up to a full `poll_secs`. Always-on (no feature gate — a cheap local read); its
+    // own store leaves the daemon's untouched by the idle borrow.
+    let mut login_watch = ExternalLoginWatcher::new(RealCredentialStore::new());
 
     let result = run_loop(
         &mut daemon,
@@ -485,6 +491,7 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         &mut shutdown,
         &control,
         &mut refresh_tick,
+        &mut login_watch,
     )
     .await;
     // A clean shutdown (`Ok`) → the lifecycle stop marker. An error exit is NOT a
