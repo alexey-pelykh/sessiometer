@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::claude_state::OauthAccount;
-use crate::config::{Account, Config};
+use crate::config::{Account, Config, ConflictPolicy};
 use crate::daemon::{
     run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, RealClock,
     RealRosterPoller, RealShutdown, StatusResponse, UnixControl,
@@ -23,7 +23,8 @@ use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
-    CredentialHealth, Diagnostic, DiagnosticLog, EventLog, RefreshEventOutcome, Verbosity,
+    CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog, ExportMode, RefreshEventOutcome,
+    Verbosity,
 };
 use crate::paths;
 use crate::refresh;
@@ -1575,6 +1576,16 @@ async fn export(path: Option<PathBuf>, no_secrets: bool, encryption: Encryption)
     let stash = RealAccountStash::new();
     let payload = gather_payload(&config, &stash, no_secrets).await?;
 
+    // The redacted-event dimensions (issue #150), captured before `encryption` is consumed by
+    // the match: whether the artifact is encrypted, and whether it carries secrets (full) or is
+    // config-only (`--no-secrets`). `accounts` is the roster size the artifact carries.
+    let encrypted = matches!(&encryption, Encryption::Encrypted(_));
+    let mode = if no_secrets {
+        ExportMode::ConfigOnly
+    } else {
+        ExportMode::Full
+    };
+
     let bytes = match encryption {
         Encryption::Plaintext => {
             // The artifact then holds restorable credentials in the clear. Warn on
@@ -1587,11 +1598,41 @@ async fn export(path: Option<PathBuf>, no_secrets: bool, encryption: Encryption)
         }
         Encryption::Encrypted(source) => {
             let passphrase = source.read("Passphrase to encrypt the export: ")?;
-            MigrationArtifact::encrypt(&payload, &passphrase)?.to_bytes()
+            // Derive the key at the operator's `[migration]` Argon2id cost (issue #150); the
+            // default maps to the built-in production cost, so a default config is unchanged.
+            MigrationArtifact::encrypt_with_cost(
+                &payload,
+                &passphrase,
+                &config.migration.kdf_cost(),
+            )?
+            .to_bytes()
         }
     };
 
-    write_export(path.as_deref(), &bytes)
+    write_export(path.as_deref(), &bytes)?;
+
+    // The artifact is written — emit the single redacted audit event (issue #150). BEST-EFFORT,
+    // like the #135 login event: the export already succeeded, so a log-open/append failure is
+    // swallowed rather than masking it. Aggregate-only (a count + a bool + a mode token) — no
+    // account handle, so nothing account-specific ever reaches the line.
+    emit_export_event(config.roster.len(), encrypted, mode);
+    Ok(())
+}
+
+/// Emit the single redacted [`Event::Export`] audit line (issue #150) — BEST-EFFORT, like the
+/// #135 login event: the export's own result stands regardless of whether the audit log is
+/// writable, so a failure to open or append it is swallowed. Carries aggregate counts only —
+/// never an account handle, token, or email.
+fn emit_export_event(accounts: usize, encrypted: bool, mode: ExportMode) {
+    if let Ok(mut log) = EventLog::open() {
+        let _ = log.emit(&Event::Export {
+            // A roster far exceeding u32 is not reachable; saturate rather than wrap so the count
+            // stays honest under any absurd input.
+            accounts: accounts.try_into().unwrap_or(u32::MAX),
+            encrypted,
+            mode,
+        });
+    }
 }
 
 /// Gather the live state into a migration [`Payload`] — READ-ONLY, generic over the
@@ -1663,13 +1704,16 @@ fn import_passphrase(passphrase_file: Option<PathBuf>, passphrase_stdin: bool) -
 ///
 /// Reads the artifact, decrypts it under a passphrase (#147) when encrypted (a plaintext
 /// artifact needs none), then merges its accounts into the local roster under the conflict
-/// policy: an account already present on the target is SKIPPED (left untouched) unless
-/// `overwrite`. Each credential-carrying account is restored through the EXISTING keychain
-/// stash write (`security -i`, off-argv, #39) and read-back-verified; a config-only account
-/// (from `export --no-secrets`) lands as a roster entry to be re-authenticated by `login`
-/// (#135). Writes serialize under the swap lock (#64); the roster is saved atomically once,
-/// so a partial failure never dangles a half-written roster and the import is safely
-/// re-runnable. Any per-account failure exits non-zero after committing the successes.
+/// policy: an account already present on the target is SKIPPED (left untouched) unless the
+/// effective policy is overwrite — forced by `--overwrite`, else the target's
+/// `[migration].conflict_policy` default (#150; Skip by default). Each credential-carrying account
+/// is restored through the EXISTING keychain stash write (`security -i`, off-argv, #39) and
+/// read-back-verified; a config-only account (from `export --no-secrets`) lands as a roster entry
+/// to be re-authenticated by `login` (#135). Writes serialize under the swap lock (#64); the
+/// roster is saved atomically once, so a partial failure never dangles a half-written roster and
+/// the import is safely re-runnable. Emits ONE redacted audit event (#150) — aggregate per-account
+/// outcome counts only, never a handle/token/email. Any per-account failure exits non-zero after
+/// committing the successes.
 ///
 /// Diagnostics name accounts by their non-secret label only — never a token or email; the
 /// passphrase is read through the #147 no-argv paths and never logged.
@@ -1697,6 +1741,11 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
         Err(other) => return Err(other),
     };
 
+    // Conflict-policy default (issue #150): when `--overwrite` is absent, defer to the TARGET
+    // operator's `[migration].conflict_policy` (Skip by default, so a default config leaves
+    // behaviour unchanged). Resolved from `local` before it is moved into `apply_import`.
+    let overwrite = resolve_import_overwrite(overwrite, local.as_ref());
+
     let (config, outcomes) = apply_import(
         Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
         &payload,
@@ -1715,17 +1764,71 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
 
     println!("{}", import_report(&outcomes));
 
+    // Emit the single redacted audit event (issue #150) — BEST-EFFORT, like the export/login
+    // events: aggregate per-account outcome COUNTS only (no handle), so nothing account-specific
+    // reaches the line. Emitted whatever the outcome (ok / partial / failed), before the exit.
+    let (imported, skipped, overwritten, failed) = count_import_outcomes(&outcomes);
+    emit_import_event(imported, skipped, overwritten, failed);
+
     // Surface any per-account failure LOUDLY with a non-zero exit — the successful
     // accounts were still committed to the roster (honest partial result), and the
     // per-account report above names which landed and which failed.
-    let failed = outcomes
-        .iter()
-        .filter(|o| o.outcome == ImportOutcome::Failed)
-        .count();
     if failed > 0 {
-        return Err(Error::MigrationImportIncomplete { failed });
+        return Err(Error::MigrationImportIncomplete {
+            failed: failed as usize,
+        });
     }
     Ok(())
+}
+
+/// Resolve the effective import overwrite policy (issue #150). The `--overwrite` CLI flag ALWAYS
+/// forces overwrite; when it is absent, defer to the TARGET operator's `[migration].conflict_policy`
+/// (`local` is `None` on a fresh machine → the [`MigrationConfig`](crate::config::MigrationConfig)
+/// default, Skip). Pure so the flag-over-config precedence is unit-testable without touching the
+/// real config path.
+fn resolve_import_overwrite(cli_overwrite: bool, local: Option<&Config>) -> bool {
+    if cli_overwrite {
+        return true;
+    }
+    local
+        .map(|config| config.migration.conflict_policy)
+        .unwrap_or_default()
+        == ConflictPolicy::Overwrite
+}
+
+/// Tally the per-account import outcomes into `(imported, skipped, overwritten, failed)` — the four
+/// counts the redacted [`Event::Import`] carries (issue #150). Saturating into `u32` (a roster far
+/// exceeding `u32` is unreachable) so the counts stay honest under any absurd input.
+fn count_import_outcomes(outcomes: &[AccountImport]) -> (u32, u32, u32, u32) {
+    let count = |want: ImportOutcome| -> u32 {
+        outcomes
+            .iter()
+            .filter(|o| o.outcome == want)
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX)
+    };
+    (
+        count(ImportOutcome::Imported),
+        count(ImportOutcome::Skipped),
+        count(ImportOutcome::Overwritten),
+        count(ImportOutcome::Failed),
+    )
+}
+
+/// Emit the single redacted [`Event::Import`] audit line (issue #150) — BEST-EFFORT, like the
+/// #135 login event and the export event: the import's own result (and its per-account report /
+/// exit code) stands regardless of whether the audit log is writable, so a failure to open or
+/// append it is swallowed. Carries aggregate counts only — never an account handle, token, or email.
+fn emit_import_event(imported: u32, skipped: u32, overwritten: u32, failed: u32) {
+    if let Ok(mut log) = EventLog::open() {
+        let _ = log.emit(&Event::Import {
+            imported,
+            skipped,
+            overwritten,
+            failed,
+        });
+    }
 }
 
 /// Merge a migration [`Payload`] into the local roster under the conflict policy —
@@ -1750,11 +1853,13 @@ async fn apply_import<S: AccountStash>(
     // on-disk config (unique non-empty account_uuid, tunable ranges).
     let incoming = Config::from_toml_str(payload.config_toml())?;
 
-    // Base config: preserve the LOCAL config when present — its tunables/refresh/login
-    // and existing roster are authoritative (the per-account merge below only touches the
-    // roster; a whole-config merge policy is the separate #150). On a fresh target adopt
-    // the incoming tunables but start from an empty roster, so every account flows through
-    // the conflict policy + integrity check below.
+    // Base config: preserve the LOCAL config when present — its tunables / refresh / login / stats
+    // / migration blocks and existing roster are authoritative (the per-account merge below only
+    // touches the roster; a whole-config merge — adopting the artifact's non-roster blocks over the
+    // local ones — remains future work, NOT what #150 added: #150 added the per-account
+    // conflict-policy DEFAULT that resolves into `overwrite` upstream, plus the redacted events).
+    // On a fresh target adopt the incoming config but start from an empty roster, so every account
+    // flows through the conflict policy + integrity check below.
     let mut result = match local {
         Some(local) => local,
         None => Config {
@@ -2294,6 +2399,7 @@ mod tests {
             refresh: crate::config::RefreshConfig::default(),
             login: crate::config::LoginConfig::default(),
             stats: crate::config::StatsConfig::default(),
+            migration: crate::config::MigrationConfig::default(),
         }
     }
 
@@ -4566,5 +4672,100 @@ spare  22222222-2222\n\
                 "no account email may appear in the report"
             );
         }
+    }
+
+    // --- [migration] tunable wiring (issue #150) ----------------------------
+
+    #[test]
+    fn resolve_import_overwrite_honours_flag_then_config_default() {
+        // `--overwrite` ALWAYS forces overwrite; when it is absent, the TARGET's
+        // `[migration].conflict_policy` decides (Skip by default → false).
+        let skip_cfg = config_with(vec![]); // default migration → Skip
+        let mut overwrite_cfg = config_with(vec![]);
+        overwrite_cfg.migration.conflict_policy = ConflictPolicy::Overwrite;
+
+        // Flag on → always overwrite, whatever the config (or absence of one).
+        assert!(resolve_import_overwrite(true, None));
+        assert!(resolve_import_overwrite(true, Some(&skip_cfg)));
+
+        // Flag off → defer to the config default.
+        assert!(
+            !resolve_import_overwrite(false, None),
+            "fresh machine (no config) → Skip default → no overwrite"
+        );
+        assert!(!resolve_import_overwrite(false, Some(&skip_cfg)));
+        assert!(resolve_import_overwrite(false, Some(&overwrite_cfg)));
+    }
+
+    #[test]
+    fn count_import_outcomes_tallies_each_outcome() {
+        let outcomes = vec![
+            AccountImport::imported("a"),
+            AccountImport::imported("b"),
+            AccountImport::skipped("c"),
+            AccountImport::overwritten("d"),
+            AccountImport::failed("e"),
+        ];
+        assert_eq!(count_import_outcomes(&outcomes), (2, 1, 1, 1));
+        assert_eq!(count_import_outcomes(&[]), (0, 0, 0, 0));
+    }
+
+    /// The `[migration].conflict_policy` default is genuinely CONSUMED — with `--overwrite` off, a
+    /// target whose config says `overwrite` REPLACES already-present accounts, while the default
+    /// `skip` leaves them untouched. Proves the tunable drives behaviour (not ceremony), through
+    /// the same `apply_import` core the verb uses.
+    #[tokio::test]
+    async fn the_migration_conflict_policy_default_drives_import_behaviour() {
+        let (src_config, src_stash) = export_config_and_stash().await;
+        let payload = gather_payload(&src_config, &src_stash, false)
+            .await
+            .unwrap();
+
+        // Target already carries both accounts; its conflict_policy is Overwrite. With the flag
+        // OFF, the resolved policy is overwrite → both are REPLACED, not skipped.
+        let mut overwrite_target = src_config.clone();
+        overwrite_target.migration.conflict_policy = ConflictPolicy::Overwrite;
+        let resolved = resolve_import_overwrite(false, Some(&overwrite_target));
+        assert!(
+            resolved,
+            "config overwrite default applies when --overwrite is off"
+        );
+        let (_c, outcomes) = apply_import(
+            None,
+            &payload,
+            Some(overwrite_target),
+            &crate::stash::FakeAccountStash::empty(),
+            resolved,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_import_outcomes(&outcomes),
+            (0, 0, 2, 0),
+            "both already-present accounts must be OVERWRITTEN under the overwrite default"
+        );
+
+        // Contrast: the same import against a Skip-default target SKIPS both.
+        let mut skip_target = src_config.clone();
+        skip_target.migration.conflict_policy = ConflictPolicy::Skip;
+        let resolved = resolve_import_overwrite(false, Some(&skip_target));
+        assert!(
+            !resolved,
+            "Skip default → no overwrite when the flag is off"
+        );
+        let (_c, skip_outcomes) = apply_import(
+            None,
+            &payload,
+            Some(skip_target),
+            &crate::stash::FakeAccountStash::empty(),
+            resolved,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_import_outcomes(&skip_outcomes),
+            (0, 2, 0, 0),
+            "the Skip default must leave both already-present accounts untouched"
+        );
     }
 }

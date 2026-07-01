@@ -502,6 +502,36 @@ const ARGON2_MEMORY_KIB: u32 = 65_536;
 const ARGON2_ITERATIONS: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 1;
 
+/// The Argon2id cost used when WRITING a new encrypted artifact — memory, time, and lane
+/// cost. Recorded in the header on write ([`KdfParams`]) so a decrypt derives with the cost
+/// the FILE carries, never these; a future- or operator-raised cost still decrypts.
+///
+/// The operator-facing source of the write-path cost is the `[migration]` config block
+/// (issue #150): `export` derives an artifact's key at [`crate::config::MigrationConfig`]'s
+/// cost through [`MigrationArtifact::encrypt_with_cost`]. [`PRODUCTION`](KdfCost::PRODUCTION)
+/// is the built-in default that block's defaults mirror (kept in sync by a `config` test), and
+/// the cost [`MigrationArtifact::encrypt`] uses when no explicit cost is supplied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KdfCost {
+    /// Argon2 memory cost, in KiB.
+    pub(crate) memory_kib: u32,
+    /// Argon2 time cost, in iterations.
+    pub(crate) iterations: u32,
+    /// Argon2 parallelism, in lanes.
+    pub(crate) parallelism: u32,
+}
+
+impl KdfCost {
+    /// The built-in production cost: ~64 MiB, 3 passes, single lane. The default the
+    /// `[migration]` config block (issue #150) mirrors, held to it by that module's
+    /// `migration_kdf_defaults_match_the_crypto` test.
+    pub(crate) const PRODUCTION: KdfCost = KdfCost {
+        memory_kib: ARGON2_MEMORY_KIB,
+        iterations: ARGON2_ITERATIONS,
+        parallelism: ARGON2_PARALLELISM,
+    };
+}
+
 /// The warning a `--plaintext` (unencrypted) export must print: the artifact then
 /// holds usable, restorable account credentials in the clear. The export command (a
 /// later work item) prints it; the wording lives here so the crypto layer owns it.
@@ -534,20 +564,32 @@ impl MigrationArtifact {
     /// payload with XChaCha20-Poly1305 (fresh 192-bit nonce) binding the header as
     /// associated data, and records the KDF + cipher parameters in the header so the
     /// file is self-describing for [`decrypt`](Self::decrypt). Uses the production
-    /// Argon2id cost ([`ARGON2_MEMORY_KIB`] / [`ARGON2_ITERATIONS`] /
-    /// [`ARGON2_PARALLELISM`]).
+    /// Argon2id cost ([`KdfCost::PRODUCTION`]); the `export` verb overrides it with the
+    /// operator's `[migration]` cost via [`encrypt_with_cost`](Self::encrypt_with_cost).
     pub(crate) fn encrypt(payload: &Payload, passphrase: &Passphrase) -> Result<Self> {
+        Self::encrypt_with_cost(payload, passphrase, &KdfCost::PRODUCTION)
+    }
+
+    /// [`encrypt`](Self::encrypt) at an explicit [`KdfCost`] — the seam the `export` verb
+    /// (issue #150) drives so an artifact's key is derived at the operator's `[migration]`
+    /// Argon2id cost. The cost is recorded in the header either way, so the artifact still
+    /// round-trips through [`decrypt`](Self::decrypt) whatever cost it was written at.
+    pub(crate) fn encrypt_with_cost(
+        payload: &Payload,
+        passphrase: &Passphrase,
+        cost: &KdfCost,
+    ) -> Result<Self> {
         Self::encrypt_with(
             payload,
             passphrase,
-            ARGON2_MEMORY_KIB,
-            ARGON2_ITERATIONS,
-            ARGON2_PARALLELISM,
+            cost.memory_kib,
+            cost.iterations,
+            cost.parallelism,
         )
     }
 
-    /// [`encrypt`](Self::encrypt) with explicit Argon2id cost parameters. Split out so
-    /// tests can derive at a trivial cost; the parameters are recorded in the header
+    /// [`encrypt`](Self::encrypt) with explicit scalar Argon2id cost parameters. Split out
+    /// so tests can derive at a trivial cost; the parameters are recorded in the header
     /// either way, so a low-cost artifact still round-trips through
     /// [`decrypt`](Self::decrypt).
     fn encrypt_with(
@@ -1584,5 +1626,38 @@ mod tests {
             artifact.decrypt(&pass).unwrap() == sample_payload(),
             "the production path must round-trip"
         );
+    }
+
+    #[test]
+    fn encrypt_with_cost_records_the_supplied_cost_and_round_trips() {
+        // The seam the `export` verb (issue #150) drives with the operator's `[migration]`
+        // cost: the supplied `KdfCost` is what lands in the header (so a decrypt derives at
+        // exactly it), and the artifact still round-trips. Uses a TRIVIAL cost so the test
+        // stays fast — the point is the cost is honoured + recorded, not its magnitude.
+        let pass = test_passphrase("pw");
+        let cost = KdfCost {
+            memory_kib: 16,
+            iterations: 2,
+            parallelism: 1,
+        };
+        let artifact =
+            MigrationArtifact::encrypt_with_cost(&sample_payload(), &pass, &cost).unwrap();
+
+        let kdf = artifact.header.kdf.as_ref().unwrap();
+        assert_eq!(kdf.memory_kib, cost.memory_kib, "memory cost not recorded");
+        assert_eq!(kdf.iterations, cost.iterations, "time cost not recorded");
+        assert_eq!(kdf.parallelism, cost.parallelism, "lane cost not recorded");
+
+        let restored = MigrationArtifact::from_bytes(&artifact.to_bytes()).unwrap();
+        assert!(
+            restored.decrypt(&pass).unwrap() == sample_payload(),
+            "an artifact written at a custom cost must round-trip"
+        );
+
+        // The built-in default IS the production cost — the anchor the `[migration]`
+        // defaults mirror (config side asserts the reverse direction).
+        assert_eq!(KdfCost::PRODUCTION.memory_kib, ARGON2_MEMORY_KIB);
+        assert_eq!(KdfCost::PRODUCTION.iterations, ARGON2_ITERATIONS);
+        assert_eq!(KdfCost::PRODUCTION.parallelism, ARGON2_PARALLELISM);
     }
 }
