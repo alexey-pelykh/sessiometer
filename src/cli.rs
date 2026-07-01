@@ -8,8 +8,11 @@
 //! `run` loop (#7), the live `status` control-socket client (#8), and the offline
 //! `list` roster view (#17).
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use lexopt::Arg::{Long, Short, Value};
 
 use tokio::net::{UnixListener, UnixStream};
 
@@ -33,295 +36,678 @@ use crate::sha256::sha256_hex;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
 
-/// Parse `argv` and run the requested subcommand.
+/// Parse `argv`, then run the requested subcommand.
+///
+/// A thin seam over the two halves the strict argv layer (issue #175) is built from:
+/// `parse` maps the argument vector to a [`Command`] — rejecting unknown flags and
+/// honouring `-h`/`--help`/`--version` as it goes — and `execute` runs it. Keeping
+/// `parse` a pure, I/O-free mapping is what lets the mis-parse cases be pinned by unit
+/// tests without a keychain, roster, or daemon: a typo'd `--force` never reaches the swap
+/// engine because it fails at `parse`, and `capture --help` resolves to help rather than
+/// re-labelling the roster (owner's #175 note).
 pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
-    let mut args = args.skip(1); // skip argv[0]
-    match args.next() {
-        None => {
-            print_usage();
-            Ok(())
-        }
-        Some(cmd) => {
-            let name = cmd.to_string_lossy();
-            match name.as_ref() {
-                "capture" => {
-                    // Optional positional label; the remainder (if any) is ignored,
-                    // matching the other subcommands.
-                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
-                    crate::capture::capture(label).await
-                }
-                // `login [<label>]` runs `claude /login` in isolation, harvests the fresh
-                // credential, and lands it in the roster (issue #135): it onboards a new account
-                // or revives a parked one, re-pointing the active credential. The label is an
-                // optional positional (auto-derived from the account uuid when omitted, #134),
-                // parsed exactly like `capture`; extras ignored. A locked keychain aborts one-shot
-                // (exit 4, no wait loop); an operator cancel (SIGINT) exits 0 "nothing captured".
-                "login" => {
-                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
-                    crate::capture::login(label).await
-                }
-                // `run [-v|--verbose]` — verbosity opts into the operator-facing
-                // diagnostic channel (issue #77); position-independent, mirroring
-                // `status --json`.
-                "run" => {
-                    let verbose = args.any(|arg| {
-                        let arg = arg.to_string_lossy();
-                        arg == "-v" || arg == "--verbose"
-                    });
-                    let verbosity = if verbose {
-                        Verbosity::Verbose
-                    } else {
-                        Verbosity::Quiet
-                    };
-                    run(verbosity).await
-                }
-                // `status [--json] [--no-color] [-v|--verbose]` — `--json` dumps the
-                // full response verbatim, the full-data contract regardless of terminal
-                // width (issue #72); `--no-color` forces the urgency overlay off
-                // (issue #73); `-v`/`--verbose` adds each account's raw access-token
-                // expiry clock under the table (issue #143). All flags may appear in any
-                // order; extras ignored.
-                "status" => {
-                    let mut json = false;
-                    let mut no_color = false;
-                    let mut verbose = false;
-                    for arg in args.by_ref() {
-                        match arg.to_string_lossy().as_ref() {
-                            "--json" => json = true,
-                            "--no-color" => no_color = true,
-                            "-v" | "--verbose" => verbose = true,
-                            _ => {}
-                        }
-                    }
-                    status(json, no_color, verbose).await
-                }
-                "list" => list().await,
-                // `use <account> [--force]` switches the active account on demand
-                // (issue #63), reusing the swap engine (#6). The target is the first
-                // non-flag positional (resolved by label OR account-uuid, #17); the
-                // `--force` flag may appear on either side of it and bypasses the
-                // policy gate. There is deliberately no "cycle to the next account"
-                // fallback for a missing target (out of scope, #63) — it surfaces as
-                // `UseTargetRequired`. Extra positionals are ignored, matching the
-                // other subcommands.
-                "use" => {
-                    let mut target = None;
-                    let mut force = false;
-                    for arg in args.by_ref() {
-                        let arg = arg.to_string_lossy();
-                        if arg == "--force" {
-                            force = true;
-                        } else if target.is_none() {
-                            target = Some(arg.into_owned());
-                        }
-                    }
-                    crate::use_account::use_account(target, force).await
-                }
-                // `disable`/`enable <label>` flip an account's rotation flag and
-                // persist (issue #36). Mirror `capture`'s optional-positional parse;
-                // a missing label surfaces as `RotationLabelRequired`.
-                "disable" => {
-                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
-                    set_enabled(label, false).await
-                }
-                "enable" => {
-                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
-                    set_enabled(label, true).await
-                }
-                // `remove <label>` drops an account from the roster AND deletes its
-                // stash — the destructive sibling of `disable` (issue #13). Same
-                // optional-positional parse; a missing label is RotationLabelRequired.
-                "remove" => {
-                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
-                    remove_account(label).await
-                }
-                // `poke [<account>]` runs Claude Code once in an isolated config dir so
-                // it refreshes a PARKED account's stored credential (issue #104), a thin
-                // one-shot over the #102 engine. The target is an optional positional
-                // (label OR account-uuid); omitting it sweeps every near-expiry parked
-                // account. Same optional-positional parse as `capture`; extras ignored.
-                "poke" => {
-                    let target = args.next().map(|s| s.to_string_lossy().into_owned());
-                    crate::poke::poke(target).await
-                }
-                // `stats [<account>...] [--period day|week|month|lifetime] [--since <when>]
-                // [--json] [--no-color] [--ascii]` — the OFFLINE usage reader (issue #158),
-                // now with terminal CHARTS (issue #159). It reads the sample store's own
-                // files directly, so it renders with the daemon DOWN and makes no live
-                // socket / keychain / usage-API call (the daemon is the sole writer, this
-                // the sole reader). Positionals filter which accounts show (all by default);
-                // `--period` defaults to `week` and is mutually exclusive with `--since`.
-                // `--no-color` forces the chart colour overlay off and `--ascii` forces the
-                // ASCII glyph ramp (issue #159), mirroring the `status` gate; both are inert
-                // under `--json` (the wire is never coloured and never charted). Flags may
-                // appear in any order; a value-bearing flag takes the next token or a
-                // `--flag=value` form. Validation lives in `stats::run`.
-                "stats" => {
-                    let mut accounts = Vec::new();
-                    let mut period = None;
-                    let mut since = None;
-                    let mut json = false;
-                    let mut no_color = false;
-                    let mut ascii = false;
-                    while let Some(arg) = args.next() {
-                        let arg = arg.to_string_lossy();
-                        if arg == "--json" {
-                            json = true;
-                        } else if arg == "--no-color" {
-                            no_color = true;
-                        } else if arg == "--ascii" {
-                            ascii = true;
-                        } else if arg == "--period" {
-                            period = Some(
-                                args.next()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
-                            );
-                        } else if let Some(v) = arg.strip_prefix("--period=") {
-                            period = Some(v.to_owned());
-                        } else if arg == "--since" {
-                            since = Some(
-                                args.next()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
-                            );
-                        } else if let Some(v) = arg.strip_prefix("--since=") {
-                            since = Some(v.to_owned());
-                        } else if arg.starts_with('-') {
-                            // Unknown flag: ignore, matching the other subcommands.
-                        } else {
-                            accounts.push(arg.into_owned());
-                        }
-                    }
-                    crate::stats::run(crate::stats::StatsArgs {
-                        accounts,
-                        period,
-                        since,
-                        json,
-                        no_color,
-                        ascii,
-                    })
-                    .await
-                }
-                // `export [PATH] [--plaintext] [--no-secrets]
-                // [--passphrase-file <path> | --passphrase-stdin]` — the READ-ONLY
-                // verb that serializes local state (per-account credential stashes +
-                // `oauthAccount` + roster + config) into a migration artifact (issue
-                // #148), driving the #146 container + #147 encryption envelope. With a
-                // `PATH` it writes the file atomically at mode 0600; with none it writes
-                // to stdout. Default encrypts (passphrase via an interactive no-echo
-                // prompt, or `--passphrase-file`/`--passphrase-stdin` — NEVER argv, cf.
-                // #39); `--plaintext` opts out (warned). `--no-secrets` drops the
-                // credential blobs (config-only). Flags may appear in any order and a
-                // value-bearing flag takes the next token or a `--flag=value` form; the
-                // first non-flag token is the PATH, extras ignored.
-                "export" => {
-                    let mut path: Option<PathBuf> = None;
-                    let mut plaintext = false;
-                    let mut no_secrets = false;
-                    let mut passphrase_file: Option<PathBuf> = None;
-                    let mut passphrase_stdin = false;
-                    while let Some(arg) = args.next() {
-                        match arg.to_string_lossy().as_ref() {
-                            "--plaintext" => plaintext = true,
-                            "--no-secrets" => no_secrets = true,
-                            "--passphrase-stdin" => passphrase_stdin = true,
-                            "--passphrase-file" => {
-                                passphrase_file = args.next().map(PathBuf::from);
-                            }
-                            v if v.starts_with("--passphrase-file=") => {
-                                passphrase_file =
-                                    Some(PathBuf::from(&v["--passphrase-file=".len()..]));
-                            }
-                            v if v.starts_with('-') => {
-                                // Unknown flag: ignore, matching the other subcommands.
-                            }
-                            _ if path.is_none() => path = Some(PathBuf::from(&arg)),
-                            _ => {} // extra positional ignored, matching the others
-                        }
-                    }
-                    export(
-                        path,
-                        no_secrets,
-                        export_encryption(plaintext, passphrase_file, passphrase_stdin),
-                    )
-                    .await
-                }
-                // `import <PATH> [--overwrite] [--passphrase-file <path> | --passphrase-stdin]`
-                // — the INVERSE of `export` (issue #149): read a migration artifact, decrypt
-                // it if encrypted (passphrase via an interactive no-echo prompt, or
-                // `--passphrase-file`/`--passphrase-stdin` — NEVER argv, cf. #39; a plaintext
-                // artifact needs none), and rehydrate the roster + per-account credential
-                // stashes through the EXISTING local write path (`security -i`). Conflict
-                // policy: an account already present on the target is SKIPPED by default and
-                // REPLACED under `--overwrite`, reported per-account. The `PATH` is required
-                // (the passphrase may ride stdin, so the artifact never does); the first
-                // non-flag token is it, extras ignored — matching the other subcommands.
-                "import" => {
-                    let mut path: Option<PathBuf> = None;
-                    let mut overwrite = false;
-                    let mut passphrase_file: Option<PathBuf> = None;
-                    let mut passphrase_stdin = false;
-                    while let Some(arg) = args.next() {
-                        match arg.to_string_lossy().as_ref() {
-                            "--overwrite" => overwrite = true,
-                            "--passphrase-stdin" => passphrase_stdin = true,
-                            "--passphrase-file" => {
-                                passphrase_file = args.next().map(PathBuf::from);
-                            }
-                            v if v.starts_with("--passphrase-file=") => {
-                                passphrase_file =
-                                    Some(PathBuf::from(&v["--passphrase-file=".len()..]));
-                            }
-                            v if v.starts_with('-') => {
-                                // Unknown flag: ignore, matching the other subcommands.
-                            }
-                            _ if path.is_none() => path = Some(PathBuf::from(&arg)),
-                            _ => {} // extra positional ignored, matching the others
-                        }
-                    }
-                    let path = path.ok_or(Error::MigrationImportPathRequired)?;
-                    import(
-                        path,
-                        overwrite,
-                        import_passphrase(passphrase_file, passphrase_stdin),
-                    )
-                    .await
-                }
-                "-h" | "--help" => {
-                    print_usage();
-                    Ok(())
-                }
-                other => Err(Error::UnknownCommand(other.to_owned())),
-            }
+    execute(parse(args.skip(1))?).await
+}
+
+/// A lexopt parse failure folds into the crate error taxonomy as a [`Error::CliUsage`].
+/// Only `Parser::next` propagates here (an unconsumed `--flag=value` on a boolean flag);
+/// the common unknown-flag and missing-value cases are turned into our own wording by
+/// `unexpected` / `required_value` before this ever fires, so this carries the generic
+/// root hint. lexopt's messages are secret-free — argv never holds a token or passphrase
+/// (the passphrase is read off-argv, cf. #39).
+impl From<lexopt::Error> for Error {
+    fn from(err: lexopt::Error) -> Self {
+        Error::CliUsage {
+            message: err.to_string(),
+            usage_hint: "sessiometer --help",
         }
     }
 }
 
-fn print_usage() {
-    println!(
-        "sessiometer — manage multiple Claude Code accounts on macOS\n\
-         \n\
-         USAGE:\n    \
-         sessiometer <COMMAND>\n\
-         \n\
-         COMMANDS:\n    \
-         capture [<label>]    Stash the active account into the rotation\n    \
-         login [<label>]      Log in to an account (claude /login) in isolation and add it to the rotation\n    \
-         run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)\n    \
-         status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)\n    \
-         list       List captured accounts\n    \
-         use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
-         disable <label>      Park an account: keep it but take it out of the rotation\n    \
-         enable <label>       Return a parked account to the rotation\n    \
-         remove <label>       Delete an account: drop it from the rotation and erase its stash\n    \
-         poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)\n    \
-         stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)\n    \
-         export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout\n    \
-         import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite\n    \
-         --help     Print this help"
-    );
+/// One fully-parsed CLI invocation: a subcommand plus its validated options, or one of
+/// the two argv-level meta actions (`--version`, `--help`). Produced by `parse`, run by
+/// `execute`. A plain, I/O-free data enum on purpose (issue #175) — the seam that makes
+/// the parse layer unit-testable, so a typo'd flag or a `<verb> --help` can be asserted
+/// without touching the keychain, roster, or daemon.
+#[derive(Debug, PartialEq)]
+enum Command {
+    /// `capture [<label>]` — stash the active account into the rotation.
+    Capture { label: Option<String> },
+    /// `login [<label>]` — `claude /login` in isolation, then land it in the rotation.
+    Login { label: Option<String> },
+    /// `run [-v|--verbose]` — the foreground poll+swap daemon.
+    Run { verbose: bool },
+    /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
+    Status {
+        json: bool,
+        no_color: bool,
+        verbose: bool,
+    },
+    /// `list` — the offline roster view.
+    List,
+    /// `use <account> [--force]` — switch the active account now.
+    Use { target: Option<String>, force: bool },
+    /// `disable`/`enable <label>` — flip an account's rotation flag (`enabled`).
+    SetEnabled {
+        label: Option<String>,
+        enabled: bool,
+    },
+    /// `remove <label>` — drop an account and erase its stash.
+    Remove { label: Option<String> },
+    /// `poke [<account>]` — refresh a parked account's credential once.
+    Poke { target: Option<String> },
+    /// `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`.
+    Stats(crate::stats::StatsArgs),
+    /// `export [PATH] …`. The raw flags are carried and resolved to an `Encryption` in
+    /// `execute`, so this variant stays a plain comparable value for the parser tests.
+    Export {
+        path: Option<PathBuf>,
+        no_secrets: bool,
+        plaintext: bool,
+        passphrase_file: Option<PathBuf>,
+        passphrase_stdin: bool,
+    },
+    /// `import <PATH> …`. Like `Export`, carries raw flags resolved to a `PassphraseSource`
+    /// in `execute`; the required `PATH` is enforced at parse time.
+    Import {
+        path: PathBuf,
+        overwrite: bool,
+        passphrase_file: Option<PathBuf>,
+        passphrase_stdin: bool,
+    },
+    /// `--version` / `-V` — print the crate version.
+    Version,
+    /// `-h` / `--help`, top-level or after a subcommand — print the matching help.
+    Help(HelpTopic),
 }
+
+/// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
+/// subcommand's own usage. Doubles as the subcommand identity in a [`Error::CliUsage`]
+/// hint, so a rejected flag points at the exact `--help` to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpTopic {
+    Root,
+    Capture,
+    Login,
+    Run,
+    Status,
+    List,
+    Use,
+    Disable,
+    Enable,
+    Remove,
+    Poke,
+    Stats,
+    Export,
+    Import,
+}
+
+impl HelpTopic {
+    /// The `sessiometer … --help` invocation an error points the operator at.
+    fn hint(self) -> &'static str {
+        match self {
+            HelpTopic::Root => "sessiometer --help",
+            HelpTopic::Capture => "sessiometer capture --help",
+            HelpTopic::Login => "sessiometer login --help",
+            HelpTopic::Run => "sessiometer run --help",
+            HelpTopic::Status => "sessiometer status --help",
+            HelpTopic::List => "sessiometer list --help",
+            HelpTopic::Use => "sessiometer use --help",
+            HelpTopic::Disable => "sessiometer disable --help",
+            HelpTopic::Enable => "sessiometer enable --help",
+            HelpTopic::Remove => "sessiometer remove --help",
+            HelpTopic::Poke => "sessiometer poke --help",
+            HelpTopic::Stats => "sessiometer stats --help",
+            HelpTopic::Export => "sessiometer export --help",
+            HelpTopic::Import => "sessiometer import --help",
+        }
+    }
+
+    /// The full help text this topic prints (trailing newline included). The root topic is
+    /// the top-level overview; every subcommand has its own focused usage block, so
+    /// `sessiometer <verb> --help` is command-specific (issue #175).
+    fn help(self) -> &'static str {
+        match self {
+            HelpTopic::Root => ROOT_USAGE,
+            HelpTopic::Capture => CAPTURE_USAGE,
+            HelpTopic::Login => LOGIN_USAGE,
+            HelpTopic::Run => RUN_USAGE,
+            HelpTopic::Status => STATUS_USAGE,
+            HelpTopic::List => LIST_USAGE,
+            HelpTopic::Use => USE_USAGE,
+            HelpTopic::Disable => DISABLE_USAGE,
+            HelpTopic::Enable => ENABLE_USAGE,
+            HelpTopic::Remove => REMOVE_USAGE,
+            HelpTopic::Poke => POKE_USAGE,
+            HelpTopic::Stats => STATS_USAGE,
+            HelpTopic::Export => EXPORT_USAGE,
+            HelpTopic::Import => IMPORT_USAGE,
+        }
+    }
+}
+
+/// Map an unrecognized argument to the strict-usage error (issue #175): a `-x` / `--foo`
+/// flag the subcommand does not accept, or a stray positional where none belongs. `topic`
+/// selects the `--help` the message points at. Secret-free — argv holds no token.
+fn unexpected(arg: lexopt::Arg<'_>, topic: HelpTopic) -> Error {
+    let message = match arg {
+        Short(c) => format!("unknown flag `-{c}`"),
+        Long(name) => format!("unknown flag `--{name}`"),
+        Value(value) => format!("unexpected argument `{}`", value.to_string_lossy()),
+    };
+    Error::CliUsage {
+        message,
+        usage_hint: topic.hint(),
+    }
+}
+
+/// Take the value a value-bearing flag requires, or map lexopt's `MissingValue` to a clear
+/// strict-usage error (issue #175) — the `--period`/`--since`/`--passphrase-file` case
+/// where the flag is the last token. Returns the raw `OsString` (a path may be non-UTF-8);
+/// the caller lossily stringifies where a `String` is wanted.
+fn required_value(parser: &mut lexopt::Parser, flag: &str, topic: HelpTopic) -> Result<OsString> {
+    parser.value().map_err(|_| Error::CliUsage {
+        message: format!("`--{flag}` needs a value"),
+        usage_hint: topic.hint(),
+    })
+}
+
+/// Parse a subcommand that takes an optional single positional (capture, login, disable,
+/// enable, remove, poke): the first non-flag token is it, extras are ignored (matching the
+/// prior behavior), `-h`/`--help` in any position short-circuits to help, and any unknown
+/// flag is rejected. `build` turns the collected positional into the right [`Command`].
+fn parse_positional(
+    parser: &mut lexopt::Parser,
+    topic: HelpTopic,
+    build: impl FnOnce(Option<String>) -> Command,
+) -> Result<Command> {
+    let mut positional = None;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(topic)),
+            Value(value) if positional.is_none() => {
+                positional = Some(value.to_string_lossy().into_owned());
+            }
+            Value(_) => {} // extra positional ignored, matching the prior behavior
+            other => return Err(unexpected(other, topic)),
+        }
+    }
+    Ok(build(positional))
+}
+
+/// Parse `list` — no positional, no flags but `-h`/`--help`. A stray positional is ignored
+/// (prior behavior); an unknown flag is rejected (issue #175).
+fn parse_list(parser: &mut lexopt::Parser) -> Result<Command> {
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::List)),
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::List)),
+        }
+    }
+    Ok(Command::List)
+}
+
+/// Parse `run [-v|--verbose]` (issue #77) — the verbosity flag, position-independent.
+fn parse_run(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut verbose = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Run)),
+            Short('v') | Long("verbose") => verbose = true,
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::Run)),
+        }
+    }
+    Ok(Command::Run { verbose })
+}
+
+/// Parse `status [--json] [--no-color] [-v|--verbose]` (issues #72/#73/#143) — all flags
+/// order-independent.
+fn parse_status(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut json = false;
+    let mut no_color = false;
+    let mut verbose = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Status)),
+            Long("json") => json = true,
+            Long("no-color") => no_color = true,
+            Short('v') | Long("verbose") => verbose = true,
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::Status)),
+        }
+    }
+    Ok(Command::Status {
+        json,
+        no_color,
+        verbose,
+    })
+}
+
+/// Parse `use <account> [--force]` (issue #63) — `--force` order-independent, the first
+/// non-flag token is the target, extras ignored. A missing target is left to
+/// `use_account` (surfaced as `UseTargetRequired`), preserving the prior split.
+fn parse_use(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut target = None;
+    let mut force = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Use)),
+            Long("force") => force = true,
+            Value(value) if target.is_none() => {
+                target = Some(value.to_string_lossy().into_owned());
+            }
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::Use)),
+        }
+    }
+    Ok(Command::Use { target, force })
+}
+
+/// Parse `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`
+/// (issues #158/#159). Positionals are the account filter; `--period`/`--since` take a
+/// value (space- or `=`-separated, handled by lexopt). Validation lives in `stats::run`.
+fn parse_stats(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut accounts = Vec::new();
+    let mut period = None;
+    let mut since = None;
+    let mut json = false;
+    let mut no_color = false;
+    let mut ascii = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Stats)),
+            Long("json") => json = true,
+            Long("no-color") => no_color = true,
+            Long("ascii") => ascii = true,
+            Long("period") => {
+                period = Some(
+                    required_value(parser, "period", HelpTopic::Stats)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Long("since") => {
+                since = Some(
+                    required_value(parser, "since", HelpTopic::Stats)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Value(value) => accounts.push(value.to_string_lossy().into_owned()),
+            other => return Err(unexpected(other, HelpTopic::Stats)),
+        }
+    }
+    Ok(Command::Stats(crate::stats::StatsArgs {
+        accounts,
+        period,
+        since,
+        json,
+        no_color,
+        ascii,
+    }))
+}
+
+/// Parse `export [PATH] [--plaintext] [--no-secrets] [--passphrase-file <path> |
+/// --passphrase-stdin]` (issue #148) — the first non-flag token is the PATH, extras
+/// ignored. The passphrase source is NEVER an argv value (#39): `--passphrase-file` takes
+/// a path, `--passphrase-stdin` a flag; both resolve to an `Encryption` in `execute`.
+fn parse_export(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut path = None;
+    let mut no_secrets = false;
+    let mut plaintext = false;
+    let mut passphrase_file = None;
+    let mut passphrase_stdin = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Export)),
+            Long("plaintext") => plaintext = true,
+            Long("no-secrets") => no_secrets = true,
+            Long("passphrase-stdin") => passphrase_stdin = true,
+            Long("passphrase-file") => {
+                passphrase_file = Some(PathBuf::from(required_value(
+                    parser,
+                    "passphrase-file",
+                    HelpTopic::Export,
+                )?));
+            }
+            Value(value) if path.is_none() => path = Some(PathBuf::from(value)),
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::Export)),
+        }
+    }
+    Ok(Command::Export {
+        path,
+        no_secrets,
+        plaintext,
+        passphrase_file,
+        passphrase_stdin,
+    })
+}
+
+/// Parse `import <PATH> [--overwrite] [--passphrase-file <path> | --passphrase-stdin]`
+/// (issue #149) — the first non-flag token is the required PATH (a missing one is
+/// `MigrationImportPathRequired`, preserved from the prior dispatch), extras ignored. The
+/// passphrase source is NEVER an argv value (#39), resolved to a `PassphraseSource` in
+/// `execute`.
+fn parse_import(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut path = None;
+    let mut overwrite = false;
+    let mut passphrase_file = None;
+    let mut passphrase_stdin = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Import)),
+            Long("overwrite") => overwrite = true,
+            Long("passphrase-stdin") => passphrase_stdin = true,
+            Long("passphrase-file") => {
+                passphrase_file = Some(PathBuf::from(required_value(
+                    parser,
+                    "passphrase-file",
+                    HelpTopic::Import,
+                )?));
+            }
+            Value(value) if path.is_none() => path = Some(PathBuf::from(value)),
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::Import)),
+        }
+    }
+    let path = path.ok_or(Error::MigrationImportPathRequired)?;
+    Ok(Command::Import {
+        path,
+        overwrite,
+        passphrase_file,
+        passphrase_stdin,
+    })
+}
+
+/// Map `argv` (already past `argv[0]`) to a [`Command`], or a strict-usage error. The
+/// argv-level meta options come first: no args or `-h`/`--help` is the root overview,
+/// `-V`/`--version` is the version, an unknown leading flag is rejected. Otherwise the
+/// first positional is the subcommand and its parser takes over. Pure — no I/O — so the
+/// whole surface is unit-testable (issue #175).
+fn parse<I>(args: I) -> Result<Command>
+where
+    I: IntoIterator,
+    I::Item: Into<OsString>,
+{
+    let mut parser = lexopt::Parser::from_args(args);
+    match parser.next()? {
+        None => Ok(Command::Help(HelpTopic::Root)),
+        Some(Short('h') | Long("help")) => Ok(Command::Help(HelpTopic::Root)),
+        Some(Short('V') | Long("version")) => Ok(Command::Version),
+        Some(Value(name)) => parse_subcommand(&name, &mut parser),
+        Some(other) => Err(unexpected(other, HelpTopic::Root)),
+    }
+}
+
+/// Route a subcommand name to its parser (the remainder of `argv` is consumed there). An
+/// unrecognized name is `UnknownCommand` — unchanged from the prior dispatch.
+fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command> {
+    match name.to_string_lossy().as_ref() {
+        "capture" => parse_positional(parser, HelpTopic::Capture, |label| Command::Capture {
+            label,
+        }),
+        "login" => parse_positional(parser, HelpTopic::Login, |label| Command::Login { label }),
+        "run" => parse_run(parser),
+        "status" => parse_status(parser),
+        "list" => parse_list(parser),
+        "use" => parse_use(parser),
+        "disable" => parse_positional(parser, HelpTopic::Disable, |label| Command::SetEnabled {
+            label,
+            enabled: false,
+        }),
+        "enable" => parse_positional(parser, HelpTopic::Enable, |label| Command::SetEnabled {
+            label,
+            enabled: true,
+        }),
+        "remove" => parse_positional(parser, HelpTopic::Remove, |label| Command::Remove { label }),
+        "poke" => parse_positional(parser, HelpTopic::Poke, |target| Command::Poke { target }),
+        "stats" => parse_stats(parser),
+        "export" => parse_export(parser),
+        "import" => parse_import(parser),
+        other => Err(Error::UnknownCommand(other.to_owned())),
+    }
+}
+
+/// The `--version` line (issue #175): the crate name plus `CARGO_PKG_VERSION`, the sole
+/// version source (`Cargo.toml`). Extracted so the parser test can assert its content
+/// without capturing stdout.
+fn version_line() -> &'static str {
+    concat!("sessiometer ", env!("CARGO_PKG_VERSION"))
+}
+
+/// Run a parsed [`Command`]. The inverse of `parse`: this half owns the I/O (keychain,
+/// roster, daemon socket), so `parse` can stay pure and testable.
+async fn execute(command: Command) -> Result<()> {
+    match command {
+        Command::Capture { label } => crate::capture::capture(label).await,
+        Command::Login { label } => crate::capture::login(label).await,
+        Command::Run { verbose } => {
+            let verbosity = if verbose {
+                Verbosity::Verbose
+            } else {
+                Verbosity::Quiet
+            };
+            run(verbosity).await
+        }
+        Command::Status {
+            json,
+            no_color,
+            verbose,
+        } => status(json, no_color, verbose).await,
+        Command::List => list().await,
+        Command::Use { target, force } => crate::use_account::use_account(target, force).await,
+        Command::SetEnabled { label, enabled } => set_enabled(label, enabled).await,
+        Command::Remove { label } => remove_account(label).await,
+        Command::Poke { target } => crate::poke::poke(target).await,
+        Command::Stats(args) => crate::stats::run(args).await,
+        Command::Export {
+            path,
+            no_secrets,
+            plaintext,
+            passphrase_file,
+            passphrase_stdin,
+        } => {
+            export(
+                path,
+                no_secrets,
+                export_encryption(plaintext, passphrase_file, passphrase_stdin),
+            )
+            .await
+        }
+        Command::Import {
+            path,
+            overwrite,
+            passphrase_file,
+            passphrase_stdin,
+        } => {
+            import(
+                path,
+                overwrite,
+                import_passphrase(passphrase_file, passphrase_stdin),
+            )
+            .await
+        }
+        Command::Version => {
+            println!("{}", version_line());
+            Ok(())
+        }
+        Command::Help(topic) => {
+            print!("{}", topic.help());
+            Ok(())
+        }
+    }
+}
+
+/// The top-level overview: the command list plus the two argv-level meta options
+/// (`--version`, `--help`). Printed for `sessiometer`, `sessiometer -h`/`--help`, and no
+/// args at all. Issue #175 added the `OPTIONS` block (`-V`/`--version` and the
+/// per-command-help note); the `COMMANDS` list is unchanged.
+const ROOT_USAGE: &str = "sessiometer — manage multiple Claude Code accounts on macOS
+
+USAGE:
+    sessiometer <COMMAND> [OPTIONS]
+
+COMMANDS:
+    capture [<label>]    Stash the active account into the rotation
+    login [<label>]      Log in to an account (claude /login) in isolation and add it to the rotation
+    run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
+    status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
+    list       List captured accounts
+    use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
+    disable <label>      Park an account: keep it but take it out of the rotation
+    enable <label>       Return a parked account to the rotation
+    remove <label>       Delete an account: drop it from the rotation and erase its stash
+    poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
+    stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
+    export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout
+    import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite
+
+OPTIONS:
+    -h, --help     Print help (append it to a command for that command's usage)
+    -V, --version  Print version
+
+Run `sessiometer <command> --help` for command-specific usage.
+";
+
+/// Per-subcommand help (issue #175): a one-line summary, a usage line, then the accepted
+/// arguments and flags. Each is what `sessiometer <verb> --help` prints and matches the
+/// flags the corresponding `parse_*` accepts, so help and parser stay in lockstep.
+const CAPTURE_USAGE: &str = "sessiometer capture — stash the active account into the rotation
+
+USAGE:
+    sessiometer capture [<label>]
+
+    <label>     a name for the captured account (auto-derived from its account-uuid if omitted)
+    -h, --help  print this help
+";
+
+const LOGIN_USAGE: &str = "sessiometer login — log in to an account (claude /login) in isolation and add it to the rotation
+
+USAGE:
+    sessiometer login [<label>]
+
+    <label>     a name for the new account (auto-derived from its account-uuid if omitted)
+    -h, --help  print this help
+";
+
+const RUN_USAGE: &str = "sessiometer run — run the foreground daemon (poll every account's usage and swap before exhaustion)
+
+USAGE:
+    sessiometer run [-v|--verbose]
+
+    -v, --verbose  emit per-tick run diagnostics on stderr
+    -h, --help     print this help
+";
+
+const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
+
+USAGE:
+    sessiometer status [--json] [--no-color] [-v|--verbose]
+
+    --json         print the raw status response, uncoloured (for scripts)
+    --no-color     force the urgency colour overlay off
+    -v, --verbose  add each account's access-token expiry under the table
+    -h, --help     print this help
+";
+
+const LIST_USAGE: &str =
+    "sessiometer list — list captured accounts (offline; reads the roster directly)
+
+USAGE:
+    sessiometer list
+
+    -h, --help  print this help
+";
+
+const USE_USAGE: &str = "sessiometer use — switch the active account now
+
+USAGE:
+    sessiometer use <account> [--force]
+
+    <account>   the target account (its label or account-uuid)
+    --force     override the pre-swap gate
+    -h, --help  print this help
+";
+
+const DISABLE_USAGE: &str =
+    "sessiometer disable — park an account: keep it but take it out of the rotation
+
+USAGE:
+    sessiometer disable <label>
+
+    <label>     the account to park (its label)
+    -h, --help  print this help
+";
+
+const ENABLE_USAGE: &str = "sessiometer enable — return a parked account to the rotation
+
+USAGE:
+    sessiometer enable <label>
+
+    <label>     the parked account to re-enable (its label)
+    -h, --help  print this help
+";
+
+const REMOVE_USAGE: &str =
+    "sessiometer remove — delete an account: drop it from the rotation and erase its stash
+
+USAGE:
+    sessiometer remove <label>
+
+    <label>     the account to delete (its label)
+    -h, --help  print this help
+";
+
+const POKE_USAGE: &str = "sessiometer poke — run Claude Code once in an isolated config dir to refresh a parked account's credential
+
+USAGE:
+    sessiometer poke [<account>]
+
+    <account>   the parked account to refresh (all near-expiry parked accounts if omitted)
+    -h, --help  print this help
+";
+
+const STATS_USAGE: &str = "sessiometer stats — show usage over a period, offline (reads the sample store directly)
+
+USAGE:
+    sessiometer stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json] [--no-color] [--ascii]
+
+    <account>...    filter to these accounts (all if omitted)
+    --period <p>    look-back window: day, week (default), month, or lifetime
+    --since <when>  look back to a time (e.g. 7d, 24h, or YYYY-MM-DD); exclusive with --period
+    --json          print the raw stats, uncoloured (for scripts)
+    --no-color      force the chart colour overlay off
+    --ascii         force the ASCII glyph ramp
+    -h, --help      print this help
+";
+
+const EXPORT_USAGE: &str = "sessiometer export — serialize state to an (encrypted by default) migration artifact
+
+USAGE:
+    sessiometer export [PATH] [--plaintext] [--no-secrets] [--passphrase-file <path> | --passphrase-stdin]
+
+    PATH                   write the artifact here (0600); stdout if omitted
+    --plaintext            do not encrypt (warned when it carries secrets)
+    --no-secrets           drop every credential blob (config-only artifact)
+    --passphrase-file <p>  read the passphrase from a file (never from argv)
+    --passphrase-stdin     read the passphrase from standard input
+    -h, --help             print this help
+";
+
+const IMPORT_USAGE: &str = "sessiometer import — rehydrate accounts from a migration artifact
+
+USAGE:
+    sessiometer import <PATH> [--overwrite] [--passphrase-file <path> | --passphrase-stdin]
+
+    PATH                   the artifact to import (required)
+    --overwrite            replace accounts already present (skip them otherwise)
+    --passphrase-file <p>  read the passphrase from a file (never from argv)
+    --passphrase-stdin     read the passphrase from standard input
+    -h, --help             print this help
+";
 
 /// Foreground daemon: poll every account's usage and swap the active credential
 /// before exhaustion.
@@ -4767,5 +5153,412 @@ spare  22222222-2222\n\
             (0, 2, 0, 0),
             "the Skip default must leave both already-present accounts untouched"
         );
+    }
+
+    // ---- CLI argv parser (issue #175) ------------------------------------
+    //
+    // `parse` is the pure, I/O-free half of the argv layer: it maps the argument vector
+    // (already past `argv[0]`) to a `Command` or a strict-usage error, WITHOUT touching
+    // the keychain, roster, or daemon. That is exactly what lets the mis-parse cases the
+    // issue calls out be pinned here — a typo'd `--force`, `use --help`, `status --josn` —
+    // without any of the side effects the old silent-ignore parser risked.
+
+    /// Drive `parse` the way `dispatch` does — over an owned `OsString` vector.
+    fn parse_argv(args: &[&str]) -> Result<Command> {
+        parse(args.iter().map(|s| std::ffi::OsString::from(*s)))
+    }
+
+    #[test]
+    fn no_args_and_top_level_help_flags_map_to_the_root_overview() {
+        // No args, `-h`, and `--help` at the top level all print the root usage (exit 0),
+        // as the prior dispatch did for the first two.
+        assert_eq!(parse_argv(&[]).unwrap(), Command::Help(HelpTopic::Root));
+        assert_eq!(parse_argv(&["-h"]).unwrap(), Command::Help(HelpTopic::Root));
+        assert_eq!(
+            parse_argv(&["--help"]).unwrap(),
+            Command::Help(HelpTopic::Root)
+        );
+    }
+
+    #[test]
+    fn version_flag_maps_to_version_and_the_line_carries_the_cargo_version() {
+        // AC2: `--version` / `-V` surface the crate version, sourced solely from
+        // `CARGO_PKG_VERSION` (`Cargo.toml`).
+        assert_eq!(parse_argv(&["--version"]).unwrap(), Command::Version);
+        assert_eq!(parse_argv(&["-V"]).unwrap(), Command::Version);
+        assert!(version_line().starts_with("sessiometer "));
+        assert!(
+            version_line().contains(env!("CARGO_PKG_VERSION")),
+            "the --version line must print CARGO_PKG_VERSION: {}",
+            version_line()
+        );
+    }
+
+    #[test]
+    fn a_typoed_force_is_rejected_so_use_never_runs_an_unforced_swap() {
+        // AC1 (the headline footgun): `use <acct> --forc` must NOT silently drop the flag
+        // and run an UNFORCED swap — it errors, naming the offending flag and pointing at
+        // the right `--help`.
+        match parse_argv(&["use", "spare", "--forc"]).unwrap_err() {
+            Error::CliUsage {
+                message,
+                usage_hint,
+            } => {
+                assert!(
+                    message.contains("--forc"),
+                    "names the offending flag: {message}"
+                );
+                assert_eq!(usage_hint, "sessiometer use --help");
+            }
+            other => panic!("expected a CliUsage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_rejects_a_typoed_json_flag_instead_of_printing_the_human_table() {
+        // AC1: `status --josn` (typo) must not silently fall through to the human table —
+        // that would break `status --josn | jq` downstream. It errors.
+        let err = parse_argv(&["status", "--josn"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("--josn"), "got: {err}");
+    }
+
+    #[test]
+    fn use_help_prints_help_rather_than_resolving_an_account_named_help() {
+        // AC1/AC3: `use --help` must print help, not try to resolve an account literally
+        // named `--help` (the prior `--help`-as-positional bug).
+        assert_eq!(
+            parse_argv(&["use", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Use)
+        );
+    }
+
+    #[test]
+    fn capture_and_login_help_never_become_a_mutating_positional_label() {
+        // AC6 (owner's #175 note): `capture --help` / `login --help` must resolve to HELP,
+        // never a label — proving they perform ZERO roster/keychain writes. `parse` is
+        // pure, so a `Help` result cannot mutate anything; the point is precisely that it
+        // is NOT a `Capture`/`Login` command carrying `--help` as the credential label
+        // (which the executor would write to stash state).
+        assert_eq!(
+            parse_argv(&["capture", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Capture)
+        );
+        assert_eq!(
+            parse_argv(&["login", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Login)
+        );
+        assert_ne!(
+            parse_argv(&["capture", "--help"]).unwrap(),
+            Command::Capture {
+                label: Some("--help".to_owned())
+            },
+            "`capture --help` must not become a capture labelled `--help`"
+        );
+        assert_ne!(
+            parse_argv(&["login", "--help"]).unwrap(),
+            Command::Login {
+                label: Some("--help".to_owned())
+            },
+            "`login --help` must not become a login labelled `--help`"
+        );
+    }
+
+    #[test]
+    fn subcommand_help_is_command_specific() {
+        // AC3: `<subcommand> --help` prints that subcommand's own usage, and `-h` is
+        // equivalent to `--help`.
+        assert_eq!(
+            parse_argv(&["stats", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Stats)
+        );
+        assert_eq!(
+            parse_argv(&["export", "-h"]).unwrap(),
+            Command::Help(HelpTopic::Export)
+        );
+        assert_eq!(
+            parse_argv(&["import", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Import)
+        );
+        // Each topic's text names its own verb, so the help is genuinely command-specific.
+        assert!(HelpTopic::Stats.help().contains("sessiometer stats"));
+        assert!(HelpTopic::Export.help().contains("sessiometer export"));
+        assert!(HelpTopic::Use.help().contains("sessiometer use"));
+    }
+
+    #[test]
+    fn help_is_honored_in_any_position() {
+        // AC3: `-h`/`--help` works even after other flags/positionals — it short-circuits,
+        // discarding the partial parse.
+        assert_eq!(
+            parse_argv(&["use", "spare", "--force", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Use)
+        );
+        assert_eq!(
+            parse_argv(&["status", "--json", "-h"]).unwrap(),
+            Command::Help(HelpTopic::Status)
+        );
+        // A leading top-level `-h` short-circuits before the subcommand is read.
+        assert_eq!(
+            parse_argv(&["-h", "capture"]).unwrap(),
+            Command::Help(HelpTopic::Root)
+        );
+    }
+
+    #[test]
+    fn an_unknown_top_level_flag_is_rejected_but_an_unknown_command_is_unchanged() {
+        // AC1: a bare unknown flag before any subcommand errors (not a silent no-op)…
+        let err = parse_argv(&["--bogus"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("--bogus"), "got: {err}");
+        // …while an unknown SUBCOMMAND stays `UnknownCommand`, exactly as before.
+        assert!(matches!(
+            parse_argv(&["frobnicate"]).unwrap_err(),
+            Error::UnknownCommand(cmd) if cmd == "frobnicate"
+        ));
+    }
+
+    #[test]
+    fn use_parses_target_and_force_in_either_order() {
+        // AC4: `--force` may sit on either side of the target; flag order does not matter
+        // and current behavior is preserved for valid input.
+        assert_eq!(
+            parse_argv(&["use", "spare", "--force"]).unwrap(),
+            Command::Use {
+                target: Some("spare".to_owned()),
+                force: true
+            }
+        );
+        assert_eq!(
+            parse_argv(&["use", "--force", "spare"]).unwrap(),
+            Command::Use {
+                target: Some("spare".to_owned()),
+                force: true
+            }
+        );
+        assert_eq!(
+            parse_argv(&["use", "spare"]).unwrap(),
+            Command::Use {
+                target: Some("spare".to_owned()),
+                force: false
+            }
+        );
+    }
+
+    #[test]
+    fn status_flags_are_order_independent() {
+        // AC4: `--json`/`--no-color`/`-v` in any order yield the same command.
+        let both_orders = [
+            parse_argv(&["status", "--json", "--no-color", "-v"]).unwrap(),
+            parse_argv(&["status", "-v", "--no-color", "--json"]).unwrap(),
+        ];
+        for parsed in both_orders {
+            assert_eq!(
+                parsed,
+                Command::Status {
+                    json: true,
+                    no_color: true,
+                    verbose: true
+                }
+            );
+        }
+        assert_eq!(
+            parse_argv(&["status"]).unwrap(),
+            Command::Status {
+                json: false,
+                no_color: false,
+                verbose: false
+            }
+        );
+    }
+
+    #[test]
+    fn run_parses_verbose_and_now_rejects_a_bogus_flag() {
+        assert_eq!(
+            parse_argv(&["run", "--verbose"]).unwrap(),
+            Command::Run { verbose: true }
+        );
+        assert_eq!(
+            parse_argv(&["run", "-v"]).unwrap(),
+            Command::Run { verbose: true }
+        );
+        assert_eq!(
+            parse_argv(&["run"]).unwrap(),
+            Command::Run { verbose: false }
+        );
+        // Previously a bogus `run` flag was silently ignored; now it errors (issue #175).
+        assert!(matches!(
+            parse_argv(&["run", "--bogus"]).unwrap_err(),
+            Error::CliUsage { .. }
+        ));
+    }
+
+    #[test]
+    fn optional_positional_subcommands_capture_their_label() {
+        assert_eq!(
+            parse_argv(&["capture"]).unwrap(),
+            Command::Capture { label: None }
+        );
+        assert_eq!(
+            parse_argv(&["capture", "work"]).unwrap(),
+            Command::Capture {
+                label: Some("work".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_argv(&["poke"]).unwrap(),
+            Command::Poke { target: None }
+        );
+        assert_eq!(
+            parse_argv(&["remove", "work"]).unwrap(),
+            Command::Remove {
+                label: Some("work".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_argv(&["disable", "work"]).unwrap(),
+            Command::SetEnabled {
+                label: Some("work".to_owned()),
+                enabled: false
+            }
+        );
+        assert_eq!(
+            parse_argv(&["enable", "work"]).unwrap(),
+            Command::SetEnabled {
+                label: Some("work".to_owned()),
+                enabled: true
+            }
+        );
+    }
+
+    #[test]
+    fn list_takes_no_flags_but_help() {
+        assert_eq!(parse_argv(&["list"]).unwrap(), Command::List);
+        assert_eq!(
+            parse_argv(&["list", "--help"]).unwrap(),
+            Command::Help(HelpTopic::List)
+        );
+        assert!(matches!(
+            parse_argv(&["list", "--bogus"]).unwrap_err(),
+            Error::CliUsage { .. }
+        ));
+    }
+
+    #[test]
+    fn a_double_dash_escapes_a_positional_that_looks_like_a_flag() {
+        // lexopt's `--` ends option parsing, so an unusual label starting with `-` is
+        // still reachable — a safety valve now that a bare `--weird` is a rejected flag.
+        assert_eq!(
+            parse_argv(&["capture", "--", "--weird"]).unwrap(),
+            Command::Capture {
+                label: Some("--weird".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn stats_collects_positionals_and_value_flags_in_either_form() {
+        // Positionals are the account filter; `--period`/`--since` take a value either
+        // space- or `=`-separated (lexopt handles the `=`). Validation lives in `stats::run`.
+        assert_eq!(
+            parse_argv(&["stats", "work", "personal", "--period", "day", "--json"]).unwrap(),
+            Command::Stats(crate::stats::StatsArgs {
+                accounts: vec!["work".to_owned(), "personal".to_owned()],
+                period: Some("day".to_owned()),
+                since: None,
+                json: true,
+                no_color: false,
+                ascii: false,
+            })
+        );
+        assert_eq!(
+            parse_argv(&["stats", "--period=week"]).unwrap(),
+            Command::Stats(crate::stats::StatsArgs {
+                accounts: vec![],
+                period: Some("week".to_owned()),
+                since: None,
+                json: false,
+                no_color: false,
+                ascii: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_value_bearing_flag_without_a_value_is_a_clear_error() {
+        // `--period` as the last token → a clear "needs a value", not a silent empty period.
+        let err = parse_argv(&["stats", "--period"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("period"), "got: {err}");
+    }
+
+    #[test]
+    fn export_carries_its_raw_flags_for_the_executor() {
+        assert_eq!(
+            parse_argv(&["export", "out.json", "--plaintext", "--no-secrets"]).unwrap(),
+            Command::Export {
+                path: Some(PathBuf::from("out.json")),
+                no_secrets: true,
+                plaintext: true,
+                passphrase_file: None,
+                passphrase_stdin: false,
+            }
+        );
+        assert_eq!(
+            parse_argv(&["export", "--passphrase-file", "pass.txt"]).unwrap(),
+            Command::Export {
+                path: None,
+                no_secrets: false,
+                plaintext: false,
+                passphrase_file: Some(PathBuf::from("pass.txt")),
+                passphrase_stdin: false,
+            }
+        );
+    }
+
+    #[test]
+    fn import_requires_a_path_and_carries_its_flags() {
+        assert_eq!(
+            parse_argv(&["import", "art.json", "--overwrite"]).unwrap(),
+            Command::Import {
+                path: PathBuf::from("art.json"),
+                overwrite: true,
+                passphrase_file: None,
+                passphrase_stdin: false,
+            }
+        );
+        // Behavior preserved from the prior dispatch: a missing PATH is a hard error.
+        assert!(matches!(
+            parse_argv(&["import", "--overwrite"]).unwrap_err(),
+            Error::MigrationImportPathRequired
+        ));
+    }
+
+    #[test]
+    fn a_usage_error_points_at_the_right_help_and_leaks_no_secret() {
+        // AC1: every strict-usage error carries a usage hint (the exact `--help` to run)…
+        let use_err = parse_argv(&["use", "--forc", "spare"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            use_err.contains("run `sessiometer use --help` for usage"),
+            "got: {use_err}"
+        );
+        // …and #15: it names only the offending flag, never a token or email.
+        let messages = [
+            parse_argv(&["use", "spare", "--forc"])
+                .unwrap_err()
+                .to_string(),
+            parse_argv(&["status", "--josn"]).unwrap_err().to_string(),
+            parse_argv(&["stats", "--period"]).unwrap_err().to_string(),
+            parse_argv(&["--bogus"]).unwrap_err().to_string(),
+        ];
+        for message in messages {
+            assert!(!message.contains('@'), "no email: {message}");
+            assert!(
+                !message.to_lowercase().contains("token"),
+                "no token: {message}"
+            );
+        }
     }
 }
