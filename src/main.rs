@@ -9,6 +9,7 @@
 //! of each subsystem is filled in by later work items (see the module docs and
 //! the `0.1.0` milestone issues).
 
+mod active;
 mod capture;
 mod claude_state;
 mod cli;

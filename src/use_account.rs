@@ -49,7 +49,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::claude_state;
+use crate::active;
 use crate::config::{Account, Config};
 use crate::daemon::{AccountStatusLine, RealRosterPoller, RosterPoller, StatusResponse};
 use crate::error::{Error, Result};
@@ -522,20 +522,31 @@ where
     let target = &config.roster[resolve_target(&config.roster, query)?];
     let target_label = target.label.clone();
 
-    // 2. Identify the active (outgoing) account: the swap re-stashes it, so its
-    //    roster identity MUST be known (mirrors the daemon's "can't identify active
-    //    ⇒ don't swap"). Its displayed identity is Claude Code's `oauthAccount`.
-    let active_uuid = claude_state::read_oauth_account_from(seams.claude_json)
-        .ok()
-        .map(|oauth| oauth.account_uuid().to_owned());
-    let active = active_uuid
-        .as_deref()
-        .and_then(|uuid| {
-            config
-                .roster
-                .iter()
-                .find(|account| account.account_uuid == uuid)
-        })
+    // 2. Identify the active (outgoing) account TOKEN-FIRST, mirroring the daemon
+    //    (issue #207). The swap re-stashes the outgoing account, so its roster
+    //    identity MUST be known — but the CANONICAL keychain token is the
+    //    authoritative bearer, whereas `~/.claude.json`'s `oauthAccount` is only the
+    //    clobberable display half Claude Code clears out-of-band on a forced logout.
+    //    Resolving from the display alone made `use` (the recovery verb) hard-fail
+    //    `ActiveAccountUnresolved` exactly when an operator needed to swap AWAY from a
+    //    logged-out account. Read the canonical and resolve token→stash, then the
+    //    display fallback, via the shared resolver both this verb and the daemon use,
+    //    so a cleared display still recovers as long as a healthy token matches a
+    //    stash. SAFETY is never bypassed: a LOCKED keychain aborts here with the
+    //    locked exit code and ZERO writes (the swap never runs) — never swallowed to
+    //    `ActiveAccountUnresolved`.
+    let active_idx = match seams.store.read().await {
+        Ok(canonical) => {
+            active::resolve_account_for(&config.roster, seams.stash, seams.claude_json, &canonical)
+                .await
+        }
+        Err(err @ Error::KeychainLocked { .. }) => return Err(err),
+        // Canonical unreadable for a non-lock reason (not-found / transient): degrade
+        // to the display-only signal, the daemon's same fallback.
+        Err(_) => active::resolve_via_display(&config.roster, seams.claude_json),
+    };
+    let active = active_idx
+        .map(|idx| &config.roster[idx])
         .ok_or(Error::ActiveAccountUnresolved)?;
     let active_stash = active.stash();
     let active_label = active.label.clone();
@@ -585,7 +596,11 @@ where
         {
             GateOutcome::Proceed(swap_target) => (swap_target, SwapReason::Manual),
             GateOutcome::AlreadyActive => {
-                // No-op success: already active, nothing to write.
+                // No-op success: already active, nothing to write. If token-first
+                // resolution (issue #207) reached here past a CLEARED `~/.claude.json`
+                // (target == the token-resolved active), the stale display is left
+                // unhealed on purpose — this no-op writes nothing; the daemon's
+                // next reconcile, or an explicit `use --force`, repairs the display.
                 println!("{}", already_active_confirmation(&target_label));
                 return Ok(());
             }
@@ -1668,10 +1683,15 @@ mod tests {
 
     #[tokio::test]
     async fn unresolvable_active_account_aborts_before_swapping() {
-        // claude.json shows an account NOT in the roster → the outgoing account is
-        // unknown, so the swap (which re-stashes it) cannot run. ZERO writes.
+        // Fail-closed (issue #207, token-first): the canonical token matches NO stash
+        // AND ~/.claude.json names an account not in the roster → the outgoing account
+        // is genuinely unknown, so the swap (which re-stashes it) cannot run. ZERO
+        // writes.
         let config = config_ab();
         let (store, stash) = seeded_store_and_stash().await;
+        // Overwrite the canonical with an ORPHAN token no stash holds, so neither the
+        // token match nor the (unresolvable u-UNKNOWN) display resolves the active.
+        store.write(&cred(b"ORPHAN-token")).await.unwrap();
         let (_json_dir, json) = claude_json_for("u-UNKNOWN");
         let log_dir = tempfile::tempdir().unwrap();
         let mut log = EventLog::at(&log_dir.path().join("sessiometer.log")).unwrap();
@@ -1711,6 +1731,116 @@ mod tests {
             matches!(result, Err(Error::ActiveAccountUnresolved)),
             "got {result:?}"
         );
+        assert_eq!(canonical(&store).await, b"ORPHAN-token", "ZERO writes");
+    }
+
+    // --- acceptance: token-first active resolution (issue #207) --------------
+
+    /// Run `run_use` over a caller-built `store` + `json` path — the #207 tests must
+    /// DIVERGE the canonical token from the display (or lock the store), which the
+    /// `u-A`-pinned `run` helper cannot express. Returns the result and the log text.
+    async fn run_use_over(
+        store: &FakeCredentialStore,
+        stash: &FakeAccountStash,
+        json: &Path,
+        query: &str,
+        force: bool,
+        probe: Probe,
+    ) -> (Result<()>, String) {
+        let config = config_ab();
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let poller = FakePoller::new(probe);
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
+        let cache = FakeCache::miss();
+        let result = run_use(
+            &config,
+            query,
+            force,
+            false,
+            Seams {
+                cache: &cache,
+                poller: &poller,
+                store,
+                stash,
+                claude_json: json,
+                lock_path: &lock_path,
+                notifier: &notifier,
+            },
+            &mut log,
+        )
+        .await;
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        (result, log_text)
+    }
+
+    #[tokio::test]
+    async fn token_match_recovers_a_swap_when_the_display_is_cleared() {
+        // The #207 fix: ~/.claude.json's oauthAccount is STALE (names an account not
+        // in the roster — the out-of-band "forced logout" clobber), but the canonical
+        // token still byte-matches work's (u-A) stash. `use spare` must resolve the
+        // outgoing account TOKEN-FIRST and swap — where the old display-only
+        // resolution hard-failed `ActiveAccountUnresolved` ("can't recover").
+        let (store, stash) = seeded_store_and_stash().await; // canonical = A-token
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN"); // display cleared/stale
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            false,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "token-first resolution recovers the swap: {result:?}"
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "the swap rerouted the canonical to spare (u-B)"
+        );
+        assert!(
+            log.contains("event=swap from=work to=spare reason=manual"),
+            "outgoing resolved token-first to work: {log}"
+        );
+        // Self-heal: the swap's co-write repaired the cleared display to the incoming
+        // account (u-B), so the display and canonical agree again.
+        let healed = crate::claude_state::read_oauth_account_from(&json).unwrap();
+        assert_eq!(
+            healed.account_uuid(),
+            "u-B",
+            "the cleared display was healed to the incoming account"
+        );
+    }
+
+    #[tokio::test]
+    async fn keychain_locked_on_active_resolution_aborts_with_zero_writes() {
+        // SAFETY (issue #207): token-first resolution reads the canonical, so a LOCKED
+        // keychain must abort with the locked exit code (4) and ZERO writes — never
+        // swallowed to `ActiveAccountUnresolved`, and never a swap.
+        let (store, stash) = seeded_store_and_stash().await;
+        store.set_locked(true);
+        let (_json_dir, json) = claude_json_for("u-A");
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            false,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        let err = result.expect_err("a locked keychain must abort");
+        assert!(matches!(err, Error::KeychainLocked { .. }), "got {err:?}");
+        assert_eq!(err.exit_code(), 4, "the locked exit code");
+        assert!(!log.contains("event=swap"), "no swap logged: {log}");
+        // Unlock and confirm ZERO writes: the canonical still holds work's token.
+        store.set_locked(false);
         assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
     }
 
