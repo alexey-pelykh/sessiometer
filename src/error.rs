@@ -330,7 +330,8 @@ pub(crate) enum Error {
     /// never swallowed to this. ZERO writes. Secret-free.
     #[error(
         "cannot determine the active account to swap away from \
-         (no logged-in account matches the roster — run `sessiometer list`)"
+         (no logged-in account matches the roster — run `sessiometer login` \
+         to re-authenticate and add it to the rotation)"
     )]
     ActiveAccountUnresolved,
 
@@ -722,6 +723,24 @@ mod tests {
                 "no token: {message}"
             );
         }
+    }
+
+    #[test]
+    fn active_account_unresolved_names_an_actionable_recovery_not_a_viewer() {
+        // Issue #210: when `use` cannot identify the active account to swap away from,
+        // the message must point the operator at a REAL recovery next step —
+        // `sessiometer login` re-authenticates and lands the account in the rotation —
+        // NOT the read-only `sessiometer list` viewer, which fixes nothing precisely
+        // when the ACTIVE account is the one missing from the roster.
+        let message = Error::ActiveAccountUnresolved.to_string();
+        assert!(
+            message.contains("sessiometer login"),
+            "must name the actionable recovery verb: {message}"
+        );
+        assert!(
+            !message.contains("sessiometer list"),
+            "must not point at the read-only viewer: {message}"
+        );
     }
 
     #[test]
