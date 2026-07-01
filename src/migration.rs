@@ -74,7 +74,15 @@
 // (main.rs only declares the module), exactly as main.rs frames every subsystem.
 #![allow(dead_code)]
 
+use std::io::BufRead;
+use std::path::Path;
+
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::aead::rand_core::RngCore;
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload as AeadPayload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -359,6 +367,365 @@ fn redact(err: serde_json::Error) -> Error {
     Error::MigrationMalformed {
         line: err.line(),
         column: err.column(),
+    }
+}
+
+// --- Encryption envelope (issue #147) -------------------------------------------
+//
+// The optional passphrase-encryption layer over the artifact body. The container
+// above defines the `encrypted` flag and the KDF / cipher parameter slots; this
+// section FILLS them: derive a key from a passphrase with Argon2id, encrypt the
+// serialized payload with XChaCha20-Poly1305 (an AEAD), and bind the header as
+// associated data so any tamper or downgrade fails closed. No home-rolled crypto —
+// only the container framing is ours; the primitives are the RustCrypto `argon2` and
+// `chacha20poly1305` crates, used as documented.
+//
+// This is the crypto LAYER only: it adds no CLI verbs (the export / import commands
+// are later work items). It provides the reusable primitives those commands consume —
+// `MigrationArtifact::{encrypt, decrypt}`, passphrase acquisition, and the plaintext
+// opt-out warning.
+
+/// XChaCha20-Poly1305 key length (256-bit).
+const KEY_LEN: usize = 32;
+/// XChaCha20 nonce length (192-bit — the "X" extended nonce, wide enough to generate
+/// at random per artifact without a birthday-bound collision worry).
+const NONCE_LEN: usize = 24;
+/// Argon2id salt length (128-bit), generated fresh per artifact.
+const SALT_LEN: usize = 16;
+
+/// KDF identifier written into (and required on read from) an encrypted header.
+const KDF_ARGON2ID: &str = "argon2id";
+/// Cipher identifier written into (and required on read from) an encrypted header.
+const CIPHER_XCHACHA20POLY1305: &str = "xchacha20poly1305";
+
+/// Argon2id cost used when WRITING a new artifact: ~64 MiB, 3 passes, single lane.
+/// Recorded in the header ([`KdfParams`]) so a future cost change still reads old
+/// files — a decrypt derives with the cost the *file* carries, never these. The lane
+/// count is 1 deliberately: the `argon2` crate derives single-threaded unless its
+/// rayon-backed `parallel` feature is enabled, which we avoid to keep the dependency
+/// surface minimal — a higher lane count would only add cost without the intended
+/// parallel defense.
+const ARGON2_MEMORY_KIB: u32 = 65_536;
+const ARGON2_ITERATIONS: u32 = 3;
+const ARGON2_PARALLELISM: u32 = 1;
+
+/// The warning a `--plaintext` (unencrypted) export must print: the artifact then
+/// holds usable, restorable account credentials in the clear. The export command (a
+/// later work item) prints it; the wording lives here so the crypto layer owns it.
+pub(crate) const PLAINTEXT_WARNING: &str =
+    "WARNING: this migration artifact is UNENCRYPTED — it contains usable Claude Code \
+     account credentials in the clear. Anyone who can read the file can restore your \
+     accounts. Store it like a password and delete it as soon as the import is done.";
+
+impl Header {
+    /// The header, serialized, used as the AEAD **associated data** so the whole
+    /// header — version, `encrypted` flag, and KDF + cipher parameters — is
+    /// authenticated alongside the ciphertext: any tamper or downgrade of a header
+    /// field changes these bytes and the Poly1305 tag no longer verifies, so
+    /// decryption fails closed.
+    ///
+    /// Computed identically on encrypt (from the header just built) and decrypt (from
+    /// the header just parsed). serde's struct serialization is deterministic here —
+    /// fixed field order, no maps or floats, and an encrypted header always carries
+    /// both parameter blocks (nothing is skipped) — so equal headers yield identical
+    /// bytes on both sides.
+    fn associated_data(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("serializing a header cannot fail")
+    }
+}
+
+impl MigrationArtifact {
+    /// Encrypt `payload` under `passphrase` into a version-current ENCRYPTED artifact.
+    ///
+    /// Derives a key with Argon2id (fresh 128-bit salt), encrypts the serialized
+    /// payload with XChaCha20-Poly1305 (fresh 192-bit nonce) binding the header as
+    /// associated data, and records the KDF + cipher parameters in the header so the
+    /// file is self-describing for [`decrypt`](Self::decrypt). Uses the production
+    /// Argon2id cost ([`ARGON2_MEMORY_KIB`] / [`ARGON2_ITERATIONS`] /
+    /// [`ARGON2_PARALLELISM`]).
+    pub(crate) fn encrypt(payload: &Payload, passphrase: &Passphrase) -> Result<Self> {
+        Self::encrypt_with(
+            payload,
+            passphrase,
+            ARGON2_MEMORY_KIB,
+            ARGON2_ITERATIONS,
+            ARGON2_PARALLELISM,
+        )
+    }
+
+    /// [`encrypt`](Self::encrypt) with explicit Argon2id cost parameters. Split out so
+    /// tests can derive at a trivial cost; the parameters are recorded in the header
+    /// either way, so a low-cost artifact still round-trips through
+    /// [`decrypt`](Self::decrypt).
+    fn encrypt_with(
+        payload: &Payload,
+        passphrase: &Passphrase,
+        memory_kib: u32,
+        iterations: u32,
+        parallelism: u32,
+    ) -> Result<Self> {
+        // Fresh per-artifact salt and nonce from the OS CSPRNG.
+        let mut salt = vec![0u8; SALT_LEN];
+        OsRng.fill_bytes(&mut salt);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        // Build the header FIRST (with the salt/nonce/cost it will carry) so it can be
+        // bound as associated data below — the ciphertext authenticates the exact
+        // header stored beside it.
+        let header = Header {
+            format_version: FORMAT_VERSION,
+            encrypted: true,
+            kdf: Some(KdfParams {
+                algorithm: KDF_ARGON2ID.to_owned(),
+                salt,
+                memory_kib,
+                iterations,
+                parallelism,
+            }),
+            cipher: Some(CipherParams {
+                algorithm: CIPHER_XCHACHA20POLY1305.to_owned(),
+                nonce: nonce.to_vec(),
+            }),
+        };
+
+        let key = derive_key(passphrase, header.kdf.as_ref().expect("kdf set above"))?;
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
+            .expect("a derived key is exactly the cipher key length");
+
+        // Serialize the payload (secret) and encrypt it, authenticating the header.
+        let mut plaintext =
+            Zeroizing::new(serde_json::to_vec(payload).expect("serializing a payload cannot fail"));
+        let aad = header.associated_data();
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                AeadPayload {
+                    msg: &plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::MigrationEncryptFailed)?;
+        plaintext.zeroize(); // also cleared on drop; explicit to shorten its lifetime.
+
+        Ok(Self {
+            magic: MAGIC.to_owned(),
+            header,
+            body: Body::Ciphertext(ciphertext),
+        })
+    }
+
+    /// Decrypt an ENCRYPTED artifact under `passphrase`, returning its [`Payload`].
+    ///
+    /// Fails CLOSED: a wrong passphrase, a tampered / downgraded header, or a tampered
+    /// / truncated body all make the AEAD tag verification fail, returning
+    /// [`Error::MigrationDecryptFailed`] with ZERO plaintext produced. A non-encrypted
+    /// artifact, an unknown algorithm, or malformed parameters return
+    /// [`Error::MigrationCryptoParams`] before any key derivation. The decrypted buffer
+    /// is held in a zeroized-on-drop wrapper.
+    pub(crate) fn decrypt(&self, passphrase: &Passphrase) -> Result<Payload> {
+        let (kdf, cipher_params, ciphertext) =
+            match (&self.header.kdf, &self.header.cipher, &self.body) {
+                (Some(kdf), Some(cipher_params), Body::Ciphertext(ciphertext)) => {
+                    (kdf, cipher_params, ciphertext)
+                }
+                _ => {
+                    return Err(Error::MigrationCryptoParams(
+                        "the artifact is not encrypted",
+                    ))
+                }
+            };
+        if cipher_params.algorithm != CIPHER_XCHACHA20POLY1305 {
+            return Err(Error::MigrationCryptoParams("unsupported cipher algorithm"));
+        }
+        if cipher_params.nonce.len() != NONCE_LEN {
+            return Err(Error::MigrationCryptoParams("wrong cipher nonce length"));
+        }
+
+        let key = derive_key(passphrase, kdf)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(key.as_slice())
+            .expect("a derived key is exactly the cipher key length");
+        let nonce = XNonce::from_slice(&cipher_params.nonce);
+        let aad = self.header.associated_data();
+
+        // The AEAD verifies the tag BEFORE yielding any bytes; on failure it returns
+        // Err and no plaintext is produced (fail-closed). Hold the decrypted bytes in
+        // a zeroized-on-drop buffer so they are wiped after deserialization.
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(
+                    nonce,
+                    AeadPayload {
+                        msg: ciphertext,
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| Error::MigrationDecryptFailed)?,
+        );
+        // A parse failure is redacted to a position (never bytes), mirroring
+        // [`MigrationArtifact::from_bytes`].
+        serde_json::from_slice::<Payload>(&plaintext).map_err(redact)
+    }
+}
+
+/// Derive the XChaCha20-Poly1305 key from `passphrase` and the header's KDF
+/// parameters with Argon2id. The parameters come from the artifact (not hardcoded),
+/// so an old file derives with the cost it was written with. Returns a
+/// zeroized-on-drop key buffer. Fails with [`Error::MigrationCryptoParams`] for an
+/// unrecognized algorithm or out-of-range cost.
+fn derive_key(passphrase: &Passphrase, kdf: &KdfParams) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    if kdf.algorithm != KDF_ARGON2ID {
+        return Err(Error::MigrationCryptoParams(
+            "unsupported key-derivation algorithm",
+        ));
+    }
+    // The cost parameters come from a potentially UNTRUSTED artifact and are consumed
+    // to derive the key BEFORE the AEAD tag can be checked — so an oversized cost would
+    // hang (huge memory + CPU) or, worse, ABORT the process: `argon2`'s memory block is
+    // an infallible `vec!` that panics-to-abort on OOM, never a fail-closed error, and
+    // `Params::new` itself imposes no upper bound (its max is `u32::MAX`). Reject abusive
+    // values up front. The ceilings sit well above the production cost
+    // ([`ARGON2_MEMORY_KIB`] / [`ARGON2_ITERATIONS`] / [`ARGON2_PARALLELISM`]) so a
+    // legitimate artifact — including a future one written with a raised cost — still
+    // decrypts, yet far below a denial-of-service. A safety guard bounding the work, NOT
+    // a format constraint (the parameters still travel in the file per #146).
+    const MAX_MEMORY_KIB: u32 = 1 << 20; // 1 GiB — 16× the 64 MiB production cost.
+    const MAX_ITERATIONS: u32 = 16; // ~5× the production 3 passes.
+    const MAX_PARALLELISM: u32 = 8; // production is 1 (derivation is single-threaded).
+    if kdf.memory_kib > MAX_MEMORY_KIB
+        || kdf.iterations > MAX_ITERATIONS
+        || kdf.parallelism > MAX_PARALLELISM
+    {
+        return Err(Error::MigrationCryptoParams(
+            "Argon2 cost parameters out of range",
+        ));
+    }
+    let params = Params::new(
+        kdf.memory_kib,
+        kdf.iterations,
+        kdf.parallelism,
+        Some(KEY_LEN),
+    )
+    .map_err(|_| Error::MigrationCryptoParams("invalid Argon2 parameters"))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    argon
+        .hash_password_into(passphrase.as_bytes(), &kdf.salt, key.as_mut_slice())
+        .map_err(|_| Error::MigrationCryptoParams("key derivation failed"))?;
+    Ok(key)
+}
+
+/// A validated, non-empty passphrase held in a zeroized-on-drop buffer.
+///
+/// Every constructor funnels through [`Passphrase::new`], which rejects an EMPTY
+/// passphrase as a hard error ([`Error::MigrationEmptyPassphrase`]): encrypt mode must
+/// never silently fall back to plaintext or "encrypt" under an empty key. The input
+/// paths ([`from_file`](Self::from_file) / [`from_stdin`](Self::from_stdin) /
+/// [`prompt`](Self::prompt)) exist so a passphrase is NEVER passed as a command-line
+/// argument. No `Debug`: the bytes are secret.
+pub(crate) struct Passphrase(Zeroizing<Vec<u8>>);
+
+impl Passphrase {
+    /// Wrap raw passphrase bytes; an EMPTY passphrase is refused.
+    fn new(bytes: Zeroizing<Vec<u8>>) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(Error::MigrationEmptyPassphrase);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// The passphrase bytes, for key derivation.
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Read a passphrase from a file's first line (a trailing newline is stripped) —
+    /// the `--passphrase-file <path>` input path.
+    pub(crate) fn from_file(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::from_first_line(&mut std::io::BufReader::new(file))
+    }
+
+    /// Read a passphrase from standard input's first line (trailing newline stripped).
+    pub(crate) fn from_stdin() -> Result<Self> {
+        Self::from_first_line(&mut std::io::stdin().lock())
+    }
+
+    /// Prompt on the controlling terminal with echo disabled, and read one line.
+    pub(crate) fn prompt(prompt: &str) -> Result<Self> {
+        read_interactive_passphrase(prompt)
+    }
+
+    /// Shared core: read the first line, strip a trailing `\n` (and a preceding `\r`),
+    /// and reject empty. Generic over the reader so the file / stdin / terminal paths
+    /// share one parse-and-validate step that the tests can exercise directly.
+    fn from_first_line<R: BufRead>(reader: &mut R) -> Result<Self> {
+        let mut line = Zeroizing::new(Vec::new());
+        reader.read_until(b'\n', &mut line)?;
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+        }
+        Self::new(line)
+    }
+}
+
+/// Read a passphrase from the controlling terminal with echo disabled.
+///
+/// Opens `/dev/tty` directly — so a redirected stdin/stdout cannot defeat the no-echo
+/// prompt — clears the `ECHO` termios flag for the read, and ALWAYS restores the
+/// previous terminal state (a drop guard restores even on early return or panic).
+/// macOS, matching the crate.
+fn read_interactive_passphrase(prompt: &str) -> Result<Passphrase> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
+    let fd = tty.as_raw_fd();
+
+    // Snapshot the terminal attributes. SAFETY: `termios` is plain-old-data that
+    // `tcgetattr` fully initializes; `fd` is a live descriptor owned by `tty`.
+    let mut attrs: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut attrs) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    // Clear ECHO for the read; arm the restore guard BEFORE changing the terminal.
+    let mut quiet = attrs;
+    quiet.c_lflag &= !libc::ECHO;
+    let _restore = TermiosRestore { fd, attrs };
+    // SAFETY: same live `fd`; `quiet` is a copy of the just-read attributes with one
+    // flag cleared. TCSAFLUSH applies after pending output drains and discards pending
+    // input, so nothing typed before the prompt leaks into the read.
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut out = &tty;
+    write!(out, "{prompt}")?;
+    out.flush()?;
+    let passphrase = Passphrase::from_first_line(&mut std::io::BufReader::new(&tty));
+    // The suppressed Enter left the cursor on the prompt line; advance it.
+    let _ = writeln!(out);
+    passphrase
+}
+
+/// Restores terminal attributes when dropped, re-enabling `ECHO` even if the
+/// passphrase read errored or panicked.
+struct TermiosRestore {
+    fd: std::os::fd::RawFd,
+    attrs: libc::termios,
+}
+
+impl Drop for TermiosRestore {
+    fn drop(&mut self) {
+        // SAFETY: `fd` is the same live descriptor; `attrs` is the snapshot taken
+        // before the terminal was modified. Best-effort — nothing to do on failure.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.attrs) };
     }
 }
 
@@ -695,5 +1062,434 @@ mod tests {
         assert_eq!(hex_bytes::decode("6X"), None, "one bad digit rejected");
         // Uppercase decodes (case-insensitive), matching the keychain stash codec.
         assert_eq!(hex_bytes::decode("4A").as_deref(), Some(b"\x4a".as_slice()));
+    }
+
+    // --- Encryption envelope (issue #147) ------------------------------------
+    //
+    // Hermetic crypto tests. Argon2id at the production cost is ~64 MiB × 3, so the
+    // round-trip / tamper cases derive at a TRIVIAL cost (recorded in the header, so
+    // the low-cost artifact still round-trips); one dedicated test exercises the real
+    // production cost and asserts the recorded parameters.
+
+    /// Trivial Argon2id cost for fast tests (the minimum: m = 8 KiB, t = 1, p = 1).
+    const TEST_M: u32 = 8;
+    const TEST_T: u32 = 1;
+    const TEST_P: u32 = 1;
+
+    /// A non-empty test passphrase.
+    fn test_passphrase(s: &str) -> Passphrase {
+        Passphrase::new(Zeroizing::new(s.as_bytes().to_vec())).expect("non-empty passphrase")
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips_the_payload_and_hides_it() {
+        // AC: encrypt→decrypt round-trip. Encrypt, then prove the artifact survives a
+        // full on-disk round-trip (to_bytes/from_bytes, incl. `validate`) and decrypts
+        // back to the ORIGINAL payload with the same passphrase.
+        let payload = sample_payload();
+        let pass = test_passphrase("correct horse battery staple");
+
+        let artifact =
+            MigrationArtifact::encrypt_with(&payload, &pass, TEST_M, TEST_T, TEST_P).unwrap();
+        assert!(
+            artifact.header.encrypted,
+            "an encrypted artifact must say so"
+        );
+
+        let on_disk = artifact.to_bytes();
+        let restored = MigrationArtifact::from_bytes(&on_disk).unwrap();
+        let decrypted = restored.decrypt(&pass).unwrap();
+        assert!(
+            decrypted == payload,
+            "decrypted payload must equal the original"
+        );
+
+        // The plaintext genuinely is NOT in the artifact bytes — the body is opaque
+        // ciphertext, not the payload in the clear.
+        let text = String::from_utf8_lossy(&on_disk);
+        assert!(
+            !text.contains("sk-ant-oat-EXAMPLE"),
+            "a bearer token leaked"
+        );
+        assert!(
+            !text.contains("poll_secs"),
+            "the config leaked in the clear"
+        );
+        assert!(!text.contains("config_toml"), "a payload field name leaked");
+    }
+
+    #[test]
+    fn a_wrong_passphrase_fails_authentication_with_zero_plaintext() {
+        // AC: wrong passphrase → authentication fails → clear error, ZERO plaintext.
+        // The `Err` arm returns no `Payload` at all.
+        let artifact = MigrationArtifact::encrypt_with(
+            &sample_payload(),
+            &test_passphrase("right"),
+            TEST_M,
+            TEST_T,
+            TEST_P,
+        )
+        .unwrap();
+        let restored = MigrationArtifact::from_bytes(&artifact.to_bytes()).unwrap();
+        match restored.decrypt(&test_passphrase("wrong")) {
+            Err(Error::MigrationDecryptFailed) => {}
+            Err(other) => panic!("expected MigrationDecryptFailed, got {other:?}"),
+            Ok(_) => panic!("a wrong passphrase must never decrypt"),
+        }
+    }
+
+    #[test]
+    fn a_tampered_ciphertext_fails_closed() {
+        // AC: a tampered file → authentication fails. Flip one nibble of the ciphertext
+        // body; even the CORRECT passphrase must not decrypt it.
+        let artifact = MigrationArtifact::encrypt_with(
+            &sample_payload(),
+            &test_passphrase("pw"),
+            TEST_M,
+            TEST_T,
+            TEST_P,
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&artifact.to_bytes()).unwrap();
+        let ct = value["body"]["data"].as_str().unwrap().to_owned();
+        let mut chars: Vec<char> = ct.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        value["body"]["data"] = serde_json::Value::String(chars.into_iter().collect());
+        let tampered = serde_json::to_vec(&value).unwrap();
+
+        let restored = MigrationArtifact::from_bytes(&tampered).unwrap();
+        assert!(matches!(
+            restored.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationDecryptFailed)
+        ));
+    }
+
+    #[test]
+    fn a_downgraded_header_fails_closed() {
+        // AC: a downgraded file fails closed. The header is bound as AAD, so silently
+        // weakening a KDF cost parameter (iterations 2 → 1) invalidates the tag: even
+        // the CORRECT passphrase cannot decrypt the altered header.
+        let artifact = MigrationArtifact::encrypt_with(
+            &sample_payload(),
+            &test_passphrase("pw"),
+            16,
+            2,
+            TEST_P,
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&artifact.to_bytes()).unwrap();
+        value["header"]["kdf"]["iterations"] = serde_json::json!(1);
+        let tampered = serde_json::to_vec(&value).unwrap();
+
+        let restored = MigrationArtifact::from_bytes(&tampered).unwrap();
+        assert!(matches!(
+            restored.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationDecryptFailed)
+        ));
+    }
+
+    #[test]
+    fn the_associated_data_binds_every_header_field() {
+        // The mechanism behind downgrade-resistance: the AAD (authenticated by the
+        // tag) changes when ANY header field changes — so the WHOLE header is bound,
+        // not just coincidentally protected by key derivation.
+        let base = Header {
+            format_version: FORMAT_VERSION,
+            encrypted: true,
+            kdf: Some(KdfParams {
+                algorithm: KDF_ARGON2ID.to_owned(),
+                salt: vec![1, 2, 3, 4],
+                memory_kib: 8,
+                iterations: 1,
+                parallelism: 1,
+            }),
+            cipher: Some(CipherParams {
+                algorithm: CIPHER_XCHACHA20POLY1305.to_owned(),
+                nonce: vec![0; NONCE_LEN],
+            }),
+        };
+        let base_aad = base.associated_data();
+
+        let mut m = base.clone();
+        m.encrypted = false;
+        assert_ne!(m.associated_data(), base_aad, "`encrypted` flag not bound");
+
+        let mut m = base.clone();
+        m.kdf.as_mut().unwrap().memory_kib = 16;
+        assert_ne!(m.associated_data(), base_aad, "memory_kib not bound");
+
+        let mut m = base.clone();
+        m.kdf.as_mut().unwrap().iterations = 2;
+        assert_ne!(m.associated_data(), base_aad, "iterations not bound");
+
+        let mut m = base.clone();
+        m.kdf.as_mut().unwrap().salt = vec![9, 9, 9, 9];
+        assert_ne!(m.associated_data(), base_aad, "salt not bound");
+
+        let mut m = base.clone();
+        m.cipher.as_mut().unwrap().nonce = vec![7; NONCE_LEN];
+        assert_ne!(m.associated_data(), base_aad, "nonce not bound");
+
+        // The untouched clone reproduces the exact AAD — determinism both sides rely on.
+        assert_eq!(base.clone().associated_data(), base_aad);
+    }
+
+    #[test]
+    fn a_truncated_ciphertext_fails_closed() {
+        // AC: a truncated file → authentication fails. Drop the trailing 32 hex chars
+        // (≥ the 16-byte Poly1305 tag); the shortened body must not decrypt.
+        let artifact = MigrationArtifact::encrypt_with(
+            &sample_payload(),
+            &test_passphrase("pw"),
+            TEST_M,
+            TEST_T,
+            TEST_P,
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&artifact.to_bytes()).unwrap();
+        let ct = value["body"]["data"].as_str().unwrap();
+        let truncated = ct[..ct.len().saturating_sub(32)].to_owned();
+        value["body"]["data"] = serde_json::Value::String(truncated);
+        let tampered = serde_json::to_vec(&value).unwrap();
+
+        let restored = MigrationArtifact::from_bytes(&tampered).unwrap();
+        assert!(matches!(
+            restored.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationDecryptFailed)
+        ));
+    }
+
+    #[test]
+    fn an_empty_passphrase_is_a_hard_error() {
+        // AC: an empty passphrase in encrypt mode is a HARD error — never a silent
+        // plaintext fall-back, never an empty key. The check lives in the one
+        // constructor every input path funnels through.
+        assert!(matches!(
+            Passphrase::new(Zeroizing::new(Vec::new())),
+            Err(Error::MigrationEmptyPassphrase)
+        ));
+        // A bare newline (an empty first line) is refused.
+        assert!(matches!(
+            Passphrase::from_first_line(&mut b"\n".as_slice()),
+            Err(Error::MigrationEmptyPassphrase)
+        ));
+        // Empty input (immediate EOF) is refused.
+        assert!(matches!(
+            Passphrase::from_first_line(&mut b"".as_slice()),
+            Err(Error::MigrationEmptyPassphrase)
+        ));
+    }
+
+    #[test]
+    fn the_plaintext_opt_out_is_unencrypted_with_a_prominent_warning() {
+        // AC: `--plaintext` → an unencrypted artifact (encrypted:false) + a prominent
+        // warning that the file holds usable credentials.
+        let artifact = MigrationArtifact::plaintext(sample_payload());
+        assert!(
+            !artifact.header.encrypted,
+            "the --plaintext path is encrypted:false"
+        );
+        // Decrypting a plaintext artifact is a clean typed error — no crypto attempted.
+        assert!(matches!(
+            artifact.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationCryptoParams(_))
+        ));
+        // The warning the export command prints names the risk prominently.
+        assert!(
+            PLAINTEXT_WARNING.contains("WARNING"),
+            "warning must be prominent"
+        );
+        let lower = PLAINTEXT_WARNING.to_lowercase();
+        assert!(
+            lower.contains("unencrypted"),
+            "warning must say unencrypted"
+        );
+        assert!(
+            lower.contains("credential"),
+            "warning must name credentials"
+        );
+    }
+
+    #[test]
+    fn passphrase_reading_takes_the_first_line_and_strips_the_newline() {
+        // The shared read path: first line only, trailing LF / CRLF stripped, inner
+        // spaces preserved, EOF-without-newline taken as-is. (The interactive terminal
+        // path funnels through this same core; only its TTY plumbing is untested.)
+        let read = |bytes: &[u8]| {
+            Passphrase::from_first_line(&mut { bytes })
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        };
+        assert_eq!(read(b"hunter2\n"), b"hunter2");
+        assert_eq!(read(b"hunter2\r\n"), b"hunter2");
+        assert_eq!(read(b"hunter2"), b"hunter2");
+        assert_eq!(read(b"two words\n"), b"two words");
+        assert_eq!(
+            read(b"first\nignored"),
+            b"first",
+            "only the first line is taken"
+        );
+    }
+
+    #[test]
+    fn a_passphrase_file_is_read_and_an_empty_file_is_refused() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = dir.path().join("pass");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"filepass\n")
+            .unwrap();
+        assert_eq!(
+            Passphrase::from_file(&path).unwrap().as_bytes(),
+            b"filepass"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::File::create(&empty).unwrap();
+        assert!(matches!(
+            Passphrase::from_file(&empty),
+            Err(Error::MigrationEmptyPassphrase)
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_kdf_or_cipher_algorithm_is_rejected_before_derivation() {
+        // The parameters travel in the file (forward-compat), but an algorithm this
+        // build does not implement is a clean decrypt-time refusal — before any key
+        // derivation, and distinct from an auth failure.
+        let unsupported_kdf = KdfParams {
+            algorithm: "scrypt".to_owned(),
+            salt: vec![0; SALT_LEN],
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let good_cipher = CipherParams {
+            algorithm: CIPHER_XCHACHA20POLY1305.to_owned(),
+            nonce: vec![0; NONCE_LEN],
+        };
+        let artifact = MigrationArtifact::encrypted(vec![0xaa; 48], unsupported_kdf, good_cipher);
+        assert!(matches!(
+            artifact.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationCryptoParams(_))
+        ));
+
+        let good_kdf = KdfParams {
+            algorithm: KDF_ARGON2ID.to_owned(),
+            salt: vec![0; SALT_LEN],
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let unsupported_cipher = CipherParams {
+            algorithm: "aes-256-gcm".to_owned(),
+            nonce: vec![0; NONCE_LEN],
+        };
+        let artifact = MigrationArtifact::encrypted(vec![0xaa; 48], good_kdf, unsupported_cipher);
+        assert!(matches!(
+            artifact.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationCryptoParams(_))
+        ));
+    }
+
+    #[test]
+    fn a_wrong_length_nonce_is_rejected_as_a_crypto_parameter_error() {
+        // A 12-byte nonce (AES-GCM sized, not XChaCha20's 24) is refused as malformed
+        // parameters, not surfaced as an opaque auth failure.
+        let kdf = KdfParams {
+            algorithm: KDF_ARGON2ID.to_owned(),
+            salt: vec![0; SALT_LEN],
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let short_nonce = CipherParams {
+            algorithm: CIPHER_XCHACHA20POLY1305.to_owned(),
+            nonce: vec![0; 12],
+        };
+        let artifact = MigrationArtifact::encrypted(vec![0xaa; 48], kdf, short_nonce);
+        assert!(matches!(
+            artifact.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationCryptoParams(_))
+        ));
+    }
+
+    #[test]
+    fn an_out_of_range_argon2_cost_is_rejected_before_derivation() {
+        // A malicious / corrupt header requesting an abusive Argon2 memory cost is
+        // rejected as a crypto-parameter error BEFORE any derivation — never allowed to
+        // hang or OOM-abort the process on an oversized allocation. The clamp fires
+        // ahead of `Params::new`, so `u32::MAX` (~4 TiB) is never actually allocated.
+        let kdf = KdfParams {
+            algorithm: KDF_ARGON2ID.to_owned(),
+            salt: vec![0; SALT_LEN],
+            memory_kib: u32::MAX,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let cipher = CipherParams {
+            algorithm: CIPHER_XCHACHA20POLY1305.to_owned(),
+            nonce: vec![0; NONCE_LEN],
+        };
+        let artifact = MigrationArtifact::encrypted(vec![0xaa; 48], kdf, cipher);
+        assert!(matches!(
+            artifact.decrypt(&test_passphrase("pw")),
+            Err(Error::MigrationCryptoParams(_))
+        ));
+    }
+
+    #[test]
+    fn each_encryption_uses_a_fresh_salt_and_nonce() {
+        // Same payload + passphrase, but a fresh per-artifact salt and nonce → the
+        // ciphertext never repeats (no deterministic-encryption leak).
+        let pass = test_passphrase("pw");
+        let a = MigrationArtifact::encrypt_with(&sample_payload(), &pass, TEST_M, TEST_T, TEST_P)
+            .unwrap();
+        let b = MigrationArtifact::encrypt_with(&sample_payload(), &pass, TEST_M, TEST_T, TEST_P)
+            .unwrap();
+        assert_ne!(
+            a.header.kdf.as_ref().unwrap().salt,
+            b.header.kdf.as_ref().unwrap().salt,
+            "the salt must be per-artifact"
+        );
+        assert_ne!(
+            a.header.cipher.as_ref().unwrap().nonce,
+            b.header.cipher.as_ref().unwrap().nonce,
+            "the nonce must be per-artifact"
+        );
+        match (&a.body, &b.body) {
+            (Body::Ciphertext(x), Body::Ciphertext(y)) => {
+                assert_ne!(x, y, "the ciphertext must not repeat")
+            }
+            _ => panic!("expected ciphertext bodies"),
+        }
+    }
+
+    #[test]
+    fn encrypt_records_the_production_argon2id_and_cipher_parameters() {
+        // The production `encrypt` path records the chosen Argon2id cost + a 128-bit
+        // salt and names XChaCha20-Poly1305 with a 192-bit nonce, and still round-trips
+        // at the real cost. (The one full-cost derivation in the suite.)
+        let pass = test_passphrase("pw");
+        let artifact = MigrationArtifact::encrypt(&sample_payload(), &pass).unwrap();
+
+        let kdf = artifact.header.kdf.as_ref().unwrap();
+        assert_eq!(kdf.algorithm, KDF_ARGON2ID);
+        assert_eq!(kdf.memory_kib, ARGON2_MEMORY_KIB);
+        assert_eq!(kdf.iterations, ARGON2_ITERATIONS);
+        assert_eq!(kdf.parallelism, ARGON2_PARALLELISM);
+        assert_eq!(kdf.salt.len(), SALT_LEN);
+
+        let cipher = artifact.header.cipher.as_ref().unwrap();
+        assert_eq!(cipher.algorithm, CIPHER_XCHACHA20POLY1305);
+        assert_eq!(cipher.nonce.len(), NONCE_LEN);
+
+        assert!(
+            artifact.decrypt(&pass).unwrap() == sample_payload(),
+            "the production path must round-trip"
+        );
     }
 }
