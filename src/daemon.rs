@@ -560,12 +560,13 @@ pub(crate) struct AccountStatusLine {
     #[serde(default)]
     pub(crate) weekly_exhausted: bool,
     /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `null` until
-    /// the refresh engine has observed this account. An absolute instant (not a relative
-    /// duration, like `session_resets_at`) carried RAW for a consumer (`--json` | `jq`) to
-    /// derive an "expires in" against its own clock; the lean text view projects only the
-    /// rollup glyph, not a clock cell. Non-secret — a timestamp, never the token.
-    /// `#[serde(default)]` per the added-field convention: a pre-#119 daemon that omits it
-    /// decodes to `None`.
+    /// this account has been polled (issue #141) — sourced from the refresh sweep when
+    /// `[refresh]` is on, otherwise from the poll path, so it is populated in the default
+    /// config too. An absolute instant (not a relative duration, like `session_resets_at`)
+    /// carried RAW for a consumer (`--json` | `jq`) to derive an "expires in" against its
+    /// own clock; the lean text view projects only the rollup glyph, not a clock cell.
+    /// Non-secret — a timestamp, never the token. `#[serde(default)]` per the added-field
+    /// convention: a pre-#119 daemon that omits it decodes to `None`.
     #[serde(default)]
     pub(crate) access_expires_at: Option<i64>,
     /// The non-secret refresh-health inputs (issue #119) — last refresh ok? token rotated?
@@ -669,6 +670,16 @@ fn wall_clock_now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Fold an access-token `expiresAt` from CC's native epoch MILLISECONDS to the epoch
+/// SECONDS the credential rollup and the `status` wire speak (issue #141 must-carry: the
+/// blob is ms, the wire/rollup are s — a missed conversion misfires the operator clock by
+/// 1000×). Integer division truncates any sub-second remainder, immaterial for a
+/// token-lifetime clock and matching the refresh fold's `ms / 1000`
+/// ([`Daemon::apply_refresh_observation`]). A pure function so the boundary is unit-tested.
+fn millis_to_secs(ms: i64) -> i64 {
+    ms / 1000
 }
 
 /// The daemon-side 4-state credential-health rollup (issue #119) — a PURE function of one
@@ -955,6 +966,20 @@ struct AccountHealth {
     /// converted at the fold). `None` until the refresh engine has observed this account
     /// (e.g. `[refresh]` is off). The rollup's `Stale` (expired) input + the wire clock.
     access_expires_at: Option<i64>,
+    /// The access-token `expiresAt` as epoch SECONDS observed on the POLL path (issue
+    /// #141) — read from the SAME credential the usage poll used (the canonical item for
+    /// the active account, the per-account stash for any other), converted MS→s at the
+    /// read boundary by [`millis_to_secs`]. `None` until this account has been polled.
+    ///
+    /// DISPLAY-ONLY, and deliberately DISTINCT from [`access_expires_at`](Self::access_expires_at):
+    /// it is the `--json` clock's fallback so `status` surfaces an expiry even with
+    /// `[refresh]` off (the refresh engine, the only prior writer, is off by default), but
+    /// it NEVER feeds [`credential_health`]. Routing an idle account's naturally-lapsed
+    /// stashed expiry into the rollup's `access_expires_at <= now → Stale` branch would
+    /// fire a false-🟠 for every idle account (CC refreshes only its own ACTIVE token); the
+    /// rollup gains a positive-liveness signal and consumes the poll clock under #137. The
+    /// wire prefers the refresh-sourced value and falls back to this (see [`Daemon::snapshot`]).
+    poll_expires_at: Option<i64>,
     /// The last-observed refresh classification (issue #119): drives the rollup's `Dead`
     /// (a cleared refresh token) check and the `--json` `last_ok` projection. `None` until
     /// a refresh has been observed. Stored as the full enum (not the reduced `last_ok`)
@@ -1339,6 +1364,15 @@ where
                 retry_after_floor = signal.retry_after;
             }
             self.state.last_readings[i] = result.ok();
+            // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
+            // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
+            // rollup reads, so `status --json` surfaces the access-token expiry with
+            // `[refresh]` off without firing a false-🟠 Stale for an idle lapsed token (the
+            // rollup's positive-liveness consumption of this clock lands under #137).
+            let poll_expiry = self
+                .read_poll_expires_at(&self.roster[i], active == Some(i))
+                .await;
+            self.state.health[i].poll_expires_at = poll_expiry;
             self.note_polled(i);
         }
 
@@ -2277,6 +2311,29 @@ where
         }
     }
 
+    /// Read the just-polled account's stored access-token expiry (epoch SECONDS, issue
+    /// #141) — the DISPLAY clock the poll path feeds into [`AccountHealth::poll_expires_at`],
+    /// so `status --json` surfaces an expiry even with `[refresh]` off. Reads the SAME
+    /// credential the usage poll used: the CANONICAL item for the active account (its token
+    /// refreshes in place there, the freshest expiry), the per-account STASH otherwise —
+    /// mirroring [`RealRosterPoller::poll`]. Reuses the non-secret
+    /// [`crate::refresh::expires_at`] / [`crate::refresh::stored_expires_at`] extractors
+    /// (only the `i64` is pulled, never the token) and converts MS→s at this boundary. A
+    /// best-effort clock, never a gate: `None` when the credential is unreadable (a locked
+    /// keychain, an absent stash), which just leaves the wire field null this cycle.
+    async fn read_poll_expires_at(&self, account: &Account, active: bool) -> Option<i64> {
+        let expires_at_ms = if active {
+            self.store
+                .read()
+                .await
+                .ok()
+                .and_then(|credential| crate::refresh::expires_at(credential.expose()))
+        } else {
+            crate::refresh::stored_expires_at(&self.stash, &account.stash()).await
+        };
+        expires_at_ms.map(millis_to_secs)
+    }
+
     /// Recompute every account's 4-state credential-health rollup (issue #119) against
     /// `now_secs` and emit one [`Event::CredentialHealth`] per account whose verdict CHANGED
     /// since the last call — the edge-triggered health timeline the issue's AC-3 requires
@@ -2349,8 +2406,12 @@ where
                         // The credential clocks + the daemon-computed 4-state rollup (issue
                         // #119), projected from this account's carried health state. The
                         // rollup is computed HERE (daemon-side) against `now_secs`; the thin
-                        // client just renders the verdict's glyph + the raw clocks.
-                        access_expires_at: health.access_expires_at,
+                        // client just renders the verdict's glyph + the raw clocks. The wire
+                        // clock prefers the refresh-sourced expiry and falls back to the
+                        // poll-sourced one (issue #141) so it is populated with `[refresh]`
+                        // off; the rollup below still reads ONLY the refresh-sourced field,
+                        // so a lapsed idle poll clock never fires a false-🟠 Stale (see #137).
+                        access_expires_at: health.access_expires_at.or(health.poll_expires_at),
                         refresh_health: refresh_health_view(health),
                         health: credential_health(
                             health.quarantined,
@@ -5866,6 +5927,17 @@ mod tests {
     }
 
     #[test]
+    fn millis_to_secs_folds_a_known_expiry_at_the_ms_boundary() {
+        // The blob's `expiresAt` is epoch MILLISECONDS; the wire and rollup are epoch SECONDS
+        // (issue #141 must-carry — a missed fold misfires the operator clock by 1000×). A
+        // known instant folds exactly; a sub-second remainder truncates (immaterial for a
+        // token-lifetime clock) and matches the refresh fold's `ms / 1000`.
+        assert_eq!(millis_to_secs(1_782_777_600_000), 1_782_777_600);
+        assert_eq!(millis_to_secs(1_782_777_600_999), 1_782_777_600);
+        assert_eq!(millis_to_secs(0), 0);
+    }
+
+    #[test]
     fn refresh_health_view_is_none_until_observed_then_reduces_the_outcome() {
         // No refresh observed yet (`[refresh]` off, or not yet swept) → None, so the wire
         // omits the field rather than fabricating a verdict.
@@ -5975,6 +6047,88 @@ mod tests {
             refresh: None,
         });
         assert_eq!(daemon.state.health[1].access_expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn poll_populates_the_display_expiry_clock_without_the_refresh_tick() {
+        // Issue #141: with `[refresh]` OFF (no `RefreshObservation` ever folded — the refresh
+        // engine, the field's only OTHER writer, is off by default), the poll path alone must
+        // surface each polled account's access-token expiry on `status --json`, WITHOUT feeding
+        // the naive `access_expires_at <= now → Stale` rollup branch — that would false-🟠 every
+        // idle account whose stashed token has lapsed (the rollup's positive-liveness
+        // consumption of the poll clock lands under #137).
+
+        // A realistic CC credential: the SECRET token beside the non-secret `expiresAt` (ms).
+        // The active account's CANONICAL item and the per-account STASH carry DIFFERENT
+        // expiries, so the assertions prove the clock is sourced from the SAME credential the
+        // poll used — canonical for the active account, the stash for any other.
+        const TOKEN: &str = "sk-ant-oat-SECRET-must-not-leak";
+        const CANON_MS: i64 = 1_782_777_600_000;
+        const CANON_S: i64 = 1_782_777_600;
+        const STASH_MS: i64 = 1_782_784_800_000;
+        const STASH_S: i64 = 1_782_784_800;
+        let blob = |expires_at_ms: i64| -> Vec<u8> {
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{TOKEN}","expiresAt":{expires_at_ms}}}}}"#
+            )
+            .into_bytes()
+        };
+
+        let canon_blob = blob(CANON_MS);
+        let stash_blob = blob(STASH_MS);
+        let roster = vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "backup"),
+        ];
+        let store = store_holding(&canon_blob).await; // canonical = the active account's bearer
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", &stash_blob, "u-A"),
+            ("Sessiometer/u-B", &stash_blob, "u-B"),
+            ("Sessiometer/u-C", &stash_blob, "u-C"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // Tick 1 polls the ACTIVE account (u-A) → its expiry is read from the CANONICAL item…
+        daemon.tick().await;
+        assert_eq!(daemon.state.health[0].poll_expires_at, Some(CANON_S));
+        // …while the refresh-sourced field the rollup actually reads stays untouched: with
+        // `[refresh]` off it is still `None`, so no lapsed poll clock can reach the Stale branch.
+        assert_eq!(daemon.state.health[0].access_expires_at, None);
+
+        // Tick 2 polls a NON-active account (u-B) → its expiry is read from that account's STASH.
+        daemon.tick().await;
+        assert_eq!(daemon.state.health[1].poll_expires_at, Some(STASH_S));
+        assert_eq!(daemon.state.health[1].access_expires_at, None);
+
+        // Project the wire the control socket returns, with `now` set a day AFTER the polled
+        // expiry — the exact lapsed-idle case. The clock IS populated (AC: non-null with
+        // `[refresh]` off) yet the rollup stays Healthy, NOT a false-🟠 Stale.
+        let readings = daemon.state.last_readings.clone();
+        let snapshot = daemon.snapshot(daemon.state.active, &readings, CANON_S + 86_400);
+        assert_eq!(snapshot.accounts[0].access_expires_at, Some(CANON_S));
+        assert_eq!(snapshot.accounts[0].health, CredentialHealth::Healthy);
+
+        // The clock reached the wire (non-vacuous), and the surrounding token never rode
+        // alongside it into any output channel (issue #15 / #141 secret-handling).
+        let corpus = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(corpus.contains(r#""access_expires_at":1782777600"#));
+        assert!(!corpus.contains(TOKEN));
     }
 
     #[tokio::test]

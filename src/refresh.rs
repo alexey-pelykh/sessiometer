@@ -171,8 +171,10 @@ impl RefreshReport {
 
 /// `claudeAiOauth.expiresAt` as an epoch-millisecond integer (CC stores
 /// `Date.now() + expires_in*1000`), or `None` if absent / unparseable. Non-secret —
-/// only the expiry timestamp is read.
-fn expires_at(blob: &[u8]) -> Option<i64> {
+/// only the expiry timestamp is read, never the token. `pub(crate)` so the daemon's
+/// poll path (issue #141) can reuse this one audited extractor on the active account's
+/// canonical blob, the way [`stored_expires_at`] serves a per-account stash.
+pub(crate) fn expires_at(blob: &[u8]) -> Option<i64> {
     let value: Value = serde_json::from_slice(blob).ok()?;
     value.get("claudeAiOauth")?.get("expiresAt")?.as_i64()
 }
