@@ -30,6 +30,7 @@ mod stash;
 mod swap;
 mod timing;
 mod usage;
+mod usage_store;
 mod use_account;
 
 use std::process::ExitCode;

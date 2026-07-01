@@ -244,6 +244,33 @@ pub(crate) fn swap_lock() -> Result<PathBuf> {
     Ok(support_dir()?.join("swap.lock"))
 }
 
+/// The raw usage-sample log: `<support_dir>/usage-samples.jsonl` (`0600`).
+///
+/// The append-only rolling window the daemon writes one JSON line per poll to, and
+/// read-only tools read (issue #155, via [`crate::usage_store`]). Native-local (via
+/// [`support_dir`]) alongside the lock/socket/config, so a single machine has one
+/// store regardless of a per-shell `XDG_CONFIG_HOME`.
+///
+/// Consumed in production by the daemon's per-poll collector (issue #156) and the
+/// read-only reporting tools (issue #157); until they land the store is a
+/// not-yet-wired seam ([`crate::usage_store`]), so — like [`write_preserving_mode`]
+/// — this is `allow(dead_code)` off the test path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn usage_samples() -> Result<PathBuf> {
+    Ok(support_dir()?.join("usage-samples.jsonl"))
+}
+
+/// The rolled usage aggregates: `<support_dir>/usage-rollup.json` (`0600`).
+///
+/// The single atomically-rewritten object holding the hourly + daily tiers and the
+/// roll watermark (issue #155, via [`crate::usage_store`]). Sibling to
+/// [`usage_samples`] under the native-local support dir; wired into production by
+/// the same later work items, hence the matching `allow(dead_code)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn usage_rollup() -> Result<PathBuf> {
+    Ok(support_dir()?.join("usage-rollup.json"))
+}
+
 /// Claude Code's per-user state file: `~/.claude.json`.
 ///
 /// Holds the active account's `oauthAccount` identity block, which `capture`
@@ -495,6 +522,20 @@ mod tests {
         let support = support_dir().unwrap();
         assert_eq!(daemon_lock().unwrap(), support.join("daemon.lock"));
         assert_eq!(control_socket().unwrap(), support.join("daemon.sock"));
+    }
+
+    #[test]
+    fn usage_store_files_live_directly_under_support_dir() {
+        // The usage-sample store (issue #155) is native-local alongside the
+        // lock/socket/config, with the two fixed leaf names, so a machine has one
+        // store regardless of `XDG_CONFIG_HOME`.
+        let support = support_dir().unwrap();
+        assert_eq!(
+            usage_samples().unwrap(),
+            support.join("usage-samples.jsonl")
+        );
+        assert_eq!(usage_rollup().unwrap(), support.join("usage-rollup.json"));
+        assert_ne!(usage_samples().unwrap(), usage_rollup().unwrap());
     }
 
     #[test]
