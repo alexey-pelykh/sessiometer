@@ -282,7 +282,11 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         paths::claude_json()?,
         &config.tunables,
     )
-    .with_swap_lock(paths::swap_lock()?);
+    .with_swap_lock(paths::swap_lock()?)
+    // Re-read this on a runtime roster-reload (#139): a `capture` / `login` / `remove`
+    // notifies the daemon over the control socket, which then reconciles the in-memory
+    // rotation to the freshly-written `config.toml` without a restart.
+    .with_config_path(paths::config_file()?);
     let mut shutdown = RealShutdown::new()?;
 
     eprintln!(
@@ -1483,8 +1487,9 @@ fn refresh_tag(last_refresh: Option<RefreshEventOutcome>) -> Option<String> {
 /// (issue #36). A reversible park, distinct from removal (#13): the account keeps
 /// its roster entry and its stash; only its `enabled` flag flips. Resolve the
 /// account by its non-secret label, set the flag, and persist via [`Config::save`]
-/// so the change survives a daemon restart (config-backed). Takes effect at the
-/// next daemon start — a running daemon loads the roster once.
+/// so the change survives a daemon restart (config-backed). A running daemon is
+/// notified to reload (#139), so the flip takes effect in the live rotation without
+/// a restart (best-effort — no daemon running is a no-op, the next start loads it).
 ///
 /// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
 /// account is [`Error::AccountLabelNotFound`]. `enabled` selects the verb so one
@@ -1498,6 +1503,10 @@ async fn set_enabled(label: Option<String>, enabled: bool) -> Result<()> {
     // already-parked account is a friendly no-op, not a needless disk write.
     if matches!(outcome, FlipOutcome::Changed) {
         config.save()?;
+        // Tell a running daemon to pick up the enable/disable now (#139) — best-effort;
+        // the account joins / leaves the live rotation without a restart. Skipped on a
+        // no-op flip (nothing changed on disk, so nothing to reload).
+        crate::capture::notify_daemon_roster_reload().await;
     }
     println!("{}", flip_confirmation(outcome, &label, enabled));
     Ok(())
@@ -1557,8 +1566,9 @@ fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String
 /// re-run after a partial failure still converges.
 ///
 /// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
-/// account is [`Error::AccountLabelNotFound`]. Takes effect at the next daemon
-/// start — a running daemon loads the roster once. Removing the ACTIVE account is
+/// account is [`Error::AccountLabelNotFound`]. A running daemon is notified to reload
+/// (#139), so the removal takes effect in the live rotation without a restart
+/// (best-effort). Removing the ACTIVE account is
 /// allowed and self-heals: this touches only sessiometer's roster entry and stash,
 /// never the canonical credential, so the daemon simply polls-only (resolving no
 /// active account) until another account is captured or the operator `/login`s.
@@ -1573,6 +1583,9 @@ async fn remove_account(label: Option<String>) -> Result<()> {
     // Then delete the now-unreferenced stash — both halves, idempotent. The
     // service name is derived from the removed account's uuid (issue #70).
     RealAccountStash::new().delete(&removed.stash()).await?;
+    // Tell a running daemon to drop the removed account from its live rotation now
+    // (#139) — best-effort, so it never swaps to an account whose stash is gone.
+    crate::capture::notify_daemon_roster_reload().await;
     println!("{}", remove_confirmation(&label));
     Ok(())
 }
