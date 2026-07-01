@@ -1544,8 +1544,9 @@ fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String
 /// re-run after a partial failure still converges.
 ///
 /// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
-/// account is [`Error::AccountLabelNotFound`]. Takes effect at the next daemon
-/// start — a running daemon loads the roster once. Removing the ACTIVE account is
+/// account is [`Error::AccountLabelNotFound`]. A running daemon is notified to reload
+/// (#139), so the removal takes effect in the live rotation without a restart
+/// (best-effort). Removing the ACTIVE account is
 /// allowed and self-heals: this touches only sessiometer's roster entry and stash,
 /// never the canonical credential, so the daemon simply polls-only (resolving no
 /// active account) until another account is captured or the operator `/login`s.
