@@ -232,6 +232,40 @@ pub(crate) struct ManagedAccount {
     oauth_account: Vec<u8>,
 }
 
+impl Payload {
+    /// Assemble a payload from the gathered live state — the rendered `config.toml`
+    /// (roster + tunables + refresh) and the per-account secret material.
+    ///
+    /// The build seam the `export` verb (issue #148) drives: this module stays a pure
+    /// format layer (it never reads the keychain or the config path), so the caller
+    /// gathers the pieces — `config_toml` from [`crate::config::Config::render`],
+    /// `accounts` from each [`crate::stash::StashedAccount`] — and hands them in. A
+    /// secret-free (`--no-secrets`) export passes an empty `accounts` vec: the roster
+    /// still travels inside `config_toml`, but no credential material does.
+    pub(crate) fn new(config_toml: String, accounts: Vec<ManagedAccount>) -> Self {
+        Self {
+            config_toml,
+            accounts,
+        }
+    }
+}
+
+impl ManagedAccount {
+    /// One account's restorable secret material, keyed by its roster `account_uuid`.
+    ///
+    /// `credential` is the raw `Claude Code-credentials` bearer blob
+    /// ([`crate::keychain::Credential::expose`]); `oauth_account` is the canonical
+    /// `oauthAccount` identity JSON ([`crate::claude_state::OauthAccount::raw_json`]).
+    /// Both travel hex-encoded (see the field docs); this module stores them opaquely.
+    pub(crate) fn new(account_uuid: String, credential: Vec<u8>, oauth_account: Vec<u8>) -> Self {
+        Self {
+            account_uuid,
+            credential,
+            oauth_account,
+        }
+    }
+}
+
 impl MigrationArtifact {
     /// Build a version-current **plaintext** artifact (the `encrypted: false` case).
     pub(crate) fn plaintext(payload: Payload) -> Self {
