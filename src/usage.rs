@@ -106,6 +106,23 @@ pub(crate) struct Usage {
     pub(crate) session_resets_at: Option<i64>,
 }
 
+/// A poll's full reading: the lean swap-decision [`Usage`] plus the sample-only
+/// fields the decision path does not consume (issue #156). Kept SEPARATE from
+/// [`Usage`] so the pervasive, `Copy` decision type stays lean — the daemon
+/// projects a `PolledReading` straight to its `Usage` on the decision path, and the
+/// usage-sample collector reads the extras here.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PolledReading {
+    /// The swap-decision reading (both quota dimensions + resets).
+    pub(crate) usage: Usage,
+    /// The provider-reported severity label for this reading (e.g. `"critical"`),
+    /// when the API supplied one — the WEEKLY window's label, falling back to the
+    /// SESSION window's. Persisted to the usage-sample store
+    /// ([`crate::usage_store::Sample`]); a tolerant free string, never parsed to an
+    /// enum, so an unrecognised future value is retained rather than dropped.
+    pub(crate) severity: Option<String>,
+}
+
 /// The full parse of a usage response: both dimensions plus each window's reset
 /// timestamp, kept VERBATIM as the API rendered them (ISO string or epoch). The
 /// reset timestamps are extracted here (issue #5 acceptance: "returns session%,
@@ -126,6 +143,13 @@ struct UsageReport {
     /// to epoch seconds by [`to_usage`](UsageReport::to_usage) for the
     /// all-exhausted terminal logic (#11).
     weekly_resets_at: Option<String>,
+    /// The session window's provider-reported `severity`, verbatim, when present.
+    /// Kept per-window here (the faithful raw mirror); [`to_usage`](UsageReport::to_usage) collapses the
+    /// pair to a single reading-level label (issue #156 parse widening).
+    session_severity: Option<String>,
+    /// The weekly window's provider-reported `severity`, verbatim, when present
+    /// (see `session_severity`).
+    weekly_severity: Option<String>,
 }
 
 impl UsageReport {
@@ -149,13 +173,25 @@ impl UsageReport {
                 .and_then(epoch_from_resets_at),
         }
     }
+
+    /// The reading's single severity label (issue #156): prefer the WEEKLY window's
+    /// (the hard/binding limit the store emphasises), falling back to the SESSION
+    /// window's; `None` when the API supplied neither. Kept off [`to_usage`](UsageReport::to_usage) so the
+    /// lean `Usage` decision type is unaffected — only [`PolledReading`] carries it.
+    fn severity(&self) -> Option<String> {
+        self.weekly_severity
+            .clone()
+            .or_else(|| self.session_severity.clone())
+    }
 }
 
-/// Seam: reads one account's usage quota. The only impl ([`RealUsageSource`])
-/// polls the usage API; it is exercised in tests through its [`UsageTransport`]
-/// seam (a fake transport returns scripted responses), not a separate fake source.
+/// Seam: reads one account's usage quota as a [`PolledReading`] — the swap-decision
+/// [`Usage`] plus the sample-only `severity`, from a SINGLE usage-API call (issue
+/// #156). The only impl ([`RealUsageSource`]) polls the API; it is exercised in tests
+/// through its [`UsageTransport`] seam (a fake transport returns scripted responses),
+/// not a separate fake source.
 pub(crate) trait UsageSource {
-    async fn usage(&self) -> Result<Usage>;
+    async fn usage(&self) -> Result<PolledReading>;
 }
 
 /// Seam: performs the raw usage HTTP GET and reports the `(status, body)`. The
@@ -197,12 +233,21 @@ impl<Tp> UsageSource for RealUsageSource<Tp>
 where
     Tp: UsageTransport,
 {
-    async fn usage(&self) -> Result<Usage> {
+    async fn usage(&self) -> Result<PolledReading> {
         let response = self.transport.fetch().await?;
         let status = response.status;
         match classify_status(status) {
             UsageStatus::Unauthorized => Err(Error::UsageUnauthorized),
-            UsageStatus::Success => Ok(parse_usage(&response.body)?.to_usage()),
+            // The one fetch+classify success path: parse ONCE and keep both the
+            // decision `Usage` and the sample-only `severity` (issue #156), so the
+            // daemon's sample piggybacks this poll with no extra API call.
+            UsageStatus::Success => {
+                let report = parse_usage(&response.body)?;
+                Ok(PolledReading {
+                    usage: report.to_usage(),
+                    severity: report.severity(),
+                })
+            }
             UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
             UsageStatus::RateLimited => Err(Error::UsageRateLimited {
                 status,
@@ -399,9 +444,10 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
     let root: Value =
         serde_json::from_str(body).map_err(|_| Error::UsageParse("body is not JSON".into()))?;
 
-    let (session, session_resets_at) = dimension(&root, "five_hour", &["session", "five_hour"])
-        .ok_or_else(|| Error::UsageParse("no session (five_hour) dimension".into()))?;
-    let (weekly, weekly_resets_at) =
+    let (session, session_resets_at, session_severity) =
+        dimension(&root, "five_hour", &["session", "five_hour"])
+            .ok_or_else(|| Error::UsageParse("no session (five_hour) dimension".into()))?;
+    let (weekly, weekly_resets_at, weekly_severity) =
         dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"])
             .ok_or_else(|| Error::UsageParse("no weekly (seven_day) dimension".into()))?;
 
@@ -410,26 +456,34 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
         weekly,
         session_resets_at,
         weekly_resets_at,
+        session_severity,
+        weekly_severity,
     })
 }
 
-/// Find one window's `(fraction, resets_at)`, trying the top-level
+/// Find one window's `(fraction, resets_at, severity)`, trying the top-level
 /// `{top_key: {...}}` object first, then a `limits[]` entry whose `kind` is one
 /// of `kinds`. Among matching `limits[]` entries an active one (`is_active` true
 /// or absent) is preferred, but an explicitly inactive entry is used as a
 /// fallback rather than dropped: `is_active: false` means "not the currently
 /// binding limit" — the live API marks `weekly_all` so — NOT "absent" (issue
 /// #66). Dropping it entirely would lose a window whenever it is the only match.
-fn dimension(root: &Value, top_key: &str, kinds: &[&str]) -> Option<(f64, Option<String>)> {
+/// `severity` is the entry's optional provider label, extracted from the SAME
+/// matched entry as the fraction (issue #156 parse widening).
+fn dimension(
+    root: &Value,
+    top_key: &str,
+    kinds: &[&str],
+) -> Option<(f64, Option<String>, Option<String>)> {
     if let Some(obj) = root.get(top_key) {
         if let Some(fraction) = fraction_of(obj) {
-            return Some((fraction, resets_at_of(obj)));
+            return Some((fraction, resets_at_of(obj), severity_of(obj)));
         }
     }
     let limits = root.get("limits").and_then(Value::as_array)?;
     // An active matching entry wins; an inactive one is kept only as a fallback
     // (is_active:false = "not the binding limit", not "absent" — issue #66).
-    let mut fallback: Option<(f64, Option<String>)> = None;
+    let mut fallback: Option<(f64, Option<String>, Option<String>)> = None;
     for entry in limits {
         let kind = entry.get("kind").and_then(Value::as_str);
         if !kind.is_some_and(|kind| kinds.contains(&kind)) {
@@ -443,10 +497,10 @@ fn dimension(root: &Value, top_key: &str, kinds: &[&str]) -> Option<(f64, Option
             .and_then(Value::as_bool)
             .unwrap_or(true);
         if active {
-            return Some((fraction, resets_at_of(entry)));
+            return Some((fraction, resets_at_of(entry), severity_of(entry)));
         }
         if fallback.is_none() {
-            fallback = Some((fraction, resets_at_of(entry)));
+            fallback = Some((fraction, resets_at_of(entry), severity_of(entry)));
         }
     }
     fallback
@@ -472,6 +526,16 @@ fn resets_at_of(obj: &Value) -> Option<String> {
     match obj.get("resets_at") {
         Some(Value::String(at)) => Some(at.clone()),
         Some(Value::Number(at)) => Some(at.to_string()),
+        _ => None,
+    }
+}
+
+/// Read a window's optional `severity` label verbatim (issue #156 parse widening).
+/// A tolerant free string — only a JSON string is taken; any other type (or an
+/// absent field) is `None`, so a reading without a severity still parses cleanly.
+fn severity_of(obj: &Value) -> Option<String> {
+    match obj.get("severity") {
+        Some(Value::String(label)) => Some(label.clone()),
         _ => None,
     }
 }
@@ -615,6 +679,55 @@ mod tests {
         assert_eq!(
             report.weekly_resets_at.as_deref(),
             Some("2026-06-30T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_widening_retains_severity_and_prefers_weekly() {
+        // Issue #156 parse widening: the `limits[]` `severity` (previously dropped)
+        // is retained per window, and the reading's single label prefers the WEEKLY
+        // window's, falling back to the session window's.
+        let both = r#"{
+            "limits": [
+                {"kind": "session", "percent": 42, "severity": "warning", "is_active": true},
+                {"kind": "weekly_all", "percent": 88, "severity": "critical", "is_active": true}
+            ]
+        }"#;
+        let report = parse_usage(both).unwrap();
+        assert_eq!(report.session_severity.as_deref(), Some("warning"));
+        assert_eq!(report.weekly_severity.as_deref(), Some("critical"));
+        assert_eq!(
+            report.severity().as_deref(),
+            Some("critical"),
+            "weekly wins"
+        );
+
+        // Only the session window labels its severity → it is used.
+        let session_only = r#"{
+            "limits": [
+                {"kind": "session", "percent": 20, "severity": "warning", "is_active": true},
+                {"kind": "weekly_all", "percent": 10, "is_active": true}
+            ]
+        }"#;
+        assert_eq!(
+            parse_usage(session_only).unwrap().severity().as_deref(),
+            Some("warning"),
+            "falls back to session"
+        );
+
+        // Neither window labels a severity → None; the reading still parses cleanly
+        // (issue #156 AC: a sample is valid when the optional field is absent).
+        let neither = r#"{
+            "limits": [
+                {"kind": "session", "percent": 20, "is_active": true},
+                {"kind": "weekly_all", "percent": 10, "is_active": true}
+            ]
+        }"#;
+        let report = parse_usage(neither).unwrap();
+        assert_eq!(report.severity(), None);
+        assert!(
+            (report.session - 0.20).abs() < 1e-9,
+            "dimensions still parse"
         );
     }
 
@@ -813,6 +926,8 @@ mod tests {
             weekly: 0.2,
             session_resets_at: Some("2025-01-01T00:00:00Z".to_owned()),
             weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
+            session_severity: None,
+            weekly_severity: None,
         };
         let usage = report.to_usage();
         assert_eq!(usage.weekly_resets_at, Some(1_750_960_800));
@@ -988,9 +1103,11 @@ mod tests {
         let body =
             r#"{"limits":[{"kind":"session","percent":30},{"kind":"weekly_all","percent":70}]}"#;
         let src = source(vec![FakeUsageTransport::ok(200, body)]);
-        let usage = src.usage().await.unwrap();
-        assert!((usage.session - 0.30).abs() < 1e-9);
-        assert!((usage.weekly - 0.70).abs() < 1e-9);
+        let reading = src.usage().await.unwrap();
+        assert!((reading.usage.session - 0.30).abs() < 1e-9);
+        assert!((reading.usage.weekly - 0.70).abs() < 1e-9);
+        // No `severity` on either limit → the reading carries none (issue #156).
+        assert_eq!(reading.severity, None);
     }
 
     #[tokio::test]
