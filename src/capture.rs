@@ -1,12 +1,15 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! The roster write paths: the `capture` command and the `login` reconcile (#134).
+//! The roster write paths: the `capture` command (#4), the `login` command (#135) and the
+//! `login` reconcile (#134) it drives.
 //!
 //! Both land an account into the roster through the SHARED capture-plan
 //! ([`plan_capture`]) — `capture` snapshots the account currently logged in to
 //! Claude Code, while [`reconcile_login`] lands a credential freshly harvested in
-//! isolation by the login engine ([`crate::login`], #132). They differ only in
+//! isolation by the login engine ([`crate::login`], #132). The user-facing [`login`] verb (#135)
+//! wires the two: it drives the capture engine, then reconciles the harvest, then emits ONE
+//! redacted [`crate::observability::Event::Login`] audit line for the outcome. They differ only in
 //! where the credential comes from and whether the login also becomes active:
 //! `capture` reads the already-active canonical credential and does not touch it,
 //! whereas the login reconcile re-points the canonical item to the fresh
@@ -42,9 +45,11 @@
 //! and prints.
 
 use crate::claude_state::{read_oauth_account, write_oauth_account, OauthAccount};
-use crate::config::{Account, Config, RefreshConfig, Tunables};
+use crate::config::{Account, Config, LoginConfig, RefreshConfig, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
+use crate::login::login_account;
+use crate::observability::{Event, EventLog, LoginEventOutcome};
 use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
@@ -93,6 +98,99 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Run the `login` command (issue #135): drive the isolated interactive-login capture engine
+/// ([`login_account`], #132), reconcile the fresh harvest into the roster ([`reconcile_login`],
+/// #134), and emit ONE redacted [`Event::Login`] audit line for the outcome.
+///
+/// The optional `label` names a NEW account (an omitted / blank label auto-derives from the
+/// account uuid via the shared capture-plan path, #134); a re-login of an already-rostered
+/// account keeps its label unless a new, non-empty one is given.
+///
+/// Terminal behavior (issue #135 AC):
+///   - **onboarded / revived** — the harvest landed; print a confirmation and exit `0`.
+///   - **cancelled** — the operator did not complete the login (timeout / SIGINT); print
+///     "login cancelled, nothing captured" and exit `0` (nothing was written).
+///   - **failed** — the engine or the reconcile aborted (e.g. a LOCKED KEYCHAIN, which aborts
+///     ONE-SHOT with no wait loop); the error propagates and `main` maps it to the existing
+///     taxonomy ([`Error::exit_code`] — a locked keychain, `security` exit 36, is exit `4`).
+///
+/// The `[login]` config block supplies the capture timeout and an optional `claude` binary
+/// override (both defaulted when no `config.toml` exists yet — the first login precedes it).
+pub(crate) async fn login(label: Option<String>) -> Result<()> {
+    // The `[login]` settings: capture timeout + optional binary override. A MALFORMED config is a
+    // hard error surfaced BEFORE the interactive login (never run a multi-minute login only to
+    // fail on save); an ABSENT config yields the defaults (the first login precedes any
+    // `config.toml`). The override threads through the SAME resolver the refresh path uses (#135
+    // AC: no new binary-override mechanism).
+    let login_cfg = load_existing()?.map(|c| c.login).unwrap_or_default();
+
+    match login_account(login_cfg.claude_bin.as_deref(), login_cfg.timeout()).await {
+        Ok(capture) => {
+            // The non-secret account handle the engine surfaces (the account uuid — exactly what
+            // `list` prints), or `None` for an incomplete capture. Read via the engine's own
+            // accessor BEFORE `into_captured` consumes the outcome; kept as the event handle for a
+            // reconcile failure (a success reports the resolved roster label instead).
+            let uuid_handle = capture.account_uuid().map(str::to_owned);
+            match capture.into_captured() {
+                // A completed login: the fresh credential + identity were harvested.
+                Some(captured) => match reconcile_login(captured, label).await {
+                    Ok((outcome, label, count)) => {
+                        let event_outcome = match outcome {
+                            LoginOutcome::Onboarded => LoginEventOutcome::Onboarded,
+                            LoginOutcome::Revived => LoginEventOutcome::Revived,
+                        };
+                        emit_login_event(Some(label.clone()), event_outcome);
+                        println!("{}", login_confirmation(outcome, &label, count));
+                        Ok(())
+                    }
+                    // Harvested, but landing it in the roster failed (e.g. a contended swap lock,
+                    // a save error). We still know WHICH account — report it on the failed event.
+                    Err(err) => {
+                        emit_login_event(uuid_handle, LoginEventOutcome::Failed);
+                        Err(err)
+                    }
+                },
+                // The login did not complete: a timeout or an operator SIGINT. Nothing was
+                // harvested — exit 0 with a clear message (issue #135 AC), never a nonzero
+                // "failure".
+                None => {
+                    emit_login_event(None, LoginEventOutcome::Cancelled);
+                    println!("login cancelled, nothing captured");
+                    Ok(())
+                }
+            }
+        }
+        // The capture engine aborted before a harvest (a LOCKED KEYCHAIN — one-shot, no wait loop;
+        // a non-tty stdout; a spawn failure; a shared-item mutation). Emit the failed event, then
+        // propagate so `main` maps the error to its existing exit code (a locked keychain → 4).
+        Err(err) => {
+            emit_login_event(None, LoginEventOutcome::Failed);
+            Err(err)
+        }
+    }
+}
+
+/// Emit the single redacted [`Event::Login`] audit line (issue #135) — BEST-EFFORT: the login's
+/// own outcome (onboarded / revived / cancelled / the propagated error) stands regardless of
+/// whether the audit log is writable, so a failure to open or append it is swallowed rather than
+/// masking the real result. `account` is a redacted handle (label or uuid), or `None` when no
+/// account was ever identified (a cancel, or a failure before harvest).
+fn emit_login_event(account: Option<String>, outcome: LoginEventOutcome) {
+    if let Ok(mut log) = EventLog::open() {
+        let _ = log.emit(&Event::Login { account, outcome });
+    }
+}
+
+/// The operator-facing confirmation for a landed login (issue #135) — the `login` counterpart of
+/// [`confirmation`], in the onboarded/revived vocabulary. Names the account by its LABEL only,
+/// never the email or token (#15).
+fn login_confirmation(outcome: LoginOutcome, label: &str, count: usize) -> String {
+    match outcome {
+        LoginOutcome::Onboarded => format!("Onboarded \"{label}\" (now {count} in rotation)."),
+        LoginOutcome::Revived => format!("Revived \"{label}\" (still {count} in rotation)."),
+    }
+}
+
 /// Load the existing config so `capture` can add to it.
 ///
 /// An absent file is `None` (the first capture creates `config.toml`). A file that
@@ -131,12 +229,18 @@ async fn run_capture(
     existing: Option<Config>,
     label: Option<&str>,
 ) -> Result<CaptureReport> {
-    // Preserve the existing tunables AND the periodic-refresh schedule across a capture
-    // (issue #58, extended for #105): adding an account to a config that already carries
-    // custom tunables / a `[refresh]` block must not reset either to defaults.
-    let (mut roster, tunables, refresh) = match existing {
-        Some(config) => (config.roster, config.tunables, config.refresh),
-        None => (Vec::new(), Tunables::default(), RefreshConfig::default()),
+    // Preserve the existing tunables, the periodic-refresh schedule AND the `[login]` settings
+    // across a capture (issue #58, extended for #105/#135): adding an account to a config that
+    // already carries custom tunables / a `[refresh]` / `[login]` block must not reset any to
+    // defaults.
+    let (mut roster, tunables, refresh, login) = match existing {
+        Some(config) => (config.roster, config.tunables, config.refresh, config.login),
+        None => (
+            Vec::new(),
+            Tunables::default(),
+            RefreshConfig::default(),
+            LoginConfig::default(),
+        ),
     };
 
     let (stash_name, outcome) = plan_capture(&mut roster, oauth.account_uuid(), label)?;
@@ -163,6 +267,7 @@ async fn run_capture(
             roster,
             tunables,
             refresh,
+            login,
         },
         outcome,
         label,
@@ -306,11 +411,17 @@ where
     C: CredentialStore,
     S: AccountStash,
 {
-    // Preserve the operator's tunables + refresh schedule across the reconcile, exactly
-    // like `run_capture` (#58/#105): landing a login must never reset either to defaults.
-    let (mut roster, tunables, refresh) = match existing {
-        Some(config) => (config.roster, config.tunables, config.refresh),
-        None => (Vec::new(), Tunables::default(), RefreshConfig::default()),
+    // Preserve the operator's tunables + refresh schedule + `[login]` settings across the
+    // reconcile, exactly like `run_capture` (#58/#105/#135): landing a login must never reset
+    // any of them to defaults.
+    let (mut roster, tunables, refresh, login) = match existing {
+        Some(config) => (config.roster, config.tunables, config.refresh, config.login),
+        None => (
+            Vec::new(),
+            Tunables::default(),
+            RefreshConfig::default(),
+            LoginConfig::default(),
+        ),
     };
 
     let (stash_name, outcome) =
@@ -346,6 +457,7 @@ where
             roster,
             tunables,
             refresh,
+            login,
         },
         outcome: outcome.into(),
         label,
@@ -388,15 +500,13 @@ where
 /// entry point (issue #134) the `login` verb (#135) calls after the capture engine
 /// (#132) hands back a [`StashedAccount`]. Wires the real keychain store + stash, holds
 /// the swap lock around the short write (serializing against a concurrent daemon swap),
-/// then persists the roster. Reachable only from tests until #135 wires the verb, hence
-/// `allow(dead_code)` off-test.
+/// then persists the roster. Wired into production by the [`login`] verb (#135).
 ///
 /// The roster (`config.toml`) write is deliberately OUTSIDE the lock: a swap contends
 /// only on the keychain + `~/.claude.json`, never on `config.toml`, so no concurrent
 /// swap can race it. Stash-before-roster (like [`capture`]): a crash after the locked
 /// write but before the save leaves a fresh, restorable stash + canonical, never a
 /// roster referencing an unstashed account.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn reconcile_login(
     captured: StashedAccount,
     label: Option<String>,
@@ -574,6 +684,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn login_confirmation_lines_name_the_account_by_label() {
+        // Issue #135: the landed-login confirmation is the onboarded/revived counterpart of the
+        // capture confirmation — the account named by its LABEL only (never email/token, #15),
+        // with the running count and no fixed denominator (#35).
+        assert_eq!(
+            login_confirmation(LoginOutcome::Onboarded, "work", 3),
+            "Onboarded \"work\" (now 3 in rotation)."
+        );
+        assert_eq!(
+            login_confirmation(LoginOutcome::Revived, "personal", 2),
+            "Revived \"personal\" (still 2 in rotation)."
+        );
+    }
+
     // --- run_capture (orchestration over the fake stash) ---
 
     #[tokio::test]
@@ -619,6 +744,7 @@ mod tests {
                 ..Tunables::default()
             },
             refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
         };
 
         let report = run_capture(
@@ -640,12 +766,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_capture_preserves_a_custom_login_block() {
+        // Issue #135: a `capture` — and, via the IDENTICAL preserve path, the login reconcile —
+        // must NOT reset an operator's custom `[login]` settings to defaults when it re-saves the
+        // config. The same data-loss trap the tunables/refresh preservation guards against.
+        let stash = FakeAccountStash::empty();
+        let login = LoginConfig {
+            timeout_secs: 420,                                 // a non-default the operator set
+            claude_bin: Some("/opt/claude/bin/claude".into()), // an explicit override
+        };
+        let existing = Config {
+            roster: vec![],
+            tunables: Tunables::default(),
+            refresh: RefreshConfig::default(),
+            login: login.clone(),
+        };
+
+        let report = run_capture(
+            Credential::new(b"token-1".to_vec()),
+            oauth("u-1"),
+            &stash,
+            Some(existing),
+            Some("work"),
+        )
+        .await
+        .unwrap();
+
+        // The operator's [login] settings survive the capture (NOT reset: the timeout default is
+        // 180, claude_bin default is None).
+        assert_eq!(report.config.login, login);
+    }
+
+    #[tokio::test]
     async fn recapture_refreshes_the_stash_without_growing_the_roster() {
         let stash = FakeAccountStash::empty();
         let existing = Config {
             roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
         };
 
         let report = run_capture(
@@ -675,6 +834,7 @@ mod tests {
             roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
         };
 
         let report = run_capture(
@@ -844,6 +1004,7 @@ mod tests {
                 ..Tunables::default()
             },
             refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
         };
 
         let report = run_login(
@@ -888,6 +1049,7 @@ mod tests {
             roster: vec![account("u-1", "work")],
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
         };
 
         run_login(

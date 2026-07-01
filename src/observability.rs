@@ -185,6 +185,40 @@ impl CredentialHealth {
     }
 }
 
+/// The outcome of one `sessiometer login` invocation (issue #135) — the `outcome=` token of the
+/// single redacted [`Event::Login`] the verb emits. The four terminal states of a login:
+/// `Onboarded` / `Revived` map from the reconcile's [`crate::capture::LoginOutcome`] (a new vs an
+/// already-rostered account), while `Failed` / `Cancelled` cover the paths that never reach a
+/// reconcile — an error (e.g. a locked keychain aborts one-shot) and an operator abandon
+/// (timeout / SIGINT), respectively. A bare classification, never a token or email (#15).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginEventOutcome {
+    /// The harvested account was NEW to the roster — a fresh entry was appended.
+    Onboarded,
+    /// The harvested account was ALREADY in the roster — its entry was updated in place and its
+    /// credential re-pointed (a re-login that un-quarantines a parked account).
+    Revived,
+    /// The login did not land: the capture engine or the reconcile returned an error (e.g. a
+    /// locked keychain, a spawn failure). Nothing was written to the roster.
+    Failed,
+    /// The operator did not complete the login within the timeout, or cancelled it (SIGINT):
+    /// nothing was captured.
+    Cancelled,
+}
+
+impl LoginEventOutcome {
+    /// The `outcome=` token for the [`Event::Login`] log line.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            LoginEventOutcome::Onboarded => "onboarded",
+            LoginEventOutcome::Revived => "revived",
+            LoginEventOutcome::Failed => "failed",
+            LoginEventOutcome::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// One observable daemon state change, rendered as a single `key=val` log line by
 /// [`Event::to_log_line`].
 ///
@@ -281,6 +315,15 @@ pub(crate) enum Event {
         account: String,
         state: CredentialHealth,
     },
+    /// One `sessiometer login` invocation completed (issue #135) — the single redacted audit line
+    /// the verb emits. `account` is the operator HANDLE (label or, for a post-harvest failure, the
+    /// account uuid) — a redacted, non-PII handle, never the email or token; it is `None` when no
+    /// account was ever identified (a cancel before completion, or a failure before harvest), in
+    /// which case the `account=` field is omitted. `outcome` is the terminal classification.
+    Login {
+        account: Option<String>,
+        outcome: LoginEventOutcome,
+    },
 }
 
 impl Event {
@@ -370,6 +413,18 @@ impl Event {
             Event::CredentialHealth { account, state } => {
                 let state = state.as_str();
                 format!("ts={ts} event=credential_health account={account} state={state}")
+            }
+            Event::Login { account, outcome } => {
+                let outcome = outcome.as_str();
+                // The account handle is omitted when absent (a cancel/early-failure that never
+                // identified an account) — mirroring `all_exhausted`'s optional `resets_at`, so
+                // the key=val grammar never carries an empty `account=`.
+                match account {
+                    Some(handle) => {
+                        format!("ts={ts} event=login account={handle} outcome={outcome}")
+                    }
+                    None => format!("ts={ts} event=login outcome={outcome}"),
+                }
             }
         }
     }
@@ -953,6 +1008,57 @@ mod tests {
     }
 
     #[test]
+    fn login_renders_the_handle_and_outcome() {
+        // The redacted `login` audit line (issue #135): the account is the operator HANDLE, the
+        // outcome its terminal classification — never a token or email.
+        let line = Event::Login {
+            account: Some("work".to_owned()),
+            outcome: LoginEventOutcome::Onboarded,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=login account=work outcome=onboarded")
+        );
+    }
+
+    #[test]
+    fn login_omits_the_account_when_absent() {
+        // A cancel (or a failure before any account was identified) carries no handle, so the
+        // `account=` field is omitted — the line stays well-formed, like `all_exhausted` without
+        // a `resets_at`.
+        let line = Event::Login {
+            account: None,
+            outcome: LoginEventOutcome::Cancelled,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=login outcome=cancelled"));
+        assert!(!line.contains("account="), "got: {line}");
+    }
+
+    #[test]
+    fn login_renders_each_outcome_token() {
+        // All four terminal outcomes render their exact `outcome=` token (issue #135 AC).
+        for (outcome, token) in [
+            (LoginEventOutcome::Onboarded, "onboarded"),
+            (LoginEventOutcome::Revived, "revived"),
+            (LoginEventOutcome::Failed, "failed"),
+            (LoginEventOutcome::Cancelled, "cancelled"),
+        ] {
+            assert_eq!(outcome.as_str(), token);
+            let line = Event::Login {
+                account: Some("work".to_owned()),
+                outcome,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!("{TS0} event=login account=work outcome={token}")
+            );
+        }
+    }
+
+    #[test]
     fn usage_scope_fail_carries_the_account_and_constant_403() {
         let line = Event::UsageScopeFail {
             account: "work".to_owned(),
@@ -1070,6 +1176,14 @@ mod tests {
             Event::CredentialHealth {
                 account: "work".to_owned(),
                 state: CredentialHealth::Dead,
+            },
+            Event::Login {
+                account: Some("work".to_owned()),
+                outcome: LoginEventOutcome::Onboarded,
+            },
+            Event::Login {
+                account: None,
+                outcome: LoginEventOutcome::Cancelled,
             },
         ];
         for event in &events {
