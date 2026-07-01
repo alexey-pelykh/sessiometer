@@ -74,8 +74,10 @@
 //! weekly `resets_at`), which now fills the event log's `resets_at=` field.
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -92,7 +94,8 @@ use crate::observability::{
     CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, PollClass,
     RefreshEventOutcome, SwapReason,
 };
-use crate::refresh_tick::{RefreshObservation, SweepOutcome};
+use crate::refresh::{RefreshOutcome, RefreshReport};
+use crate::refresh_tick::{RealRefreshEngine, RefreshEngine, RefreshObservation, SweepOutcome};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
@@ -406,6 +409,44 @@ pub(crate) trait RefreshTicker {
     /// Records the sweep for cadence gating. Per-account failures are non-fatal (the engine
     /// Caller contract). Returns the per-cycle [`SweepOutcome`] for the daemon to emit + apply.
     async fn sweep(&mut self, excluded: &[String], quarantined: &[String]) -> SweepOutcome;
+}
+
+/// Per-account refresh seam the POLL path uses to revive an expired-but-refreshable
+/// access token BEFORE a usage 401 counts toward the #42 dead-credential streak (issue
+/// #162). Distinct from [`RefreshTicker`] (the periodic parked-account sweep, #105): this
+/// is a single, on-demand, one-account refresh composed into the poll→streak seam that a
+/// 401 previously fell straight through.
+///
+/// Carried as an OPTIONAL [`Daemon`] field (`Option<Box<dyn PollRefresh>>`, like
+/// `swap_lock_path`) rather than a 5th generic seam: the retry re-polls through the
+/// account's EXISTING [`RosterPoller`], so only the refresh needs injecting, and the boxed
+/// option leaves every hermetic-test `Daemon::new` site — and `tick`'s many call sites —
+/// untouched (a scoped change that composes with the queued #140 daemon work). `None` (the
+/// default) is the pre-#162 behaviour: a 401 flows straight to the streak. Production wires
+/// the #102 engine ([`RealRefreshEngine`]); the seam tests wire a scripted fake.
+///
+/// A hand-desugared `async fn` (a boxed future) so the trait is `dyn`-compatible; the
+/// current-thread runtime keeps the returned future free of a `Send` bound.
+pub(crate) trait PollRefresh {
+    /// Run ONE isolated refresh cycle for `account` (the #102 engine), yielding the
+    /// classified [`RefreshReport`] so the caller can distinguish a revived / still-alive
+    /// token from a `Dead` one (the refresh token cleared in place).
+    fn refresh<'a>(
+        &'a self,
+        account: &'a Account,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshReport>> + 'a>>;
+}
+
+impl PollRefresh for RealRefreshEngine {
+    fn refresh<'a>(
+        &'a self,
+        account: &'a Account,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshReport>> + 'a>> {
+        // Reuse the SAME #102 engine the periodic tick drives — the poll path and the
+        // sweep now compose over one refresh implementation (issue #162 root cause: they
+        // were scoped as separate issues and never composed).
+        Box::pin(RefreshEngine::refresh(self, account))
+    }
 }
 
 /// Production control: accept one client at a time on the bound socket and answer
@@ -1325,6 +1366,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`with_config_path`](Self::with_config_path); when `None`, an inbound
     /// `roster-reload` signal is a logged best-effort no-op (there is nothing to read).
     config_path: Option<PathBuf>,
+    /// The poll-path refresh-then-retry seam (issue #162), or `None` to disable it (the
+    /// hermetic-test default AND a `[refresh]`-off daemon — a 401 then flows straight to
+    /// the #42 streak exactly as before). Production wires the #102 engine
+    /// ([`RealRefreshEngine`]) via [`with_refresh_engine`](Self::with_refresh_engine),
+    /// gated on the same effective switch as the periodic tick; when `Some`, a usage 401
+    /// attempts one isolated refresh + re-poll before it can quarantine the account.
+    poll_refresh: Option<Box<dyn PollRefresh>>,
     state: DecisionState,
 }
 
@@ -1376,6 +1424,9 @@ where
             // No runtime roster-reload by default (issue #139); production opts in via
             // `with_config_path`. A hermetic test drives `reconcile_roster` directly.
             config_path: None,
+            // No poll-path refresh-then-retry by default (issue #162); production opts in
+            // via `with_refresh_engine`. Left unset, a 401 flows straight to the streak.
+            poll_refresh: None,
             state: DecisionState {
                 health,
                 last_readings,
@@ -1403,6 +1454,18 @@ where
     /// / `with_seed` and keep `new`'s args stable.
     pub(crate) fn with_config_path(mut self, path: PathBuf) -> Self {
         self.config_path = Some(path);
+        self
+    }
+
+    /// Wire the poll-path refresh-then-retry seam (issue #162): on a usage 401 the daemon
+    /// then attempts one isolated refresh (the #102 engine) + a single re-poll BEFORE the
+    /// 401 counts toward the #42 death streak, so a merely-expired access token is revived
+    /// instead of quarantining a healthy account. Production wires [`RealRefreshEngine`]
+    /// (gated on the same effective switch as the periodic tick — a resolvable `claude`
+    /// binary); left unset, a test / feature-off daemon behaves exactly as before. Builder-
+    /// style to mirror `with_swap_lock` / `with_config_path` and keep `new`'s args stable.
+    pub(crate) fn with_refresh_engine(mut self, engine: Box<dyn PollRefresh>) -> Self {
+        self.poll_refresh = Some(engine);
         self
     }
 
@@ -1556,7 +1619,20 @@ where
             record_usage_sample(&self.roster[i].label, &polled);
             // Project to the lean `Usage` the decision path consumes; the sample-only
             // `severity` does not travel past here.
-            let result = polled.map(|reading| reading.usage);
+            let mut result = polled.map(|reading| reading.usage);
+            // Issue #162: a usage 401 is USUALLY a merely-expired access token, not a dead
+            // credential. Before it counts toward the #42 death streak, attempt ONE isolated
+            // refresh (the #102 engine) + a single re-poll — but only on the FIRST 401 of a
+            // streak episode and never for an already-quarantined account (see
+            // `should_refresh_retry`), so a persistently-401 account triggers at most one
+            // refresh per episode (no `claude -p` storm). A re-poll that CLEARS keeps the
+            // account healthy (the false-death this fixes); a 401 that SURVIVES a fresh token
+            // — or a refresh that reports the token DEAD — is the genuine dead signal and
+            // flows on to `note_poll_outcome` unchanged. The seam is inert (unset) unless
+            // `with_refresh_engine` wired it, so every other path behaves exactly as before.
+            if self.should_refresh_retry(i, &result) {
+                result = self.refresh_retry(i).await;
+            }
             self.note_poll_outcome(i, &result, &mut events);
             diagnostics.push(Diagnostic::Poll {
                 account: self.roster[i].label.clone(),
@@ -1996,6 +2072,64 @@ where
                 self.state.health[i].consec_401 = 0;
                 self.state.health[i].recovery_successes = 0;
             }
+        }
+    }
+
+    /// Whether poll `i`'s outcome warrants a #162 refresh-then-retry, evaluated on the
+    /// PRE-fold state (before [`note_poll_outcome`](Self::note_poll_outcome) advances the
+    /// streak):
+    ///
+    /// - a refresh seam is wired ([`with_refresh_engine`](Self::with_refresh_engine)),
+    /// - the poll was a 401 ([`PollOutcome::Unauthorized`]),
+    /// - the account is not already quarantined (a dead account is left to the #106 sweep /
+    ///   an operator re-login — never re-refreshed on every re-probe poll), and
+    /// - this is the FIRST 401 of the current streak episode (`consec_401 == 0`).
+    ///
+    /// The last condition is the once-per-episode guard (AC-4, no refresh storm): a refresh
+    /// spawns `claude -p` under the swap lock (seconds), so a persistently-401 account must
+    /// refresh at most once per streak — the first 401 attempts the revive; the rest of the
+    /// episode advances the streak directly.
+    fn should_refresh_retry(&self, i: usize, result: &Result<Usage>) -> bool {
+        self.poll_refresh.is_some()
+            && matches!(classify_poll(result), PollOutcome::Unauthorized)
+            && !self.state.health[i].quarantined
+            && self.state.health[i].consec_401 == 0
+    }
+
+    /// Attempt one isolated refresh of account `i` (the #102 engine) and a single re-poll,
+    /// returning the outcome [`note_poll_outcome`](Self::note_poll_outcome) then folds into
+    /// the streak (issue #162). Only called when [`should_refresh_retry`](Self::should_refresh_retry)
+    /// holds, so `poll_refresh` is `Some`.
+    ///
+    /// - Refresh reports **`Dead`** (the refresh token was cleared in place, `refresh.rs`) →
+    ///   a genuine death: skip the re-poll and let the 401 stand so the streak advances.
+    /// - Refresh ran otherwise (refreshed / no-change / even an engine error report) → the
+    ///   account's STASH may now bear a fresh token, so re-poll THROUGH THE STASH
+    ///   (`active = false`). Re-polling the stash is a liveness probe that never touches the
+    ///   live canonical credential — the deliberate, safe path for the ACTIVE account too:
+    ///   its 401 is the most urgent so it is NOT skipped, but confirming its liveness must
+    ///   never mutate the credential its live session depends on. A stale-stash `Dead` for an
+    ///   active account therefore only advances the streak by one (a later canonical re-poll
+    ///   can still clear it), never an instant false-kill.
+    /// - The refresh itself **errors** → "could not revive"; fail-safe by letting the 401
+    ///   stand. A refresh failure never crashes the poll loop.
+    async fn refresh_retry(&self, i: usize) -> Result<Usage> {
+        let refreshed = match self.poll_refresh.as_ref() {
+            Some(engine) => engine.refresh(&self.roster[i]).await,
+            // Unreachable given the `should_refresh_retry` guard; treat as could-not-revive.
+            None => return Err(Error::UsageUnauthorized),
+        };
+        match refreshed {
+            // The refresh token was cleared in place → genuinely dead: let the 401 stand.
+            Ok(report) if report.outcome == RefreshOutcome::Dead => Err(Error::UsageUnauthorized),
+            // A fresh token may now be stashed → probe liveness through the stash.
+            Ok(_) => self
+                .poller
+                .poll(&self.roster[i], false)
+                .await
+                .map(|reading| reading.usage),
+            // Could not revive (spawn / read-back failure) → fail-safe: the 401 stands.
+            Err(_) => Err(Error::UsageUnauthorized),
         }
     }
 
@@ -3307,6 +3441,7 @@ mod tests {
     use crate::timing::Jitter;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     // --- Fakes -------------------------------------------------------------
 
@@ -8542,6 +8677,304 @@ mod tests {
         assert!(
             events.is_empty(),
             "an already-dead 401 re-emits nothing: {events:?}"
+        );
+    }
+
+    // --- Issue #162: poll↔refresh seam ------------------------------------
+
+    /// Shared, mutable per-account poll outcome the #162 seam tests drive: [`SeamPoller`]
+    /// reads the CURRENT outcome and [`SeamRefresh`] may FLIP it (revive an expired token)
+    /// on refresh — modelling the poll↔refresh seam the fix composes. Keyed by
+    /// `account_uuid`, mirroring [`FakeRosterPoller`].
+    type SeamOutcomes = Rc<RefCell<HashMap<String, Scripted>>>;
+
+    /// A [`RosterPoller`] reading its per-account outcome from a shared [`SeamOutcomes`]
+    /// cell, so a refresh that revives a token is observed on the very next poll.
+    struct SeamPoller {
+        outcomes: SeamOutcomes,
+    }
+
+    impl RosterPoller for SeamPoller {
+        async fn poll(&self, account: &Account, _active: bool) -> Result<PolledReading> {
+            match self.outcomes.borrow().get(&account.account_uuid) {
+                Some(Scripted::Ok(usage)) => Ok(PolledReading {
+                    usage: *usage,
+                    severity: None,
+                }),
+                Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
+                Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
+                // Only `Ok` / `Unauthorized` / `ScopeMissing` are scripted here; anything
+                // else (or an unscripted account) is an unavailable transient gap.
+                _ => Err(Error::UsageTransient {
+                    status: 0,
+                    retry_after: None,
+                }),
+            }
+        }
+    }
+
+    /// A [`PollRefresh`] fake for the #162 seam tests: it COUNTS refresh calls (the
+    /// once-per-episode guard, AC-4), returns a scripted [`RefreshOutcome`], and — when
+    /// `revive_to` is set — REVIVES the account by flipping its shared [`SeamOutcomes`]
+    /// entry to a live reading (the false-death the fix rescues). `hard_error` makes the
+    /// refresh itself fail (the fail-safe path).
+    struct SeamRefresh {
+        outcomes: SeamOutcomes,
+        outcome: RefreshOutcome,
+        revive_to: Option<Usage>,
+        hard_error: bool,
+        calls: Rc<Cell<u32>>,
+    }
+
+    impl PollRefresh for SeamRefresh {
+        fn refresh<'a>(
+            &'a self,
+            account: &'a Account,
+        ) -> Pin<Box<dyn Future<Output = Result<RefreshReport>> + 'a>> {
+            Box::pin(async move {
+                self.calls.set(self.calls.get() + 1);
+                if self.hard_error {
+                    // A refresh that cannot even run (spawn / lock failure) → could-not-revive.
+                    return Err(Error::SwapLockBusy);
+                }
+                if let Some(usage) = self.revive_to {
+                    self.outcomes
+                        .borrow_mut()
+                        .insert(account.account_uuid.clone(), Scripted::Ok(usage));
+                }
+                Ok(RefreshReport {
+                    outcome: self.outcome,
+                    expires_at_delta_secs: None,
+                    refresh_token_rotated: false,
+                    re_stashed: matches!(self.outcome, RefreshOutcome::Refreshed),
+                })
+            })
+        }
+    }
+
+    /// A two-account seam daemon (issue #162): `work` (`u-A`) polls healthy and stays the
+    /// active account; `spare` (`u-B`) is the non-active account under test (isolating the
+    /// refresh-retry from the emergency-swap path, exactly as
+    /// [`nth_consecutive_401_quarantines_the_account_and_signals_once`] isolates detection).
+    /// The round-robin schedule (#80) polls `work` then `spare`, so `spare` is polled on
+    /// every SECOND tick. Returns the daemon plus the shared outcome cell (to re-script
+    /// mid-run) and the refresh call-counter (to assert no storm).
+    async fn seam_daemon(
+        spare_outcome: Scripted,
+        refresh_outcome: RefreshOutcome,
+        revive_to: Option<Usage>,
+        hard_error: bool,
+        monitor_401_n: u8,
+    ) -> (
+        Daemon<SeamPoller, FakeCredentialStore, FakeAccountStash, FakeClock>,
+        SeamOutcomes,
+        Rc<Cell<u32>>,
+    ) {
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        // Keep the temp `~/.claude.json` alive for the daemon's life (as `three_account_daemon`).
+        std::mem::forget(dir);
+        let tun = Tunables {
+            monitor_401_n,
+            ..tunables(95, 80, 0)
+        };
+        let outcomes: SeamOutcomes = Rc::new(RefCell::new(HashMap::from([
+            ("u-A".to_owned(), Scripted::Ok(reading(0.10, 0.10))),
+            ("u-B".to_owned(), spare_outcome),
+        ])));
+        let calls = Rc::new(Cell::new(0u32));
+        let daemon = Daemon::new(
+            roster,
+            SeamPoller {
+                outcomes: outcomes.clone(),
+            },
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_refresh_engine(Box::new(SeamRefresh {
+            outcomes: outcomes.clone(),
+            outcome: refresh_outcome,
+            revive_to,
+            hard_error,
+            calls: calls.clone(),
+        }));
+        (daemon, outcomes, calls)
+    }
+
+    #[tokio::test]
+    async fn a_usage_401_that_clears_after_refresh_does_not_quarantine() {
+        // AC-1: a parked account whose access token merely EXPIRED (401) but whose refresh
+        // token is valid → the daemon refreshes + re-polls, the re-poll CLEARS, and the #42
+        // death streak never advances. This is the false death the fix eliminates.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed,
+            Some(reading(0.10, 0.10)), // the refresh REVIVES the spare's token
+            false,
+            3,
+        )
+        .await;
+        // Drive three spare polls (round-robin idx 1 → ticks 2, 4, 6).
+        for _ in 0..6 {
+            daemon.tick().await;
+        }
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "a 401 that clears after one refresh must NOT quarantine the account",
+        );
+        assert_eq!(
+            daemon.state.health[1].consec_401, 0,
+            "the successful re-poll resets the streak",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "exactly one refresh — the revive, not a per-poll storm",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_usage_401_that_survives_a_fresh_token_still_quarantines_after_n() {
+        // AC-2 (+ AC-4): a 401 that PERSISTS after a fresh token is the genuine dead signal —
+        // it still quarantines after `monitor_401_n` such survivals, and the refresh fires at
+        // most ONCE per episode, not on every poll.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed, // the refresh "succeeds" but does NOT revive (no flip)
+            None,
+            false,
+            3,
+        )
+        .await;
+        // spare polled on ticks 2, 4, 6 → three surviving 401s → quarantine at N = 3.
+        for _ in 0..6 {
+            daemon.tick().await;
+        }
+        assert!(
+            daemon.state.health[1].quarantined,
+            "a 401 that survives the fresh token must still quarantine after N",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "AC-4: at most ONE refresh per streak episode — no per-poll refresh storm",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_reporting_dead_is_treated_as_a_genuine_death() {
+        // AC-3: the refresh clears the refresh token in place (Dead) — a genuine death. The
+        // re-poll is skipped, the 401 stands, and the account quarantines through the streak.
+        let (mut daemon, _outcomes, calls) =
+            seam_daemon(Scripted::Unauthorized, RefreshOutcome::Dead, None, false, 3).await;
+        for _ in 0..6 {
+            daemon.tick().await;
+        }
+        assert!(
+            daemon.state.health[1].quarantined,
+            "a refresh that reports the token Dead must quarantine the account",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "one refresh confirmed the death; the rest of the streak advances directly",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_fails_is_fail_safe_and_still_quarantines() {
+        // Fail-safe AC: a refresh that itself ERRORS (spawn / lock failure) is handled — it
+        // never crashes the poll loop, and "could not revive" lets the 401 stand so a truly
+        // dead account still quarantines after N.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Error, // unused: `hard_error` short-circuits before the report
+            None,
+            true,
+            3,
+        )
+        .await;
+        for _ in 0..6 {
+            daemon.tick().await;
+        }
+        assert!(
+            daemon.state.health[1].quarantined,
+            "a refresh failure is treated as could-not-revive → the account still quarantines",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "the failed refresh is still bounded to one attempt per episode",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_streak_episode_may_refresh_again_after_a_recovery() {
+        // AC-4 boundary: the once-per-episode guard is per-STREAK, not per-lifetime. A 401
+        // refreshes (persists → streak = 1); the streak then RESETS on a live poll, closing
+        // the episode; a LATER 401 opens a fresh episode allowed one more refresh.
+        let (mut daemon, outcomes, calls) = seam_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed, // succeeds but does not auto-revive
+            None,
+            false,
+            3,
+        )
+        .await;
+        daemon.tick().await; // tick 1: work (healthy)
+        daemon.tick().await; // tick 2: spare 401 → refresh (calls = 1), streak = 1
+        assert_eq!(calls.get(), 1);
+        assert_eq!(daemon.state.health[1].consec_401, 1);
+        // Heal the spare: its next poll is Live → the streak resets, closing the episode.
+        outcomes
+            .borrow_mut()
+            .insert("u-B".to_owned(), Scripted::Ok(reading(0.10, 0.10)));
+        daemon.tick().await; // tick 3: work
+        daemon.tick().await; // tick 4: spare Live → streak resets to 0
+        assert_eq!(daemon.state.health[1].consec_401, 0);
+        assert_eq!(calls.get(), 1, "a live poll needs no refresh");
+        // Break the spare again → the next spare 401 is a NEW episode → one more refresh.
+        outcomes
+            .borrow_mut()
+            .insert("u-B".to_owned(), Scripted::Unauthorized);
+        daemon.tick().await; // tick 5: work
+        daemon.tick().await; // tick 6: spare 401 (consec 0) → refresh AGAIN (calls = 2)
+        assert_eq!(
+            calls.get(),
+            2,
+            "a fresh streak episode is allowed one more refresh",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_poll_path_never_refreshes_or_quarantines() {
+        // The seam is inert on the happy path — a never-401 account triggers no refresh (no
+        // `claude -p` spawn) and never quarantines, so the fix costs the common case nothing.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.20, 0.10)), // spare polls healthy from the start
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        for _ in 0..6 {
+            daemon.tick().await;
+        }
+        assert!(!daemon.state.health[1].quarantined);
+        assert_eq!(
+            calls.get(),
+            0,
+            "a healthy poll path never invokes the refresh seam",
         );
     }
 
