@@ -752,6 +752,9 @@ fn health_cell(account: &AccountStatusLine) -> String {
 fn health_glyph(health: CredentialHealth) -> &'static str {
     match health {
         CredentialHealth::Healthy => "🟢",
+        // #137: no positive-liveness evidence — a neutral ⚪, not a false 🟢. `char_width`
+        // measures U+26AA as two cells (see its WIDE table) so the column stays aligned.
+        CredentialHealth::Unknown => "⚪",
         CredentialHealth::Stale => "🟡",
         CredentialHealth::AtRisk => "🟠",
         CredentialHealth::Dead => "🔴",
@@ -1114,6 +1117,7 @@ fn char_width(c: char) -> usize {
         (0xFE30, 0xFE4F),   // CJK Compatibility Forms
         (0xFF00, 0xFF60),   // Fullwidth Forms
         (0xFFE0, 0xFFE6),   // Fullwidth signs
+        (0x26AA, 0x26AB),   // medium white/black circles (emoji-presentation; #137's ⚪)
         (0x1F300, 0x1FAFF), // emoji & pictographs (approximated as uniformly wide)
         (0x20000, 0x3FFFD), // CJK Ext B+ (supplementary planes)
     ];
@@ -1945,7 +1949,7 @@ spare  22222222-2222\n\
 
     #[test]
     fn health_cell_projects_each_rollup_state_to_a_glyph_with_an_actionable_cue() {
-        use CredentialHealth::{AtRisk, Dead, Healthy, Stale};
+        use CredentialHealth::{AtRisk, Dead, Healthy, Stale, Unknown};
         // `health == Some(verdict)`: the daemon's 4-state rollup renders as ONE self-coloring
         // glyph, plus the minimal cue an operator needs to act.
         let cell = |health, quarantined, recovering, enabled| {
@@ -1958,6 +1962,9 @@ spare  22222222-2222\n\
             })
         };
         assert_eq!(cell(Some(Healthy), false, false, true), "🟢");
+        // #137: no positive-liveness evidence renders a neutral ⚪ — distinct from a false 🟢,
+        // and carries NO cue (only `Dead` prompts `claude /login`).
+        assert_eq!(cell(Some(Unknown), false, false, true), "⚪");
         assert_eq!(cell(Some(Stale), false, false, true), "🟡");
         assert_eq!(cell(Some(AtRisk), false, false, true), "🟠");
         // A DEAD credential carries the exact recovery command (AC-1) — visibly distinct from
@@ -2803,7 +2810,11 @@ spare  22222222-2222\n\
         // Wide CJK: each glyph is two cells (three chars → six cells).
         assert_eq!(display_width("日本語"), 6);
         assert_eq!("日本語".chars().count(), 3); // the count it must NOT use
-                                                 // A combining mark adds no width: "e" + U+0301 (combining acute) → one cell.
+                                                 // #137's ⚪ (U+26AA, emoji-presentation) is two cells, like the 🟢/🟡/🟠/🔴
+                                                 // rollup glyphs, so the HEALTH column stays aligned.
+        assert_eq!(display_width("⚪"), 2);
+        assert_eq!(display_width("🟢"), 2);
+        // A combining mark adds no width: "e" + U+0301 (combining acute) → one cell.
         assert_eq!(display_width("e\u{0301}"), 1);
         // Zero-width joiner and the BOM contribute nothing.
         assert_eq!(display_width("a\u{200d}b"), 2);

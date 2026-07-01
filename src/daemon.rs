@@ -682,12 +682,14 @@ fn millis_to_secs(ms: i64) -> i64 {
     ms / 1000
 }
 
-/// The daemon-side 4-state credential-health rollup (issue #119) — a PURE function of one
-/// account's health inputs and the wall clock, so it is unit-tested directly and computed
-/// identically for the display snapshot and the transition-event diff. The thin `status`
-/// client just projects the returned verdict to a glyph.
+/// The daemon-side credential-health rollup (issue #119, extended by #137) — a PURE function
+/// of one account's health inputs, its fresh-reading liveness signal, and the wall clock, so
+/// it is unit-tested directly and computed identically for the display snapshot and the
+/// transition-event diff. The thin `status` client just projects the returned verdict to a
+/// glyph.
 ///
-/// A SEVERITY ladder (most-severe wins), matching the issue's 🟢→🟡→🟠→🔴 ordering:
+/// A SEVERITY ladder (most-severe wins), matching the issue's 🟢→🟡→🟠→🔴 ordering, plus a
+/// distinct ⚪ `Unknown` for the no-evidence case (#137):
 /// - **Dead** — `quarantined` (the #42 401-streak verdict) OR the last refresh outcome was
 ///   `Dead` (the refresh token was cleared in place). Both genuinely need `claude /login`;
 ///   surfacing a refresh-detected death as 🔴 too is more honest than hiding it (this is a
@@ -695,15 +697,30 @@ fn millis_to_secs(ms: i64) -> i64 {
 /// - **AtRisk** — the refresh safety-net is failing (`consecutive_refresh_failures > 0`):
 ///   a streak of `Error` cycles means the mechanism that prevents staleness/death is
 ///   struggling, so the account trends toward dead even while its token may still work.
-/// - **Stale** — the stored access token has EXPIRED (`access_expires_at <= now_secs`) but
-///   the refresh token is still valid (not dead, not failing): a transient window the next
-///   refresh recovers.
-/// - **Healthy** — none of the above.
+/// - **Stale** — the stored REFRESH-sourced access token has EXPIRED (`access_expires_at <=
+///   now_secs`) but the refresh token is still valid (not dead, not failing): a transient
+///   window the next refresh recovers. Keys off `access_expires_at` ONLY (never the
+///   poll-sourced clock), so an idle account's naturally-lapsed stashed expiry never
+///   false-🟠s (#141/#137).
+/// - **Healthy** — a POSITIVE liveness signal exists: a fresh successful usage reading
+///   (`has_fresh_reading`), OR refresh telemetry, OR a (future) refresh-sourced expiry.
+/// - **Unknown** — none of the above AND no positive liveness signal (#137): a non-active
+///   account never successfully polled, `[refresh]` off, no/unknown `access_expires_at`.
+///   Absence of a NEGATIVE signal is not health; the daemon reports "unverified" rather than
+///   a false 🟢 that would jump straight to 🔴 the moment the 401-streak quarantines it.
+///
+/// `has_fresh_reading` is this account's masked [`decision_readings`](Daemon::decision_readings)
+/// entry being `Some` — a SUCCESSFUL poll against the live API (the strongest liveness proof),
+/// `None` for a failed poll or an out-of-rotation account. Deliberately NOT `poll_expires_at`:
+/// that clock is written on every poll ATTEMPT (even a 401 against a readable-but-revoked
+/// stash), so it cannot distinguish alive from the exact lapsed-credential bug #137 fixes; it
+/// stays the display clock only (`--json`, via [`Daemon::snapshot`]'s `.or()` fallback).
 fn credential_health(
     quarantined: bool,
     last_refresh_outcome: Option<RefreshEventOutcome>,
     consecutive_refresh_failures: u32,
     access_expires_at: Option<i64>,
+    has_fresh_reading: bool,
     now_secs: i64,
 ) -> CredentialHealth {
     if quarantined || last_refresh_outcome == Some(RefreshEventOutcome::Dead) {
@@ -712,8 +729,10 @@ fn credential_health(
         CredentialHealth::AtRisk
     } else if access_expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
         CredentialHealth::Stale
-    } else {
+    } else if has_fresh_reading || last_refresh_outcome.is_some() || access_expires_at.is_some() {
         CredentialHealth::Healthy
+    } else {
+        CredentialHealth::Unknown
     }
 }
 
@@ -2350,13 +2369,19 @@ where
     /// refresh-detected death the 401 path never quarantines).
     fn note_health_transitions(&mut self, now_secs: i64) -> Vec<Event> {
         let mut events = Vec::new();
-        for i in 0..self.roster.len() {
+        // The same masked, in-rotation readings the display snapshot uses (keyed on the
+        // current active), so the edge-triggered event verdict matches what `status` shows:
+        // a `Some` entry is this account's positive-liveness signal (a successful poll),
+        // `None` a failed poll / out-of-rotation account → the #137 `Unknown` input.
+        let readings = self.decision_readings(self.state.active);
+        for (i, reading) in readings.iter().enumerate() {
             let health = &self.state.health[i];
             let verdict = credential_health(
                 health.quarantined,
                 health.last_refresh_outcome,
                 health.consecutive_refresh_failures,
                 health.access_expires_at,
+                reading.is_some(),
                 now_secs,
             );
             // Emit only on a CHANGE from a SEEDED baseline; the first observation (None)
@@ -2413,11 +2438,16 @@ where
                         // so a lapsed idle poll clock never fires a false-🟠 Stale (see #137).
                         access_expires_at: health.access_expires_at.or(health.poll_expires_at),
                         refresh_health: refresh_health_view(health),
+                        // #137: a `Some` reading is this account's positive-liveness signal (a
+                        // successful poll); without one (and no refresh telemetry / expiry) the
+                        // rollup is `Unknown`, never a false 🟢. The poll-sourced clock above is
+                        // display-only and deliberately NOT fed here (set even on a failed poll).
                         health: credential_health(
                             health.quarantined,
                             health.last_refresh_outcome,
                             health.consecutive_refresh_failures,
                             health.access_expires_at,
+                            readings[i].is_some(),
                             now_secs,
                         ),
                     }
@@ -5865,39 +5895,41 @@ mod tests {
         use RefreshEventOutcome::{Error, NoChange, Refreshed};
         const NOW: i64 = 1_782_777_600;
 
-        // Healthy — not quarantined, no refresh failure, token not yet expired.
+        // Healthy — not quarantined, no refresh failure, token not yet expired; the refresh
+        // telemetry + a future expiry are the positive-liveness signal (no reading needed).
         assert_eq!(
-            credential_health(false, Some(Refreshed), 0, Some(NOW + 60), NOW),
+            credential_health(false, Some(Refreshed), 0, Some(NOW + 60), false, NOW),
             CredentialHealth::Healthy
         );
-        // Healthy is also the graceful-degradation default when no clock has been observed
-        // (the `[refresh]` feature is off, so there is no expiry / refresh outcome to judge).
+        // A fresh successful usage reading is ALSO a positive-liveness signal (#137): even
+        // with `[refresh]` off (no telemetry, no clock), a live-API poll ⇒ Healthy. The
+        // no-reading counterpart is `Unknown`, covered in the sibling test.
         assert_eq!(
-            credential_health(false, None, 0, None, NOW),
+            credential_health(false, None, 0, None, true, NOW),
             CredentialHealth::Healthy
         );
 
         // Stale — the access token has expired (`<= now`) but the refresh net is still
         // alive: a transient window the next refresh recovers. The boundary is inclusive.
         assert_eq!(
-            credential_health(false, Some(NoChange), 0, Some(NOW), NOW),
+            credential_health(false, Some(NoChange), 0, Some(NOW), false, NOW),
             CredentialHealth::Stale
         );
         assert_eq!(
-            credential_health(false, Some(Refreshed), 0, Some(NOW - 1), NOW),
+            credential_health(false, Some(Refreshed), 0, Some(NOW - 1), false, NOW),
             CredentialHealth::Stale
         );
 
         // AtRisk — the refresh safety-net is failing (a streak of errors), even while the
         // access token itself has not yet expired.
         assert_eq!(
-            credential_health(false, Some(Error), 1, Some(NOW + 60), NOW),
+            credential_health(false, Some(Error), 1, Some(NOW + 60), false, NOW),
             CredentialHealth::AtRisk
         );
 
         // Dead — quarantined (the #42 401-streak verdict)…
         assert_eq!(
-            credential_health(true, None, 0, None, NOW),
+            credential_health(true, None, 0, None, false, NOW),
             CredentialHealth::Dead
         );
         // …or the refresh token was cleared in place (a refresh-detected death), surfaced
@@ -5908,6 +5940,7 @@ mod tests {
                 Some(RefreshEventOutcome::Dead),
                 0,
                 Some(NOW + 60),
+                false,
                 NOW
             ),
             CredentialHealth::Dead
@@ -5915,14 +5948,64 @@ mod tests {
 
         // Severity ladder (Dead > AtRisk > Stale > Healthy): a quarantined account whose
         // token is ALSO expired and whose refresh is ALSO failing still reads Dead; an
-        // at-risk account whose token is ALSO expired reads AtRisk, not Stale.
+        // at-risk account whose token is ALSO expired reads AtRisk, not Stale. A fresh
+        // reading NEVER masks a negative signal — even `has_fresh_reading = true` stays
+        // Dead / AtRisk here.
         assert_eq!(
-            credential_health(true, Some(Error), 3, Some(NOW - 10), NOW),
+            credential_health(true, Some(Error), 3, Some(NOW - 10), true, NOW),
             CredentialHealth::Dead
         );
         assert_eq!(
-            credential_health(false, Some(Error), 2, Some(NOW - 10), NOW),
+            credential_health(false, Some(Error), 2, Some(NOW - 10), true, NOW),
             CredentialHealth::AtRisk
+        );
+    }
+
+    #[test]
+    fn credential_health_reports_unknown_without_a_positive_liveness_signal() {
+        use RefreshEventOutcome::NoChange;
+        const NOW: i64 = 1_782_777_600;
+
+        // #137: absence of a NEGATIVE signal is not health. A non-active account never
+        // successfully polled, `[refresh]` off (no telemetry, no refresh-sourced expiry, no
+        // fresh reading) ⇒ Unknown — NOT a false 🟢 that would jump straight to 🔴 the moment
+        // the 401-streak quarantines it. This is the exact case that fell through to Healthy
+        // before the fix.
+        assert_eq!(
+            credential_health(false, None, 0, None, false, NOW),
+            CredentialHealth::Unknown
+        );
+
+        // Any ONE positive-liveness signal lifts it to Healthy:
+        //  (a) a fresh successful usage reading (the strongest proof — a live-API poll),
+        assert_eq!(
+            credential_health(false, None, 0, None, true, NOW),
+            CredentialHealth::Healthy
+        );
+        //  (b) refresh telemetry (the refresh path observed the account alive),
+        assert_eq!(
+            credential_health(false, Some(NoChange), 0, None, false, NOW),
+            CredentialHealth::Healthy
+        );
+        //  (c) a FUTURE refresh-sourced expiry (the refresh engine read a valid token).
+        assert_eq!(
+            credential_health(false, None, 0, Some(NOW + 60), false, NOW),
+            CredentialHealth::Healthy
+        );
+
+        // AC: a LAPSED refresh-sourced expiry (no telemetry, no reading) is a KNOWN stale
+        // window the refresh net recovers — Stale wins over the no-evidence check, never
+        // Unknown and never a false Healthy.
+        assert_eq!(
+            credential_health(false, None, 0, Some(NOW - 1), false, NOW),
+            CredentialHealth::Stale
+        );
+
+        // A negative signal always overrides missing evidence — quarantine ⇒ Dead, not
+        // Unknown, even with no other input.
+        assert_eq!(
+            credential_health(true, None, 0, None, false, NOW),
+            CredentialHealth::Dead
         );
     }
 
@@ -6118,17 +6201,26 @@ mod tests {
 
         // Project the wire the control socket returns, with `now` set a day AFTER the polled
         // expiry — the exact lapsed-idle case. The clock IS populated (AC: non-null with
-        // `[refresh]` off) yet the rollup stays Healthy, NOT a false-🟠 Stale.
+        // `[refresh]` off) yet the ACTIVE account stays Healthy, NOT a false-🟠 Stale: the
+        // poll clock never reaches the Stale branch, and its own successful poll is the
+        // positive-liveness signal keeping it Healthy rather than Unknown (#137).
         let readings = daemon.state.last_readings.clone();
         let snapshot = daemon.snapshot(daemon.state.active, &readings, CANON_S + 86_400);
         assert_eq!(snapshot.accounts[0].access_expires_at, Some(CANON_S));
         assert_eq!(snapshot.accounts[0].health, CredentialHealth::Healthy);
+        // The third account (u-C) was never polled this run — no reading, no telemetry, no
+        // refresh clock — so #137 reports it ⚪ Unknown, NOT a false 🟢, even as #141's
+        // display clock keeps working for the accounts that were polled.
+        assert_eq!(snapshot.accounts[2].health, CredentialHealth::Unknown);
 
         // The clock reached the wire (non-vacuous), and the surrounding token never rode
         // alongside it into any output channel (issue #15 / #141 secret-handling).
         let corpus = serde_json::to_string(&status_response(&snapshot)).unwrap();
         assert!(corpus.contains(r#""access_expires_at":1782777600"#));
         assert!(!corpus.contains(TOKEN));
+        // #137 AC: the raw Unknown state rides the `--json` wire as a scriptable token,
+        // so a consumer can tell "unverified" apart from a genuine "healthy".
+        assert!(corpus.contains(r#""health":"unknown""#));
     }
 
     #[tokio::test]
@@ -6137,11 +6229,13 @@ mod tests {
         const NOW: i64 = 1_782_777_600;
 
         // The FIRST computation per account SEEDS the baseline WITHOUT emitting — a fresh
-        // daemon logs no startup storm. All three start healthy (not quarantined, no clocks).
+        // daemon logs no startup storm. All three start UNKNOWN (#137): not quarantined, no
+        // clocks, and no successful poll yet (this daemon was never ticked) — no positive
+        // liveness signal, so honestly unverified rather than a false 🟢.
         assert!(daemon.note_health_transitions(NOW).is_empty());
         assert_eq!(
             daemon.state.health[0].last_health,
-            Some(CredentialHealth::Healthy)
+            Some(CredentialHealth::Unknown)
         );
 
         // A genuine change emits EXACTLY ONE redacted event (AC-3) — the handle and the new
@@ -6158,8 +6252,25 @@ mod tests {
         // No change ⇒ no event (edge-triggered, not level-triggered).
         assert!(daemon.note_health_transitions(NOW).is_empty());
 
-        // Recovery flips it back — another single transition event.
-        daemon.state.health[0].quarantined = false; // → Healthy
+        // Un-quarantine WITHOUT any new evidence ⇒ back to Unknown, NOT a false Healthy
+        // (#137): clearing the dead flag does not prove the credential is alive.
+        daemon.state.health[0].quarantined = false; // → Unknown (still no liveness signal)
+        assert_eq!(
+            daemon.note_health_transitions(NOW),
+            vec![Event::CredentialHealth {
+                account: "work".to_owned(),
+                state: CredentialHealth::Unknown,
+            }]
+        );
+
+        // Evidence ARRIVES — a successful poll for `work` (enabled, non-quarantined, so it
+        // surfaces through `decision_readings`) ⇒ Unknown transitions to a real Healthy state.
+        daemon.state.last_readings[0] = Some(Usage {
+            session: 0.10,
+            weekly: 0.10,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        });
         assert_eq!(
             daemon.note_health_transitions(NOW),
             vec![Event::CredentialHealth {
@@ -7157,15 +7268,25 @@ mod tests {
         assert_eq!(displayed_uuid(&json).as_deref(), Some("u-B"));
         assert_eq!(daemon.state.active, Some(1));
 
-        // End-to-end (issue #9): the swap wrote exactly one structured event line —
-        // handles only (work → spare), never a token or email — to the event log.
-        // The session reading (0.97) is at/over the 95 % trigger, so the line is
-        // tagged `reason=session` with the outgoing account's `session_pct`.
+        // End-to-end (issue #9): the swap wrote one structured swap line — handles only
+        // (work → spare), never a token or email. The session reading (0.97) is at/over the
+        // 95 % trigger, so the line is tagged `reason=session` with the outgoing account's
+        // `session_pct`. Since #137, `spare` also logs one honest Unknown→healthy transition
+        // as the swap makes it active and its first poll verifies it — an expected companion
+        // line, not spurious output (and itself #15-clean: a handle + a bare state token).
         let logged = std::fs::read_to_string(&log_path).unwrap();
-        assert_eq!(logged.lines().count(), 1, "one event line: {logged:?}");
+        assert_eq!(
+            logged.lines().count(),
+            2,
+            "swap + spare health line: {logged:?}"
+        );
         assert!(
             logged.contains("event=swap from=work to=spare reason=session session_pct=97"),
             "got: {logged:?}"
+        );
+        assert!(
+            logged.contains("event=credential_health account=spare state=healthy"),
+            "spare verified healthy once polled after the swap (#137): {logged:?}"
         );
         assert!(logged.starts_with("ts="), "stamped: {logged:?}");
         assert!(!logged.contains('@'), "no email: {logged:?}");
@@ -7451,11 +7572,21 @@ mod tests {
         .await
         .unwrap();
 
+        // The swap line carries the weekly reason; since #137 `spare` also logs one honest
+        // Unknown→healthy transition once the swap makes it active and its poll verifies it.
         let logged = std::fs::read_to_string(&log_path).unwrap();
-        assert_eq!(logged.lines().count(), 1, "one event line: {logged:?}");
+        assert_eq!(
+            logged.lines().count(),
+            2,
+            "swap + spare health line: {logged:?}"
+        );
         assert!(
             logged.contains("event=swap from=work to=spare reason=weekly session_pct=50"),
             "got: {logged:?}"
+        );
+        assert!(
+            logged.contains("event=credential_health account=spare state=healthy"),
+            "spare verified healthy once polled after the swap (#137): {logged:?}"
         );
     }
 
