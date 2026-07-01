@@ -657,12 +657,16 @@ pub(crate) struct AccountStatusLine {
     /// a pre-#119 daemon omits it → `None`.
     #[serde(default)]
     pub(crate) refresh_health: Option<RefreshHealth>,
-    /// The daemon-computed 4-state credential-health rollup (issue #119): the verdict the
-    /// thin read-only client projects to a glyph (🟢/🟡/🟠/🔴). `Option` for backward
-    /// compatibility — `#[serde(default)]` makes a pre-#119 daemon (which omits the field)
-    /// decode to `None`, and the client then FALLS BACK to the legacy quarantine-based text
-    /// rather than mis-reading a defaulted `healthy` over a dead account.
-    #[serde(default)]
+    /// The daemon-computed 4-state credential-auth rollup (issue #119): the verdict the
+    /// thin read-only client projects to a glyph (🟢/🟡/🟠/🔴/⚪) under the `AUTH` column.
+    /// Serialized on the `--json` wire as **`auth`** (issue #143 — the field reports the
+    /// credential-AUTH standing, not a vague "health"; renamed while pre-release, no stable
+    /// `--json` consumers yet); the Rust field keeps the name `health` to localize the
+    /// rename to the wire key. `Option` for backward compatibility — `#[serde(default)]`
+    /// makes a pre-#119 daemon (which omits the field) decode to `None`, and the client then
+    /// FALLS BACK to the legacy quarantine-based text rather than mis-reading a defaulted
+    /// `healthy` over a dead account.
+    #[serde(default, rename = "auth")]
     pub(crate) health: Option<CredentialHealth>,
 }
 
@@ -6654,8 +6658,9 @@ mod tests {
         assert!(corpus.contains(r#""access_expires_at":1782777600"#));
         assert!(!corpus.contains(TOKEN));
         // #137 AC: the raw Unknown state rides the `--json` wire as a scriptable token,
-        // so a consumer can tell "unverified" apart from a genuine "healthy".
-        assert!(corpus.contains(r#""health":"unknown""#));
+        // so a consumer can tell "unverified" apart from a genuine "healthy". The wire key
+        // is `auth` (issue #143 renamed the field `health` → `auth`).
+        assert!(corpus.contains(r#""auth":"unknown""#));
     }
 
     #[tokio::test]
@@ -6750,12 +6755,20 @@ mod tests {
             None,
             false,
         ));
+        // …and the `status --verbose` access-token expiry block (issue #143), a third
+        // operator-facing surface that reprojects the same `access_expires_at` clock — so a
+        // path leaking the surrounding token alongside the expiry surfaces here too.
+        corpus.push_str(&crate::cli::render_access_token_expiry(
+            &response,
+            1_782_700_000,
+        ));
 
         // Cardinality (#15 non-vacuous gate): the new fields actually reached the scanned
         // corpus before the clean verdict below is trusted.
         assert!(corpus.contains(r#""access_expires_at":1782777600"#));
         assert!(corpus.contains(r#""refresh_health":{"#));
-        assert!(corpus.contains(r#""health":"stale""#));
+        // The rollup rides the wire under the `auth` key (issue #143 renamed `health` → `auth`).
+        assert!(corpus.contains(r#""auth":"stale""#));
         assert_clean(&corpus, &secrets);
     }
 
@@ -9605,8 +9618,9 @@ mod tests {
             // The status-TEXT rendering of a dead credential (#119): the 🔴 rollup glyph
             // plus the actionable `claude /login` cue (AC-1) now stand in for the pre-rollup
             // `needs re-login` tag. Unique to the text channel — the wire carries the verdict
-            // as the `"health":"dead"` enum, not this operator-facing command — so it proves
-            // the status-text channel contributed (a non-vacuous #15 gate).
+            // as the `"auth":"dead"` enum (issue #143 renamed the key `health` → `auth`), not
+            // this operator-facing command — so it proves the status-text channel contributed
+            // (a non-vacuous #15 gate).
             corpus.contains("🔴 claude /login"),
             "status-text channel: dead-credential cue missing"
         );

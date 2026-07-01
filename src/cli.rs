@@ -69,21 +69,25 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     };
                     run(verbosity).await
                 }
-                // `status [--json] [--no-color]` — `--json` dumps the full
-                // response verbatim, the full-data contract regardless of terminal
+                // `status [--json] [--no-color] [-v|--verbose]` — `--json` dumps the
+                // full response verbatim, the full-data contract regardless of terminal
                 // width (issue #72); `--no-color` forces the urgency overlay off
-                // (issue #73). Both flags may appear in any order; extras ignored.
+                // (issue #73); `-v`/`--verbose` adds each account's raw access-token
+                // expiry clock under the table (issue #143). All flags may appear in any
+                // order; extras ignored.
                 "status" => {
                     let mut json = false;
                     let mut no_color = false;
+                    let mut verbose = false;
                     for arg in args.by_ref() {
                         match arg.to_string_lossy().as_ref() {
                             "--json" => json = true,
                             "--no-color" => no_color = true,
+                            "-v" | "--verbose" => verbose = true,
                             _ => {}
                         }
                     }
-                    status(json, no_color).await
+                    status(json, no_color, verbose).await
                 }
                 "list" => list().await,
                 // `use <account> [--force]` switches the active account on demand
@@ -214,7 +218,7 @@ fn print_usage() {
          capture [<label>]    Stash the active account into the rotation\n    \
          login [<label>]      Log in to an account (claude /login) in isolation and add it to the rotation\n    \
          run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)\n    \
-         status [--json] [--no-color]  Show each account's usage + resets-in, and the next swap\n    \
+         status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)\n    \
          list       List captured accounts\n    \
          use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)\n    \
          disable <label>      Park an account: keep it but take it out of the rotation\n    \
@@ -419,23 +423,36 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
 /// stdout TTY with none of the opt-outs ([`should_colorize`]). `--json` is never
 /// colored (raw data for scripts), and the gate keeps ANSI out of any pipe,
 /// redirect, or log, so `status | grep` and `status > file` stay escape-free.
-async fn status(json: bool, no_color: bool) -> Result<()> {
+///
+/// `verbose` (`-v`/`--verbose`, issue #143) appends the per-account access-token
+/// expiry block under the table — the raw "expires in" clock, labelled so it is not
+/// misread as a re-login deadline. It affects only the text view: `--json` already
+/// carries the raw `access_expires_at` for every account (the full-data contract), so
+/// verbose adds nothing there.
+async fn status(json: bool, no_color: bool, verbose: bool) -> Result<()> {
     let response = query_status(&paths::control_socket()?).await?;
     if json {
         // The full-data contract, regardless of terminal width (issue #72): the
-        // raw response — both per-account reset instants included — pretty-printed,
-        // for scripts (`status --json | jq`). Sourced from the same non-secret
-        // response as the text view, so it too can never carry a token or email.
-        // Never colored — scripts consume the bytes verbatim.
+        // raw response — both per-account reset instants AND the raw access-token
+        // expiry included — pretty-printed, for scripts (`status --json | jq`).
+        // Sourced from the same non-secret response as the text view, so it too can
+        // never carry a token or email. Never colored — scripts consume the bytes
+        // verbatim; `--verbose` is inert here (the raw clock is already present).
         let rendered = serde_json::to_string_pretty(&response)
             .map_err(|err| Error::Io(std::io::Error::other(err)))?;
         println!("{rendered}");
     } else {
         let color = should_colorize(no_color);
-        print!(
-            "{}",
-            render_status(&response, now_epoch(), terminal_cols(), color)
-        );
+        // One `now` for both the table's "resets in" and the verbose expiry block, so
+        // the two never read against different clocks within a single render.
+        let now = now_epoch();
+        print!("{}", render_status(&response, now, terminal_cols(), color));
+        // The verbose access-token expiry block (issue #143) trails the table — content,
+        // not color, so it shows through a pipe like the rest of the table (the
+        // color gate governs only the ANSI overlay).
+        if verbose {
+            print!("{}", render_access_token_expiry(&response, now));
+        }
     }
     Ok(())
 }
@@ -483,7 +500,7 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// `session-reset`), then the WEEKLY pair (`weekly% ` `weekly-reset`), then the
 /// health-text tags (issue #94). A labelled header row (issue #99) tops the table —
 /// `ACCOUNT`, the grouped `SESSION%` + `RESET`, the grouped `WEEKLY%` + `RESET`, then
-/// `HEALTH` — measured into the SAME column widths as the data so the labels line up;
+/// `AUTH` — measured into the SAME column widths as the data so the labels line up;
 /// the pairing is also read by adjacency (each `%` sits immediately before its OWN
 /// reset), so the two reset columns share the `RESET` label. A reset's lead gap is a
 /// single space (tying it to its `%`); independent columns are two spaces apart. When
@@ -567,11 +584,14 @@ pub(crate) fn render_status(
         ),
     ];
     if rows.iter().any(|row| !row.status.is_empty()) {
-        // The health-text column carries its own tags (`disabled`, `needs re-login` /
-        // `recovering`); it is never tinted (issue #84) — the tags are their own signal,
-        // so its severity getter is always `None`. Its header is `HEALTH` (issue #99).
+        // The AUTH column carries the credential-auth state — the 4-state+Unknown glyph
+        // (issue #119/#137) plus its cues (`claude /login` on 🔴, `recovering`, `disabled`);
+        // it is never tinted (issue #84) — the glyph is self-coloring and the tags are their
+        // own signal, so its severity getter is always `None`. Its header is `AUTH` (issue
+        // #143, renamed from the over-general `HEALTH` of issue #99 — this column reports
+        // the credential-AUTH standing, while rate-limit health lives in `SESSION%`/`WEEKLY%`).
         columns.push(Column::droppable(
-            "HEALTH",
+            "AUTH",
             2,
             |row| &row.status,
             |_| None,
@@ -664,7 +684,7 @@ struct StatusRow {
     weekly: String,
     /// Compact time until the WEEKLY window resets, or `n/a` (issue #94).
     weekly_reset: String,
-    /// The HEALTH cell (issue #119): the daemon's 4-state credential rollup as ONE glyph
+    /// The AUTH cell (issue #119): the daemon's 4-state credential rollup as ONE glyph
     /// (🟢 healthy · 🟡 stale · 🟠 at-risk · 🔴 dead), with the `claude /login` cue appended
     /// for a dead account — softened to `recovering` for a healing quarantined one (#109) —
     /// and a trailing `disabled` for a parked account (#36, orthogonal to credential health).
@@ -715,7 +735,7 @@ impl StatusRow {
     }
 }
 
-/// The `status` HEALTH cell for one account (issue #119): the daemon's 4-state credential
+/// The `status` AUTH cell for one account (issue #119): the daemon's 4-state credential
 /// rollup as ONE glyph plus the minimal cue an operator needs to act, with the `disabled`
 /// rotation tag (#36) — orthogonal to credential health — appended.
 ///
@@ -765,7 +785,7 @@ fn health_glyph(health: CredentialHealth) -> &'static str {
     }
 }
 
-/// The pre-#119 HEALTH text for an account whose daemon sent no rollup (`health == None`):
+/// The pre-#119 AUTH-column text for an account whose daemon sent no rollup (`health == None`):
 /// the comma-joined `disabled` (#36) + `needs re-login` / `recovering` (#42/#109) tags the
 /// column carried before the glyph rollup. Kept so a `status` client talking to an older
 /// daemon degrades gracefully rather than showing a defaulted-healthy glyph over a dead
@@ -1189,6 +1209,63 @@ fn humanize_until(secs: i64) -> String {
         format!("{mins}m")
     } else {
         "<1m".to_owned()
+    }
+}
+
+/// The `status --verbose` access-token expiry block (issue #143): one line per account
+/// with the RAW access-token "expires in", printed under the table when `-v`/`--verbose`
+/// is passed. Empty for an empty roster (the table renders its own empty state).
+///
+/// The clock is the wire's `access_expires_at` — the refresh-sourced access-token expiry
+/// when `[refresh]` is on, else the poll-sourced fallback the daemon folds into the same
+/// field (issue #141), so it is populated in the default config too. It is LABELLED
+/// ("auto-refreshed by Claude Code, not a re-login deadline") because Claude Code
+/// refreshes this token invisibly: a lapsed access clock is NOT the re-login signal — that
+/// is the `🔴` AUTH cell's `claude /login` cue (issue #143). Kept out of the default table
+/// (a raw clock there would be misread as a deadline); `--verbose` is the opt-in for the
+/// raw number, mirroring the `--json` full-data contract that already carries it.
+///
+/// Sourced solely from each account's label + the non-secret `access_expires_at` timestamp
+/// — a reprojection of fields the wire and table already carry, no new secret-bearing input —
+/// so it can never print a token or email (issue #15); pure over the [`StatusResponse`] +
+/// `now`, so the rendering is unit-testable without a live socket. `pub(crate)` so the issue-#15
+/// redaction METER (driven from [`crate::daemon`]) routes this new operator-facing surface
+/// through its scan too, alongside [`render_status`] and [`render_roster`].
+pub(crate) fn render_access_token_expiry(response: &StatusResponse, now: i64) -> String {
+    if response.accounts.is_empty() {
+        return String::new();
+    }
+    // Pad each label to the widest (by char count, matching the `{:<width$}` fill and the
+    // `list` view) so the expiry column lines up under a two-space gap.
+    let width = response
+        .accounts
+        .iter()
+        .map(|account| account.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out =
+        String::from("\naccess token — auto-refreshed by Claude Code, not a re-login deadline:\n");
+    for account in &response.accounts {
+        out.push_str(&format!(
+            "  {:<width$}  {}\n",
+            account.label,
+            access_token_expiry_cell(account.access_expires_at, now),
+        ));
+    }
+    out
+}
+
+/// One account's access-token "expires in" for the `--verbose` block (issue #143):
+/// `expires in <compact>` for a future expiry — the same two-largest-unit clock the table's
+/// resets render (via [`humanize_until`]) — `expired` once at/past `now`, or `unknown` when
+/// the daemon carries no expiry for the account (never a fabricated duration). The wire
+/// clock is epoch SECONDS (issue #119/#141), so it differences against `now` directly —
+/// unlike the `list` view's `expiry_tag`, which reduces a millisecond stash read first.
+fn access_token_expiry_cell(expires_at: Option<i64>, now: i64) -> String {
+    match expires_at {
+        Some(at) if at <= now => "expired".to_owned(),
+        Some(at) => format!("expires in {}", humanize_until(at - now)),
+        None => "unknown".to_owned(),
     }
 }
 
@@ -2036,7 +2113,7 @@ spare  22222222-2222\n\
         // The glyph IS the signal — present even without color, and #15-clean.
         assert!(!out.contains('@'));
         assert!(!out.to_lowercase().contains("token"));
-        // The HEALTH column starts at the SAME display offset in both rows — the preceding
+        // The AUTH column starts at the SAME display offset in both rows — the preceding
         // columns pad to one width despite the dead row's `n/a` cells and the healthy row's
         // `%` readings (the last column's own trailing pad is trimmed, so total line widths
         // legitimately differ; the wide-glyph cell width itself is covered by
@@ -2046,8 +2123,151 @@ spare  22222222-2222\n\
         assert_eq!(
             glyph_offset(work, "🟢"),
             glyph_offset(spare, "🔴"),
-            "the HEALTH column is misaligned across rows:\n{out}"
+            "the AUTH column is misaligned across rows:\n{out}"
         );
+    }
+
+    // --- status: AUTH column rename + verbose access-token clock (issue #143) --
+
+    #[test]
+    fn render_status_labels_the_credential_column_auth_not_health() {
+        // #143 Part A: the credential column header is `AUTH` (was `HEALTH`) — it names the
+        // credential-AUTH standing, not a vague "health" (rate-limit health lives in the `%`
+        // columns). Any glyph rollup materializes the column and its label.
+        let response = StatusResponse {
+            accounts: vec![AccountStatusLine {
+                health: Some(CredentialHealth::Healthy),
+                ..status_line("work", true, Some(10), Some(20))
+            }],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        let header = out.lines().next().expect("a header row");
+        assert!(
+            header.contains("AUTH") && !header.contains("HEALTH"),
+            "the credential column header is AUTH, not HEALTH: {header:?}"
+        );
+    }
+
+    #[test]
+    fn render_status_renders_every_rollup_state_including_unknown_under_auth() {
+        // #143 + #137: the AUTH column renders each of the four states AND the neutral ⚪
+        // Unknown (#137) as its self-coloring glyph, so `status` tells "unverified" apart
+        // from a genuine 🟢 at a glance — and the DEAD account keeps its `claude /login` cue.
+        use CredentialHealth::{AtRisk, Dead, Healthy, Stale, Unknown};
+        let line = |label, health| AccountStatusLine {
+            health: Some(health),
+            ..status_line(label, false, Some(10), Some(20))
+        };
+        let response = StatusResponse {
+            accounts: vec![
+                line("healthy", Healthy),
+                line("unknownacct", Unknown),
+                line("staleacct", Stale),
+                line("atriskacct", AtRisk),
+                {
+                    let mut dead = line("deadacct", Dead);
+                    dead.quarantined = true;
+                    dead
+                },
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        let row = |label| out.lines().find(|l| l.contains(label)).unwrap().to_owned();
+        assert!(row("healthy").contains("🟢"), "{}", row("healthy"));
+        assert!(row("unknownacct").contains("⚪"), "{}", row("unknownacct"));
+        assert!(row("staleacct").contains("🟡"), "{}", row("staleacct"));
+        assert!(row("atriskacct").contains("🟠"), "{}", row("atriskacct"));
+        assert!(
+            row("deadacct").contains("🔴") && row("deadacct").contains("claude /login"),
+            "the dead state keeps its glyph and re-login cue: {}",
+            row("deadacct")
+        );
+        // Rendered under the renamed AUTH header (#143).
+        assert!(out.lines().next().unwrap().contains("AUTH"));
+    }
+
+    #[test]
+    fn access_token_expiry_cell_renders_future_expired_and_absent() {
+        // #143 Part B: the raw access-token clock — `expires in <compact>` ahead of `now`,
+        // `expired` at/past it, and an honest `unknown` when no expiry is stored (never a
+        // fabricated duration). The wire clock is epoch SECONDS, differenced directly.
+        assert_eq!(
+            access_token_expiry_cell(Some(NOW + 4 * 3_600), NOW),
+            "expires in 4h"
+        );
+        assert_eq!(access_token_expiry_cell(Some(NOW), NOW), "expired");
+        assert_eq!(access_token_expiry_cell(Some(NOW - 60), NOW), "expired");
+        assert_eq!(access_token_expiry_cell(None, NOW), "unknown");
+    }
+
+    #[test]
+    fn status_verbose_surfaces_the_labeled_clock_while_the_default_table_omits_it() {
+        // #143 Part B: `--verbose` surfaces the raw access-token "expires in" per account,
+        // LABELLED so it is never misread as a re-login deadline; an account with no stored
+        // expiry reads an honest `unknown`. The DEFAULT table stays compact — no raw clock.
+        let response = StatusResponse {
+            accounts: vec![
+                AccountStatusLine {
+                    health: Some(CredentialHealth::Healthy),
+                    access_expires_at: Some(NOW + 4 * 3_600),
+                    ..status_line("work", true, Some(10), Some(20))
+                },
+                AccountStatusLine {
+                    health: Some(CredentialHealth::Unknown),
+                    access_expires_at: None,
+                    ..status_line("spare", false, None, None)
+                },
+            ],
+            next_swap: None,
+        };
+        // Default (non-verbose) table: no raw expiry clock anywhere (AC: "no raw expiry
+        // clock in the default table").
+        let table = render_status(&response, NOW, None, false);
+        assert!(
+            !table.contains("expires in") && !table.contains("access token"),
+            "the default table stays compact — no raw clock: {table}"
+        );
+        // Verbose block: labeled, per-account, honest placeholder for the absent one.
+        let verbose = render_access_token_expiry(&response, NOW);
+        assert!(
+            verbose.contains("not a re-login deadline"),
+            "the block is labeled so the clock is not misread as a deadline: {verbose}"
+        );
+        let vline = |label| {
+            verbose
+                .lines()
+                .find(|l| l.contains(label))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            vline("work").contains("expires in 4h"),
+            "the polled account shows its access-token expiry: {}",
+            vline("work")
+        );
+        assert!(
+            vline("spare").contains("unknown"),
+            "an account with no stored expiry reads an honest placeholder: {}",
+            vline("spare")
+        );
+        // #15: sourced from labels + a timestamp only, so no email rides the surface.
+        assert!(
+            !verbose.contains('@'),
+            "no email on the verbose surface: {verbose}"
+        );
+    }
+
+    #[test]
+    fn render_access_token_expiry_is_empty_for_an_empty_roster() {
+        // No accounts → no block at all (the table renders its own empty state), so a bare
+        // `status --verbose` on an empty roster adds nothing.
+        let response = StatusResponse {
+            accounts: vec![],
+            next_swap: None,
+        };
+        assert_eq!(render_access_token_expiry(&response, NOW), "");
     }
 
     #[test]
@@ -2172,7 +2392,7 @@ spare  22222222-2222\n\
             weekly_resets_at: None,
             weekly_exhausted: false,
             // The layout / alignment / coloring tests below exercise the legacy
-            // (pre-#119) HEALTH text via `health: None`; the #119 glyph rollup has its
+            // (pre-#119) AUTH-column text via `health: None`; the #119 glyph rollup has its
             // own dedicated tests (`health_cell` + `render_status` with `Some(..)`).
             access_expires_at: None,
             refresh_health: None,
@@ -2219,7 +2439,7 @@ spare  22222222-2222\n\
         // ties the pair; two spaces separate the SESSION pair from the WEEKLY pair),
         // aligned in columns — header and data measured into the SAME widths — one
         // record per line, then the forward-looking next-swap footer (#88). Healthy
-        // roster (no tags) → no health-text column, so no `HEALTH` label. The exact
+        // roster (no tags) → no AUTH column, so no `AUTH` label. The exact
         // match proves the header row, the paired column order, and the alignment.
         let mut work = status_line_resets(
             "work",
@@ -2300,8 +2520,10 @@ spare  22222222-2222\n\
             );
         }
         // The `--json` surface is serialized field names, not these display labels.
+        // (The rollup key is the lowercase `auth` in JSON, #143; the uppercase `AUTH`
+        // display label still never appears there.)
         let json = serde_json::to_string(&response).unwrap();
-        for label in ["ACCOUNT", "SESSION%", "WEEKLY%", "HEALTH"] {
+        for label in ["ACCOUNT", "SESSION%", "WEEKLY%", "AUTH"] {
             assert!(
                 !json.contains(label),
                 "the header label {label:?} is text-view only, never in --json: {json}"
@@ -2373,7 +2595,7 @@ spare  22222222-2222\n\
         // Header row (issue #99): the FIRST line labels the columns — `ACCOUNT`, then
         // the grouped `SESSION%`+`RESET` and `WEEKLY%`+`RESET` pairs (each window's
         // reset shares the `RESET` label, disambiguated by adjacency to its `%`). No
-        // tags here → no `HEALTH` column. This restores a header #94 had removed.
+        // tags here → no `AUTH` column. This restores a header #94 had removed.
         let header = out.lines().next().expect("a header row");
         assert!(
             header.starts_with("ACCOUNT")
@@ -2383,8 +2605,8 @@ spare  22222222-2222\n\
             "header labels the columns in paired order: {header:?}"
         );
         assert!(
-            !header.contains("HEALTH"),
-            "no HEALTH label when no account carries a tag: {header:?}"
+            !header.contains("AUTH"),
+            "no AUTH label when no account carries a tag: {header:?}"
         );
         // Greppable: one record per line — each label on exactly one line.
         for label in ["work", "spare", "third"] {
@@ -2394,8 +2616,8 @@ spare  22222222-2222\n\
 
     #[test]
     fn render_status_marks_disabled_and_quarantined_in_a_status_column() {
-        // A tag on any account adds the health-text column (issue #94), labelled
-        // `HEALTH` (issue #99); both tags can hold at once.
+        // A tag on any account adds the AUTH column (issue #94), labelled
+        // `AUTH` (issue #99, renamed from `HEALTH` in #143); both tags can hold at once.
         let mut quarantined = status_line("dead", false, None, None);
         quarantined.enabled = false;
         quarantined.quarantined = true;
@@ -2448,7 +2670,7 @@ spare  22222222-2222\n\
         );
         let full_header = full.lines().next().unwrap();
         assert!(
-            full_header.contains("WEEKLY%") && full_header.contains("HEALTH"),
+            full_header.contains("WEEKLY%") && full_header.contains("AUTH"),
             "the full header carries every label: {full_header:?}"
         );
         // Narrow (33 ≤ 40 < 48): the WEEKLY pair drops first, atomically — NEITHER
@@ -2467,7 +2689,7 @@ spare  22222222-2222\n\
         assert!(
             narrow_header.starts_with("ACCOUNT")
                 && narrow_header.contains("SESSION%")
-                && narrow_header.contains("HEALTH")
+                && narrow_header.contains("AUTH")
                 && !narrow_header.contains("WEEKLY%"),
             "the WEEKLY label drops with its columns; ACCOUNT + SESSION% kept: {narrow_header:?}"
         );
@@ -2487,7 +2709,7 @@ spare  22222222-2222\n\
             tiny_header.starts_with("ACCOUNT")
                 && tiny_header.contains("SESSION%")
                 && !tiny_header.contains("WEEKLY%")
-                && !tiny_header.contains("HEALTH"),
+                && !tiny_header.contains("AUTH"),
             "only ACCOUNT + the SESSION group labels remain: {tiny_header:?}"
         );
         assert_eq!(tiny.lines().filter(|l| l.contains("work")).count(), 1);
@@ -2824,7 +3046,7 @@ spare  22222222-2222\n\
         assert_eq!(display_width("日本語"), 6);
         assert_eq!("日本語".chars().count(), 3); // the count it must NOT use
                                                  // #137's ⚪ (U+26AA, emoji-presentation) is two cells, like the 🟢/🟡/🟠/🔴
-                                                 // rollup glyphs, so the HEALTH column stays aligned.
+                                                 // rollup glyphs, so the AUTH column stays aligned.
         assert_eq!(display_width("⚪"), 2);
         assert_eq!(display_width("🟢"), 2);
         // A combining mark adds no width: "e" + U+0301 (combining acute) → one cell.
