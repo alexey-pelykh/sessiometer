@@ -425,6 +425,38 @@ pub(crate) enum Error {
     #[error("invalid migration artifact: {0}")]
     MigrationInvalid(&'static str),
 
+    // --- Migration encryption envelope (issue #147) ---------------------------
+    //
+    // The optional passphrase-encryption layer's own outcomes (see
+    // [`crate::migration`]). All secret-free: they carry no passphrase, no key, and
+    // no plaintext — a decrypt failure never distinguishes wrong-passphrase from
+    // tamper (no decryption oracle) and never echoes any byte.
+    /// The passphrase supplied for encryption was EMPTY. Encrypt mode refuses this as
+    /// a hard error — it must never silently fall back to plaintext, nor "encrypt"
+    /// under an empty key. Secret-free.
+    #[error("a passphrase is required — an empty passphrase is refused")]
+    MigrationEmptyPassphrase,
+
+    /// A migration artifact could not be encrypted (the AEAD refused, e.g. the payload
+    /// exceeded the cipher's message limit). Carries no plaintext. Secret-free.
+    #[error("could not encrypt the migration artifact")]
+    MigrationEncryptFailed,
+
+    /// Authentication FAILED while decrypting a migration artifact: a wrong passphrase,
+    /// or a tampered / downgraded / truncated file. A single variant for all three so
+    /// it is not a decryption oracle; ZERO plaintext is produced. Secret-free.
+    #[error(
+        "could not decrypt the migration artifact: wrong passphrase, or the file was \
+         tampered with or truncated"
+    )]
+    MigrationDecryptFailed,
+
+    /// The migration artifact's KDF / cipher parameters are unsupported or malformed —
+    /// an unrecognized algorithm, an out-of-range Argon2 cost, or a wrong-length nonce.
+    /// A static, secret-free reason; never the parameter bytes.
+    #[error("unsupported or malformed migration crypto parameters: {0}")]
+    MigrationCryptoParams(&'static str),
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
