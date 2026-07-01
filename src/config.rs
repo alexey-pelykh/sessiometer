@@ -29,6 +29,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::paths;
 use crate::timing::{Jitter, Strategy};
+use crate::usage_store::RetentionPolicy;
 
 /// Default seconds between re-polling a given account — the per-account cadence.
 /// Issue #38 lengthened this from the original fixed 60 s to a longer base that the
@@ -88,6 +89,30 @@ const DEFAULT_REFRESH_TIMEOUT_SECS: u64 = 90;
 /// headless `claude -p` spawn; the operator-tunable range (60..=600) bounds both an impatient
 /// and a very patient operator.
 const DEFAULT_LOGIN_TIMEOUT_SECS: u64 = 180;
+
+/// Default raw-tier retention horizon (~14 d) for the usage-stats store (issue #161).
+/// Mirrors [`crate::usage_store`]'s self-contained `DEFAULT_RAW_WINDOW_SECS` — this
+/// block is the operator-facing source of truth the daemon threads into the store's
+/// [`crate::usage_store::RetentionPolicy`], kept in sync by the
+/// `stats_defaults_match_the_store` test.
+const DEFAULT_STATS_RAW_RETENTION_SECS: u64 = 14 * 86_400;
+/// Default hourly-tier retention horizon (~90 d) for the usage-stats store (issue #161).
+/// Mirrors the store's `DEFAULT_HOURLY_WINDOW_SECS`.
+const DEFAULT_STATS_HOURLY_RETENTION_SECS: u64 = 90 * 86_400;
+/// Default daily-tier retention horizon (issue #161). **`0` = lifetime**: the daily
+/// aggregate tier is kept for the store's whole lifetime by design (a summarised day
+/// cannot be recovered once its raw samples age out), so the default preserves that.
+/// A non-zero value opts INTO bounding the daily tier to that many seconds.
+const DEFAULT_STATS_DAILY_RETENTION_SECS: u64 = 0;
+/// Default reporting period for the offline `stats` verb (issue #161) — the window it
+/// selects when `--period` / `--since` are both omitted. One of the `stats`
+/// vocabulary (`day` | `week` | `month` | `lifetime`); `week` matches that verb's own
+/// built-in default.
+const DEFAULT_STATS_PERIOD: &str = "week";
+/// The valid `[stats].default_period` tokens (issue #161), the SAME vocabulary the
+/// `stats` verb's `--period` accepts (`crate::stats::PeriodSpec`). Validated here so a
+/// bad value fails at config-load with a clear message rather than at `stats`-run.
+const STATS_PERIODS: [&str; 4] = ["day", "week", "month", "lifetime"];
 
 /// The keychain service-name namespace every account's stash lives under; the
 /// full name is `Sessiometer/<account_uuid>` ([`Account::stash`]). Kept as one
@@ -342,6 +367,64 @@ impl LoginConfig {
     }
 }
 
+/// The usage-stats subsystem's settings (issue #161): the retention horizons the daemon
+/// threads into the store's [`RetentionPolicy`] when it compacts + rolls the sample store
+/// (issues #155/#156), plus the default reporting period for the offline `stats` verb (#158).
+///
+/// All keys are optional with documented, BOUNDED defaults, so a config with no `[stats]`
+/// table (or none at all) uses [`StatsConfig::default`] — the same opt-out contract as the
+/// other blocks. Nothing here is secret: horizons are plain durations and the period is a
+/// fixed vocabulary token, never an account handle, email, or token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatsConfig {
+    /// Seconds a raw sample is kept in the append-only raw tier before its whole aged-out
+    /// day is folded into the hourly/daily aggregates (`3600..=31_536_000`, i.e. 1 h..365 d).
+    /// The daemon carries this into [`RetentionPolicy::raw_window_secs`]. Larger = more
+    /// point-in-time detail retained, at more on-disk raw lines.
+    pub(crate) raw_retention_secs: u64,
+    /// Seconds an hourly-aggregate bucket is kept before it is pruned (`86_400..=315_360_000`,
+    /// i.e. 1 d..10 y) — [`RetentionPolicy::hourly_window_secs`]. The mid-resolution tier: long
+    /// enough to chart a season, bounded so the rollup file cannot grow without limit.
+    pub(crate) hourly_retention_secs: u64,
+    /// Seconds a daily-aggregate bucket is kept, or **`0` for lifetime** (`0..=315_360_000`).
+    /// The daily tier is kept for the store's whole lifetime BY DESIGN (a summarised day
+    /// cannot be recovered once its raw samples age out), so `0` (the default) preserves that;
+    /// a non-zero value opts into bounding it — [`RetentionPolicy::daily_window_secs`].
+    pub(crate) daily_retention_secs: u64,
+    /// The reporting period the offline `stats` verb selects when neither `--period` nor
+    /// `--since` is given (issue #158): one of `day` | `week` | `month` | `lifetime`. Validated
+    /// against that vocabulary at load ([`STATS_PERIODS`]) so a typo fails fast, not at run.
+    pub(crate) default_period: String,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            raw_retention_secs: DEFAULT_STATS_RAW_RETENTION_SECS,
+            hourly_retention_secs: DEFAULT_STATS_HOURLY_RETENTION_SECS,
+            daily_retention_secs: DEFAULT_STATS_DAILY_RETENTION_SECS,
+            default_period: DEFAULT_STATS_PERIOD.to_owned(),
+        }
+    }
+}
+
+impl StatsConfig {
+    /// Build the store's [`RetentionPolicy`] from these horizons plus the daemon's poll
+    /// cadence (issue #161). `poll_interval_secs` — the `[tunables].poll_secs` the daemon
+    /// actually polls at — is the coverage denominator (observed ÷ expected samples per day),
+    /// so it is threaded in here rather than duplicated in `[stats]`. The daily horizon's
+    /// `0 = lifetime` sentinel passes straight through to
+    /// [`RetentionPolicy::daily_window_secs`] (also `0 = lifetime`).
+    pub(crate) fn retention_policy(&self, poll_interval_secs: i64) -> RetentionPolicy {
+        RetentionPolicy {
+            raw_window_secs: self.raw_retention_secs as i64,
+            hourly_window_secs: self.hourly_retention_secs as i64,
+            daily_window_secs: self.daily_retention_secs as i64,
+            poll_interval_secs,
+        }
+    }
+}
+
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -359,6 +442,10 @@ pub(crate) struct Config {
     /// The one-shot `login` verb's settings (issue #135): capture timeout + optional `claude`
     /// binary override. Consumed by `crate::capture::login`, never by the daemon.
     pub(crate) login: LoginConfig,
+    /// The usage-stats subsystem's settings (issue #161): store retention horizons + the
+    /// offline `stats` verb's default period. The daemon derives its [`RetentionPolicy`] from
+    /// this ([`StatsConfig::retention_policy`]) to compact + roll the sample store.
+    pub(crate) stats: StatsConfig,
 }
 
 impl Config {
@@ -616,11 +703,48 @@ impl Config {
                 .map(PathBuf::from),
         };
 
+        // The usage-stats subsystem's settings (issue #161). Each retention horizon is
+        // bounds-checked like the tunables; the daily horizon's lower bound is 0 (its
+        // lifetime sentinel). `default_period` is validated against the fixed `stats`
+        // vocabulary so a typo fails at load, not at `stats`-run. No cross-field rules.
+        let s = raw.stats;
+        range(
+            "stats.raw_retention_secs",
+            s.raw_retention_secs,
+            3_600,
+            31_536_000,
+        )?;
+        range(
+            "stats.hourly_retention_secs",
+            s.hourly_retention_secs,
+            86_400,
+            315_360_000,
+        )?;
+        range(
+            "stats.daily_retention_secs",
+            s.daily_retention_secs,
+            0,
+            315_360_000,
+        )?;
+        if !STATS_PERIODS.contains(&s.default_period.as_str()) {
+            return Err(Error::ConfigInvalid(format!(
+                "stats.default_period must be one of {STATS_PERIODS:?}, got {:?}",
+                s.default_period
+            )));
+        }
+        let stats = StatsConfig {
+            raw_retention_secs: s.raw_retention_secs as u64,
+            hourly_retention_secs: s.hourly_retention_secs as u64,
+            daily_retention_secs: s.daily_retention_secs as u64,
+            default_period: s.default_period,
+        };
+
         Ok(Config {
             roster,
             tunables,
             refresh,
             login,
+            stats,
         })
     }
 
@@ -782,6 +906,46 @@ impl Config {
             )),
             None => out.push_str("# claude_bin = \"/absolute/path/to/claude\"\n"),
         }
+
+        // The usage-stats subsystem (issue #161): retention horizons the daemon threads into
+        // the sample store's compaction, plus the offline `stats` verb's default period. The
+        // next block ([migration], #150) renders after this one, before [[account]].
+        let s = &self.stats;
+        out.push_str("\n[stats]\n");
+        out.push_str(
+            "# The usage-stats store: the daemon records one sample per poll and periodically\n\
+             # rolls aged raw samples down into hourly then daily aggregates. These horizons bound\n\
+             # each tier; the `stats` verb reads the store offline.\n",
+        );
+        out.push_str(
+            "# Seconds a raw per-poll sample is kept before its whole aged-out day is folded into\n\
+             # the aggregates (3600..=31536000, i.e. 1h..365d).\n",
+        );
+        out.push_str(&format!("raw_retention_secs = {}\n", s.raw_retention_secs));
+        out.push_str(
+            "# Seconds an hourly-aggregate bucket is kept before it is pruned\n\
+             # (86400..=315360000, i.e. 1d..10y).\n",
+        );
+        out.push_str(&format!(
+            "hourly_retention_secs = {}\n",
+            s.hourly_retention_secs
+        ));
+        out.push_str(
+            "# Seconds a daily-aggregate bucket is kept, or 0 for lifetime (0..=315360000). The\n\
+             # daily tier is kept for the store's lifetime by default; set non-zero to bound it.\n",
+        );
+        out.push_str(&format!(
+            "daily_retention_secs = {}\n",
+            s.daily_retention_secs
+        ));
+        out.push_str(
+            "# Default `stats` reporting period when --period/--since are omitted:\n\
+             # day | week | month | lifetime.\n",
+        );
+        out.push_str(&format!(
+            "default_period = {}\n",
+            basic_string(&s.default_period)
+        ));
 
         for account in &self.roster {
             out.push_str("\n[[account]]\n");
@@ -951,6 +1115,8 @@ struct RawConfig {
     refresh: RawRefresh,
     #[serde(default)]
     login: RawLogin,
+    #[serde(default)]
+    stats: RawStats,
 }
 
 #[derive(Deserialize)]
@@ -1100,6 +1266,47 @@ impl Default for RawLogin {
 
 fn default_login_timeout_secs() -> i64 {
     DEFAULT_LOGIN_TIMEOUT_SECS as i64
+}
+
+/// Permissive deserialization of the optional `[stats]` table (issue #161): every key
+/// optional with a documented default, the retention horizons kept wide (`i64`) so an
+/// out-of-range value reaches [`Config::validate`] with a clear message rather than a bare
+/// `serde` type error. `deny_unknown_fields` rejects a stray key as a parse error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStats {
+    #[serde(default = "default_stats_raw_retention_secs")]
+    raw_retention_secs: i64,
+    #[serde(default = "default_stats_hourly_retention_secs")]
+    hourly_retention_secs: i64,
+    #[serde(default = "default_stats_daily_retention_secs")]
+    daily_retention_secs: i64,
+    #[serde(default = "default_stats_period")]
+    default_period: String,
+}
+
+impl Default for RawStats {
+    fn default() -> Self {
+        Self {
+            raw_retention_secs: default_stats_raw_retention_secs(),
+            hourly_retention_secs: default_stats_hourly_retention_secs(),
+            daily_retention_secs: default_stats_daily_retention_secs(),
+            default_period: default_stats_period(),
+        }
+    }
+}
+
+fn default_stats_raw_retention_secs() -> i64 {
+    DEFAULT_STATS_RAW_RETENTION_SECS as i64
+}
+fn default_stats_hourly_retention_secs() -> i64 {
+    DEFAULT_STATS_HOURLY_RETENTION_SECS as i64
+}
+fn default_stats_daily_retention_secs() -> i64 {
+    DEFAULT_STATS_DAILY_RETENTION_SECS as i64
+}
+fn default_stats_period() -> String {
+    DEFAULT_STATS_PERIOD.to_owned()
 }
 
 /// Permissive deserialization of the optional `[jitter]` table (issue #38): each
@@ -2019,5 +2226,154 @@ label = "personal"
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // --- [stats] block (issue #161) -----------------------------------------
+
+    #[test]
+    fn stats_defaults_when_the_table_is_absent() {
+        // A config with no `[stats]` table (VALID has none) loads the documented defaults —
+        // the same opt-out contract as `[refresh]` / `[login]`.
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.stats, StatsConfig::default());
+        assert_eq!(config.stats.raw_retention_secs, 14 * 86_400);
+        assert_eq!(config.stats.hourly_retention_secs, 90 * 86_400);
+        assert_eq!(config.stats.daily_retention_secs, 0); // 0 = lifetime
+        assert_eq!(config.stats.default_period, "week");
+    }
+
+    #[test]
+    fn parses_a_full_stats_override() {
+        // Every key set to a non-default the operator chose, all within bounds.
+        let toml = format!(
+            "{VALID}\n[stats]\n\
+             raw_retention_secs = 604800\n\
+             hourly_retention_secs = 2592000\n\
+             daily_retention_secs = 31536000\n\
+             default_period = \"month\"\n"
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.stats,
+            StatsConfig {
+                raw_retention_secs: 604_800,
+                hourly_retention_secs: 2_592_000,
+                daily_retention_secs: 31_536_000,
+                default_period: "month".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_partial_stats_table_fills_only_named_keys() {
+        // Like `[refresh]`, a partial table sets only the named key; the rest default.
+        let toml = format!("{VALID}\n[stats]\ndefault_period = \"lifetime\"\n");
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.stats.default_period, "lifetime");
+        assert_eq!(config.stats.raw_retention_secs, 14 * 86_400); // untouched → default
+        assert_eq!(config.stats.daily_retention_secs, 0);
+    }
+
+    #[test]
+    fn rendered_default_config_round_trips_the_stats_block() {
+        // The rendered default config carries a `[stats]` block that reparses to the same
+        // settings — the render → parse round-trip the other blocks hold to.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(text.contains("[stats]"), "render must emit [stats]: {text}");
+        assert!(
+            text.contains("raw_retention_secs ="),
+            "render must document raw retention: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.stats, config.stats);
+    }
+
+    #[test]
+    fn rendered_stats_round_trips_operator_overrides() {
+        // Operator-set non-defaults survive render → parse unchanged (defaults + overrides,
+        // the issue's round-trip AC).
+        let mut config = Config::parse(VALID).unwrap();
+        config.stats = StatsConfig {
+            raw_retention_secs: 3_600,          // the lower bound
+            hourly_retention_secs: 315_360_000, // the upper bound
+            daily_retention_secs: 7_776_000,
+            default_period: "day".to_owned(),
+        };
+        let text = config.render();
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.stats, config.stats);
+    }
+
+    #[test]
+    fn rejects_each_out_of_range_stats_horizon() {
+        for (key, value) in [
+            ("raw_retention_secs", "3599"),     // below 1h
+            ("raw_retention_secs", "31536001"), // above 365d
+            ("hourly_retention_secs", "86399"), // below 1d
+            ("hourly_retention_secs", "315360001"),
+            ("daily_retention_secs", "-1"), // below the 0 = lifetime floor
+            ("daily_retention_secs", "315360001"), // above the cap
+        ] {
+            let toml = format!("{VALID}\n[stats]\n{key} = {value}\n");
+            assert!(
+                matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
+                "stats.{key} = {value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_zero_daily_retention_as_lifetime() {
+        // The 0 = lifetime sentinel is IN range (it is the default), not rejected.
+        let toml = format!("{VALID}\n[stats]\ndaily_retention_secs = 0\n");
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.stats.daily_retention_secs, 0);
+    }
+
+    #[test]
+    fn rejects_an_unknown_stats_default_period() {
+        let toml = format!("{VALID}\n[stats]\ndefault_period = \"fortnight\"\n");
+        assert!(matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))));
+    }
+
+    #[test]
+    fn rejects_an_unknown_stats_key() {
+        // `deny_unknown_fields` rejects a stray key as a parse error, like the other tables.
+        let toml = format!("{VALID}\n[stats]\nbogus = 1\n");
+        assert!(matches!(Config::parse(&toml), Err(Error::ConfigParse(_))));
+    }
+
+    #[test]
+    fn stats_defaults_match_the_store_retention_policy() {
+        // The `[stats]` defaults are the operator-facing source of truth for the store's
+        // RetentionPolicy — so the default `[stats]` maps to exactly RetentionPolicy::default()
+        // (raw ~14d, hourly ~90d, daily 0 = lifetime), threading the store's own default poll
+        // cadence in as the coverage denominator. Guards the two from drifting apart.
+        let store_default = RetentionPolicy::default();
+        let derived = StatsConfig::default().retention_policy(store_default.poll_interval_secs);
+        assert_eq!(derived, store_default);
+    }
+
+    #[test]
+    fn stats_retention_policy_maps_every_horizon() {
+        let stats = StatsConfig {
+            raw_retention_secs: 100,
+            hourly_retention_secs: 200,
+            daily_retention_secs: 300,
+            default_period: "week".to_owned(),
+        };
+        let policy = stats.retention_policy(42);
+        assert_eq!(policy.raw_window_secs, 100);
+        assert_eq!(policy.hourly_window_secs, 200);
+        assert_eq!(policy.daily_window_secs, 300);
+        assert_eq!(policy.poll_interval_secs, 42);
+        // The daily lifetime sentinel passes straight through.
+        assert_eq!(
+            StatsConfig::default()
+                .retention_policy(42)
+                .daily_window_secs,
+            0
+        );
     }
 }

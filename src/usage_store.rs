@@ -271,6 +271,11 @@ pub(crate) struct RetentionPolicy {
     pub(crate) raw_window_secs: i64,
     /// Hourly buckets older than `now - hourly_window_secs` are pruned.
     pub(crate) hourly_window_secs: i64,
+    /// Daily buckets older than `now - daily_window_secs` are pruned, or — when this is
+    /// **`0` (the default, "lifetime")** — the daily tier is never pruned, kept for the
+    /// store's whole lifetime (issue #161). A summarised day cannot be rebuilt once its raw
+    /// samples age out, so lifetime is the default; a non-zero value opts INTO bounding it.
+    pub(crate) daily_window_secs: i64,
     /// The expected poll cadence, the denominator for daily coverage.
     pub(crate) poll_interval_secs: i64,
 }
@@ -280,9 +285,24 @@ impl Default for RetentionPolicy {
         Self {
             raw_window_secs: DEFAULT_RAW_WINDOW_SECS,
             hourly_window_secs: DEFAULT_HOURLY_WINDOW_SECS,
+            // 0 = lifetime: the daily tier is kept for the store's lifetime by default.
+            daily_window_secs: 0,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
         }
     }
+}
+
+/// What a [`compact_and_roll`] pass moved (issue #161) — the non-secret summary a caller
+/// (the daemon collector) turns into a redacted `usage_rollup` event. `raw_lines` is how
+/// many raw samples were folded down into the aggregates this pass (`0` = nothing aged out,
+/// so no event is emitted); `rolled_through_ts` is the store's roll watermark AFTER the pass
+/// (the newest sample epoch now folded). Both are plain integers — never a handle or token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RollSummary {
+    /// The roll watermark after this pass — the newest sample epoch folded into the tiers.
+    pub(crate) rolled_through_ts: i64,
+    /// How many raw samples this pass folded down into the hourly/daily aggregates.
+    pub(crate) raw_lines: u32,
 }
 
 /// Append one `sample` to the raw JSONL file as a single line.
@@ -360,12 +380,18 @@ pub(crate) fn read_rollup(rollup_path: &Path) -> Result<Rollup> {
 ///
 /// Idempotent: a second call with the same `now` re-rolls nothing (the watermark
 /// excludes already-folded samples, and the aged ones are gone from the raw file).
+///
+/// Returns a [`RollSummary`] naming what this pass folded (issue #161): `raw_lines` = how
+/// many raw samples were rolled down (`0` when nothing aged out), and the post-pass roll
+/// watermark. The daemon collector turns a non-empty summary into a redacted `usage_rollup`
+/// event; the value is non-secret (two integers), so returning it never widens the redaction
+/// surface.
 pub(crate) fn compact_and_roll(
     samples_path: &Path,
     rollup_path: &Path,
     now: i64,
     policy: &RetentionPolicy,
-) -> Result<()> {
+) -> Result<RollSummary> {
     let samples = read_samples(samples_path)?;
     let mut rollup = read_rollup(rollup_path)?;
 
@@ -385,16 +411,27 @@ pub(crate) fn compact_and_roll(
         // else: aged out AND already folded (ts <= watermark) → compacted away.
     }
 
+    // How many raw lines this pass folds down — the `usage_rollup` event's `raw_lines`
+    // (issue #161). Captured before `to_roll` is consumed by the fold below.
+    let raw_lines = to_roll.len() as u32;
     if let Some(newest) = to_roll.iter().map(|s| s.ts).max() {
         fold_into_tiers(&mut rollup, &to_roll, policy);
         rollup.rolled_through_ts = rollup.rolled_through_ts.max(newest);
     }
 
-    // Bound the hourly tier; the daily tier is lifetime.
+    // Bound the hourly tier. The daily tier is lifetime UNLESS the policy opts into a
+    // bound (`daily_window_secs > 0`, issue #161) — `0` keeps every daily bucket, the
+    // by-design lifetime default.
     let hourly_cutoff = now - policy.hourly_window_secs;
     rollup
         .hourly
         .retain(|bucket| bucket.hour_start >= hourly_cutoff);
+    if policy.daily_window_secs > 0 {
+        let daily_cutoff = now - policy.daily_window_secs;
+        rollup
+            .daily
+            .retain(|bucket| bucket.day_start >= daily_cutoff);
+    }
     rollup.hourly.sort_by_key(|bucket| bucket.hour_start);
     rollup.daily.sort_by_key(|bucket| bucket.day_start);
 
@@ -402,7 +439,10 @@ pub(crate) fn compact_and_roll(
     retained.sort_by_key(|sample| sample.ts);
     write_samples(samples_path, &retained)?;
     write_rollup(rollup_path, &rollup)?;
-    Ok(())
+    Ok(RollSummary {
+        rolled_through_ts: rollup.rolled_through_ts,
+        raw_lines,
+    })
 }
 
 /// Atomically rewrite the raw file to exactly `samples` (used by
@@ -1074,5 +1114,97 @@ mod tests {
     fn weighted_mean_pools_by_count() {
         // (0.2·1 + 0.8·3) / 4 = 0.65.
         assert!((weighted_mean(0.2, 1, 0.8, 3) - 0.65).abs() < 1e-9);
+    }
+
+    // --- issue #161: RollSummary + configurable daily retention ---------------
+
+    #[test]
+    fn compact_and_roll_reports_what_it_folded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        let policy = RetentionPolicy::default();
+        let now: i64 = 200 * DAY_SECS;
+        let aged = 10 * DAY_SECS; // one aged-out day (past the 14d raw window)
+        let recent = now - 2 * DAY_SECS; // inside the raw window
+        for k in 0..3 {
+            append_sample(&samples_path, &sample(aged + k * 600, 0.5, 0.6)).unwrap();
+        }
+        for k in 0..2 {
+            append_sample(&samples_path, &sample(recent + k * 600, 0.1, 0.2)).unwrap();
+        }
+
+        let summary = compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+        assert_eq!(summary.raw_lines, 3, "folded exactly the 3 aged samples");
+        assert_eq!(
+            summary.rolled_through_ts,
+            aged + 2 * 600,
+            "watermark = newest folded ts"
+        );
+
+        // A second pass folds nothing new: raw_lines 0 (so the daemon emits no event),
+        // watermark unchanged.
+        let again = compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+        assert_eq!(again.raw_lines, 0, "nothing new to fold");
+        assert_eq!(again.rolled_through_ts, summary.rolled_through_ts);
+    }
+
+    #[test]
+    fn zero_daily_window_keeps_the_daily_tier_for_the_stores_lifetime() {
+        // The default (`daily_window_secs = 0`) preserves the by-design lifetime daily tier.
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        let policy = RetentionPolicy::default();
+        assert_eq!(policy.daily_window_secs, 0, "default daily = lifetime");
+        let now: i64 = 400 * DAY_SECS;
+        let ancient = 5 * DAY_SECS; // ~395 days old
+        for k in 0..4 {
+            append_sample(&samples_path, &sample(ancient + k * 600, 0.5, 0.6)).unwrap();
+        }
+
+        compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+        let rollup = read_rollup(&rollup_path).unwrap();
+        assert!(
+            rollup
+                .daily
+                .iter()
+                .any(|d| d.day_start == day_start(ancient)),
+            "daily=0 keeps even a 395d-old day (lifetime)"
+        );
+    }
+
+    #[test]
+    fn a_nonzero_daily_window_prunes_aged_daily_buckets() {
+        // Opting into a bounded daily tier prunes days older than the window while keeping
+        // days inside it (issue #161) — retention honouring the `[stats]` config.
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        let policy = RetentionPolicy {
+            daily_window_secs: 60 * DAY_SECS, // bound the daily tier to ~60d
+            ..RetentionPolicy::default()
+        };
+        let now: i64 = 400 * DAY_SECS;
+        let ancient = 5 * DAY_SECS; // ~395d old → beyond the 60d daily window
+        let within = 370 * DAY_SECS; // 30d old → inside the 60d window (and past the raw window)
+        for k in 0..4 {
+            append_sample(&samples_path, &sample(ancient + k * 600, 0.5, 0.6)).unwrap();
+            append_sample(&samples_path, &sample(within + k * 600, 0.4, 0.5)).unwrap();
+        }
+
+        compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+        let rollup = read_rollup(&rollup_path).unwrap();
+        assert!(
+            !rollup
+                .daily
+                .iter()
+                .any(|d| d.day_start == day_start(ancient)),
+            "395d-old daily bucket pruned by the 60d window"
+        );
+        assert!(
+            rollup
+                .daily
+                .iter()
+                .any(|d| d.day_start == day_start(within)),
+            "30d-old daily bucket kept (inside the 60d window)"
+        );
     }
 }

@@ -45,7 +45,7 @@
 //! and prints.
 
 use crate::claude_state::{read_oauth_account, write_oauth_account, OauthAccount};
-use crate::config::{Account, Config, LoginConfig, RefreshConfig, Tunables};
+use crate::config::{Account, Config, LoginConfig, RefreshConfig, StatsConfig, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::login::login_account;
@@ -259,17 +259,24 @@ async fn run_capture(
     existing: Option<Config>,
     label: Option<&str>,
 ) -> Result<CaptureReport> {
-    // Preserve the existing tunables, the periodic-refresh schedule AND the `[login]` settings
-    // across a capture (issue #58, extended for #105/#135): adding an account to a config that
-    // already carries custom tunables / a `[refresh]` / `[login]` block must not reset any to
-    // defaults.
-    let (mut roster, tunables, refresh, login) = match existing {
-        Some(config) => (config.roster, config.tunables, config.refresh, config.login),
+    // Preserve the existing tunables, the periodic-refresh schedule, the `[login]` settings AND
+    // the `[stats]` settings across a capture (issue #58, extended for #105/#135/#161): adding an
+    // account to a config that already carries custom tunables / a `[refresh]` / `[login]` /
+    // `[stats]` block must not reset any to defaults.
+    let (mut roster, tunables, refresh, login, stats) = match existing {
+        Some(config) => (
+            config.roster,
+            config.tunables,
+            config.refresh,
+            config.login,
+            config.stats,
+        ),
         None => (
             Vec::new(),
             Tunables::default(),
             RefreshConfig::default(),
             LoginConfig::default(),
+            StatsConfig::default(),
         ),
     };
 
@@ -298,6 +305,7 @@ async fn run_capture(
             tunables,
             refresh,
             login,
+            stats,
         },
         outcome,
         label,
@@ -441,16 +449,23 @@ where
     C: CredentialStore,
     S: AccountStash,
 {
-    // Preserve the operator's tunables + refresh schedule + `[login]` settings across the
-    // reconcile, exactly like `run_capture` (#58/#105/#135): landing a login must never reset
-    // any of them to defaults.
-    let (mut roster, tunables, refresh, login) = match existing {
-        Some(config) => (config.roster, config.tunables, config.refresh, config.login),
+    // Preserve the operator's tunables + refresh schedule + `[login]` + `[stats]` settings across
+    // the reconcile, exactly like `run_capture` (#58/#105/#135/#161): landing a login must never
+    // reset any of them to defaults.
+    let (mut roster, tunables, refresh, login, stats) = match existing {
+        Some(config) => (
+            config.roster,
+            config.tunables,
+            config.refresh,
+            config.login,
+            config.stats,
+        ),
         None => (
             Vec::new(),
             Tunables::default(),
             RefreshConfig::default(),
             LoginConfig::default(),
+            StatsConfig::default(),
         ),
     };
 
@@ -488,6 +503,7 @@ where
             tunables,
             refresh,
             login,
+            stats,
         },
         outcome: outcome.into(),
         label,
@@ -778,6 +794,7 @@ mod tests {
             },
             refresh: RefreshConfig::default(),
             login: LoginConfig::default(),
+            stats: StatsConfig::default(),
         };
 
         let report = run_capture(
@@ -813,6 +830,7 @@ mod tests {
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
             login: login.clone(),
+            stats: StatsConfig::default(),
         };
 
         let report = run_capture(
@@ -838,6 +856,7 @@ mod tests {
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
             login: LoginConfig::default(),
+            stats: StatsConfig::default(),
         };
 
         let report = run_capture(
@@ -868,6 +887,7 @@ mod tests {
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
             login: LoginConfig::default(),
+            stats: StatsConfig::default(),
         };
 
         let report = run_capture(
@@ -1038,6 +1058,7 @@ mod tests {
             },
             refresh: RefreshConfig::default(),
             login: LoginConfig::default(),
+            stats: StatsConfig::default(),
         };
 
         let report = run_login(
@@ -1083,6 +1104,7 @@ mod tests {
             tunables: Tunables::default(),
             refresh: RefreshConfig::default(),
             login: LoginConfig::default(),
+            stats: StatsConfig::default(),
         };
 
         run_login(
