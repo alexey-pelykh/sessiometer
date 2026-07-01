@@ -44,6 +44,16 @@ pub(crate) async fn dispatch(args: std::env::ArgsOs) -> Result<()> {
                     let label = args.next().map(|s| s.to_string_lossy().into_owned());
                     crate::capture::capture(label).await
                 }
+                // `login [<label>]` runs `claude /login` in isolation, harvests the fresh
+                // credential, and lands it in the roster (issue #135): it onboards a new account
+                // or revives a parked one, re-pointing the active credential. The label is an
+                // optional positional (auto-derived from the account uuid when omitted, #134),
+                // parsed exactly like `capture`; extras ignored. A locked keychain aborts one-shot
+                // (exit 4, no wait loop); an operator cancel (SIGINT) exits 0 "nothing captured".
+                "login" => {
+                    let label = args.next().map(|s| s.to_string_lossy().into_owned());
+                    crate::capture::login(label).await
+                }
                 // `run [-v|--verbose]` — verbosity opts into the operator-facing
                 // diagnostic channel (issue #77); position-independent, mirroring
                 // `status --json`.
@@ -143,6 +153,7 @@ fn print_usage() {
          \n\
          COMMANDS:\n    \
          capture [<label>]    Stash the active account into the rotation\n    \
+         login [<label>]      Log in to an account (claude /login) in isolation and add it to the rotation\n    \
          run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)\n    \
          status [--json] [--no-color]  Show each account's usage + resets-in, and the next swap\n    \
          list       List captured accounts\n    \
@@ -1564,6 +1575,7 @@ mod tests {
                 ..Tunables::default()
             },
             refresh: crate::config::RefreshConfig::default(),
+            login: crate::config::LoginConfig::default(),
         }
     }
 

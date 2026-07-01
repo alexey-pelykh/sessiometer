@@ -81,6 +81,14 @@ const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
 /// always runs (#102) and a forfeited token is bounded/recoverable (the engine Caller contract).
 const DEFAULT_REFRESH_TIMEOUT_SECS: u64 = 90;
 
+/// Default seconds bounding one whole interactive `login` capture (issue #135). Mirrors
+/// [`crate::login::DEFAULT_LOGIN_TIMEOUT`] — the engine's per-call fallback — kept in sync by
+/// the `default_login_timeout_matches_the_engine_default` test. Far longer than the refresh
+/// timeout because a `/login` waits on a human completing a browser OAuth handoff, not a
+/// headless `claude -p` spawn; the operator-tunable range (60..=600) bounds both an impatient
+/// and a very patient operator.
+const DEFAULT_LOGIN_TIMEOUT_SECS: u64 = 180;
+
 /// The keychain service-name namespace every account's stash lives under; the
 /// full name is `Sessiometer/<account_uuid>` ([`Account::stash`]). Kept as one
 /// shared constant so the prefix has a single definition (issue #70).
@@ -296,6 +304,44 @@ impl RefreshConfig {
     }
 }
 
+/// The `login` verb's settings (issue #135): how long one interactive `login` capture may run,
+/// and an optional `claude` binary override — the user-facing counterpart of the `[refresh]`
+/// block for the one-shot `sessiometer login [label]` command.
+///
+/// Both keys are optional with documented defaults, so a config with no `[login]` table (or none
+/// at all — the first `login` runs before any `config.toml` exists) uses [`LoginConfig::default`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginConfig {
+    /// Seconds bounding ONE whole interactive login capture (issue #135 AC): on expiry the
+    /// isolated `claude /login` child is killed and teardown runs (the operator gets a cancelled
+    /// outcome). Default [`DEFAULT_LOGIN_TIMEOUT_SECS`] (180), operator-tunable within `60..=600`
+    /// — low enough to abandon an unattended login, high enough for a deliberate browser handoff.
+    pub(crate) timeout_secs: u64,
+    /// The `claude` binary the login engine spawns, overriding the `$CLAUDE_BIN` / `$PATH`
+    /// resolution — `None` (the default) defers to that resolution. Resolved (absolutized,
+    /// validated to exist) before the spawn by the SAME resolver the refresh path uses,
+    /// [`crate::paths::claude_binary_with_override`] (issue #135 AC: "reusing the existing
+    /// binary-override resolver; no new config mechanism").
+    pub(crate) claude_bin: Option<PathBuf>,
+}
+
+impl Default for LoginConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: DEFAULT_LOGIN_TIMEOUT_SECS,
+            claude_bin: None,
+        }
+    }
+}
+
+impl LoginConfig {
+    /// The whole-capture timeout, as a [`Duration`] — the bound the `login` verb threads into
+    /// [`crate::login::login_account`].
+    pub(crate) fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+}
+
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -310,6 +356,9 @@ pub(crate) struct Config {
     pub(crate) tunables: Tunables,
     /// The periodic isolated-refresh schedule (issue #105); opt-in, disabled by default.
     pub(crate) refresh: RefreshConfig,
+    /// The one-shot `login` verb's settings (issue #135): capture timeout + optional `claude`
+    /// binary override. Consumed by `crate::capture::login`, never by the daemon.
+    pub(crate) login: LoginConfig,
 }
 
 impl Config {
@@ -543,10 +592,25 @@ impl Config {
                 .map(PathBuf::from),
         };
 
+        // The one-shot `login` verb's settings (issue #135). The timeout is bounds-checked like the
+        // refresh timeout; `claude_bin` is free-form and an empty/whitespace value collapses to
+        // `None` — the SAME override-resolver contract as `[refresh].claude_bin` (a bad path
+        // surfaces at spawn-resolution time, never here).
+        let l = raw.login;
+        range("login.timeout_secs", l.timeout_secs, 60, 600)?;
+        let login = LoginConfig {
+            timeout_secs: l.timeout_secs as u64,
+            claude_bin: l
+                .claude_bin
+                .filter(|bin| !bin.trim().is_empty())
+                .map(PathBuf::from),
+        };
+
         Ok(Config {
             roster,
             tunables,
             refresh,
+            login,
         })
     }
 
@@ -673,6 +737,33 @@ impl Config {
              # empty) to resolve from $CLAUDE_BIN then $PATH.\n",
         );
         match &r.claude_bin {
+            Some(bin) => out.push_str(&format!(
+                "claude_bin = {}\n",
+                basic_string(&bin.to_string_lossy())
+            )),
+            None => out.push_str("# claude_bin = \"/absolute/path/to/claude\"\n"),
+        }
+
+        // The one-shot `login` verb's settings (issue #135): capture timeout + optional binary
+        // override. Independent of `[refresh]` (a login is interactive, not a daemon tick).
+        let l = &self.login;
+        out.push_str("\n[login]\n");
+        out.push_str(
+            "# Settings for `sessiometer login [label]`, the interactive re-auth verb: run\n\
+             # `claude /login` in an isolated config dir, harvest the fresh credential, and land\n\
+             # it in the roster (onboarding a new account or reviving a parked one).\n",
+        );
+        out.push_str(
+            "# Seconds bounding one whole login capture (60..=600); on expiry the login is\n\
+             # cancelled (nothing captured). Longer than the refresh timeout — a login waits on a\n\
+             # human completing a browser OAuth handoff.\n",
+        );
+        out.push_str(&format!("timeout_secs = {}\n", l.timeout_secs));
+        out.push_str(
+            "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave empty)\n\
+             # to resolve from $CLAUDE_BIN then $PATH.\n",
+        );
+        match &l.claude_bin {
             Some(bin) => out.push_str(&format!(
                 "claude_bin = {}\n",
                 basic_string(&bin.to_string_lossy())
@@ -846,6 +937,8 @@ struct RawConfig {
     jitter: RawJitter,
     #[serde(default)]
     refresh: RawRefresh,
+    #[serde(default)]
+    login: RawLogin,
 }
 
 #[derive(Deserialize)]
@@ -969,6 +1062,32 @@ fn default_refresh_idle_after_secs() -> i64 {
 }
 fn default_refresh_timeout_secs() -> i64 {
     DEFAULT_REFRESH_TIMEOUT_SECS as i64
+}
+
+/// Permissive deserialization of the optional `[login]` table (issue #135): both keys optional
+/// with a documented default, the timeout kept wide (`i64`) so an out-of-range value reaches
+/// [`Config::validate`] with a clear message rather than a bare `serde` type error.
+/// `deny_unknown_fields` rejects a stray key as a parse error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLogin {
+    #[serde(default = "default_login_timeout_secs")]
+    timeout_secs: i64,
+    #[serde(default)]
+    claude_bin: Option<String>,
+}
+
+impl Default for RawLogin {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_login_timeout_secs(),
+            claude_bin: None,
+        }
+    }
+}
+
+fn default_login_timeout_secs() -> i64 {
+    DEFAULT_LOGIN_TIMEOUT_SECS as i64
 }
 
 /// Permissive deserialization of the optional `[jitter]` table (issue #38): each
@@ -1287,6 +1406,8 @@ label = "personal"
         assert_eq!(original.roster, reparsed.roster);
         // The (default) refresh schedule round-trips too (issue #105).
         assert_eq!(original.refresh, reparsed.refresh);
+        // …and the (default) [login] settings (issue #135).
+        assert_eq!(original.login, reparsed.login);
     }
 
     // --- [refresh] schedule (issue #105) ------------------------------------
@@ -1430,6 +1551,122 @@ label = "personal"
             Config::parse(&text).unwrap().refresh,
             RefreshConfig::default()
         );
+    }
+
+    // --- [login] settings (issue #135) --------------------------------------
+
+    #[test]
+    fn login_defaults_when_table_absent() {
+        // No [login] table → the default 180 s timeout and no binary override.
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.login, LoginConfig::default());
+        assert_eq!(config.login.timeout_secs, DEFAULT_LOGIN_TIMEOUT_SECS);
+        assert_eq!(config.login.claude_bin, None);
+    }
+
+    #[test]
+    fn default_login_timeout_matches_the_engine_default() {
+        // The config default and the engine's per-call fallback ([`login::DEFAULT_LOGIN_TIMEOUT`])
+        // must agree, so an operator who never writes a [login] block gets the SAME 180 s the
+        // engine would use standalone. A drift guard: if either constant moves, this fails.
+        assert_eq!(
+            LoginConfig::default().timeout(),
+            crate::login::DEFAULT_LOGIN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn parses_a_custom_login_table() {
+        let toml = format!(
+            "{VALID}\n[login]\n\
+             timeout_secs = 300\n\
+             claude_bin = \"/opt/claude/bin/claude\"\n"
+        );
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.login,
+            LoginConfig {
+                timeout_secs: 300,
+                claude_bin: Some(PathBuf::from("/opt/claude/bin/claude")),
+            }
+        );
+        assert_eq!(config.login.timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn login_missing_key_takes_its_default() {
+        // A partial [login] table fills only the named keys; the rest default.
+        let toml = format!("{VALID}\n[login]\ntimeout_secs = 240\n");
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(config.login.timeout_secs, 240);
+        assert_eq!(config.login.claude_bin, None);
+    }
+
+    #[test]
+    fn login_timeout_out_of_range_is_rejected() {
+        // Below the 60 s floor and above the 600 s ceiling both fail, naming the field.
+        for bad in ["timeout_secs = 59", "timeout_secs = 601"] {
+            let toml = format!("{VALID}\n[login]\n{bad}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(&err, Error::ConfigInvalid(msg) if msg.contains("login.timeout_secs")),
+                "expected a login.timeout_secs range error, got {err:?}"
+            );
+        }
+        // The inclusive bounds themselves are accepted.
+        for ok in ["timeout_secs = 60", "timeout_secs = 600"] {
+            let toml = format!("{VALID}\n[login]\n{ok}\n");
+            assert!(
+                Config::parse(&toml).is_ok(),
+                "an inclusive bound must be accepted: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_empty_claude_bin_collapses_to_none() {
+        // A stray `claude_bin = ""` defers to $CLAUDE_BIN/$PATH (None), like omitting it —
+        // the same override-resolver contract as [refresh].claude_bin (issue #135 AC).
+        let toml = format!("{VALID}\n[login]\nclaude_bin = \"   \"\n");
+        assert_eq!(Config::parse(&toml).unwrap().login.claude_bin, None);
+    }
+
+    #[test]
+    fn login_unknown_field_is_rejected() {
+        // deny_unknown_fields: a stray key is a parse error, not a silent ignore.
+        let toml = format!("{VALID}\n[login]\ntimeout_secs = 200\nwait_loop = true\n");
+        assert!(matches!(Config::parse(&toml), Err(Error::ConfigParse(_))));
+    }
+
+    #[test]
+    fn login_round_trips_render_then_parse() {
+        // A fully-customised [login] block survives render → parse byte-equivalently.
+        let toml = format!(
+            "{VALID}\n[login]\n\
+             timeout_secs = 420\n\
+             claude_bin = \"/usr/local/bin/claude\"\n"
+        );
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.login, reparsed.login);
+    }
+
+    #[test]
+    fn rendered_default_login_documents_timeout_and_commented_claude_bin() {
+        // The rendered default [login] block carries the 180 s timeout and leaves claude_bin
+        // commented (a self-documenting, inert override), and round-trips to the default.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(text.contains("[login]"), "render must emit [login]: {text}");
+        assert!(
+            text.contains("timeout_secs = 180"),
+            "default login must render the 180 s timeout: {text}"
+        );
+        assert!(
+            text.contains("# claude_bin ="),
+            "an unset login claude_bin must render commented: {text}"
+        );
+        assert_eq!(Config::parse(&text).unwrap().login, LoginConfig::default());
     }
 
     #[test]
