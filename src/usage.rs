@@ -571,7 +571,17 @@ pub(crate) fn epoch_from_rfc3339(s: &str) -> Option<i64> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Reject anything the civil calendar does not admit, so a malformed upstream
+    // value degrades to "reset unknown" rather than a fabricated instant (#177):
+    // a 4-digit year bound keeps `days_from_civil` clear of `i64` overflow, and
+    // the per-month day length rejects `2026-02-30` / `2025-02-29` instead of
+    // silently normalizing them forward. `||` short-circuits, so `days_in_month`
+    // only sees a `1..=12` month.
+    if date_parts.next().is_some()
+        || !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+    {
         return None;
     }
 
@@ -608,7 +618,9 @@ fn split_offset(rest: &str) -> Option<(&str, i64)> {
     let tz = &tz[1..];
     let (hours, minutes) = match tz.split_once(':') {
         Some((h, m)) => (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?),
-        None if tz.len() == 4 => (tz[..2].parse().ok()?, tz[2..].parse().ok()?),
+        // `±HHMM`: slice via `get` (not `tz[..2]`) so a non-ASCII byte landing
+        // mid-char yields None instead of panicking on the daemon poll loop (#177).
+        None if tz.len() == 4 => (tz.get(..2)?.parse().ok()?, tz.get(2..)?.parse().ok()?),
         None => (tz.parse::<i64>().ok()?, 0),
     };
     Some((time, sign * (hours * 3_600 + minutes * 60)))
@@ -627,6 +639,29 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + (day - 1); // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
+}
+
+/// Whether `year` is a Gregorian leap year — the 4 / 100 / 400 rule (divisible by
+/// 4, except whole centuries, except those divisible by 400, so 2000 is a leap
+/// year and 2100 is not). Only bounds February in [`days_in_month`]; the epoch
+/// arithmetic itself lives in [`days_from_civil`].
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+/// The length of `month` (`1..=12`) in `year`, honouring leap February. Lets
+/// [`epoch_from_rfc3339`] reject an impossible calendar date instead of letting
+/// [`days_from_civil`] normalize it to a wrong instant (#177). Callers guarantee
+/// `month ∈ 1..=12`; any other value is treated as zero-length so it can never
+/// masquerade as a valid day count.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +939,49 @@ mod tests {
             epoch_from_rfc3339("2024-02-29T00:00:00Z"),
             Some(1_709_164_800)
         );
+        // 2000-02-29 exists too (the 400-year century rule is a leap year), so a
+        // valid leap day survives regardless of which leap sub-rule qualifies it.
+        assert!(epoch_from_rfc3339("2000-02-29T00:00:00Z").is_some());
+    }
+
+    #[test]
+    fn epoch_from_rfc3339_rejects_impossible_calendar_dates() {
+        // Issue #177: the day was validated only as `1..=31`, so a day past the
+        // month's real length silently normalized to a WRONG instant instead of
+        // degrading to "reset unknown". A total parser rejects each of these.
+        for bad in [
+            "2026-02-30T00:00:00Z", // February never has 30 days
+            "2025-02-29T00:00:00Z", // 2025 is not a leap year — no Feb 29
+            "2100-02-29T00:00:00Z", // century non-leap (÷100 but not ÷400)
+            "2026-04-31T00:00:00Z", // April has 30 days
+            "2026-06-31T00:00:00Z", // June has 30 days
+            "2026-00-15T00:00:00Z", // month 0 is not a real month
+            "2026-01-00T00:00:00Z", // day 0 is not a real day
+        ] {
+            assert_eq!(epoch_from_rfc3339(bad), None, "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn epoch_from_rfc3339_does_not_panic_on_a_non_ascii_timezone() {
+        // Issue #177 (follow-up): the `±HHMM` offset was byte-sliced (`tz[..2]`),
+        // which panics when byte index 2 lands mid-char. A `from_utf8_lossy`-decoded
+        // upstream `resets_at` can carry such a byte and must degrade to None, not
+        // abort the daemon poll loop.
+        assert_eq!(epoch_from_rfc3339("2026-06-26T00:00:00+1é2"), None);
+        assert_eq!(epoch_from_rfc3339("2026-06-26T00:00:00+é0"), None);
+    }
+
+    #[test]
+    fn epoch_from_rfc3339_does_not_panic_on_an_overflowing_year() {
+        // Issue #177 (follow-up): an unbounded year overflowed the civil-day
+        // arithmetic (`era * 146_097`) — a panic on the poll loop. A bounded parser
+        // rejects an out-of-range year instead of overflowing.
+        assert_eq!(
+            epoch_from_rfc3339("99999999999999999-02-15T00:00:00Z"),
+            None
+        );
+        assert_eq!(epoch_from_rfc3339("10000-01-01T00:00:00Z"), None);
     }
 
     #[test]

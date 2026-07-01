@@ -371,6 +371,29 @@ pub(crate) enum Error {
     #[error("another swap is in progress — could not acquire the swap lock; retry shortly")]
     SwapLockBusy,
 
+    // --- Swap engine identity guard (issue #211) -----------------------------
+    /// SAFETY ABORT: the out-of-band swap engine (#6) was about to re-stash the
+    /// outgoing account, but the LIVE canonical credential belongs to the account
+    /// being swapped TO — not the one being swapped away from. The caller resolved
+    /// the outgoing account from a STALE `~/.claude.json` (its `oauthAccount` names
+    /// an account that is no longer the active one), so re-stashing the live token
+    /// under the outgoing account's stash key + identity would staple a DIFFERENT
+    /// account's credential onto it, silently CORRUPTING that stash. Refused with
+    /// ZERO writes — the guard fires before the engine mutates anything, mirroring
+    /// the daemon's "never staple a different account's identity" (`restash_account`,
+    /// `src/daemon.rs`). Secret-free: the mismatch is detected by comparing credential
+    /// blobs, never by exposing either. A generic exit `1`, like its sibling
+    /// precondition abort [`Error::ActiveAccountUnresolved`] — not a "retry shortly"
+    /// (`4`) condition, since a stale display does not clear on its own. Reconcile
+    /// with `sessiometer status` (or re-login) so `~/.claude.json` names the
+    /// truly-active account.
+    #[error(
+        "refusing the swap: the active credential does not belong to the account being \
+         swapped away from — re-stashing it would corrupt that account's stash \
+         (reconcile with `sessiometer status`, or re-login)"
+    )]
+    SwapWrongIdentityRestash,
+
     // --- One-shot `poke` (issue #104) ----------------------------------------
     /// `poke <account>` named the ACTIVE account. The isolated-refresh engine
     /// refreshes only PARKED (non-active) accounts (`src/refresh.rs` Caller
@@ -671,5 +694,20 @@ mod tests {
                 "no token: {message}"
             );
         }
+    }
+
+    #[test]
+    fn wrong_identity_restash_is_a_secret_free_generic_abort() {
+        // Issue #211: the swap engine's identity guard is a precondition safety abort
+        // like `ActiveAccountUnresolved` — a generic exit `1` (NOT the "retry shortly"
+        // `4` class, since a stale display does not clear on its own), and secret-free
+        // (no token / email in the message — the mismatch is found by comparing blobs).
+        assert_eq!(Error::SwapWrongIdentityRestash.exit_code(), 1);
+        let message = Error::SwapWrongIdentityRestash.to_string();
+        assert!(!message.contains('@'), "no email: {message}");
+        assert!(
+            !message.to_lowercase().contains("token"),
+            "no token: {message}"
+        );
     }
 }

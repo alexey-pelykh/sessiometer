@@ -156,6 +156,32 @@ where
     // absent / corrupt incoming stash aborts before the outgoing stash is rewritten.
     let incoming = stash.read(incoming_stash).await?;
 
+    // Identity-consistency guard (issue #211): the step-2 re-stash below writes the
+    // LIVE canonical token under the OUTGOING account's stash key + its PRESERVED
+    // identity. Refuse — BEFORE any write (ZERO writes) — when the engine has POSITIVE
+    // evidence the caller mis-resolved the outgoing account: the live canonical does
+    // NOT match the outgoing account's own stashed token, yet DOES match the incoming
+    // account's. Re-stashing then would staple the incoming account's credential onto
+    // the outgoing stash — silent corruption (a stale `~/.claude.json` naming an
+    // account that is no longer active: the failure mode #207 fixes at the caller;
+    // this is the engine-level safety net UNDERNEATH it, also covering `--force` and
+    // adopt-target callers). Mirrors the daemon's token-first ownership check +
+    // "never staple a different account's identity" (`restash_account`, `src/daemon.rs`).
+    //
+    // Both halves are load-bearing:
+    //   - The canonical MATCHING the outgoing stash is the safe no-drift case (and the
+    //     self-swap / shared-token case) — never refuse it.
+    //   - The canonical matching NEITHER stash is the legitimate in-place token-refresh
+    //     DRIFT the re-stash exists to capture (the outgoing account's OWN freshly-
+    //     refreshed token, stashed nowhere yet) — allow it, so a normal swap is
+    //     unaffected. Only a canonical that is DEMONSTRABLY the incoming account's token
+    //     (matches its stash) while NOT the outgoing's is a wrong-identity staple.
+    if !outgoing_current.matches(&outgoing_prev.credential)
+        && outgoing_current.matches(&incoming.credential)
+    {
+        return Err(Error::SwapWrongIdentityRestash);
+    }
+
     // 2. Re-stash the outgoing account BEFORE overwriting the canonical item — the
     //    token-refresh-rotation drift guard: re-stash its FRESH canonical token
     //    with its PRESERVED `oauthAccount` half (never fabricated).
@@ -733,6 +759,45 @@ mod tests {
         assert_eq!(a.credential.expose(), b"A-stash-token");
         // The canonical item is likewise untouched.
         assert!(store.read().await.unwrap().matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn a_stale_claude_json_cannot_corrupt_another_accounts_stash() {
+        // Issue #211 (AC2): the wrong-identity re-stash guard. `~/.claude.json` is
+        // stale (shows A) while the LIVE canonical is actually B's token, so a caller
+        // (`use`) mis-resolves outgoing = A and asks to swap A → B. The live canonical
+        // (B's token) belongs to the INCOMING account, so re-stashing it under A's key
+        // would corrupt A's stash. The engine must REFUSE with ZERO writes.
+        let store = store_holding(b"B-token").await; // canonical is really B's
+        let stash = stash_with(stashed(b"A-token", "u-A"), stashed(b"B-token", "u-B")).await;
+        let (_dir, json) = claude_json("u-A", 0o600); // display lies: shows A
+
+        let result = swap(&store, &stash, ACCT_A, ACCT_B, &json).await;
+
+        // AC1: refused on the token↔key mismatch — no wrong-identity staple.
+        assert!(
+            matches!(result, Err(Error::SwapWrongIdentityRestash)),
+            "the swap must refuse a wrong-identity re-stash"
+        );
+        // AC2: A's stash is UNCORRUPTED — still A's own token + identity, never B's.
+        let a = stash.read(ACCT_A).await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-token",
+            "A's stash must be untouched"
+        );
+        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+        // AC3: ZERO writes — the canonical item and B's stash are both untouched.
+        assert!(
+            store.read().await.unwrap().matches(&cred(b"B-token")),
+            "the canonical item must be untouched (ZERO writes)"
+        );
+        let b = stash.read(ACCT_B).await.unwrap();
+        assert_eq!(
+            b.credential.expose(),
+            b"B-token",
+            "B's stash must be untouched"
+        );
     }
 
     // --- the single-writer swap lock (#64) ---------------------------------
