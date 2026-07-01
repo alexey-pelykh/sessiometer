@@ -27,6 +27,19 @@ pub(crate) enum Error {
     #[error("unknown command: {0}")]
     UnknownCommand(String),
 
+    /// The argv layer rejected the invocation (issue #175): an unknown flag, a
+    /// value-less option, or otherwise malformed usage — the strict counterpart to
+    /// the old silent no-op. `message` is the specific problem and `usage_hint` names
+    /// the exact `--help` to run; both are secret-free (argv never carries a token or
+    /// passphrase — the passphrase is read off-argv, cf. #39). Maps to the generic
+    /// exit `1`, matching [`Error::UnknownCommand`] — both are "you asked for
+    /// something that isn't a thing", distinct from a runtime failure.
+    #[error("{message}\n  run `{usage_hint}` for usage")]
+    CliUsage {
+        message: String,
+        usage_hint: &'static str,
+    },
+
     /// `stats --period` got a value outside `day|week|month|lifetime`.
     #[error("invalid --period `{0}`: expected one of day, week, month, lifetime")]
     StatsPeriodInvalid(String),
@@ -307,11 +320,14 @@ pub(crate) enum Error {
     #[error("`{query}` is ambiguous: {count} accounts match — disambiguate with the account-uuid")]
     UseTargetAmbiguous { query: String, count: usize },
 
-    /// `use` could not identify the active account to swap AWAY from: no account
-    /// is logged in to Claude Code, or the logged-in `oauthAccount.accountUuid`
-    /// matches no roster entry. The swap re-stashes the outgoing account, so its
-    /// roster identity must be known — mirrors the daemon's "can't identify active
-    /// ⇒ don't swap". ZERO writes. Secret-free.
+    /// `use` could not identify the active account to swap AWAY from: the canonical
+    /// keychain token matches no captured stash AND `~/.claude.json`'s logged-in
+    /// `oauthAccount.accountUuid` matches no roster entry either (issue #207 resolves
+    /// the active account token-first, with the display as the fallback). The swap
+    /// re-stashes the outgoing account, so its roster identity must be known —
+    /// mirrors the daemon's "can't identify active ⇒ don't swap". A LOCKED keychain
+    /// does NOT surface here: it aborts earlier as [`KeychainLocked`](Self::KeychainLocked),
+    /// never swallowed to this. ZERO writes. Secret-free.
     #[error(
         "cannot determine the active account to swap away from \
          (no logged-in account matches the roster — run `sessiometer list`)"
@@ -597,6 +613,21 @@ mod tests {
         assert_eq!(Error::CredentialNotFound.exit_code(), 1);
         assert_eq!(Error::Unimplemented("x").exit_code(), 1);
         assert_eq!(Error::Io(std::io::Error::other("boom")).exit_code(), 1);
+        // A strict-usage rejection (issue #175) is a generic failure, matching the
+        // sibling `UnknownCommand` — both are "you asked for something that isn't a
+        // thing", distinct from a runtime failure.
+        assert_eq!(
+            Error::CliUsage {
+                message: "unknown flag `--forc`".to_owned(),
+                usage_hint: "sessiometer use --help",
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            Error::UnknownCommand("frobnicate".to_owned()).exit_code(),
+            1
+        );
     }
 
     #[test]

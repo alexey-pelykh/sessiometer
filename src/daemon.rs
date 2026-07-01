@@ -1800,12 +1800,10 @@ where
     async fn resolve_active(&self) -> Option<usize> {
         match self.store.read().await {
             Ok(canonical) => self.resolve_account_for(&canonical).await,
-            Err(_) => {
-                let oauth = claude_state::read_oauth_account_from(&self.claude_json).ok()?;
-                self.roster
-                    .iter()
-                    .position(|a| a.account_uuid == oauth.account_uuid())
-            }
+            // Canonical unreadable (locked / not-found): the displayed identity is the
+            // only signal left — the same display-only fallback the shared resolver's
+            // step 2 uses. The daemon degrades to it here rather than swap blindly.
+            Err(_) => crate::active::resolve_via_display(&self.roster, &self.claude_json),
         }
     }
 
@@ -2240,28 +2238,15 @@ where
         self.state.canonical_watch.baseline()
     }
 
-    /// Identify which roster account the given `canonical` credential belongs to,
-    /// using two signals in order: (1) the canonical token byte-matches an account's
-    /// stash — exact right after a swap or a re-stash; (2) the displayed
-    /// `~/.claude.json` `accountUuid` maps to a roster account — the signal when the
-    /// token has changed in place and no stash matches it yet (a fresh `/login` or
-    /// an in-place refresh). `None` if neither resolves. Shared by
+    /// Identify which roster account the given `canonical` credential belongs to — a
+    /// thin `&self` adapter over the shared token-first resolver
+    /// [`crate::active::resolve_account_for`] (canonical token byte-match, then the
+    /// `~/.claude.json` display fallback). Extracted so the manual `use` swap resolves
+    /// the active account the SAME way (issue #207); called here by
     /// [`resolve_active`](Self::resolve_active) and the re-auth re-stash path (#13).
     async fn resolve_account_for(&self, canonical: &Credential) -> Option<usize> {
-        for (i, account) in self.roster.iter().enumerate() {
-            if let Ok(stashed) = self.stash.read(&account.stash()).await {
-                if stashed.credential.matches(canonical) {
-                    return Some(i);
-                }
-            }
-        }
-        if let Ok(oauth) = claude_state::read_oauth_account_from(&self.claude_json) {
-            return self
-                .roster
-                .iter()
-                .position(|a| a.account_uuid == oauth.account_uuid());
-        }
-        None
+        crate::active::resolve_account_for(&self.roster, &self.stash, &self.claude_json, canonical)
+            .await
     }
 
     /// Refresh account `idx`'s stash to the new `canonical` token (issue #13 re-auth
