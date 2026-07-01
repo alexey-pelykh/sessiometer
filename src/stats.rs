@@ -88,6 +88,10 @@ const MAX_BUCKETS: i64 = 366;
 /// The parsed `stats` argument vector, as collected by the CLI dispatcher. Validation
 /// (period enum, `--since` grammar, mutual exclusion) happens downstream in [`run`] so it
 /// is unit-testable.
+///
+/// `Debug`/`PartialEq` let the CLI parser's own tests (issue #175) assert the parsed
+/// `stats` invocation by value alongside the rest of the `Command` enum.
+#[derive(Debug, PartialEq)]
 pub(crate) struct StatsArgs {
     /// Positional account filter — the redacted handles to show (empty = all).
     pub(crate) accounts: Vec<String>,
