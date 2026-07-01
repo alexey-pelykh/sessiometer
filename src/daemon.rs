@@ -8216,6 +8216,7 @@ mod tests {
 
     #[tokio::test]
     async fn redaction_meter_emits_no_secret_on_any_channel_across_the_full_loop() {
+        use crate::observability::LoginEventOutcome;
         use crate::redaction::meter::{assert_clean, Secrets};
 
         let secrets = Secrets::meter_fixture();
@@ -8395,6 +8396,28 @@ mod tests {
         );
         corpus.push('\n');
 
+        // Channel — the `login` verb's redacted audit event (issue #135), emitted only by the
+        // one-shot `login` command, so (like the refresh line above) it is planted here rather than
+        // tick-harvested. `account` is the operator HANDLE (a label) — the SAME #15 bar as every
+        // other channel; the onboarded form carries a handle, the cancelled form is accountless
+        // (the omit branch), so both shapes of the line join the all-channels clean verdict below.
+        corpus.push_str(
+            &Event::Login {
+                account: Some(A.1.to_owned()),
+                outcome: LoginEventOutcome::Onboarded,
+            }
+            .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &Event::Login {
+                account: None,
+                outcome: LoginEventOutcome::Cancelled,
+            }
+            .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
+        );
+        corpus.push('\n');
+
         // Channel — the UDS error replies (malformed request / unknown command) and
         // the `manual-swapped` ack / unauthorized replies (#64), all secret-free.
         corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
@@ -8466,6 +8489,17 @@ mod tests {
         assert!(
             corpus.contains("event=refresh account=spare outcome=refreshed"),
             "log channel: refresh event missing"
+        );
+        // The `login` verb channel (issue #135): the handle-carrying onboarded line AND the
+        // accountless cancelled line both contributed, so the clean verdict below is non-vacuous
+        // for the login event on BOTH its shapes.
+        assert!(
+            corpus.contains("event=login account=work outcome=onboarded"),
+            "log channel: login event missing"
+        );
+        assert!(
+            corpus.contains("event=login outcome=cancelled"),
+            "log channel: accountless (cancelled) login event missing"
         );
         assert!(
             corpus.contains(r#""quarantined":true"#),
