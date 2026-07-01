@@ -24,20 +24,23 @@
 //! * a **series** — the same `aggregate` over each sub-bucket of the window (hourly for
 //!   `day`, daily otherwise), the time-ordered points a chart plots.
 //!
-//! Default render is NUMERIC text (the summary table + a roster line + the resolved-window
-//! echo in local time). `--json` emits the versioned, stable `schema:1` wire contract
-//! (full series + summary + neutral descriptor enums; redacted handles only).
+//! The human render is terminal CHARTS on an interactive TTY (issue #159) and the NUMERIC
+//! text table (the summary table + a roster line + the resolved-window echo in local time)
+//! when stdout is not one — a pipe / redirect keeps the plain, greppable numbers. `--json`
+//! emits the versioned, stable `schema:1` wire contract (full series + summary + neutral
+//! descriptor enums; redacted handles only), never charted, never coloured.
 //!
 //! # Scope seam (issues #159 / #160)
 //!
-//! This is the BASE verb: numbers + JSON. The terminal CHARTS (#159) render the JSON
-//! `series`; the neutral SIGNAL summary (#160) annotates the JSON `summary`. Neither is
-//! built here — the wire schema carries the series + summary + neutral per-account
-//! descriptor enums (`band`, `coverage_class`) they consume, and deliberately carries no
-//! chart glyph and no recommendation field. `HistoryStore::read_rollup` also exposes the
-//! lifetime daily tier as a seam for #159's deep-history charts (that tier is roster-wide,
-//! so it cannot back a per-account series; here it only anchors the `lifetime` window
-//! start).
+//! The terminal CHARTS (issue #159) live in the `rendering: terminal charts` section below:
+//! they render the same `series` / `summary` the base verb computed — nothing is
+//! re-aggregated, the store is not re-read — presentation-only, so the `--json` wire is
+//! byte-for-byte the #158 contract (no chart glyph reaches it). Still to come is the neutral
+//! SIGNAL summary (#160), which annotates the `summary` off the neutral per-account
+//! descriptor enums (`band`, `coverage_class`) the wire already carries and deliberately
+//! adds no recommendation field. `HistoryStore::read_rollup` also exposes the lifetime daily
+//! tier as a seam for deep-history charts (that tier is roster-wide, so it cannot back a
+//! per-account series; here it only anchors the `lifetime` window start).
 //!
 //! # Gap honesty
 //!
@@ -52,6 +55,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+// The `status` view's terminal-cell width primitive (issue #73), reused so the charts
+// (issue #159) size their columns on the SAME wcwidth — one definition for the crate.
+use crate::cli::display_width;
 use crate::config::{Config, Tunables};
 use crate::error::{Error, Result};
 use crate::observability;
@@ -88,6 +94,10 @@ pub(crate) struct StatsArgs {
     pub(crate) since: Option<String>,
     /// Whether `--json` was set.
     pub(crate) json: bool,
+    /// Whether `--no-color` was set — forces the chart colour overlay off (issue #159).
+    pub(crate) no_color: bool,
+    /// Whether `--ascii` was set — forces the ASCII glyph ramp (issue #159).
+    pub(crate) ascii: bool,
 }
 
 /// The `--period` selector: a rolling look-back window with a natural bucket resolution.
@@ -277,10 +287,60 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     let out = if args.json {
         render_json(&report)?
     } else {
-        render_text(&report)
+        render_human(&report, TermEnv::detect(args.no_color, args.ascii))
     };
     print!("{out}");
     Ok(())
+}
+
+/// The resolved terminal environment for the human render — the ONE impure probe of
+/// stdout (width + colour gate + glyph ramp), computed in [`run`] and then passed as
+/// plain data so the whole chart pipeline is a pure function of it (issue #159). Mirrors
+/// the `status` view's render discipline: width drives column degradation, `color` the
+/// ANSI overlay, `ascii` the glyph ramp. Reuses `crate::cli`'s single width probe and
+/// single colour gate rather than re-deriving either.
+#[derive(Clone, Copy, Debug)]
+struct TermEnv {
+    /// Terminal columns, or `None` when stdout is NOT a TTY (piped / redirected) — the
+    /// signal that drops the charts for the plain numeric table.
+    cols: Option<usize>,
+    /// Whether the ANSI colour overlay may be emitted (the shared `status` colour gate).
+    color: bool,
+    /// Whether to render the ASCII glyph ramp instead of the Unicode blocks (`--ascii`,
+    /// or `TERM=dumb`).
+    ascii: bool,
+}
+
+impl TermEnv {
+    /// Probe stdout ONCE: width via [`crate::cli::terminal_cols`], colour via the shared
+    /// [`crate::cli::should_colorize`] gate, and the ASCII ramp when forced (`--ascii`) or
+    /// the terminal cannot render the block glyphs (`TERM=dumb`).
+    fn detect(no_color: bool, ascii: bool) -> Self {
+        Self {
+            cols: crate::cli::terminal_cols(),
+            color: crate::cli::should_colorize(no_color),
+            ascii: ascii || term_is_dumb(),
+        }
+    }
+}
+
+/// Whether `TERM=dumb` — a terminal that cannot render SGR OR the Unicode block ramp, so
+/// the charts fall back to the ASCII ramp (issue #159). The colour half is already folded
+/// into [`crate::cli::should_colorize`]; this is only the ramp half.
+fn term_is_dumb() -> bool {
+    std::env::var("TERM").as_deref() == Ok("dumb")
+}
+
+/// Render the HUMAN-facing view: the terminal CHARTS (issue #159) on an interactive TTY,
+/// or the #158 numeric table when stdout is NOT one (piped / redirected → `cols` is
+/// `None`), so `stats | grep` and `stats > file` stay the plain, greppable numeric
+/// surface with zero ANSI. Pure over `env`, so the whole view is golden-testable at a
+/// fixed width / colour / ramp.
+fn render_human(report: &Report, env: TermEnv) -> String {
+    match env.cols {
+        None => render_text(report),
+        Some(w) => render_charts(report, w, env.color, env.ascii),
+    }
 }
 
 /// Resolve the reporting window from the raw `--period` / `--since` values.
@@ -483,8 +543,10 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 // --- rendering: numeric text ------------------------------------------------
 
 /// Render the numeric text view: the window echo, the per-account summary table, and the
-/// roster line. Deliberately carries no chart glyph (issue #159) and no recommendation
-/// (issue #160) — just numbers.
+/// roster line. This is the NON-TTY surface (issue #159): a piped / redirected `stats`
+/// renders exactly this — plain, greppable, zero ANSI, no chart glyph — while an
+/// interactive TTY gets [`render_charts`]. Carries no recommendation (issue #160): just
+/// numbers.
 fn render_text(report: &Report) -> String {
     let mut out = String::new();
     let label = format_window_label(&report.window, report.offset);
@@ -521,9 +583,16 @@ fn render_text(report: &Report) -> String {
         }
     }
 
-    let r = &summary.roster;
     out.push('\n');
-    out.push_str(&format!(
+    out.push_str(&roster_line(&summary.roster));
+    out
+}
+
+/// The roster summary line (issue #158): swap frequency broken out by reason and the
+/// all-accounts-high episodes. Extracted so the numeric [`render_text`] and the charts
+/// [`render_charts`] (issue #159) foot the view with the IDENTICAL roster sentence.
+fn roster_line(r: &RosterStats) -> String {
+    format!(
         "roster: {} swap{} ({} session, {} weekly, {} manual, {} forced, {} emergency) · \
          all-accounts-high: {} episode{} ({})\n",
         r.swap_count,
@@ -536,8 +605,7 @@ fn render_text(report: &Report) -> String {
         r.all_high_episodes,
         plural(r.all_high_episodes),
         fmt_dur(r.all_high_secs),
-    ));
-    out
+    )
 }
 
 /// A dimension as `mean/peak/p95` in whole percents, e.g. `42/88/85`.
@@ -874,9 +942,764 @@ fn roster_wire(r: &RosterStats) -> RosterWire {
     }
 }
 
+// --- rendering: terminal charts (issue #159) --------------------------------
+//
+// Hand-rolled, dependency-free charts over the SAME series/summary the #158 base verb
+// already produced — nothing is re-aggregated here, the store is not re-read. The charts
+// render ONLY on an interactive TTY (a piped / redirected `stats` keeps the plain numeric
+// table, [`render_human`]); they reuse the `status` view's render discipline — the shared
+// [`display_width`], the shared colour gate, pad-before-colour, and priority column-drop
+// that NEVER wraps a row. Every glyph encodes MAGNITUDE on the fixed 0–100% (cap) scale,
+// so a no-colour reader keeps the full signal; colour merely augments. A GAP — a bucket in
+// which an account had no reading — renders as a BREAK (a space), never a fabricated 0%.
+
+/// The 8-level Unicode "vertical bar" ramp for the sparkline height: index `0` (a real,
+/// lowest reading) → `▁`, `7` → `█`. A GAP is NOT in the ramp — it renders as a break, so
+/// an absent bucket can never read as a fabricated 0%.
+const SPARK_UNICODE: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// The 8-level ASCII intensity ramp (`--ascii` / `TERM=dumb`): the classic light→heavy
+/// shading run; index `0` → `.` (a real lowest reading, still distinct from a ` ` gap).
+const RAMP_ASCII: [char; 8] = ['.', ':', '-', '=', '+', '*', '#', '@'];
+/// The 4-level Unicode shade ramp for the heatmap grid: `░` (lowest reading) → `█`.
+const SHADE_UNICODE: [char; 4] = ['░', '▒', '▓', '█'];
+/// The 4-level ASCII shade ramp for the heatmap grid.
+const SHADE_ASCII: [char; 4] = ['.', ':', '+', '#'];
+/// The bar glyphs for the horizontal-bar chart: `(fill, track)`, Unicode then ASCII.
+const BAR_UNICODE: (char, char) = ('█', '░');
+const BAR_ASCII: (char, char) = ('#', '-');
+
+impl Band {
+    /// The ANSI SGR colour for this band under the chart overlay, reusing the `status`
+    /// view's green/yellow/red vocabulary: idle/low read green (headroom), moderate yellow
+    /// (worth watching), high/at-cap red (near/over the cap). Emitted only when the shared
+    /// colour gate is open ([`crate::cli::should_colorize`]); carries no secret (issue #15).
+    fn sgr(self) -> &'static str {
+        match self {
+            Band::Idle | Band::Low => "32",
+            Band::Moderate => "33",
+            Band::High | Band::AtCap => "31",
+        }
+    }
+}
+
+/// A utilisation fraction → an `0..=(n-1)` ramp level on the FIXED `[0, 1]` (0–100%, the
+/// cap) scale — an ABSOLUTE, cross-account-comparable magnitude, never normalised to the
+/// series' own max (which would editorialise a flat-low account into a spiky one). A real
+/// `0.0` maps to level `0` (the lowest glyph, a genuine reading); an over-cap reading
+/// (`> 1.0`) clamps to the top. `n` is the ramp length (8 for the bar ramp, 4 for shade).
+fn ramp_level(v: f64, n: usize) -> usize {
+    let top = (n - 1) as f64;
+    ((v.clamp(0.0, 1.0) * top).round() as usize).min(n - 1)
+}
+
+/// One sparkline glyph for a bucket value: a break (` `) for a GAP (`None`), else the ramp
+/// glyph at the value's absolute level.
+fn spark_glyph(v: Option<f64>, ascii: bool) -> char {
+    match v {
+        None => ' ',
+        Some(v) => {
+            let ramp = if ascii { &RAMP_ASCII } else { &SPARK_UNICODE };
+            ramp[ramp_level(v, ramp.len())]
+        }
+    }
+}
+
+/// One heatmap-cell glyph: a break (` `) for a GAP, else the shade at the value's level.
+fn shade_glyph(v: Option<f64>, ascii: bool) -> char {
+    match v {
+        None => ' ',
+        Some(v) => {
+            let ramp = if ascii { &SHADE_ASCII } else { &SHADE_UNICODE };
+            ramp[ramp_level(v, ramp.len())]
+        }
+    }
+}
+
+/// One account's per-bucket `pick` values across the series, with GAPS (`None`) where the
+/// account had NO reading in that bucket — it is absent from the bucket, or present with
+/// `seen == 0`. Charts render those as breaks, never a fabricated 0% (issue #159 gap
+/// honesty, mirroring the aggregator: an absent bucket is unknown, not calm).
+fn account_series(
+    series: &[UsageReport],
+    handle: &str,
+    pick: fn(&AccountStats) -> f64,
+) -> Vec<Option<f64>> {
+    series
+        .iter()
+        .map(|b| match b.per_account.get(handle) {
+            Some(a) if a.seen > 0 => Some(pick(a)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The per-bucket session peak — the sparkline / heatmap "how hot did it get" pick.
+fn session_peak(a: &AccountStats) -> f64 {
+    a.session.peak
+}
+/// The per-bucket session mean — the heatmap "average load" pick (complements the peak
+/// trend so the two views are not the same number twice).
+fn session_mean(a: &AccountStats) -> f64 {
+    a.session.mean
+}
+
+/// A sparkline string for a per-bucket value series: one glyph per bucket, gaps as breaks.
+fn render_sparkline(values: &[Option<f64>], ascii: bool) -> String {
+    values.iter().map(|&v| spark_glyph(v, ascii)).collect()
+}
+
+/// One droppable table column: a header, per-row cells, an optional per-row colour, the
+/// spaces rendered BEFORE it, and a drop priority (`None` = always keep; `Some(n)` =
+/// droppable, the LOWEST present `n` dropping first under a narrow terminal). Mirrors the
+/// `status` view's [`Column`](crate::cli) discipline but over already-rendered string cells.
+struct ChartCol {
+    header: &'static str,
+    cells: Vec<String>,
+    colors: Vec<Option<&'static str>>,
+    lead_gap: usize,
+    priority: Option<u8>,
+}
+
+impl ChartCol {
+    /// This column's render width: the widest of its header and cells, on DISPLAY width.
+    fn width(&self) -> usize {
+        self.cells
+            .iter()
+            .map(|s| display_width(s))
+            .max()
+            .unwrap_or(0)
+            .max(display_width(self.header))
+    }
+}
+
+/// The rendered width of a column set: summed column widths plus each column's lead gap.
+fn table_width(columns: &[ChartCol]) -> usize {
+    columns.iter().map(|c| c.lead_gap + c.width()).sum()
+}
+
+/// Render one table line: each cell preceded by its lead gap, LEFT-padded to its column
+/// width on DISPLAY width, colour wrapping the raw cell BEFORE the pad (so the escape bytes
+/// never enter the width math and stripping them recovers the exact plain table), trailing
+/// whitespace trimmed. The `status` view's `render_cells` discipline (issue #159 reuse).
+fn render_line(
+    cells: &[&str],
+    widths: &[usize],
+    colors: &[Option<&str>],
+    gaps: &[usize],
+) -> String {
+    let mut line = String::new();
+    for (((cell, &width), color), &gap) in cells.iter().zip(widths).zip(colors).zip(gaps) {
+        line.push_str(&" ".repeat(gap));
+        match color {
+            Some(sgr) => line.push_str(&format!("\x1b[{sgr}m{cell}\x1b[0m")),
+            None => line.push_str(cell),
+        }
+        line.push_str(&" ".repeat(width.saturating_sub(display_width(cell))));
+    }
+    format!("{}\n", line.trim_end())
+}
+
+/// Render a header row plus one line per data row, dropping the lowest-priority droppable
+/// columns until the table fits `w` — or only always-keep columns remain, in which case the
+/// table is allowed to OVERFLOW rather than WRAP a row (issue #159: never wrap). Colour is
+/// applied per cell only when `color` is set.
+fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
+    while table_width(&columns) > w {
+        match columns.iter().filter_map(|c| c.priority).min() {
+            Some(p) => columns.retain(|c| c.priority != Some(p)),
+            None => break, // only keep-columns left → accept overflow, never wrap
+        }
+    }
+    let widths: Vec<usize> = columns.iter().map(ChartCol::width).collect();
+    let gaps: Vec<usize> = columns.iter().map(|c| c.lead_gap).collect();
+    let n_rows = columns.first().map_or(0, |c| c.cells.len());
+
+    let headers: Vec<&str> = columns.iter().map(|c| c.header).collect();
+    let no_color: Vec<Option<&str>> = vec![None; columns.len()];
+    let mut out = render_line(&headers, &widths, &no_color, &gaps);
+    for r in 0..n_rows {
+        let cells: Vec<&str> = columns.iter().map(|c| c.cells[r].as_str()).collect();
+        let colors: Vec<Option<&str>> = columns
+            .iter()
+            .map(|c| if color { c.colors[r] } else { None })
+            .collect();
+        out.push_str(&render_line(&cells, &widths, &colors, &gaps));
+    }
+    out
+}
+
+/// The per-account chart table: `account`, the whole-window `session` and `weekly` peak %,
+/// and a `trend` sparkline of the per-bucket session peak. Priority column-drop under a
+/// narrow terminal — `trend` drops FIRST, then `weekly`; `account` + `session` (the most
+/// actionable signal) are always kept — never wrapping. Colour tints each `%` by its
+/// neutral utilisation band; the sparkline glyphs carry their own magnitude.
+fn render_chart_table(
+    report: &Report,
+    accounts: &[&String],
+    w: usize,
+    color: bool,
+    ascii: bool,
+) -> String {
+    let summary = &report.summary;
+    let n = accounts.len();
+    let (mut acct, mut sess, mut sess_c) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut week, mut week_c, mut trend) = (Vec::new(), Vec::new(), Vec::new());
+    for &h in accounts {
+        let a = &summary.per_account[h];
+        acct.push(h.clone());
+        sess.push(format!("{}%", pct(a.session.peak)));
+        sess_c.push(Some(Band::of(a.session.peak).sgr()));
+        week.push(format!("{}%", pct(a.weekly.peak)));
+        week_c.push(Some(Band::of(a.weekly.peak).sgr()));
+        trend.push(render_sparkline(
+            &account_series(&report.series, h, session_peak),
+            ascii,
+        ));
+    }
+    let columns = vec![
+        ChartCol {
+            header: "account",
+            cells: acct,
+            colors: vec![None; n],
+            lead_gap: 0,
+            priority: None,
+        },
+        ChartCol {
+            header: "session",
+            cells: sess,
+            colors: sess_c,
+            lead_gap: 2,
+            priority: None,
+        },
+        ChartCol {
+            header: "weekly",
+            cells: week,
+            colors: week_c,
+            lead_gap: 2,
+            priority: Some(2),
+        },
+        ChartCol {
+            header: "trend",
+            cells: trend,
+            colors: vec![None; n],
+            lead_gap: 2,
+            priority: Some(1),
+        },
+    ];
+    render_table(columns, w, color)
+}
+
+/// The cross-account horizontal-bar chart: each account's whole-window contribution share
+/// (the fraction of in-period observations made while it was the active credential) as a
+/// bar filled on the FIXED 0–100% scale, followed by the share percent. `None` when the
+/// terminal is too narrow for a readable bar (the block degrades away cleanly, issue #159).
+fn render_bars(report: &Report, accounts: &[&String], w: usize, ascii: bool) -> Option<String> {
+    let summary = &report.summary;
+    let (fill, track) = if ascii { BAR_ASCII } else { BAR_UNICODE };
+    let label_w = accounts.iter().map(|h| display_width(h)).max().unwrap_or(0);
+    // line = label + "  " + bar + "  " + "NNN%"; reserve 4 for the percent field.
+    let bar_w = w.checked_sub(label_w + 2 + 2 + 4)?;
+    if bar_w < 4 {
+        return None;
+    }
+    let mut out = String::from("contribution share\n");
+    for &h in accounts {
+        let share = summary.per_account[h].contribution_share;
+        let filled = (share.clamp(0.0, 1.0) * bar_w as f64).round() as usize;
+        let bar: String = std::iter::repeat_n(fill, filled)
+            .chain(std::iter::repeat_n(track, bar_w - filled))
+            .collect();
+        out.push_str(&format!(
+            "{:<label_w$}  {bar}  {:>3}%\n",
+            h,
+            pct(share),
+            label_w = label_w,
+        ));
+    }
+    Some(out)
+}
+
+/// The account × bucket heatmap: one shaded row per account, one cell per series bucket,
+/// shaded by that bucket's session MEAN — the "when was each account loaded" pattern that
+/// complements the peak trend column. Gaps render as breaks. `None` when the grid is wider
+/// than the terminal (it degrades away rather than wrapping, issue #159). Colour tints each
+/// cell by its own value's band, so the grid reads as a true heat map when the gate is open.
+fn render_heatmap(
+    report: &Report,
+    accounts: &[&String],
+    w: usize,
+    color: bool,
+    ascii: bool,
+) -> Option<String> {
+    let buckets = report.series.len();
+    let label_w = accounts.iter().map(|h| display_width(h)).max().unwrap_or(0);
+    if buckets == 0 || label_w + 2 + buckets > w {
+        return None;
+    }
+    let unit = if report.window.base_bucket() == HOUR_SECS {
+        "hourly"
+    } else {
+        "daily"
+    };
+    let mut out = format!("session pattern — {unit} mean\n");
+    for &h in accounts {
+        let values = account_series(&report.series, h, session_mean);
+        let mut line = format!("{h:<label_w$}  ");
+        for &v in &values {
+            let g = shade_glyph(v, ascii);
+            match (color, v) {
+                (true, Some(val)) => {
+                    line.push_str(&format!("\x1b[{}m{}\x1b[0m", Band::of(val).sgr(), g))
+                }
+                _ => line.push(g),
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// The per-account session-distribution gauge: a 0–100% track marking `mean` (`m`), `p95`
+/// (`P`) and `peak` (`x`), with the exact percents alongside so the distribution reads in
+/// text without colour. `None` when the terminal is too narrow for a readable track. On a
+/// marker collision the higher statistic wins the cell (peak over p95 over mean).
+fn render_percentiles(
+    report: &Report,
+    accounts: &[&String],
+    w: usize,
+    ascii: bool,
+) -> Option<String> {
+    let summary = &report.summary;
+    let (track, lb, rb) = if ascii {
+        ('-', '[', ']')
+    } else {
+        ('─', '┤', '├')
+    };
+    let label_w = accounts.iter().map(|h| display_width(h)).max().unwrap_or(0);
+    // The widest "NN% · NN% · NN%" trailer, so every gauge shares one width and aligns.
+    let trailer = |a: &AccountStats| {
+        format!(
+            "{}% · {}% · {}%",
+            pct(a.session.mean),
+            pct(a.session.p95),
+            pct(a.session.peak)
+        )
+    };
+    let trailer_w = accounts
+        .iter()
+        .map(|&h| display_width(&trailer(&summary.per_account[h])))
+        .max()
+        .unwrap_or(0);
+    // line = label + "  " + lb + gauge + rb + "  " + trailer; brackets are one cell each.
+    let gauge_w = w.checked_sub(label_w + 2 + 1 + 1 + 2 + trailer_w)?.min(40);
+    if gauge_w < 8 {
+        return None;
+    }
+    let pos = |v: f64| (v.clamp(0.0, 1.0) * (gauge_w - 1) as f64).round() as usize;
+    let mut out = String::from("session distribution — mean · p95 · peak\n");
+    for &h in accounts {
+        let a = &summary.per_account[h];
+        let mut buf = vec![track; gauge_w];
+        // Lower statistic first, so a higher one overwrites it on a shared cell.
+        buf[pos(a.session.mean)] = 'm';
+        buf[pos(a.session.p95)] = 'P';
+        buf[pos(a.session.peak)] = 'x';
+        let gauge: String = buf.into_iter().collect();
+        out.push_str(&format!(
+            "{:<label_w$}  {lb}{gauge}{rb}  {}\n",
+            h,
+            trailer(a),
+            label_w = label_w,
+        ));
+    }
+    Some(out)
+}
+
+/// Compose the HUMAN-facing charts view for an interactive TTY (issue #159): the window
+/// echo, the per-account chart table (with inline sparkline), then the bars / heatmap /
+/// percentile blocks (each degrading away cleanly when the terminal is too narrow), footed
+/// by the same roster line the numeric view uses. Pure over `(w, color, ascii)` so the
+/// whole view is golden-testable at a fixed width / colour / ramp.
+fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String {
+    let mut out = format!(
+        "usage — {}\n\n",
+        format_window_label(&report.window, report.offset)
+    );
+    let accounts: Vec<&String> = report.summary.per_account.keys().collect();
+    if accounts.is_empty() {
+        out.push_str("  no per-account usage in this window\n\n");
+        out.push_str(&roster_line(&report.summary.roster));
+        return out;
+    }
+    out.push_str(&render_chart_table(report, &accounts, w, color, ascii));
+    for block in [
+        render_bars(report, &accounts, w, ascii),
+        render_heatmap(report, &accounts, w, color, ascii),
+        render_percentiles(report, &accounts, w, ascii),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        out.push('\n');
+        out.push_str(&block);
+    }
+    out.push('\n');
+    out.push_str(&roster_line(&report.summary.roster));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- issue #159 chart fixtures: hand-built reports for deterministic goldens ------
+
+    /// One dimension's stats.
+    fn ds(mean: f64, peak: f64, p95: f64) -> crate::usage_stats::DimStats {
+        crate::usage_stats::DimStats { mean, peak, p95 }
+    }
+
+    /// An account row: `seen`, its session dimension, its weekly PEAK (mean/p95 unused by
+    /// the charts), and its contribution share. `seen == 0` is a GAP for chart purposes.
+    fn stat(
+        seen: u32,
+        session: crate::usage_stats::DimStats,
+        weekly_peak: f64,
+        share: f64,
+    ) -> AccountStats {
+        AccountStats {
+            seen,
+            expected: 1.0,
+            coverage: 1.0,
+            session,
+            weekly: ds(0.0, weekly_peak, 0.0),
+            cap_hits: 0,
+            time_at_cap_secs: 0,
+            contribution_share: share,
+        }
+    }
+
+    /// A `UsageReport` (series bucket or summary) from an account list.
+    fn ureport(accts: &[(&str, AccountStats)]) -> UsageReport {
+        UsageReport {
+            period: Period::new(0, HOUR_SECS),
+            per_account: accts.iter().map(|(h, a)| (h.to_string(), *a)).collect(),
+            roster: RosterStats::default(),
+        }
+    }
+
+    /// A charted `Report`: an hourly-bucketed `day` window (so the heatmap reads "hourly"),
+    /// a summary account list, and a per-bucket series. Offset 0 (deterministic echo).
+    fn charts_report(
+        summary: &[(&str, AccountStats)],
+        series: &[&[(&str, AccountStats)]],
+    ) -> Report {
+        Report {
+            window: Window {
+                start: epoch("2026-06-30T12:00:00Z"),
+                end: epoch("2026-07-01T12:00:00Z"),
+                kind: WindowKind::Period(PeriodSpec::Day),
+            },
+            accounts: vec![],
+            summary: ureport(summary),
+            series: series.iter().map(|b| ureport(b)).collect(),
+            offset: 0,
+        }
+    }
+
+    /// The canonical two-account fixture used across the chart goldens. `alpha` runs hot
+    /// (session peak 0.99) and carries most of the roster; `beta` idles. `beta` is GAP in
+    /// buckets 1 and 3, `alpha` in bucket 3 — so both a trend and a heatmap row carry an
+    /// interior break, proving a gap renders as a break, never a 0%.
+    fn two_account_charts() -> Report {
+        let alpha_sum = stat(4, ds(0.50, 0.99, 0.80), 0.40, 0.75);
+        let beta_sum = stat(2, ds(0.10, 0.20, 0.15), 0.05, 0.25);
+        let a = |m, p| stat(1, ds(m, p, p), 0.0, 0.0);
+        charts_report(
+            &[("alpha", alpha_sum), ("beta", beta_sum)],
+            &[
+                &[("alpha", a(0.20, 0.30)), ("beta", a(0.10, 0.10))],
+                &[("alpha", a(0.50, 0.60))], // beta GAP
+                &[("alpha", a(0.90, 0.99)), ("beta", a(0.15, 0.20))],
+                &[], // both GAP
+            ],
+        )
+    }
+
+    /// The sorted account handles of a report, as the chart renderers receive them.
+    fn keys(r: &Report) -> Vec<&String> {
+        r.summary.per_account.keys().collect()
+    }
+
+    // --- issue #159 AC: chart glyph primitives (fixed absolute scale, gaps ≠ 0%) ------
+
+    #[test]
+    fn ramp_level_is_a_fixed_absolute_scale_clamped_at_the_cap() {
+        // 0% → level 0 (a real lowest reading), 100% → the top, over-cap clamps, mid rounds.
+        assert_eq!(ramp_level(0.0, 8), 0);
+        assert_eq!(ramp_level(1.0, 8), 7);
+        assert_eq!(
+            ramp_level(1.5, 8),
+            7,
+            "over-cap clamps, never overflows the ramp"
+        );
+        assert_eq!(ramp_level(0.5, 8), 4, "0.5·7 = 3.5 rounds to 4");
+        assert_eq!(ramp_level(0.0, 4), 0);
+        assert_eq!(ramp_level(1.0, 4), 3);
+    }
+
+    #[test]
+    fn a_gap_renders_as_a_break_never_a_zero() {
+        // The crux of AC "gaps render as breaks (not zero)": a GAP is a space; a real 0%
+        // reading is the LOWEST glyph — visibly distinct, so an absent bucket never reads
+        // as a fabricated calm. Holds for both the Unicode and the ASCII ramp.
+        assert_eq!(spark_glyph(None, false), ' ');
+        assert_eq!(spark_glyph(Some(0.0), false), '▁');
+        assert_eq!(spark_glyph(None, true), ' ');
+        assert_eq!(spark_glyph(Some(0.0), true), '.');
+        assert_eq!(shade_glyph(None, false), ' ');
+        assert_eq!(shade_glyph(Some(0.0), false), '░');
+        assert_eq!(shade_glyph(Some(1.0), false), '█');
+    }
+
+    #[test]
+    fn render_sparkline_is_deterministic_with_gaps_as_breaks() {
+        // A real 0% (▁), a gap (space), a peak (█), and a mid value (▅) — the interior
+        // space is the break, not a 0% glyph.
+        assert_eq!(
+            render_sparkline(&[Some(0.0), None, Some(1.0), Some(0.5)], false),
+            "▁ █▅"
+        );
+        assert_eq!(
+            render_sparkline(&[Some(0.0), None, Some(1.0), Some(0.5)], true),
+            ". @+"
+        );
+    }
+
+    #[test]
+    fn account_series_marks_absent_or_unseen_buckets_as_gaps() {
+        let series = vec![
+            ureport(&[("a", stat(1, ds(0.3, 0.3, 0.3), 0.0, 0.0))]),
+            ureport(&[]), // account absent from the bucket → gap
+            ureport(&[("a", stat(0, ds(0.9, 0.9, 0.9), 0.0, 0.0))]), // present but seen==0 → gap
+        ];
+        assert_eq!(
+            account_series(&series, "a", session_peak),
+            vec![Some(0.3), None, None]
+        );
+    }
+
+    // --- issue #159 AC: full chart set on a wide interactive TTY (golden strings) ------
+
+    #[test]
+    fn chart_table_golden_wide() {
+        let r = two_account_charts();
+        assert_eq!(
+            render_chart_table(&r, &keys(&r), 60, false, false),
+            "account  session  weekly  trend\n\
+             alpha    99%      40%     ▃▅█\n\
+             beta     20%      5%      ▂ ▂\n",
+        );
+    }
+
+    #[test]
+    fn bars_heatmap_percentiles_golden_wide() {
+        let r = two_account_charts();
+        assert_eq!(
+            render_bars(&r, &keys(&r), 60, false).unwrap(),
+            "contribution share\n\
+             alpha  ███████████████████████████████████░░░░░░░░░░░░   75%\n\
+             beta   ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   25%\n",
+        );
+        assert_eq!(
+            render_heatmap(&r, &keys(&r), 60, false, false).unwrap(),
+            "session pattern — hourly mean\n\
+             alpha  ▒▓█\n\
+             beta   ░ ░\n",
+            "the heatmap carries interior gaps as breaks too",
+        );
+        assert_eq!(
+            render_percentiles(&r, &keys(&r), 60, false).unwrap(),
+            "session distribution — mean · p95 · peak\n\
+             alpha  ┤─────────────────m────────P──────x├  50% · 80% · 99%\n\
+             beta   ┤───m─P─x──────────────────────────├  10% · 15% · 20%\n",
+            "distinct mean/p95/peak markers spread apart; clustered where they are close",
+        );
+    }
+
+    #[test]
+    fn full_charts_view_wide_tty() {
+        let r = two_account_charts();
+        let out = render_charts(&r, 60, false, false);
+        assert!(out.starts_with("usage — last 24h (Jun 30–Jul 1)\n\n"));
+        assert!(out.contains("account  session  weekly  trend\n"));
+        assert!(out.contains("contribution share\n"));
+        assert!(out.contains("session pattern — hourly mean\n"));
+        assert!(out.contains("session distribution — mean · p95 · peak\n"));
+        assert!(out
+            .trim_end()
+            .ends_with("all-accounts-high: 0 episodes (0s)"));
+    }
+
+    #[test]
+    fn ascii_ramp_replaces_the_unicode_blocks() {
+        // AC `TERM=dumb` / `--ascii` → ASCII ramp: the sparkline uses the ASCII intensity
+        // run and carries no Unicode block glyph.
+        let r = two_account_charts();
+        let table = render_chart_table(&r, &keys(&r), 60, false, true);
+        assert!(table.contains("alpha    99%      40%     -+@\n"));
+        assert!(table.contains("beta     20%      5%      : :\n"));
+        for glyph in ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '░', '▒', '▓'] {
+            assert!(!table.contains(glyph), "no Unicode block survives --ascii");
+        }
+    }
+
+    // --- issue #159 AC: narrow terminal → priority column-drop, no row wrap -----------
+
+    #[test]
+    fn narrow_terminal_drops_trend_then_weekly_keeping_session_never_wrapping() {
+        let r = two_account_charts();
+        // Just too narrow for the trend column → it drops FIRST; weekly stays.
+        let w25 = render_chart_table(&r, &keys(&r), 25, false, false);
+        assert_eq!(
+            w25,
+            "account  session  weekly\n\
+             alpha    99%      40%\n\
+             beta     20%      5%\n",
+        );
+        // Narrower still → weekly drops NEXT; account + session are always kept, even when
+        // that overflows the width — the row is never wrapped.
+        let w15 = render_chart_table(&r, &keys(&r), 15, false, false);
+        assert_eq!(
+            w15,
+            "account  session\n\
+             alpha    99%\n\
+             beta     20%\n",
+        );
+        assert_eq!(
+            w15.lines().count(),
+            3,
+            "one header + one line per account: no wrap"
+        );
+        assert!(
+            w15.contains("99%") && w15.contains("20%"),
+            "the session signal is kept"
+        );
+    }
+
+    #[test]
+    fn a_very_narrow_terminal_degrades_the_wide_blocks_away() {
+        let r = two_account_charts();
+        // Below a readable width the bars / heatmap / percentile blocks drop out entirely
+        // (rather than wrap or truncate), but the view still renders its table + roster.
+        assert!(render_bars(&r, &keys(&r), 12, false).is_none());
+        assert!(render_heatmap(&r, &keys(&r), 8, false, false).is_none());
+        assert!(render_percentiles(&r, &keys(&r), 20, false).is_none());
+        let out = render_charts(&r, 12, false, false);
+        assert!(out.contains("account"), "the table still renders");
+        assert!(out.contains("roster:"), "the roster line still renders");
+        assert!(!out.contains('\x1b'));
+    }
+
+    // --- issue #159 AC: piped / non-TTY → numeric table, zero ANSI -------------------
+
+    #[test]
+    fn non_tty_falls_back_to_the_numeric_table_with_zero_ansi() {
+        let r = two_account_charts();
+        let piped = render_human(
+            &r,
+            TermEnv {
+                cols: None,
+                color: false,
+                ascii: false,
+            },
+        );
+        assert_eq!(
+            piped,
+            render_text(&r),
+            "a piped stats is the #158 numeric table verbatim"
+        );
+        assert!(!piped.contains('\x1b'), "zero ANSI on a pipe");
+        for glyph in ['▁', '█', '░', '▒', '▓', '┤'] {
+            assert!(
+                !piped.contains(glyph),
+                "no chart glyph in the piped numeric table"
+            );
+        }
+    }
+
+    // --- issue #159 AC: NO_COLOR / --no-color → zero ANSI, full signal in text --------
+
+    #[test]
+    fn color_gate_governs_every_ansi_byte() {
+        let r = two_account_charts();
+        // Gate open → the utilisation bands tint the `%` cells (alpha's 99% is red).
+        let colored = render_chart_table(&r, &keys(&r), 60, true, false);
+        assert!(
+            colored.contains("\x1b[31m99%\x1b[0m"),
+            "hot session reads red"
+        );
+        assert!(
+            colored.contains("\x1b[32m40%\x1b[0m"),
+            "a low weekly reads green"
+        );
+        // Gate closed → not one escape byte anywhere in the whole view, yet the full signal
+        // survives in text (the percentages and the glyphs).
+        let plain = render_charts(&r, 60, false, false);
+        assert!(!plain.contains('\x1b'), "no ANSI when the gate is closed");
+        assert!(
+            plain.contains("99%") && plain.contains("▃▅█"),
+            "full signal without colour"
+        );
+    }
+
+    // --- issue #159: --json wire stays byte-stable vs #158 (no chart glyphs) ----------
+
+    #[test]
+    fn charts_never_leak_into_the_json_wire() {
+        // The charts are presentation-only: the schema:1 wire carries no glyph, no ANSI, no
+        // chart field — the #158 contract is unchanged by #159.
+        let json = render_json(&two_account_charts()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert!(!json.contains('\x1b'));
+        for glyph in ['▁', '▂', '█', '░', '▒', '▓', '┤', '├', '─'] {
+            assert!(
+                !json.contains(glyph),
+                "no chart glyph on the wire (issue #159)"
+            );
+        }
+    }
+
+    // --- issue #159: empty / single-sample / all-gap series render without panic -------
+
+    #[test]
+    fn degenerate_series_render_without_panicking() {
+        // Empty roster.
+        let empty = charts_report(&[], &[]);
+        let out = render_charts(&empty, 80, true, false);
+        assert!(out.contains("no per-account usage in this window"));
+        assert!(out.contains("roster:"));
+
+        // A single account with a single sample and no series buckets.
+        let single = charts_report(&[("solo", stat(1, ds(0.5, 0.5, 0.5), 0.5, 1.0))], &[]);
+        let _ = render_charts(&single, 80, true, false);
+        let _ = render_charts(&single, 1, true, true);
+
+        // An account present in the summary but a GAP in every series bucket.
+        let all_gap = charts_report(
+            &[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))],
+            &[&[], &[]],
+        );
+        let out = render_charts(&all_gap, 80, false, false);
+        assert!(
+            out.contains("ghost"),
+            "an all-gap account still lists, its trend all breaks"
+        );
+        // A pathological width of 0 must not panic either.
+        let _ = render_charts(&two_account_charts(), 0, true, true);
+    }
 
     /// A minimal reading: `provider="claude"`, given `acct`, no optionals.
     fn sample(ts: i64, acct: &str, session: f64, weekly: f64) -> Sample {
