@@ -1,7 +1,16 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! The `capture` command: stash the active account and add it to the roster.
+//! The roster write paths: the `capture` command and the `login` reconcile (#134).
+//!
+//! Both land an account into the roster through the SHARED capture-plan
+//! ([`plan_capture`]) — `capture` snapshots the account currently logged in to
+//! Claude Code, while [`reconcile_login`] lands a credential freshly harvested in
+//! isolation by the login engine ([`crate::login`], #132). They differ only in
+//! where the credential comes from and whether the login also becomes active:
+//! `capture` reads the already-active canonical credential and does not touch it,
+//! whereas the login reconcile re-points the canonical item to the fresh
+//! credential (the login takes effect) under the swap lock — see [`reconcile_login`].
 //!
 //! While an account is the one currently logged in to Claude Code, `capture`:
 //!   1. reads that account's `~/.claude.json` `oauthAccount` block
@@ -32,13 +41,15 @@
 //! are unit-tested hermetically; [`capture`] only wires the real seams, persists,
 //! and prints.
 
-use crate::claude_state::{read_oauth_account, OauthAccount};
+use crate::claude_state::{read_oauth_account, write_oauth_account, OauthAccount};
 use crate::config::{Account, Config, RefreshConfig, Tunables};
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
+use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
 use std::path::Path;
+use std::time::Duration;
 
 /// Whether a `capture` added a new account or refreshed an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,15 +170,29 @@ async fn run_capture(
     })
 }
 
+/// Auto-derive a roster label from the immutable `account_uuid` — the fallback when
+/// the operator omits the optional label (issue #134).
+///
+/// The `account_uuid` is the ONLY non-secret, always-present, unique field the
+/// harvested identity exposes: `displayName` is deliberately not surfaced (two
+/// distinct accounts can share one — `build/version-compat.md`) and `emailAddress`
+/// is redacted (#15). So the derived label IS the uuid — unique (it is the roster
+/// key) and safe to print — which the operator can rename later by re-capturing /
+/// re-logging-in with an explicit label.
+fn derive_label(account_uuid: &str) -> String {
+    account_uuid.to_owned()
+}
+
 /// Pure roster update. Returns the stash service to write and whether this was a new
 /// capture or a refresh. Mutates `roster` in place (appending a new account, or
 /// updating an existing one's label).
 ///
-/// A new account requires an explicit, operator-chosen `label`: the account must
-/// be identifiable by something the operator controls, never a server-provided
-/// field. `displayName` is unsuitable (two distinct accounts can share one —
-/// `build/version-compat.md`) and `emailAddress` is redacted (#15), so there is
-/// no field to default to — hence [`Error::LabelRequired`] rather than a fallback.
+/// The `label` is OPTIONAL (issue #134). For a NEW account, an omitted or blank label
+/// is auto-derived via [`derive_label`] rather than rejected — the shared capture-plan
+/// path that both `capture` and the [`reconcile_login`] reconcile take, so neither
+/// hard-errors nor prompts on a missing label. A re-capture / re-login of an EXISTING
+/// account keeps its current label unless a new, non-empty one is given (an
+/// auto-derived label never clobbers the operator's chosen name).
 fn plan_capture(
     roster: &mut Vec<Account>,
     account_uuid: &str,
@@ -184,10 +209,10 @@ fn plan_capture(
         return Ok((existing.stash(), CaptureOutcome::Refreshed));
     }
 
-    // New account: an explicit label is required. There is no roster ceiling
-    // (#35) — the operator captures as many accounts as they choose, so a new
-    // account is always appended (never rejected for being "one too many").
-    let label = provided.ok_or(Error::LabelRequired)?.to_owned();
+    // New account: no explicit label → auto-derive one (never reject or prompt,
+    // issue #134). There is no roster ceiling (#35) — the operator captures as many
+    // accounts as they choose, so a new account is always appended.
+    let label = provided.map_or_else(|| derive_label(account_uuid), str::to_owned);
     // Key the stash by the immutable, server-assigned account_uuid — not a
     // positional slot. The keychain service accepts the uuid (hex + hyphens)
     // verbatim, and the stash uses fixed `acct=credential`/`acct=oauthAccount`,
@@ -217,9 +242,191 @@ fn confirmation(outcome: CaptureOutcome, label: &str, count: usize) -> String {
     }
 }
 
+// --- login reconcile (issue #134) ----------------------------------------------
+
+/// Whether a `login` reconcile ONBOARDED a brand-new account or REVIVED one already in
+/// the roster (issue #134). The `login` counterpart of [`CaptureOutcome`] — distinct
+/// vocabulary because a login is a fresh interactive re-auth (a possibly-quarantined
+/// account brought back), not the active-account snapshot `capture` takes. Consumed by
+/// the `login` verb (#135) for its redacted `onboarded|revived` event.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginOutcome {
+    /// The harvested account was not in the roster — a new entry was appended.
+    Onboarded,
+    /// The harvested account was already in the roster — its entry was updated IN
+    /// PLACE (never duplicated) and its stash + canonical re-pointed to the fresh
+    /// credential; the running daemon's #107 path un-quarantines it on that canonical
+    /// change (clearing any "needs re-login").
+    Revived,
+}
+
+impl From<CaptureOutcome> for LoginOutcome {
+    fn from(outcome: CaptureOutcome) -> Self {
+        // A login ONBOARDS where a capture would "capture" (new account) and REVIVES
+        // where a capture would "refresh" (existing account): the SAME roster decision
+        // (via the shared [`plan_capture`]), surfaced in login-facing vocabulary.
+        match outcome {
+            CaptureOutcome::Captured => LoginOutcome::Onboarded,
+            CaptureOutcome::Refreshed => LoginOutcome::Revived,
+        }
+    }
+}
+
+/// The result of reconciling a harvested login into the roster: the config to persist
+/// plus the facts the `login` verb (#135) needs for its event.
+#[cfg_attr(not(test), allow(dead_code))]
+struct LoginReport {
+    config: Config,
+    outcome: LoginOutcome,
+    label: String,
+    count: usize,
+}
+
+/// Reconcile a freshly-harvested login ([`StashedAccount`] from the isolated capture
+/// engine, #132) into the roster — the hermetic core (issue #134). Generic over both
+/// keychain seams so it is unit-tested with in-memory fakes; performs NO lock, NO config
+/// persistence, and NO reads of the real environment (every input is passed in).
+///
+/// Onboard (new account) or update-IN-PLACE (existing, matched by `account_uuid`) via
+/// the SHARED [`plan_capture`]; then, mirroring the swap engine's write ordering (#6):
+/// re-stash the fresh credential, re-point the canonical `Claude Code-credentials` item
+/// to it — this is the canonical change the running daemon's #107 path un-quarantines a
+/// re-logged-in account on (there is no roster-persisted quarantine flag a CLI could
+/// clear directly) — then best-effort co-write the identity into `~/.claude.json`.
+async fn run_login<C, S>(
+    captured: StashedAccount,
+    store: &C,
+    stash: &S,
+    existing: Option<Config>,
+    label: Option<&str>,
+    claude_json: &Path,
+) -> Result<LoginReport>
+where
+    C: CredentialStore,
+    S: AccountStash,
+{
+    // Preserve the operator's tunables + refresh schedule across the reconcile, exactly
+    // like `run_capture` (#58/#105): landing a login must never reset either to defaults.
+    let (mut roster, tunables, refresh) = match existing {
+        Some(config) => (config.roster, config.tunables, config.refresh),
+        None => (Vec::new(), Tunables::default(), RefreshConfig::default()),
+    };
+
+    let (stash_name, outcome) =
+        plan_capture(&mut roster, captured.oauth_account.account_uuid(), label)?;
+
+    // Re-stash the fresh credential BEFORE re-pointing canonical (#6 ordering): a crash
+    // between the two leaves a fresh, restorable stash, never a canonical pointing at an
+    // unstashed credential.
+    stash.write(&stash_name, &captured).await?;
+
+    // Re-point the canonical item to the fresh credential: the freshly-logged-in account
+    // becomes the active one AND — being a canonical change — is what the running
+    // daemon's #107 reconcile un-quarantines the account on. Atomic (`security -U`),
+    // exactly like the swap engine's incoming write.
+    store.write(&captured.credential).await?;
+
+    // Best-effort honest-display co-write (the swap engine's step 4): a failure
+    // self-heals on the daemon's next reconcile, so it never fails the login.
+    let _ = write_oauth_account(claude_json, &captured.oauth_account);
+
+    let count = roster.len();
+    // The final label lives on the rostered account (an onboard auto-derived it; a
+    // revive kept the prior label unless a new, non-empty one was given).
+    let label = roster
+        .iter()
+        .find(|a| a.stash() == stash_name)
+        .expect("the account just planned is in the roster")
+        .label
+        .clone();
+
+    Ok(LoginReport {
+        config: Config {
+            roster,
+            tunables,
+            refresh,
+        },
+        outcome: outcome.into(),
+        label,
+        count,
+    })
+}
+
+/// [`run_login`] wrapped in the single-writer swap lock (issue #64) when `lock` is
+/// `Some((path, max_wait))` — mirrors [`crate::swap::swap_locked`]. The lock is held
+/// ONLY around the short keychain write (stash + canonical), NEVER across the
+/// interactive login spawn (that ran in the capture engine, #132, before we get here).
+/// A `lock` of `None` runs unlocked: the hermetic test path, where there is no
+/// concurrent swap to serialize against. A contended acquire fails closed BEFORE any
+/// write; when the lock IS taken, the operator's fresh interactive login is the most
+/// recent authoritative write, so it wins a race with a concurrent swap (last-writer-wins).
+#[cfg_attr(not(test), allow(dead_code))]
+async fn run_login_locked<C, S>(
+    lock: Option<(&Path, Duration)>,
+    captured: StashedAccount,
+    store: &C,
+    stash: &S,
+    existing: Option<Config>,
+    label: Option<&str>,
+    claude_json: &Path,
+) -> Result<LoginReport>
+where
+    C: CredentialStore,
+    S: AccountStash,
+{
+    // Bind the guard so it outlives the whole write and drops on return (releasing the
+    // lock). Acquired BEFORE any write, so a contended refusal is a true no-op.
+    let _guard = match lock {
+        Some((path, max_wait)) => Some(SwapLock::acquire(path, max_wait).await?),
+        None => None,
+    };
+    run_login(captured, store, stash, existing, label, claude_json).await
+}
+
+/// Reconcile a harvested login into the roster over the REAL seams — the production
+/// entry point (issue #134) the `login` verb (#135) calls after the capture engine
+/// (#132) hands back a [`StashedAccount`]. Wires the real keychain store + stash, holds
+/// the swap lock around the short write (serializing against a concurrent daemon swap),
+/// then persists the roster. Reachable only from tests until #135 wires the verb, hence
+/// `allow(dead_code)` off-test.
+///
+/// The roster (`config.toml`) write is deliberately OUTSIDE the lock: a swap contends
+/// only on the keychain + `~/.claude.json`, never on `config.toml`, so no concurrent
+/// swap can race it. Stash-before-roster (like [`capture`]): a crash after the locked
+/// write but before the save leaves a fresh, restorable stash + canonical, never a
+/// roster referencing an unstashed account.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn reconcile_login(
+    captured: StashedAccount,
+    label: Option<String>,
+) -> Result<(LoginOutcome, String, usize)> {
+    // Ensure the native-local support dir (0700) that houses `swap.lock` exists before
+    // acquiring the lock (mirrors `use`, #64).
+    paths::ensure_private_dir(&paths::support_dir()?)?;
+    let swap_lock = paths::swap_lock()?;
+    let claude_json = paths::claude_json()?;
+    let existing = load_existing()?;
+
+    let report = run_login_locked(
+        Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
+        captured,
+        &RealCredentialStore::new(),
+        &RealAccountStash::new(),
+        existing,
+        label.as_deref(),
+        &claude_json,
+    )
+    .await?;
+
+    report.config.save()?;
+    Ok((report.outcome, report.label, report.count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keychain::FakeCredentialStore;
     use crate::stash::FakeAccountStash;
 
     fn account(uuid: &str, label: &str) -> Account {
@@ -233,6 +440,15 @@ mod tests {
     fn oauth(uuid: &str) -> OauthAccount {
         let json = format!(r#"{{"accountUuid":"{uuid}","displayName":"ignored"}}"#);
         OauthAccount::from_object_bytes(json.as_bytes()).unwrap()
+    }
+
+    /// A freshly-harvested login (the #132 capture engine's hand-off): a fresh
+    /// credential bundled with its `oauthAccount` identity.
+    fn stashed(uuid: &str, token: &[u8]) -> StashedAccount {
+        StashedAccount {
+            credential: Credential::new(token.to_vec()),
+            oauth_account: oauth(uuid),
+        }
     }
 
     // --- plan_capture (pure) ---
@@ -267,25 +483,27 @@ mod tests {
     }
 
     #[test]
-    fn a_new_account_without_a_label_is_rejected() {
-        // No server-provided fallback: an explicit operator label is required.
+    fn a_new_account_without_a_label_auto_derives_from_the_account_uuid() {
+        // Issue #134: an omitted label is NOT rejected — it auto-derives from the
+        // account_uuid (the only exposed non-secret unique field), so the shared
+        // capture-plan path never hard-errors nor prompts on a missing label.
         let mut roster = Vec::new();
-        assert!(matches!(
-            plan_capture(&mut roster, "u-1", None),
-            Err(Error::LabelRequired)
-        ));
-        // Nothing was appended on the error path.
-        assert!(roster.is_empty());
+        let (stash, outcome) = plan_capture(&mut roster, "u-1", None).unwrap();
+        assert_eq!(stash, "Sessiometer/u-1");
+        assert_eq!(outcome, CaptureOutcome::Captured);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0], account("u-1", "u-1"));
     }
 
     #[test]
-    fn a_blank_label_on_a_new_account_is_rejected() {
+    fn a_blank_label_on_a_new_account_auto_derives_from_the_account_uuid() {
+        // A whitespace-only label is treated as absent (trimmed to empty) and the
+        // account_uuid is used — the same auto-derive path as an omitted label (#134).
         let mut roster = Vec::new();
-        assert!(matches!(
-            plan_capture(&mut roster, "u-1", Some("   ")),
-            Err(Error::LabelRequired)
-        ));
-        assert!(roster.is_empty());
+        let (_, outcome) = plan_capture(&mut roster, "u-1", Some("   ")).unwrap();
+        assert_eq!(outcome, CaptureOutcome::Captured);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].label, "u-1");
     }
 
     #[test]
@@ -525,5 +743,227 @@ mod tests {
             load_existing_from(&path),
             Err(Error::ConfigParse(_))
         ));
+    }
+
+    // --- login reconcile (issue #134) ---
+
+    #[test]
+    fn login_outcome_maps_from_the_capture_outcome() {
+        // The shared plan yields a capture outcome; the login surfaces it as its own
+        // vocabulary — a NEW account is an onboard, an EXISTING one a revive.
+        assert_eq!(
+            LoginOutcome::from(CaptureOutcome::Captured),
+            LoginOutcome::Onboarded
+        );
+        assert_eq!(
+            LoginOutcome::from(CaptureOutcome::Refreshed),
+            LoginOutcome::Revived
+        );
+    }
+
+    // A claude.json path that does not exist: the best-effort co-write inside
+    // `run_login` fails and is swallowed (`let _ =`), so the reconcile still succeeds —
+    // exactly the honest-display self-heal contract, and it keeps the test off the real
+    // `~/.claude.json`.
+    fn absent_claude_json(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("claude.json")
+    }
+
+    #[tokio::test]
+    async fn login_onboards_an_account_absent_from_the_roster() {
+        // AC: a login for an account NOT in the roster ADDS a new entry (onboard),
+        // stashes the fresh credential, and re-points the canonical item to it. Here the
+        // label is omitted → auto-derived from the account_uuid (issue #134).
+        let store = FakeCredentialStore::empty();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = run_login(
+            stashed("u-new", b"fresh-token"),
+            &store,
+            &stash,
+            None,
+            None,
+            &absent_claude_json(dir.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, LoginOutcome::Onboarded);
+        assert_eq!(report.count, 1);
+        assert_eq!(report.label, "u-new"); // auto-derived from the account_uuid
+        assert_eq!(report.config.roster.len(), 1);
+        assert_eq!(report.config.roster[0].account_uuid, "u-new");
+
+        // The fresh credential is stashed under the account's service…
+        let stashed = stash.read("Sessiometer/u-new").await.unwrap();
+        assert_eq!(stashed.credential.expose(), b"fresh-token");
+        // …and the canonical item was re-pointed to it (the login took effect).
+        assert_eq!(store.read().await.unwrap().expose(), b"fresh-token");
+    }
+
+    #[tokio::test]
+    async fn login_writes_the_identity_into_an_existing_claude_json() {
+        // The best-effort honest-display co-write: when `~/.claude.json` exists, the
+        // reconcile writes the harvested identity into it (self-heals if it doesn't —
+        // covered by the absent-path tests). Format correctness is claude_state's own
+        // tests; here we prove `run_login` WIRES the co-write.
+        let store = FakeCredentialStore::empty();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let claude_json = dir.path().join("claude.json");
+        std::fs::write(&claude_json, b"{}").unwrap();
+
+        run_login(
+            stashed("u-disp", b"tok"),
+            &store,
+            &stash,
+            None,
+            Some("work"),
+            &claude_json,
+        )
+        .await
+        .unwrap();
+
+        let written = std::fs::read_to_string(&claude_json).unwrap();
+        assert!(written.contains("oauthAccount"));
+        assert!(written.contains("u-disp"));
+    }
+
+    #[tokio::test]
+    async fn login_updates_an_existing_account_in_place_without_duplicating() {
+        // AC: a login for an account ALREADY in the roster (matched by account_uuid)
+        // updates IN PLACE — never a duplicate — and preserves the operator's tunables.
+        let store = FakeCredentialStore::empty();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let existing = Config {
+            roster: vec![account("u-1", "work")],
+            tunables: Tunables {
+                poll_secs: 120, // a non-default the operator set
+                ..Tunables::default()
+            },
+            refresh: RefreshConfig::default(),
+        };
+
+        let report = run_login(
+            stashed("u-1", b"re-logged-in"),
+            &store,
+            &stash,
+            Some(existing),
+            None, // no new label → keep the operator's "work"
+            &absent_claude_json(dir.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, LoginOutcome::Revived);
+        assert_eq!(report.count, 1);
+        assert_eq!(report.config.roster.len(), 1); // NOT duplicated
+        assert_eq!(report.config.roster[0].account_uuid, "u-1");
+        assert_eq!(report.label, "work"); // the prior label is kept, not auto-derived
+                                          // The operator's tunables survive the reconcile (poll_secs default is 300).
+        assert_eq!(report.config.tunables.poll_secs, 120);
+        // The stash now holds the fresh credential.
+        let stashed = stash.read("Sessiometer/u-1").await.unwrap();
+        assert_eq!(stashed.credential.expose(), b"re-logged-in");
+    }
+
+    #[tokio::test]
+    async fn a_relogin_repoints_canonical_so_the_daemon_unquarantines() {
+        // AC: clears any "needs re-login" state by REUSING the un-quarantine-on-re-stash
+        // path (#107). Quarantine is DAEMON runtime state, cleared only on a CANONICAL
+        // change; #134's contribution is to WRITE the fresh credential to the canonical
+        // item, which the running daemon's #107 reconcile then un-quarantines on. Here we
+        // assert that re-point: the canonical starts at a STALE credential (the one that
+        // got the account quarantined) and ends at the fresh one.
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(b"stale".to_vec()))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let existing = Config {
+            roster: vec![account("u-1", "work")],
+            tunables: Tunables::default(),
+            refresh: RefreshConfig::default(),
+        };
+
+        run_login(
+            stashed("u-1", b"fresh"),
+            &store,
+            &stash,
+            Some(existing),
+            None,
+            &absent_claude_json(dir.path()),
+        )
+        .await
+        .unwrap();
+
+        // Canonical re-pointed from the stale credential to the fresh one → the daemon's
+        // #107 path sees a canonical change and un-quarantines the account.
+        assert_eq!(store.read().await.unwrap().expose(), b"fresh");
+    }
+
+    #[tokio::test]
+    async fn capture_without_a_label_auto_derives_from_the_account_uuid() {
+        // AC: because the optional-label + auto-derive lives in the SHARED capture-plan
+        // path, the `capture` verb's label likewise becomes optional — an omitted label
+        // auto-derives from the account_uuid rather than erroring (issue #134).
+        let stash = FakeAccountStash::empty();
+        let report = run_capture(
+            Credential::new(b"token".to_vec()),
+            oauth("u-cap"),
+            &stash,
+            None,
+            None, // label omitted
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, CaptureOutcome::Captured);
+        assert_eq!(report.label, "u-cap"); // auto-derived
+        assert_eq!(report.config.roster[0].account_uuid, "u-cap");
+    }
+
+    #[tokio::test]
+    async fn run_login_locked_writes_through_an_uncontended_lock() {
+        // AC: the stash/roster write serializes against a concurrent swap via the
+        // EXISTING swap.lock (#64). Here we prove the locked path is WIRED and completes
+        // uncontended (the lock's serialization guarantee itself is proven in swap.rs).
+        // The lock is held only around this short write — there is no interactive login
+        // spawn in scope (that ran in the capture engine, #132, before we got here).
+        let store = FakeCredentialStore::empty();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+
+        let report = run_login_locked(
+            Some((&lock, SWAP_LOCK_MAX_WAIT)),
+            stashed("u-lock", b"tok"),
+            &store,
+            &stash,
+            None,
+            Some("locked"),
+            &absent_claude_json(dir.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, LoginOutcome::Onboarded);
+        assert_eq!(report.label, "locked");
+        assert_eq!(store.read().await.unwrap().expose(), b"tok");
+        assert!(stash.contains("Sessiometer/u-lock"));
+    }
+
+    // Keep the production entry (and its production-only callees — the real seam
+    // construction, the swap-lock + config-save wiring) reachable from the test target
+    // until #135 wires it to the `login` CLI verb; the reference does not run the async
+    // body (no real keychain / config / lock is touched). Mirrors how #132 keeps
+    // `login_account` alive by referencing it in a test.
+    #[test]
+    fn the_login_reconcile_entry_stays_reachable() {
+        let _entry = reconcile_login;
     }
 }

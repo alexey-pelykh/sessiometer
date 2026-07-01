@@ -8187,7 +8187,6 @@ mod tests {
             Error::OauthAccountFieldMissing {
                 field: "accountUuid",
             },
-            Error::LabelRequired,
             Error::RotationLabelRequired { verb: "disable" },
             Error::AccountLabelNotFound {
                 label: "work".to_owned(),
