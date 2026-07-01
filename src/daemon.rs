@@ -96,7 +96,8 @@ use crate::refresh_tick::{RefreshObservation, SweepOutcome};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
-use crate::usage::{CurlTransport, RealUsageSource, Usage, UsageSource};
+use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
+use crate::usage_store::{append_sample, Sample};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
 /// config's `session_trigger` range so a jittered draw can never escape it.
@@ -211,8 +212,11 @@ impl Shutdown for RealShutdown {
 pub(crate) trait RosterPoller {
     /// Poll `account`'s usage. `active` selects the token source: the canonical
     /// keychain item for the active account (whose token is the freshest), or the
-    /// account's stash for any other.
-    async fn poll(&self, account: &Account, active: bool) -> Result<Usage>;
+    /// account's stash for any other. Returns the full [`PolledReading`] — the
+    /// swap-decision [`Usage`] plus the sample-only `severity` — from a single API
+    /// call; the caller projects to `Usage` for the decision and records the sample
+    /// from the same reading (issue #156, no extra call).
+    async fn poll(&self, account: &Account, active: bool) -> Result<PolledReading>;
 }
 
 /// Production poller: build a [`CurlTransport`]-backed [`RealUsageSource`] per
@@ -233,7 +237,7 @@ impl RealRosterPoller {
 }
 
 impl RosterPoller for RealRosterPoller {
-    async fn poll(&self, account: &Account, active: bool) -> Result<Usage> {
+    async fn poll(&self, account: &Account, active: bool) -> Result<PolledReading> {
         if active {
             // The active account's token refreshes in place, so the canonical
             // item is the freshest bearer — poll through it.
@@ -272,6 +276,73 @@ impl<S: AccountStash> CredentialStore for StashCredentialStore<'_, S> {
         Err(Error::Unimplemented(
             "stash-backed credential store is read-only",
         ))
+    }
+}
+
+/// The provider tag stamped on every usage sample (issue #156). Sessiometer manages
+/// Claude accounts only today; the [`Sample`] schema keeps a provider field so a
+/// future multi-provider store stays distinguishable, so the collector names it.
+const USAGE_PROVIDER: &str = "claude";
+
+/// Record ONE usage sample for a poll (issue #156), fail-open.
+///
+/// The poll-loop entry point: resolve the store path, then delegate to
+/// [`append_sample_for_poll`]. Splitting path resolution out keeps that core
+/// hermetically testable with an injected path + clock. A path-resolution failure is
+/// logged and swallowed — usage sampling is telemetry and must never break the
+/// poll/swap loop (see [`append_sample_for_poll`] for the full fail-open contract).
+fn record_usage_sample(account_label: &str, polled: &Result<PolledReading>) {
+    let samples_path = match crate::paths::usage_samples() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("sessiometer: usage-sample path unavailable, skipped: {err}");
+            return;
+        }
+    };
+    append_sample_for_poll(&samples_path, account_label, polled, wall_clock_now_secs());
+}
+
+/// Append one usage [`Sample`] for a poll to `samples_path`, fail-open (issue #156).
+///
+/// The collector's testable core — an injected `now` and path make it hermetic:
+///
+/// - **Piggyback, no extra call**: builds the sample from `polled`, the reading the
+///   swap poll already fetched, never issuing its own usage request.
+/// - **Gap honesty**: a FAILED poll (`Err` — API error, 401, offline) records
+///   NOTHING. A gap is absent, never a fabricated zero/healthy sample (issue #157
+///   reads a missing sample as UNKNOWN, never zero).
+/// - **Redaction-clean**: `acct` is the account's redacted handle (`label`), never
+///   an email or token — the store's invariant (issue #15).
+/// - **Fail-open**: a store-write error (disk full, permission, torn write) is logged
+///   and swallowed; it must never break the poll/swap loop or crash the daemon. The
+///   credential rotation/health path is unaffected by a sampling failure.
+///
+/// `spend` is a forward slot in the [`Sample`] schema with no producer in the current
+/// usage response, so it is wired to `None` until one exists.
+fn append_sample_for_poll(
+    samples_path: &std::path::Path,
+    account_label: &str,
+    polled: &Result<PolledReading>,
+    now: i64,
+) {
+    let Ok(reading) = polled else {
+        return; // gap: a poll with no reading records no sample
+    };
+    let sample = Sample::new(
+        now,
+        USAGE_PROVIDER,
+        account_label,
+        reading.usage.session,
+        reading.usage.weekly,
+    )
+    .with_resets(
+        reading.usage.session_resets_at,
+        reading.usage.weekly_resets_at,
+    )
+    .with_severity(reading.severity.clone())
+    .with_spend(None);
+    if let Err(err) = append_sample(samples_path, &sample) {
+        eprintln!("sessiometer: usage-sample write skipped: {err}");
     }
 }
 
@@ -1473,7 +1544,15 @@ where
         let mut backed_off = false;
         let mut retry_after_floor: Option<Duration> = None;
         if let Some(i) = poll_idx {
-            let result = self.poller.poll(&self.roster[i], active == Some(i)).await;
+            let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
+            // Record ONE usage sample for this poll (issue #156): piggyback the
+            // reading just fetched (no extra usage-API call), recording nothing on a
+            // gap and swallowing any store error. Off the swap-decision path — a
+            // sampling failure never perturbs the loop below.
+            record_usage_sample(&self.roster[i].label, &polled);
+            // Project to the lean `Usage` the decision path consumes; the sample-only
+            // `severity` does not travel past here.
+            let result = polled.map(|reading| reading.usage);
             self.note_poll_outcome(i, &result, &mut events);
             diagnostics.push(Diagnostic::Poll {
                 account: self.roster[i].label.clone(),
@@ -3352,9 +3431,14 @@ mod tests {
     }
 
     impl RosterPoller for FakeRosterPoller {
-        async fn poll(&self, account: &Account, _active: bool) -> Result<Usage> {
+        async fn poll(&self, account: &Account, _active: bool) -> Result<PolledReading> {
             match self.readings.get(&account.account_uuid) {
-                Some(Scripted::Ok(usage)) => Ok(*usage),
+                // The scripted decision reading, wrapped as a PolledReading with no
+                // severity (the collector's severity path is unit-tested directly).
+                Some(Scripted::Ok(usage)) => Ok(PolledReading {
+                    usage: *usage,
+                    severity: None,
+                }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
@@ -9817,5 +9901,142 @@ mod tests {
         // bytes or sha256), email shape, or high-entropy run leaked onto ANY channel
         // across the whole acceptance loop.
         assert_clean(&corpus, &secrets);
+    }
+
+    // --- Usage-sample collector (issue #156) ------------------------------
+
+    /// A successful poll writes EXACTLY ONE sample carrying the redacted handle and
+    /// every projected field — including the widened `severity` — with no secret.
+    #[test]
+    fn collector_writes_one_redacted_sample_per_successful_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: 0.42,
+                weekly: 0.88,
+                weekly_resets_at: Some(1_700_600_000),
+                session_resets_at: Some(1_700_003_600),
+            },
+            severity: Some("critical".to_owned()),
+        });
+
+        append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(samples.len(), 1, "exactly one sample per successful poll");
+        let s = &samples[0];
+        assert_eq!(s.ts, 1_700_000_000);
+        assert_eq!(s.provider, USAGE_PROVIDER);
+        assert_eq!(s.acct, "work", "the redacted handle, verbatim");
+        assert!((s.session - 0.42).abs() < 1e-9);
+        assert!((s.weekly - 0.88).abs() < 1e-9);
+        assert_eq!(s.session_resets_at, Some(1_700_003_600));
+        assert_eq!(s.weekly_resets_at, Some(1_700_600_000));
+        assert_eq!(s.severity.as_deref(), Some("critical"), "severity retained");
+        assert_eq!(s.spend, None, "no spend producer yet (forward slot)");
+
+        // Redaction: the persisted line carries no email/token shape (issue #15).
+        let raw = std::fs::read_to_string(&samples_path).unwrap();
+        assert!(!raw.contains('@'), "no email may reach the store: {raw}");
+        assert!(
+            !raw.contains("sk-ant"),
+            "no token may reach the store: {raw}"
+        );
+    }
+
+    /// A reading whose optional `severity` is absent still yields a valid sample
+    /// (issue #156 AC: valid when the optional field is absent).
+    #[test]
+    fn collector_sample_is_valid_without_severity() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: 0.1,
+                weekly: 0.2,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            },
+            severity: None,
+        });
+
+        append_sample_for_poll(&samples_path, "spare", &reading, 42);
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].severity, None);
+        assert_eq!(samples[0].acct, "spare");
+    }
+
+    /// GAP HONESTY: a poll that yields NO reading (`Err`) records NOTHING — a gap is
+    /// absent, never a fabricated zero/healthy sample (issue #157 reads a missing
+    /// sample as UNKNOWN). A pre-existing sample file is left untouched.
+    #[test]
+    fn collector_records_nothing_for_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+
+        // A 401 / offline / API-error poll writes no sample (and no file).
+        let gap: Result<PolledReading> = Err(Error::UsageUnauthorized);
+        append_sample_for_poll(&samples_path, "work", &gap, 100);
+        assert!(
+            crate::usage_store::read_samples(&samples_path)
+                .unwrap()
+                .is_empty(),
+            "a gap writes no sample"
+        );
+
+        // A gap AFTER a real sample adds nothing — the earlier reading stands alone.
+        let ok = Ok(PolledReading {
+            usage: Usage {
+                session: 0.3,
+                weekly: 0.4,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            },
+            severity: None,
+        });
+        append_sample_for_poll(&samples_path, "work", &ok, 200);
+        let transient: Result<PolledReading> = Err(Error::UsageTransient {
+            status: 0,
+            retry_after: None,
+        });
+        append_sample_for_poll(&samples_path, "work", &transient, 300);
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "only the successful poll produced a sample"
+        );
+        assert_eq!(samples[0].ts, 200);
+    }
+
+    /// FAIL-OPEN: a store-write error is swallowed — the collector returns normally
+    /// (the poll/swap loop continues, the daemon stays up) and leaves no file. Here
+    /// the parent directory does not exist, so the append cannot open its file.
+    #[test]
+    fn collector_swallows_a_store_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // Parent subdir intentionally absent → the private-file open fails (ENOENT).
+        let unwritable = dir
+            .path()
+            .join("missing-subdir")
+            .join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: 0.5,
+                weekly: 0.6,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            },
+            severity: Some("warning".to_owned()),
+        });
+
+        // Must NOT panic / unwind: reaching the assertion below proves the write
+        // error was swallowed and control returned to the (simulated) poll loop.
+        append_sample_for_poll(&unwritable, "work", &reading, 7);
+
+        assert!(!unwritable.exists(), "no partial file left behind");
     }
 }
