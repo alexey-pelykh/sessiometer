@@ -27,6 +27,27 @@ pub(crate) enum Error {
     #[error("unknown command: {0}")]
     UnknownCommand(String),
 
+    /// `stats --period` got a value outside `day|week|month|lifetime`.
+    #[error("invalid --period `{0}`: expected one of day, week, month, lifetime")]
+    StatsPeriodInvalid(String),
+
+    /// `stats --since` got a value that is neither a relative offset (e.g. `7d`, `24h`,
+    /// `30m`, `2w`) nor an absolute date (`YYYY-MM-DD` or RFC 3339).
+    #[error(
+        "invalid --since `{0}`: expected a relative offset (e.g. 7d, 24h) or a date (YYYY-MM-DD)"
+    )]
+    StatsSinceInvalid(String),
+
+    /// `stats` got both `--period` and `--since`, which select the window two different
+    /// ways — the caller must pick one.
+    #[error("--period and --since are mutually exclusive")]
+    StatsPeriodSinceConflict,
+
+    /// A usage value was not finite and so could not be rendered as `stats --json`.
+    /// Unreachable under the aggregator's finite-output guarantee; mapped, never panicked.
+    #[error("could not render stats as JSON: {0}")]
+    StatsSerialize(&'static str),
+
     /// The current user's home directory could not be resolved from the
     /// password database (see [`crate::paths`]).
     #[error("could not resolve the home directory for the current user")]
