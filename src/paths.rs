@@ -116,9 +116,9 @@ pub(crate) fn isolated_refresh_dir(uuid: &str) -> Result<PathBuf> {
 /// login at a time), and [`create_isolated_dir`] removes any stale leaf a crashed
 /// prior capture left behind before each run.
 ///
-/// Wired by the login-capture engine's production entry (a later issue, #134), hence
-/// the test-only reachability today.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Reachable in production via the daemon startup / `login`-start orphan reaper (issue #133), which
+/// derives the isolated login item's #100 service from this path; the login-capture engine's own
+/// production entry is wired by a later issue (#134).
 pub(crate) fn isolated_login_dir() -> Result<PathBuf> {
     Ok(support_dir()?.join("login"))
 }
