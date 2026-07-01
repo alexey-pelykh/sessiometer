@@ -73,6 +73,7 @@
 //! edge-triggered `all_exhausted` event naming the least-bad account (the soonest
 //! weekly `resets_at`), which now fills the event log's `resets_at=` field.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write;
@@ -100,7 +101,7 @@ use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
 use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
-use crate::usage_store::{append_sample, Sample};
+use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sample};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
 /// config's `session_trigger` range so a jittered draw can never escape it.
@@ -347,6 +348,146 @@ fn append_sample_for_poll(
     if let Err(err) = append_sample(samples_path, &sample) {
         eprintln!("sessiometer: usage-sample write skipped: {err}");
     }
+}
+
+/// Per-account usage-gap tracking for the rate-limited `usage_gap` event (issue #161). An
+/// entry exists only while an account is in a gap streak (no reading since `since`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GapState {
+    /// Epoch second the current gap streak began — the event's fixed `since`.
+    since: i64,
+    /// Epoch second the last `usage_gap` for this streak was emitted — the rate-limit anchor.
+    last_emitted: i64,
+}
+
+/// The cadences bounding the stats-store maintenance layer (issue #161): how often a gapping
+/// account re-emits `usage_gap`, and how often the daemon runs `compact_and_roll`.
+#[derive(Clone, Copy, Debug)]
+struct StatsCadence {
+    /// Minimum seconds between `usage_gap` re-emissions for one account while it keeps gapping.
+    gap_reemit_secs: i64,
+    /// Minimum seconds between `compact_and_roll` passes.
+    roll_cadence_secs: i64,
+}
+
+/// Minimum seconds between `usage_gap` re-emits for one account (issue #161): a persistently
+/// gapping account logs at most hourly, not once per failed poll.
+const GAP_REEMIT_MIN_SECS: i64 = 3_600;
+/// Minimum seconds between `compact_and_roll` passes (issue #161): compaction runs at most
+/// hourly, bounding raw-file churn — a roll only folds data when a whole day ages out anyway.
+const STATS_ROLL_CADENCE_SECS: i64 = 3_600;
+/// The production stats cadences (issue #161). The pure [`stats_events_for_poll`] core takes
+/// these as a parameter so a hermetic test can drive tighter windows.
+const STATS_CADENCE: StatsCadence = StatsCadence {
+    gap_reemit_secs: GAP_REEMIT_MIN_SECS,
+    roll_cadence_secs: STATS_ROLL_CADENCE_SECS,
+};
+
+/// The two on-disk paths of the usage-stats store (issue #161), bundled so the maintenance
+/// core takes one argument for them rather than two.
+struct StorePaths<'a> {
+    /// The append-only raw-sample JSONL (`crate::paths::usage_samples`).
+    samples: &'a Path,
+    /// The rolled-aggregate document (`crate::paths::usage_rollup`).
+    rollup: &'a Path,
+}
+
+/// The carried usage-stats maintenance state (issue #161): per-account gap streaks plus the
+/// last compaction time. One cohesive unit in [`DecisionState`], mutated only when the stats
+/// seam is wired ([`Daemon::with_stats`]).
+#[derive(Default)]
+struct StatsState {
+    /// Per-account gap streaks keyed by handle (see [`GapState`]) — an entry exists only while
+    /// an account is gapping, so a roster reload never has to resize it.
+    gap_state: BTreeMap<String, GapState>,
+    /// Epoch second of the last `compact_and_roll` pass, or `None` until the first — the
+    /// cadence anchor bounding compaction to at most one pass per roll window.
+    last_roll: Option<i64>,
+}
+
+/// The pure, hermetic core of the usage-stats maintenance layer (issue #161): given a poll's
+/// gap-or-reading outcome, the store paths, the retention policy, and the carried gap +
+/// roll-cadence state, produce the redacted events to emit. Mutates only the two pieces of
+/// carried state it is handed (`gap_state`, `last_roll`); everything else is by-value / `&`.
+///
+/// Two independent, fail-open effects (a store error is swallowed — telemetry must never break
+/// the poll loop):
+///
+/// - **Gap** (`is_gap`): a no-reading poll recorded no sample (#156's gap-honesty), and MAY
+///   surface a rate-limited `usage_gap`. The first poll of a streak emits (`since = now`);
+///   later gapping polls re-emit only once `cadence.gap_reemit_secs` has elapsed, `since` fixed
+///   at the streak start. A reading clears the account's streak.
+/// - **Rollup**: at most once per `cadence.roll_cadence_secs`, run `compact_and_roll` under
+///   `policy`; when a pass folds ≥1 raw sample, emit a `usage_rollup`.
+///
+/// Every emitted event is redaction-clean: `usage_gap` carries only the account HANDLE +
+/// timestamps, `usage_rollup` only integers — never a token or email (the #15 guarantee).
+fn stats_events_for_poll(
+    paths: &StorePaths,
+    account_label: &str,
+    is_gap: bool,
+    now: i64,
+    policy: &RetentionPolicy,
+    state: &mut StatsState,
+    cadence: &StatsCadence,
+) -> Vec<Event> {
+    let mut events = Vec::new();
+
+    // Gap tracking + rate-limited emission.
+    if is_gap {
+        match state.gap_state.get_mut(account_label) {
+            Some(streak) => {
+                // The streak continues: re-emit only once the rate-limit window has passed,
+                // keeping `since` fixed at the streak start.
+                if now - streak.last_emitted >= cadence.gap_reemit_secs {
+                    streak.last_emitted = now;
+                    events.push(Event::UsageGap {
+                        account: account_label.to_owned(),
+                        since: streak.since,
+                    });
+                }
+            }
+            None => {
+                // A new streak: record it and emit the first gap immediately.
+                state.gap_state.insert(
+                    account_label.to_owned(),
+                    GapState {
+                        since: now,
+                        last_emitted: now,
+                    },
+                );
+                events.push(Event::UsageGap {
+                    account: account_label.to_owned(),
+                    since: now,
+                });
+            }
+        }
+    } else {
+        // A reading resumed → the streak (if any) is over.
+        state.gap_state.remove(account_label);
+    }
+
+    // Cadence-gated compaction + rollup emission. Store-global (independent of this poll's
+    // account), so it runs on every poll subject only to the cadence.
+    let roll_due = match state.last_roll {
+        None => true,
+        Some(prev) => now - prev >= cadence.roll_cadence_secs,
+    };
+    if roll_due {
+        // Bound attempts to one per cadence window regardless of outcome (fail-open): a
+        // persistent store error then retries at the cadence, never once per poll.
+        state.last_roll = Some(now);
+        if let Ok(summary) = compact_and_roll(paths.samples, paths.rollup, now, policy) {
+            if summary.raw_lines > 0 {
+                events.push(Event::UsageRollup {
+                    rolled_through: summary.rolled_through_ts,
+                    raw_lines: summary.raw_lines,
+                });
+            }
+        }
+    }
+
+    events
 }
 
 /// A side effect a served control connection asks the run loop to apply after the
@@ -1295,6 +1436,12 @@ struct DecisionState {
     /// might still be viable. Once warmed up, [`decide_action`](Daemon::decide_action)
     /// runs normally on the full last-known set.
     warmed_up: bool,
+    /// The usage-stats store maintenance state (issue #161): per-account gap streaks (for the
+    /// rate-limited `usage_gap` event) plus the last `compact_and_roll` time (the roll-cadence
+    /// anchor). Populated ONLY when the stats seam is wired ([`Daemon::with_stats`]); otherwise
+    /// it stays at its empty default and the collector's roll/gap layer is inert. See
+    /// [`StatsState`].
+    stats_state: StatsState,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -1373,6 +1520,15 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// gated on the same effective switch as the periodic tick; when `Some`, a usage 401
     /// attempts one isolated refresh + re-poll before it can quarantine the account.
     poll_refresh: Option<Box<dyn PollRefresh>>,
+    /// The usage-stats store maintenance seam (issue #161), or `None` to disable it (the
+    /// hermetic-test default — a test with no on-disk store wires nothing, so the collector's
+    /// roll/gap emission is wholly inert and the ~existing `tick` tests are unaffected).
+    /// Production wires the config-derived [`RetentionPolicy`] via
+    /// [`with_stats`](Self::with_stats); when `Some`, each poll runs the cadence-gated
+    /// `compact_and_roll` (emitting a redacted `usage_rollup` when a pass folds samples) and
+    /// records a rate-limited redacted `usage_gap` on a no-reading poll. The append-per-poll
+    /// collector (#156) runs regardless — this seam adds only the roll + gap-event layer.
+    stats: Option<RetentionPolicy>,
     state: DecisionState,
 }
 
@@ -1427,6 +1583,9 @@ where
             // No poll-path refresh-then-retry by default (issue #162); production opts in
             // via `with_refresh_engine`. Left unset, a 401 flows straight to the streak.
             poll_refresh: None,
+            // No usage-stats store maintenance by default (issue #161); production opts in via
+            // `with_stats`. Left unset, the collector's roll/gap-event layer is inert.
+            stats: None,
             state: DecisionState {
                 health,
                 last_readings,
@@ -1455,6 +1614,52 @@ where
     pub(crate) fn with_config_path(mut self, path: PathBuf) -> Self {
         self.config_path = Some(path);
         self
+    }
+
+    /// Wire the usage-stats store maintenance seam (issue #161): the daemon then runs the
+    /// cadence-gated `compact_and_roll` under `policy` after each poll — emitting a redacted
+    /// `usage_rollup` when a pass folds aged samples — and records a rate-limited redacted
+    /// `usage_gap` on a no-reading poll. `policy` is the config-derived
+    /// [`StatsConfig::retention_policy`](crate::config::StatsConfig::retention_policy).
+    /// Builder-style to mirror `with_swap_lock` / `with_config_path` and keep `new`'s args
+    /// stable; a hermetic test drives the pure [`stats_events_for_poll`] core directly instead.
+    pub(crate) fn with_stats(mut self, policy: RetentionPolicy) -> Self {
+        self.stats = Some(policy);
+        self
+    }
+
+    /// The stats-store maintenance layer wired into [`tick`](Self::tick) (issue #161): a thin
+    /// adapter over the pure [`stats_events_for_poll`] core. Resolve the real store paths, run
+    /// the core under the wired policy + carried gap/roll state, and append any redacted events
+    /// to this tick's batch. A no-op when the stats seam is unset (`with_stats` not called) or a
+    /// store path is unavailable — fail-open, exactly like [`record_usage_sample`]: sampling
+    /// telemetry never breaks the poll/swap loop. `i` is the polled roster index; `is_gap` is
+    /// whether that poll yielded no reading.
+    fn maintain_stats_store(&mut self, i: usize, is_gap: bool, now: i64, events: &mut Vec<Event>) {
+        let Some(policy) = &self.stats else {
+            return; // stats seam not wired (hermetic-test default) → inert
+        };
+        let samples_path = match crate::paths::usage_samples() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let rollup_path = match crate::paths::usage_rollup() {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let produced = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            &self.roster[i].label,
+            is_gap,
+            now,
+            policy,
+            &mut self.state.stats_state,
+            &STATS_CADENCE,
+        );
+        events.extend(produced);
     }
 
     /// Wire the poll-path refresh-then-retry seam (issue #162): on a usage 401 the daemon
@@ -1617,6 +1822,12 @@ where
             // gap and swallowing any store error. Off the swap-decision path — a
             // sampling failure never perturbs the loop below.
             record_usage_sample(&self.roster[i].label, &polled);
+            // Usage-stats store maintenance (issue #161): a cadence-gated `compact_and_roll`
+            // (emitting a redacted `usage_rollup` when a pass folds aged samples) plus a
+            // rate-limited redacted `usage_gap` on a no-reading poll. Inert unless `with_stats`
+            // wired the retention policy; off the swap-decision path, so a store failure is
+            // swallowed and never perturbs the loop below.
+            self.maintain_stats_store(i, polled.is_err(), wall_clock_now_secs(), &mut events);
             // Project to the lean `Usage` the decision path consumes; the sample-only
             // `severity` does not travel past here.
             let mut result = polled.map(|reading| reading.usage);
@@ -10485,5 +10696,308 @@ mod tests {
         append_sample_for_poll(&unwritable, "work", &reading, 7);
 
         assert!(!unwritable.exists(), "no partial file left behind");
+    }
+
+    // --- Usage-stats store maintenance events (issue #161) ------------------
+
+    /// Tight cadences so the hermetic tests drive re-emit / roll windows deterministically.
+    fn test_cadence() -> StatsCadence {
+        StatsCadence {
+            gap_reemit_secs: 3_600,
+            roll_cadence_secs: 3_600,
+        }
+    }
+
+    /// A no-reading poll emits ONE redacted `usage_gap` (handle + streak-start), then is
+    /// RATE-LIMITED: a second gap inside the re-emit window is suppressed; a later one
+    /// re-emits with `since` STILL fixed at the streak start. No PII on any line.
+    #[test]
+    fn stats_gap_emits_a_rate_limited_redacted_gap_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        let policy = RetentionPolicy::default();
+        let cadence = test_cadence();
+        let mut state = StatsState::default(); // empty store → the roll folds nothing (no rollup noise)
+
+        // First gap of a streak → one UsageGap, since = now, handle-only.
+        let e1 = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            true,
+            1_000_000,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert_eq!(e1.len(), 1, "the first gap of a streak emits");
+        match &e1[0] {
+            Event::UsageGap { account, since } => {
+                assert_eq!(account, "work", "the redacted handle");
+                assert_eq!(*since, 1_000_000, "since = streak start");
+            }
+            other => panic!("expected UsageGap, got {other:?}"),
+        }
+
+        // A second gap 100s later — inside the 3600s window → suppressed.
+        let e2 = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            true,
+            1_000_100,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(e2.is_empty(), "rate-limited inside the re-emit window");
+
+        // A third gap past the window → re-emit, `since` STILL the streak start.
+        let e3 = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            true,
+            1_003_600,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert_eq!(e3.len(), 1, "re-emits past the window");
+        match &e3[0] {
+            Event::UsageGap { since, .. } => {
+                assert_eq!(*since, 1_000_000, "since is fixed across the streak")
+            }
+            other => panic!("expected UsageGap, got {other:?}"),
+        }
+
+        // NO PII on the rendered gap line — handle + timestamp only.
+        let line = e3[0].to_log_line(std::time::UNIX_EPOCH);
+        assert!(line.contains("event=usage_gap acct=work"), "got: {line}");
+        assert!(!line.contains('@'), "no email: {line}");
+        assert!(!line.contains("sk-ant"), "no token: {line}");
+    }
+
+    /// A reading CLEARS the account's gap streak, so a later gap starts fresh (`since` = the
+    /// new gap's time) rather than re-using the old streak start.
+    #[test]
+    fn stats_reading_clears_the_gap_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        let policy = RetentionPolicy::default();
+        let cadence = test_cadence();
+        let mut state = StatsState::default();
+
+        // A gap opens a streak.
+        stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            true,
+            100,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(state.gap_state.contains_key("work"), "streak recorded");
+
+        // A reading clears it and emits no gap.
+        let reading = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            false,
+            200,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(
+            !state.gap_state.contains_key("work"),
+            "reading clears the streak"
+        );
+        assert!(
+            reading.iter().all(|e| !matches!(e, Event::UsageGap { .. })),
+            "a reading emits no gap"
+        );
+
+        // A later gap is a NEW streak.
+        let e = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            true,
+            5_000,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        match &e[0] {
+            Event::UsageGap { since, .. } => assert_eq!(*since, 5_000, "fresh streak start"),
+            other => panic!("expected UsageGap, got {other:?}"),
+        }
+    }
+
+    /// A reading poll whose cadence-gated `compact_and_roll` folds aged samples emits ONE
+    /// redacted `usage_rollup` (store-global: integers only, NO account handle). No PII.
+    #[test]
+    fn stats_rollup_emits_a_redacted_event_when_a_pass_folds_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        let policy = RetentionPolicy::default();
+        let cadence = test_cadence();
+        let mut state = StatsState::default(); // first pass is due
+        let now = 200 * 86_400;
+        let aged = 10 * 86_400; // one aged-out day, past the 14d raw window
+        for k in 0..3 {
+            append_sample(
+                &samples_path,
+                &Sample::new(aged + k * 600, "claude", "work", 0.5, 0.6),
+            )
+            .unwrap();
+        }
+
+        let events = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            false,
+            now,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        let rollups: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Event::UsageRollup { .. }))
+            .collect();
+        assert_eq!(rollups.len(), 1, "one rollup when a pass folds samples");
+        match rollups[0] {
+            Event::UsageRollup {
+                rolled_through,
+                raw_lines,
+            } => {
+                assert_eq!(*raw_lines, 3, "folded the 3 aged samples");
+                assert_eq!(
+                    *rolled_through,
+                    aged + 2 * 600,
+                    "watermark = newest folded ts"
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::UsageGap { .. })),
+            "a reading poll emits no gap"
+        );
+        assert!(
+            state.last_roll.is_some(),
+            "the roll advanced the cadence anchor"
+        );
+
+        // NO PII: store-global, integers only — no handle, no email/token.
+        let line = rollups[0].to_log_line(std::time::UNIX_EPOCH);
+        assert!(line.contains("event=usage_rollup"), "got: {line}");
+        assert!(!line.contains("acct="), "rollup carries no handle: {line}");
+        assert!(!line.contains('@'), "no email: {line}");
+    }
+
+    /// The roll is CADENCE-GATED: after a pass, a second poll inside the window runs no
+    /// compaction (aged samples added meanwhile stay raw); a poll past the window rolls them.
+    #[test]
+    fn stats_rollup_is_cadence_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        let policy = RetentionPolicy::default();
+        let cadence = test_cadence();
+        let mut state = StatsState::default();
+        let now = 200 * 86_400;
+
+        // Day-10 samples → the first pass (due) rolls them.
+        for k in 0..3 {
+            append_sample(
+                &samples_path,
+                &Sample::new(10 * 86_400 + k * 600, "claude", "work", 0.5, 0.6),
+            )
+            .unwrap();
+        }
+        let e1 = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            false,
+            now,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(
+            e1.iter().any(|e| matches!(e, Event::UsageRollup { .. })),
+            "the first pass rolls"
+        );
+
+        // A different aged day's samples appended AFTER the first pass.
+        for k in 0..3 {
+            append_sample(
+                &samples_path,
+                &Sample::new(11 * 86_400 + k * 600, "claude", "work", 0.4, 0.5),
+            )
+            .unwrap();
+        }
+        // Inside the roll window → no compaction, so no rollup and the new samples stay raw.
+        let e2 = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            false,
+            now + 100,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(
+            e2.iter().all(|e| !matches!(e, Event::UsageRollup { .. })),
+            "cadence-gated: no roll inside the window"
+        );
+
+        // Past the window → rolls the new day.
+        let e3 = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            false,
+            now + 3_600,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(
+            e3.iter().any(|e| matches!(e, Event::UsageRollup { .. })),
+            "rolls again past the cadence"
+        );
     }
 }

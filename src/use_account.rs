@@ -897,6 +897,7 @@ mod tests {
             tunables: Tunables::default(),
             refresh: crate::config::RefreshConfig::default(),
             login: crate::config::LoginConfig::default(),
+            stats: crate::config::StatsConfig::default(),
         }
     }
 

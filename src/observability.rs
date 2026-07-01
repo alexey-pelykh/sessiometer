@@ -336,6 +336,21 @@ pub(crate) enum Event {
         account: Option<String>,
         outcome: LoginEventOutcome,
     },
+    /// The usage-stats store compacted and rolled aged raw samples down into its hourly/daily
+    /// aggregates (issue #161). Edge-ish: emitted only when a pass actually folds something
+    /// (`raw_lines > 0`), so a no-op maintenance pass is silent. `rolled_through` is the roll
+    /// watermark AFTER the pass (the newest sample epoch now folded, epoch seconds, rendered to
+    /// RFC 3339); `raw_lines` is how many raw samples that pass folded. Store-global — NO
+    /// `account` field (a roll spans every account's samples), and every field is a plain
+    /// integer / timestamp, never a handle, token, or email.
+    UsageRollup { rolled_through: i64, raw_lines: u32 },
+    /// A poll produced no reading for `account`, so the usage-stats store recorded no sample
+    /// for it (issue #161, honouring #156's gap-honesty: a gap is an ABSENCE, never a fabricated
+    /// zero). Rate-limited by the daemon (at most one per account per re-emit interval) rather
+    /// than per failed poll. `account` is the operator HANDLE (label) — never a token or email;
+    /// `since` is the epoch second the current gap streak began (rendered to RFC 3339), fixed
+    /// across a streak's re-emissions so the line reads "gapping since X".
+    UsageGap { account: String, since: i64 },
 }
 
 impl Event {
@@ -437,6 +452,23 @@ impl Event {
                     }
                     None => format!("ts={ts} event=login outcome={outcome}"),
                 }
+            }
+            Event::UsageRollup {
+                rolled_through,
+                raw_lines,
+            } => {
+                // `rolled_through` is epoch seconds, rendered through the SAME formatter as the
+                // line `ts` (and `resets_at` / refresh expiries), so watermarks read uniformly.
+                let rolled_through = rfc3339(system_time_from_epoch(*rolled_through));
+                format!(
+                    "ts={ts} event=usage_rollup rolled_through={rolled_through} raw_lines={raw_lines}"
+                )
+            }
+            Event::UsageGap { account, since } => {
+                // `account` is the handle; `since` is the gap-streak start, rendered to RFC 3339
+                // through the shared formatter. Both non-secret (the #15 single-surface guarantee).
+                let since = rfc3339(system_time_from_epoch(*since));
+                format!("ts={ts} event=usage_gap acct={account} since={since}")
             }
         }
     }
@@ -1115,6 +1147,64 @@ mod tests {
             format!("{TS0} event=refresh account=spare outcome=error")
         );
         assert!(!unknown.contains("expires_"), "got: {unknown}");
+    }
+
+    #[test]
+    fn usage_rollup_carries_the_watermark_and_raw_line_count() {
+        // Issue #161: the store rolled `raw_lines` samples through to `rolled_through`
+        // (epoch seconds → whole-second RFC 3339 via the shared formatter). Store-global —
+        // no `account` field.
+        let line = Event::UsageRollup {
+            rolled_through: 1_782_777_600, // 2026-06-30T00:00:00Z
+            raw_lines: 288,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=usage_rollup rolled_through=2026-06-30T00:00:00Z raw_lines=288")
+        );
+        assert!(!line.contains("account"), "rollup is store-global: {line}");
+        assert!(!line.contains("acct="), "rollup is store-global: {line}");
+    }
+
+    #[test]
+    fn usage_gap_carries_the_handle_and_streak_start() {
+        // Issue #161: a no-reading poll surfaces the account HANDLE + the gap-streak start
+        // (`since`, epoch seconds → RFC 3339). Handle-only identity — never a token or email.
+        let line = Event::UsageGap {
+            account: "work".to_owned(),
+            since: 1_782_777_600, // 2026-06-30T00:00:00Z
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=usage_gap acct=work since=2026-06-30T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn usage_rollup_and_gap_lines_carry_no_pii() {
+        // The #15 single-surface guarantee for the #161 events: every rendered field is a
+        // handle, an integer, or a timestamp — never an email or token. Even the gap event's
+        // only free field is the operator handle we passed; there is no separate identity
+        // field that could leak an email/token.
+        let rollup = Event::UsageRollup {
+            rolled_through: 1_782_777_600,
+            raw_lines: 5,
+        }
+        .to_log_line(at_epoch(0));
+        let gap = Event::UsageGap {
+            account: "work".to_owned(),
+            since: 1_782_777_600,
+        }
+        .to_log_line(at_epoch(0));
+        for line in [&rollup, &gap] {
+            assert!(!line.contains('@'), "no email may appear: {line}");
+            // The refresh/login events use `outcome=`/`token`; ours carry no credential field.
+            assert!(!line.contains("token"), "no token may appear: {line}");
+            assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
+            assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
+        }
     }
 
     #[test]

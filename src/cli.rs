@@ -382,7 +382,15 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // Re-read this on a runtime roster-reload (#139): a `capture` / `login` / `remove`
     // notifies the daemon over the control socket, which then reconciles the in-memory
     // rotation to the freshly-written `config.toml` without a restart.
-    .with_config_path(paths::config_file()?);
+    .with_config_path(paths::config_file()?)
+    // Maintain the usage-stats store (#161): compact + roll aged samples under the operator's
+    // `[stats]` retention horizons, emitting redacted `usage_rollup` / `usage_gap` events. The
+    // poll cadence is the daily-coverage denominator, so it is threaded in from `[tunables]`.
+    .with_stats(
+        config
+            .stats
+            .retention_policy(config.tunables.poll_secs as i64),
+    );
     let mut shutdown = RealShutdown::new()?;
 
     eprintln!(
@@ -2278,6 +2286,7 @@ mod tests {
             },
             refresh: crate::config::RefreshConfig::default(),
             login: crate::config::LoginConfig::default(),
+            stats: crate::config::StatsConfig::default(),
         }
     }
 
