@@ -425,6 +425,24 @@ pub(crate) enum Error {
     #[error("invalid migration artifact: {0}")]
     MigrationInvalid(&'static str),
 
+    // --- Usage-sample datastore (issue #155) ----------------------------------
+    //
+    // The local usage-sample store's own outcomes (see [`crate::usage_store`]).
+    // Both secret-free: the store holds only percentages, epoch timestamps and
+    // redacted handles (never a token or email), so neither can carry one.
+    /// A usage-store record or rollup could not be serialized to JSON — reachable
+    /// only for a non-finite float in a usage fraction/spend, which JSON cannot
+    /// represent. The payload is a static, secret-free hint.
+    #[error("could not serialize a usage-store record: {0}")]
+    UsageStoreSerialize(&'static str),
+
+    /// The usage-rollup file is not valid JSON. Only the parser's `line`/`column`
+    /// is carried — never the surrounding bytes (issue #15 redaction discipline,
+    /// mirroring [`Error::MigrationMalformed`]); secret-free regardless, since the
+    /// store holds no secret.
+    #[error("malformed usage rollup: JSON error at line {line} column {column}")]
+    UsageRollupMalformed { line: usize, column: usize },
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
