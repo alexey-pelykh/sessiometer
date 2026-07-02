@@ -119,6 +119,25 @@ TTY: it is suppressed when output is piped or redirected, when `--no-color` is
 passed, or when `NO_COLOR`, `CLICOLOR=0`, or `TERM=dumb` is set in the environment
 — so an escape sequence never reaches a pipe, a redirect, or a log.
 
+When the periodic refresh (**`[refresh]`**) is **off** and at least one **non-active**
+account is unverified or going stale (**⚪**/**🟡**/**🟠**/**🔴** in `AUTH`), a single
+**advisory** line trails the footer, naming the one-shot remedy:
+
+```text
+next swap: spare
+
+advisory: [refresh] is off and non-active accounts are going stale — run 'sessiometer poke' or enable [refresh] to maintain them
+```
+
+With the tick off, non-active credentials get no maintenance and can lapse silently —
+the advisory surfaces that gap up front instead of leaving it to the eventual
+`none (no viable target)`, by which point the fallback set is already dead. Run
+[`sessiometer poke`](#keeping-a-parked-credential-fresh) once, or enable
+[`[refresh]`](#refreshing-parked-credentials-automatically) for ongoing upkeep. Like the
+colour overlay it is **advisory chrome** — shown only on an interactive TTY (suppressed
+when piped, redirected, `--no-color`, or `NO_COLOR`/`CLICOLOR=0`/`TERM=dumb`) and
+**never** emitted into `--json`, so scripts and `status | grep` are unaffected.
+
 For the full data regardless of terminal width — both reset instants as raw
 epoch seconds, for scripting — use `--json`:
 
