@@ -1,0 +1,32 @@
+# Architecture Decision Records
+
+This directory holds **Architecture Decision Records (ADRs)** — short,
+immutable, point-in-time notes that capture a load-bearing technical decision
+together with the context that made it, the alternatives weighed, and the
+consequences accepted.
+
+An ADR exists so a contributor does not have to reverse-engineer *why* the code
+is the way it is. Rationale that today lives only in module doc-comments and
+issue threads is consolidated here in a stable, discoverable place.
+
+## Index
+
+| ADR | Title | Status |
+|-----|-------|--------|
+| [0001](0001-current-thread-tokio-runtime.md) | Single-threaded (`current_thread`) Tokio runtime | Accepted |
+| [0002](0002-keychain-via-security-cli-zero-ffi.md) | Keychain access via `/usr/bin/security` CLI (zero FFI) | Accepted |
+| [0003](0003-no-torn-swap-invariant.md) | No-torn-swap invariant | Accepted |
+
+## Conventions
+
+- **Filename**: `NNNN-kebab-case-title.md`, `NNNN` zero-padded and sequential;
+  numbers are never reused, even after supersession.
+- **Sections**: every ADR carries **Context**, **Decision**, **Alternatives
+  considered**, and **Consequences** (positive and negative/trade-offs).
+- **Status vocabulary**: `Accepted` (in force) · `Superseded` (replaced by a
+  later ADR — link both ways) · `Deprecated` (no longer applies, not replaced).
+- **Immutability**: ADRs are historical artifacts. Do not rewrite an accepted
+  ADR to match newer thinking — write a new ADR that supersedes it, and mark the
+  old one `Superseded by ADR-NNNN`.
+- **Provenance**: cite the code (`file` / symbol) and the originating issue
+  numbers, matching this repo's house style.
