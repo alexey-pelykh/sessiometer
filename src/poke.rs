@@ -18,10 +18,13 @@
 //!
 //! A thin caller over the isolated-refresh engine (issue #102, [`crate::refresh`]); it
 //! honors the engine's documented Caller contract:
-//!   - **Refresh PARKED accounts only.** The ACTIVE account (resolved from
-//!     `~/.claude.json`) is excluded — named-mode REFUSES it
-//!     ([`Error::PokeTargetActive`]), all-mode SKIPS it. "Mid-swap" exclusion needs no
-//!     logic here: the engine holds the swap lock around its stash read + re-stash, so a
+//!   - **Refresh PARKED accounts only.** The ACTIVE account (resolved TOKEN-FIRST via the
+//!     shared [`crate::active`] resolver — canonical keychain token → stash byte-match,
+//!     `~/.claude.json` a display-only fallback — so a forced-logout that clears the
+//!     display cannot mask a still-active account, issues #207/#250) is excluded —
+//!     named-mode REFUSES it ([`Error::PokeTargetActive`]), all-mode SKIPS it. "Mid-swap"
+//!     exclusion needs no logic here: the engine holds the swap lock around its stash
+//!     read + re-stash, so a
 //!     concurrent swap can never interleave (issue #105 note, "the lock enforces the
 //!     latter"). A one-shot cannot know the daemon's *imminent* swap target, but that
 //!     residual is bounded and self-healing — the engine's CAS re-stash plus the
@@ -48,14 +51,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::claude_state;
+use crate::active;
 use crate::config::{Account, Config};
 use crate::daemon::{AccountStatusLine, StatusResponse};
 use crate::error::{Error, Result};
+use crate::keychain::{CredentialStore, RealCredentialStore};
 use crate::observability::CredentialHealth;
 use crate::paths;
 use crate::refresh::{self, RefreshOutcome, RefreshReport};
-use crate::stash::RealAccountStash;
+use crate::stash::{AccountStash, RealAccountStash};
 use crate::use_account::resolve_target;
 
 /// How close to its `expiresAt` a parked account's stored token must be for the
@@ -121,9 +125,17 @@ pub(crate) async fn poke(target: Option<String>) -> Result<()> {
     // ensure it (0700) before the engine touches it (mirrors `use`).
     paths::ensure_private_dir(&paths::support_dir()?)?;
 
-    let active_uuid = resolve_active_uuid(&paths::claude_json()?)?;
+    // Resolve WHICH account is active TOKEN-FIRST (issue #207/#250): read the canonical
+    // keychain credential and byte-match it against the stashes, `~/.claude.json`'s
+    // clobberable `oauthAccount` a DISPLAY-only fallback. One `RealAccountStash` is reused
+    // — borrowed here for resolution, then moved into the engine — so this adds only a
+    // `CredentialStore` read over the pre-#250 display-only path.
+    let store = RealCredentialStore::new();
+    let stash = RealAccountStash::new();
+    let active_uuid =
+        resolve_active_uuid(&config.roster, &store, &stash, &paths::claude_json()?).await?;
     let engine = RealPokeEngine {
-        stash: RealAccountStash::new(),
+        stash,
         claude_binary: paths::claude_binary()?,
     };
     // The daemon's current per-account verdict (#163), read best-effort BEFORE the
@@ -143,19 +155,57 @@ pub(crate) async fn poke(target: Option<String>) -> Result<()> {
 }
 
 /// The active account's uuid (the one logged in to Claude Code), or `None` when no
-/// account is active.
+/// account is active — resolved TOKEN-FIRST via the shared [`crate::active`] resolver,
+/// exactly as the `use` swap and the daemon poll do (issue #207).
 ///
-/// A MISSING `~/.claude.json`, or one carrying no `oauthAccount`, means no account is
-/// logged in ⇒ `None` ⇒ every roster account is parked and safe to poke. A
-/// PRESENT-but-unreadable state file (a parse error, a malformed `oauthAccount`)
-/// PROPAGATES as an error: `poke` must EXCLUDE the active account, so when one exists
-/// but cannot be identified it refuses rather than risk poking it.
-fn resolve_active_uuid(claude_json: &Path) -> Result<Option<String>> {
-    match claude_state::read_oauth_account_from(claude_json) {
-        Ok(oauth) => Ok(Some(oauth.account_uuid().to_owned())),
-        Err(Error::ClaudeStateNotFound { .. }) | Err(Error::OauthAccountMissing) => Ok(None),
-        Err(other) => Err(other),
-    }
+/// The canonical keychain credential is the authoritative bearer of the live session;
+/// `~/.claude.json`'s `oauthAccount` is only the clobberable, last-writer-wins DISPLAY
+/// half, which Claude Code clears out-of-band on a forced logout. The pre-#207
+/// display-only path let a cleared display mask a still-active account (canonical token
+/// unchanged) — defeating poke's "exclude the active account" safety and letting it
+/// refresh the live session's shared token (issue #250). Resolution now consults the
+/// canonical first: a byte-match against a stash identifies the active account even when
+/// the display is cleared or stale.
+///
+/// The canonical is read ONCE and classified exactly as `use`'s swap does
+/// ([`crate::use_account`], issue #212): a LOCKED keychain, or any other PRESENT-but-unreadable
+/// failure, REFUSES (propagates the error) — poke must EXCLUDE the active account, so a
+/// canonical it merely *could not read* is never degraded to "nothing is active" (the
+/// exact blind spot #250 closes). Only a CONFIRMED-absent canonical
+/// ([`Error::CredentialNotFound`], the scrubbed item) degrades to the display-only signal
+/// — there is no live token to protect. `None` (canonical present but matching no stash
+/// AND the display resolving nothing, or both signals absent) means truly logged out ⇒
+/// every roster account is parked and safe to poke.
+///
+/// Returns the resolved account's uuid — converting the resolver's roster INDEX at the
+/// boundary — so poke's hermetic core keeps taking a bare `Option<&str>`. The #15
+/// redaction invariant holds by construction: the shared resolver yields only an index,
+/// never a token or email.
+async fn resolve_active_uuid<C: CredentialStore, S: AccountStash>(
+    roster: &[Account],
+    store: &C,
+    stash: &S,
+    claude_json: &Path,
+) -> Result<Option<String>> {
+    let canonical = match store.read().await {
+        Ok(canonical) => Some(canonical),
+        // Locked ≠ gone (transient — retry when unlocked): refuse rather than risk poking
+        // a still-active account behind a locked keychain (issue #250).
+        Err(err @ Error::KeychainLocked { .. }) => return Err(err),
+        // CONFIRMED absent (`errSecItemNotFound`): the scrubbed canonical — no live token
+        // to protect, so degrade to the display-only signal below.
+        Err(Error::CredentialNotFound) => None,
+        // PRESENT-but-unreadable for any other reason ("could not read" ≠ "gone"): refuse,
+        // never degrade to poke-all-on-cleared-display, the exact #250 blind spot.
+        Err(err) => return Err(err),
+    };
+    let active = match &canonical {
+        Some(canonical) => active::resolve_account_for(roster, stash, claude_json, canonical).await,
+        // No readable canonical → the display is the only remaining signal (itself possibly
+        // cleared, leaving the account genuinely logged out ⇒ `None` ⇒ poke all).
+        None => active::resolve_via_display(roster, claude_json),
+    };
+    Ok(active.map(|idx| roster[idx].account_uuid.clone()))
 }
 
 /// Run the requested `poke` mode over the injected `engine`: named (one account) or
@@ -390,6 +440,10 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    use crate::claude_state::OauthAccount;
+    use crate::keychain::{Credential, FakeCredentialStore};
+    use crate::stash::{FakeAccountStash, StashedAccount};
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
@@ -719,34 +773,157 @@ mod tests {
         );
     }
 
-    // --- resolve_active_uuid -------------------------------------------------
+    // --- resolve_active_uuid (token-first, issue #207/#250) ------------------
 
-    #[test]
-    fn active_uuid_is_some_when_logged_in() {
-        let (_dir, path) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-A"}}"#);
-        assert_eq!(resolve_active_uuid(&path).unwrap().as_deref(), Some("u-A"));
+    fn cred(blob: &[u8]) -> Credential {
+        Credential::new(blob.to_vec())
     }
 
-    #[test]
-    fn active_uuid_is_none_when_no_state_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.json");
-        assert_eq!(resolve_active_uuid(&path).unwrap(), None);
+    /// A `StashedAccount` pairing `token` with `uuid`'s display half — mirrors the
+    /// `active` module's own test fixture.
+    fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
+        StashedAccount {
+            credential: cred(token),
+            oauth_account: OauthAccount::from_object_bytes(
+                format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
+                    .as_bytes(),
+            )
+            .unwrap(),
+        }
     }
 
-    #[test]
-    fn active_uuid_is_none_when_not_logged_in() {
-        // Valid JSON, but no `oauthAccount` — no account is active.
-        let (_dir, path) = write_claude_json(r#"{"numStartups":1}"#);
-        assert_eq!(resolve_active_uuid(&path).unwrap(), None);
+    /// A `FakeCredentialStore` whose canonical item holds `token`.
+    async fn store_holding(token: &[u8]) -> FakeCredentialStore {
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(token)).await.unwrap();
+        store
     }
 
-    #[test]
-    fn active_uuid_refuses_on_an_unreadable_state_file() {
-        // Present but malformed — an active account may exist yet cannot be named, so
-        // poke refuses rather than risk poking it.
-        let (_dir, path) = write_claude_json("{ not json");
-        assert!(resolve_active_uuid(&path).is_err());
+    /// A stash holding `work` (`u-A` → `A-token`) and `spare` (`u-B` → `B-token`).
+    async fn stash_ab() -> FakeAccountStash {
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        stash
+    }
+
+    fn roster_ab() -> Vec<Account> {
+        vec![acct("work", "u-A"), acct("spare", "u-B")]
+    }
+
+    #[tokio::test]
+    async fn active_uuid_resolves_token_first() {
+        // AC-1: the canonical token byte-matches u-A's stash → active is u-A, even with a
+        // display that agrees.
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-A"}}"#);
+        let resolved = resolve_active_uuid(
+            &roster_ab(),
+            &store_holding(b"A-token").await,
+            &stash_ab().await,
+            &json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("u-A"));
+    }
+
+    #[tokio::test]
+    async fn active_uuid_token_match_wins_over_a_cleared_display() {
+        // AC-2 (the #250 core): Claude Code force-logged-out and cleared `~/.claude.json`'s
+        // `oauthAccount`, but the canonical token is unchanged and still byte-matches u-A's
+        // stash → poke MUST still resolve u-A as active (and thus exclude it from any
+        // refresh), not fall through to "nothing active" and sweep the live token.
+        let (_dir, json) = write_claude_json(r#"{"numStartups":1}"#); // cleared display
+        let resolved = resolve_active_uuid(
+            &roster_ab(),
+            &store_holding(b"A-token").await,
+            &stash_ab().await,
+            &json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.as_deref(),
+            Some("u-A"),
+            "token byte-match resolves the active account despite the cleared display"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_uuid_refuses_on_a_locked_canonical() {
+        // AC-3: a locked keychain is a SAFETY abort (locked ≠ gone) — refuse rather than
+        // degrade to poke-all-on-cleared-display and risk poking a still-active account.
+        let store = FakeCredentialStore::empty();
+        store.set_locked(true);
+        let (_dir, json) = write_claude_json(r#"{"numStartups":1}"#);
+        let err = resolve_active_uuid(&roster_ab(), &store, &stash_ab().await, &json)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::KeychainLocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn active_uuid_refuses_on_a_present_but_unreadable_canonical() {
+        // AC-3: "could not read" ≠ "gone" — a present-but-unreadable canonical (an
+        // ACL/auth-deny) likewise refuses, never degraded to "nothing is active".
+        let store = FakeCredentialStore::empty();
+        store.set_unreadable(true);
+        let (_dir, json) = write_claude_json(r#"{"numStartups":1}"#);
+        assert!(
+            resolve_active_uuid(&roster_ab(), &store, &stash_ab().await, &json)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_uuid_falls_back_to_display_when_the_canonical_is_confirmed_absent() {
+        // AC-4: a CONFIRMED-absent canonical (`errSecItemNotFound`, the scrubbed item) is
+        // NOT a refuse — there is no live token to protect. Degrade to the display-only
+        // signal: a display still naming a roster account marks it (display-)active.
+        let store = FakeCredentialStore::empty();
+        store.set_not_found(true);
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-B"}}"#);
+        let resolved = resolve_active_uuid(&roster_ab(), &store, &stash_ab().await, &json)
+            .await
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("u-B"));
+    }
+
+    #[tokio::test]
+    async fn active_uuid_is_none_when_truly_logged_out() {
+        // AC-4: canonical present but matching NO stash (an orphan/unmanaged token) AND a
+        // display naming nothing in the roster → `None` ⇒ every roster account is parked
+        // and safe to poke (today's defensible default, preserved).
+        let (_dir, json) = write_claude_json(r#"{"numStartups":1}"#);
+        let resolved = resolve_active_uuid(
+            &roster_ab(),
+            &store_holding(b"ORPHAN-token").await,
+            &stash_ab().await,
+            &json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn active_uuid_is_none_when_canonical_and_display_are_both_absent() {
+        // AC-4: fully logged out — the canonical item is gone and the display carries no
+        // `oauthAccount` → `None` ⇒ poke all.
+        let store = FakeCredentialStore::empty();
+        store.set_not_found(true);
+        let (_dir, json) = write_claude_json(r#"{"numStartups":1}"#);
+        let resolved = resolve_active_uuid(&roster_ab(), &store, &stash_ab().await, &json)
+            .await
+            .unwrap();
+        assert_eq!(resolved, None);
     }
 
     // --- run_poke: named mode ------------------------------------------------
