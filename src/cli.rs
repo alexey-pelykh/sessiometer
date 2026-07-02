@@ -1821,6 +1821,10 @@ fn access_token_expiry_cell(expires_at: Option<i64>, now: i64) -> String {
 /// `None` there means "not a TTY", the signal that drops the charts for the numeric
 /// table (a piped / redirected `stats` stays the plain, greppable surface).
 pub(crate) fn terminal_cols() -> Option<usize> {
+    // Raw `libc` FFI, kept un-wrapped by ADR-0004: `TIOCGWINSZ` has no std
+    // equivalent (unlike `isatty` -> `IsTerminal`, #178), so wrapping it would mean
+    // a production `rustix` / `terminal_size` dependency the crate's minimalism
+    // rejects for a single, sound POD probe.
     // SAFETY: `winsize` is plain-old-data we zero-initialize; the ioctl only writes
     // into it through the pointer we pass and returns `0` on success. The same
     // direct-libc idiom the rest of the crate uses (e.g. `getpeereid`, `flock`).

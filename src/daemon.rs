@@ -638,6 +638,10 @@ impl InstanceLock {
             .truncate(false)
             .mode(0o600)
             .open(path)?;
+        // Raw `flock` FFI, kept un-wrapped by ADR-0004: kept raw rather than
+        // adding a `rustix` production dependency; the std wheel
+        // (`File::try_lock`, stable 1.89) is the planned replacement once MSRV
+        // reaches 1.89 (see #257).
         // SAFETY: `flock` takes a valid open fd (owned by `file`, which outlives
         // the call) and the two flag constants; it has no other preconditions.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
