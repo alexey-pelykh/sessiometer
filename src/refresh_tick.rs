@@ -349,7 +349,11 @@ fn error_refresh_event(label: &str, before_ms: Option<i64>) -> Event {
 /// Map a completed cycle's [`RefreshReport`] to the non-secret [`RefreshEventOutcome`]
 /// (issue #106) — the classification #105's removed `eprintln` summarized, now folded into
 /// the structured event. `Refreshed` splits on whether the CAS re-stash stored the token.
-fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutcome {
+///
+/// `pub(crate)` so the #162 poll-path refresh ([`crate::daemon`], issue #255) maps its own
+/// cycle's report to the SAME event vocabulary through this one function — the periodic sweep
+/// and the poll path never drift on how a report becomes an `outcome=` token.
+pub(crate) fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutcome {
     match report.outcome {
         RefreshOutcome::Refreshed if report.re_stashed => RefreshEventOutcome::Refreshed,
         RefreshOutcome::Refreshed => RefreshEventOutcome::RefreshedNotReStashed,

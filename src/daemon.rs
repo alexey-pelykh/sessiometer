@@ -100,7 +100,7 @@ use crate::observability::{
     RefreshEventOutcome, SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
-use crate::refresh_tick::{RealRefreshEngine, RefreshEngine};
+use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
@@ -1376,7 +1376,7 @@ where
             // flows on to `note_poll_outcome` unchanged. The seam is inert (unset) unless
             // `with_refresh_engine` wired it, so every other path behaves exactly as before.
             if self.should_refresh_retry(i, &result) {
-                result = self.refresh_retry(i).await;
+                result = self.refresh_retry(i, &mut events).await;
             }
             self.note_poll_outcome(i, &result, &mut events);
             diagnostics.push(Diagnostic::Poll {
@@ -1887,12 +1887,31 @@ where
     ///   undo — not the re-poll itself, issue #253.)
     /// - The refresh itself **errors** → "could not revive"; fail-safe by letting the 401
     ///   stand. A refresh failure never crashes the poll loop.
-    async fn refresh_retry(&self, i: usize) -> Result<Usage> {
+    ///
+    /// Every firing pushes ONE durable [`Event::PollRefresh`] onto `events` (issue #255): the
+    /// isolated-refresh ACTION the durable log previously lacked — until now only the DOWNSTREAM
+    /// poll outcome reached it (via [`note_poll_outcome`](Self::note_poll_outcome)), so the log
+    /// showed a `CredentialDead` edge but not the poll-refresh that preceded it.
+    async fn refresh_retry(&self, i: usize, events: &mut Vec<Event>) -> Result<Usage> {
         let refreshed = match self.poll_refresh.as_ref() {
             Some(engine) => engine.refresh(&self.roster[i]).await,
             // Unreachable given the `should_refresh_retry` guard; treat as could-not-revive.
             None => return Err(Error::UsageUnauthorized),
         };
+        // Durably record the isolated poll-refresh ACTION (issue #255): the fact it fired, its
+        // target PARKED account (redacted handle), and the classified outcome — the forensic
+        // trail the transient `diag=` line alone did not leave. Emitted for EVERY firing, BEFORE
+        // the Dead / re-poll split below, so a genuine-death `Dead` is evented as surely as a
+        // revive. A completed cycle maps through the shared `refresh_event_outcome` (the same
+        // vocabulary the periodic #106 `event=refresh` uses); an engine that could not even run
+        // (`Err`) is an `Error` outcome — mirroring `refresh_tick`'s `error_refresh_event`.
+        events.push(Event::PollRefresh {
+            account: self.roster[i].label.clone(),
+            outcome: match &refreshed {
+                Ok(report) => refresh_event_outcome(report),
+                Err(_) => RefreshEventOutcome::Error,
+            },
+        });
         match refreshed {
             // The refresh token was cleared in place → genuinely dead: let the 401 stand.
             Ok(report) if report.outcome == RefreshOutcome::Dead => Err(Error::UsageUnauthorized),
@@ -9089,6 +9108,66 @@ mod tests {
             "#253: a still-active account's 401 advances the #42 streak toward operator re-login, \
              never a stash-only refresh + re-poll that resets the streak and masks it healthy",
         );
+    }
+
+    /// Drive the #162 seam to exactly ONE poll-refresh firing (issue #255) and return the
+    /// durable events the REFRESHING tick emitted: tick 1 polls `work` (healthy, seam inert),
+    /// tick 2 is `spare`'s first 401 → [`refresh_retry`](Daemon::refresh_retry) → the
+    /// `Event::PollRefresh` under test. `refresh_outcome` is what the fake engine reports;
+    /// `hard_error` makes the refresh itself fail (the fail-safe `Error` path).
+    async fn poll_refresh_tick_events(
+        refresh_outcome: RefreshOutcome,
+        hard_error: bool,
+    ) -> Vec<Event> {
+        let (mut daemon, _outcomes, _calls) =
+            seam_daemon(Scripted::Unauthorized, refresh_outcome, None, hard_error, 3).await;
+        daemon.tick().await; // tick 1: work (healthy) — the seam stays inert
+        daemon.tick().await.events // tick 2: spare's first 401 → the poll-refresh fires
+    }
+
+    #[tokio::test]
+    async fn a_poll_refresh_emits_one_durable_event_per_outcome_branch() {
+        // AC (issue #255): every #162 poll-refresh firing emits ONE durable `Event::PollRefresh`
+        // carrying the target PARKED account (redacted handle) and the classified refresh outcome
+        // — the isolated-refresh ACTION the durable log lacked (only the DOWNSTREAM poll outcome
+        // was evented, via `note_poll_outcome`). One firing per outcome branch, asserted like the
+        // `Monitor401` / `ReStash` event tests.
+        let cases = [
+            // (fake engine report outcome, hard engine error?, expected evented outcome)
+            (
+                RefreshOutcome::Refreshed,
+                false,
+                RefreshEventOutcome::Refreshed,
+            ),
+            (
+                RefreshOutcome::NoChange,
+                false,
+                RefreshEventOutcome::NoChange,
+            ),
+            (RefreshOutcome::Dead, false, RefreshEventOutcome::Dead),
+            (RefreshOutcome::Error, false, RefreshEventOutcome::Error),
+            // The engine could not even RUN (spawn / lock failure): the fail-safe `Error`
+            // outcome, mirroring `refresh_tick`'s `error_refresh_event`. The report `outcome`
+            // is unused on this path, so any value stands in.
+            (RefreshOutcome::Refreshed, true, RefreshEventOutcome::Error),
+        ];
+        for (report_outcome, hard_error, expected) in cases {
+            let events = poll_refresh_tick_events(report_outcome, hard_error).await;
+            let poll_refreshes = events
+                .iter()
+                .filter(|e| matches!(e, Event::PollRefresh { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                poll_refreshes,
+                vec![Event::PollRefresh {
+                    account: "spare".to_owned(),
+                    outcome: expected,
+                }],
+                "report {report_outcome:?} (hard_error={hard_error}) must emit exactly one \
+                 poll_refresh event with the redacted handle + mapped outcome",
+            );
+        }
     }
 
     #[tokio::test]
