@@ -2,6 +2,10 @@
 name = "sessiometer"
 version = "0.1.0"
 edition = "2021"
+# MSRV: 1.87 stabilized `u*::is_multiple_of` (used in stash/keychain/migration); 1.86 and
+# older will not compile. CI gates build+test on this exact version — keep the `RUST_MSRV`
+# env in `.github/workflows/ci.yml` in sync.
+rust-version = "1.87.0"
 license = "MIT"
 description = "Manage multiple Claude Code accounts on macOS: poll per-account usage quota and swap the active credential out-of-band before exhaustion."
 repository = "https://github.com/alexey-pelykh/sessiometer"
