@@ -22,7 +22,7 @@
 ///
 /// Behind a trait so the daemon's per-cycle draws can be driven from a fixed-seed
 /// PRNG in tests (deterministic) and from process entropy in production — the
-/// same injectable-seam pattern as the daemon's [`Clock`](crate::daemon::Clock) /
+/// same injectable-seam pattern as the daemon's [`Clock`](crate::contract::Clock) /
 /// poller seams.
 pub(crate) trait Rng {
     /// The next uniform sample in `[0, 1)`.
