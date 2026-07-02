@@ -43,72 +43,17 @@
 //!
 //! The selection → refresh flow is generic over a [`RefreshEngine`] seam (mirroring `poke`'s
 //! `PokeEngine`) and a [`Clock`] seam, so the whole tick runs hermetically against in-memory
-//! fakes in tests; production wires [`RealRefreshEngine`] + [`crate::daemon::RealClock`].
+//! fakes in tests; production wires [`RealRefreshEngine`] + [`crate::contract::RealClock`].
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Account, RefreshConfig};
-use crate::daemon::{Clock, RefreshTicker};
+use crate::contract::{Clock, RefreshDelta, RefreshObservation, RefreshTicker, SweepOutcome};
 use crate::error::Result;
 use crate::observability::{Event, RefreshEventOutcome};
 use crate::refresh::{self, RefreshOutcome, RefreshReport};
 use crate::stash::RealAccountStash;
-
-/// What one [`RefreshTick::sweep`](RefreshTicker::sweep) produced (issue #106): the
-/// per-cycle [`Event::Refresh`] log lines, plus the `account_uuid`s of QUARANTINED
-/// accounts whose refresh succeeded and so should be RESTORED to eligible.
-///
-/// Both are handed back to the daemon (which owns the event log and the health machine)
-/// rather than acted on here: the tick is a hermetic seam with no `EventLog` handle and
-/// no view of the quarantine state. The daemon emits the events and applies the restores
-/// ([`crate::daemon`]'s run loop) — keeping each `restored` flip paired with its
-/// [`Event::CredentialRestored`] in the one place that owns the health machine.
-#[derive(Debug, Default, PartialEq)]
-pub(crate) struct SweepOutcome {
-    /// One [`Event::Refresh`] per refreshed account, in sweep order.
-    pub(crate) events: Vec<Event>,
-    /// `account_uuid`s of quarantined accounts the cycle proved still refreshable.
-    pub(crate) restored: Vec<String>,
-    /// One [`RefreshObservation`] per account the sweep READ this cycle (issue #119) —
-    /// the credential clocks the daemon folds into its per-account health state for the
-    /// `status` rollup. Recorded for EVERY non-excluded, allowlisted account whose stash
-    /// the sweep touched (so a healthy far-from-expiry account still surfaces its expiry
-    /// clock), with the refresh-health delta present only on the ones actually refreshed.
-    pub(crate) observations: Vec<RefreshObservation>,
-}
-
-/// One account's credential-clock observation from a sweep (issue #119): the stored
-/// access-token expiry the sweep read, plus — only when the account was actually
-/// refreshed this cycle — the refresh-health delta. The daemon folds these into its
-/// per-account health state ([`crate::daemon`]) for the `status` 4-state rollup; every
-/// field is non-secret (a timestamp, a classification, a boolean — never a token / email).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RefreshObservation {
-    /// The account, keyed by `account_uuid` (the daemon resolves it to a roster slot) —
-    /// the same resolution key `restored` uses; never the email or a token.
-    pub(crate) account_uuid: String,
-    /// The stored access-token `expiresAt` (epoch MS, CC's native unit) the sweep read
-    /// this cycle, or `None` when the stash was unreadable. The daemon converts to epoch
-    /// seconds at the fold boundary.
-    pub(crate) expires_at_ms: Option<i64>,
-    /// The refresh-health delta — `Some` ONLY when this cycle actually ran a refresh (a
-    /// near-expiry or quarantined account); `None` when the sweep merely READ the
-    /// account's expiry without refreshing it (a healthy, far-from-expiry account).
-    pub(crate) refresh: Option<RefreshDelta>,
-}
-
-/// The non-secret refresh-health signal from one completed refresh cycle (issue #119):
-/// the classification plus whether the refresh token rotated. The expiry slide lives in
-/// [`RefreshObservation::expires_at_ms`]; this is the "did it work / did the token value
-/// change" half the rollup's at-risk / dead inputs key off.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct RefreshDelta {
-    /// The cycle's non-secret classification (the same one the [`Event::Refresh`] carries).
-    pub(crate) outcome: RefreshEventOutcome,
-    /// Whether CC rotated the refresh token value this cycle (the AC-3 durability signal).
-    pub(crate) token_rotated: bool,
-}
 
 /// The per-account isolated-refresh operations [`RefreshTick`] drives, injected as a seam so
 /// the whole selection → refresh flow runs hermetically against an in-memory fake in tests —

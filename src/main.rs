@@ -14,6 +14,7 @@ mod capture;
 mod claude_state;
 mod cli;
 mod config;
+mod contract;
 mod daemon;
 mod error;
 mod hex;

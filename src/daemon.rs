@@ -87,6 +87,12 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::claude_state;
 use crate::config::{Account, Config, Tunables};
+// The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
+// `refresh_tick` can depend on it without depending on the whole daemon. Re-exported under
+// `crate::daemon::*` so every existing `daemon::Clock` / `daemon::RealClock` caller is unchanged.
+// (`SweepOutcome` is named only in test code here — the run loop consumes it by inference — so
+// it is imported test-scoped inside `mod tests`, not at module scope.)
+pub(crate) use crate::contract::{Clock, RealClock, RefreshObservation, RefreshTicker};
 use crate::error::{Error, Result};
 use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
@@ -96,7 +102,7 @@ use crate::observability::{
     RefreshEventOutcome, SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
-use crate::refresh_tick::{RealRefreshEngine, RefreshEngine, RefreshObservation, SweepOutcome};
+use crate::refresh_tick::{RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
@@ -146,37 +152,6 @@ const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 /// the same config — and the N accounts within a cycle — do not synchronize an
 /// immediate burst of usage requests. Small enough to stay responsive on launch.
 const STARTUP_DELAY_CAP: f64 = 30.0;
-
-/// Time seam: the daemon reads "now" and sleeps until the next poll through
-/// this, so a fake can drive time and make the loop run instantly in tests.
-pub(crate) trait Clock {
-    /// The current instant.
-    fn now(&self) -> Instant;
-    /// Sleep for `interval` — the (jittered) wait until the next poll, computed
-    /// per cycle by the daemon (issue #38). The clock no longer owns the
-    /// interval; it just sleeps the duration it is handed.
-    async fn tick(&self, interval: Duration);
-}
-
-/// Real clock: monotonic `Instant::now` and a Tokio sleep of the handed interval.
-#[derive(Default)]
-pub(crate) struct RealClock;
-
-impl RealClock {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
-impl Clock for RealClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    async fn tick(&self, interval: Duration) {
-        tokio::time::sleep(interval).await;
-    }
-}
 
 /// Shutdown seam: resolves when a graceful stop has been requested. Behind a seam
 /// so the loop's stop path is driven deterministically in tests (a real
@@ -524,32 +499,6 @@ pub(crate) trait Control {
     /// Serve at most one control connection from `snapshot`, then resolve to any
     /// [`ControlSignal`] the exchange produced (`None` if none).
     async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal>;
-}
-
-/// Periodic-refresh seam (issue #105): the run loop drives the in-daemon isolated-refresh
-/// tick from its idle path, off the poll→usage→swap seam. The production impl
-/// ([`crate::refresh_tick::RefreshTick`]) keeps PARKED accounts' stored tokens fresh through
-/// the #102 engine — and is wholly inert when the feature is off: its `until_due` never
-/// resolves, so a feature-off daemon (or a hermetic test wired with a no-op ticker) behaves
-/// exactly as it did before #105.
-///
-/// Two methods so the run loop can serve the control socket WHILE waiting for the tick to
-/// fall due, yet protect an in-flight sweep from being cancelled by a control read (only
-/// shutdown interrupts a sweep): [`until_due`](RefreshTicker::until_due) is the wait;
-/// [`sweep`](RefreshTicker::sweep) is the bounded work.
-pub(crate) trait RefreshTicker {
-    /// Resolve when a refresh sweep is due (the ticker's own cadence/idle gating, on its own
-    /// [`Clock`] seam). MUST never resolve when the feature is disabled, so it never wins the
-    /// idle select and adds no clock activity. Re-armable: the run loop awaits it afresh each
-    /// idle iteration, and a control read between waits simply restarts it.
-    async fn until_due(&mut self);
-    /// Run ONE refresh sweep over the due parked accounts, EXCLUDING the `excluded` uuids
-    /// (the active account + the imminent swap target the daemon supplies). `quarantined` is
-    /// the daemon's currently-dead ("needs re-login") set: those accounts are refreshed even
-    /// when not near expiry, and a successful one is reported for RESTORE (issue #106).
-    /// Records the sweep for cadence gating. Per-account failures are non-fatal (the engine
-    /// Caller contract). Returns the per-cycle [`SweepOutcome`] for the daemon to emit + apply.
-    async fn sweep(&mut self, excluded: &[String], quarantined: &[String]) -> SweepOutcome;
 }
 
 /// The external-login watch cadence (issue #140): how often the run loop probes the canonical
@@ -3833,6 +3782,9 @@ mod tests {
     use super::*;
     use crate::claude_state::OauthAccount;
     use crate::config::Tunables;
+    // `SweepOutcome` is named only in test code here (the run loop consumes it by
+    // inference); import it test-scoped so a non-test build sees no unused import.
+    use crate::contract::SweepOutcome;
     use crate::keychain::FakeCredentialStore;
     // `Verbosity` is named only in test code here (the diagnostic SINK gating lives
     // in `cli`); import it test-scoped so a non-test build sees no unused import.
@@ -7208,9 +7160,9 @@ mod tests {
     #[tokio::test]
     async fn apply_refresh_observation_folds_ms_expiry_and_tracks_consecutive_failures() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
-        // `RefreshDelta` lives in `refresh_tick` and is not imported at module scope (only
+        // `RefreshDelta` lives in `contract` and is not imported at module scope (only
         // the daemon's fold consumes it); name it in full here.
-        use crate::refresh_tick::RefreshDelta;
+        use crate::contract::RefreshDelta;
         let observe = |outcome, rotated, ms| RefreshObservation {
             account_uuid: "u-A".to_owned(),
             expires_at_ms: Some(ms),
