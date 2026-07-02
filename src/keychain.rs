@@ -606,6 +606,23 @@ pub(crate) struct FakeCredentialStore {
     /// — the in-memory analog of a locked login keychain (exit 36), so the daemon's
     /// locked-path backoff (#13) is testable without a real keychain.
     locked: Cell<bool>,
+    /// When set, [`read`](CredentialStore::read) returns [`Error::CredentialNotFound`]
+    /// — the in-memory analog of an ABSENT canonical item (exit 44, an empty keychain),
+    /// so the adopt-target recovery (#212) is testable against a scrubbed canonical. A
+    /// [`write`](CredentialStore::write) CLEARS it (an `add-generic-password -U` creates
+    /// the item), so a post-adopt re-read confirms. Distinct from the empty-`slot`
+    /// [`Error::Unimplemented`] (which `login.rs` relies on): this is the FAITHFUL
+    /// gone-canonical signal (`errSecItemNotFound`), matching the real store.
+    not_found: Cell<bool>,
+    /// When set, [`read`](CredentialStore::read) returns [`Error::Keychain`] — the
+    /// in-memory analog of a PRESENT-but-unreadable canonical (a non-lock, non-not-found
+    /// `security` exit, e.g. an ACL / auth-deny on the secret read in a UI session). This
+    /// is a "could not read" that is NOT "gone": the item may still be present, so the
+    /// adopt-target recovery (#212) must ABORT with ZERO writes rather than clobber it —
+    /// the same discipline as the engine `swap`'s step-1 read (`?` on any error). Takes
+    /// precedence over the `slot` value (the item is present but its secret is
+    /// unreadable), NOT cleared by a write.
+    unreadable: Cell<bool>,
 }
 
 #[cfg(test)]
@@ -614,6 +631,8 @@ impl FakeCredentialStore {
         Self {
             slot: RefCell::new(None),
             locked: Cell::new(false),
+            not_found: Cell::new(false),
+            unreadable: Cell::new(false),
         }
     }
 
@@ -622,13 +641,43 @@ impl FakeCredentialStore {
     pub(crate) fn set_locked(&self, locked: bool) {
         self.locked.set(locked);
     }
+
+    /// Simulate the canonical item being ABSENT (`true`) — `read` returns
+    /// [`Error::CredentialNotFound`], the scrubbed / gone canonical the adopt-target
+    /// recovery (#212) faces. A subsequent `write` clears it (the item is created).
+    pub(crate) fn set_not_found(&self, not_found: bool) {
+        self.not_found.set(not_found);
+    }
+
+    /// Simulate the canonical item being PRESENT but its secret unreadable (`true`) — a
+    /// non-lock, non-not-found `security` failure (an ACL / auth-deny on the read in a
+    /// UI session): `read` returns [`Error::Keychain`]. This is a "could not read" that
+    /// is NOT "gone", so the adopt-target recovery (#212) must abort here with ZERO
+    /// writes rather than clobber a canonical it could not read.
+    pub(crate) fn set_unreadable(&self, unreadable: bool) {
+        self.unreadable.set(unreadable);
+    }
 }
 
 #[cfg(test)]
 impl CredentialStore for FakeCredentialStore {
     async fn read(&self) -> Result<Credential> {
+        // Locked takes precedence: a locked keychain cannot be read to tell whether
+        // the item is present, so it wins over the absent signal ("locked ≠ gone").
         if self.locked.get() {
             return Err(Error::KeychainLocked { op: "read" });
+        }
+        // Present-but-unreadable wins over the `slot` value (the item is there, but its
+        // secret cannot be read) and is DISTINCT from absent below: "could not read" is
+        // not "gone", so adopt-target must abort here (issue #212).
+        if self.unreadable.get() {
+            return Err(Error::Keychain {
+                op: "read",
+                code: 1,
+            });
+        }
+        if self.not_found.get() {
+            return Err(Error::CredentialNotFound);
         }
         self.slot
             .borrow()
@@ -638,6 +687,9 @@ impl CredentialStore for FakeCredentialStore {
 
     async fn write(&self, credential: &Credential) -> Result<()> {
         *self.slot.borrow_mut() = Some(credential.clone());
+        // An `add-generic-password -U` creates the item if it was absent, so a write
+        // clears the gone-canonical signal — a post-write re-read now finds it.
+        self.not_found.set(false);
         Ok(())
     }
 }

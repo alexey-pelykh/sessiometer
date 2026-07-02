@@ -33,6 +33,25 @@
 //! field-preserving `~/.claude.json` co-write are preserved; and output redaction
 //! (#15) holds on every channel (all output is sourced from non-secret handles).
 //!
+//! ## Adopt-target recovery (issue #212)
+//!
+//! `--force` ALSO recovers the session when the active credential itself is GONE or
+//! ROTATED — a forced Claude logout that scrubbed / rotated the canonical keychain
+//! token (issue #209), leaving no sound outgoing account to swap AWAY from (token-first
+//! resolution, #207, finds no stash when the token itself is gone). When the canonical
+//! is confirmed-absent (scrubbed) OR the outgoing is otherwise unresolvable (e.g. a
+//! readable but rotated token that matches no stash, with the display cleared too),
+//! [`run_use`] routes to the swap engine's [`swap::adopt_target`] variant instead of the
+//! normal re-stash swap: it installs ONLY the target (canonical write + `~/.claude.json`
+//! co-write — the sequence's steps 3–5), skipping the outgoing read + re-stash (steps
+//! 1–2). The departing (dead / absent) token is not required, and because nothing is
+//! re-stashed, no credential can be stapled under a wrong identity (#211 is moot).
+//! SAFETY is unchanged: a LOCKED keychain still aborts (locked ≠ gone — transient, retry
+//! when unlocked) — as does a canonical that merely CANNOT BE READ for any other reason
+//! (an ACL / auth-deny: "could not read" ≠ "gone"; only a confirmed-absent or readable
+//! canonical is adopted). Recovery is `--force`-gated (WITHOUT it, an unresolvable
+//! outgoing stays the fail-closed [`Error::ActiveAccountUnresolved`]).
+//!
 //! ## The forced target is a NAMED escape hatch (issue #63)
 //!
 //! [`SwapTarget`] wraps the incoming stash name the swap engine consumes; its field
@@ -453,6 +472,23 @@ fn warn_quarantined(label: &str) -> String {
     format!("warning: forcing onto `{label}`, which is quarantined and needs re-login")
 }
 
+/// The `from` handle logged / printed for an adopt-target recovery (issue #212) when
+/// the outgoing account is genuinely unknown — the canonical was scrubbed / rotated AND
+/// `~/.claude.json` was cleared, so no roster account resolves. A non-secret sentinel
+/// (issue #15 — never a token, email, or account-uuid).
+const ADOPT_UNKNOWN_FROM: &str = "(unknown)";
+
+/// The adopt-target recovery note (issue #212): the canonical credential was gone or
+/// rotated, so the target was installed DIRECTLY — the previous account was NOT
+/// re-stashed (there was no sound outgoing token to re-stash). Tells the operator what
+/// the recovery did; names only the non-secret handle (issue #15).
+fn note_adopt_target(label: &str) -> String {
+    format!(
+        "note: the previous credential was gone or rotated — adopted `{label}` directly \
+         (the previous account was not re-stashed)"
+    )
+}
+
 /// The `--force` warn-and-proceed warning for forcing onto a target of this
 /// `viability`, or `None` when it is viable (nothing to warn about). The pure
 /// DECISION of WHICH warning a forced swap emits — split from the `eprintln!` in
@@ -465,6 +501,43 @@ fn force_warning(viability: Viability, label: &str) -> Option<String> {
         Viability::Quarantined => Some(warn_quarantined(label)),
         Viability::Viable => None,
     }
+}
+
+/// The `--force` warn-and-proceed viability probe, shared by the normal forced swap and
+/// the adopt-target recovery (issue #212 / #63): consult the daemon's CACHED verdict
+/// first (issue #75 — ZERO usage-endpoint requests when a daemon is up), else a single
+/// live poll. SAFETY is never bypassed — a LOCKED keychain on the live fallback ABORTS
+/// (ZERO writes, `Err` propagates); any other poll failure (transient / `429`) only
+/// costs the informational warning, so the forced swap proceeds without one (decision
+/// D1). Emits the specific warning — none for a viable target, none when viability is
+/// unknown (cache miss + failed live poll) — via stderr. Extracted so the forced and
+/// adopt paths cannot drift on this safety-bearing locked-abort.
+async fn warn_if_forcing_onto_non_viable<R, P>(
+    cache: &R,
+    poller: &P,
+    target: &Account,
+    weekly_trigger: f64,
+) -> Result<()>
+where
+    R: CachedViabilitySource,
+    P: RosterPoller,
+{
+    let viability = match cache.cached_viability(target).await {
+        Some(cached) => Some(cached),
+        None => match poll_viability(poller, target, weekly_trigger).await {
+            Ok(viability) => Some(viability),
+            // SAFETY is never bypassed: a locked keychain aborts even with `--force`
+            // (ZERO writes — the swap never runs).
+            Err(err @ Error::KeychainLocked { .. }) => return Err(err),
+            // A transient / rate-limited poll only affects the (informational) warning,
+            // so the forced swap proceeds without one (decision D1).
+            Err(_) => None,
+        },
+    };
+    if let Some(warning) = viability.and_then(|v| force_warning(v, &target.label)) {
+        eprintln!("{warning}");
+    }
+    Ok(())
 }
 
 /// The injectable seams [`run_use`] drives — the viability/credential/stash/state
@@ -529,136 +602,183 @@ where
     //    clobberable display half Claude Code clears out-of-band on a forced logout.
     //    Resolving from the display alone made `use` (the recovery verb) hard-fail
     //    `ActiveAccountUnresolved` exactly when an operator needed to swap AWAY from a
-    //    logged-out account. Read the canonical and resolve token→stash, then the
-    //    display fallback, via the shared resolver both this verb and the daemon use,
-    //    so a cleared display still recovers as long as a healthy token matches a
-    //    stash. SAFETY is never bypassed: a LOCKED keychain aborts here with the
-    //    locked exit code and ZERO writes (the swap never runs) — never swallowed to
-    //    `ActiveAccountUnresolved`.
-    let active_idx = match seams.store.read().await {
-        Ok(canonical) => {
-            active::resolve_account_for(&config.roster, seams.stash, seams.claude_json, &canonical)
+    //    logged-out account. Issue #212 extends this: when a forced logout ALSO scrubs /
+    //    rotates the canonical keychain token, token-first resolution finds no stash, so
+    //    `--force` recovers via adopt-target (step 3 below) instead of hard-failing.
+    //    Read the canonical ONCE and classify it. The credential is treated as GONE
+    //    (the #212 recovery signal) ONLY on positive evidence — a CONFIRMED-absent item
+    //    (`CredentialNotFound`, the scrubbed token). A LOCKED keychain is a SAFETY abort
+    //    (locked ≠ gone — transient, retry when unlocked), and EVERY other read failure
+    //    (an ACL / auth-deny or other `security` error, ambiguity, I/O) is likewise an
+    //    abort: a canonical we merely *could not read* is NOT proven *gone* — treating it
+    //    as gone would let `--force` adopt-clobber a present token without re-stashing it
+    //    (the #211 loss). Resolve token→stash, then the display fallback (the clobberable
+    //    half above), via the shared resolver both this verb and the daemon use.
+    let canonical = match seams.store.read().await {
+        Ok(canonical) => Some(canonical),
+        // SAFETY: a LOCKED keychain aborts here with the locked exit code and ZERO
+        // writes (the swap never runs) — never swallowed to `ActiveAccountUnresolved`
+        // nor to the adopt-target recovery path (locked ≠ gone).
+        Err(err @ Error::KeychainLocked { .. }) => return Err(err),
+        // CONFIRMED absent (errSecItemNotFound): the scrubbed canonical. `None` degrades
+        // active resolution to the display-only signal AND is the adopt-target recovery
+        // signal below (issue #212).
+        Err(Error::CredentialNotFound) => None,
+        // PRESENT-but-unreadable for another reason (ACL / auth-deny or other `security`
+        // error, ambiguity, I/O): "could not read" is NOT "gone". Abort with ZERO writes
+        // rather than misclassify as gone and adopt-clobber it — mirroring the engine
+        // probe and the normal swap's step-1 read (issue #212).
+        Err(err) => return Err(err),
+    };
+    let active = match &canonical {
+        Some(canonical) => {
+            active::resolve_account_for(&config.roster, seams.stash, seams.claude_json, canonical)
                 .await
         }
-        Err(err @ Error::KeychainLocked { .. }) => return Err(err),
-        // Canonical unreadable for a non-lock reason (not-found / transient): degrade
-        // to the display-only signal, the daemon's same fallback.
-        Err(_) => active::resolve_via_display(&config.roster, seams.claude_json),
-    };
-    let active = active_idx
-        .map(|idx| &config.roster[idx])
-        .ok_or(Error::ActiveAccountUnresolved)?;
-    let active_stash = active.stash();
-    let active_label = active.label.clone();
+        // No readable canonical → the display is the only remaining signal (it may be
+        // cleared too, leaving the outgoing genuinely unknown — adopt-target's case).
+        None => active::resolve_via_display(&config.roster, seams.claude_json),
+    }
+    .map(|idx| &config.roster[idx]);
 
     let weekly_trigger = f64::from(config.tunables.weekly_trigger) / 100.0;
 
-    // 3. Gate (default) or `--force`-bypass — yielding the vetted target + reason.
-    let (swap_target, reason) = if force {
-        // `--force` bypasses the POLICY gates (cooldown, weekly-exhausted,
-        // already-active), but still WARNS when forcing onto a non-viable target.
-        // Consult the daemon's CACHED verdict first (issue #75 — ZERO usage-endpoint
-        // requests when a daemon is up); only on a cache MISS do a single live poll.
-        // SAFETY is never bypassed: a locked keychain on the live fallback aborts
-        // (ZERO writes); any other live-poll failure (transient / 429) only affects
-        // the informational warning, so the forced swap proceeds best-effort
-        // without one (decision D1).
-        let viability = match seams.cache.cached_viability(target).await {
-            Some(cached) => Some(cached),
-            None => match poll_viability(seams.poller, target, weekly_trigger).await {
-                Ok(viability) => Some(viability),
-                // SAFETY is never bypassed: a locked keychain aborts even with
-                // `--force` (ZERO writes — the swap never runs).
-                Err(err @ Error::KeychainLocked { .. }) => return Err(err),
-                // A transient / rate-limited poll only affects the (informational)
-                // warning, so the forced swap proceeds without one (decision D1).
-                Err(_) => None,
-            },
-        };
-        // The DECISION of WHICH warning to emit is the pure `force_warning` (none for
-        // a viable target, none when viability is unknown); only the emission lives
-        // here. An unknown verdict (cache miss + failed live poll) warns nothing and
-        // the forced swap still proceeds.
-        if let Some(warning) = viability.and_then(|v| force_warning(v, &target_label)) {
-            eprintln!("{warning}");
-        }
-        (SwapTarget::forced(target), SwapReason::Forced)
-    } else {
-        match SwapTarget::resolve(
-            seams.cache,
-            seams.poller,
-            target,
-            &active_stash,
-            weekly_trigger,
-            in_cooldown,
+    // 3. Decide the swap MODE and perform the keychain rotation, yielding
+    //    `(from_label, reason, adopted)` for the shared event / notify / print tail:
+    //    - ADOPT-TARGET RECOVERY (#212): with `--force`, when the canonical is GONE
+    //      (`canonical` is `None`) OR the outgoing account is unresolvable, the normal
+    //      re-stash swap cannot run (its steps 1–2 read + re-stash the outgoing
+    //      canonical, which is absent). Skip those and install the target (steps 3–5)
+    //      via `adopt_target_locked`. `--force`-gated; a locked keychain already
+    //      aborted above.
+    //    - FORCED swap (#63): `--force` with a sound outgoing — bypass the policy gates.
+    //    - GATED swap (#63): the default pre-swap gate.
+    let adopt = force && (canonical.is_none() || active.is_none());
+    let (from_label, reason, adopted) = if adopt {
+        // Warn-and-proceed if forcing onto a non-viable target, exactly as a normal
+        // forced swap does; a locked keychain on the viability poll still aborts (ZERO
+        // writes) — the always-enforced safety.
+        warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_trigger).await?;
+        // Adopt: skip the outgoing re-stash, install the target (steps 3–5), lock-wrapped
+        // (#64) so a concurrent daemon swap cannot interleave. SAFETY still holds inside
+        // the engine: the canonical is probed for a LOCK before any write (ZERO writes on
+        // lock — locked ≠ gone), and the incoming stash is read before any mutation. The
+        // departing (dead / absent) token is NOT required, and nothing is re-stashed, so
+        // no credential can be stapled under a wrong identity (#211 is moot here).
+        swap::adopt_target_locked(
+            Some((seams.lock_path, swap::SWAP_LOCK_MAX_WAIT)),
+            seams.store,
+            seams.stash,
+            &target.stash(),
+            seams.claude_json,
         )
-        .await?
-        {
-            GateOutcome::Proceed(swap_target) => (swap_target, SwapReason::Manual),
-            GateOutcome::AlreadyActive => {
-                // No-op success: already active, nothing to write. If token-first
-                // resolution (issue #207) reached here past a CLEARED `~/.claude.json`
-                // (target == the token-resolved active), the stale display is left
-                // unhealed on purpose — this no-op writes nothing; the daemon's
-                // next reconcile, or an explicit `use --force`, repairs the display.
-                println!("{}", already_active_confirmation(&target_label));
-                return Ok(());
+        .await?;
+        // The outgoing account is gone / unknown; name it if the display still resolved
+        // one, else a non-secret sentinel (issue #15 — never a token or email).
+        let from = active
+            .map(|a| a.label.clone())
+            .unwrap_or_else(|| ADOPT_UNKNOWN_FROM.to_owned());
+        (from, SwapReason::Forced, true)
+    } else {
+        // The normal paths re-stash the outgoing account, so it MUST be known. (Without
+        // `--force`, a gone canonical / unresolvable outgoing stays the fail-closed
+        // `ActiveAccountUnresolved` — recovery requires `--force`.)
+        let active = active.ok_or(Error::ActiveAccountUnresolved)?;
+        let active_stash = active.stash();
+        let active_label = active.label.clone();
+
+        // Gate (default) or `--force`-bypass — yielding the vetted target + reason.
+        let (swap_target, reason) = if force {
+            // `--force` bypasses the POLICY gates (cooldown, weekly-exhausted,
+            // already-active), but still WARNS when forcing onto a non-viable target.
+            warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_trigger)
+                .await?;
+            (SwapTarget::forced(target), SwapReason::Forced)
+        } else {
+            match SwapTarget::resolve(
+                seams.cache,
+                seams.poller,
+                target,
+                &active_stash,
+                weekly_trigger,
+                in_cooldown,
+            )
+            .await?
+            {
+                GateOutcome::Proceed(swap_target) => (swap_target, SwapReason::Manual),
+                GateOutcome::AlreadyActive => {
+                    // No-op success: already active, nothing to write. If token-first
+                    // resolution (issue #207) reached here past a CLEARED `~/.claude.json`
+                    // (target == the token-resolved active), the stale display is left
+                    // unhealed on purpose — this no-op writes nothing; the daemon's
+                    // next reconcile, or an explicit `use --force`, repairs the display.
+                    println!("{}", already_active_confirmation(&target_label));
+                    return Ok(());
+                }
+                GateOutcome::Refused(Refusal::WeeklyExhausted) => {
+                    return Err(Error::UseTargetWeeklyExhausted {
+                        label: target_label,
+                    })
+                }
+                GateOutcome::Refused(Refusal::Cooldown) => return Err(Error::UseCooldownActive),
+                GateOutcome::Refused(Refusal::Quarantined) => {
+                    return Err(Error::UseTargetQuarantined {
+                        label: target_label,
+                    })
+                }
             }
-            GateOutcome::Refused(Refusal::WeeklyExhausted) => {
-                return Err(Error::UseTargetWeeklyExhausted {
-                    label: target_label,
-                })
-            }
-            GateOutcome::Refused(Refusal::Cooldown) => return Err(Error::UseCooldownActive),
-            GateOutcome::Refused(Refusal::Quarantined) => {
-                return Err(Error::UseTargetQuarantined {
-                    label: target_label,
-                })
-            }
-        }
+        };
+
+        // Reuse the swap engine UNCHANGED, wrapped in the single-writer swap lock
+        // (#64): acquired (blocking, bounded) BEFORE the swap reads anything and held
+        // across the whole two-step write, so a concurrent daemon swap cannot interleave
+        // into a split state. FAIL-CLOSED — a contended lock that never frees within the
+        // bounded wait aborts with `SwapLockBusy` (exit `4`, ZERO writes), never a torn
+        // write. Inside, the engine's own discipline still holds: canonical write FIRST
+        // (a locked keychain aborts here with ZERO writes — the always-enforced safety,
+        // even with `--force`), then the atomic, field-preserving `~/.claude.json`
+        // co-write.
+        swap::swap_locked(
+            Some((seams.lock_path, swap::SWAP_LOCK_MAX_WAIT)),
+            seams.store,
+            seams.stash,
+            &active_stash,
+            swap_target.incoming_stash(),
+            seams.claude_json,
+        )
+        .await?;
+        (active_label, reason, false)
     };
 
-    // 4. Reuse the swap engine UNCHANGED, now wrapped in the single-writer swap
-    //    lock (#64): the lock is acquired (blocking, bounded) BEFORE the swap reads
-    //    anything and held across the whole two-step write, so a concurrent daemon
-    //    swap cannot interleave into a split state. FAIL-CLOSED — a contended lock
-    //    that never frees within the bounded wait aborts with `SwapLockBusy` (exit
-    //    `4`, ZERO writes), never a torn write. Inside, the engine's own discipline
-    //    still holds: canonical write FIRST (a locked keychain aborts here with ZERO
-    //    writes — the always-enforced safety, even with `--force`), then the atomic,
-    //    field-preserving `~/.claude.json` co-write.
-    swap::swap_locked(
-        Some((seams.lock_path, swap::SWAP_LOCK_MAX_WAIT)),
-        seams.store,
-        seams.stash,
-        &active_stash,
-        swap_target.incoming_stash(),
-        seams.claude_json,
-    )
-    .await?;
-
-    // 5. Emit the standard structured event (#9) — the durable record that also
-    //    updates `last_swap` — with the new manual/forced reason, and print the
-    //    one-line confirmation. `session_pct=0`: a manual swap is not session-
-    //    triggered (the reason distinguishes it). Both are sourced from non-secret
-    //    handles only (issue #15).
+    // 4. Emit the standard structured event (#9) — the durable record that also updates
+    //    `last_swap` — with the manual / forced reason. `session_pct=0`: a manual swap is
+    //    not session-triggered (the reason distinguishes it). Sourced from non-secret
+    //    handles only (issue #15); for an adopt recovery with an unknown outgoing, `from`
+    //    is the non-secret `(unknown)` sentinel.
     log.emit(&Event::Swap {
-        from: active_label.clone(),
+        from: from_label.clone(),
         to: target_label.clone(),
         reason,
         session_pct: 0,
     })?;
 
-    // 6. Manual-hold (#64): the swap has COMMITTED and `swap_locked` has released
-    //    the lock on return, so — and ONLY now, never before — best-effort notify a
-    //    running daemon to arm its cooldown, so its next poll does not immediately
-    //    revert this choice. A failure (no daemon, a timeout) is logged and ignored:
-    //    the keychain write is authoritative, so the manual swap already succeeded.
+    // 5. For an adopt-target recovery, tell the operator what the recovery did: the
+    //    previous credential was gone / rotated, so the target was adopted directly and
+    //    the previous account was NOT re-stashed. Non-secret handle only (issue #15).
+    if adopted {
+        eprintln!("{}", note_adopt_target(&target_label));
+    }
+
+    // 6. Manual-hold (#64): the swap has COMMITTED and the lock is released on return,
+    //    so — and ONLY now, never before — best-effort notify a running daemon to arm
+    //    its cooldown, so its next poll does not immediately revert this choice. A
+    //    failure (no daemon, a timeout) is logged and ignored: the keychain write is
+    //    authoritative, so the manual swap already succeeded.
     if let Err(err) = seams.notifier.notify().await {
         eprintln!("sessiometer: manual-hold notify skipped (is the daemon running?): {err}");
     }
 
-    println!("{}", swap_confirmation(&active_label, &target_label));
+    println!("{}", swap_confirmation(&from_label, &target_label));
     Ok(())
 }
 
@@ -1847,6 +1967,208 @@ mod tests {
         assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
     }
 
+    // --- acceptance: adopt-target recovery (issue #212) ----------------------
+
+    #[tokio::test]
+    async fn force_adopts_the_target_when_the_canonical_is_absent_and_display_is_cleared() {
+        // AC #1: a forced logout scrubbed the canonical (read → CredentialNotFound) AND
+        // cleared ~/.claude.json (u-UNKNOWN). `use --force spare` RECOVERS by adopting the
+        // healthy target directly — where before it hard-failed ActiveAccountUnresolved
+        // (token-first resolution, #207, finds no stash when the token itself is gone).
+        let (store, stash) = seeded_store_and_stash().await;
+        store.set_not_found(true); // the scrubbed / absent canonical
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN"); // display cleared
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            true,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "adopt-target recovers the session: {result:?}"
+        );
+        // The canonical now holds spare's (u-B) token — the write created the absent item.
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "adopted spare into the canonical"
+        );
+        // The display was co-written to the incoming account (self-healed).
+        let healed = crate::claude_state::read_oauth_account_from(&json).unwrap();
+        assert_eq!(healed.account_uuid(), "u-B");
+        // The outgoing account is unknown (display cleared) → the non-secret sentinel.
+        assert!(
+            log.contains("event=swap from=(unknown) to=spare reason=forced"),
+            "log: {log}"
+        );
+        // AC #3: NOTHING was re-stashed — work's stash is untouched (no wrong-identity
+        // staple; the departing token was never required).
+        let a = stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-token",
+            "work's stash must be untouched"
+        );
+        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+    }
+
+    #[tokio::test]
+    async fn force_adopts_the_target_when_the_canonical_is_rotated_and_display_is_cleared() {
+        // AC #1, rotated variant: the canonical holds a ROTATED orphan token (matches no
+        // stash) and the display is cleared → the outgoing is unresolvable → `--force`
+        // adopts the target, overwriting the orphan without stashing it anywhere.
+        let (store, stash) = seeded_store_and_stash().await;
+        store.write(&cred(b"ORPHAN-rotated")).await.unwrap(); // canonical rotated in place
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN");
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            true,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "adopt-target recovers a rotated canonical: {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"B-token");
+        assert!(
+            log.contains("event=swap from=(unknown) to=spare reason=forced"),
+            "log: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_adopt_names_the_outgoing_when_the_display_still_resolves() {
+        // AC #1: the canonical is gone but ~/.claude.json still names a roster account
+        // (u-A = work). Adopt still recovers (the normal swap would fault reading the
+        // absent canonical at its step 1), and the event NAMES the resolved outgoing
+        // rather than the sentinel — a more useful record when the display survived.
+        let (store, stash) = seeded_store_and_stash().await;
+        store.set_not_found(true);
+        let (_json_dir, json) = claude_json_for("u-A"); // display still resolves work
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            true,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "adopt recovers with a resolvable display: {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"B-token");
+        assert!(
+            log.contains("event=swap from=work to=spare reason=forced"),
+            "the resolved outgoing is named, not the sentinel: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_keychain_aborts_adopt_recovery_with_zero_writes() {
+        // AC #2 ("locked ≠ gone"): even in the adopt SCENARIO — the canonical would be
+        // gone AND the display cleared, so `--force` would adopt — a LOCKED keychain
+        // aborts with the locked exit code (4) and ZERO writes. A lock is transient
+        // (retry when unlocked), never a scrubbed credential to clobber over.
+        let (store, stash) = seeded_store_and_stash().await;
+        store.set_not_found(true); // would-be-gone…
+        store.set_locked(true); // …but the keychain is LOCKED (locked takes precedence)
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN");
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            true,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        let err = result.expect_err("a locked keychain must abort even in the adopt path");
+        assert!(matches!(err, Error::KeychainLocked { .. }), "got {err:?}");
+        assert_eq!(err.exit_code(), 4, "the locked exit code");
+        assert!(!log.contains("event=swap"), "no swap logged: {log}");
+        // ZERO writes: unlock and confirm the canonical is STILL absent (never adopted).
+        store.set_locked(false);
+        assert!(
+            matches!(store.read().await, Err(Error::CredentialNotFound)),
+            "the canonical must still be absent (ZERO writes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_but_unreadable_canonical_aborts_adopt_recovery_with_zero_writes() {
+        // AC #2 generalized ("could not read ≠ gone"): the canonical is PRESENT (holds
+        // work's live token) but its secret cannot be READ — a non-lock, non-not-found
+        // `security` error (an ACL / auth-deny in a UI session), NOT a scrubbed
+        // credential. The display is cleared, so a naive "any read failure is gone"
+        // classification would let `--force` adopt-CLOBBER work's present token WITHOUT
+        // re-stashing it — losing it. The fix aborts here (as it does on a lock): only a
+        // CONFIRMED-absent or readable canonical is adopt-eligible.
+        let (store, stash) = seeded_store_and_stash().await; // canonical = A-token (present)
+        store.set_unreadable(true); // …but its secret is unreadable (not a lock, not absent)
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN"); // display cleared
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            true,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        let err = result.expect_err("a present-but-unreadable canonical must abort the adopt");
+        assert!(matches!(err, Error::Keychain { .. }), "got {err:?}");
+        assert_eq!(err.exit_code(), 1, "a generic keychain read failure");
+        assert!(!log.contains("event=swap"), "no swap logged: {log}");
+        // ZERO writes: clear the read fault and confirm work's live token is STILL the
+        // canonical — it was NOT clobbered, and (AC #3) nothing was re-stashed.
+        store.set_unreadable(false);
+        assert_eq!(
+            canonical(&store).await,
+            b"A-token",
+            "the present token must be untouched (ZERO writes — not adopt-clobbered)"
+        );
+        let a = stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(a.credential.expose(), b"A-token", "work's stash untouched");
+    }
+
+    #[tokio::test]
+    async fn no_force_leaves_a_gone_canonical_unresolved_with_zero_writes() {
+        // Recovery requires `--force`: WITHOUT it, a scrubbed canonical + cleared display
+        // stays the fail-closed ActiveAccountUnresolved (adopt never triggers), ZERO
+        // writes — the #207 behaviour is unchanged for the non-forced path.
+        let (store, stash) = seeded_store_and_stash().await;
+        store.set_not_found(true);
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN");
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            false,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::ActiveAccountUnresolved)),
+            "without --force, a gone canonical stays unresolved: {result:?}"
+        );
+        assert!(
+            matches!(store.read().await, Err(Error::CredentialNotFound)),
+            "ZERO writes — the canonical is still absent"
+        );
+        assert!(!log.contains("event=swap"), "no swap logged: {log}");
+    }
+
     // --- acceptance: manual-hold daemon notification (#64) -------------------
 
     /// Drive a gated `use spare` over a viable target with a caller-supplied
@@ -1935,6 +2257,10 @@ mod tests {
         let secrets = meter::Secrets::meter_fixture();
         let corpus = [
             swap_confirmation("work", "spare"),
+            // The adopt-target recovery surfaces (#212): its note, and a confirmation
+            // whose outgoing is the non-secret `(unknown)` sentinel.
+            note_adopt_target("spare"),
+            swap_confirmation(ADOPT_UNKNOWN_FROM, "spare"),
             already_active_confirmation("spare"),
             warn_weekly_exhausted("spare"),
             warn_quarantined("spare"),
