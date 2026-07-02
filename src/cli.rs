@@ -1685,6 +1685,19 @@ pub(crate) fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// Left-justify `s` in a field `width` DISPLAY columns wide, right-padding with spaces
+/// measured on [`display_width`] — the wide-glyph-correct analogue of Rust's `{:<width$}`
+/// fill, which pads by `char` count and so mis-aligns any cell carrying a CJK, emoji, or
+/// combining glyph (issue #249). Returns `s` unchanged when it already fills or overflows
+/// `width` (never truncates — matching the `{:<width$}` fill it replaces). The shared
+/// primitive for the block renderers that pad a label column inline rather than through
+/// `render_cells` (this `status` table) or the `stats` view's `render_line`: the `list`
+/// and `--verbose` label columns here, and the `stats` bars / heatmap / percentiles /
+/// numeric-table charts. `pub(crate)` so those `stats` renderers share this one helper.
+pub(crate) fn pad_end(s: &str, width: usize) -> String {
+    format!("{s}{}", " ".repeat(width.saturating_sub(display_width(s))))
+}
+
 /// One window's compact "resets in" (issue #94): the time until `reset_at`, or `n/a`
 /// when that reset instant is unknown (the poll failed, or the API gave no parseable
 /// timestamp) — never a fabricated duration. Unlike the pre-#94 single "resets in"
@@ -1763,20 +1776,22 @@ pub(crate) fn render_access_token_expiry(response: &StatusResponse, now: i64) ->
     if response.accounts.is_empty() {
         return String::new();
     }
-    // Pad each label to the widest (by char count, matching the `{:<width$}` fill and the
-    // `list` view) so the expiry column lines up under a two-space gap.
+    // Pad each label to the widest on DISPLAY width (issue #249, as the `status` table and
+    // the `list` view now do) so the expiry column lines up under a two-space gap even when
+    // a label carries a wide CJK / emoji glyph that `.chars().count()` and the `{:<width$}`
+    // fill would mis-measure.
     let width = response
         .accounts
         .iter()
-        .map(|account| account.label.chars().count())
+        .map(|account| display_width(&account.label))
         .max()
         .unwrap_or(0);
     let mut out =
         String::from("\naccess token — auto-refreshed by Claude Code, not a re-login deadline:\n");
     for account in &response.accounts {
         out.push_str(&format!(
-            "  {:<width$}  {}\n",
-            account.label,
+            "  {}  {}\n",
+            pad_end(&account.label, width),
             access_token_expiry_cell(account.access_expires_at, now),
         ));
     }
@@ -2550,13 +2565,14 @@ pub(crate) fn render_roster(roster: &[Account], auth: &[AuthSubset], now_secs: i
     // `auth` is built parallel to `roster` by `gather_auth_subset`; the zip below pairs
     // them positionally, so a length mismatch would silently drop trailing rows.
     debug_assert_eq!(roster.len(), auth.len(), "auth subset must parallel roster");
-    // Pad the label column to the widest label (by char count, matching the
-    // `{:<width$}` fill) so the uuid column aligns. The offline `list` never
-    // renders an empty roster (that maps to the friendly `RosterEmpty`), but
-    // `unwrap_or(0)` keeps this total for the METER's direct callers.
+    // Pad the label column to the widest label on DISPLAY width (issue #249, matching the
+    // `status` table fixed in #176) so the uuid column aligns even when a label carries a
+    // wide CJK / emoji glyph — `.chars().count()` and the `{:<width$}` fill would stagger
+    // it. The offline `list` never renders an empty roster (that maps to the friendly
+    // `RosterEmpty`), but `unwrap_or(0)` keeps this total for the METER's direct callers.
     let width = roster
         .iter()
-        .map(|account| account.label.chars().count())
+        .map(|account| display_width(&account.label))
         .max()
         .unwrap_or(0);
     let mut out = String::new();
@@ -2566,8 +2582,11 @@ pub(crate) fn render_roster(roster: &[Account], auth: &[AuthSubset], now_secs: i
         let state = if account.enabled { "" } else { " · disabled" };
         let tags = auth_tags(auth, now_secs);
         out.push_str(&format!(
-            "{:<width$}  {}{}{}\n",
-            account.label, account.account_uuid, state, tags,
+            "{}  {}{}{}\n",
+            pad_end(&account.label, width),
+            account.account_uuid,
+            state,
+            tags,
         ));
     }
     let n = roster.len();
@@ -4635,6 +4654,91 @@ spare  22222222-2222\n\
             col_of("SESSION%"),
             col_of("50%"),
             "the SESSION% header aligns with its data column on display width:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pad_end_fills_on_display_width_and_never_truncates() {
+        // pad_end is the wide-glyph-correct analogue of `{:<width$}` (issue #249). For ASCII
+        // it is byte-identical to the fill it replaces — the "zero golden churn" guarantee.
+        assert_eq!(pad_end("ab", 5), format!("{:<5}", "ab"));
+        assert_eq!(pad_end("ab", 5), "ab   ");
+        // A CJK triple is 6 display columns, so padding to 8 adds TWO spaces (not five, as
+        // char-count `{:<8}` would) — and the padded field is exactly `width` cells wide.
+        assert_eq!(pad_end("日本語", 8), "日本語  ");
+        assert_eq!(display_width(&pad_end("日本語", 8)), 8);
+        // Already at or over `width` → returned untouched (never truncates), matching the
+        // `{:<width$}` fill it replaces.
+        assert_eq!(pad_end("日本語", 6), "日本語");
+        assert_eq!(pad_end("日本語", 4), "日本語");
+        // Degenerate widths.
+        assert_eq!(pad_end("x", 0), "x");
+        assert_eq!(pad_end("", 3), "   ");
+    }
+
+    #[test]
+    fn render_roster_label_column_aligns_on_display_width() {
+        // The `list` view sized AND padded the label column on char count; a wide-glyph
+        // label shifts the uuid column right of the ASCII rows. Padding on display width
+        // lands every uuid at one display column (issue #249) — as the `status` table does.
+        let roster = [
+            acct("ascii", "11111111-1111"),
+            acct("日本語", "22222222-2222"),
+            acct("👨\u{200D}👩\u{200D}👧", "33333333-3333"),
+        ];
+        let out = render_roster(&roster, &no_auth(roster.len()), 0);
+        // Each row's uuid begins at the same DISPLAY column as the ASCII row's.
+        let uuid_col = |label: &str, uuid: &str| {
+            let line = out.lines().find(|l| l.contains(label)).unwrap();
+            display_width(&line[..line.find(uuid).unwrap()])
+        };
+        assert_eq!(
+            uuid_col("ascii", "11111111-1111"),
+            uuid_col("日本語", "22222222-2222"),
+            "the CJK row's uuid aligns with the ASCII row's on display width:\n{out}"
+        );
+        assert_eq!(
+            uuid_col("ascii", "11111111-1111"),
+            uuid_col("👨\u{200D}👩\u{200D}👧", "33333333-3333"),
+            "the emoji row's uuid aligns with the ASCII row's on display width:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_access_token_expiry_label_column_aligns_on_display_width() {
+        // The `--verbose` access-token block (#143) sized AND padded the label on char
+        // count; a wide-glyph label shifts the expiry column. Display-width padding aligns
+        // every expiry cell (issue #249). The cells differ per row; the column they START
+        // at must not.
+        let line_for = |label: &str, exp: Option<i64>| AccountStatusLine {
+            access_expires_at: exp,
+            ..status_line(label, false, None, None)
+        };
+        let response = StatusResponse {
+            refresh_enabled: None,
+            accounts: vec![
+                line_for("ascii", Some(NOW + 4 * 3_600)),
+                line_for("日本語", Some(NOW + 2 * 3_600)),
+                line_for("👨\u{200D}👩\u{200D}👧", None),
+            ],
+            next_swap: None,
+        };
+        let out = render_access_token_expiry(&response, NOW);
+        let cell_col = |label: &str| {
+            let line = out.lines().find(|l| l.contains(label)).unwrap();
+            let after = line.find(label).unwrap() + label.len();
+            let gap = line[after..].find(|c: char| c != ' ').unwrap();
+            display_width(&line[..after + gap])
+        };
+        assert_eq!(
+            cell_col("ascii"),
+            cell_col("日本語"),
+            "the CJK row's expiry cell aligns with the ASCII row's on display width:\n{out}"
+        );
+        assert_eq!(
+            cell_col("ascii"),
+            cell_col("👨\u{200D}👩\u{200D}👧"),
+            "the emoji row's expiry cell aligns with the ASCII row's on display width:\n{out}"
         );
     }
 

@@ -60,7 +60,7 @@ use serde::Serialize;
 
 // The `status` view's terminal-cell width primitive (issue #73), reused so the charts
 // (issue #159) size their columns on the SAME wcwidth — one definition for the crate.
-use crate::cli::display_width;
+use crate::cli::{display_width, pad_end};
 use crate::config::{Config, Tunables};
 use crate::error::{Error, Result};
 use crate::observability;
@@ -563,29 +563,31 @@ fn render_text(report: &Report) -> String {
     if summary.per_account.is_empty() {
         out.push_str("  no per-account usage in this window\n");
     } else {
+        // Size the label column on DISPLAY width, not `String::len()` bytes (issue #249):
+        // a wide glyph spans fewer bytes than its terminal footprint, so byte sizing AND
+        // char-count `{:<hw$}` padding both mis-aligned the numeric columns. Those numeric
+        // fields stay literal `{:>N}` / `{:<15}` fills — they are ASCII-only.
         let handle_w = summary
             .per_account
             .keys()
-            .map(String::len)
+            .map(|handle| display_width(handle))
             .max()
             .unwrap_or(0)
-            .max("account".len());
+            .max(display_width("account"));
         out.push_str(&format!(
-            "{:<hw$}  cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share\n",
-            "account",
-            hw = handle_w,
+            "{}  cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share\n",
+            pad_end("account", handle_w),
         ));
         for (handle, a) in &summary.per_account {
             out.push_str(&format!(
-                "{:<hw$}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%\n",
-                handle,
+                "{}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%\n",
+                pad_end(handle, handle_w),
                 pct(a.coverage),
                 triple(&a.session),
                 triple(&a.weekly),
                 a.cap_hits,
                 fmt_dur(a.time_at_cap_secs),
                 pct(a.contribution_share),
-                hw = handle_w,
             ));
         }
     }
@@ -1347,10 +1349,9 @@ fn render_bars(report: &Report, accounts: &[&String], w: usize, ascii: bool) -> 
             .chain(std::iter::repeat_n(track, bar_w - filled))
             .collect();
         out.push_str(&format!(
-            "{:<label_w$}  {bar}  {:>3}%\n",
-            h,
+            "{}  {bar}  {:>3}%\n",
+            pad_end(h, label_w),
             pct(share),
-            label_w = label_w,
         ));
     }
     Some(out)
@@ -1381,7 +1382,7 @@ fn render_heatmap(
     let mut out = format!("session pattern — {unit} mean\n");
     for &h in accounts {
         let values = account_series(&report.series, h, session_mean);
-        let mut line = format!("{h:<label_w$}  ");
+        let mut line = format!("{}  ", pad_end(h, label_w));
         for &v in &values {
             let g = shade_glyph(v, ascii);
             match (color, v) {
@@ -1444,10 +1445,9 @@ fn render_percentiles(
         buf[pos(a.session.peak)] = 'x';
         let gauge: String = buf.into_iter().collect();
         out.push_str(&format!(
-            "{:<label_w$}  {lb}{gauge}{rb}  {}\n",
-            h,
+            "{}  {lb}{gauge}{rb}  {}\n",
+            pad_end(h, label_w),
             trailer(a),
-            label_w = label_w,
         ));
     }
     Some(out)
@@ -1670,6 +1670,105 @@ mod tests {
              alpha  ┤─────────────────m────────P──────x├  50% · 80% · 99%\n\
              beta   ┤───m─P─x──────────────────────────├  10% · 15% · 20%\n",
             "distinct mean/p95/peak markers spread apart; clustered where they are close",
+        );
+    }
+
+    // --- issue #249 AC: wide-glyph label columns align on DISPLAY width ----------------
+
+    /// A three-row chart report whose account labels stress display-width padding: an ASCII
+    /// label (5 cells), a CJK triple (`日本語`, 6 cells — the widest, so it sets `label_w`),
+    /// and a ZWJ-family emoji (one coalesced 2-cell glyph, 5 code points). Rust's
+    /// `{:<width$}` fill pads by `char` count, giving these three DIFFERENT display widths;
+    /// only display-width padding lands the next column at one place. Every account is
+    /// present and non-zero in the single series bucket, so the heatmap carries no leading
+    /// gap (a space) that could mask a padding bug.
+    fn wide_glyph_charts() -> Report {
+        let row = |m: f64, p: f64, share: f64| stat(2, ds(m, p, p), 0.3, share);
+        let accts = [
+            ("ascii", row(0.40, 0.60, 0.50)),
+            ("日本語", row(0.20, 0.40, 0.30)),
+            ("👨\u{200D}👩\u{200D}👧", row(0.10, 0.20, 0.20)),
+        ];
+        charts_report(&accts, &[&accts[..]])
+    }
+
+    /// The three wide-glyph labels, in the sorted order the renderers receive them.
+    const WIDE_LABELS: [&str; 3] = ["ascii", "日本語", "👨\u{200D}👩\u{200D}👧"];
+
+    /// The display column at which the content after `label`'s padded field begins in the
+    /// row containing `label`: skip the label, then the run of spaces (its right-padding
+    /// plus the two-space inter-column gap), landing on the first cell of the next column.
+    /// Equal across rows IFF the label column is padded on DISPLAY width (issue #249). The
+    /// content that follows every label in these block renderers is left-aligned (a bar / a
+    /// heat cell / a gauge bracket), so the first non-space IS that column's first cell.
+    fn post_label_col(out: &str, label: &str) -> usize {
+        let line = out.lines().find(|l| l.contains(label)).unwrap();
+        let after = line.find(label).unwrap() + label.len();
+        let gap = line[after..].find(|c: char| c != ' ').unwrap();
+        display_width(&line[..after + gap])
+    }
+
+    #[test]
+    fn render_bars_label_column_aligns_on_display_width() {
+        let r = wide_glyph_charts();
+        let out = render_bars(&r, &keys(&r), 60, false).unwrap();
+        let cols: Vec<usize> = WIDE_LABELS
+            .iter()
+            .map(|&l| post_label_col(&out, l))
+            .collect();
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "bars: every bar starts at one display column — char-count padding staggers the \
+             CJK/emoji rows: {cols:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_heatmap_label_column_aligns_on_display_width() {
+        // The heatmap is the worst case: it is read DOWN columns to compare a time bucket
+        // across accounts, so a horizontally-shifted row is a cross-account misread.
+        let r = wide_glyph_charts();
+        let out = render_heatmap(&r, &keys(&r), 60, false, false).unwrap();
+        let cols: Vec<usize> = WIDE_LABELS
+            .iter()
+            .map(|&l| post_label_col(&out, l))
+            .collect();
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "heatmap: every row's cells start at one display column: {cols:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_percentiles_label_column_aligns_on_display_width() {
+        let r = wide_glyph_charts();
+        let out = render_percentiles(&r, &keys(&r), 60, false).unwrap();
+        let cols: Vec<usize> = WIDE_LABELS
+            .iter()
+            .map(|&l| post_label_col(&out, l))
+            .collect();
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "percentiles: every gauge's opening bracket starts at one display column: \
+             {cols:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_text_label_column_aligns_on_display_width() {
+        // render_text carried a DOUBLE bug: it sized the label column on `String::len()`
+        // (bytes) AND padded on char count. The coverage `%` is a fixed-offset marker after
+        // the label (a `{:>3}` field then a literal `%`), so it lands at one display column
+        // per row only when the label column is sized AND padded on display width.
+        let out = render_text(&wide_glyph_charts());
+        let pct_col = |label: &str| {
+            let line = out.lines().find(|l| l.contains(label)).unwrap();
+            display_width(&line[..line.find('%').unwrap()])
+        };
+        let cols: Vec<usize> = WIDE_LABELS.iter().map(|&l| pct_col(l)).collect();
+        assert!(
+            cols.iter().all(|&c| c == cols[0]),
+            "text: the coverage `%` aligns across rows: {cols:?}\n{out}"
         );
     }
 
