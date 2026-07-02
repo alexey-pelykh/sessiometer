@@ -1,7 +1,33 @@
-# cargo-deny — security-advisory baseline for CI (`cargo deny check advisories`).
+# cargo-deny — supply-chain gates for CI (`cargo deny check advisories sources licenses`).
 #
 # The Security.framework SDK ban is enforced separately and authoritatively by
 # scripts/check-no-security-framework.sh (issues #1 and #2).
+#
+# A `[bans]` policy (duplicate/version bans) is intentionally not configured — out
+# of scope here; add it separately if wanted.
 
 [advisories]
 yanked = "warn"
+
+# Provenance gate: dependencies must come from crates.io. A future git or
+# alternate-registry dependency fails `cargo deny check sources` until it is
+# vetted and its source is added here — the credential-relevant supply-chain gate.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+# License gate: an allow-list of the permissive licenses in the current dependency
+# tree. A new dependency under any other license fails `cargo deny check licenses`
+# until it is reviewed and added here, locking in the audited-clean state.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+]
+# `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`; the Unicode-3.0 half is
+# scoped to that one crate rather than allowed tree-wide.
+exceptions = [
+    { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+]
