@@ -1,0 +1,340 @@
+// Copyright (c) 2026 Oleksii PELYKH
+// SPDX-License-Identifier: MIT
+
+//! Status-snapshot assembly: the non-secret `status` snapshot + wire types and the pure
+//! projections that build them (issue #203, the #195 per-concern decomposition).
+//!
+//! [`StatusSnapshot`] is the daemon's per-cycle reading set; [`status_response`] projects it
+//! into the [`StatusResponse`] wire reply — handles + percentages + the `next_swap` candidate,
+//! never a token or email (the #15 discipline). [`credential_health`] is the pure 4-state
+//! rollup the display snapshot and the transition-event diff share. Each item is re-exported
+//! under `crate::daemon::*`, so relocating them is source-compatible for every existing consumer
+//! (cli / poke / use_account) and for the in-module test suite (`mod tests`' `use super::*`).
+
+use serde::{Deserialize, Serialize};
+
+use super::*;
+
+/// The latest per-account reading the daemon exposes — over the control socket
+/// and in the event log. Non-secret by construction: a handle (label), the active
+/// flag, and percentages — never a token or email (issue #15).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StatusSnapshot {
+    pub(crate) accounts: Vec<AccountReading>,
+    /// The next swap candidate as of this cycle (issue #88): who [`pick_target`]
+    /// would rotate the active session to, or why there is no candidate. Computed
+    /// daemon-side ([`Daemon::next_swap`]); [`status_response`] copies it straight
+    /// onto the wire. `None` only when there is no active anchor to swap from.
+    pub(crate) next_swap: Option<NextSwap>,
+    /// Whether the periodic isolated-refresh tick is enabled in config (`[refresh].enabled`,
+    /// issue #105) — copied from [`Daemon::refresh_enabled`] at build. Carried to the wire so
+    /// the thin `status` client can surface the issue-#138 advisory (with the tick OFF,
+    /// non-active accounts get no maintenance). `false` by `Default` (an all-defaults snapshot
+    /// reads as tick-off), matching the opt-in default.
+    pub(crate) refresh_enabled: bool,
+}
+
+/// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
+/// daemon's reduced projection of the refresh observations its per-account health state
+/// carries — whether the last refresh kept the credential alive, whether CC rotated the
+/// refresh-token VALUE, and the consecutive-failure streak. `None` (the whole struct) until
+/// the refresh engine has observed the account at least once (e.g. the `[refresh]` feature
+/// is off, or the account has not yet been swept). Every field is a boolean / count — never
+/// a token or expiry (the #15 discipline). Derives `Deserialize` so the `status` client can
+/// read it back; `#[serde(default)]` on the carrying field handles a pre-#119 daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RefreshHealth {
+    /// Whether the LAST observed refresh kept the credential ALIVE (`refreshed` /
+    /// `no_change`), as opposed to a `dead` (refresh token cleared) or `error` (cycle
+    /// failed) outcome.
+    pub(crate) last_ok: bool,
+    /// Whether CC ROTATED the refresh-token value on the last refresh (the AC-3 durability
+    /// signal) — the boolean only, never either token value. Named `rotated` (not
+    /// `token_rotated`) so the `--json` field carries no `token` substring that a coarse
+    /// #15 leak-proxy (`!contains("token")`) could false-positive on.
+    pub(crate) rotated: bool,
+    /// Consecutive refresh FAILURES (`dead` / `error` outcomes), reset to 0 by the next
+    /// alive refresh — the rollup's at-risk input.
+    pub(crate) consecutive_failures: u32,
+}
+
+/// One account's latest reading.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AccountReading {
+    pub(crate) label: String,
+    pub(crate) active: bool,
+    /// Whether the account is in the rotation (issue #36) — surfaced so `status`
+    /// can mark a parked account. A disabled account is shown but never swapped to.
+    pub(crate) enabled: bool,
+    /// Whether the account is QUARANTINED — its credential is dead and needs a
+    /// re-login (issue #42). The durable "needs re-login" status `status` surfaces;
+    /// non-secret (a plain flag on the account's handle).
+    pub(crate) quarantined: bool,
+    /// Whether a quarantined account is mid-RECOVERY — its credential is currently
+    /// answering again (`quarantined && recovery_successes > 0`), climbing toward the
+    /// un-quarantine threshold on the spontaneous-revival path (issue #109). A refinement
+    /// of `quarantined` (always implies it), surfaced so `status` can render `recovering`
+    /// instead of the alarming `needs re-login` for a healing account. Derived from the
+    /// health counter (where it lives); non-secret — a plain flag, no raw count exposed.
+    pub(crate) recovering: bool,
+    /// Whether the account's WEEKLY window is EXHAUSTED — `weekly >= weekly_trigger`
+    /// (the base, un-jittered threshold; issue #11/#37), the daemon's own viability
+    /// verdict. When true the account is blocked until its weekly reset, so `status`
+    /// keys its "resets in" off the weekly reset rather than the sooner session
+    /// reset (issue #72). Precomputed here (where the threshold lives) so the wire
+    /// projection stays threshold-free; `false` when the last poll failed.
+    pub(crate) weekly_exhausted: bool,
+    pub(crate) usage: Option<Usage>,
+    /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `None` until
+    /// the refresh engine has observed this account's stash. An absolute instant (not a
+    /// relative duration, like `session_resets_at`) carried RAW on the wire, from which a
+    /// consumer (`--json` | `jq`) can derive an "expires in" against its own clock; the lean
+    /// text view projects only the rollup glyph, not a clock cell. Non-secret — a timestamp.
+    pub(crate) access_expires_at: Option<i64>,
+    /// The non-secret refresh-health inputs (issue #119), or `None` until a refresh has been
+    /// observed. The rollup's at-risk / dead inputs plus the `--json` durability signal.
+    pub(crate) refresh_health: Option<RefreshHealth>,
+    /// The daemon-computed 4-state credential-health rollup (issue #119) — the verdict the
+    /// thin `status` client projects to a glyph. Computed in [`Daemon::snapshot`] from this
+    /// account's health state and the wall clock.
+    pub(crate) health: CredentialHealth,
+}
+
+/// The control socket's `status` reply — handles + percentages + the forward-looking
+/// `next_swap` candidate, and nothing else (issue #15: never a token or email).
+/// Derives both `Serialize` (the daemon writes it) and `Deserialize` (the `status`
+/// client reads it), so this one definition is the whole wire contract. The durable,
+/// timestamped swap HISTORY remains the event-log view (#9), not `status`.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct StatusResponse {
+    pub(crate) accounts: Vec<AccountStatusLine>,
+    /// The next swap candidate (issue #88), or `null` when there is no active anchor
+    /// to swap from. `#[serde(default)]` per the added-field convention (cf.
+    /// `session_resets_at`): a pre-#88 daemon that omits the field decodes to `None`.
+    #[serde(default)]
+    pub(crate) next_swap: Option<NextSwap>,
+    /// Whether the daemon's periodic isolated-refresh tick is enabled (`[refresh].enabled`,
+    /// issue #105). `Some(false)` is the ONLY value that arms the issue-#138 discoverability
+    /// advisory (paired with ≥1 unhealthy/unverified non-active account); `Some(true)`
+    /// suppresses it. `Option` + `#[serde(default)]` per the added-field convention (cf.
+    /// `auth`): a pre-#138 daemon that omits the field decodes to `None`, which the client
+    /// treats as "unknown → suppress" rather than mis-firing a stale advisory against an old
+    /// daemon. Non-secret — a plain flag.
+    #[serde(default)]
+    pub(crate) refresh_enabled: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct AccountStatusLine {
+    /// The operator-chosen handle (label) — never the email (issue #15).
+    pub(crate) label: String,
+    pub(crate) active: bool,
+    /// Whether the account is in the rotation (issue #36); `false` for a parked
+    /// account, which `status` marks. Non-secret — a plain flag.
+    pub(crate) enabled: bool,
+    /// Whether the account is QUARANTINED — its credential is dead and needs a
+    /// re-login (issue #42). The durable "needs re-login" status; `false` for a
+    /// healthy account. Non-secret — a plain flag.
+    pub(crate) quarantined: bool,
+    /// Whether a quarantined account is mid-RECOVERY — its credential is answering
+    /// again and climbing toward un-quarantine (issue #109). Refines `quarantined`
+    /// (true only when it is): lets `status` render `recovering` instead of the
+    /// alarming `needs re-login` for a healing account, so an operator does not swap
+    /// away from a recovering — and often healthier — account. Non-secret — a derived
+    /// flag, no raw count. `#[serde(default)]` per the added-field convention (cf.
+    /// `session_resets_at`): a pre-#109 daemon that omits it decodes to `false`.
+    #[serde(default)]
+    pub(crate) recovering: bool,
+    /// Last-polled session-window usage percent (`0..=100`); `null` if the last
+    /// poll for this account failed (never a fabricated `0`).
+    pub(crate) session_pct: Option<u8>,
+    /// Last-polled weekly-window usage percent (`0..=100`).
+    pub(crate) weekly_pct: Option<u8>,
+    /// Epoch seconds at which the rolling 5-hour SESSION window resets, or `null`
+    /// when the last poll failed or the API supplied no parseable timestamp.
+    /// Carried so the client can render a per-account "resets in" (issue #72); an
+    /// absolute instant (not a relative duration), so the client computes the
+    /// freshest delta against its own clock at print time. Non-secret — an integer.
+    #[serde(default)]
+    pub(crate) session_resets_at: Option<i64>,
+    /// Epoch seconds at which the WEEKLY window resets (see `session_resets_at`).
+    /// `null` when unknown. Non-secret — an integer.
+    #[serde(default)]
+    pub(crate) weekly_resets_at: Option<i64>,
+    /// Whether the account's WEEKLY window is exhausted (`weekly >= weekly_trigger`),
+    /// the daemon's own viability verdict (issue #11/#37). The client keys "resets
+    /// in" off this: a weekly-exhausted account is blocked until the WEEKLY reset,
+    /// otherwise the sooner SESSION reset governs (issue #72). Non-secret — a flag.
+    #[serde(default)]
+    pub(crate) weekly_exhausted: bool,
+    /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `null` until
+    /// this account has been polled (issue #141) — sourced from the refresh sweep when
+    /// `[refresh]` is on, otherwise from the poll path, so it is populated in the default
+    /// config too. An absolute instant (not a relative duration, like `session_resets_at`)
+    /// carried RAW for a consumer (`--json` | `jq`) to derive an "expires in" against its
+    /// own clock; the lean text view projects only the rollup glyph, not a clock cell.
+    /// Non-secret — a timestamp, never the token. `#[serde(default)]` per the added-field
+    /// convention: a pre-#119 daemon that omits it decodes to `None`.
+    #[serde(default)]
+    pub(crate) access_expires_at: Option<i64>,
+    /// The non-secret refresh-health inputs (issue #119) — last refresh ok? token rotated?
+    /// consecutive failures — or `null` until a refresh has been observed (e.g. `[refresh]`
+    /// off). The `--json` durability signal; also feeds the daemon's rollup. `#[serde(default)]`:
+    /// a pre-#119 daemon omits it → `None`.
+    #[serde(default)]
+    pub(crate) refresh_health: Option<RefreshHealth>,
+    /// The daemon-computed 4-state credential-auth rollup (issue #119): the verdict the
+    /// thin read-only client projects to a glyph (🟢/🟡/🟠/🔴/⚪) under the `AUTH` column.
+    /// Serialized on the `--json` wire as **`auth`** (issue #143 — the field reports the
+    /// credential-AUTH standing, not a vague "health"; renamed while pre-release, no stable
+    /// `--json` consumers yet); the Rust field keeps the name `health` to localize the
+    /// rename to the wire key. `Option` for backward compatibility — `#[serde(default)]`
+    /// makes a pre-#119 daemon (which omits the field) decode to `None`, and the client then
+    /// FALLS BACK to the legacy quarantine-based text rather than mis-reading a defaulted
+    /// `healthy` over a dead account.
+    #[serde(default, rename = "auth")]
+    pub(crate) health: Option<CredentialHealth>,
+}
+
+/// The next swap candidate shown by `status` (issue #88): who the daemon would
+/// rotate the active session TO if a swap fired right now. DERIVED state —
+/// recomputed each cycle from the latest readings — so, unlike the dropped in-process
+/// `last_swap` (#8), it survives a daemon restart by construction and never reads
+/// `none` merely because the process is young. Non-secret by construction: a roster
+/// label or a bare reason, never a token or email (issue #15). One serializable type
+/// for both [`StatusSnapshot`] (built each cycle) and [`StatusResponse`] (the wire),
+/// mirroring the redaction posture of the now-removed `LastSwapLine`. Internally
+/// tagged (`state`), so the three cases stay one self-describing field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub(crate) enum NextSwap {
+    /// A viable target exists — [`pick_target`]'s choice, by roster label.
+    Target { to: String },
+    /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
+    /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
+    /// *live* (enabled, non-quarantined) other account has already been polled and none
+    /// qualifies (weekly-exhausted, or over the opt-in session floor) — even while other
+    /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
+    /// there is no live other account at all (every other disabled #36 or quarantined #42,
+    /// its reading masked away by `decision_readings`, or there is simply no other account).
+    NoViableTarget,
+    /// No reading yet for any *live* (enabled, non-quarantined) other account — the
+    /// post-restart moment, before the staggered poll loop (#80) has read the rotation.
+    /// Kept distinct from `NoViableTarget` because it is exactly the moment an operator
+    /// checks `status`; a quarantined account's masked-away reading does NOT count here
+    /// (its data needs a re-login, not a poll).
+    AwaitingData,
+}
+
+/// Project a [`StatusSnapshot`] into the wire [`StatusResponse`]. Sourced solely
+/// from non-secret fields, so it can never carry a token or email (issue #15).
+pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
+    StatusResponse {
+        accounts: snapshot
+            .accounts
+            .iter()
+            .map(|account| AccountStatusLine {
+                label: account.label.clone(),
+                active: account.active,
+                enabled: account.enabled,
+                quarantined: account.quarantined,
+                recovering: account.recovering,
+                session_pct: account.usage.map(|u| to_pct(u.session)),
+                weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
+                session_resets_at: account.usage.and_then(|u| u.session_resets_at),
+                weekly_resets_at: account.usage.and_then(|u| u.weekly_resets_at),
+                weekly_exhausted: account.weekly_exhausted,
+                // The credential clocks + the daemon-computed rollup (issue #119), already
+                // resolved at snapshot build; `health` is wrapped `Some` since a current
+                // daemon always sends a verdict (the `Option` is purely pre-#119 wire compat).
+                access_expires_at: account.access_expires_at,
+                refresh_health: account.refresh_health,
+                health: Some(account.health),
+            })
+            .collect(),
+        // Already computed at snapshot build (issue #88); copy it to the wire.
+        next_swap: snapshot.next_swap.clone(),
+        // The config `[refresh].enabled` (#105) for the #138 advisory; wrapped `Some` since a
+        // current daemon always knows it (the `Option` is purely pre-#138 wire compat, mirroring
+        // `health`).
+        refresh_enabled: Some(snapshot.refresh_enabled),
+    }
+}
+
+/// A usage fraction in `[0.0, 1.0]` as a rounded, clamped `0..=100` percent.
+pub(crate) fn to_pct(fraction: f64) -> u8 {
+    (fraction * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+/// The daemon-side credential-health rollup (issue #119, extended by #137) — a PURE function
+/// of one account's health inputs, its fresh-reading liveness signal, and the wall clock, so
+/// it is unit-tested directly and computed identically for the display snapshot and the
+/// transition-event diff. The thin `status` client just projects the returned verdict to a
+/// glyph.
+///
+/// A SEVERITY ladder (most-severe wins), matching the issue's 🟢→🟡→🟠→🔴 ordering, plus a
+/// distinct ⚪ `Unknown` for the no-evidence case (#137):
+/// - **Dead** — `quarantined` (the #42 401-streak verdict) OR the last refresh outcome was
+///   `Dead` (the refresh token was cleared in place). Both genuinely need `claude /login`;
+///   surfacing a refresh-detected death as 🔴 too is more honest than hiding it (this is a
+///   DISPLAY rollup — it never flips the quarantine machinery).
+/// - **AtRisk** — the refresh safety-net is failing (`consecutive_refresh_failures > 0`):
+///   a streak of `Error` cycles means the mechanism that prevents staleness/death is
+///   struggling, so the account trends toward dead even while its token may still work.
+/// - **Stale** — the stored REFRESH-sourced access token has EXPIRED (`access_expires_at <=
+///   now_secs`) but the refresh token is still valid (not dead, not failing): a transient
+///   window the next refresh recovers. Keys off `access_expires_at` ONLY (never the
+///   poll-sourced clock), so an idle account's naturally-lapsed stashed expiry never
+///   false-🟠s (#141/#137).
+/// - **Healthy** — a POSITIVE liveness signal exists: a fresh successful usage reading
+///   (`has_fresh_reading`), OR refresh telemetry, OR a (future) refresh-sourced expiry.
+/// - **Unknown** — none of the above AND no positive liveness signal (#137): a non-active
+///   account never successfully polled, `[refresh]` off, no/unknown `access_expires_at`.
+///   Absence of a NEGATIVE signal is not health; the daemon reports "unverified" rather than
+///   a false 🟢 that would jump straight to 🔴 the moment the 401-streak quarantines it.
+///
+/// `has_fresh_reading` is this account's masked [`decision_readings`](Daemon::decision_readings)
+/// entry being `Some` — a SUCCESSFUL poll against the live API (the strongest liveness proof),
+/// `None` for a failed poll or an out-of-rotation account. Deliberately NOT `poll_expires_at`:
+/// that clock is written on every poll ATTEMPT (even a 401 against a readable-but-revoked
+/// stash), so it cannot distinguish alive from the exact lapsed-credential bug #137 fixes; it
+/// stays the display clock only (`--json`, via [`Daemon::snapshot`]'s `.or()` fallback).
+pub(crate) fn credential_health(
+    quarantined: bool,
+    last_refresh_outcome: Option<RefreshEventOutcome>,
+    consecutive_refresh_failures: u32,
+    access_expires_at: Option<i64>,
+    has_fresh_reading: bool,
+    now_secs: i64,
+) -> CredentialHealth {
+    if quarantined || last_refresh_outcome == Some(RefreshEventOutcome::Dead) {
+        CredentialHealth::Dead
+    } else if consecutive_refresh_failures > 0 {
+        CredentialHealth::AtRisk
+    } else if access_expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
+        CredentialHealth::Stale
+    } else if has_fresh_reading || last_refresh_outcome.is_some() || access_expires_at.is_some() {
+        CredentialHealth::Healthy
+    } else {
+        CredentialHealth::Unknown
+    }
+}
+
+/// Reduce one account's stored refresh observations into the non-secret [`RefreshHealth`]
+/// the wire surfaces (issue #119), or `None` when no refresh has been observed yet. `last_ok`
+/// collapses the full outcome to alive-vs-not (`Refreshed` / `NoChange` ⇒ ok; `Dead` /
+/// `Error` ⇒ not), the rollup's finer `Dead`-vs-`Error` distinction having already been
+/// applied by [`credential_health`].
+pub(crate) fn refresh_health_view(health: &AccountHealth) -> Option<RefreshHealth> {
+    let outcome = health.last_refresh_outcome?;
+    Some(RefreshHealth {
+        last_ok: matches!(
+            outcome,
+            RefreshEventOutcome::Refreshed
+                | RefreshEventOutcome::RefreshedNotReStashed
+                | RefreshEventOutcome::NoChange
+        ),
+        rotated: health.refresh_token_rotated.unwrap_or(false),
+        consecutive_failures: health.consecutive_refresh_failures,
+    })
+}
