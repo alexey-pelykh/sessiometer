@@ -503,6 +503,103 @@ mode `0600`; with no `PATH` the artifact goes to standard output. Cross-machine
 credential portability on macOS is verified (build spike #145), so an exported artifact
 restores on another Mac.
 
+## What it stores
+
+`sessiometer` takes custody of Claude Code credentials, so it is worth knowing
+exactly what it keeps and where. Everything lives under your own user account — in
+the **login keychain** and under `~/Library` — and nothing leaves the machine
+(the only outbound traffic is the read-only usage poll; the one file that can carry
+credentials off-machine is an [`export`](#exporting-state-offline) artifact you
+create explicitly).
+
+### In the login keychain
+
+All credential material lives in the macOS **login keychain**
+(`~/Library/Keychains/login.keychain-db`), reached only through the
+`/usr/bin/security` CLI:
+
+- **The active Claude Code credential** — the generic-password item whose service
+  is `Claude Code-credentials` (Claude Code suffixes it with a hash under a
+  non-default `CLAUDE_CONFIG_DIR`). This item is **Claude Code's own**;
+  `sessiometer` reads and rewrites it in place to swap the active account, but it
+  is the same item plain Claude Code created and reads, so removing `sessiometer`
+  leaves it intact.
+- **A per-account stash**, one per captured account, under the service
+  `Sessiometer/<account_uuid>` — two items each: the raw credential blob
+  (`acct = "credential"`) and the account's `oauthAccount` identity block
+  (`acct = "oauthAccount"`). Written by `capture` and `login`, erased by `remove`.
+  This is what lets `sessiometer` restore any account as the active one.
+- **Short-lived isolated items** created during `poke`, `login`, and the periodic
+  refresh so Claude Code can refresh a parked account's token without touching the
+  live credential. Each is seeded and **torn down within the same cycle**; a crash
+  can leave one behind, and the next run's reaper clears it.
+
+### On disk
+
+Under `~/Library`, every file `0600` and every directory `0700`, each checked to be
+owned by you:
+
+| Location | Holds | Secrets? |
+|----------|-------|----------|
+| `~/Library/Application Support/sessiometer/config.toml` (or `$XDG_CONFIG_HOME/sessiometer/config.toml`) | The **roster** — `[[account]]` labels and `account_uuid`s pointing at the keychain stashes — plus the tunables | **No** — the roster references stashes; the credential blobs stay in the keychain |
+| `~/Library/Application Support/sessiometer/` | The daemon's runtime files: `daemon.lock`, `daemon.sock` (control socket), `swap.lock`, the usage store (`usage-samples.jsonl`, `usage-rollup.json`), and the ephemeral `refresh/` and `login/` isolation directories | No |
+| `~/Library/Logs/sessiometer/sessiometer.log` | The event log — durable state changes | No — every line passes a CI redaction check; never a token or email |
+
+The config directory is `$XDG_CONFIG_HOME/sessiometer` when `$XDG_CONFIG_HOME` is
+set, otherwise `~/Library/Application Support/sessiometer`; the daemon's runtime
+files always live in the native `~/Library/Application Support/sessiometer`
+regardless. `sessiometer` also co-writes the active account's `oauthAccount` block
+into Claude Code's own `~/.claude.json` during a swap — that file belongs to Claude
+Code, not `sessiometer`.
+
+The security posture behind all of this — keychain-via-CLI, secrets off `argv`,
+in-memory zeroization, redacted diagnostics — is stated in
+[`SECURITY.md`](SECURITY.md).
+
+## Uninstalling / recovery
+
+To remove `sessiometer` completely and hand credential custody back to plain
+Claude Code:
+
+1. **Stop the daemon.** Quit any running `sessiometer run` (Ctrl-C in its terminal,
+   or kill the process). Nothing else runs in the background.
+
+2. **Erase the per-account stashes.** The cleanest way is to `remove` each captured
+   account, which deletes its `Sessiometer/<account_uuid>` keychain stash:
+
+   ```sh
+   sessiometer list               # see the captured accounts
+   sessiometer remove <label>     # repeat for each; erases that account's stash
+   ```
+
+   `remove` never touches the live `Claude Code-credentials` item — even for the
+   active account — so your Claude Code session keeps working throughout.
+
+3. **Delete the on-disk state:**
+
+   ```sh
+   rm -rf ~/"Library/Application Support/sessiometer"
+   rm -rf ~/"Library/Logs/sessiometer"
+   # only if you set $XDG_CONFIG_HOME:
+   rm -rf "$XDG_CONFIG_HOME/sessiometer"
+   ```
+
+4. **Remove the binary** — delete the `sessiometer` executable you built or
+   installed (e.g. `target/release/sessiometer`, or wherever you copied it).
+
+**Returning custody to plain Claude Code.** `sessiometer` never takes the
+`Claude Code-credentials` item away from Claude Code — it only rewrites it in
+place — so once `sessiometer` is gone, Claude Code simply keeps using **whichever
+account was active last**. If that is not the account you want, switch to it before
+uninstalling (`sessiometer use <account>`), or run `claude /login` afterwards to
+re-authenticate directly.
+
+If you skipped step 2, any leftover `Sessiometer/<account_uuid>` items are inert —
+plain Claude Code never reads them — but you can still delete them by hand: in
+**Keychain Access**, search `Sessiometer/` and delete the matching items (two per
+account); or scripted, `security delete-generic-password -s "Sessiometer/<account_uuid>"`,
+repeated until it reports the service is gone.
+
 ## Edge cases & resilience
 
 `sessiometer` is built to ride out the keychain and credential edge cases a
