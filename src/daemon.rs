@@ -2223,6 +2223,14 @@ where
                     events.push(Event::UncapturedLogin { account_uuid });
                     // Committed so we do not re-surface it every cycle; nothing to re-stash.
                     self.state.canonical_watch.commit(canonical);
+                    // Drop the cached active too (issue #208), mirroring the Some-branch
+                    // above: the canonical now resolves to NO roster account, so a
+                    // surviving stale index would make `status` show a false `*` on the
+                    // now-inactive account and let `decide_action` act on a phantom
+                    // active. Cleared here, the top-of-tick re-resolution finds no stash
+                    // or display match and re-resolves to `None`, so `decide_action`
+                    // routes to the safe `SkippedActiveUnknown` path.
+                    self.state.active = None;
                 }
             },
         }
@@ -6006,6 +6014,13 @@ mod tests {
         assert!(
             daemon.stash.read("Sessiometer/u-Z").await.is_err(),
             "no stash is created for the un-captured account"
+        );
+        // #208: the stale cached active is dropped when the canonical resolves to no
+        // roster account, so `status` shows no false `*` on the now-inactive account.
+        // Before the fix the stale `Some(0)` (work) survived this un-captured login.
+        assert_eq!(
+            daemon.state.active, None,
+            "the stale active is dropped on an un-captured login → status shows no `*` (#208)"
         );
 
         // Tick 3: the same canonical is now the committed baseline → no repeat surfacing.
@@ -9928,6 +9943,68 @@ mod tests {
         // The swap-TO account (`spare`) is healthy and untouched by the probe reset.
         assert!(!daemon.state.health[1].quarantined);
         assert_eq!(daemon.state.health[1].recovery_successes, 0);
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_seam_drops_the_stale_active_on_an_unresolvable_canonical() {
+        // Issue #208, the None-branch counterpart to the swap-away test above: a forced
+        // logout / `/login` into an UN-CAPTURED account makes the canonical resolve to NO
+        // roster account (`Changed → None`). The stale cached `state.active` must be
+        // dropped — mirroring the re-stash (`Changed → Some`) branch — so `status` stops
+        // showing a false `*` on the now-inactive account and `decide_action` routes to
+        // the safe `SkippedActiveUnknown` path instead of acting on a phantom index.
+        // Before the fix the None-branch committed the watch baseline WITHOUT resetting
+        // `state.active`, so the stale index survived precisely when the operator trusts
+        // `status` during an incident.
+        let mut daemon = lifecycle_daemon().await;
+        daemon.state.active = Some(0);
+
+        let mut events = Vec::new();
+        // Prime the watch on `work`'s current canonical (A-token): first observation, no
+        // change detected, the resolved active left in place.
+        daemon
+            .reconcile_canonical_change(&cred(b"A-token"), &mut events)
+            .await;
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "priming the watch leaves the resolved active untouched"
+        );
+
+        // The canonical now holds a token no stash matches AND the display switches to a
+        // uuid not in the roster, so it resolves to no roster account (the None-branch).
+        crate::claude_state::write_oauth_account(&daemon.claude_json, &oauth("u-Z")).unwrap();
+        daemon
+            .reconcile_canonical_change(&cred(b"Z-token"), &mut events)
+            .await;
+
+        assert_eq!(
+            daemon.state.active, None,
+            "the stale active is dropped when the canonical resolves to no roster account (#208)"
+        );
+        // The un-captured login is still surfaced (never onboarded) — the None-branch's
+        // existing behavior is preserved alongside the active reset.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::UncapturedLogin { .. })),
+            "the un-captured login is still surfaced: {events:?}"
+        );
+
+        // Consequence (AC-3): with the active now unknown, `decide_action` takes the safe
+        // poll-only path and fires NO emergency swap on a phantom index.
+        let at = daemon.clock.now();
+        let active = daemon.state.active;
+        let readings = vec![None, None];
+        let mut decide_events = Vec::new();
+        let action = daemon
+            .decide_action(at, active, &readings, &mut decide_events)
+            .await;
+        assert_eq!(action, TickAction::SkippedActiveUnknown);
+        assert!(
+            decide_events.is_empty(),
+            "no swap fires on an unknown active: {decide_events:?}"
+        );
     }
 
     #[tokio::test]
