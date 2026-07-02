@@ -1,0 +1,5 @@
+# GitHub reads this file to surface the "Sponsor" button on the repository page
+# and in the sidebar. Sponsorships must also be enabled in
+# Settings -> General -> Features for the button to appear.
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+github: alexey-pelykh
