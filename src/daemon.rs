@@ -45,7 +45,7 @@
 //! lockstep. The seam is seeded from entropy in production and from a fixed seed
 //! in tests (`Daemon::with_seed`), keeping the draws deterministic under test.
 //!
-//! ## Lifecycle (the run loop, [`run_loop`])
+//! ## Lifecycle (the run loop, [`run_loop()`])
 //!
 //! - **Single-instance lock** ([`InstanceLock`]) — a kernel advisory `flock` held
 //!   for the process lifetime; a second `run` exits `3`.
@@ -81,8 +81,6 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::claude_state;
@@ -108,6 +106,52 @@ use crate::swap::{self, SwapDecision};
 use crate::timing::{Jitter, SplitMix64, Strategy};
 use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
 use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sample};
+
+// Per-concern submodules split off from this file along its responsibility seams (issue
+// #203, the #195 decomposition after #202 untied the contract cycle). Each is re-exported
+// under `crate::daemon::*` below, so relocating them is source-compatible for every existing
+// consumer (cli / use_account / poke / capture) and for the in-module test suite, which
+// reaches them through `use super::*`. `daemon` retains only the poll-loop decision core
+// (the [`Daemon`] state machine) and its wiring.
+mod peer_auth;
+
+pub(crate) use peer_auth::peer_is_same_user;
+// `is_same_user` / `peer_euid` are exercised only by the in-module peer-auth tests
+// (production reaches them through `peer_is_same_user`); re-export test-scoped so
+// `mod tests`' `use super::*` resolves them unmodified while a non-test build sees no
+// unused re-export.
+#[cfg(test)]
+pub(crate) use peer_auth::{is_same_user, peer_euid};
+
+mod snapshot;
+
+pub(crate) use snapshot::{
+    credential_health, refresh_health_view, status_response, to_pct, AccountReading,
+    AccountStatusLine, NextSwap, StatusResponse, StatusSnapshot,
+};
+// `RefreshHealth` is named only by the in-module snapshot tests (production builds it through
+// `refresh_health_view` without naming the type); re-export test-scoped so `use super::*`
+// resolves it while a non-test build sees no unused re-export.
+#[cfg(test)]
+pub(crate) use snapshot::RefreshHealth;
+
+mod socket;
+
+pub(crate) use socket::{notify_roster_reload, Control, ControlSignal, UnixControl};
+// `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
+// in-module socket tests (production reaches them through `UnixControl::serve`); re-export
+// test-scoped so `use super::*` resolves them while a non-test build sees no unused re-export.
+#[cfg(test)]
+pub(crate) use socket::{control_reply, serve_control, MAX_CONTROL_LINE_BYTES};
+
+mod run_loop;
+
+pub(crate) use run_loop::run_loop;
+// `swap_report` is exercised only by the in-module run-loop tests (production calls it inside
+// `run_loop`); re-export test-scoped so `use super::*` resolves it while a non-test build sees
+// no unused re-export.
+#[cfg(test)]
+pub(crate) use run_loop::swap_report;
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
 /// config's `session_trigger` range so a jittered draw can never escape it.
@@ -465,42 +509,6 @@ fn stats_events_for_poll(
     events
 }
 
-/// A side effect a served control connection asks the run loop to apply after the
-/// reply is sent. `status` produces none (a pure read); the only variant today is
-/// the manual-hold signal (issue #64). Returned by [`Control::serve`] so the
-/// mutation lands on the daemon's decision state in the run loop, where `&mut
-/// Daemon` is available — `serve` itself only borrows the read-only snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ControlSignal {
-    /// A manual `use` swap committed and notified the daemon (issue #64). The run
-    /// loop adopts it ([`Daemon::adopt_manual_swap`]): arm the post-swap cooldown
-    /// (#10) so the very next poll does not immediately revert the operator's
-    /// choice, and re-resolve the active account from the canonical item. A
-    /// cooldown-only signal — it carries no credential and no write target, and
-    /// never becomes a write command.
-    ManualSwapped,
-    /// A roster write on disk (`capture` / `login` / `remove`) committed and notified
-    /// the daemon (issue #139). The run loop reloads it
-    /// ([`Daemon::adopt_roster_reload`]): re-read `config.toml` and reconcile the
-    /// in-memory roster (add onboarded/relogged-in accounts, drop removed ones),
-    /// preserving per-account health/decision state for accounts that persist. Like
-    /// [`ManualSwapped`](ControlSignal::ManualSwapped) it carries no payload — the
-    /// authoritative new roster is the on-disk `config.toml`, re-read from scratch — so
-    /// a duplicate or out-of-order notification at worst re-reads an unchanged file.
-    RosterReloadRequested,
-}
-
-/// Control seam: serve control-socket connections. The production impl
-/// ([`UnixControl`]) accepts on a `UnixListener`; the run loop's idle select
-/// drives it between polls. The test no-op never resolves, so it never wins the
-/// select. A served connection may return a [`ControlSignal`] for the run loop to
-/// apply (`None` for a pure `status` read).
-pub(crate) trait Control {
-    /// Serve at most one control connection from `snapshot`, then resolve to any
-    /// [`ControlSignal`] the exchange produced (`None` if none).
-    async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal>;
-}
-
 /// The external-login watch cadence (issue #140): how often the run loop probes the canonical
 /// credential item for an OUT-OF-BAND change (a manual `claude /login`), DECOUPLED from the
 /// usage-poll cadence (`poll_secs`, default 300 s). The probe is a LOCAL keychain read — no
@@ -605,82 +613,6 @@ impl PollRefresh for RealRefreshEngine {
     }
 }
 
-/// Production control: accept one client at a time on the bound socket and answer
-/// from the latest snapshot.
-pub(crate) struct UnixControl {
-    listener: UnixListener,
-}
-
-impl UnixControl {
-    pub(crate) fn new(listener: UnixListener) -> Self {
-        Self { listener }
-    }
-}
-
-impl Control for UnixControl {
-    async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal> {
-        match self.listener.accept().await {
-            Ok((stream, _addr)) => {
-                // Authenticate the peer as the SAME local user (issue #64): a
-                // state-affecting command (`manual-swapped`) is honored only from
-                // our own uid. The socket is already `0600` in a `0700` dir, so
-                // this is defense-in-depth — but the manual-hold receive path must
-                // be authenticated, never trust-by-reachability. Peer creds are read
-                // from the real fd here; `serve_control` takes the verdict as a
-                // plain bool so it stays testable over an in-memory duplex.
-                let peer_authenticated = peer_is_same_user(&stream);
-                // Best-effort: a malformed or disconnected client must never crash
-                // the daemon — drop the exchange (the reply carries nothing secret).
-                serve_control(stream, snapshot, peer_authenticated)
-                    .await
-                    .unwrap_or(None)
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-/// The peer's effective uid read from the connected Unix-domain socket `fd` via
-/// `getpeereid(2)`, or `None` when the credential cannot be read (the syscall errors —
-/// a not-connected socket, a non-socket fd, a bad fd). Split out from the same-user
-/// decision ([`is_same_user`]) so the fail-closed error branch is testable without a
-/// real failing peer (issue #196). Returning `None` on error IS the fail-closed
-/// primitive: an unreadable credential is never a uid, so it can never match ours.
-fn peer_euid(fd: std::os::unix::io::RawFd) -> Option<libc::uid_t> {
-    let mut euid: libc::uid_t = 0;
-    let mut egid: libc::gid_t = 0;
-    // SAFETY: `getpeereid` is a syscall the kernel validates `fd` for itself — a bad,
-    // non-socket, or not-connected fd returns `rc != 0` (mapped to `None` below),
-    // never UB — and it writes the two out-pointers (stack locals here) ONLY on
-    // success (`rc == 0`). No preconditions on `fd`.
-    let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
-    (rc == 0).then_some(euid)
-}
-
-/// The pure peer-auth decision (issue #64): whether a peer bearing effective uid
-/// `peer_euid` — or `None` when its credential could not be read — is the SAME local
-/// user as `our_uid`. Split from the syscall ([`peer_euid`]) so every branch is testable
-/// without a real foreign-uid peer or root: same-user, a foreign uid, and the
-/// unreadable-credential branch (issue #196). FAIL CLOSED — `None` is never the same
-/// user, so a `getpeereid` error denies. Inverting this comparison flips BOTH the
-/// foreign-uid and the error branch from deny to allow, which the peer-auth tests catch.
-fn is_same_user(peer_euid: Option<libc::uid_t>, our_uid: libc::uid_t) -> bool {
-    peer_euid == Some(our_uid)
-}
-
-/// Whether the peer connected on `stream` is the same local user as this process
-/// (issue #64). Reads the peer's effective uid via [`peer_euid`] (`getpeereid(2)`, the
-/// portable BSD/macOS peer-credential call for a Unix-domain socket) and compares it to
-/// our own `getuid()` via [`is_same_user`]. Any failure to read the credential is
-/// treated as NOT authenticated — fail closed. Used to gate the state-affecting
-/// `manual-swapped` / `roster-reload` commands; the non-secret `status` read is not
-/// gated.
-fn peer_is_same_user(stream: &tokio::net::UnixStream) -> bool {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: `getuid` cannot fail and has no preconditions.
-    is_same_user(peer_euid(stream.as_raw_fd()), unsafe { libc::getuid() })
-}
-
 /// A held single-instance lock: a kernel advisory `flock(LOCK_EX|LOCK_NB)` on the
 /// native-local `daemon.lock`. The file is held open for the process lifetime —
 /// the kernel releases the lock on death (or on drop), so there is no stale-PID
@@ -723,263 +655,6 @@ impl InstanceLock {
     }
 }
 
-/// The latest per-account reading the daemon exposes — over the control socket
-/// and in the event log. Non-secret by construction: a handle (label), the active
-/// flag, and percentages — never a token or email (issue #15).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct StatusSnapshot {
-    pub(crate) accounts: Vec<AccountReading>,
-    /// The next swap candidate as of this cycle (issue #88): who [`pick_target`]
-    /// would rotate the active session to, or why there is no candidate. Computed
-    /// daemon-side ([`Daemon::next_swap`]); [`status_response`] copies it straight
-    /// onto the wire. `None` only when there is no active anchor to swap from.
-    pub(crate) next_swap: Option<NextSwap>,
-    /// Whether the periodic isolated-refresh tick is enabled in config (`[refresh].enabled`,
-    /// issue #105) — copied from [`Daemon::refresh_enabled`] at build. Carried to the wire so
-    /// the thin `status` client can surface the issue-#138 advisory (with the tick OFF,
-    /// non-active accounts get no maintenance). `false` by `Default` (an all-defaults snapshot
-    /// reads as tick-off), matching the opt-in default.
-    pub(crate) refresh_enabled: bool,
-}
-
-/// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
-/// daemon's reduced projection of the refresh observations its per-account health state
-/// carries — whether the last refresh kept the credential alive, whether CC rotated the
-/// refresh-token VALUE, and the consecutive-failure streak. `None` (the whole struct) until
-/// the refresh engine has observed the account at least once (e.g. the `[refresh]` feature
-/// is off, or the account has not yet been swept). Every field is a boolean / count — never
-/// a token or expiry (the #15 discipline). Derives `Deserialize` so the `status` client can
-/// read it back; `#[serde(default)]` on the carrying field handles a pre-#119 daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RefreshHealth {
-    /// Whether the LAST observed refresh kept the credential ALIVE (`refreshed` /
-    /// `no_change`), as opposed to a `dead` (refresh token cleared) or `error` (cycle
-    /// failed) outcome.
-    pub(crate) last_ok: bool,
-    /// Whether CC ROTATED the refresh-token value on the last refresh (the AC-3 durability
-    /// signal) — the boolean only, never either token value. Named `rotated` (not
-    /// `token_rotated`) so the `--json` field carries no `token` substring that a coarse
-    /// #15 leak-proxy (`!contains("token")`) could false-positive on.
-    pub(crate) rotated: bool,
-    /// Consecutive refresh FAILURES (`dead` / `error` outcomes), reset to 0 by the next
-    /// alive refresh — the rollup's at-risk input.
-    pub(crate) consecutive_failures: u32,
-}
-
-/// One account's latest reading.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct AccountReading {
-    pub(crate) label: String,
-    pub(crate) active: bool,
-    /// Whether the account is in the rotation (issue #36) — surfaced so `status`
-    /// can mark a parked account. A disabled account is shown but never swapped to.
-    pub(crate) enabled: bool,
-    /// Whether the account is QUARANTINED — its credential is dead and needs a
-    /// re-login (issue #42). The durable "needs re-login" status `status` surfaces;
-    /// non-secret (a plain flag on the account's handle).
-    pub(crate) quarantined: bool,
-    /// Whether a quarantined account is mid-RECOVERY — its credential is currently
-    /// answering again (`quarantined && recovery_successes > 0`), climbing toward the
-    /// un-quarantine threshold on the spontaneous-revival path (issue #109). A refinement
-    /// of `quarantined` (always implies it), surfaced so `status` can render `recovering`
-    /// instead of the alarming `needs re-login` for a healing account. Derived from the
-    /// health counter (where it lives); non-secret — a plain flag, no raw count exposed.
-    pub(crate) recovering: bool,
-    /// Whether the account's WEEKLY window is EXHAUSTED — `weekly >= weekly_trigger`
-    /// (the base, un-jittered threshold; issue #11/#37), the daemon's own viability
-    /// verdict. When true the account is blocked until its weekly reset, so `status`
-    /// keys its "resets in" off the weekly reset rather than the sooner session
-    /// reset (issue #72). Precomputed here (where the threshold lives) so the wire
-    /// projection stays threshold-free; `false` when the last poll failed.
-    pub(crate) weekly_exhausted: bool,
-    pub(crate) usage: Option<Usage>,
-    /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `None` until
-    /// the refresh engine has observed this account's stash. An absolute instant (not a
-    /// relative duration, like `session_resets_at`) carried RAW on the wire, from which a
-    /// consumer (`--json` | `jq`) can derive an "expires in" against its own clock; the lean
-    /// text view projects only the rollup glyph, not a clock cell. Non-secret — a timestamp.
-    pub(crate) access_expires_at: Option<i64>,
-    /// The non-secret refresh-health inputs (issue #119), or `None` until a refresh has been
-    /// observed. The rollup's at-risk / dead inputs plus the `--json` durability signal.
-    pub(crate) refresh_health: Option<RefreshHealth>,
-    /// The daemon-computed 4-state credential-health rollup (issue #119) — the verdict the
-    /// thin `status` client projects to a glyph. Computed in [`Daemon::snapshot`] from this
-    /// account's health state and the wall clock.
-    pub(crate) health: CredentialHealth,
-}
-
-/// The control socket's `status` reply — handles + percentages + the forward-looking
-/// `next_swap` candidate, and nothing else (issue #15: never a token or email).
-/// Derives both `Serialize` (the daemon writes it) and `Deserialize` (the `status`
-/// client reads it), so this one definition is the whole wire contract. The durable,
-/// timestamped swap HISTORY remains the event-log view (#9), not `status`.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct StatusResponse {
-    pub(crate) accounts: Vec<AccountStatusLine>,
-    /// The next swap candidate (issue #88), or `null` when there is no active anchor
-    /// to swap from. `#[serde(default)]` per the added-field convention (cf.
-    /// `session_resets_at`): a pre-#88 daemon that omits the field decodes to `None`.
-    #[serde(default)]
-    pub(crate) next_swap: Option<NextSwap>,
-    /// Whether the daemon's periodic isolated-refresh tick is enabled (`[refresh].enabled`,
-    /// issue #105). `Some(false)` is the ONLY value that arms the issue-#138 discoverability
-    /// advisory (paired with ≥1 unhealthy/unverified non-active account); `Some(true)`
-    /// suppresses it. `Option` + `#[serde(default)]` per the added-field convention (cf.
-    /// `auth`): a pre-#138 daemon that omits the field decodes to `None`, which the client
-    /// treats as "unknown → suppress" rather than mis-firing a stale advisory against an old
-    /// daemon. Non-secret — a plain flag.
-    #[serde(default)]
-    pub(crate) refresh_enabled: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct AccountStatusLine {
-    /// The operator-chosen handle (label) — never the email (issue #15).
-    pub(crate) label: String,
-    pub(crate) active: bool,
-    /// Whether the account is in the rotation (issue #36); `false` for a parked
-    /// account, which `status` marks. Non-secret — a plain flag.
-    pub(crate) enabled: bool,
-    /// Whether the account is QUARANTINED — its credential is dead and needs a
-    /// re-login (issue #42). The durable "needs re-login" status; `false` for a
-    /// healthy account. Non-secret — a plain flag.
-    pub(crate) quarantined: bool,
-    /// Whether a quarantined account is mid-RECOVERY — its credential is answering
-    /// again and climbing toward un-quarantine (issue #109). Refines `quarantined`
-    /// (true only when it is): lets `status` render `recovering` instead of the
-    /// alarming `needs re-login` for a healing account, so an operator does not swap
-    /// away from a recovering — and often healthier — account. Non-secret — a derived
-    /// flag, no raw count. `#[serde(default)]` per the added-field convention (cf.
-    /// `session_resets_at`): a pre-#109 daemon that omits it decodes to `false`.
-    #[serde(default)]
-    pub(crate) recovering: bool,
-    /// Last-polled session-window usage percent (`0..=100`); `null` if the last
-    /// poll for this account failed (never a fabricated `0`).
-    pub(crate) session_pct: Option<u8>,
-    /// Last-polled weekly-window usage percent (`0..=100`).
-    pub(crate) weekly_pct: Option<u8>,
-    /// Epoch seconds at which the rolling 5-hour SESSION window resets, or `null`
-    /// when the last poll failed or the API supplied no parseable timestamp.
-    /// Carried so the client can render a per-account "resets in" (issue #72); an
-    /// absolute instant (not a relative duration), so the client computes the
-    /// freshest delta against its own clock at print time. Non-secret — an integer.
-    #[serde(default)]
-    pub(crate) session_resets_at: Option<i64>,
-    /// Epoch seconds at which the WEEKLY window resets (see `session_resets_at`).
-    /// `null` when unknown. Non-secret — an integer.
-    #[serde(default)]
-    pub(crate) weekly_resets_at: Option<i64>,
-    /// Whether the account's WEEKLY window is exhausted (`weekly >= weekly_trigger`),
-    /// the daemon's own viability verdict (issue #11/#37). The client keys "resets
-    /// in" off this: a weekly-exhausted account is blocked until the WEEKLY reset,
-    /// otherwise the sooner SESSION reset governs (issue #72). Non-secret — a flag.
-    #[serde(default)]
-    pub(crate) weekly_exhausted: bool,
-    /// The stored access-token `expiresAt` as epoch SECONDS (issue #119), or `null` until
-    /// this account has been polled (issue #141) — sourced from the refresh sweep when
-    /// `[refresh]` is on, otherwise from the poll path, so it is populated in the default
-    /// config too. An absolute instant (not a relative duration, like `session_resets_at`)
-    /// carried RAW for a consumer (`--json` | `jq`) to derive an "expires in" against its
-    /// own clock; the lean text view projects only the rollup glyph, not a clock cell.
-    /// Non-secret — a timestamp, never the token. `#[serde(default)]` per the added-field
-    /// convention: a pre-#119 daemon that omits it decodes to `None`.
-    #[serde(default)]
-    pub(crate) access_expires_at: Option<i64>,
-    /// The non-secret refresh-health inputs (issue #119) — last refresh ok? token rotated?
-    /// consecutive failures — or `null` until a refresh has been observed (e.g. `[refresh]`
-    /// off). The `--json` durability signal; also feeds the daemon's rollup. `#[serde(default)]`:
-    /// a pre-#119 daemon omits it → `None`.
-    #[serde(default)]
-    pub(crate) refresh_health: Option<RefreshHealth>,
-    /// The daemon-computed 4-state credential-auth rollup (issue #119): the verdict the
-    /// thin read-only client projects to a glyph (🟢/🟡/🟠/🔴/⚪) under the `AUTH` column.
-    /// Serialized on the `--json` wire as **`auth`** (issue #143 — the field reports the
-    /// credential-AUTH standing, not a vague "health"; renamed while pre-release, no stable
-    /// `--json` consumers yet); the Rust field keeps the name `health` to localize the
-    /// rename to the wire key. `Option` for backward compatibility — `#[serde(default)]`
-    /// makes a pre-#119 daemon (which omits the field) decode to `None`, and the client then
-    /// FALLS BACK to the legacy quarantine-based text rather than mis-reading a defaulted
-    /// `healthy` over a dead account.
-    #[serde(default, rename = "auth")]
-    pub(crate) health: Option<CredentialHealth>,
-}
-
-/// The next swap candidate shown by `status` (issue #88): who the daemon would
-/// rotate the active session TO if a swap fired right now. DERIVED state —
-/// recomputed each cycle from the latest readings — so, unlike the dropped in-process
-/// `last_swap` (#8), it survives a daemon restart by construction and never reads
-/// `none` merely because the process is young. Non-secret by construction: a roster
-/// label or a bare reason, never a token or email (issue #15). One serializable type
-/// for both [`StatusSnapshot`] (built each cycle) and [`StatusResponse`] (the wire),
-/// mirroring the redaction posture of the now-removed `LastSwapLine`. Internally
-/// tagged (`state`), so the three cases stay one self-describing field.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", tag = "state")]
-pub(crate) enum NextSwap {
-    /// A viable target exists — [`pick_target`]'s choice, by roster label.
-    Target { to: String },
-    /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
-    /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
-    /// *live* (enabled, non-quarantined) other account has already been polled and none
-    /// qualifies (weekly-exhausted, or over the opt-in session floor) — even while other
-    /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
-    /// there is no live other account at all (every other disabled #36 or quarantined #42,
-    /// its reading masked away by `decision_readings`, or there is simply no other account).
-    NoViableTarget,
-    /// No reading yet for any *live* (enabled, non-quarantined) other account — the
-    /// post-restart moment, before the staggered poll loop (#80) has read the rotation.
-    /// Kept distinct from `NoViableTarget` because it is exactly the moment an operator
-    /// checks `status`; a quarantined account's masked-away reading does NOT count here
-    /// (its data needs a re-login, not a poll).
-    AwaitingData,
-}
-
-/// The `{"cmd": "..."}` control request.
-#[derive(Deserialize)]
-struct ControlRequest {
-    cmd: String,
-}
-
-/// Project a [`StatusSnapshot`] into the wire [`StatusResponse`]. Sourced solely
-/// from non-secret fields, so it can never carry a token or email (issue #15).
-fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
-    StatusResponse {
-        accounts: snapshot
-            .accounts
-            .iter()
-            .map(|account| AccountStatusLine {
-                label: account.label.clone(),
-                active: account.active,
-                enabled: account.enabled,
-                quarantined: account.quarantined,
-                recovering: account.recovering,
-                session_pct: account.usage.map(|u| to_pct(u.session)),
-                weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
-                session_resets_at: account.usage.and_then(|u| u.session_resets_at),
-                weekly_resets_at: account.usage.and_then(|u| u.weekly_resets_at),
-                weekly_exhausted: account.weekly_exhausted,
-                // The credential clocks + the daemon-computed rollup (issue #119), already
-                // resolved at snapshot build; `health` is wrapped `Some` since a current
-                // daemon always sends a verdict (the `Option` is purely pre-#119 wire compat).
-                access_expires_at: account.access_expires_at,
-                refresh_health: account.refresh_health,
-                health: Some(account.health),
-            })
-            .collect(),
-        // Already computed at snapshot build (issue #88); copy it to the wire.
-        next_swap: snapshot.next_swap.clone(),
-        // The config `[refresh].enabled` (#105) for the #138 advisory; wrapped `Some` since a
-        // current daemon always knows it (the `Option` is purely pre-#138 wire compat, mirroring
-        // `health`).
-        refresh_enabled: Some(snapshot.refresh_enabled),
-    }
-}
-
-/// A usage fraction in `[0.0, 1.0]` as a rounded, clamped `0..=100` percent.
-fn to_pct(fraction: f64) -> u8 {
-    (fraction * 100.0).round().clamp(0.0, 100.0) as u8
-}
-
 /// Current wall-clock as epoch SECONDS, the unit the #119 credential rollup and wire use
 /// (`access_expires_at`, like `session_resets_at`). `0` on the pre-1970 impossible case —
 /// a best-effort, never-panic read, mirroring [`crate::observability`]'s log timestamps.
@@ -1004,227 +679,6 @@ fn wall_clock_now_secs() -> i64 {
 /// ([`Daemon::apply_refresh_observation`]). A pure function so the boundary is unit-tested.
 fn millis_to_secs(ms: i64) -> i64 {
     ms / 1000
-}
-
-/// The daemon-side credential-health rollup (issue #119, extended by #137) — a PURE function
-/// of one account's health inputs, its fresh-reading liveness signal, and the wall clock, so
-/// it is unit-tested directly and computed identically for the display snapshot and the
-/// transition-event diff. The thin `status` client just projects the returned verdict to a
-/// glyph.
-///
-/// A SEVERITY ladder (most-severe wins), matching the issue's 🟢→🟡→🟠→🔴 ordering, plus a
-/// distinct ⚪ `Unknown` for the no-evidence case (#137):
-/// - **Dead** — `quarantined` (the #42 401-streak verdict) OR the last refresh outcome was
-///   `Dead` (the refresh token was cleared in place). Both genuinely need `claude /login`;
-///   surfacing a refresh-detected death as 🔴 too is more honest than hiding it (this is a
-///   DISPLAY rollup — it never flips the quarantine machinery).
-/// - **AtRisk** — the refresh safety-net is failing (`consecutive_refresh_failures > 0`):
-///   a streak of `Error` cycles means the mechanism that prevents staleness/death is
-///   struggling, so the account trends toward dead even while its token may still work.
-/// - **Stale** — the stored REFRESH-sourced access token has EXPIRED (`access_expires_at <=
-///   now_secs`) but the refresh token is still valid (not dead, not failing): a transient
-///   window the next refresh recovers. Keys off `access_expires_at` ONLY (never the
-///   poll-sourced clock), so an idle account's naturally-lapsed stashed expiry never
-///   false-🟠s (#141/#137).
-/// - **Healthy** — a POSITIVE liveness signal exists: a fresh successful usage reading
-///   (`has_fresh_reading`), OR refresh telemetry, OR a (future) refresh-sourced expiry.
-/// - **Unknown** — none of the above AND no positive liveness signal (#137): a non-active
-///   account never successfully polled, `[refresh]` off, no/unknown `access_expires_at`.
-///   Absence of a NEGATIVE signal is not health; the daemon reports "unverified" rather than
-///   a false 🟢 that would jump straight to 🔴 the moment the 401-streak quarantines it.
-///
-/// `has_fresh_reading` is this account's masked [`decision_readings`](Daemon::decision_readings)
-/// entry being `Some` — a SUCCESSFUL poll against the live API (the strongest liveness proof),
-/// `None` for a failed poll or an out-of-rotation account. Deliberately NOT `poll_expires_at`:
-/// that clock is written on every poll ATTEMPT (even a 401 against a readable-but-revoked
-/// stash), so it cannot distinguish alive from the exact lapsed-credential bug #137 fixes; it
-/// stays the display clock only (`--json`, via [`Daemon::snapshot`]'s `.or()` fallback).
-fn credential_health(
-    quarantined: bool,
-    last_refresh_outcome: Option<RefreshEventOutcome>,
-    consecutive_refresh_failures: u32,
-    access_expires_at: Option<i64>,
-    has_fresh_reading: bool,
-    now_secs: i64,
-) -> CredentialHealth {
-    if quarantined || last_refresh_outcome == Some(RefreshEventOutcome::Dead) {
-        CredentialHealth::Dead
-    } else if consecutive_refresh_failures > 0 {
-        CredentialHealth::AtRisk
-    } else if access_expires_at.is_some_and(|expires_at| expires_at <= now_secs) {
-        CredentialHealth::Stale
-    } else if has_fresh_reading || last_refresh_outcome.is_some() || access_expires_at.is_some() {
-        CredentialHealth::Healthy
-    } else {
-        CredentialHealth::Unknown
-    }
-}
-
-/// Reduce one account's stored refresh observations into the non-secret [`RefreshHealth`]
-/// the wire surfaces (issue #119), or `None` when no refresh has been observed yet. `last_ok`
-/// collapses the full outcome to alive-vs-not (`Refreshed` / `NoChange` ⇒ ok; `Dead` /
-/// `Error` ⇒ not), the rollup's finer `Dead`-vs-`Error` distinction having already been
-/// applied by [`credential_health`].
-fn refresh_health_view(health: &AccountHealth) -> Option<RefreshHealth> {
-    let outcome = health.last_refresh_outcome?;
-    Some(RefreshHealth {
-        last_ok: matches!(
-            outcome,
-            RefreshEventOutcome::Refreshed
-                | RefreshEventOutcome::RefreshedNotReStashed
-                | RefreshEventOutcome::NoChange
-        ),
-        rotated: health.refresh_token_rotated.unwrap_or(false),
-        consecutive_failures: health.consecutive_refresh_failures,
-    })
-}
-
-/// Build the one-line reply to a control request line, plus any [`ControlSignal`]
-/// the run loop must apply afterward. Pure (no I/O, no clock), so the
-/// request→(reply, signal) mapping is unit-testable; `peer_authenticated` is
-/// passed in (computed from the real fd by the caller) rather than read here, for
-/// the same testability reason `in_cooldown` is a parameter elsewhere.
-///
-/// `status` is a non-secret read, answered for any peer. `manual-swapped` (issue
-/// #64) is state-affecting, so it is honored ONLY for an authenticated same-user
-/// peer; an unauthenticated one gets an error and produces NO signal (the cooldown
-/// is never armed by a stranger).
-fn control_reply(
-    line: &str,
-    snapshot: &StatusSnapshot,
-    peer_authenticated: bool,
-) -> (String, Option<ControlSignal>) {
-    match serde_json::from_str::<ControlRequest>(line) {
-        Ok(request) if request.cmd == "status" => (
-            serde_json::to_string(&status_response(snapshot))
-                .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.to_owned()),
-            None,
-        ),
-        Ok(request) if request.cmd == "manual-swapped" => {
-            if peer_authenticated {
-                (
-                    r#"{"ok":true}"#.to_owned(),
-                    Some(ControlSignal::ManualSwapped),
-                )
-            } else {
-                (r#"{"error":"unauthorized"}"#.to_owned(), None)
-            }
-        }
-        // `roster-reload` (issue #139) is state-affecting — it makes the daemon adopt a
-        // new on-disk roster — so, like `manual-swapped`, it is honored ONLY for an
-        // authenticated same-user peer; an unauthenticated one gets an error and
-        // produces NO signal (a stranger can never make the daemon re-read its config).
-        Ok(request) if request.cmd == "roster-reload" => {
-            if peer_authenticated {
-                (
-                    r#"{"ok":true}"#.to_owned(),
-                    Some(ControlSignal::RosterReloadRequested),
-                )
-            } else {
-                (r#"{"error":"unauthorized"}"#.to_owned(), None)
-            }
-        }
-        Ok(_) => (r#"{"error":"unknown command"}"#.to_owned(), None),
-        Err(_) => (r#"{"error":"malformed request"}"#.to_owned(), None),
-    }
-}
-
-/// Upper bound on a single control-socket request line. A control request is one
-/// short JSON command (`{"cmd":"status"}` / `{"cmd":"manual-swapped"}`); capping the
-/// read keeps a misbehaving same-uid client from growing the daemon's buffer without
-/// bound (issue #64 — the receive path must be BOUNDED).
-const MAX_CONTROL_LINE_BYTES: u64 = 8 * 1024;
-
-/// Upper bound on one whole control exchange (read request + write reply). Mirrors
-/// the `use`-side `CONTROL_SOCKET_TIMEOUT` so a peer that never completes its line
-/// cannot hold the serve arm; the run-loop select also drops this future at the next
-/// poll tick, so this is the tighter, dedicated time bound (issue #64).
-const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Serve one control exchange: read one newline-delimited JSON request and write
-/// one newline-delimited JSON reply, returning any [`ControlSignal`] the request
-/// produced. Generic over the stream so it is testable over an in-memory duplex
-/// without binding a real socket; `peer_authenticated` is the caller's
-/// peer-credential verdict (issue #64), gating the state-affecting commands. The
-/// receive path is BOUNDED in space (the read is capped at [`MAX_CONTROL_LINE_BYTES`])
-/// and in time (the exchange is wrapped in [`CONTROL_EXCHANGE_TIMEOUT`]).
-async fn serve_control<RW>(
-    stream: RW,
-    snapshot: &StatusSnapshot,
-    peer_authenticated: bool,
-) -> Result<Option<ControlSignal>>
-where
-    RW: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-
-    let exchange = async {
-        // Cap the request read: a control request is one short line, so a peer that
-        // streams more — or never sends a newline — is bounded here (EOF at the
-        // limit) instead of growing `line` without limit.
-        let mut buffered = tokio::io::BufReader::new(stream);
-        let mut line = String::new();
-        (&mut buffered)
-            .take(MAX_CONTROL_LINE_BYTES)
-            .read_line(&mut line)
-            .await?;
-        let (reply, signal) = control_reply(line.trim_end(), snapshot, peer_authenticated);
-        buffered.write_all(reply.as_bytes()).await?;
-        buffered.write_all(b"\n").await?;
-        buffered.flush().await?;
-        Ok::<_, Error>(signal)
-    };
-    // A peer that stalls mid-line must not hold the exchange open: time-box it and
-    // drop on elapse. The reply carries nothing secret, so a dropped exchange is
-    // harmless — the caller maps both a timeout and an error to "no signal".
-    match tokio::time::timeout(CONTROL_EXCHANGE_TIMEOUT, exchange).await {
-        Ok(result) => result,
-        Err(_elapsed) => Ok(None),
-    }
-}
-
-/// Upper bound on the client-side `roster-reload` notify exchange (issue #139) — the
-/// CLI-verb counterpart of the server's [`CONTROL_EXCHANGE_TIMEOUT`]. Mirrors the
-/// `use`-side manual-hold notify (#64): a missing / wedged daemon must never hang the
-/// `capture` / `login` / `remove` verb, so the whole connect→send→ack exchange is
-/// time-boxed and any failure degrades to a logged best-effort skip.
-const ROSTER_RELOAD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Notify a running daemon that the on-disk roster changed (issue #139), so it
-/// re-reads `config.toml` and reconciles its in-memory rotation WITHOUT a restart.
-/// The CLI-verb counterpart of the daemon's `roster-reload` control handler
-/// ([`control_reply`]); sends one newline-delimited `{"cmd":"roster-reload"}` request
-/// and reads the one-line ack so the daemon has RECEIVED it before returning.
-///
-/// BEST-EFFORT by contract, exactly like the `use` manual-hold notify (#64): the
-/// on-disk `config.toml` is authoritative (the write already succeeded), so a notify
-/// failure — no daemon running (connect refused / socket absent), a timeout, an I/O
-/// error — is for the CALLER to log and ignore, never fatal. Bounded by
-/// [`ROSTER_RELOAD_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
-/// verb. Carries NO credential and NO write target — a pure reload signal (the daemon
-/// re-reads the authoritative file itself).
-pub(crate) async fn notify_roster_reload(socket: &Path) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-    let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket).await?;
-        let mut buffered = tokio::io::BufReader::new(stream);
-        buffered.write_all(b"{\"cmd\":\"roster-reload\"}\n").await?;
-        buffered.flush().await?;
-        // Read the one-line ack so the daemon has processed the request before we
-        // return; the content is irrelevant (any failure is non-fatal for the caller).
-        let mut line = String::new();
-        buffered.read_line(&mut line).await?;
-        Ok::<(), Error>(())
-    };
-    tokio::time::timeout(ROSTER_RELOAD_NOTIFY_TIMEOUT, exchange)
-        .await
-        .map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "roster-reload notify timed out",
-            ))
-        })?
 }
 
 /// What the loop decided to do this cycle — logged, and asserted on in tests.
@@ -1336,8 +790,11 @@ struct LastSwap {
 /// 401 streak and the recovery probe must accumulate across ticks: a per-poll
 /// counter is rebuilt every cycle and never observes a streak (the prerequisite the
 /// issue fixed). Sized to the roster in [`Daemon::new`].
+// `pub(crate)` (fields stay private) so the snapshot submodule's re-exported
+// `refresh_health_view(&AccountHealth)` does not expose a more-private type (issue #203);
+// the health state itself remains daemon-owned and its fields daemon-private.
 #[derive(Default, Clone)]
-struct AccountHealth {
+pub(crate) struct AccountHealth {
     /// Consecutive non-scope 401s on this account's stored token. Incremented on a
     /// 401, reset to 0 on ANY non-401 outcome (success, 403, transient, locked). The
     /// `consecutive=` field of a `monitor_401` event while still healthy; reaching
@@ -3481,300 +2938,6 @@ fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
         }
     }
     soonest
-}
-
-/// The console line for a swap this cycle, or `None` for any non-swap outcome.
-/// Surfaced to the operator watching the foreground `run` (issue #8) — the file
-/// event log records every cycle separately. Both swap kinds echo: a normal swap
-/// and the #42 emergency swap away from a dead active credential (the latter named
-/// distinctly, since it means a credential just died and the daemon force-rotated).
-/// Sourced solely from labels, so it can never carry a token or email (issue #15).
-fn swap_report(outcome: &TickOutcome) -> Option<String> {
-    match outcome.action {
-        TickAction::Swapped { from, to } => Some(format!(
-            // `off <from> onto <to>` rather than `<from> → <to>` (issue #89): the
-            // bare arrow reads ambiguously, but `to` is the account just made
-            // active (swapped ONTO) and `from` the one swapped OFF — spell it out
-            // so the operator can never misread the direction.
-            "swapped off {} onto {}",
-            label_at(&outcome.snapshot, from),
-            label_at(&outcome.snapshot, to),
-        )),
-        TickAction::EmergencySwapped { from, to } => Some(format!(
-            // Same off/onto phrasing (#89), still named distinctly — the trailing
-            // cause tells the operator a credential just died and forced this.
-            "emergency-swapped off {} onto {} (dead credential)",
-            label_at(&outcome.snapshot, from),
-            label_at(&outcome.snapshot, to),
-        )),
-        _ => None,
-    }
-}
-
-/// The label of the roster account at `index` in `snapshot`, or `"?"` if out of
-/// range. A swap's indices are always valid, but the long-running daemon must
-/// never panic on a display path, so this stays total.
-fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
-    snapshot
-        .accounts
-        .get(index)
-        .map_or("?", |account| account.label.as_str())
-}
-
-/// Drive the poll loop until shutdown.
-///
-/// Reconcile-on-start, then forever: tick, log (the event log `log` AND the
-/// operator-facing diagnostic channel `diag`, issue #77), and idle until the next
-/// poll — meanwhile serving control requests and watching for shutdown. Shutdown is
-/// observed only HERE (between ticks), never mid-tick: a swap inside [`Daemon::tick`]
-/// always runs to completion, so a shutdown can never tear a swap
-/// (complete-or-abort; #6 is no-half-swap). The lifecycle markers (`diag=start` /
-/// `diag=stop`) bracket this call in [`crate::cli`], which owns the process
-/// lifecycle; this loop emits only the per-tick diagnostics.
-pub(crate) async fn run_loop<P, C, S, K, Sh, Ctl, R, LW, W>(
-    daemon: &mut Daemon<P, C, S, K>,
-    log: &mut EventLog,
-    diag: &mut DiagnosticLog<W>,
-    shutdown: &mut Sh,
-    control: &Ctl,
-    refresh: &mut R,
-    login_watch: &mut LW,
-) -> Result<()>
-where
-    P: RosterPoller,
-    C: CredentialStore,
-    S: AccountStash,
-    K: Clock,
-    Sh: Shutdown,
-    Ctl: Control,
-    R: RefreshTicker,
-    LW: ExternalLoginWatch,
-    W: Write,
-{
-    // Reconcile-on-start is best-effort: a failure is logged and the loop still
-    // starts — the next swap re-establishes consistency anyway.
-    if let Err(err) = daemon.reconcile_on_start().await {
-        eprintln!("sessiometer: reconcile-on-start skipped: {err}");
-    }
-
-    /// How the idle-until-next-tick wait ended. Scoping the wait future to one
-    /// block lets it (and its `&mut Daemon` borrow) drop before the run loop
-    /// applies a `ManualSwapped` adoption, which needs its own `&mut Daemon`.
-    enum Idle {
-        /// SIGINT / SIGTERM observed — exit the loop cleanly.
-        Shutdown,
-        /// The poll interval (or a back-off wait — #13 locked-keychain or #76
-        /// rate-limit) elapsed — re-tick.
-        Elapsed,
-        /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
-        ManualSwapped,
-        /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
-        /// — reload + reconcile the in-memory roster, then re-tick.
-        RosterReloadRequested,
-        /// The external-login watch (#140) saw the canonical credential change out-of-band
-        /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
-        /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
-        /// it within the watch cadence instead of up to a full poll interval later.
-        ExternalLoginDetected,
-    }
-
-    // De-burst start-up (issue #76): wait a small jittered delay before the FIRST
-    // poll, so repeated restarts of the same config do not synchronize an immediate
-    // burst of usage requests. Behind the Clock seam, so tests pass through it
-    // instantly. Shutdown-responsive (like the per-cycle idle below): a SIGINT /
-    // SIGTERM during the delay exits cleanly rather than being deferred for up to
-    // STARTUP_DELAY_CAP. No control serving here — there is no snapshot to answer
-    // from until the first tick.
-    let startup_delay = daemon.startup_delay();
-    tokio::select! {
-        biased;
-        _ = shutdown.requested() => return Ok(()),
-        _ = daemon.clock.tick(startup_delay) => {}
-    }
-
-    loop {
-        let outcome = daemon.tick().await;
-        // Best-effort logging (issue #9): emit each event the tick produced. A
-        // write failure must not kill the daemon, and one failed event must not
-        // drop the rest of the tick's events — so log and continue, never return.
-        for event in &outcome.events {
-            if let Err(err) = log.emit(event) {
-                eprintln!("sessiometer: event log write failed: {err}");
-            }
-        }
-        // Operator-facing diagnostics (issue #77): emit each to the diagnostic
-        // channel, which DROPS them unless `-v`/`--verbose` was passed. Per-poll
-        // outcomes, the per-tick decision, and any all-exhausted-leave edge — the
-        // run-debugging detail the edge-triggered event log deliberately omits.
-        for diagnostic in &outcome.diagnostics {
-            diag.emit(diagnostic);
-        }
-        // Echo a swap to the operator watching the foreground process (issue #8).
-        // The file event log (above) records every cycle; the console gets just
-        // swaps, sourced solely from labels (issue #15).
-        if let Some(report) = swap_report(&outcome) {
-            eprintln!("sessiometer: {report}");
-        }
-        // The wait this tick requested — an explicit back-off overrides the normal
-        // interval (locked-keychain #13, or rate-limit / transient #76); captured
-        // before the snapshot is moved.
-        let next_wait = outcome.next_wait;
-        // The snapshot the control socket answers from until the next poll.
-        let snapshot = outcome.snapshot;
-
-        // The accounts the periodic refresh tick (#105) must not touch this idle period —
-        // the active account and the imminent swap target — and the quarantined ("needs
-        // re-login") accounts it SHOULD attempt for the RESTORE path (issue #106). Both are
-        // computed from the POST-tick state HERE, before the idle borrows `&mut daemon`; the
-        // tick owns its own roster copy + clock, so the sweep below needs nothing from it.
-        let refresh_excluded = daemon.refresh_exclusions();
-        let refresh_quarantined = daemon.refresh_quarantined();
-        // Accounts the sweep proved still refreshable (issue #106): collected inside the idle
-        // loop (where `&mut daemon` is held by `wait`) and un-quarantined AFTER it, when
-        // `&mut daemon` is free again — the same post-idle pattern as the manual-swap adoption.
-        let mut refresh_restored: Vec<String> = Vec::new();
-        // The credential-clock observations the sweep read (issue #119): collected here and
-        // folded into the per-account health state AFTER the idle block (the fold needs
-        // `&mut daemon`), exactly like the restores above.
-        let mut refresh_observations: Vec<RefreshObservation> = Vec::new();
-
-        // The canonical the daemon last COMMITTED to its watch (issue #140), snapshotted HERE —
-        // before the idle borrows `&mut daemon` — so the external-login watch arm can tell an
-        // out-of-band write it reads DURING the idle from the daemon's own last state, without
-        // needing `&mut daemon` mid-idle. The daemon's own writes (a swap) commit the watch, so
-        // this baseline already reflects them and they are never mis-seen as external.
-        let canonical_baseline = daemon.canonical_baseline();
-
-        // Idle until the next tick is due, serving control requests and watching
-        // for shutdown. A swap (if any) already completed inside `tick`, so a
-        // shutdown observed here aborts cleanly before the next tick — no half-swap.
-        // The wait future borrows `&mut daemon`, so it is scoped to this block and
-        // dropped before any post-idle mutation (the manual-swap adoption) runs.
-        let idle = {
-            let wait = daemon.wait_after_tick(next_wait);
-            tokio::pin!(wait);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown.requested() => break Idle::Shutdown,
-                    // A served control connection may carry a signal (#64): a
-                    // `manual-swapped` breaks the idle to adopt it; a `status` read
-                    // (None) just continues serving until the wait elapses.
-                    signal = control.serve(&snapshot) => match signal {
-                        Some(ControlSignal::ManualSwapped) => break Idle::ManualSwapped,
-                        // A `roster-reload` (#139) breaks the idle to reconcile the
-                        // in-memory roster to the freshly-written config; a `status`
-                        // read (None) just continues serving until the wait elapses.
-                        Some(ControlSignal::RosterReloadRequested) => {
-                            break Idle::RosterReloadRequested
-                        }
-                        None => continue,
-                    },
-                    // The periodic isolated-refresh tick (issue #105), in the idle path off
-                    // the poll→usage→swap seam. `until_due` resolves only when a refresh is
-                    // due — and NEVER when the feature is off (the no-op ticker) — so this arm
-                    // is inert by default. When it fires, run the sweep under a NESTED select
-                    // so ONLY a shutdown can interrupt it: a control read must not cancel an
-                    // in-flight refresh (the swap-lock-holding engine is cancel-safe, but a
-                    // status query should neither forfeit a token nor be able to starve the
-                    // sweep). `wait` is pinned OUTSIDE this loop, so a sweep does not reset the
-                    // poll cadence; after it the loop idles on until the wait elapses.
-                    () = refresh.until_due() => {
-                        tokio::select! {
-                            biased;
-                            _ = shutdown.requested() => break Idle::Shutdown,
-                            sweep = refresh.sweep(&refresh_excluded, &refresh_quarantined) => {
-                                // Emit each per-cycle refresh event (issue #106) to the event
-                                // log — the SAME best-effort path the tick's events ride; `log`
-                                // is not borrowed by `wait`, so it is free to use here. The
-                                // RESTORES are deferred: un-quarantining mutates the health
-                                // machine (needs `&mut daemon`, held by `wait`), so they are
-                                // collected here and applied after the idle block.
-                                for event in &sweep.events {
-                                    if let Err(err) = log.emit(event) {
-                                        eprintln!("sessiometer: event log write failed: {err}");
-                                    }
-                                }
-                                refresh_restored.extend(sweep.restored);
-                                // The #119 credential-clock observations, deferred like the
-                                // restores: folding them mutates the health machine.
-                                refresh_observations.extend(sweep.observations);
-                            }
-                        }
-                    }
-                    // The external-login watch (issue #140): a dedicated SHORT-cadence, LOCAL
-                    // (no-network) probe of the canonical credential, DECOUPLED from the
-                    // usage-poll cadence, so a manual `claude /login` on the active account is
-                    // reflected within the watch cadence, not up to a full poll interval. The
-                    // probe reads the canonical via the watch's OWN store (the daemon's is
-                    // borrowed by `wait`) and compares against the pre-idle committed baseline;
-                    // a difference is an out-of-band write since the last tick → break to
-                    // re-tick, so `tick`'s `reconcile_canonical_change` does the authoritative
-                    // re-stash / re-resolve / surface. Fail-safe: an unreadable / locked /
-                    // absent probe (`None`), or a byte-identical read, or no baseline yet,
-                    // detects nothing and keeps idling — the loop never stalls. `wait` is pinned
-                    // OUTSIDE this loop, so a probe does not reset the poll cadence.
-                    () = login_watch.until_due() => {
-                        if let Some(current) = login_watch.read_canonical().await {
-                            if canonical_baseline
-                                .as_ref()
-                                .is_some_and(|base| !base.matches(&current))
-                            {
-                                break Idle::ExternalLoginDetected;
-                            }
-                        }
-                    }
-                    _ = &mut wait => break Idle::Elapsed,
-                }
-            }
-        };
-        // Apply the RESTORES the sweep reported (issue #106), now that the idle block has
-        // dropped its `&mut daemon` borrow: un-quarantine each recovered account and log its
-        // edge-triggered `credential_restored`. Applied on every idle exit (shutdown included
-        // — the restore genuinely happened, so the log record is honest; the durable effect is
-        // the re-stashed fresh token, which persists regardless of the in-memory flip).
-        for uuid in &refresh_restored {
-            if let Some(event) = daemon.apply_refresh_restore(uuid) {
-                if let Err(err) = log.emit(&event) {
-                    eprintln!("sessiometer: event log write failed: {err}");
-                }
-            }
-        }
-        // Fold the sweep's credential-clock observations into the health state (issue #119),
-        // now that `&mut daemon` is free, BEFORE diffing the rollup so a transition reflects
-        // this cycle's refresh.
-        for observation in &refresh_observations {
-            daemon.apply_refresh_observation(observation);
-        }
-        // Diff every account's 4-state rollup against its last-emitted verdict and log one
-        // edge-triggered `credential_health` per CHANGE (issue #119, AC-3). Runs EVERY
-        // iteration — not only on a sweep — so a time-driven transition (the access token
-        // crossing its expiry) and a quarantine-driven one (the #42 path, even with the
-        // refresh feature OFF) are both caught; the first computation per account seeds the
-        // baseline silently. Best-effort like every other log emission here.
-        for event in daemon.note_health_transitions(wall_clock_now_secs()) {
-            if let Err(err) = log.emit(&event) {
-                eprintln!("sessiometer: event log write failed: {err}");
-            }
-        }
-        match idle {
-            Idle::Shutdown => return Ok(()),
-            // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick
-            // holds on the operator's choice, and re-resolve active from the
-            // canonical — BEFORE looping back to re-tick.
-            Idle::ManualSwapped => daemon.adopt_manual_swap().await,
-            // Reload + reconcile the in-memory roster to the freshly-written
-            // `config.toml` (#139) — the onboarded / relogged-in / removed account is
-            // adopted into the live rotation — BEFORE looping back to re-tick.
-            Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
-            // The external-login watch (#140) detected an out-of-band canonical change: just
-            // re-tick — the next `tick` reads the canonical and its `reconcile_canonical_change`
-            // does the authoritative re-stash / re-resolve / surface (no pre-tick adoption
-            // needed, unlike a manual swap or a roster reload).
-            Idle::ExternalLoginDetected => {}
-            Idle::Elapsed => {}
-        }
-    }
 }
 
 #[cfg(test)]
