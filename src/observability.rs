@@ -380,6 +380,21 @@ pub(crate) enum Event {
         expires_before: Option<i64>,
         expires_after: Option<i64>,
     },
+    /// The `#162` poll-path refresh-then-retry fired for the PARKED `account` (issue #255): on
+    /// the FIRST usage-401 of a streak episode the daemon ran ONE isolated refresh (the #102
+    /// engine) plus a single re-poll, hoping a merely-expired access token is revived before it
+    /// counts toward the #42 death streak. This records the *action* — that an isolated refresh
+    /// fired and how it classified — the durable complement to the DOWNSTREAM poll outcome
+    /// ([`Event::Monitor401`] / [`Event::CredentialDead`]) that
+    /// [`crate::daemon`]'s `note_poll_outcome` already logs. `outcome` is the same non-secret
+    /// [`RefreshEventOutcome`] projection [`Event::Refresh`] carries (one shared refresh-outcome
+    /// vocabulary); the trigger is the fixed `poll_401` — the only condition that fires this path,
+    /// and never for the ACTIVE account (issue #253). `account` is the HANDLE (operator label),
+    /// never a token or email — the #15 single-surface guarantee.
+    PollRefresh {
+        account: String,
+        outcome: RefreshEventOutcome,
+    },
     /// `account`'s 4-state credential-health rollup (issue #119) TRANSITIONED to `state`
     /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
     /// the state holds), so the event log carries the per-account health timeline. The
@@ -532,6 +547,18 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=refresh account={account} outcome={outcome}{before}{after}")
+            }
+            Event::PollRefresh { account, outcome } => {
+                // The isolated poll-refresh ACTION (issue #255). The trigger is the fixed
+                // `poll_401` — the only condition that fires the #162 path — rendered as a literal
+                // (a single-valued discriminant needs no enum field); `outcome` reuses the SAME
+                // non-secret token vocabulary `event=refresh` renders. The DISTINCT `poll_refresh`
+                // event name keeps it clear of the periodic #106 `event=refresh` line that the
+                // `list` view's [`last_refresh_outcomes`] reader parses.
+                let outcome = outcome.as_str();
+                format!(
+                    "ts={ts} event=poll_refresh account={account} trigger=poll_401 outcome={outcome}"
+                )
             }
             Event::CredentialHealth { account, state } => {
                 let state = state.as_str();
@@ -1281,6 +1308,35 @@ mod tests {
             format!("{TS0} event=refresh account=spare outcome=error")
         );
         assert!(!unknown.contains("expires_"), "got: {unknown}");
+    }
+
+    #[test]
+    fn poll_refresh_line_carries_handle_trigger_and_outcome() {
+        // Issue #255: the #162 poll-refresh ACTION renders the redacted handle, the fixed
+        // `trigger=poll_401`, and the outcome token — the SAME vocabulary `event=refresh` uses,
+        // under a DISTINCT `poll_refresh` event name (so it never collides with the periodic
+        // #106 refresh line the `list` view's `last_refresh_outcomes` reader parses).
+        let dead = Event::PollRefresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Dead,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            dead,
+            format!("{TS0} event=poll_refresh account=spare trigger=poll_401 outcome=dead")
+        );
+        // The `outcome=` token tracks the variant (the shared refresh vocabulary), and no
+        // expiry fields ride this line (unlike `event=refresh`).
+        let refreshed = Event::PollRefresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Refreshed,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            refreshed,
+            format!("{TS0} event=poll_refresh account=spare trigger=poll_401 outcome=refreshed")
+        );
+        assert!(!refreshed.contains("expires_"), "got: {refreshed}");
     }
 
     #[test]
