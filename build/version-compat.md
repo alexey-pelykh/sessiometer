@@ -1,5 +1,33 @@
 # Pre-build empirical checks (H0–H3) — results ledger
 
+## Supported Claude Code range
+
+<!-- Machine-readable: scripts/check-cc-version.sh parses the two `CC_SUPPORTED_*` lines below.
+     Keep the `- CC_SUPPORTED_MIN: x.y.z` / `- CC_SUPPORTED_MAX: x.y.z` format stable. -->
+
+- CC_SUPPORTED_MIN: 2.1.181
+- CC_SUPPORTED_MAX: 2.1.197
+
+This range is the **authoritative source of truth** for sessiometer's Claude Code compatibility.
+Every reverse-engineered assumption recorded in this ledger — the keychain-service derivation
+(#100), the credential-refresh lifecycle (#101), the `oauthAccount`/token orthogonality (H2) — was
+verified against Claude Code in `2.1.181`–`2.1.197` on macOS `26.5.1` / Darwin `25.x`. Because these
+are reverse-engineered CC internals, a CC release outside this range may silently change them, and
+`sessiometer` would then target the wrong keychain item with no other signal.
+
+Consumers of this range:
+
+- The **README** states it for users (`## Prerequisites`) — the user-facing surface required
+  because a released binary must declare which CC it was verified against.
+- [`scripts/check-cc-version.sh`](../scripts/check-cc-version.sh) re-verifies the installed `claude`
+  against the two lines above, and also asserts the README still states this range (so the
+  user-facing copy can't silently drift); the pre-release
+  [`build/release-checklist.md`](release-checklist.md) runs it as a gate.
+
+When a CC bump moves the installed version **above** `CC_SUPPORTED_MAX`, re-verify the
+version-sensitive findings below — at minimum **H3** (fresh-start adoption) and the **#100**
+keychain-service derivation (`n1()`) — then widen the range here and update the README to match.
+
 The acceptance record for issue [#16](https://github.com/alexey-pelykh/sessiometer/issues/16): a
 one-time empirical verification of the macOS credential mechanism, run **before** the swap engine
 (#6) is built. The verification was originally driven by a bash harness + runbook; now that the

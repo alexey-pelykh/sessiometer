@@ -15,7 +15,7 @@
 //! under a fixed seed — the whole sampler is unit-testable without wall-clock
 //! flakiness. The jitter is decorrelation noise, not a security primitive, so a
 //! small, fully-deterministic PRNG ([`SplitMix64`]) is exactly right and adds no
-//! dependency (keeping `cargo deny check advisories` trivially green): production
+//! dependency (keeping `cargo deny check` trivially green): production
 //! seeds it from coarse process entropy, tests seed it from a constant.
 
 /// Randomness seam for jitter draws: a stream of uniform samples in `[0, 1)`.

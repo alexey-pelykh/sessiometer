@@ -867,15 +867,15 @@ impl Drop for TermiosRestore {
 /// Hex codec for the byte fields, as a serde `with` adapter, so opaque secret bytes
 /// and the salt/nonce/ciphertext travel as pure-ASCII strings in the JSON container.
 ///
-/// A private, self-contained copy of the same lowercase-hex scheme
-/// [`crate::stash`] uses for keychain blobs — duplicated rather than shared to keep
-/// this a pure format module that does not reach into the keychain code.
+/// A thin serde shim over the shared [`crate::hex`] codec (issue #179 consolidated the
+/// previously-duplicated per-module copies); this module only adapts that codec to
+/// serde's `serialize_with` / `deserialize_with` shape.
 mod hex_bytes {
     use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
 
     /// Serialize bytes as a lowercase hex string.
     pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&encode(bytes))
+        serializer.serialize_str(&crate::hex::encode(bytes))
     }
 
     /// Deserialize a hex string back to bytes, rejecting a non-hex / odd-length
@@ -885,34 +885,7 @@ mod hex_bytes {
         deserializer: D,
     ) -> Result<Vec<u8>, D::Error> {
         let hex = String::deserialize(deserializer)?;
-        decode(&hex).ok_or_else(|| D::Error::custom("invalid hex encoding"))
-    }
-
-    /// Encode bytes as lowercase, two-digits-per-byte hex (always pure ASCII).
-    pub(super) fn encode(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for &b in bytes {
-            // `from_digit(0..16, 16)` is infallible and yields `0-9a-f`.
-            out.push(char::from_digit((b >> 4) as u32, 16).expect("high nibble < 16"));
-            out.push(char::from_digit((b & 0x0f) as u32, 16).expect("low nibble < 16"));
-        }
-        out
-    }
-
-    /// Decode lowercase (or uppercase) hex, returning `None` for an odd length or a
-    /// non-hex byte — i.e. a corrupted field.
-    pub(super) fn decode(hex: &str) -> Option<Vec<u8>> {
-        let bytes = hex.as_bytes();
-        if !bytes.len().is_multiple_of(2) {
-            return None;
-        }
-        let mut out = Vec::with_capacity(bytes.len() / 2);
-        for pair in bytes.chunks_exact(2) {
-            let hi = (pair[0] as char).to_digit(16)?;
-            let lo = (pair[1] as char).to_digit(16)?;
-            out.push((hi * 16 + lo) as u8);
-        }
-        Some(out)
+        crate::hex::decode(hex.as_bytes()).ok_or_else(|| D::Error::custom("invalid hex encoding"))
     }
 }
 
@@ -1182,21 +1155,6 @@ mod tests {
             !message.contains("sk-ant"),
             "error leaked content: {message}"
         );
-    }
-
-    #[test]
-    fn hex_round_trips_all_byte_values_and_rejects_bad_input() {
-        let all_bytes: Vec<u8> = (0u8..=255).collect();
-        for sample in [b"".as_slice(), b"{\"a\":1}", &all_bytes] {
-            let encoded = hex_bytes::encode(sample);
-            assert!(encoded.is_ascii(), "hex output must be pure ASCII");
-            assert_eq!(hex_bytes::decode(&encoded).as_deref(), Some(sample));
-        }
-        assert_eq!(hex_bytes::decode("abc"), None, "odd length rejected");
-        assert_eq!(hex_bytes::decode("zz"), None, "non-hex rejected");
-        assert_eq!(hex_bytes::decode("6X"), None, "one bad digit rejected");
-        // Uppercase decodes (case-insensitive), matching the keychain stash codec.
-        assert_eq!(hex_bytes::decode("4A").as_deref(), Some(b"\x4a".as_slice()));
     }
 
     // --- Encryption envelope (issue #147) ------------------------------------

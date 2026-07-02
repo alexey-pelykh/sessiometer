@@ -12,16 +12,26 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+env:
+  # Pinned stand-in for `stable` — bumped deliberately, never floating, so a new stable
+  # release can't introduce a lint that flips `main` red with no code change.
+  RUST_STABLE: "1.96.0"
+  # Minimum Supported Rust Version — keep in sync with `rust-version` in Cargo.toml.
+  RUST_MSRV: "1.87.0"
+
 jobs:
+  # Full gate: format, lints, docs, build, tests. `-D warnings` clippy/rustdoc behavior is
+  # toolchain-version-sensitive, so the toolchain is pinned (RUST_STABLE) rather than `stable`.
   test:
     name: test
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-06-30)
         with:
+          toolchain: ${{ env.RUST_STABLE }}
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -35,17 +45,37 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+  # MSRV gate: the crate must build and its tests must pass on the declared minimum
+  # supported Rust version (Cargo.toml `rust-version`). Lints/docs are intentionally not
+  # run here — `-D warnings` clippy/rustdoc drifts across toolchains and would fail on lint
+  # churn unrelated to whether the crate actually works on the MSRV.
+  msrv:
+    name: msrv
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-06-30)
+        with:
+          toolchain: ${{ env.RUST_MSRV }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build
+        run: cargo build --verbose
+      - name: Test
+        run: cargo test --verbose
+
   deny:
     name: deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master (2026-06-30)
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: No Security.framework SDK linkage
         run: ./scripts/check-no-security-framework.sh
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-deny
-      - name: Security advisories
-        run: cargo deny check advisories
+      - name: Supply-chain gates (advisories, sources, licenses)
+        run: cargo deny check advisories sources licenses

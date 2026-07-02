@@ -2,6 +2,10 @@
 name = "sessiometer"
 version = "0.1.0"
 edition = "2021"
+# MSRV: 1.87 stabilized `u*::is_multiple_of` (used in stash/keychain/migration); 1.86 and
+# older will not compile. CI gates build+test on this exact version — keep the `RUST_MSRV`
+# env in `.github/workflows/ci.yml` in sync.
+rust-version = "1.87.0"
 license = "MIT"
 description = "Manage multiple Claude Code accounts on macOS: poll per-account usage quota and swap the active credential out-of-band before exhaustion."
 repository = "https://github.com/alexey-pelykh/sessiometer"
@@ -24,6 +28,15 @@ serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "macros", "time", "process", "io-util", "net", "signal"] }
 toml = "1.1.2"
+# The canonical UAX #11 display-width table (issue #176), replacing a hand-rolled
+# wcwidth approximation that guessed the whole emoji block as uniformly width-2 and
+# ignored ZWJ sequences, regional-indicator flags, skin-tone modifiers, and variation
+# selectors. Unlike the crate's other hand-rolled primitives (curl transport, SHA-256,
+# hex), this one is a solved-and-versioned Unicode table: `unicode-width` has ZERO
+# transitive dependencies and is strictly more correct, so the minimal-dependency
+# posture is preserved (~nil dependency-count impact) while operator-provided account
+# labels with wide/emoji glyphs stop misaligning the `status` / `stats` tables.
+unicode-width = "0.2.2"
 zeroize = "1.9.0"
 
 [dev-dependencies]

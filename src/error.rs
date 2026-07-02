@@ -566,6 +566,18 @@ pub(crate) enum Error {
     #[error("malformed usage rollup: JSON error at line {line} column {column}")]
     UsageRollupMalformed { line: usize, column: usize },
 
+    /// The single-writer store lock (issue #188) could not be acquired within the
+    /// bounded wait — a concurrent [`append_sample`](crate::usage_store::append_sample)
+    /// / [`compact_and_roll`](crate::usage_store::compact_and_roll) held it the whole
+    /// time. FAIL-CLOSED: rather than write
+    /// without it and race a torn read-modify-rewrite of the raw sample file, the
+    /// store operation ABORTS with ZERO writes. Both producers are fail-open (the
+    /// daemon logs and skips a busy store, never breaking the poll loop), so this is
+    /// swallowed telemetry in practice. Maps to exit `4`, the same "could not write
+    /// safely, retry shortly" class as [`Error::SwapLockBusy`]. Secret-free.
+    #[error("the usage store is busy — could not acquire the store lock; retry shortly")]
+    UsageStoreBusy,
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -585,10 +597,11 @@ impl Error {
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Error::AlreadyRunning => 3,
-            // A locked keychain AND a contended swap lock (issue #64) share exit
-            // `4`: both are the "could not write safely right now, retry shortly"
-            // class — the swap aborted with ZERO writes rather than tear state.
-            Error::KeychainLocked { .. } | Error::SwapLockBusy => 4,
+            // A locked keychain, a contended swap lock (issue #64) AND a contended
+            // usage-store lock (issue #188) share exit `4`: all are the "could not
+            // write safely right now, retry shortly" class — each aborted with ZERO
+            // writes rather than tear state.
+            Error::KeychainLocked { .. } | Error::SwapLockBusy | Error::UsageStoreBusy => 4,
             Error::UseTargetNotFound { .. } => 5,
             Error::UseTargetAmbiguous { .. } => 6,
             // The pre-swap gate refused without `--force` — weekly-exhausted,
@@ -644,6 +657,18 @@ mod tests {
         assert_eq!(
             Error::SwapLockBusy.exit_code(),
             Error::KeychainLocked { op: "write" }.exit_code(),
+        );
+    }
+
+    #[test]
+    fn a_busy_usage_store_shares_the_retry_shortly_exit_code() {
+        // Issue #188: a fail-closed usage-store-lock abort joins the locked keychain
+        // and the swap lock in exit `4` — the "could not write safely now, ZERO
+        // writes, retry shortly" class, distinct from a generic failure (`1`).
+        assert_eq!(Error::UsageStoreBusy.exit_code(), 4);
+        assert_eq!(
+            Error::UsageStoreBusy.exit_code(),
+            Error::SwapLockBusy.exit_code(),
         );
     }
 

@@ -16,6 +16,7 @@ mod cli;
 mod config;
 mod daemon;
 mod error;
+mod hex;
 mod isolated_spawn;
 mod keychain;
 mod login;

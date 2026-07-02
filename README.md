@@ -26,6 +26,14 @@ accounts is permitted under them.
   place through the `/usr/bin/security` CLI; it never uses the
   Security.framework SDK (a CI guard enforces this, so the original silent-read
   access is preserved).
+- A **supported Claude Code version**. `sessiometer` depends on reverse-engineered
+  Claude Code internals (the keychain-service derivation and credential-refresh
+  behaviour) that were verified against a specific range — currently
+  **`2.1.181`–`2.1.197`** on macOS `26.5.1` / Darwin `25.x`. A `claude` outside
+  this range may have changed those internals and is unverified: `sessiometer`
+  could target the wrong keychain item with no other signal. The authoritative
+  range lives in [`build/version-compat.md`](build/version-compat.md), and
+  `scripts/check-cc-version.sh` checks your installed `claude` against it.
 
 ## Quickstart
 
@@ -74,7 +82,8 @@ next swap: spare
 - A trailing **`AUTH`** column reports each account's **credential-auth state** as one
   self-coloring glyph — **🟢** healthy (a positive liveness signal), **🟡** stale (the
   access token has expired but the refresh token still recovers it), **🟠** at-risk (the
-  auto-refresh safety-net is failing), **🔴** dead (needs re-login), **⚪** unknown (no
+  auto-refresh safety-net is failing), **🔴** dead (needs re-login — recover with
+  [`sessiometer login`](#logging-in--re-authenticating)), **⚪** unknown (no
   liveness signal yet — unverified, not a false 🟢, issue #137). A **🔴** dead credential
   trails the actionable **`claude /login`** cue, softened to `recovering` while a dead
   credential is answering again and climbing back toward health (issue #109); a parked
@@ -297,6 +306,31 @@ roster entry and stash, never the live `Claude Code-credentials` item, so the
 running Claude Code session keeps working. The daemon then simply resolves no
 active account (polling only, never swapping) until you `capture` another account
 or sign in again.
+
+## Logging in / re-authenticating
+
+Revive a **`dead`** account — or onboard a new one — by re-authenticating it.
+`sessiometer login` runs `claude /login` inside an **isolated, throwaway
+`CLAUDE_CONFIG_DIR`** (the same isolation `poke` uses), so the browser OAuth
+handoff never touches the live `Claude Code-credentials` item a running session
+reads. It harvests the credential Claude Code writes there and lands it in the
+rotation, re-pointing the canonical credential to it under the swap lock — so the
+re-login also takes effect:
+
+```sh
+# Re-authenticate (or onboard) an account; the label is optional:
+sessiometer login spare
+```
+
+The optional `<label>` names a **new** account — omit it and the label is
+auto-derived from the account's `account_uuid` (exactly as `capture`); a re-login of
+an already-rostered account keeps its existing label unless you pass a new one.
+`login` needs a real terminal and the `claude` binary on your `PATH` (or
+`$CLAUDE_BIN`); tune its timeout in the [`[login]`](#login) block. On success it
+prints one redacted line — `Onboarded` (new) or `Revived` (existing); an unfinished
+login prints `login cancelled, nothing captured` and still exits `0`. Unlike the
+daemon, a **locked keychain aborts the login at once** (one-shot, no back-off,
+nothing written), exiting **`4`**.
 
 ## Keeping a parked credential fresh
 

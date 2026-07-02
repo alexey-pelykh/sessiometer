@@ -509,17 +509,14 @@ fn decode_attr_value(rest: &str) -> Option<Vec<u8>> {
         // Quoted: bytes up to the final quote on the line.
         after.rfind('"').map(|end| after.as_bytes()[..end].to_vec())
     } else if let Some(hex) = rest.strip_prefix("0x") {
+        // Take the hex run (the dumped line may append trailing content); an empty
+        // run is not a valid `0x` value. Pair-decoding — including the odd-length
+        // rejection — is the shared codec's job ([`crate::hex`]).
         let digits: Vec<u8> = hex.bytes().take_while(|b| b.is_ascii_hexdigit()).collect();
-        if digits.is_empty() || !digits.len().is_multiple_of(2) {
+        if digits.is_empty() {
             return None;
         }
-        let mut bytes = Vec::with_capacity(digits.len() / 2);
-        for pair in digits.chunks_exact(2) {
-            let hi = (pair[0] as char).to_digit(16)?;
-            let lo = (pair[1] as char).to_digit(16)?;
-            bytes.push((hi * 16 + lo) as u8);
-        }
-        Some(bytes)
+        crate::hex::decode(&digits)
     } else if rest == "<NULL>" {
         Some(Vec::new())
     } else {
