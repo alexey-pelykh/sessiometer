@@ -780,7 +780,13 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         config
             .stats
             .retention_policy(config.tunables.poll_secs as i64),
-    );
+    )
+    // Carry the CONFIG `[refresh].enabled` (#105) onto the display snapshot so the thin
+    // `status` client can surface the isolated-refresh discoverability advisory (#138): with
+    // the tick OFF, non-active accounts get no maintenance and their credentials silently
+    // lapse. The CONFIG value (not the effective switch below, which also needs a resolvable
+    // `claude` binary) — the advisory keys off what the operator set, per AC-2.
+    .with_refresh_enabled(config.refresh.enabled);
     let mut shutdown = RealShutdown::new()?;
 
     eprintln!(
@@ -1170,8 +1176,42 @@ pub(crate) fn render_status(
         Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
         None => out.push_str("next swap: none\n"),
     }
+
+    // The isolated-refresh discoverability advisory (issue #138): when the periodic refresh
+    // tick is OFF (`[refresh].enabled = false`) AND ≥1 NON-ACTIVE account is unverified / stale
+    // / at-risk / dead, that account's stored credential is going unmaintained — the operator
+    // would otherwise only find out at `next swap: none (no viable target)`, after the fallback
+    // set is already dead. One line names the remedy. ADVISORY CHROME, not data (AC-3): gated on
+    // the SAME color gate as the #73 ANSI overlay, so it rides an interactive stdout TTY only —
+    // never into `--json` (this fn is not reached there), a pipe, a redirect, or under
+    // NO_COLOR / CLICOLOR=0 / TERM=dumb / --no-color. `Some(false)` is the ONLY arming value;
+    // `Some(true)` (enabled) and `None` (a pre-#138 daemon that omits the field) both suppress.
+    if color && response.refresh_enabled == Some(false) && has_stale_nonactive(response) {
+        out.push_str(REFRESH_DISABLED_ADVISORY);
+    }
     out
 }
+
+/// The issue-#138 signal: ≥1 NON-ACTIVE account carries a non-healthy / unverified credential
+/// rollup, so its stored credential may be lapsing while the refresh tick is off. Keys off the
+/// daemon's 4-state rollup (`Some(h)`, a #119+ daemon): any of Unknown ⚪ / Stale 🟡 / AtRisk 🟠 /
+/// Dead 🔴 counts; Healthy 🟢 and a pre-#119 `None` (no rollup to judge) do not. The ACTIVE
+/// account is excluded — the live daemon maintains it via the poll path (#162), so it is never
+/// the stale-fallback concern this advisory is about.
+fn has_stale_nonactive(response: &StatusResponse) -> bool {
+    response.accounts.iter().any(|account| {
+        !account.active
+            && matches!(account.health, Some(health) if health != CredentialHealth::Healthy)
+    })
+}
+
+/// The issue-#138 advisory line: the periodic refresh tick is off while a non-active account's
+/// credential is going unmaintained. Names BOTH remedies — the one-shot `poke` and enabling
+/// `[refresh]`. Lowercase and terse, matching the `next swap:` footer register; carries no
+/// account labels (AC-4, no PII). Leading blank line separates it from the footer (mirroring the
+/// verbose block's leading `\n`); trailing newline closes it.
+const REFRESH_DISABLED_ADVISORY: &str = "\nadvisory: [refresh] is off and non-active accounts \
+    are going stale — run 'sessiometer poke' or enable [refresh] to maintain them\n";
 
 /// Gap between adjacent independent `status`-table columns (two spaces, matching
 /// `list`).
@@ -2980,6 +3020,7 @@ spare  22222222-2222\n\
         let mut spare = status_line("spare", false, Some(10), Some(20));
         spare.enabled = false;
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
         };
@@ -3006,6 +3047,7 @@ spare  22222222-2222\n\
         let mut spare = status_line("spare", false, None, None);
         spare.quarantined = true;
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
         };
@@ -3040,6 +3082,7 @@ spare  22222222-2222\n\
         let mut dead = status_line("dead", false, None, None);
         dead.quarantined = true; // quarantined but NOT recovering — still dead
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
             next_swap: None,
         };
@@ -3123,6 +3166,7 @@ spare  22222222-2222\n\
             ..status_line("spare", false, None, None)
         };
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![healthy_but_spent, dead],
             next_swap: None,
         };
@@ -3162,6 +3206,7 @@ spare  22222222-2222\n\
         // credential-AUTH standing, not a vague "health" (rate-limit health lives in the `%`
         // columns). Any glyph rollup materializes the column and its label.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 health: Some(CredentialHealth::Healthy),
                 ..status_line("work", true, Some(10), Some(20))
@@ -3187,6 +3232,7 @@ spare  22222222-2222\n\
             ..status_line(label, false, Some(10), Some(20))
         };
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 line("healthy", Healthy),
                 line("unknownacct", Unknown),
@@ -3235,6 +3281,7 @@ spare  22222222-2222\n\
         // LABELLED so it is never misread as a re-login deadline; an account with no stored
         // expiry reads an honest `unknown`. The DEFAULT table stays compact — no raw clock.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 AccountStatusLine {
                     health: Some(CredentialHealth::Healthy),
@@ -3291,6 +3338,7 @@ spare  22222222-2222\n\
         // No accounts → no block at all (the table renders its own empty state), so a bare
         // `status --verbose` on an empty roster adds nothing.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![],
             next_swap: None,
         };
@@ -3478,6 +3526,7 @@ spare  22222222-2222\n\
         );
         work.active = true;
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 work,
                 status_line_resets(
@@ -3515,6 +3564,7 @@ spare  22222222-2222\n\
         // contract is a SEPARATE surface (serialized field names), so it never carries
         // these display labels.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
                 Some(50),
@@ -3565,6 +3615,7 @@ spare  22222222-2222\n\
         // This holds even for a weekly-EXHAUSTED account (`third`): pre-#94 it showed
         // only the weekly reset; now it shows the session reset too.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 // healthy: session 12m, weekly 5d — both appear.
                 status_line_resets(
@@ -3649,6 +3700,7 @@ spare  22222222-2222\n\
         quarantined.enabled = false;
         quarantined.quarantined = true;
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             next_swap: None,
         };
@@ -3672,6 +3724,7 @@ spare  22222222-2222\n\
         // `2h`); the header (issue #99) carries only labels, and each dropped column
         // takes its label with it.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![{
                 let mut a = status_line_resets(
                     "work",
@@ -3757,6 +3810,7 @@ spare  22222222-2222\n\
         // same single active account each time — only `next_swap` drives the footer.
         let footer = |next_swap| {
             let response = StatusResponse {
+                refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap,
             };
@@ -3790,6 +3844,7 @@ spare  22222222-2222\n\
         // The candidate footer (#88) carries no SGR even when the color gate is open —
         // per-cell health coloring is #84, orthogonal; the footer stays uncolored.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
@@ -3804,11 +3859,204 @@ spare  22222222-2222\n\
         );
     }
 
+    // --- status: isolated-refresh discoverability advisory (issue #138) -------
+
+    /// One account line with a chosen credential rollup, layered over `status_line`
+    /// (a #138 fixture: the advisory keys off `active` + `health`). Labels use the
+    /// `account-a/b/c` placeholders (AC-4, no PII).
+    fn health_line(label: &str, active: bool, health: CredentialHealth) -> AccountStatusLine {
+        AccountStatusLine {
+            health: Some(health),
+            ..status_line(label, active, Some(10), Some(20))
+        }
+    }
+
+    #[test]
+    fn render_status_advises_poke_when_refresh_off_and_a_nonactive_account_is_unhealthy() {
+        // AC-1: `[refresh].enabled = false` (wire `Some(false)`) AND ≥1 NON-ACTIVE account not
+        // healthy (here ⚪ Unknown — the "unverified" case the issue calls out) → one advisory
+        // line that names BOTH remedies (`poke` and enabling `[refresh]`). Color gate open (an
+        // interactive TTY).
+        let response = StatusResponse {
+            refresh_enabled: Some(false),
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Healthy),
+                health_line("account-b", false, CredentialHealth::Unknown),
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        let advisory = out
+            .lines()
+            .find(|l| l.starts_with("advisory:"))
+            .expect("the #138 advisory line is present");
+        assert!(
+            advisory.contains("poke") && advisory.contains("[refresh]"),
+            "the advisory names both remedies (poke / enable [refresh]): {advisory:?}"
+        );
+        // AC-4: no PII — the advisory never names a specific account.
+        assert!(
+            !advisory.contains("account-a") && !advisory.contains("account-b"),
+            "the advisory carries no account labels: {advisory:?}"
+        );
+    }
+
+    #[test]
+    fn render_status_advisory_fires_for_every_non_healthy_nonactive_rollup() {
+        // AC-1 breadth: each of ⚪ Unknown / 🟡 Stale / 🟠 AtRisk / 🔴 Dead on a NON-ACTIVE
+        // account arms the advisory (all are "unhealthy/unverified"); only 🟢 Healthy does not.
+        use CredentialHealth::{AtRisk, Dead, Healthy, Stale, Unknown};
+        for health in [Unknown, Stale, AtRisk, Dead] {
+            let response = StatusResponse {
+                refresh_enabled: Some(false),
+                accounts: vec![
+                    health_line("account-a", true, Healthy),
+                    health_line("account-b", false, health),
+                ],
+                next_swap: None,
+            };
+            let out = render_status(&response, NOW, None, true);
+            assert!(
+                out.lines().any(|l| l.starts_with("advisory:")),
+                "a non-active {health:?} account arms the #138 advisory:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_status_advisory_suppressed_when_refresh_enabled() {
+        // AC-2: `[refresh]` enabled (`Some(true)`) suppresses the advisory even with an unhealthy
+        // non-active account — the maintenance mechanism is already on.
+        let response = StatusResponse {
+            refresh_enabled: Some(true),
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Healthy),
+                health_line("account-b", false, CredentialHealth::Dead),
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        assert!(
+            !out.contains("advisory:"),
+            "an enabled [refresh] suppresses the #138 advisory:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_status_advisory_suppressed_when_no_nonactive_account_is_unhealthy() {
+        // AC-2: refresh off, but every NON-ACTIVE account is 🟢 Healthy → nothing to advise.
+        let response = StatusResponse {
+            refresh_enabled: Some(false),
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Healthy),
+                health_line("account-b", false, CredentialHealth::Healthy),
+                health_line("account-c", false, CredentialHealth::Healthy),
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        assert!(
+            !out.contains("advisory:"),
+            "an all-healthy non-active roster suppresses the #138 advisory:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_status_advisory_ignores_the_active_account_health() {
+        // AC-1 scoping: the ACTIVE account is maintained live by the daemon (poll-path refresh,
+        // #162) — it is never the stale-fallback concern. An unhealthy ACTIVE account with all
+        // non-active accounts healthy does NOT arm the advisory.
+        let response = StatusResponse {
+            refresh_enabled: Some(false),
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Dead),
+                health_line("account-b", false, CredentialHealth::Healthy),
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        assert!(
+            !out.contains("advisory:"),
+            "only NON-active staleness arms the #138 advisory:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_status_advisory_rides_the_color_gate() {
+        // AC-3: the advisory is chrome, not data — it rides the #73 color gate. With the gate
+        // CLOSED (`color = false`: a pipe / redirect / NO_COLOR / --no-color / non-TTY) it is
+        // suppressed, so `status | grep` and `status > file` stay advisory-free, exactly like the
+        // ANSI overlay. Same response as AC-1, only the gate differs.
+        let response = StatusResponse {
+            refresh_enabled: Some(false),
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Healthy),
+                health_line("account-b", false, CredentialHealth::Unknown),
+            ],
+            next_swap: None,
+        };
+        let piped = render_status(&response, NOW, None, false);
+        assert!(
+            !piped.contains("advisory:"),
+            "a closed color gate suppresses the #138 advisory (never into a pipe/redirect):\n{piped}"
+        );
+        // Sanity: the SAME response with the gate open DOES advise (isolating the gate as the
+        // only difference).
+        let interactive = render_status(&response, NOW, None, true);
+        assert!(interactive.contains("advisory:"), "{interactive}");
+    }
+
+    #[test]
+    fn render_status_advisory_suppressed_for_a_pre_138_daemon() {
+        // A pre-#138 daemon omits `refresh_enabled` → the client decodes `None` → "unknown", and
+        // suppresses rather than mis-firing a stale advisory against a daemon whose refresh state
+        // it cannot know.
+        let response = StatusResponse {
+            refresh_enabled: None,
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Healthy),
+                health_line("account-b", false, CredentialHealth::Dead),
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        assert!(
+            !out.contains("advisory:"),
+            "an unknown (pre-#138) refresh state suppresses the #138 advisory:\n{out}"
+        );
+    }
+
+    #[test]
+    fn status_json_carries_the_refresh_flag_never_the_advisory_text() {
+        // AC-3 (`--json`): the JSON view serializes the raw `StatusResponse` — it carries the
+        // `refresh_enabled` SIGNAL (a bonus for scripts) but NEVER the advisory TEXT, which is a
+        // human-only render_status string. This is the exact payload `status --json` prints
+        // (cli.rs:951-953), so the advisory can never reach a `--json | jq` consumer as data.
+        let response = StatusResponse {
+            refresh_enabled: Some(false),
+            accounts: vec![
+                health_line("account-a", true, CredentialHealth::Healthy),
+                health_line("account-b", false, CredentialHealth::Dead),
+            ],
+            next_swap: None,
+        };
+        let json = serde_json::to_string_pretty(&response).unwrap();
+        assert!(
+            json.contains("\"refresh_enabled\": false"),
+            "the flag is on the wire for scripts: {json}"
+        );
+        assert!(
+            !json.contains("advisory") && !json.contains("poke"),
+            "the advisory text is never serialized into --json: {json}"
+        );
+    }
+
     #[test]
     fn render_status_never_carries_an_email_or_token_sigil() {
         // #15: the printer sources only labels + percentages + reset instants + a
         // next-swap candidate label, so a token / email can never reach the printed surface.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
                 Some(50),
@@ -4118,6 +4366,7 @@ spare  22222222-2222\n\
         // Even with a red-urgency account present, color=false yields no ANSI — so
         // a pipe / redirect / log never carries an escape (the gate's promise).
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "hot",
                 Some(99),
@@ -4138,6 +4387,7 @@ spare  22222222-2222\n\
     #[test]
     fn color_on_tints_each_row_and_strips_back_to_the_exact_plain_table() {
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 // green: low utilization.
                 status_line_resets(
@@ -4195,6 +4445,7 @@ spare  22222222-2222\n\
         // (red) sits beside a comfortable WEEKLY (green) on the SAME row — proving
         // per-cell color, not one row-wide tint.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
                 Some(99), // SESSION: red band
@@ -4230,6 +4481,7 @@ spare  22222222-2222\n\
         // act on) — each reset cell coloured by its own proximity, independent of
         // utilization (both `%` here are a calm green).
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
                 Some(50), // session %: green band
@@ -4271,6 +4523,7 @@ spare  22222222-2222\n\
         // stay uncolored — absence of color is not a false "healthy" (issue #84) —
         // while its colored siblings prove the overlay is active.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "half",
                 Some(99), // session present → red
@@ -4304,6 +4557,7 @@ spare  22222222-2222\n\
         // width keeps the SESSION column aligned where `.chars().count()` would
         // misalign it — and keeps the `SESSION%` header (issue #99) over its data too.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
                 status_line("日本語", false, Some(10), Some(20)),
@@ -4356,6 +4610,7 @@ spare  22222222-2222\n\
         // SESSION column aligned with an ASCII row, because `render_cells` pads on the
         // now-correct `display_width` (2 cells for the coalesced glyph), not char count.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
                 status_line("👨\u{200D}👩\u{200D}👧", false, Some(10), Some(20)),
@@ -4387,6 +4642,7 @@ spare  22222222-2222\n\
         // #15 holds with the #73 overlay: the ANSI codes add only `\x1b[3Xm`…,
         // never an `@`-email or a token sigil.
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
                 Some(99),
@@ -4453,6 +4709,7 @@ spare  22222222-2222\n\
         // weekly pair on a narrow terminal, but the JSON never does. (`status --json`
         // serializes this exact response verbatim, the same surface scripts consume.)
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
                 Some(50),
@@ -4497,6 +4754,7 @@ spare  22222222-2222\n\
         let listener = UnixListener::bind(&path).unwrap();
 
         let response = StatusResponse {
+            refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),

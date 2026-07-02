@@ -763,6 +763,12 @@ pub(crate) struct StatusSnapshot {
     /// daemon-side ([`Daemon::next_swap`]); [`status_response`] copies it straight
     /// onto the wire. `None` only when there is no active anchor to swap from.
     pub(crate) next_swap: Option<NextSwap>,
+    /// Whether the periodic isolated-refresh tick is enabled in config (`[refresh].enabled`,
+    /// issue #105) — copied from [`Daemon::refresh_enabled`] at build. Carried to the wire so
+    /// the thin `status` client can surface the issue-#138 advisory (with the tick OFF,
+    /// non-active accounts get no maintenance). `false` by `Default` (an all-defaults snapshot
+    /// reads as tick-off), matching the opt-in default.
+    pub(crate) refresh_enabled: bool,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -844,6 +850,15 @@ pub(crate) struct StatusResponse {
     /// `session_resets_at`): a pre-#88 daemon that omits the field decodes to `None`.
     #[serde(default)]
     pub(crate) next_swap: Option<NextSwap>,
+    /// Whether the daemon's periodic isolated-refresh tick is enabled (`[refresh].enabled`,
+    /// issue #105). `Some(false)` is the ONLY value that arms the issue-#138 discoverability
+    /// advisory (paired with ≥1 unhealthy/unverified non-active account); `Some(true)`
+    /// suppresses it. `Option` + `#[serde(default)]` per the added-field convention (cf.
+    /// `auth`): a pre-#138 daemon that omits the field decodes to `None`, which the client
+    /// treats as "unknown → suppress" rather than mis-firing a stale advisory against an old
+    /// daemon. Non-secret — a plain flag.
+    #[serde(default)]
+    pub(crate) refresh_enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -982,6 +997,10 @@ fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
             .collect(),
         // Already computed at snapshot build (issue #88); copy it to the wire.
         next_swap: snapshot.next_swap.clone(),
+        // The config `[refresh].enabled` (#105) for the #138 advisory; wrapped `Some` since a
+        // current daemon always knows it (the `Option` is purely pre-#138 wire compat, mirroring
+        // `health`).
+        refresh_enabled: Some(snapshot.refresh_enabled),
     }
 }
 
@@ -1595,6 +1614,15 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// records a rate-limited redacted `usage_gap` on a no-reading poll. The append-per-poll
     /// collector (#156) runs regardless — this seam adds only the roll + gap-event layer.
     stats: Option<RetentionPolicy>,
+    /// Whether the operator turned the periodic isolated-refresh tick ON in config
+    /// (`[refresh].enabled`, issue #105) — the CONFIG value, NOT the effective switch (which
+    /// also requires a resolvable `claude` binary). Carried onto the display snapshot so the
+    /// thin `status` client can surface the issue-#138 discoverability advisory: with the tick
+    /// OFF, non-active accounts get no maintenance and their credentials can silently lapse.
+    /// `false` by default (the opt-in default, #105); production sets the real config value via
+    /// [`with_refresh_enabled`](Self::with_refresh_enabled). Purely a display signal — never a
+    /// swap/poll decision input.
+    refresh_enabled: bool,
     state: DecisionState,
 }
 
@@ -1652,6 +1680,10 @@ where
             // No usage-stats store maintenance by default (issue #161); production opts in via
             // `with_stats`. Left unset, the collector's roll/gap-event layer is inert.
             stats: None,
+            // The periodic-refresh tick defaults OFF (opt-in, #105); production sets the real
+            // `config.refresh.enabled` via `with_refresh_enabled`. Left false, the #138 advisory
+            // stays inert (it also requires an unhealthy non-active account to fire).
+            refresh_enabled: false,
             state: DecisionState {
                 health,
                 last_readings,
@@ -1668,6 +1700,16 @@ where
     /// to mirror `with_seed` and keep `new`'s 7 args stable.
     pub(crate) fn with_swap_lock(mut self, path: PathBuf) -> Self {
         self.swap_lock_path = Some(path);
+        self
+    }
+
+    /// Record whether the operator enabled the periodic isolated-refresh tick
+    /// (`[refresh].enabled`, issue #105) so the display snapshot can carry it to the `status`
+    /// client for the issue-#138 discoverability advisory. Builder-style to keep `new`'s arg
+    /// list stable, mirroring `with_swap_lock` / `with_config_path`; the hermetic-test default
+    /// (`false`, set in `new`) leaves the advisory inert.
+    pub(crate) fn with_refresh_enabled(mut self, enabled: bool) -> Self {
+        self.refresh_enabled = enabled;
         self
     }
 
@@ -3198,6 +3240,10 @@ where
             // same raw readings; sourced from a label only, so no token/email can
             // reach it (issue #15).
             next_swap: self.next_swap(active, readings),
+            // The config `[refresh].enabled` (#105), carried to the client for the #138
+            // advisory — the CONFIG value, so the advisory keys off what the operator set
+            // (AC-2: "suppressed when [refresh] is enabled").
+            refresh_enabled: self.refresh_enabled,
         }
     }
 
@@ -6911,6 +6957,7 @@ mod tests {
     #[test]
     fn status_response_carries_handles_and_percentages_and_never_a_secret() {
         let snapshot = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![
                 AccountReading {
                     label: "work".to_owned(),
@@ -7366,6 +7413,7 @@ mod tests {
         // surface it — and prove the value-based meter (#15) still reads clean.
         let secrets = Secrets::meter_fixture();
         let snapshot = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
                 active: true,
@@ -7408,11 +7456,48 @@ mod tests {
         assert_clean(&corpus, &secrets);
     }
 
+    #[test]
+    fn status_response_carries_the_refresh_enabled_flag_onto_the_wire() {
+        // Issue #138: the daemon's live `[refresh].enabled` is wrapped `Some(..)` on the wire
+        // (mirroring `health`) so the thin `status` client can gate its advisory off the daemon's
+        // ACTUAL refresh state. A current daemon always sends a definite `Some(true/false)`; only
+        // a pre-#138 daemon omits the field (→ the client decodes `None` and suppresses).
+        for enabled in [true, false] {
+            let snapshot = StatusSnapshot {
+                refresh_enabled: enabled,
+                ..Default::default()
+            };
+            assert_eq!(status_response(&snapshot).refresh_enabled, Some(enabled));
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_snapshot_reflects_with_refresh_enabled() {
+        // Issue #138 daemon plumbing: `with_refresh_enabled` (fed `config.refresh.enabled` in the
+        // run path) flows onto the display snapshot, so the client's advisory gate sees the
+        // daemon's LIVE refresh state. Default (no builder) is the opt-in `false`; the builder
+        // flips it. `snapshot` reads only the flag here, so all-`None` readings keep it minimal.
+        let default_daemon = lifecycle_daemon().await;
+        let readings = vec![None; default_daemon.roster.len()];
+        let off = default_daemon.snapshot(Some(0), &readings, 0);
+        assert!(!off.refresh_enabled, "the opt-in default carries tick-off");
+
+        let on = lifecycle_daemon()
+            .await
+            .with_refresh_enabled(true)
+            .snapshot(Some(0), &readings, 0);
+        assert!(
+            on.refresh_enabled,
+            "with_refresh_enabled(true) flows to the display snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn serve_control_answers_status_with_exactly_one_line() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let snapshot = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
                 active: true,
@@ -7535,6 +7620,7 @@ mod tests {
     fn status_response_projects_the_next_swap_candidate_and_drops_last_swap() {
         // A viable candidate projects as a label (#88), never a token/email (#15).
         let target = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
@@ -7551,6 +7637,7 @@ mod tests {
         // The two no-candidate verdicts project as bare reasons (no label at all), so
         // the client can tell `no viable target` from `awaiting usage data`.
         let no_target = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![],
             next_swap: Some(NextSwap::NoViableTarget),
         };
@@ -7558,6 +7645,7 @@ mod tests {
             .unwrap()
             .contains("\"next_swap\":{\"state\":\"no_viable_target\"}"));
         let awaiting = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![],
             next_swap: Some(NextSwap::AwaitingData),
         };
@@ -7567,6 +7655,7 @@ mod tests {
 
         // No anchor → null candidate; and the dropped `last_swap` field never appears.
         let none = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![],
             next_swap: None,
         };
@@ -7664,6 +7753,7 @@ mod tests {
     #[test]
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
+            refresh_enabled: false,
             accounts: vec![
                 AccountReading {
                     label: "work".to_owned(),
