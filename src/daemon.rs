@@ -691,23 +691,45 @@ impl Control for UnixControl {
     }
 }
 
-/// Whether the peer connected on `stream` is the same local user as this process
-/// (issue #64). Reads the peer's effective uid via `getpeereid(2)` (the portable
-/// BSD/macOS peer-credential call for a Unix-domain socket) and compares it to our
-/// own `getuid()`. Any failure to read the credential is treated as NOT
-/// authenticated — fail closed. Used to gate the state-affecting `manual-swapped`
-/// command; the non-secret `status` read is not gated.
-fn peer_is_same_user(stream: &tokio::net::UnixStream) -> bool {
-    use std::os::unix::io::AsRawFd;
-
+/// The peer's effective uid read from the connected Unix-domain socket `fd` via
+/// `getpeereid(2)`, or `None` when the credential cannot be read (the syscall errors —
+/// a not-connected socket, a non-socket fd, a bad fd). Split out from the same-user
+/// decision ([`is_same_user`]) so the fail-closed error branch is testable without a
+/// real failing peer (issue #196). Returning `None` on error IS the fail-closed
+/// primitive: an unreadable credential is never a uid, so it can never match ours.
+fn peer_euid(fd: std::os::unix::io::RawFd) -> Option<libc::uid_t> {
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
-    // SAFETY: `getpeereid` takes a valid connected-socket fd (owned by `stream`,
-    // which outlives the call) and two out-pointers to stack locals it fills only
-    // on success (rc == 0). No other preconditions.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+    // SAFETY: `getpeereid` is a syscall the kernel validates `fd` for itself — a bad,
+    // non-socket, or not-connected fd returns `rc != 0` (mapped to `None` below),
+    // never UB — and it writes the two out-pointers (stack locals here) ONLY on
+    // success (`rc == 0`). No preconditions on `fd`.
+    let rc = unsafe { libc::getpeereid(fd, &mut euid, &mut egid) };
+    (rc == 0).then_some(euid)
+}
+
+/// The pure peer-auth decision (issue #64): whether a peer bearing effective uid
+/// `peer_euid` — or `None` when its credential could not be read — is the SAME local
+/// user as `our_uid`. Split from the syscall ([`peer_euid`]) so every branch is testable
+/// without a real foreign-uid peer or root: same-user, a foreign uid, and the
+/// unreadable-credential branch (issue #196). FAIL CLOSED — `None` is never the same
+/// user, so a `getpeereid` error denies. Inverting this comparison flips BOTH the
+/// foreign-uid and the error branch from deny to allow, which the peer-auth tests catch.
+fn is_same_user(peer_euid: Option<libc::uid_t>, our_uid: libc::uid_t) -> bool {
+    peer_euid == Some(our_uid)
+}
+
+/// Whether the peer connected on `stream` is the same local user as this process
+/// (issue #64). Reads the peer's effective uid via [`peer_euid`] (`getpeereid(2)`, the
+/// portable BSD/macOS peer-credential call for a Unix-domain socket) and compares it to
+/// our own `getuid()` via [`is_same_user`]. Any failure to read the credential is
+/// treated as NOT authenticated — fail closed. Used to gate the state-affecting
+/// `manual-swapped` / `roster-reload` commands; the non-secret `status` read is not
+/// gated.
+fn peer_is_same_user(stream: &tokio::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
     // SAFETY: `getuid` cannot fail and has no preconditions.
-    rc == 0 && euid == unsafe { libc::getuid() }
+    is_same_user(peer_euid(stream.as_raw_fd()), unsafe { libc::getuid() })
 }
 
 /// A held single-instance lock: a kernel advisory `flock(LOCK_EX|LOCK_NB)` on the
@@ -7526,6 +7548,94 @@ mod tests {
         assert!(
             peer_is_same_user(&ours),
             "a same-process socket peer is the same local user"
+        );
+    }
+
+    #[test]
+    fn is_same_user_denies_foreign_and_unreadable_credentials() {
+        // Issue #196: the pure peer-auth decision, exercised on all three branches so a
+        // silent auth-inverting refactor cannot ship green. Fixed uids (no syscall) —
+        // the real `getpeereid` path is covered by the socket tests around this one.
+        let owner: libc::uid_t = 1_000;
+        // Same user → authenticated.
+        assert!(
+            is_same_user(Some(owner), owner),
+            "the socket owner is the same local user"
+        );
+        // A foreign (non-owner) uid → rejected. Inverting `==`→`!=` would ALLOW this.
+        assert!(
+            !is_same_user(Some(owner + 1), owner),
+            "a foreign uid is not the same local user"
+        );
+        // Unreadable credential (a `getpeereid` error) → fail closed. Both a fail-OPEN
+        // regression (treating `None` as allow) and inverting the comparison ALLOW this.
+        assert!(
+            !is_same_user(None, owner),
+            "an unreadable peer credential must fail closed"
+        );
+    }
+
+    #[test]
+    fn peer_euid_fails_closed_when_getpeereid_errors() {
+        use std::os::unix::io::AsRawFd;
+        // Issue #196: the fail-closed ERROR branch, driven for real. `getpeereid` on a
+        // non-socket fd returns `ENOTSOCK` — the syscall itself errors — so `peer_euid`
+        // must yield `None` and the decision must then DENY. A fail-open regression that
+        // surfaced a default uid on error (e.g. the pre-`Option` `euid` left at 0) would
+        // return `Some(_)` here. A regular file's fd is a real, valid fd that is simply
+        // not a socket, so this exercises the `rc != 0` branch portably.
+        let file = tempfile::tempfile().expect("tempfile");
+        let euid = peer_euid(file.as_raw_fd());
+        assert_eq!(
+            euid, None,
+            "getpeereid on a non-socket fd must fail (no credential)"
+        );
+        // SAFETY: `getuid` cannot fail and has no preconditions.
+        assert!(
+            !is_same_user(euid, unsafe { libc::getuid() }),
+            "a getpeereid error must deny — fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_a_foreign_uid_peer() {
+        use std::os::unix::io::AsRawFd;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Issue #196: drive a REAL socket peer through the serve path and assert the
+        // state-affecting `manual-swapped` is REJECTED when the peer is not the socket
+        // owner. A genuinely foreign-uid peer cannot be spawned without root, so "foreign"
+        // is realized faithfully: the peer's uid is read for real via `getpeereid`, then
+        // compared against an owner uid deliberately NOT it. The real credential read and
+        // the real serve exchange are exercised; only the owner identity is synthesized.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+
+        // Real getpeereid read of the connected peer — its true euid (our own).
+        let peer_uid =
+            peer_euid(server.as_raw_fd()).expect("a connected peer has a readable credential");
+        // A socket owner that is NOT the peer → the peer is foreign to this socket.
+        let authenticated = is_same_user(Some(peer_uid), peer_uid.wrapping_add(1));
+        assert!(
+            !authenticated,
+            "a foreign uid must not authenticate (guards against an inverted decision)"
+        );
+
+        client
+            .write_all(b"{\"cmd\":\"manual-swapped\"}\n")
+            .await
+            .expect("write request");
+        let signal = serve_control(server, &StatusSnapshot::default(), authenticated)
+            .await
+            .expect("serve");
+        assert!(
+            signal.is_none(),
+            "a foreign-uid peer must NOT arm the daemon (no control signal)"
+        );
+
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.expect("read reply");
+        assert!(
+            reply.contains("unauthorized"),
+            "a foreign-uid manual-swapped must be rejected: {reply:?}"
         );
     }
 

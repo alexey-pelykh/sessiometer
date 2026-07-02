@@ -37,7 +37,24 @@ The supported range is the authoritative declaration in
   user-facing range (AC1) cannot silently drift — keep the README `## Prerequisites` range in sync
   with `CC_SUPPORTED_MIN`–`CC_SUPPORTED_MAX`.
 
-## 2. Standard gates
+## 2. Rollback/downgrade procedure current (required)
+
+`sessiometer` rewrites live Claude Code state (the `Claude Code-credentials` keychain item and
+`~/.claude.json`) and reads/writes a versioned migration artifact, so a downgrade or an
+abandoned rollout must have a documented recovery path — [`build/rollback.md`](rollback.md)
+(issue #191). Confirm it still matches what this release ships:
+
+- [ ] The mutated artifacts documented in [`build/rollback.md`](rollback.md) still match
+  reality — the canonical `Claude Code-credentials` keychain item, `~/.claude.json`, and the
+  migration `format_version` contract. No release adds a new mutated state artifact without a
+  rollback note for it.
+- [ ] **If `FORMAT_VERSION` was bumped this release** (`src/migration.rs`): the `format_version`
+  section (§3) of [`build/rollback.md`](rollback.md) states the new version and its
+  cross-version compatibility (does this release's reader still exact-match its own version, or
+  was it widened to accept older ones?), and its "older binary meets newer artifact" error text
+  still matches `Error::MigrationUnsupportedVersion` (`src/error.rs`).
+
+## 3. Standard gates
 
 - [ ] CI is green on the release commit — format, `clippy -D warnings`, docs, build, tests, MSRV, and
   `cargo deny` (see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
