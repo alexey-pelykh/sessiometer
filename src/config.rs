@@ -880,9 +880,12 @@ impl Config {
     }
 
     /// Render the config back to TOML with the inline tunable-documenting
-    /// comments (issue #3 N2). `serde` serialization cannot emit comments, so
-    /// the file is rendered by hand; integers need no escaping and roster
-    /// strings go through [`basic_string`].
+    /// comments (issue #3 N2). Emitted by hand *by design* (issue #181, ADR-0005):
+    /// `serde` serialization cannot emit comments at all, and `toml_edit` (not a
+    /// current dependency) would still hand-author every comment as node decor and
+    /// re-express the OFF-state opt-ins as injected text — for more ceremony and a
+    /// new direct dep. So the file is rendered by hand; integers need no escaping
+    /// and roster strings go through [`basic_string`].
     ///
     /// `pub(crate)` so the `export` verb (issue #148) can serialize the canonical
     /// config text into a migration artifact ([`crate::migration::Payload`]).
@@ -1234,6 +1237,10 @@ fn render_str_array(items: &[String]) -> String {
 /// Render `s` as a TOML basic string (quoted, with the required escapes). Used
 /// by [`Config::render`] for roster fields, which (unlike the integer tunables)
 /// may contain characters needing escaping.
+///
+/// Hand-rolled on purpose, not delegated to a TOML crate: the emitter it serves is
+/// hand-written by design (see [`Config::render`]; issue #181, ADR-0005). Kept
+/// minimal and pinned by `basic_string_escapes_specials`.
 #[allow(dead_code)]
 fn basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);

@@ -16,6 +16,8 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0001](0001-current-thread-tokio-runtime.md) | Single-threaded (`current_thread`) Tokio runtime | Accepted |
 | [0002](0002-keychain-via-security-cli-zero-ffi.md) | Keychain access via `/usr/bin/security` CLI (zero FFI) | Accepted |
 | [0003](0003-no-torn-swap-invariant.md) | No-torn-swap invariant | Accepted |
+| [0004](0004-incidental-libc-ffi-kept-raw.md) | Incidental `libc` FFI kept raw (no wrapper crate) | Accepted |
+| [0005](0005-config-parsed-by-crate-emitted-by-hand.md) | Config parsed with the `toml` crate, emitted by hand | Accepted |
 
 ## Conventions
 
