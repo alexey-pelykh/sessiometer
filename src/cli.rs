@@ -17,6 +17,8 @@ use lexopt::Arg::{Long, Short, Value};
 
 use tokio::net::{UnixListener, UnixStream};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy};
 use crate::daemon::{
@@ -1279,13 +1281,13 @@ fn health_cell(account: &AccountStatusLine) -> String {
 
 /// The emoji glyph for a 4-state rollup verdict (issue #119). Self-coloring (the glyph is
 /// content, not an ANSI overlay), so it conveys state even under `--no-color` and through a
-/// pipe; `display_width` already measures each as two terminal cells (the `0x1F300..` wide
-/// block), so the table stays aligned.
+/// pipe; `display_width` already measures each as two terminal cells (emoji-presentation
+/// glyphs, per `unicode-width`), so the table stays aligned.
 fn health_glyph(health: CredentialHealth) -> &'static str {
     match health {
         CredentialHealth::Healthy => "🟢",
-        // #137: no positive-liveness evidence — a neutral ⚪, not a false 🟢. `char_width`
-        // measures U+26AA as two cells (see its WIDE table) so the column stays aligned.
+        // #137: no positive-liveness evidence — a neutral ⚪, not a false 🟢. `display_width`
+        // measures U+26AA as two cells (emoji-presentation, per `unicode-width`) so the column stays aligned.
         CredentialHealth::Unknown => "⚪",
         CredentialHealth::Stale => "🟡",
         CredentialHealth::AtRisk => "🟠",
@@ -1606,63 +1608,24 @@ fn render_cells(
 }
 
 /// The display (terminal-column) width of `s`: how many cells it occupies when
-/// printed, which is NOT its `char` count for non-Latin text (issue #73). A
-/// pragmatic wcwidth (UAX #11) — wide East Asian glyphs (CJK, Hangul, Kana,
-/// fullwidth forms) count two, combining marks and zero-width characters count
-/// zero, everything else one. Hand-rolled to keep the dependency graph minimal,
-/// matching the crate's other hand-rolled primitives (the SHA-256 in
-/// [`crate::redaction`], the civil-date math); it covers the ranges that occur in
-/// real operator labels rather than the full Unicode table, and that is enough to
-/// keep colored and multibyte `status` rows aligned where `char` count would not.
+/// printed, which is NOT its `char` count for non-Latin text (issue #73). Measured
+/// with the canonical UAX #11 table from the `unicode-width` crate (issue #176):
+/// wide East Asian glyphs (CJK, Hangul, Kana, fullwidth forms) and default
+/// emoji-presentation characters count two, combining marks and zero-width
+/// characters count zero, everything else one — and, unlike the wcwidth this
+/// replaced, it understands ZWJ sequences, regional-indicator flags, skin-tone
+/// modifiers, and emoji variation selectors, so operator-provided account labels
+/// carrying those glyphs stop misaligning the table. The old hand-roll approximated
+/// the whole emoji block as uniformly width-2 and covered only the ranges seen in
+/// practice; `unicode-width` is a solved, versioned Unicode table with ZERO
+/// transitive dependencies, so adopting it keeps the crate's minimal-dependency
+/// posture intact (see `Cargo.toml`) — the one hand-rolled primitive where the
+/// canonical crate is strictly more correct at ~nil dependency cost.
 ///
 /// `pub(crate)` so the `stats` charts (issue #159) size their columns on the SAME
 /// terminal-cell width this `status` view does — one wcwidth for the whole crate.
 pub(crate) fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
-}
-
-/// The display width of one `char`: 0 (combining / zero-width / NUL), 2 (East
-/// Asian wide & fullwidth), or 1 (everything else). The ranges are the well-known
-/// UAX #11 wide blocks plus the common zero-width set — see [`display_width`] for
-/// the pragmatic-vs-exhaustive scope.
-fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    // Inclusive `(lo, hi)` code-point ranges that occupy ZERO cells: combining
-    // marks, the zero-width space/joiner family, variation selectors, and the BOM.
-    const ZERO_WIDTH: &[(u32, u32)] = &[
-        (0x0300, 0x036F), // combining diacritical marks
-        (0x200B, 0x200F), // zero-width space … RLM
-        (0xFE00, 0xFE0F), // variation selectors
-        (0xFEFF, 0xFEFF), // zero-width no-break space (BOM)
-    ];
-    // Inclusive ranges that occupy TWO cells: the principal East Asian blocks,
-    // fullwidth forms, wide emoji / pictographs, and the supplementary CJK planes.
-    const WIDE: &[(u32, u32)] = &[
-        (0x1100, 0x115F),   // Hangul Jamo
-        (0x2E80, 0x303E),   // CJK radicals … Kangxi … CJK symbols
-        (0x3041, 0x33FF),   // Hiragana, Katakana, CJK symbols & punctuation
-        (0x3400, 0x4DBF),   // CJK Unified Ext A
-        (0x4E00, 0x9FFF),   // CJK Unified Ideographs
-        (0xA000, 0xA4CF),   // Yi
-        (0xAC00, 0xD7A3),   // Hangul Syllables
-        (0xF900, 0xFAFF),   // CJK Compatibility Ideographs
-        (0xFE30, 0xFE4F),   // CJK Compatibility Forms
-        (0xFF00, 0xFF60),   // Fullwidth Forms
-        (0xFFE0, 0xFFE6),   // Fullwidth signs
-        (0x26AA, 0x26AB),   // medium white/black circles (emoji-presentation; #137's ⚪)
-        (0x1F300, 0x1FAFF), // emoji & pictographs (approximated as uniformly wide)
-        (0x20000, 0x3FFFD), // CJK Ext B+ (supplementary planes)
-    ];
-    let in_any = |ranges: &[(u32, u32)]| ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp));
-    // NUL and the zero-width set render nothing; the wide set renders two cells;
-    // everything else (the common Latin / ASCII path) renders one.
-    if cp == 0 || in_any(ZERO_WIDTH) {
-        0
-    } else if in_any(WIDE) {
-        2
-    } else {
-        1
-    }
+    UnicodeWidthStr::width(s)
 }
 
 /// One window's compact "resets in" (issue #94): the time until `reset_at`, or `n/a`
@@ -4094,9 +4057,12 @@ spare  22222222-2222\n\
         assert_eq!(display_width("日本語"), 6);
         assert_eq!("日本語".chars().count(), 3); // the count it must NOT use
                                                  // #137's ⚪ (U+26AA, emoji-presentation) is two cells, like the 🟢/🟡/🟠/🔴
-                                                 // rollup glyphs, so the AUTH column stays aligned.
+                                                 // rollup glyphs (issue #176 relies on this), so the AUTH column stays aligned.
         assert_eq!(display_width("⚪"), 2);
         assert_eq!(display_width("🟢"), 2);
+        assert_eq!(display_width("🟡"), 2);
+        assert_eq!(display_width("🟠"), 2);
+        assert_eq!(display_width("🔴"), 2);
         // A combining mark adds no width: "e" + U+0301 (combining acute) → one cell.
         assert_eq!(display_width("e\u{0301}"), 1);
         // Zero-width joiner and the BOM contribute nothing.
@@ -4343,6 +4309,56 @@ spare  22222222-2222\n\
         // The header's SESSION% label sits at the SAME display column as its data,
         // even though the wide-glyph label widened the ACCOUNT column (issue #99 — the
         // header is measured into the same display-width columns as the rows).
+        assert_eq!(
+            col_of("SESSION%"),
+            col_of("50%"),
+            "the SESSION% header aligns with its data column on display width:\n{out}"
+        );
+    }
+
+    #[test]
+    fn display_width_coalesces_zwj_flag_and_modifier_emoji() {
+        // The heart of issue #176: the retired hand-rolled wcwidth approximated the
+        // whole emoji block as uniformly width-2 and summed per code point, so it
+        // MIS-counted every multi-code-point emoji. `unicode-width` coalesces each
+        // sequence into the single width-2 glyph a terminal actually draws.
+        // A ZWJ family — 👨 ZWJ 👩 ZWJ 👧 — is ONE width-2 glyph (the hand-roll said 6).
+        assert_eq!(display_width("👨\u{200D}👩\u{200D}👧"), 2);
+        // A skin-tone modifier merges into its base glyph (the hand-roll said 4).
+        assert_eq!(display_width("👍\u{1F3FD}"), 2);
+        // An emoji variation selector (U+FE0F) promotes ❤ the text-heart to its
+        // width-2 emoji presentation (the hand-roll said 1 — VS16 counted as zero).
+        assert_eq!(display_width("❤\u{FE0F}"), 2);
+        // A regional-indicator flag pair renders as one width-2 glyph.
+        assert_eq!(display_width("🇺🇸"), 2);
+    }
+
+    #[test]
+    fn emoji_label_row_stays_aligned_on_display_width() {
+        // Issue #176 AC: a row whose operator label carries a multi-code-point emoji
+        // (a ZWJ family here — the old hand-roll mis-measured it as 6 cells) keeps the
+        // SESSION column aligned with an ASCII row, because `render_cells` pads on the
+        // now-correct `display_width` (2 cells for the coalesced glyph), not char count.
+        let response = StatusResponse {
+            accounts: vec![
+                status_line("ascii", true, Some(50), Some(60)),
+                status_line("👨\u{200D}👩\u{200D}👧", false, Some(10), Some(20)),
+            ],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        // Each row's value begins at the same DISPLAY column as the `needle`.
+        let col_of = |needle: &str| {
+            let line = out.lines().find(|l| l.contains(needle)).unwrap();
+            let idx = line.find(needle).unwrap();
+            display_width(&line[..idx])
+        };
+        assert_eq!(
+            col_of("50%"),
+            col_of("10%"),
+            "emoji-label and ascii rows align the SESSION column on display width:\n{out}"
+        );
+        // And the header stays over its data column, as with any wide label (issue #99).
         assert_eq!(
             col_of("SESSION%"),
             col_of("50%"),
