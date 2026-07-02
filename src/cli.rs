@@ -1026,8 +1026,9 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
 /// glance reads several independent signals per account: `account` by the overall
 /// urgency ([`severity`]), each `%` by its window's own utilization band
 /// ([`util_severity`] / [`weekly_cell_severity`]), and each reset by its OWN
-/// PROXIMITY ([`proximity_severity`], issue #94) — a far weekly reset can read green
-/// while an imminent session reset on the same row reads red. (The health-text tags
+/// PROXIMITY ([`proximity_severity`], issue #94) — an imminent session reset reads
+/// green (relief arriving) while a far weekly reset on the same row is dimmed
+/// (issue #90). (The health-text tags
 /// stay untinted: they are their own signal.) The color AUGMENTS — it wraps the
 /// already-padded text, so a no-color reader still sees every state, percentage, and
 /// reset; it is never the only signal. Padding is computed on DISPLAY WIDTH from the
@@ -1321,9 +1322,15 @@ fn legacy_health_tags(account: &AccountStatusLine) -> String {
 /// One urgency band for the `status` color overlay (issue #73), carried per CELL
 /// since issue #84: how much you can rely on what that cell reports at a glance.
 ///
-/// - `Green` — healthy: plenty of quota, usable now.
-/// - `Yellow` — getting depleted, OR heavily used but about to reset (recovering).
-/// - `Red` — heavily used and not about to reset: the least-available.
+/// - `Green` — healthy: plenty of quota, usable now (util cells); OR a reset that is
+///   imminent, i.e. fresh quota is arriving (reset cells, issue #90).
+/// - `Yellow` — getting depleted, OR heavily used but about to reset (recovering);
+///   OR a reset that is approaching (reset cells).
+/// - `Red` — heavily used and not about to reset: the least-available (util cells).
+/// - `Dim` — de-emphasis, NOT an urgency: a reset that is far off — the window just
+///   reset, so there is nothing to act on. Used only by the reset cells
+///   ([`proximity_severity`]); it renders faint rather than alarming, because a
+///   just-reset account is the *healthiest* state, not an emergency (issue #90).
 ///
 /// Purely a redundant overlay on the `SESSION`/`WEEKLY` percentages and the
 /// `RESETS` time the row already prints — the text stands alone without color
@@ -1333,17 +1340,20 @@ enum Severity {
     Green,
     Yellow,
     Red,
+    Dim,
 }
 
 impl Severity {
-    /// The ANSI SGR foreground code for this severity (`32`/`33`/`31` =
-    /// green/yellow/red). Emitted only when the color gate is open
-    /// ([`should_colorize`]); the codes carry no secret (issue #15).
+    /// The ANSI SGR code for this severity (`32`/`33`/`31` = green/yellow/red
+    /// foreground; `2` = faint intensity for the de-emphasized far-reset cell).
+    /// Emitted only when the color gate is open ([`should_colorize`]); the codes
+    /// carry no secret (issue #15).
     fn sgr(self) -> &'static str {
         match self {
             Severity::Green => "32",
             Severity::Yellow => "33",
             Severity::Red => "31",
+            Severity::Dim => "2",
         }
     }
 }
@@ -1451,36 +1461,42 @@ fn weekly_cell_severity(account: &AccountStatusLine) -> Option<Severity> {
     })
 }
 
-/// A reset at/under this many seconds out reads as IMMINENT — the most urgent
-/// proximity band (Red): the window is about to flip (issue #94).
+/// A reset at/under this many seconds out reads as IMMINENT — fresh quota is
+/// arriving, so the cell reads Green, the relief band (issue #94; direction
+/// corrected per issue #90 — a soon reset is good news, not an alarm).
 const RESET_IMMINENT_SECS: i64 = 60 * 60;
-/// A reset beyond this many seconds out reads as FAR — the calm band (Green); a
-/// reset between [`RESET_IMMINENT_SECS`] and this is APPROACHING (Yellow) (issue #94).
+/// A reset beyond this many seconds out reads as FAR — the window just reset, so
+/// relief is a long way off; the cell is de-emphasized (Dim), not alarmed. A reset
+/// between [`RESET_IMMINENT_SECS`] and this is APPROACHING (Yellow) (issue #94).
 const RESET_FAR_SECS: i64 = 24 * 60 * 60;
 
-/// One reset cell's own health (issue #94): its PROXIMITY, not utilization. The
-/// cell answers "how soon does THIS window flip", so a sooner reset reads more
-/// urgent and a later one less urgent — independent of how depleted the account is.
-/// That is exactly why a far weekly reset can read green while an imminent session
-/// reset on the SAME row reads red (the issue's worked example). Bands: at/under
-/// [`RESET_IMMINENT_SECS`] (1h) Red; beyond [`RESET_FAR_SECS`] (1d) Green; in
-/// between Yellow. A reset already past (non-positive delta) is maximally imminent →
-/// Red. `None` when the reset instant is unknown — the cell shows `n/a`, which stays
-/// uncolored (absence of color must not read as a false "healthy").
+/// One reset cell's own reading (issue #94): its PROXIMITY, not utilization, framed
+/// as RELIEF. The cell answers "how soon does THIS window flip" — a sooner reset
+/// means fresh quota is arriving, so it reads Green (good); a far reset means the
+/// window just reset and relief is a long way off, so it is de-emphasized (Dim)
+/// rather than alarmed — independent of how depleted the account is. Bands: at/under
+/// [`RESET_IMMINENT_SECS`] (1h) Green; beyond [`RESET_FAR_SECS`] (1d) Dim; in between
+/// Yellow. A reset already past (non-positive delta) is maximally imminent → Green
+/// (the window is fully available). `None` when the reset instant is unknown — the
+/// cell shows `n/a`, which stays uncolored (absence of color must not read as a false
+/// "healthy").
 ///
-/// This is intentionally DISTINCT from the account-overall [`severity`], which keeps
-/// its RELIEF reading of reset proximity (a depleted account about to reset is
-/// recovering, so its `account` cell softens Red→Yellow). The two answer different
-/// questions — `account` "how usable is this account", a reset cell "how soon does
-/// this window flip" — and per the #84 model each cell's signal is independent. The
-/// reset-cell colour driver is documented here so the sibling colour-audit issue
-/// (#90) can confirm the semantics: sooner = redder, later = greener.
+/// This RELIEF direction is intentionally CONSISTENT with the account-overall
+/// [`severity`], which also treats an imminent reset as good (a depleted account
+/// about to reset is recovering, so its `account` cell softens Red→Yellow). The two
+/// still answer different questions — `account` "how usable is this account", a reset
+/// cell "how soon does this window flip" — and per the #84 model each cell's signal
+/// is independent; but they no longer disagree on whether a soon reset is good.
+/// Corrected per issue #90: the cell previously read sooner = redder, which inverted
+/// the relief signal and painted an imminent reset as an alarm and a just-reset,
+/// full-quota account as green. Now a soon reset is Green and a far reset is Dim (not
+/// red), so the freshest account is not mistaken for one that needs attention.
 fn proximity_severity(reset_at: Option<i64>, now: i64) -> Option<Severity> {
     let delta = reset_at? - now;
     Some(if delta <= RESET_IMMINENT_SECS {
-        Severity::Red
-    } else if delta > RESET_FAR_SECS {
         Severity::Green
+    } else if delta > RESET_FAR_SECS {
+        Severity::Dim
     } else {
         Severity::Yellow
     })
@@ -3992,41 +4008,42 @@ spare  22222222-2222\n\
 
     #[test]
     fn proximity_severity_colors_a_reset_by_how_soon_it_flips() {
-        // Issue #94: a reset cell's colour is its PROXIMITY, not utilization — sooner
-        // reads more urgent (red), later less urgent (green), independent of how
-        // depleted the account is. An imminent reset (≤ 1h) is red; a far one (> 1d)
-        // is green; in between is yellow.
+        // Issue #94 + #90: a reset cell's colour is its PROXIMITY, not utilization,
+        // framed as RELIEF — sooner means fresh quota arriving (green), farther means
+        // relief is off and the just-reset window is de-emphasized (dim), independent
+        // of how depleted the account is. An imminent reset (≤ 1h) is green; a far one
+        // (> 1d) is dim; in between is yellow.
         assert_eq!(
             proximity_severity(Some(NOW + 12 * 60), NOW),
-            Some(Severity::Red),
-            "12m out is imminent → red"
+            Some(Severity::Green),
+            "12m out is imminent → green (relief arriving)"
         );
         assert_eq!(
             proximity_severity(Some(NOW + 5 * 86_400), NOW),
-            Some(Severity::Green),
-            "5d out is far → green"
+            Some(Severity::Dim),
+            "5d out is far → dim (just reset, nothing to act on)"
         );
         assert_eq!(
             proximity_severity(Some(NOW + 6 * 3_600), NOW),
             Some(Severity::Yellow),
             "6h out (between 1h and 1d) → yellow"
         );
-        // Proximity ignores utilization: a far reset is green even at 99% used, and an
-        // imminent reset is red even at 5% used — the worked example of a green weekly
-        // beside a red session on one row.
+        // Proximity ignores utilization: a far reset is dim even at 99% used, and an
+        // imminent reset is green even at 5% used — the worked example of a dim weekly
+        // beside a green session on one row.
         assert_eq!(
             proximity_severity(Some(NOW + 5 * 86_400), NOW),
-            Some(Severity::Green)
+            Some(Severity::Dim)
         );
         assert_eq!(
             proximity_severity(Some(NOW + 10 * 60), NOW),
-            Some(Severity::Red)
+            Some(Severity::Green)
         );
-        // Boundaries (`<=` imminent, `>` far): exactly 1h is still red, one second
-        // past is yellow; exactly 1d is yellow, one second past is green.
+        // Boundaries (`<=` imminent, `>` far): exactly 1h is still green, one second
+        // past is yellow; exactly 1d is yellow, one second past is dim.
         assert_eq!(
             proximity_severity(Some(NOW + RESET_IMMINENT_SECS), NOW),
-            Some(Severity::Red)
+            Some(Severity::Green)
         );
         assert_eq!(
             proximity_severity(Some(NOW + RESET_IMMINENT_SECS + 1), NOW),
@@ -4038,12 +4055,13 @@ spare  22222222-2222\n\
         );
         assert_eq!(
             proximity_severity(Some(NOW + RESET_FAR_SECS + 1), NOW),
-            Some(Severity::Green)
+            Some(Severity::Dim)
         );
-        // An already-past reset (non-positive delta) is maximally imminent → red.
+        // An already-past reset (non-positive delta) is maximally imminent → green
+        // (the window is fully available right now).
         assert_eq!(
             proximity_severity(Some(NOW - 100), NOW),
-            Some(Severity::Red)
+            Some(Severity::Green)
         );
         // Unknown reset instant → None: the cell shows `n/a`, which stays uncolored.
         assert_eq!(proximity_severity(None, NOW), None);
@@ -4207,17 +4225,18 @@ spare  22222222-2222\n\
 
     #[test]
     fn color_paints_each_reset_cell_by_its_own_proximity() {
-        // The #94 headline: on ONE row, a far weekly reset reads GREEN while an
-        // imminent session reset reads RED — each reset cell coloured by its own
-        // proximity, independent of utilization (both `%` here are a calm green).
+        // The #94/#90 headline: on ONE row, an imminent session reset reads GREEN
+        // (relief arriving) while a far weekly reset is DIM (just reset, nothing to
+        // act on) — each reset cell coloured by its own proximity, independent of
+        // utilization (both `%` here are a calm green).
         let response = StatusResponse {
             accounts: vec![status_line_resets(
                 "mix",
                 Some(50), // session %: green band
                 Some(50), // weekly %: green band
                 false,
-                Some(NOW + 10 * 60),    // session reset imminent → red
-                Some(NOW + 5 * 86_400), // weekly reset far → green
+                Some(NOW + 10 * 60),    // session reset imminent → green
+                Some(NOW + 5 * 86_400), // weekly reset far → dim
             )],
             next_swap: None,
         };
@@ -4227,23 +4246,20 @@ spare  22222222-2222\n\
             .lines()
             .find(|l| l.contains("mix"))
             .expect("a row for mix");
-        // The imminent session reset is red; the far weekly reset is green — on one row.
+        // The imminent session reset is green; the far weekly reset is dim — on one row.
         assert!(
-            row.contains("\x1b[31m10m"),
-            "imminent session reset red: {row:?}"
+            row.contains("\x1b[32m10m"),
+            "imminent session reset green: {row:?}"
         );
-        assert!(
-            row.contains("\x1b[32m5d"),
-            "far weekly reset green: {row:?}"
-        );
+        assert!(row.contains("\x1b[2m5d"), "far weekly reset dim: {row:?}");
         // …and not the inverse — proving proximity, not a fixed colour, drives it.
         assert!(
-            !row.contains("\x1b[32m10m"),
-            "the imminent reset is not green: {row:?}"
+            !row.contains("\x1b[2m10m"),
+            "the imminent reset is not dim: {row:?}"
         );
         assert!(
-            !row.contains("\x1b[31m5d"),
-            "the far reset is not red: {row:?}"
+            !row.contains("\x1b[32m5d"),
+            "the far reset is not green: {row:?}"
         );
         // Purely additive: stripping the ANSI recovers the exact plain table.
         assert_eq!(strip_ansi(&colored), plain);
