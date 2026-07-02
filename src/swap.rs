@@ -217,6 +217,94 @@ where
     })
 }
 
+/// Run one out-of-band **adopt-target** recovery (issue #212): install `incoming`
+/// as the active account by writing ONLY its credential to the canonical item and
+/// co-writing its `oauthAccount` into `~/.claude.json` — the swap sequence's steps
+/// 3–5, SKIPPING the outgoing read + re-stash (steps 1–2).
+///
+/// This is the recovery path for when the canonical credential is **gone or rotated**
+/// — a forced Claude logout that scrubbed / rotated the keychain token (issue #209) —
+/// so the normal [`swap`] cannot run: its step 1 reads the outgoing canonical and step
+/// 2 re-stashes it, but there is no sound outgoing token to re-stash. Adopt-target needs
+/// NEITHER: the departing (dead / absent) token is not required, and because it
+/// re-stashes nothing, no credential can be stapled under a wrong identity — the #211
+/// failure mode is structurally impossible here (nothing is written to any stash).
+///
+/// SAFETY is preserved, matching [`swap`]'s discipline:
+///   - **read-everything-before-mutate** — the incoming account's stash (its token
+///     → canonical, its `oauthAccount` → `~/.claude.json`) is read FIRST; an absent /
+///     corrupt incoming stash aborts with ZERO writes;
+///   - **could not read ≠ gone** — the canonical item is PROBED before any write, and
+///     the write proceeds ONLY on positive evidence it is safe: a CONFIRMED-absent
+///     canonical ([`Error::CredentialNotFound`], the scrubbed token) or a PRESENT-but-
+///     readable one (`Ok`, a rotated / orphan token the caller vetted as un-attributable)
+///     — the two states adopt-target recovers from. EVERY other read outcome aborts with
+///     ZERO writes: a LOCKED keychain (transient — "locked ≠ gone", retry when unlocked),
+///     but equally an ACL / auth-deny or other [`Error::Keychain`], ambiguity, or I/O
+///     error, because a canonical we merely *could not read* is not proven *gone* —
+///     clobbering it would lose a present token without re-stashing it. This mirrors the
+///     normal [`swap`]'s step-1 read, which aborts on any error (`?`) identically.
+///
+/// Gated by `--force` at the sole caller ([`crate::use_account`]); the autonomous daemon
+/// never adopts (it only rotates between known, re-stashed accounts). Steps 4–5 are
+/// best-effort and reported in the returned [`SwapReport`], exactly as in [`swap`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn adopt_target<C, S>(
+    store: &C,
+    stash: &S,
+    incoming_stash: &str,
+    claude_json: &Path,
+) -> Result<SwapReport>
+where
+    C: CredentialStore,
+    S: AccountStash,
+{
+    // Read the essential input FIRST — the incoming account's stash. An absent /
+    // corrupt stash aborts before any mutation (ZERO writes), exactly as [`swap`]
+    // reads all its inputs up front.
+    let incoming = stash.read(incoming_stash).await?;
+
+    // Probe the canonical before any write. Proceed ONLY on positive evidence it is safe
+    // to overwrite: a CONFIRMED-absent canonical (the scrubbed token) or a PRESENT-but-
+    // readable one (a rotated / orphan token the caller vetted as un-attributable) — the
+    // two states adopt-target recovers from. EVERY other read outcome aborts with ZERO
+    // writes, because a canonical we merely *could not read* is NOT proven *gone*:
+    // clobbering it would lose a present token without re-stashing it (the #211 loss the
+    // normal [`swap`] avoids by aborting its step-1 read on any error).
+    match store.read().await {
+        // Present + readable: the caller routes here only when this token matches no
+        // known account, so overwriting the orphan is the intended rotation recovery.
+        Ok(_) => {}
+        // Confirmed absent (errSecItemNotFound): nothing to clobber — the recovery case.
+        Err(Error::CredentialNotFound) => {}
+        // LOCKED (transient — "locked ≠ gone"), or an ACL / auth-deny or other
+        // `security` error, ambiguity, or I/O: "could not read" is not "gone". Abort.
+        Err(err) => return Err(err),
+    }
+
+    // 3. Write the incoming account's token to the canonical item (atomic `-U`: a
+    //    reader sees old-or-new, never empty / torn).
+    store.write(&incoming.credential).await?;
+
+    // 4. Co-write the incoming account's `oauthAccount` into `~/.claude.json`
+    //    (best-effort display correctness — a failure is tolerated and self-heals).
+    let oauth_cowritten =
+        claude_state::write_oauth_account(claude_json, &incoming.oauth_account).is_ok();
+
+    // 5. Post-write re-read to confirm the canonical still holds the token we wrote
+    //    (re-read each cycle, never cache). A read failure or a third-writer change
+    //    leaves it unconfirmed; the token reroute already succeeded.
+    let canonical_confirmed = store
+        .read()
+        .await
+        .is_ok_and(|current| current.matches(&incoming.credential));
+
+    Ok(SwapReport {
+        canonical_confirmed,
+        oauth_cowritten,
+    })
+}
+
 /// How long a contended swap-lock acquire ([`SwapLock::acquire`]) waits before
 /// failing closed (issue #64). Comfortably exceeds one swap's keychain work (a
 /// handful of `security` subprocesses, sub-second to ~2 s), so the ordinary
@@ -327,6 +415,38 @@ where
         None => None,
     };
     swap(store, stash, outgoing_stash, incoming_stash, claude_json).await
+}
+
+/// Run one out-of-band [`adopt_target`] recovery (issue #212), wrapped in the
+/// single-writer swap lock (issue #64) when `lock` is `Some((path, max_wait))` —
+/// the locked counterpart of [`swap_locked`], for the adopt path.
+///
+/// The lock is acquired BEFORE the adopt reads any input and held across the whole
+/// write, so the manual `use` recovery cannot interleave with a concurrent daemon
+/// swap into a split canonical / `~/.claude.json` pair. A contended acquire fails
+/// closed (`Err`) BEFORE any input is read, so a refusal is a true no-op (ZERO
+/// writes), matching [`swap_locked`]. A `lock` of `None` runs unlocked — the
+/// hermetic single-process test path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn adopt_target_locked<C, S>(
+    lock: Option<(&Path, Duration)>,
+    store: &C,
+    stash: &S,
+    incoming_stash: &str,
+    claude_json: &Path,
+) -> Result<SwapReport>
+where
+    C: CredentialStore,
+    S: AccountStash,
+{
+    // Bind the guard here so it outlives the entire adopt and drops only on return.
+    // A contended acquire fails closed (`Err`) BEFORE any input is read, so a refusal
+    // is a true no-op (ZERO writes), exactly like [`swap_locked`].
+    let _guard = match lock {
+        Some((path, max_wait)) => Some(SwapLock::acquire(path, max_wait).await?),
+        None => None,
+    };
+    adopt_target(store, stash, incoming_stash, claude_json).await
 }
 
 #[cfg(test)]
@@ -798,6 +918,180 @@ mod tests {
             b"B-token",
             "B's stash must be untouched"
         );
+    }
+
+    // --- adopt-target recovery (#212) --------------------------------------
+
+    #[tokio::test]
+    async fn adopt_target_installs_the_target_when_the_canonical_is_absent() {
+        // AC #1 (engine half): the canonical is GONE (scrubbed) — `store.read()` is
+        // `CredentialNotFound`. Adopt-target installs B's token → canonical and
+        // co-writes B's identity, WITHOUT reading or re-stashing any outgoing account.
+        let store = FakeCredentialStore::empty();
+        store.set_not_found(true); // the scrubbed / absent canonical
+        let stash = stash_with(stashed(b"A-token", "u-A"), stashed(b"B-token", "u-B")).await;
+        let (_dir, json) = claude_json("u-STALE", 0o600); // display is stale/cleared
+
+        let report = adopt_target(&store, &stash, ACCT_B, &json).await.unwrap();
+
+        // The canonical now holds B's token (the write created the absent item), and
+        // the post-write re-read confirmed it.
+        assert!(store.read().await.unwrap().matches(&cred(b"B-token")));
+        assert!(report.canonical_confirmed);
+        // The display identity was co-written to B.
+        assert!(report.oauth_cowritten);
+        assert_eq!(displayed_uuid(&json), "u-B");
+        // AC #3: NOTHING was re-stashed — A's stash is byte-for-byte untouched, so no
+        // credential could be stapled under a wrong identity (the departing token was
+        // never required).
+        let a = stash.read(ACCT_A).await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-token",
+            "A's stash must be untouched"
+        );
+        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+    }
+
+    #[tokio::test]
+    async fn adopt_target_installs_the_target_when_the_canonical_is_rotated() {
+        // AC #1 (engine half), rotated variant: the canonical holds a ROTATED token that
+        // matches no stash (a forced logout replaced it). Adopt-target overwrites it with
+        // B's token regardless — it does not re-stash the orphan under any identity.
+        let store = store_holding(b"ORPHAN-rotated-token").await;
+        let stash = stash_with(stashed(b"A-token", "u-A"), stashed(b"B-token", "u-B")).await;
+        let (_dir, json) = claude_json("u-STALE", 0o600);
+
+        let report = adopt_target(&store, &stash, ACCT_B, &json).await.unwrap();
+
+        assert!(store.read().await.unwrap().matches(&cred(b"B-token")));
+        assert!(report.canonical_confirmed);
+        assert!(report.oauth_cowritten);
+        assert_eq!(displayed_uuid(&json), "u-B");
+        // The rotated orphan was NOT stashed anywhere — A's stash is untouched.
+        let a = stash.read(ACCT_A).await.unwrap();
+        assert_eq!(
+            a.credential.expose(),
+            b"A-token",
+            "A's stash must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_target_aborts_with_zero_writes_when_the_keychain_is_locked() {
+        // AC #2: "locked ≠ gone." A LOCKED keychain is transient (retry when unlocked),
+        // NOT a scrubbed credential — so adopt-target must ABORT with ZERO writes rather
+        // than clobber a canonical it cannot even read. The probe catches the lock before
+        // any write.
+        let store = store_holding(b"A-token").await;
+        store.set_locked(true);
+        let stash = stash_with(stashed(b"A-token", "u-A"), stashed(b"B-token", "u-B")).await;
+        let (_dir, json) = claude_json("u-A", 0o600);
+
+        let result = adopt_target(&store, &stash, ACCT_B, &json).await;
+
+        assert!(
+            matches!(result, Err(Error::KeychainLocked { .. })),
+            "a locked keychain must abort the adopt (locked ≠ gone)"
+        );
+        // ZERO writes: unlock and confirm the canonical is untouched, the display is
+        // untouched, and NOTHING was stashed.
+        store.set_locked(false);
+        assert!(
+            store.read().await.unwrap().matches(&cred(b"A-token")),
+            "the canonical must be untouched (ZERO writes)"
+        );
+        assert_eq!(
+            displayed_uuid(&json),
+            "u-A",
+            "the display must be untouched"
+        );
+        let a = stash.read(ACCT_A).await.unwrap();
+        assert_eq!(a.credential.expose(), b"A-token");
+    }
+
+    #[tokio::test]
+    async fn adopt_target_aborts_with_zero_writes_when_the_canonical_is_present_but_unreadable() {
+        // "Could not read ≠ gone." A canonical that is PRESENT but whose secret cannot be
+        // read (a non-lock, non-not-found `security` error — an ACL / auth-deny) is NOT a
+        // scrubbed credential: adopt-target must ABORT with ZERO writes rather than clobber
+        // a present token without re-stashing it. The probe treats this exactly as a lock
+        // (only a CONFIRMED-absent or readable canonical proceeds), matching the normal
+        // swap's step-1 read, which `?`-aborts on any error.
+        let store = store_holding(b"A-token").await;
+        store.set_unreadable(true);
+        let stash = stash_with(stashed(b"A-token", "u-A"), stashed(b"B-token", "u-B")).await;
+        let (_dir, json) = claude_json("u-A", 0o600);
+
+        let result = adopt_target(&store, &stash, ACCT_B, &json).await;
+
+        assert!(
+            matches!(result, Err(Error::Keychain { .. })),
+            "a present-but-unreadable canonical must abort the adopt (could not read ≠ gone), got {result:?}"
+        );
+        // ZERO writes: clear the read fault and confirm the canonical is untouched, the
+        // display is untouched, and NOTHING was stashed.
+        store.set_unreadable(false);
+        assert!(
+            store.read().await.unwrap().matches(&cred(b"A-token")),
+            "the canonical must be untouched (ZERO writes)"
+        );
+        assert_eq!(
+            displayed_uuid(&json),
+            "u-A",
+            "the display must be untouched"
+        );
+        let a = stash.read(ACCT_A).await.unwrap();
+        assert_eq!(a.credential.expose(), b"A-token");
+    }
+
+    #[tokio::test]
+    async fn adopt_target_aborts_before_any_write_when_the_incoming_stash_is_absent() {
+        // Read-everything-before-mutate: the incoming stash is the essential input; an
+        // absent one aborts as a true no-op (ZERO writes) — the canonical stays absent.
+        let store = FakeCredentialStore::empty();
+        store.set_not_found(true);
+        let stash = FakeAccountStash::empty(); // B is NOT stashed
+        stash
+            .write(ACCT_A, &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        let (_dir, json) = claude_json("u-A", 0o600);
+
+        let result = adopt_target(&store, &stash, ACCT_B, &json).await;
+
+        assert!(matches!(result, Err(Error::StashIncomplete { .. })));
+        // ZERO writes: the canonical is still absent (never created).
+        assert!(matches!(store.read().await, Err(Error::CredentialNotFound)));
+        // The display is untouched.
+        assert_eq!(displayed_uuid(&json), "u-A");
+    }
+
+    #[tokio::test]
+    async fn adopt_target_locked_installs_the_target_through_the_lock() {
+        // The lock-wrapped adopt (the production path): an uncontended lock acquires
+        // instantly and the adopt runs, proving `adopt_target_locked` drives the same
+        // recovery as the bare engine through the single-writer lock (#64).
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+        let store = FakeCredentialStore::empty();
+        store.set_not_found(true);
+        let stash = stash_with(stashed(b"A-token", "u-A"), stashed(b"B-token", "u-B")).await;
+        let (_jdir, json) = claude_json("u-STALE", 0o600);
+
+        let report = adopt_target_locked(
+            Some((lock.as_path(), SWAP_LOCK_MAX_WAIT)),
+            &store,
+            &stash,
+            ACCT_B,
+            &json,
+        )
+        .await
+        .unwrap();
+
+        assert!(store.read().await.unwrap().matches(&cred(b"B-token")));
+        assert!(report.canonical_confirmed);
+        assert_eq!(displayed_uuid(&json), "u-B");
     }
 
     // --- the single-writer swap lock (#64) ---------------------------------

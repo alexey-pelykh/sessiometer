@@ -320,18 +320,22 @@ pub(crate) enum Error {
     #[error("`{query}` is ambiguous: {count} accounts match — disambiguate with the account-uuid")]
     UseTargetAmbiguous { query: String, count: usize },
 
-    /// `use` could not identify the active account to swap AWAY from: the canonical
-    /// keychain token matches no captured stash AND `~/.claude.json`'s logged-in
-    /// `oauthAccount.accountUuid` matches no roster entry either (issue #207 resolves
-    /// the active account token-first, with the display as the fallback). The swap
-    /// re-stashes the outgoing account, so its roster identity must be known —
-    /// mirrors the daemon's "can't identify active ⇒ don't swap". A LOCKED keychain
-    /// does NOT surface here: it aborts earlier as [`KeychainLocked`](Self::KeychainLocked),
-    /// never swallowed to this. ZERO writes. Secret-free.
+    /// `use` (WITHOUT `--force`) could not identify the active account to swap AWAY
+    /// from: the canonical keychain token matches no captured stash AND
+    /// `~/.claude.json`'s logged-in `oauthAccount.accountUuid` matches no roster entry
+    /// either (issue #207 resolves the active account token-first, with the display as
+    /// the fallback). The normal swap re-stashes the outgoing account, so its roster
+    /// identity must be known — mirrors the daemon's "can't identify active ⇒ don't
+    /// swap". A LOCKED keychain does NOT surface here: it aborts earlier as
+    /// [`KeychainLocked`](Self::KeychainLocked), never swallowed to this. With `--force`
+    /// this instead becomes the adopt-target RECOVERY (issue #212) — the target is
+    /// installed directly, no outgoing re-stash — so this error is the non-forced path
+    /// only. ZERO writes. Secret-free.
     #[error(
         "cannot determine the active account to swap away from \
-         (no logged-in account matches the roster — run `sessiometer login` \
-         to re-authenticate and add it to the rotation)"
+         (no logged-in account matches the roster — run `sessiometer login` to \
+         re-authenticate and add it to the rotation, or `sessiometer use <account> \
+         --force` to adopt a healthy account directly)"
     )]
     ActiveAccountUnresolved,
 

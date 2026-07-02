@@ -629,7 +629,8 @@ USAGE:
     sessiometer use <account> [--force]
 
     <account>   the target account (its label or account-uuid)
-    --force     override the pre-swap gate
+    --force     override the pre-swap gate; also adopts the target when the active
+                credential is gone/rotated (a forced logout), a locked keychain aside
     -h, --help  print this help
 ";
 
