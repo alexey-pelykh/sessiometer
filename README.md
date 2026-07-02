@@ -244,11 +244,24 @@ them apart.
 
 `--force` overrides those **policy** checks (and warns when you force onto an
 exhausted or quarantined account), but it never bypasses **safety**: if the login
-keychain is locked the switch still aborts at once, writing nothing. `use` works
-whether or not the daemon is running: when one is up, the pre-swap gate reads the
-**cached** usage the daemon already polled — so `use` makes no usage request of its
-own and won't trip a rate limit — and with no daemon it falls back to a single live
-check.
+keychain is locked the switch still aborts at once, writing nothing.
+
+`--force` also **recovers** the session when the active credential itself is **gone
+or rotated** — for example a forced Claude logout that scrubbed or replaced the
+keychain token, leaving nothing to swap *away* from. With no sound outgoing account
+to preserve, `use --force <account>` **adopts** the target directly: it writes the
+target's credential to the keychain and `~/.claude.json` without re-stashing the
+departing account (there is no valid token to re-stash, so nothing is stapled under
+the wrong identity). Only a **confirmed-absent** or **rotated** canonical is adopted:
+a credential that merely *could not be read* — a **locked** keychain (transient:
+unlock and retry), or any other read failure — still aborts here, writing nothing.
+*Could not read* is not *gone*, so a swap is never written blind over a credential
+that could not be read.
+
+`use` works whether or not the daemon is running: when one is up, the pre-swap gate
+reads the **cached** usage the daemon already polled — so `use` makes no usage
+request of its own and won't trip a rate limit — and with no daemon it falls back to
+a single live check.
 
 ## Parking an account
 
