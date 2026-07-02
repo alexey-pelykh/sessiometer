@@ -9,6 +9,7 @@
 //! `list` roster view (#17).
 
 use std::ffi::{OsStr, OsString};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1848,12 +1849,13 @@ fn color_decision(
 }
 
 /// Whether stdout is an interactive terminal — the color gate's final condition
-/// (issue #73). The `isatty(3)` sibling of [`terminal_cols`]'s `TIOCGWINSZ` probe:
-/// a pipe, a redirect, or a closed stdout is not a TTY, so color stays off there.
+/// (issue #73). A pipe, a redirect, or a closed stdout is not a TTY, so color
+/// stays off there. Uses [`std::io::IsTerminal`] (stable since Rust 1.70), which
+/// wraps `isatty(3)` on Unix with no `unsafe` FFI (issue #178) — unlike
+/// [`terminal_cols`]'s direct-libc `TIOCGWINSZ` probe, whose ioctl has no std
+/// equivalent, so that sibling keeps its raw `libc` call.
 fn stdout_is_tty() -> bool {
-    // SAFETY: `isatty` only inspects the fd and returns 1 (a TTY) or 0; it touches
-    // no memory. The same direct-libc idiom the crate uses elsewhere.
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+    std::io::stdout().is_terminal()
 }
 
 /// Current wall-clock time as epoch seconds — the reference `status` measures each
