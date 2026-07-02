@@ -26,6 +26,14 @@ accounts is permitted under them.
   place through the `/usr/bin/security` CLI; it never uses the
   Security.framework SDK (a CI guard enforces this, so the original silent-read
   access is preserved).
+- A **supported Claude Code version**. `sessiometer` depends on reverse-engineered
+  Claude Code internals (the keychain-service derivation and credential-refresh
+  behaviour) that were verified against a specific range — currently
+  **`2.1.181`–`2.1.197`** on macOS `26.5.1` / Darwin `25.x`. A `claude` outside
+  this range may have changed those internals and is unverified: `sessiometer`
+  could target the wrong keychain item with no other signal. The authoritative
+  range lives in [`build/version-compat.md`](build/version-compat.md), and
+  `scripts/check-cc-version.sh` checks your installed `claude` against it.
 
 ## Quickstart
 
