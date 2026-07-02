@@ -4,7 +4,7 @@
 //! SHA-256 (FIPS 180-4), hand-rolled.
 //!
 //! Hand-rolled to keep the dependency graph minimal — the crate hand-rolls its
-//! other primitives (hex in [`crate::stash`], the civil-date math) for the same
+//! other primitives (hex in [`crate::hex`], the civil-date math) for the same
 //! reason, and a cryptographic hash is the wrong thing to pull a runtime
 //! dependency in for. Two consumers: the keychain service-name derivation
 //! ([`crate::keychain`], a startup path) replicates Claude Code's
@@ -88,16 +88,13 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
         h[7] = h[7].wrapping_add(hh);
     }
 
-    // Render the eight state words as big-endian hex (lowercase, two digits
-    // per byte) — the same nibble-push idiom `crate::stash::hex_encode` uses.
-    let mut hex = String::with_capacity(64);
-    for word in h {
-        for shift in (0..8).rev() {
-            let nibble = (word >> (shift * 4)) & 0xf;
-            hex.push(char::from_digit(nibble, 16).expect("a nibble is < 16"));
-        }
+    // Serialize the eight state words as big-endian bytes, then render them as
+    // lowercase hex via the shared codec ([`crate::hex`]).
+    let mut bytes = [0u8; 32];
+    for (word, chunk) in h.iter().zip(bytes.chunks_exact_mut(4)) {
+        chunk.copy_from_slice(&word.to_be_bytes());
     }
-    hex
+    crate::hex::encode(&bytes)
 }
 
 #[cfg(test)]
