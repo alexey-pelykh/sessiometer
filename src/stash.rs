@@ -226,7 +226,7 @@ impl AccountStash for RealAccountStash {
             service,
             ACCT_OAUTH,
             &keychain,
-            hex_encode(account.oauth_account.raw_json()).as_bytes(),
+            crate::hex::encode(account.oauth_account.raw_json()).as_bytes(),
         )
         .await?;
         Ok(())
@@ -239,7 +239,7 @@ impl AccountStash for RealAccountStash {
         let oauth_hex = self.find_item(service, ACCT_OAUTH, &keychain).await?;
         // We always write valid hex, so a decode failure means the stored item was
         // truncated or tampered with — treat that as an unusable stash.
-        let oauth_bytes = hex_decode(&oauth_hex).ok_or_else(|| Error::StashIncomplete {
+        let oauth_bytes = crate::hex::decode(&oauth_hex).ok_or_else(|| Error::StashIncomplete {
             service: service.to_owned(),
         })?;
         let oauth_account = OauthAccount::from_object_bytes(&oauth_bytes)?;
@@ -368,34 +368,6 @@ fn strip_one_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.pop();
     }
     bytes
-}
-
-/// Encode bytes as lowercase, two-digits-per-byte hex. Used to keep a stored
-/// secret pure-ASCII so `find-generic-password -w` always renders it as text
-/// (see the module doc); the inverse is [`hex_decode`].
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // `from_digit(0..16, 16)` is infallible and yields `0-9a-f`.
-        out.push(char::from_digit((b >> 4) as u32, 16).expect("high nibble < 16"));
-        out.push(char::from_digit((b & 0x0f) as u32, 16).expect("low nibble < 16"));
-    }
-    out
-}
-
-/// Decode the lowercase hex produced by [`hex_encode`] (accepting either case).
-/// Returns `None` for odd length or a non-hex byte — i.e. a corrupted item.
-fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks_exact(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-    }
-    Some(out)
 }
 
 /// Map a non-zero `security` exit `code` to a typed error. `36` is
@@ -560,33 +532,6 @@ mod tests {
                 code: 1
             }
         ));
-    }
-
-    #[test]
-    fn hex_round_trips_arbitrary_bytes_including_non_ascii() {
-        // Every byte value, plus a non-ASCII UTF-8 JSON string like a real
-        // displayName/organizationName — the case that broke a raw round-trip.
-        let all_bytes: Vec<u8> = (0u8..=255).collect();
-        for sample in [
-            b"".as_slice(),
-            b"{\"a\":1}",
-            "{\"displayName\":\"Cafe\u{301} \u{41e}\u{43b}\u{435}\u{43a}\u{441}i\u{439}\"}"
-                .as_bytes(),
-            &all_bytes,
-        ] {
-            let encoded = hex_encode(sample);
-            assert!(encoded.is_ascii(), "hex output must be pure ASCII");
-            assert_eq!(hex_decode(encoded.as_bytes()).as_deref(), Some(sample));
-        }
-    }
-
-    #[test]
-    fn hex_decode_rejects_odd_length_and_non_hex() {
-        assert_eq!(hex_decode(b"abc"), None); // odd length
-        assert_eq!(hex_decode(b"zz"), None); // non-hex digit
-        assert_eq!(hex_decode(b"6X"), None); // one bad digit
-                                             // Uppercase is accepted (decode is case-insensitive).
-        assert_eq!(hex_decode(b"4A").as_deref(), Some(b"\x4a".as_slice()));
     }
 
     #[tokio::test]
