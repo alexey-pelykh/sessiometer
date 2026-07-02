@@ -74,8 +74,10 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +103,18 @@ const DEFAULT_POLL_INTERVAL_SECS: i64 = 300;
 const CAP_FRACTION: f64 = 1.0;
 /// The percentile the daily tier records (95th).
 const P95: f64 = 0.95;
+
+/// The bounded wait for the single-writer store lock (issue #188) before failing
+/// closed. Generous versus the sub-millisecond critical sections it guards; a
+/// contended acquire that ever exhausts it signals a genuinely stuck store, so the
+/// caller (both producers are fail-open) skips this one write rather than stall the
+/// poll loop. Kept short because the store is best-effort telemetry — a dropped
+/// sample beats a stalled rotation loop.
+const STORE_LOCK_MAX_WAIT: Duration = Duration::from_secs(2);
+/// Poll interval while waiting on a contended store lock (issue #188) — short enough
+/// that the wait ends within ~one interval of the holder releasing, negligible over
+/// the few polls a typical sub-millisecond critical section needs.
+const STORE_LOCK_RETRY: Duration = Duration::from_millis(20);
 
 /// One point-in-time usage reading for one account, as persisted to the raw tier.
 ///
@@ -305,13 +319,103 @@ pub(crate) struct RollSummary {
     pub(crate) raw_lines: u32,
 }
 
+/// The store's advisory-lock path — the `usage.lock` sibling of the raw-sample file.
+///
+/// [`append_sample`] and [`compact_and_roll`] both derive it from the SAME
+/// `samples_path`, so they contend on one stable lock file and serialize (issue
+/// #188). A dedicated lock file — never the sample file itself — is required because
+/// [`compact_and_roll`] REPLACES the sample file via `rename`: a lock taken on that
+/// inode would not carry across the swap, so a fresh appender opening the new file
+/// by path would not contend with it. In production `samples_path` is
+/// `<support_dir>/usage-samples.jsonl`, so the lock lands at
+/// `<support_dir>/usage.lock` — native-local alongside `swap.lock` / `daemon.lock`.
+fn lock_path(samples_path: &Path) -> PathBuf {
+    samples_path.with_file_name("usage.lock")
+}
+
+/// A held single-writer store lock: a kernel advisory `flock(LOCK_EX)` on the
+/// store's [`lock_path`], held only for the DURATION of one store write (issue
+/// #188). The file is held open for the critical section; the kernel releases the
+/// lock on drop (or process death), so there is no stale-lock reaping.
+///
+/// It ENFORCES the single-writer invariant the store's read-tolerance and
+/// atomic-rewrite behaviour rest on: [`append_sample`] and [`compact_and_roll`] both
+/// acquire it, so an append can never interleave `compact_and_roll`'s
+/// read-modify-rewrite of the raw file (which would silently drop the appended
+/// line). Mirrors the crate's per-swap [`crate::swap`] lock, but SYNCHRONOUS — the
+/// store's writes are blocking (they `fsync`), so a blocking acquire fits the same
+/// call context.
+#[derive(Debug)]
+struct StoreLock {
+    // Held open purely to keep the lock; dropping it (or the process dying)
+    // releases it.
+    _file: std::fs::File,
+}
+
+impl StoreLock {
+    /// Acquire the store lock at `path` (creating the file `0600` if needed),
+    /// bounded-blocking up to `max_wait`.
+    ///
+    /// FAIL-CLOSED: if the lock cannot be taken within `max_wait` — another store
+    /// write held it the whole time — returns [`Error::UsageStoreBusy`] so the caller
+    /// aborts with ZERO writes rather than racing a torn rewrite. Polls
+    /// `flock(LOCK_EX|LOCK_NB)`: the uncontended case (the only one on the
+    /// single-daemon poll loop, which calls the two writers sequentially) succeeds on
+    /// the first try with no sleep; a genuine contender waits [`STORE_LOCK_RETRY`]
+    /// between tries. `EINTR` (a signal during the wait) retries immediately.
+    fn acquire(path: &Path, max_wait: Duration) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        let deadline = Instant::now() + max_wait;
+        loop {
+            // SAFETY: `flock` takes a valid open fd (owned by `file`, which outlives
+            // the call) and the two flag constants; it has no other preconditions.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                // EWOULDBLOCK (== EAGAIN): another store write holds it — wait, retry.
+                Some(libc::EWOULDBLOCK) => {}
+                // Interrupted by a signal — not contention; retry immediately.
+                Some(libc::EINTR) => continue,
+                // A genuine I/O failure (broken fd / filesystem), surfaced as itself
+                // rather than masqueraded as contention.
+                _ => return Err(Error::Io(err)),
+            }
+            // Out of patience: fail closed (the caller aborts with ZERO writes).
+            if Instant::now() >= deadline {
+                return Err(Error::UsageStoreBusy);
+            }
+            std::thread::sleep(STORE_LOCK_RETRY);
+        }
+    }
+}
+
 /// Append one `sample` to the raw JSONL file as a single line.
 ///
 /// One `write_all` of `<json>\n` to the `0600` append-open file
 /// ([`crate::paths::create_private_file`]) — deliberately un-`fsync`ed: the raw tier
 /// is best-effort (the durable checkpoint is the rollup), and a crash mid-append
 /// leaves a torn trailing line that [`read_samples`] tolerates.
+///
+/// Serialized against [`compact_and_roll`]'s atomic rewrite by the store lock
+/// ([`StoreLock`], issue #188): an append can never interleave that
+/// read-modify-rewrite, so the single-writer invariant is ENFORCED, not merely
+/// assumed. A contended lock fails closed ([`Error::UsageStoreBusy`]); the daemon's
+/// collector is fail-open, so it logs and skips the sample rather than risk a torn
+/// write.
 pub(crate) fn append_sample(samples_path: &Path, sample: &Sample) -> Result<()> {
+    let _guard = StoreLock::acquire(&lock_path(samples_path), STORE_LOCK_MAX_WAIT)?;
     let mut line = serde_json::to_vec(sample).map_err(|_| serialize_err())?;
     line.push(b'\n');
     let mut file = paths::create_private_file(samples_path)?;
@@ -325,8 +429,9 @@ pub(crate) fn append_sample(samples_path: &Path, sample: &Sample) -> Result<()> 
 /// An absent file reads as no samples. Each newline-delimited record is parsed on
 /// its raw bytes (so a torn multi-byte UTF-8 tail cannot poison the whole read);
 /// any record that fails to parse is skipped. Under the single-writer append model
-/// (only the daemon writes, and [`compact_and_roll`] rewrites atomically) the sole
-/// reachable parse failure is a crash-torn trailing line, exactly the AC's case.
+/// (now ENFORCED by the store lock — [`StoreLock`], issue #188 — so only one writer
+/// runs at a time, and [`compact_and_roll`] rewrites atomically) the sole reachable
+/// parse failure is a crash-torn trailing line, exactly the AC's case.
 pub(crate) fn read_samples(samples_path: &Path) -> Result<Vec<Sample>> {
     let bytes = match std::fs::read(samples_path) {
         Ok(bytes) => bytes,
@@ -367,16 +472,32 @@ pub(crate) fn read_rollup(rollup_path: &Path) -> Result<Rollup> {
 
 /// Bound the raw window and fold aged samples into the hourly + daily tiers.
 ///
-/// A single-writer operation (the daemon, issue #156) run periodically. It:
+/// A single-writer operation (the daemon, issue #156) run periodically, serialized
+/// against [`append_sample`] by the store lock ([`StoreLock`], issue #188) so the two
+/// writers can never interleave a torn rewrite. Under that lock it:
 ///
 /// 1. reads the raw samples and the current rollup;
 /// 2. rolls every sample whose **whole day** has aged past `now - raw_window` and
 ///    is newer than the watermark — grouped by day (and, within a day, by hour) so
 ///    each bucket is built from that day's complete set in one exact batch;
-/// 3. advances `rolled_through_ts` past the rolled batch;
-/// 4. rewrites the raw file **atomically** to just the still-in-window samples;
-/// 5. prunes the hourly tier to `hourly_window` (the daily tier is lifetime) and
-///    rewrites the rollup atomically.
+/// 3. advances `rolled_through_ts` past the rolled batch and prunes the hourly tier
+///    to `hourly_window` (the daily tier is lifetime);
+/// 4. persists the rollup **atomically** — the durable checkpoint, written FIRST;
+/// 5. rewrites the raw file **atomically** to just the still-in-window samples,
+///    AFTER the rollup.
+///
+/// **Crash-safe ordering (issue #188)**: the durable rollup is persisted BEFORE the
+/// raw source is truncated, so a crash between the two writes leaves every aged
+/// sample still in the raw file for a re-roll — the `rolled_through_ts` watermark
+/// then de-dupes it on the next pass — rather than absent from BOTH tiers (the old
+/// raw-first order lost it, permanently for the lifetime daily tier). This is the
+/// same invariant [`crate::capture`] applies as "stash BEFORE persisting the roster",
+/// inverted here. Each file's write is itself atomic (tmp + `fsync` + `rename`), so a
+/// torn write of either file degrades to old-or-new, never partial. "Crash-safe" here
+/// covers a process crash / interruption / failed write (the AC's fault boundaries),
+/// where a returned write is visible to the next process; there is no WAL (a non-goal),
+/// so ordering under hard power loss is bounded by the atomic-write primitive rather
+/// than a journal.
 ///
 /// Idempotent: a second call with the same `now` re-rolls nothing (the watermark
 /// excludes already-folded samples, and the aged ones are gone from the raw file).
@@ -392,9 +513,39 @@ pub(crate) fn compact_and_roll(
     now: i64,
     policy: &RetentionPolicy,
 ) -> Result<RollSummary> {
-    let samples = read_samples(samples_path)?;
-    let mut rollup = read_rollup(rollup_path)?;
+    // Hold the single-writer lock across the WHOLE read-modify-write (issue #188):
+    // acquired BEFORE the reads so a concurrent `append_sample` cannot slip a line in
+    // between our read and our atomic rewrite (which would silently drop that line).
+    let _guard = StoreLock::acquire(&lock_path(samples_path), STORE_LOCK_MAX_WAIT)?;
 
+    let samples = read_samples(samples_path)?;
+    let rollup = read_rollup(rollup_path)?;
+    let (retained, rollup, summary) = plan_roll(samples, rollup, now, policy);
+
+    // Persist the durable rollup checkpoint BEFORE truncating the raw source (issue
+    // #188). A crash between these two atomic writes then leaves every aged sample
+    // still in raw for a re-roll — the watermark de-dupes it — never absent from both
+    // tiers. The reverse order (the pre-#188 bug) lost the aged batch from both.
+    write_rollup(rollup_path, &rollup)?;
+    write_samples(samples_path, &retained)?;
+    Ok(summary)
+}
+
+/// The pure compute half of [`compact_and_roll`] — no I/O, so the persist ORDERING
+/// can be exercised under a fault injected at each write boundary (issue #188).
+///
+/// Partitions `samples` into the still-in-window `retained` set and the aged,
+/// not-yet-folded batch; folds that batch into `rollup`'s hourly + daily tiers and
+/// advances `rolled_through_ts`; prunes the hourly tier (and the daily tier when the
+/// policy opts into a bound). Returns the sorted retained raw window, the updated
+/// rollup, and the [`RollSummary`]. The caller persists the rollup FIRST, then the
+/// retained window (the crash-safe order).
+fn plan_roll(
+    samples: Vec<Sample>,
+    mut rollup: Rollup,
+    now: i64,
+    policy: &RetentionPolicy,
+) -> (Vec<Sample>, Rollup, RollSummary) {
     // A sample rolls only once its ENTIRE day sits older than the raw window, so the
     // day's bucket is always folded from a complete batch (exact p95, no re-merge).
     let roll_before = now - policy.raw_window_secs;
@@ -435,14 +586,19 @@ pub(crate) fn compact_and_roll(
     rollup.hourly.sort_by_key(|bucket| bucket.hour_start);
     rollup.daily.sort_by_key(|bucket| bucket.day_start);
 
-    // Rewrite the raw file to the bounded window (atomic — never a torn read).
+    // The bounded raw window, sorted — the caller rewrites it atomically (never a
+    // torn read).
     retained.sort_by_key(|sample| sample.ts);
-    write_samples(samples_path, &retained)?;
-    write_rollup(rollup_path, &rollup)?;
-    Ok(RollSummary {
-        rolled_through_ts: rollup.rolled_through_ts,
-        raw_lines,
-    })
+
+    let rolled_through_ts = rollup.rolled_through_ts;
+    (
+        retained,
+        rollup,
+        RollSummary {
+            rolled_through_ts,
+            raw_lines,
+        },
+    )
 }
 
 /// Atomically rewrite the raw file to exactly `samples` (used by
@@ -465,7 +621,8 @@ fn write_samples(samples_path: &Path, samples: &[Sample]) -> Result<()> {
 /// A first write creates it `0600` ([`crate::paths::write_private_file`]); a rewrite
 /// preserves the existing mode via `fchmod` ([`crate::paths::write_preserving_mode`]),
 /// honouring an operator who tightened/loosened it rather than silently forcing it
-/// back. Single-writer, so the `exists()` probe is race-free.
+/// back. Single-writer (now enforced by the store lock — [`StoreLock`], issue #188),
+/// so the `exists()` probe is race-free.
 fn write_rollup(rollup_path: &Path, rollup: &Rollup) -> Result<()> {
     let bytes = serde_json::to_vec(rollup).map_err(|_| serialize_err())?;
     if rollup_path.exists() {
@@ -1205,6 +1362,149 @@ mod tests {
                 .iter()
                 .any(|d| d.day_start == day_start(within)),
             "30d-old daily bucket kept (inside the 60d window)"
+        );
+    }
+
+    // --- issue #188: crash-safe ordering + enforced single-writer lock ----------
+
+    #[test]
+    fn a_fault_at_every_write_boundary_loses_no_sample() {
+        // AC (issue #188): a fault injected at every write boundary in the compaction
+        // persist step must leave every sample recoverable — folded-and-durable in
+        // the rollup OR still present in raw for a re-roll, never lost from BOTH
+        // tiers. Because the rollup is persisted BEFORE the raw is truncated (and the
+        // `rolled_through_ts` watermark de-dupes a re-roll), a crash anywhere in the
+        // persist window loses nothing and double-counts nothing: recovery converges
+        // to the SAME end state at every boundary.
+        //
+        //   boundary 0: crash BEFORE write_rollup                (nothing persisted)
+        //   boundary 1: crash AFTER write_rollup, BEFORE write_samples (the window)
+        //   boundary 2: crash AFTER write_samples                (fully persisted)
+        for crash_after in 0..=2 {
+            let dir = tempfile::tempdir().unwrap();
+            let (samples_path, rollup_path) = store_paths(dir.path());
+            let policy = RetentionPolicy::default();
+            let now: i64 = 200 * DAY_SECS;
+            let aged_day = 10 * DAY_SECS; // long past the 14d raw window
+            let recent = now - 2 * DAY_SECS; // inside the raw window
+            for k in 0..3 {
+                append_sample(&samples_path, &sample(aged_day + k * 600, 0.5, 0.6)).unwrap();
+            }
+            for k in 0..2 {
+                append_sample(&samples_path, &sample(recent + k * 600, 0.1, 0.2)).unwrap();
+            }
+
+            // Drive the plan + a PARTIAL persist by hand — the real write functions,
+            // the real crash-safe order — stopping at boundary `crash_after`.
+            let samples = read_samples(&samples_path).unwrap();
+            let rollup = read_rollup(&rollup_path).unwrap();
+            let (retained, rolled, _summary) = plan_roll(samples, rollup, now, &policy);
+            if crash_after >= 1 {
+                write_rollup(&rollup_path, &rolled).unwrap();
+            }
+            if crash_after >= 2 {
+                write_samples(&samples_path, &retained).unwrap();
+            }
+
+            // Recovery: a full compaction to completion.
+            compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+
+            // Identical invariant at EVERY boundary: the 3 aged samples are folded
+            // EXACTLY once into `aged_day`, and only the 2 recent samples stay raw —
+            // never lost (count < 3) and never double-counted (count > 3).
+            let remaining = read_samples(&samples_path).unwrap();
+            assert_eq!(
+                remaining.len(),
+                2,
+                "crash_after={crash_after}: only the in-window samples stay raw"
+            );
+            assert!(
+                remaining.iter().all(|s| s.ts >= recent),
+                "crash_after={crash_after}: aged samples left raw"
+            );
+            let rollup = read_rollup(&rollup_path).unwrap();
+            let day = rollup
+                .daily
+                .iter()
+                .find(|d| d.day_start == day_start(aged_day))
+                .unwrap_or_else(|| panic!("crash_after={crash_after}: aged day never folded"));
+            assert_eq!(
+                day.count, 3,
+                "crash_after={crash_after}: aged day folded exactly once (no loss, no double-count)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_store_lock_fails_a_second_bounded_acquire_closed() {
+        // The enforcement AC (issue #188): while one `StoreLock` is held, a second
+        // bounded acquire on the same path fails CLOSED with `UsageStoreBusy` rather
+        // than proceeding without the lock. A second, SEPARATE open of the same file
+        // contends even within one process (flock locks the open file description),
+        // so the bounded wait elapses — mirroring the swap lock's own proof.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.lock");
+
+        let _held = StoreLock::acquire(&path, STORE_LOCK_MAX_WAIT).unwrap();
+        let start = Instant::now();
+        let busy = StoreLock::acquire(&path, Duration::from_millis(120)).unwrap_err();
+        assert!(
+            matches!(busy, Error::UsageStoreBusy),
+            "a held lock must fail closed, got {busy:?}"
+        );
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "the bounded wait must actually elapse (not an instant fail)"
+        );
+        assert_eq!(
+            busy.exit_code(),
+            4,
+            "fail-closed shares the retry-shortly code"
+        );
+    }
+
+    #[test]
+    fn append_never_loses_a_sample_to_a_concurrent_compaction() {
+        // The enforcement AC end-to-end (issue #188): an `append_sample` running
+        // concurrently with a `compact_and_roll` rewrite is serialized by the store
+        // lock, so the rewrite's read-modify-write can never drop it. Every appended
+        // sample sits INSIDE the raw window (never aged), so a correct run keeps all
+        // of them in the raw file; a lost append (the pre-lock race) would surface as
+        // a short count.
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        let policy = RetentionPolicy::default();
+        let now: i64 = 200 * DAY_SECS;
+        let base = now - DAY_SECS; // inside the 14d raw window → always retained
+
+        const N: i64 = 50;
+        let appender = {
+            let samples_path = samples_path.clone();
+            std::thread::spawn(move || {
+                for k in 0..N {
+                    append_sample(&samples_path, &sample(base + k, 0.1, 0.2)).unwrap();
+                }
+            })
+        };
+        // Compact concurrently while the appender runs. A brief yield between passes
+        // models reality (the daemon compacts at most hourly, never in a tight loop)
+        // AND keeps the advisory lock — which `flock` grants unfairly — free often
+        // enough that neither writer starves the other; a tight no-yield loop would
+        // let the compactor hold the lock ~continuously and starve the backing-off
+        // appender, a test artifact rather than a serialization failure.
+        while !appender.is_finished() {
+            compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        appender.join().unwrap();
+        // Settle any samples appended after the last concurrent compaction.
+        compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
+
+        let remaining = read_samples(&samples_path).unwrap();
+        assert_eq!(
+            remaining.len(),
+            N as usize,
+            "every concurrently-appended sample survived the compaction rewrites"
         );
     }
 }
