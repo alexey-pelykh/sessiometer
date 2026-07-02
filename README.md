@@ -682,6 +682,14 @@ cargo build --release
 ./target/release/sessiometer --help
 ```
 
+## Support
+
+`sessiometer` is free and MIT-licensed. If you find it useful, you can support
+its continued development through GitHub Sponsors —
+**[github.com/sponsors/alexey-pelykh](https://github.com/sponsors/alexey-pelykh)**.
+Sponsorship is entirely optional and never gates any functionality; every
+feature remains available under the [MIT license](LICENSE).
+
 ## License
 
 [MIT](LICENSE) © 2026 Oleksii PELYKH
