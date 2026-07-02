@@ -1843,35 +1843,48 @@ where
     /// - a refresh seam is wired ([`with_refresh_engine`](Self::with_refresh_engine)),
     /// - the poll was a 401 ([`PollOutcome::Unauthorized`]),
     /// - the account is not already quarantined (a dead account is left to the #106 sweep /
-    ///   an operator re-login — never re-refreshed on every re-probe poll), and
-    /// - this is the FIRST 401 of the current streak episode (`consec_401 == 0`).
+    ///   an operator re-login — never re-refreshed on every re-probe poll),
+    /// - this is the FIRST 401 of the current streak episode (`consec_401 == 0`), and
+    /// - the account is NOT the ACTIVE one (`state.active != Some(i)`, issue #253).
     ///
-    /// The last condition is the once-per-episode guard (AC-4, no refresh storm): a refresh
-    /// spawns `claude -p` under the swap lock (seconds), so a persistently-401 account must
-    /// refresh at most once per streak — the first 401 attempts the revive; the rest of the
+    /// The `consec_401 == 0` condition is the once-per-episode guard (AC-4, no refresh storm): a
+    /// refresh spawns `claude -p` under the swap lock (seconds), so a persistently-401 account
+    /// must refresh at most once per streak — the first 401 attempts the revive; the rest of the
     /// episode advances the streak directly.
+    ///
+    /// The active-account exclusion (issue #253) upholds the #102 engine's Caller contract
+    /// ("refresh PARKED accounts only", `refresh.rs`): the isolated refresh performs a real OAuth
+    /// exchange that ROTATES the refresh token server-side, but CAS-writes the fresh token only to
+    /// the account's STASH — the canonical keychain item every live session reads keeps the old,
+    /// now-invalidated token. Refreshing the active account would therefore break concurrent live
+    /// sessions AND mask the account healthy (its stash re-poll succeeds), stranding the fresh
+    /// token where no recovery path promotes it. `state.active` is resolved token-first at
+    /// top-of-tick (#207) — the same authoritative signal [`refresh_exclusions`](Self::refresh_exclusions)
+    /// (#105) and #250/`poke` exclude on. A still-active account's 401 instead advances the #42
+    /// streak toward an operator re-login, exactly how a dead active account is already handled.
     fn should_refresh_retry(&self, i: usize, result: &Result<Usage>) -> bool {
         self.poll_refresh.is_some()
             && matches!(classify_poll(result), PollOutcome::Unauthorized)
             && !self.state.health[i].quarantined
             && self.state.health[i].consec_401 == 0
+            && self.state.active != Some(i)
     }
 
     /// Attempt one isolated refresh of account `i` (the #102 engine) and a single re-poll,
     /// returning the outcome [`note_poll_outcome`](Self::note_poll_outcome) then folds into
     /// the streak (issue #162). Only called when [`should_refresh_retry`](Self::should_refresh_retry)
-    /// holds, so `poll_refresh` is `Some`.
+    /// holds, so `poll_refresh` is `Some` and — per that guard's active-account exclusion
+    /// (issue #253) — `i` is always a PARKED account, never the active one.
     ///
     /// - Refresh reports **`Dead`** (the refresh token was cleared in place, `refresh.rs`) →
     ///   a genuine death: skip the re-poll and let the 401 stand so the streak advances.
     /// - Refresh ran otherwise (refreshed / no-change / even an engine error report) → the
     ///   account's STASH may now bear a fresh token, so re-poll THROUGH THE STASH
-    ///   (`active = false`). Re-polling the stash is a liveness probe that never touches the
-    ///   live canonical credential — the deliberate, safe path for the ACTIVE account too:
-    ///   its 401 is the most urgent so it is NOT skipped, but confirming its liveness must
-    ///   never mutate the credential its live session depends on. A stale-stash `Dead` for an
-    ///   active account therefore only advances the streak by one (a later canonical re-poll
-    ///   can still clear it), never an instant false-kill.
+    ///   (`active = false`). The re-poll is a liveness probe against the parked account's stash
+    ///   that never touches the live canonical credential. (This path deliberately does NOT run
+    ///   for the active account: `should_refresh_retry` excludes it, because the harm is the
+    ///   `engine.refresh` server-side token rotation one step EARLIER — which the re-poll cannot
+    ///   undo — not the re-poll itself, issue #253.)
     /// - The refresh itself **errors** → "could not revive"; fail-safe by letting the 401
     ///   stand. A refresh failure never crashes the poll loop.
     async fn refresh_retry(&self, i: usize) -> Result<Usage> {
@@ -9031,6 +9044,50 @@ mod tests {
             calls.get(),
             0,
             "a healthy poll path never invokes the refresh seam",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_active_account_is_never_isolated_refreshed_on_a_401() {
+        // Issue #253: the #162 refresh-then-retry must NEVER isolated-refresh the ACTIVE account.
+        // The #102 engine performs a real OAuth exchange that ROTATES the refresh token
+        // server-side (`refresh.rs` Caller contract), invalidating the canonical credential every
+        // live Claude Code session reads — the exact hazard #105/`refresh_exclusions` and
+        // #250/`poke` already guard. The existing seam tests only drive the non-active `spare`;
+        // this covers the active account. Two rotation-INDEPENDENT defects must hold
+        // deterministically:
+        //   1. caller-contract: the active account is never handed to `engine.refresh` at all
+        //      (`calls == 0`), and
+        //   2. no masking: its surviving 401 ADVANCES the #42 streak (toward operator re-login),
+        //      never a stash re-poll that resets the streak and marks it healthy.
+        // `revive_to` is set so that WITHOUT the fix the masking is sharp (a refresh would revive
+        // `work` and reset its streak); WITH the fix the refresh never fires, so it is inert.
+        let (mut daemon, outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)), // spare stays healthy — isolate the active path
+            RefreshOutcome::Refreshed,
+            Some(reading(0.10, 0.10)), // would (wrongly) revive `work` IF it were refreshed
+            false,
+            3,
+        )
+        .await;
+        // Re-script the ACTIVE account (`work` / u-A, idx 0) to 401.
+        outcomes
+            .borrow_mut()
+            .insert("u-A".to_owned(), Scripted::Unauthorized);
+        // `work` is polled on ticks 1 and 3 (staggered schedule #80) → two surviving 401s.
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "#253: the active account must NEVER be isolated-refreshed — its live session reads \
+             the canonical credential the #102 refresh would rotate server-side",
+        );
+        assert_eq!(
+            daemon.state.health[0].consec_401, 2,
+            "#253: a still-active account's 401 advances the #42 streak toward operator re-login, \
+             never a stash-only refresh + re-poll that resets the streak and masks it healthy",
         );
     }
 
