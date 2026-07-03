@@ -60,7 +60,10 @@
 //! real refresh token against the operator's live accounts). Instead each cycle's
 //! [`RefreshReport`] carries the `expiresAt` delta and the refresh-token-rotation flag,
 //! so the engine's OWN first days of operation are the safe multi-day observation
-//! (#101 AC-3) — gathered through this CAS-protected flow, never a bespoke probe.
+//! (#101 AC-3) — gathered through this CAS-protected flow, never a bespoke probe. The
+//! rotation half of that question has since been RESOLVED (the server rotates — see the
+//! Caller-contract note below, spike #262); the flag remains the per-cycle new-token
+//! signal, and the sliding-window-vs-cap TTL question stays open.
 //!
 //! ## Caller contract (the two thin callers must honor)
 //!
@@ -83,8 +86,17 @@
 //!     classifies the account `Dead`. This is bounded and RECOVERABLE — the re-auth /
 //!     dead-credential recovery path (#13/#42) surfaces a dead account for an operator
 //!     re-login — so a caller treats a refresh `Err` as NON-fatal (log + let recovery
-//!     self-heal), never as corruption. Whether the server actually rotates is the open
-//!     question this engine's own telemetry (the AC-3 section above) exists to answer.
+//!     self-heal), never as corruption. **Resolved (spike #262) — the server rotates
+//!     (Medium-High):** Anthropic's token endpoint issues a NEW refresh token on each
+//!     exchange — exactly what this engine's own `refresh_token_rotated` telemetry (the
+//!     AC-3 section above) measures. The new-token half is directly observed; the
+//!     invalidation-of-the-old half is INFERRED, not measured here — RFC 9700 §2.2.2
+//!     makes rotation (or sender-constraining) a MUST for a public PKCE client, and the
+//!     reproduced concurrent-session race (claude-code#24317) plus RE of CC's OAuth flow
+//!     corroborate it. OBSERVED, Anthropic-undocumented behavior — the safe posture, not
+//!     a contracted guarantee; a live retry of the old token would still settle the
+//!     grace-window / reuse-revocation questions #262 leaves open. So the
+//!     invalidated-server-side premise above HOLDS and the #253 exclusion stands.
 //!
 //! ## Deferred live check (needs a live token; cannot run in CI)
 //!
