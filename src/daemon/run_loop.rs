@@ -307,12 +307,19 @@ where
 /// time-driven transition (the access token crossing its expiry) and a quarantine-driven one
 /// (the #42 path, even with the refresh feature OFF) are both caught; the first computation per
 /// account seeds the baseline silently. Best-effort logging throughout.
+///
+/// Returns the handles of any accounts whose sweep-refresh CONFIRMED an unrecoverable death this
+/// cycle (issue #261) — the edge-triggered `credential_unrecoverable` events are logged HERE
+/// (durable channel / future menubar #168), and their handles are handed back for the caller to
+/// project onto the operator notification channels (console + macOS) from its async context. The
+/// handles are labels only, so no secret reaches either channel (#15).
 fn apply_post_idle<P, C, S, K>(
     daemon: &mut Daemon<P, C, S, K>,
     log: &mut EventLog,
     refresh_restored: &[String],
     refresh_observations: &[RefreshObservation],
-) where
+) -> Vec<String>
+where
     P: RosterPoller,
     C: CredentialStore,
     S: AccountStash,
@@ -326,12 +333,70 @@ fn apply_post_idle<P, C, S, K>(
             emit_best_effort(log, &event);
         }
     }
+    let mut unrecoverable = Vec::new();
     for observation in refresh_observations {
-        daemon.apply_refresh_observation(observation);
+        if let Some(event) = daemon.apply_refresh_observation(observation) {
+            // Collect the handle for the operator notification and emit the SAME event to
+            // the durable log — one edge feeds both, so the log and the operator channel
+            // can never disagree (issue #261).
+            if let Event::CredentialUnrecoverable { account } = &event {
+                unrecoverable.push(account.clone());
+            }
+            emit_best_effort(log, &event);
+        }
     }
     for event in daemon.note_health_transitions(wall_clock_now_secs()) {
         emit_best_effort(log, &event);
     }
+    unrecoverable
+}
+
+/// The operator message for a confirmed unrecoverable death (issue #261): names the account
+/// HANDLE and the fix (`claude /login`). A pure builder — like [`swap_report`] — so the wording,
+/// and the #15 guarantee that it is sourced from the LABEL alone (never a token or email), are
+/// unit-tested directly. Shared verbatim by both operator channels below, so they cannot drift.
+pub(crate) fn unrecoverable_report(label: &str) -> String {
+    format!("account {label} needs re-login — its refresh token is dead; run: claude /login")
+}
+
+/// Surface each confirmed unrecoverable death (issue #261) to the operator on the two channels
+/// the file log cannot reach: the foreground `run`'s stderr (matching the `sessiometer: …` swap
+/// reports) and a macOS user notification for the background-agent case (#168/#169 menubar
+/// direction). Both carry [`unrecoverable_report`] (handle + `claude /login`, label only), so no
+/// token or email can travel (#15). Best-effort and non-fatal: the daemon must outlive a failed
+/// notification, so a macOS spawn error is swallowed and the console line is the reliable channel.
+fn notify_unrecoverable(labels: &[String]) {
+    for label in labels {
+        let report = unrecoverable_report(label);
+        eprintln!("sessiometer: {report}");
+        notify_macos("Sessiometer: account needs re-login", &report);
+    }
+}
+
+/// Fire a best-effort macOS `display notification` via `osascript`, fire-and-forget. Uses
+/// `tokio::process` (this runs inside the run-loop's runtime) and does NOT await the child —
+/// tokio's reaper collects it, so a slow/hung `osascript` can never wedge the loop and no zombie
+/// accrues. The message and title are passed as `argv` to an `on run argv` script, NEVER
+/// interpolated into the `-e` source: an account label is charset-unrestricted, so interpolation
+/// would let a `"`-bearing label break — or inject — the AppleScript. A spawn failure (no
+/// `osascript`, not a macOS GUI session) is swallowed: the console line above is the reliable
+/// channel, the notification a best-effort upgrade.
+fn notify_macos(title: &str, body: &str) {
+    let _ = tokio::process::Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "display notification (item 1 of argv) with title (item 2 of argv)",
+            "-e",
+            "end run",
+            body,
+            title,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Drive the poll loop until shutdown.
@@ -399,7 +464,11 @@ where
         let (idle, refresh_restored, refresh_observations) =
             idle_until_next_tick(daemon, log, &mut seams, &snapshot, next_wait).await;
 
-        apply_post_idle(daemon, log, &refresh_restored, &refresh_observations);
+        // Apply the deferred mutations + log this cycle's edges, then surface any newly-confirmed
+        // unrecoverable death (#261) to the operator from here — the async context `notify_macos`
+        // needs to fire-and-forget its `osascript` child.
+        let unrecoverable = apply_post_idle(daemon, log, &refresh_restored, &refresh_observations);
+        notify_unrecoverable(&unrecoverable);
 
         match idle {
             Idle::Shutdown => return Ok(()),

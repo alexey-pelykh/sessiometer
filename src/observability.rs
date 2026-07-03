@@ -358,6 +358,21 @@ pub(crate) enum Event {
     /// it and returned it to the rotation (issue #42). Edge-triggered: exactly ONCE
     /// on the recovery transition. `account` is the HANDLE — never a token or email.
     CredentialRestored { account: String },
+    /// `account`'s refresh token is confirmed DEAD and UNRECOVERABLE by automation: a
+    /// quarantined account's isolated #106-sweep refresh returned `outcome=dead` (the
+    /// stored refresh token is revoked/empty), so no daemon path can revive it — only
+    /// an operator `claude /login` mints a new one (issue #261).
+    ///
+    /// Distinct from [`Event::CredentialDead`], and the distinction is load-bearing:
+    /// `credential_dead` is the QUARANTINE edge (the access token was rejected
+    /// `monitor_401_n` times) and is NOT terminal — it still auto-recovers via the
+    /// #106 sweep, spontaneous revival, or a re-login. `credential_unrecoverable` fires
+    /// only once those automated recoveries are EXHAUSTED (the sweep's own refresh came
+    /// back dead), so it is the operator's cue to act. Edge-triggered: exactly ONCE per
+    /// quarantine episode (a sticky per-account latch, reset when the account
+    /// re-quarantines), never per sweep re-probe. `account` is the HANDLE (operator
+    /// label) — never a token or email (issue #15).
+    CredentialUnrecoverable { account: String },
     /// The keychain was locked when the daemon went to read the canonical
     /// credential, so this tick's work is deferred and the daemon backs off (issue
     /// #13). Edge-triggered: emitted ONCE when the lock is first observed, not every
@@ -510,6 +525,9 @@ impl Event {
             }
             Event::CredentialRestored { account } => {
                 format!("ts={ts} event=credential_restored account={account}")
+            }
+            Event::CredentialUnrecoverable { account } => {
+                format!("ts={ts} event=credential_unrecoverable account={account}")
             }
             Event::KeychainLockedWait => {
                 format!("ts={ts} event=keychain_locked_wait")
@@ -1192,6 +1210,18 @@ mod tests {
         assert_eq!(
             line,
             format!("{TS0} event=credential_restored account=work")
+        );
+    }
+
+    #[test]
+    fn credential_unrecoverable_carries_only_the_account_handle() {
+        let line = Event::CredentialUnrecoverable {
+            account: "work".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=credential_unrecoverable account=work")
         );
     }
 
