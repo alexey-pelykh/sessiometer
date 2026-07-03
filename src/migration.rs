@@ -1618,4 +1618,193 @@ mod tests {
         assert_eq!(KdfCost::PRODUCTION.iterations, ARGON2_ITERATIONS);
         assert_eq!(KdfCost::PRODUCTION.parallelism, ARGON2_PARALLELISM);
     }
+
+    // --- Cross-version golden fixtures (issue #198 / ADR-0006) ----------------
+    //
+    // The byte-frozen v1 baseline. EVERY crypto test above round-trips within ONE
+    // binary — it encrypts and decrypts with the SAME `Header`/`Payload` definition,
+    // so the AAD (the whole serialized header, `Header::associated_data`) is
+    // self-consistent by construction and CANNOT witness a future struct change that
+    // silently alters those bytes. The tests below instead read artifact bytes FROZEN
+    // ONCE from the current tree and thereafter only READ them, so a later
+    // `Header`/`Payload`/`Body` change that breaks parsing (plaintext) or shifts the
+    // AAD (encrypted) fails HERE — the exact cross-definition regression #198 exists to
+    // catch, which no same-binary round-trip can.
+
+    /// The synthetic passphrase the committed encrypted fixture was sealed under, and
+    /// the one its reading test decrypts it with. NOT a secret — it is committed on
+    /// purpose so CI can decrypt the frozen bytes; obviously-a-test by construction.
+    const FIXTURE_PASSPHRASE: &str = "sessiometer-v1-golden-fixture-not-a-real-secret";
+
+    /// The `format_version` the committed fixtures were frozen at. Coupled to
+    /// [`FORMAT_VERSION`]: the pin test asserts BOTH that every fixture's on-disk
+    /// version equals this AND that this equals the live `FORMAT_VERSION`, so a
+    /// `FORMAT_VERSION` bump cannot land without refreshing the fixtures (and this
+    /// constant) in the same change.
+    const EXPECTED_FIXTURE_VERSION: u16 = 1;
+
+    /// The frozen v1 PLAINTEXT artifact bytes — committed, read-only. `include_str!`
+    /// makes the file a compile-time input, so it must exist before this module
+    /// compiles (emit once via [`emit_v1_golden_fixtures`]).
+    const PLAINTEXT_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/migration-v1-plaintext.json"
+    ));
+
+    /// The frozen v1 ENCRYPTED artifact bytes — committed, read-only. Sealed at the
+    /// trivial test cost under [`FIXTURE_PASSPHRASE`].
+    const ENCRYPTED_FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/migration-v1-encrypted.json"
+    ));
+
+    /// The exact synthetic payload the committed fixtures were built from — the pinned
+    /// expectation both reading tests compare against. Deliberately a DEDICATED
+    /// function, NOT [`sample_payload`]: the fixtures are frozen bytes, so their
+    /// expectation must not silently move if `sample_payload` is later edited for other
+    /// tests. Includes non-ASCII `oauth_account` bytes so the hex codec's handling of
+    /// bytes `>= 0x80` is frozen too. Any edit here MUST be paired with a fixture
+    /// refresh (re-run [`emit_v1_golden_fixtures`]).
+    fn expected_fixture_payload() -> Payload {
+        Payload {
+            config_toml: "[tunables]\npoll_secs = 300\n\n\
+                          [[account]]\naccount_uuid = \"fixture-1\"\nlabel = \"work\"\nenabled = true\n\n\
+                          [[account]]\naccount_uuid = \"fixture-2\"\nlabel = \"spare\"\nenabled = false\n"
+                .to_owned(),
+            accounts: vec![
+                ManagedAccount {
+                    account_uuid: "fixture-1".to_owned(),
+                    credential: br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-SYNTHETIC-FIXTURE"}}"#.to_vec(),
+                    oauth_account: "{\"accountUuid\":\"fixture-1\",\"displayName\":\"Cafe\u{301} \u{41e}\u{43b}\u{435}\u{43a}\u{441}i\u{439}\"}"
+                        .as_bytes()
+                        .to_vec(),
+                },
+                ManagedAccount {
+                    account_uuid: "fixture-2".to_owned(),
+                    credential: br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-SYNTHETIC-TWO"}}"#.to_vec(),
+                    oauth_account: br#"{"accountUuid":"fixture-2"}"#.to_vec(),
+                },
+            ],
+        }
+    }
+
+    /// One-time emitter for the committed golden fixtures. `#[ignore]` — it is NOT part
+    /// of the suite; it WRITES the frozen bytes the reading tests below consume.
+    ///
+    /// Run manually with:
+    /// `cargo test -- --ignored emit_v1_golden_fixtures`
+    ///
+    /// Run this ONLY alongside a deliberate `FORMAT_VERSION` bump (and bump
+    /// [`EXPECTED_FIXTURE_VERSION`] to match). The encrypt path draws a FRESH random
+    /// salt and nonce every call, so re-emitting produces DIFFERENT bytes —
+    /// regenerating the fixture on any other occasion silently replaces the frozen
+    /// baseline with a new same-binary capture and masks exactly the cross-definition
+    /// regression the fixture exists to catch. Freeze once; thereafter only read.
+    #[test]
+    #[ignore = "one-time fixture emitter — run ONLY alongside a deliberate FORMAT_VERSION bump"]
+    fn emit_v1_golden_fixtures() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/fixtures");
+        std::fs::create_dir_all(&dir).expect("create build/fixtures");
+
+        // Plaintext: deterministic (no salt/nonce) — re-emitting is byte-identical.
+        let plaintext = MigrationArtifact::plaintext(expected_fixture_payload()).to_bytes();
+        std::fs::write(dir.join("migration-v1-plaintext.json"), &plaintext)
+            .expect("write plaintext fixture");
+
+        // Encrypted at the trivial test cost, sealed under the committed passphrase.
+        // Fresh random salt+nonce each run — hence the one-time, read-only discipline.
+        let encrypted = MigrationArtifact::encrypt_with(
+            &expected_fixture_payload(),
+            &test_passphrase(FIXTURE_PASSPHRASE),
+            TEST_M,
+            TEST_T,
+            TEST_P,
+        )
+        .expect("encrypt fixture")
+        .to_bytes();
+        std::fs::write(dir.join("migration-v1-encrypted.json"), &encrypted)
+            .expect("write encrypted fixture");
+    }
+
+    #[test]
+    fn the_frozen_v1_plaintext_fixture_still_parses_to_its_payload() {
+        // Reads the COMMITTED bytes (never regenerated in-run). A future magic /
+        // version-gate / `Body` / `Payload` parse break fails here.
+        let restored = MigrationArtifact::from_bytes(PLAINTEXT_FIXTURE.as_bytes())
+            .expect("the frozen v1 plaintext fixture must still parse")
+            .into_plaintext_payload()
+            .expect("the frozen v1 plaintext fixture must still yield its payload");
+        // No `Debug` on `Payload` (secrets) → compare with `==`, not `assert_eq!`.
+        assert!(
+            restored == expected_fixture_payload(),
+            "the frozen v1 plaintext fixture no longer round-trips to its payload"
+        );
+    }
+
+    #[test]
+    fn the_frozen_v1_encrypted_fixture_still_decrypts() {
+        // The load-bearing gate. Reads the COMMITTED encrypted bytes and decrypts with
+        // the committed passphrase. The whole `Header` is bound as AEAD associated data
+        // (`Header::associated_data`), so a future header change that shifts those bytes
+        // — reorder / rename / retype a field, or add a populated one — reconstructs a
+        // DIFFERENT AAD, the Poly1305 tag no longer verifies, and this decrypt fails. No
+        // same-binary round-trip above can witness that; only frozen bytes can.
+        let restored = MigrationArtifact::from_bytes(ENCRYPTED_FIXTURE.as_bytes())
+            .expect("the frozen v1 encrypted fixture must still parse");
+        let decrypted = restored
+            .decrypt(&test_passphrase(FIXTURE_PASSPHRASE))
+            .expect(
+                "the frozen v1 encrypted fixture must still decrypt — a failure here means a \
+             Header change shifted the AAD bytes and broke every already-written artifact",
+            );
+        assert!(
+            decrypted == expected_fixture_payload(),
+            "the frozen v1 encrypted fixture no longer decrypts to its payload"
+        );
+    }
+
+    #[test]
+    fn the_frozen_fixtures_are_pinned_to_the_expected_format_version() {
+        // Each fixture's on-disk version is the frozen one...
+        for (label, fixture) in [
+            ("plaintext", PLAINTEXT_FIXTURE),
+            ("encrypted", ENCRYPTED_FIXTURE),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(fixture)
+                .unwrap_or_else(|e| panic!("the {label} fixture is not valid JSON: {e}"));
+            assert_eq!(
+                value["header"]["format_version"].as_u64(),
+                Some(u64::from(EXPECTED_FIXTURE_VERSION)),
+                "the {label} fixture's on-disk format_version drifted from the pin"
+            );
+        }
+        // ...and the pin tracks the CURRENT code version, so a `FORMAT_VERSION` bump
+        // cannot land without refreshing the fixtures + this constant together.
+        assert_eq!(
+            EXPECTED_FIXTURE_VERSION, FORMAT_VERSION,
+            "FORMAT_VERSION was bumped: re-emit the golden fixtures (run the ignored \
+             emit_v1_golden_fixtures) and update EXPECTED_FIXTURE_VERSION to match"
+        );
+    }
+
+    #[test]
+    fn a_future_version_stamped_onto_frozen_bytes_hits_the_exact_match_island() {
+        // The exact-match version gate proven on REAL committed bytes: take the frozen
+        // plaintext fixture, stamp a future `format_version` onto it, and confirm the
+        // typed rejection carries the found + supported versions (never an opaque parse
+        // failure). Self-adjusting: always tests "current + 1".
+        let mut value: serde_json::Value =
+            serde_json::from_str(PLAINTEXT_FIXTURE).expect("the frozen fixture is valid JSON");
+        value["header"]["format_version"] = serde_json::json!(FORMAT_VERSION + 1);
+        let future = serde_json::to_vec(&value).unwrap();
+        match MigrationArtifact::from_bytes(&future) {
+            Err(Error::MigrationUnsupportedVersion { found, supported }) => {
+                assert_eq!(found, FORMAT_VERSION + 1);
+                assert_eq!(supported, FORMAT_VERSION);
+            }
+            // `MigrationArtifact` has no `Debug`; never format the `Ok` value.
+            Err(other) => panic!("expected MigrationUnsupportedVersion, got {other:?}"),
+            Ok(_) => panic!("expected MigrationUnsupportedVersion, got Ok"),
+        }
+    }
 }
