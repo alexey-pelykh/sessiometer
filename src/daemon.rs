@@ -147,11 +147,11 @@ pub(crate) use socket::{control_reply, serve_control, MAX_CONTROL_LINE_BYTES};
 mod run_loop;
 
 pub(crate) use run_loop::run_loop;
-// `swap_report` is exercised only by the in-module run-loop tests (production calls it inside
-// `run_loop`); re-export test-scoped so `use super::*` resolves it while a non-test build sees
-// no unused re-export.
+// `swap_report` / `unrecoverable_report` are exercised only by the in-module run-loop tests
+// (production calls them inside `run_loop`); re-export test-scoped so `use super::*` resolves them
+// while a non-test build sees no unused re-export.
 #[cfg(test)]
-pub(crate) use run_loop::swap_report;
+pub(crate) use run_loop::{swap_report, unrecoverable_report};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
 /// config's `session_trigger` range so a jittered draw can never escape it.
@@ -859,6 +859,19 @@ pub(crate) struct AccountHealth {
     /// UNSEEDED — the first computation seeds it WITHOUT emitting (there is no prior state
     /// to transition from), so a fresh daemon does not log a startup storm.
     last_health: Option<CredentialHealth>,
+    /// Edge-trigger latch for the unrecoverable-death signal (issue #261): set when a
+    /// quarantined account's isolated #106-sweep refresh returns `Dead` and the daemon
+    /// emits [`Event::CredentialUnrecoverable`], and CLEARED when the account
+    /// (re-)quarantines (the single set site of [`quarantined`](Self::quarantined) in
+    /// [`note_poll_outcome`](Daemon::note_poll_outcome)). So the signal fires exactly ONCE
+    /// per quarantine episode — not once per sweep re-probe of a still-dead token — and
+    /// fires afresh if the account recovers and dies again. Mirrors the daemon-level
+    /// [`DecisionState::signaled_all_exhausted`] idiom, but PER-ACCOUNT (a dead refresh
+    /// token is an account-scoped fact). Keyed on this latch, NOT on
+    /// [`last_refresh_outcome`](Self::last_refresh_outcome): that field flaps `Dead`↔`Error`
+    /// on a transient sweep failure and survives an un-quarantine, so keying the edge off it
+    /// would both double-fire and miss-fire.
+    unrecoverable_signaled: bool,
 }
 
 /// Per-loop decision state carried across polls.
@@ -1807,6 +1820,11 @@ where
                 // The Nth consecutive non-scope 401 declares the credential DEAD.
                 if consecutive >= u32::from(self.monitor_401_n) {
                     self.state.health[i].quarantined = true;
+                    // Open a fresh unrecoverable-death episode (issue #261): this account
+                    // may later be confirmed unrecoverable by a dead sweep-refresh, and the
+                    // #261 latch must be armed for THIS quarantine, having been left set by
+                    // any prior episode. Reset here, the single quarantine-SET site.
+                    self.state.health[i].unrecoverable_signaled = false;
                     events.push(Event::CredentialDead {
                         account: self.roster[i].label.clone(),
                     });
@@ -2549,32 +2567,51 @@ where
     /// (`observation.refresh` is `Some`): a `Dead` / `Error` outcome advances the
     /// consecutive-failure streak; any alive outcome resets it — so the streak the rollup's
     /// `AtRisk` keys off counts only CONSECUTIVE failures.
-    fn apply_refresh_observation(&mut self, observation: &RefreshObservation) {
-        let Some(idx) = self
+    ///
+    /// Returns [`Event::CredentialUnrecoverable`] on the ONE observation that first confirms a
+    /// QUARANTINED account's refresh token is dead — the sweep's isolated refresh came back
+    /// `Dead`, so no automated path revives it and only an operator `claude /login` can (issue
+    /// #261). Gated by the sticky per-account [`AccountHealth::unrecoverable_signaled`] latch so
+    /// the caller emits the operator signal exactly once per quarantine episode, never per sweep
+    /// re-probe. Every other observation returns `None` (mirroring [`Self::apply_refresh_restore`]'s
+    /// `Option<Event>` shape, so the caller emits uniformly).
+    fn apply_refresh_observation(&mut self, observation: &RefreshObservation) -> Option<Event> {
+        let idx = self
             .roster
             .iter()
-            .position(|a| a.account_uuid == observation.account_uuid)
-        else {
-            return;
-        };
+            .position(|a| a.account_uuid == observation.account_uuid)?;
         let health = &mut self.state.health[idx];
         // ms → s at the boundary; the rollup/wire are uniform epoch seconds.
         health.access_expires_at = observation.expires_at_ms.map(|ms| ms / 1000);
-        if let Some(delta) = observation.refresh {
-            health.last_refresh_outcome = Some(delta.outcome);
-            health.refresh_token_rotated = Some(delta.token_rotated);
-            match delta.outcome {
-                RefreshEventOutcome::Dead | RefreshEventOutcome::Error => {
-                    health.consecutive_refresh_failures =
-                        health.consecutive_refresh_failures.saturating_add(1);
-                }
-                RefreshEventOutcome::Refreshed
-                | RefreshEventOutcome::RefreshedNotReStashed
-                | RefreshEventOutcome::NoChange => {
-                    health.consecutive_refresh_failures = 0;
-                }
+        let delta = observation.refresh?;
+        health.last_refresh_outcome = Some(delta.outcome);
+        health.refresh_token_rotated = Some(delta.token_rotated);
+        match delta.outcome {
+            RefreshEventOutcome::Dead | RefreshEventOutcome::Error => {
+                health.consecutive_refresh_failures =
+                    health.consecutive_refresh_failures.saturating_add(1);
+            }
+            RefreshEventOutcome::Refreshed
+            | RefreshEventOutcome::RefreshedNotReStashed
+            | RefreshEventOutcome::NoChange => {
+                health.consecutive_refresh_failures = 0;
             }
         }
+        // Issue #261: a QUARANTINED account whose isolated sweep-refresh returns `Dead` is
+        // confirmed unrecoverable. Fire the operator signal once per quarantine episode — the
+        // latch (reset on re-quarantine in `note_poll_outcome`) suppresses the re-probe repeats
+        // and the `Dead`↔`Error` flap. Keyed on the latch, deliberately NOT on the prior
+        // `last_refresh_outcome`, which is orthogonal to the quarantine lifecycle.
+        let signal = delta.outcome == RefreshEventOutcome::Dead
+            && health.quarantined
+            && !health.unrecoverable_signaled;
+        if signal {
+            health.unrecoverable_signaled = true;
+        }
+        // The `&mut health` borrow ends at its last use above (NLL); read the label off `roster`.
+        signal.then(|| Event::CredentialUnrecoverable {
+            account: self.roster[idx].label.clone(),
+        })
     }
 
     /// Read the just-polled account's stored access-token expiry (epoch SECONDS, issue
@@ -6428,6 +6465,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrecoverable_signal_fires_once_and_only_when_quarantined() {
+        // Issue #261: a QUARANTINED account whose isolated sweep-refresh returns `Dead` is
+        // confirmed unrecoverable — `apply_refresh_observation` yields `credential_unrecoverable`
+        // ONCE per quarantine episode, never per re-probe (AC2), and never for a non-quarantined
+        // account (the AC's scope gate). The handle is the operator label only (AC3/#15).
+        use crate::contract::RefreshDelta;
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let obs = |uuid: &str, outcome| RefreshObservation {
+            account_uuid: uuid.to_owned(),
+            expires_at_ms: Some(1_782_777_600_000),
+            refresh: Some(RefreshDelta {
+                outcome,
+                token_rotated: false,
+            }),
+        };
+
+        // A non-quarantined account's dead sweep-refresh does NOT notify — that is the #119
+        // refresh-detected death the rollup surfaces, deliberately outside #261's console/macOS
+        // operator-signal scope.
+        assert_eq!(
+            daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Dead)),
+            None
+        );
+        assert!(!daemon.state.health[0].unrecoverable_signaled);
+
+        // Quarantine account 0 (the #42 verdict); the next dead sweep-refresh CONFIRMS it
+        // unrecoverable → exactly one event, named by handle only.
+        daemon.state.health[0].quarantined = true;
+        assert_eq!(
+            daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Dead)),
+            Some(Event::CredentialUnrecoverable {
+                account: "work".to_owned(),
+            })
+        );
+        assert!(daemon.state.health[0].unrecoverable_signaled);
+
+        // Every subsequent re-probe of the still-dead token is SILENT — INCLUDING a
+        // `Dead`→`Error`→`Dead` flap, which a naive last-outcome guard would double-fire on (a
+        // transient sweep `Error` between dead probes must not re-arm the signal).
+        assert_eq!(
+            daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Dead)),
+            None
+        );
+        assert_eq!(
+            daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Error)),
+            None
+        );
+        assert_eq!(
+            daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Dead)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_latch_resets_on_requarantine_so_the_signal_can_refire() {
+        // Issue #261: the latch is reset at the single quarantine-SET site, so each NEW quarantine
+        // episode re-arms the signal. This covers two regressions a `last_refresh_outcome`-based
+        // guard fails: (b) a sweep that saw `Dead` BEFORE the account quarantined must STILL fire
+        // once it does, and (a) a recover→re-die must re-fire.
+        use crate::contract::RefreshDelta;
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let dead = |uuid: &str| RefreshObservation {
+            account_uuid: uuid.to_owned(),
+            expires_at_ms: Some(1_782_777_600_000),
+            refresh: Some(RefreshDelta {
+                outcome: RefreshEventOutcome::Dead,
+                token_rotated: false,
+            }),
+        };
+        let mut events = Vec::new();
+        // Drive account `i` into quarantine through the real poll path (monitor_401_n = 3): the
+        // Nth consecutive 401 sets `quarantined` AND resets the #261 latch.
+        let quarantine = |d: &mut FakeDaemon, i: usize, sink: &mut Vec<Event>| {
+            for _ in 0..3 {
+                d.note_poll_outcome(i, &Err(Error::UsageUnauthorized), sink);
+            }
+        };
+
+        // (b) The sweep sees `Dead` while account 0 is NOT yet quarantined: no signal, but
+        // `last_refresh_outcome` is now `Some(Dead)` — the state that would poison a naive guard.
+        assert_eq!(daemon.apply_refresh_observation(&dead("u-A")), None);
+        assert_eq!(
+            daemon.state.health[0].last_refresh_outcome,
+            Some(RefreshEventOutcome::Dead)
+        );
+
+        // The access token then 401-streaks account 0 into quarantine; the SET clears the latch.
+        quarantine(&mut daemon, 0, &mut events);
+        assert!(daemon.state.health[0].quarantined);
+        assert!(!daemon.state.health[0].unrecoverable_signaled);
+        // Despite `last_refresh_outcome` ALREADY being `Dead`, the next dead sweep FIRES — the
+        // latch, not the outcome history, gates the edge.
+        assert_eq!(
+            daemon.apply_refresh_observation(&dead("u-A")),
+            Some(Event::CredentialUnrecoverable {
+                account: "work".to_owned(),
+            })
+        );
+
+        // (a) Recover (an operator re-login un-quarantines) then re-die: the fresh episode re-fires.
+        daemon.state.health[0].quarantined = false;
+        daemon.state.health[0].consec_401 = 0;
+        quarantine(&mut daemon, 0, &mut events);
+        assert!(!daemon.state.health[0].unrecoverable_signaled);
+        assert_eq!(
+            daemon.apply_refresh_observation(&dead("u-A")),
+            Some(Event::CredentialUnrecoverable {
+                account: "work".to_owned(),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn poll_populates_the_display_expiry_clock_without_the_refresh_tick() {
         // Issue #141: with `[refresh]` OFF (no `RefreshObservation` ever folded — the refresh
         // engine, the field's only OTHER writer, is off by default), the poll path alone must
@@ -7061,6 +7211,25 @@ mod tests {
         assert_eq!(swap_report(&outcome(TickAction::NoViableTarget)), None);
         // A dead active account with no viable target holds — no console echo.
         assert_eq!(swap_report(&outcome(TickAction::ActiveDeadNoTarget)), None);
+    }
+
+    #[test]
+    fn unrecoverable_report_names_the_handle_and_the_relogin_action() {
+        // Issue #261 AC1/AC3: the operator message names the account HANDLE and the fix
+        // (`claude /login`), and is sourced from the LABEL alone — no token or email (#15). Both
+        // operator channels (console + macOS) carry this exact string, so testing it covers both.
+        let line = unrecoverable_report("work");
+        assert!(line.contains("work"), "must name the handle: {line}");
+        assert!(
+            line.contains("claude /login"),
+            "must name the fix action: {line}"
+        );
+        // The whole message is the handle interpolated into a fixed non-secret template — a label
+        // is the ONLY dynamic input, mirroring `Event::CredentialUnrecoverable`'s redaction.
+        assert_eq!(
+            line,
+            "account work needs re-login — its refresh token is dead; run: claude /login"
+        );
     }
 
     #[tokio::test]
