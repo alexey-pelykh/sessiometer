@@ -241,6 +241,13 @@ where
                 // status query should neither forfeit a token nor be able to starve the
                 // sweep). `wait` is pinned OUTSIDE this loop, so a sweep does not reset the
                 // poll cadence; after it the loop idles on until the wait elapses.
+                //
+                // #260: this arm is intentionally RE-CREATED each iteration (unlike the pinned
+                // `wait`), so a shorter-cadence sibling wake — the 15 s `login_watch` below, or a
+                // control read — rebuilds it mid-floor. `RefreshTick` anchors its idle floor to an
+                // ABSOLUTE instant precisely so that re-creation SHRINKS the remaining wait rather
+                // than resetting it to a full `idle_after`; a refactor that pins or reorders this
+                // arm must preserve that coupling or the sweep can starve again.
                 () = refresh.until_due() => {
                     tokio::select! {
                         biased;

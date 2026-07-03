@@ -69,10 +69,10 @@ const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
 /// (`expiresAt`-delta + RT-rotation, the #102 [`crate::refresh::RefreshReport`]) pins the
 /// server TTL; the #104 `poke` all-accounts horizon used the same one hour for the same reason.
 const DEFAULT_REFRESH_CADENCE_SECS: u64 = 3600;
-/// Default seconds the daemon must sit idle (no poll/usage/swap tick) before a refresh
-/// tick fires (issue #105). **Provisional** like the cadence: one minute keeps the refresh
-/// off the freshly-finished poll→usage→swap seam — it runs in the quiet part of the idle
-/// gap — without waiting out a whole poll interval. Re-tune with the cadence.
+/// Default seconds the daemon must idle before a refresh sweep fires (issue #105).
+/// **Provisional** like the cadence: one minute lets the idle floor — anchored absolutely
+/// since #260, so it accumulates rather than resetting on each idle re-arm — elapse soon after
+/// start-up without waiting out a whole poll interval. Re-tune with the cadence.
 const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
 /// Default seconds bounding ONE account's whole isolated-refresh cycle (issue #105). The
 /// engine's internal `claude -p` spawn budget is ~40 s (#102); ninety seconds leaves
@@ -306,9 +306,12 @@ pub(crate) struct RefreshConfig {
     /// TTL-aware threshold (#104 left the all-accounts horizon provisional for #105 to own).
     /// **Provisional default** ([`DEFAULT_REFRESH_CADENCE_SECS`]) pending #101's TTL.
     pub(crate) cadence_secs: u64,
-    /// Seconds the daemon must sit idle (since the last poll→usage→swap tick) before a refresh
-    /// fires (issue #105) — so the refresh runs in the quiet part of the idle gap, off the
-    /// seam. **Provisional default** ([`DEFAULT_REFRESH_IDLE_AFTER_SECS`]).
+    /// Seconds the daemon must idle before a refresh sweep fires (issue #105). Anchored
+    /// absolutely since #260: the idle floor no longer restarts on every idle re-arm (the 15 s
+    /// login-watch, a control read), so it accumulates across the idle gap instead of resetting
+    /// off the poll→usage→swap seam — which bounds primarily the FIRST sweep after a (re)start,
+    /// after which steady-state sweeps fire on the cadence alone. **Provisional default**
+    /// ([`DEFAULT_REFRESH_IDLE_AFTER_SECS`]).
     pub(crate) idle_after_secs: u64,
     /// Seconds bounding ONE account's whole isolated-refresh cycle (issue #105); a cycle that
     /// exceeds it is cancelled (engine RAII teardown still runs) and reported as a non-fatal
@@ -993,8 +996,8 @@ impl Config {
         );
         out.push_str(&format!("cadence_secs = {}\n", r.cadence_secs));
         out.push_str(
-            "# Seconds the daemon must sit idle (no poll/swap) before a refresh fires\n\
-             # (0..=3600) — keeps it in the quiet part of the idle gap. Provisional.\n",
+            "# Seconds the daemon must idle before the first refresh sweep after start-up\n\
+             # (0..=3600); anchored absolutely (#260), then sweeps recur on cadence. Provisional.\n",
         );
         out.push_str(&format!("idle_after_secs = {}\n", r.idle_after_secs));
         out.push_str(

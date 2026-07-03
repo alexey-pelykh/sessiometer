@@ -9,9 +9,9 @@
 //!
 //! ## What it does each cycle
 //!
-//! Between poll ticks, once the daemon has been idle for `idle_after_secs` AND a full
-//! `cadence_secs` has elapsed since the last refresh, it sweeps the roster for *due*
-//! accounts and runs one isolated-refresh cycle per account through the engine
+//! Between poll ticks, once the idle floor `idle_after_secs` (anchored absolutely since #260)
+//! AND a full `cadence_secs` since the last refresh have both elapsed, it sweeps the roster
+//! for *due* accounts and runs one isolated-refresh cycle per account through the engine
 //! ([`crate::refresh::refresh_account`]). An account is **due** when:
 //!   - it is not excluded (the daemon passes the active account + the imminent swap target
 //!     — the engine Caller contract's "parked only"; the swap lock the engine holds covers
@@ -119,6 +119,13 @@ pub(crate) struct RefreshTick<E, K> {
     /// When the last sweep ran (this clock's `Instant`), or `None` until the first — the
     /// cadence anchor. `None` makes the first sweep due as soon as the idle floor is met.
     last_refresh: Option<Instant>,
+    /// The absolute anchor for the idle floor (issue #260): the `Instant` the current idle
+    /// window started. Seeded lazily on the first [`until_due`](RefreshTicker::until_due) of a
+    /// window and cleared after each [`sweep`](RefreshTicker::sweep). The idle-floor term of
+    /// [`delay_until_due`](Self::delay_until_due) counts down toward `idle_anchor + idle_after`,
+    /// so a `until_due` future the run loop RE-CREATES every idle iteration sees a SHRINKING
+    /// delay rather than a fresh full floor — the fix for the 15s-login-watch starvation.
+    idle_anchor: Option<Instant>,
 }
 
 impl<E, K> RefreshTick<E, K> {
@@ -137,6 +144,7 @@ impl<E, K> RefreshTick<E, K> {
             engine,
             clock,
             last_refresh: None,
+            idle_anchor: None,
         }
     }
 
@@ -144,11 +152,23 @@ impl<E, K> RefreshTick<E, K> {
     /// never sooner than a full cadence since the last refresh. With no prior refresh the
     /// cadence term is zero, so the first sweep waits only the idle floor.
     ///
-    /// The cadence term is anchored ABSOLUTELY (from `last_refresh`) so control-socket
-    /// activity that re-arms this wait cannot let refreshes outrun the cadence; the idle
-    /// floor is relative to `now`, so each re-arm restarts the "quiet since last activity"
-    /// clock — the intended semantics of `idle_after_secs`.
-    fn delay_until_due(&self, now: Instant) -> Duration {
+    /// BOTH terms are anchored ABSOLUTELY (issue #260). The cadence term counts from
+    /// `last_refresh`, so control-socket activity that re-arms this wait cannot let refreshes
+    /// outrun the cadence. The idle-floor term counts from `idle_anchor` (the start of the
+    /// current idle window), NOT from `now`, so the run loop RE-CREATING this wait every idle
+    /// iteration cannot reset it: a shorter-cadence sibling wake (the 15s external-login watch,
+    /// the poll `wait`) merely re-enters with a larger `now`, SHRINKING the remaining floor
+    /// toward zero rather than restarting it at a full `idle_after`. Before #260 the idle floor
+    /// was relative to `now`, and the 15s watch re-armed it below 60 s forever — starving the
+    /// sweep so it effectively never fired.
+    ///
+    /// Consequence of the absolute idle anchor: `idle_after` bounds primarily the FIRST sweep
+    /// after a (re)start — and, after a sweep, until the anchor ages past it — while steady-state
+    /// sweeps then fire on the cadence alone (effectively "sweep once `max(idle_after, cadence)`
+    /// has elapsed since the last sweep"). Dropping the per-sweep idle debounce is safe: the
+    /// sweep already excludes the active account and the imminent swap target and runs only in
+    /// the idle path off the poll→usage→swap seam.
+    fn delay_until_due(&self, now: Instant, idle_anchor: Instant) -> Duration {
         let cadence_remaining = match self.last_refresh {
             Some(last) => self
                 .config
@@ -156,7 +176,11 @@ impl<E, K> RefreshTick<E, K> {
                 .saturating_sub(now.saturating_duration_since(last)),
             None => Duration::ZERO,
         };
-        self.config.idle_after().max(cadence_remaining)
+        let idle_remaining = self
+            .config
+            .idle_after()
+            .saturating_sub(now.saturating_duration_since(idle_anchor));
+        idle_remaining.max(cadence_remaining)
     }
 
     /// Whether `account` is named in the `accounts` allowlist — by `list` label OR
@@ -289,7 +313,12 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
             std::future::pending::<()>().await;
             return;
         }
-        let delay = self.delay_until_due(self.clock.now());
+        let now = self.clock.now();
+        // Seed the idle-floor anchor on the first re-arm of this idle window; later re-arms reuse
+        // it, so a sub-`idle_after` sibling wake (the 15s login watch) shrinks the floor toward
+        // zero rather than resetting it to a full `idle_after` — the #260 fix.
+        let anchor = *self.idle_anchor.get_or_insert(now);
+        let delay = self.delay_until_due(now, anchor);
         self.clock.tick(delay).await;
     }
 
@@ -301,6 +330,9 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
         // Anchor the cadence from the END of the sweep, so a long sweep does not let the
         // next one start early.
         self.last_refresh = Some(self.clock.now());
+        // Clear the idle-floor anchor so the next idle window re-seeds it (issue #260); until the
+        // cadence is nearly elapsed the cadence term dominates the idle floor anyway.
+        self.idle_anchor = None;
         outcome
     }
 }
@@ -434,6 +466,24 @@ mod tests {
         async fn tick(&self, _interval: Duration) {}
     }
 
+    /// A [`Clock`] on tokio's VIRTUAL timeline (issue #260 regression harness): `now` reads a
+    /// `tokio::time::Instant` — which `#[tokio::test(start_paused = true)]` advances in lockstep
+    /// with virtual sleeps — bridged to `std::time::Instant` via `into_std`. This is the load-
+    /// bearing difference from [`crate::contract::RealClock`], whose `now` reads
+    /// `std::time::Instant::now()` that `pause()` does NOT freeze-advance: under a paused runtime
+    /// a `RealClock` would report a frozen `now`, so the anchored idle floor would never shrink
+    /// and the race below would falsely starve. Behaviourally identical to `RealClock` in
+    /// production (both track wall-clock); they diverge only under a paused test runtime.
+    struct TokioClock;
+    impl Clock for TokioClock {
+        fn now(&self) -> Instant {
+            tokio::time::Instant::now().into_std()
+        }
+        async fn tick(&self, interval: Duration) {
+            tokio::time::sleep(interval).await;
+        }
+    }
+
     /// What a faked refresh cycle returns for an account.
     #[derive(Clone, Copy)]
     enum FakeRefresh {
@@ -526,9 +576,11 @@ mod tests {
 
     #[test]
     fn first_refresh_waits_only_the_idle_floor() {
-        // No prior refresh → the cadence term is zero, so the wait is the idle floor.
+        // No prior refresh → the cadence term is zero, so a freshly-anchored window (anchor ==
+        // now) waits the full idle floor.
         let t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
-        assert_eq!(t.delay_until_due(t.clock.now()), Duration::from_secs(60));
+        let now = t.clock.now();
+        assert_eq!(t.delay_until_due(now, now), Duration::from_secs(60));
     }
 
     #[test]
@@ -536,19 +588,92 @@ mod tests {
         let base = Instant::now();
         let mut t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
         t.last_refresh = Some(base);
-        // 100 s after a refresh: ~3500 s of cadence remain, well above the 60 s idle floor.
-        let delay = t.delay_until_due(base + Duration::from_secs(100));
+        // 100 s after a refresh (anchor ≈ the sweep instant): ~3500 s of cadence remain, well
+        // above the idle floor, so the cadence term dominates.
+        let delay = t.delay_until_due(base + Duration::from_secs(100), base);
         assert_eq!(delay, Duration::from_secs(3500));
     }
 
     #[test]
-    fn idle_floor_dominates_once_the_cadence_has_elapsed() {
+    fn an_aged_idle_anchor_saturates_so_cadence_alone_gates_a_later_sweep() {
+        // Issue #260 behaviour change. Once the idle anchor has aged past `idle_after`, the idle
+        // floor saturates to zero and no longer RE-dominates — the cadence term alone gates a
+        // steady-state sweep. (Pre-#260 the floor was relative to `now`, re-imposing a fresh 60 s
+        // before EVERY sweep; that same relativity is what a 15 s watch exploited to starve the
+        // sweep forever.)
         let base = Instant::now();
         let mut t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
         t.last_refresh = Some(base);
-        // Two hours later the cadence is long satisfied → only the idle floor remains.
-        let delay = t.delay_until_due(base + Duration::from_secs(7200));
-        assert_eq!(delay, Duration::from_secs(60));
+        // Two hours after the sweep (anchor seeded at the sweep instant): cadence long satisfied
+        // AND the idle floor saturated → due now.
+        assert_eq!(
+            t.delay_until_due(base + Duration::from_secs(7200), base),
+            Duration::ZERO,
+        );
+        // 30 s before the cadence elapses, the idle floor is still saturated (anchor long aged),
+        // so the cadence term alone sets the wait — the floor does not add a second 60 s.
+        assert_eq!(
+            t.delay_until_due(base + Duration::from_secs(3570), base),
+            Duration::from_secs(30),
+        );
+    }
+
+    #[test]
+    fn a_sub_idle_floor_rearm_sees_a_shrinking_absolute_floor() {
+        // The pure-math core of the #260 fix: with the idle floor anchored ABSOLUTELY, a wait
+        // re-created at a later `now` against the SAME anchor returns a SHORTER delay — 60 → 45 →
+        // 30 → 15 → 0 as a 15 s watch re-arms — instead of resetting to a full 60 s. So a
+        // faster-cadence sibling wake cannot pin the floor above its own interval forever.
+        let anchor = Instant::now();
+        // No prior refresh → the cadence term is zero, so the idle floor alone sets the delay.
+        let t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
+        for (elapsed, expected) in [(0, 60), (15, 45), (30, 30), (45, 15), (60, 0), (75, 0)] {
+            assert_eq!(
+                t.delay_until_due(anchor + Duration::from_secs(elapsed), anchor),
+                Duration::from_secs(expected),
+                "a re-arm at +{elapsed}s must see the absolute floor shrink, not reset to 60",
+            );
+        }
+    }
+
+    // --- #260: a faster re-arming watch must not starve the idle floor ------
+
+    #[tokio::test(start_paused = true)]
+    async fn until_due_is_not_starved_by_a_faster_rearming_watch() {
+        // Issue #260 regression, at the exact seam that starved. The run loop
+        // (`src/daemon/run_loop.rs`) RE-CREATES the `refresh.until_due()` select arm every idle
+        // iteration, and the 15s external-login watch (`EXTERNAL_LOGIN_WATCH_SECS`) forces an
+        // iteration every 15s — shorter than the 60s idle floor. Pre-fix the idle floor was
+        // relative to `now`, so each re-created `until_due` reset it to a FULL 60s and the 15s
+        // watch won forever: the sweep never became due. With the floor anchored absolutely, each
+        // re-created `until_due` computes a SHRINKING delay (60 → 45 → 30 → 15 → 0), so the
+        // refresh arm wins within one idle_after window. This mirrors the loop's two load-bearing
+        // details: the `biased` arm ORDER (refresh before the watch) and RE-CREATING `until_due`
+        // each iteration. A regression that reset the anchor would re-starve and exhaust the loop.
+        let mut t = RefreshTick::new(
+            vec![],
+            cfg(3600, 60, &[]),
+            true,
+            FakeEngine::new(),
+            TokioClock,
+        );
+        let mut became_due = false;
+        for _ in 0..5 {
+            tokio::select! {
+                biased;
+                // Re-created every iteration, exactly as the run loop does.
+                () = t.until_due() => {
+                    became_due = true;
+                    break;
+                }
+                // The 15s login-watch cadence, re-armed every iteration.
+                () = tokio::time::sleep(Duration::from_secs(15)) => {}
+            }
+        }
+        assert!(
+            became_due,
+            "a 15s-cadence watch must not starve the 60s idle floor forever (#260)"
+        );
     }
 
     // --- sweep selection ----------------------------------------------------

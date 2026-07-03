@@ -408,11 +408,12 @@ the near-expiry horizon (no second knob). Changes take effect at the next daemon
 start. If the `claude` binary cannot be resolved when the tick is enabled, the tick
 is disabled with a warning rather than failing the daemon.
 
-`idle_after_secs` is measured from the last poll, and the daemon polls one account
-roughly every `poll_secs ÷ (accounts in rotation)` — so keep `idle_after_secs`
-**below** that spacing, or the next poll always preempts the refresh and it never
-fires. With the defaults (`poll_secs = 300`) that leaves room for rosters up to five
-accounts; larger rosters should lower `idle_after_secs` to fit the gap.
+`idle_after_secs` sets how long the daemon must idle before the **first** refresh
+sweep after start-up. Since issue #260 the idle floor is anchored to an absolute
+instant, so neither the usage poll nor the 15 s internal login-watch resets it — it
+accumulates across idle gaps and the sweep fires once it elapses, after which sweeps
+recur on `cadence_secs` alone. Keep it comfortably below `cadence_secs`; the default
+60 s suits any roster size.
 
 > **Defaults are provisional.** The refresh token's durable lifetime is not yet
 > pinned, so the shipped cadence/idle defaults are deliberately conservative and may
