@@ -65,6 +65,25 @@
 //! Caller-contract note below, spike #262); the flag remains the per-cycle new-token
 //! signal, and the sliding-window-vs-cap TTL question stays open.
 //!
+//! "The TTL question" is really TWO different TTLs — spike #281 separated them and settled
+//! what is knowable WITHOUT a live token:
+//!
+//!   - **Access-token TTL — readable AT REST.** The credential blob's `expiresAt` field IS
+//!     the access token's expiry (~8h; a zero-impact read measured 7h19m remaining). No
+//!     experiment needed for this one.
+//!   - **Refresh-token idle-expiry (`refresh_token_expires_in`) — NOT at rest, verified
+//!     (High).** A zero-impact enumeration of the live `Claude Code-credentials` blob found
+//!     SIX fields — `accessToken`, `refreshToken`, `expiresAt`, `scopes`,
+//!     `subscriptionType`, `rateLimitTier` — and NONE is a refresh-token expiry (the lone
+//!     `expiresAt` is the access token's). The refresh token is itself an opaque
+//!     `sk-ant-ort…` string, not a JWT, so it carries no decodable `exp` either. Claude
+//!     Code does not persist `refresh_token_expires_in` (the OAuth-response field that
+//!     carries the RT lifetime), so the number survives only in that single live
+//!     `/v1/oauth/token` response — an operator one-shot on a throwaway account is the
+//!     sole source (deferred, zero-impact mandate #101; see
+//!     the Deferred-live-check section). The sliding-window-vs-cap facet stays with the
+//!     engine's own `expires_at_delta_secs` telemetry (above).
+//!
 //! ## Caller contract (the two thin callers must honor)
 //!
 //! The engine is a correct SINGLE cycle, but two hazards are intrinsic to its
@@ -104,7 +123,10 @@
 //! rotate a real refresh token — the zero-impact mandate, #101). The hermetic tests
 //! drive the engine's logic with fakes; a real-CLI test ([`crate::keychain`]) covers the
 //! isolated keychain item mechanics on a throwaway keychain; the live refresh is the
-//! engine's own production telemetry (above).
+//! engine's own production telemetry (above). The one datum this can never surface at rest
+//! — the refresh token's own idle-expiry (`refresh_token_expires_in`, spike #281) — needs
+//! an operator one-shot interception of a single `/v1/oauth/token` exchange on a throwaway
+//! account (the recipe lives in issue #281, not in-tree).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
