@@ -1056,9 +1056,22 @@ pub(crate) enum Diagnostic {
     /// the locked-keychain back-off (issue #13) or the rate-limit / transient
     /// back-off (issue #76). `None` ⇒ the field is omitted and the next poll uses
     /// the normal jittered interval.
+    ///
+    /// `retry_after_secs` LABELS the SOURCE of that wait (issue #295): the RAW
+    /// server-advised `Retry-After` (delta-seconds, BEFORE the `POLL_BACKOFF_CAP`
+    /// clamp) the throttled poll's response supplied, when any. `Some` ⇒ the server
+    /// advised a floor; `None` ⇒ the wait is the daemon's self-capped exponential (or
+    /// the keychain-lock back-off), with no server advice. It disambiguates a
+    /// `backoff_secs` an operator otherwise cannot place, by comparison: absent ⇒
+    /// self-capped exponential; `== backoff_secs` ⇒ the server-advised wait governed;
+    /// `< backoff_secs` ⇒ the server advised a smaller floor but the exponential governed;
+    /// `> backoff_secs` ⇒ the #294 cap clamped a pathological value (e.g.
+    /// `backoff_secs=3600 retry_after_secs=86400`). Pre-cap on purpose, so that clamped
+    /// value stays visible rather than collapsing into an indistinguishable `backoff_secs=3600`.
     Tick {
         decision: DecisionClass,
         backoff_secs: Option<u64>,
+        retry_after_secs: Option<u64>,
     },
     /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap
     /// target is possible again. The edge-triggered LEAVE marker — the symmetric
@@ -1108,17 +1121,24 @@ impl Diagnostic {
             Diagnostic::Tick {
                 decision,
                 backoff_secs,
+                retry_after_secs,
             } => {
                 let decision = decision.as_str();
-                // Omit `backoff_secs` when there is none — an empty value after `=`
-                // would split the `key=val` grammar (mirrors `all_exhausted`'s
-                // optional `resets_at`).
-                match backoff_secs {
-                    Some(secs) => {
-                        format!("ts={ts} diag=tick decision={decision} backoff_secs={secs}")
-                    }
-                    None => format!("ts={ts} diag=tick decision={decision}"),
-                }
+                // Each optional field is rendered only when present — an empty value after
+                // `=` would split the `key=val` grammar (mirrors `all_exhausted`'s optional
+                // `resets_at`). `backoff_secs` is the wait imposed; `retry_after_secs` LABELS
+                // its source (issue #295) — the raw server-advised `Retry-After`, present iff
+                // the server sent one, so a server-driven wait is told apart from the
+                // daemon's self-capped exponential.
+                let backoff = match backoff_secs {
+                    Some(secs) => format!(" backoff_secs={secs}"),
+                    None => String::new(),
+                };
+                let retry_after = match retry_after_secs {
+                    Some(secs) => format!(" retry_after_secs={secs}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} diag=tick decision={decision}{backoff}{retry_after}")
             }
             Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
         }
@@ -2065,25 +2085,53 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn tick_line_renders_the_decision_and_omits_backoff_when_absent() {
-        // No back-off → the field is simply absent (the line stays well-formed).
+        // No back-off → both back-off fields are simply absent (the line stays well-formed).
         let held = Diagnostic::Tick {
             decision: DecisionClass::Hold,
             backoff_secs: None,
+            retry_after_secs: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(held, format!("{TS0} diag=tick decision=hold"));
         assert!(!held.contains("backoff_secs"), "got: {held}");
+        assert!(!held.contains("retry_after_secs"), "got: {held}");
 
-        // A back-off (#13 / #76) → the wait in whole seconds.
+        // A self-capped back-off (#13 keychain-lock / #76 exponential) → the wait in whole
+        // seconds, and NO `retry_after_secs` (no server advised it — issue #295).
         let backed_off = Diagnostic::Tick {
             decision: DecisionClass::KeychainLocked,
             backoff_secs: Some(8),
+            retry_after_secs: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             backed_off,
             format!("{TS0} diag=tick decision=keychain_locked backoff_secs=8")
         );
+    }
+
+    #[test]
+    fn tick_line_labels_the_retry_after_source() {
+        // Issue #295: `retry_after_secs` LABELS a server-advised wait, distinguishing it from
+        // the self-capped exponential. Present → it renders after `backoff_secs`, so an
+        // operator can place a `backoff_secs` that was previously ambiguous.
+        let server_advised = Diagnostic::Tick {
+            decision: DecisionClass::SkipActiveUnavailable,
+            backoff_secs: Some(3600),
+            retry_after_secs: Some(86_400),
+        }
+        .to_log_line(at_epoch(0));
+        // The pathological `Retry-After` the #294 cap bit is now VISIBLE beside the clamped
+        // wait — the `backoff_secs=3600` ambiguity #295 set out to resolve.
+        assert_eq!(
+            server_advised,
+            format!("{TS0} diag=tick decision=skip_active_unavailable backoff_secs=3600 retry_after_secs=86400")
+        );
+
+        // Order is fixed: `backoff_secs` then `retry_after_secs`, both after `decision`.
+        let idx_backoff = server_advised.find("backoff_secs").unwrap();
+        let idx_retry = server_advised.find("retry_after_secs").unwrap();
+        assert!(idx_backoff < idx_retry, "field order: {server_advised}");
     }
 
     #[test]
@@ -2107,6 +2155,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             let line = Diagnostic::Tick {
                 decision,
                 backoff_secs: None,
+                retry_after_secs: None,
             }
             .to_log_line(at_epoch(0));
             assert_eq!(line, format!("{TS0} diag=tick decision={token}"));
@@ -2143,6 +2192,8 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             Diagnostic::Tick {
                 decision: DecisionClass::Swap,
                 backoff_secs: Some(16),
+                // Exercise the #295 source-label field through the #15 redaction scan too.
+                retry_after_secs: Some(3600),
             },
             Diagnostic::AllExhaustedCleared,
         ];
@@ -2182,6 +2233,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         log.emit(&Diagnostic::Tick {
             decision: DecisionClass::Hold,
             backoff_secs: None,
+            retry_after_secs: None,
         });
         let out = String::from_utf8(log.sink).unwrap();
         assert_eq!(out.lines().count(), 2, "one line per emit: {out:?}");

@@ -1540,10 +1540,10 @@ where
         let poll_idx = self.next_poll_index(active);
         // The per-account rate-limit / transient back-off this tick imposed (issue #293,
         // the per-account revision of #76): the widened wait the account polled this tick
-        // earned by a `429` / `5xx`, surfaced on the diagnostic tick line below. `None`
-        // when this tick polled cleanly, skipped an account still inside its back-off
-        // window, or polled nothing.
-        let mut this_tick_backoff: Option<Duration> = None;
+        // earned by a `429` / `5xx`, plus the raw server `Retry-After` source label (issue
+        // #295), surfaced on the diagnostic tick line below. `None` when this tick polled
+        // cleanly, skipped an account still inside its back-off window, or polled nothing.
+        let mut this_tick_backoff: Option<TickBackoff> = None;
         // Issue #293: the `429` is PER-ACCOUNT (each token resolves to its own Anthropic
         // org, so the throttle buckets are independent), so a throttled account backs off
         // ONLY its own next poll — the active account and every other account keep their
@@ -1660,7 +1660,12 @@ where
             decision: action.decision_class(),
             // The back-off imposed on the account polled THIS tick (issue #293, per-account);
             // `None` on a clean poll, a skipped (already-backing-off) account, or a no-poll tick.
-            backoff_secs: this_tick_backoff.map(|wait| wait.as_secs()),
+            backoff_secs: this_tick_backoff.map(|b| b.wait.as_secs()),
+            // The wait's SOURCE (issue #295): the raw server `Retry-After` when one drove (or
+            // floored) the wait, `None` when it was the self-capped exponential.
+            retry_after_secs: this_tick_backoff
+                .and_then(|b| b.retry_after)
+                .map(|ra| ra.as_secs()),
         });
         // Snapshot from the POST-swap active index (`self.state.active`), NOT the local
         // `active` captured at top-of-tick (`let active = self.state.active`): when
@@ -1818,6 +1823,9 @@ where
         let diagnostics = vec![Diagnostic::Tick {
             decision: TickAction::KeychainLocked.decision_class(),
             backoff_secs: Some(backoff.as_secs()),
+            // A keychain-lock back-off (#13) is self-imposed — no server is in the loop, so
+            // there is no `Retry-After` source to label (issue #295).
+            retry_after_secs: None,
         }];
         TickOutcome {
             action: TickAction::KeychainLocked,
@@ -3261,8 +3269,9 @@ where
     /// (rate-limited) or a `5xx` / network transient advances the account's exponential
     /// streak and arms its back-off window (its next poll is skipped until the window
     /// elapses on the monotonic [`Clock`]); ANY other outcome (success / 401 / 403) clears
-    /// the account's streak and window. Returns the widened wait it imposed — for the
-    /// diagnostic tick line — or `None` when the outcome was not a throttle.
+    /// the account's streak and window. Returns the [`TickBackoff`] it imposed — the
+    /// effective wait plus the raw server `Retry-After` source label (issue #295), both for
+    /// the diagnostic tick line — or `None` when the outcome was not a throttle.
     ///
     /// The base is this cycle's freshly-drawn, jittered poll interval — inheriting the #38
     /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, clamped to
@@ -3276,7 +3285,7 @@ where
     /// `429` is per-Anthropic-org (independent buckets), and under a genuine endpoint outage
     /// every account fails its OWN poll and arms its OWN window anyway — so one per-account
     /// path is the simplest correct design and needs no separate global case.
-    fn note_account_backoff(&mut self, i: usize, result: &Result<Usage>) -> Option<Duration> {
+    fn note_account_backoff(&mut self, i: usize, result: &Result<Usage>) -> Option<TickBackoff> {
         let Some(signal) = backoff_signal(result) else {
             let health = &mut self.state.health[i];
             health.poll_backoff_streak = 0;
@@ -3303,7 +3312,14 @@ where
         // instant cannot overflow — the value is bounded at the source (issue #294), which
         // supersedes #293's `checked_add` guard against an unbounded `Retry-After`.
         self.state.health[i].poll_backoff_until = Some(self.clock.now() + wait);
-        Some(wait)
+        // Carry the RAW server `Retry-After` (pre-cap) alongside the effective `wait` so the
+        // diagnostic tick line can LABEL the wait's source (issue #295): a `Some` marks a
+        // server-advised floor, a `None` marks the self-capped exponential. Pre-cap keeps a
+        // pathological value the #294 clamp bit visible (`wait` ≪ `retry_after`).
+        Some(TickBackoff {
+            wait,
+            retry_after: signal.retry_after,
+        })
     }
 
     /// Draw the jittered start-up delay (issue #76): a uniform `[0,
@@ -3386,6 +3402,21 @@ fn diag_poll_class(result: &Result<Usage>) -> PollClass {
 /// (rate-limited) or a `5xx` / network transient. Carries the server-advised
 /// `Retry-After` the response supplied, if any.
 struct BackoffSignal {
+    retry_after: Option<Duration>,
+}
+
+/// The back-off one throttled poll imposed this tick (issue #293/#294), for the diagnostic
+/// tick line. The output sibling of [`BackoffSignal`] (the input): `wait` is the effective
+/// window armed on the account — `max(self-capped exponential, server Retry-After)`, clamped
+/// to [`POLL_BACKOFF_CAP`] — which the line renders as `backoff_secs`. `retry_after` is the
+/// RAW server-advised `Retry-After` the response supplied (issue #295), BEFORE that clamp,
+/// or `None` when the server sent none — the source label that tells a server-advised wait
+/// from the daemon's self-capped exponential. Pre-cap on purpose: a pathological value the
+/// #294 cap bit stays visible (`wait` = 3600 s beside `retry_after` = 86400 s), rather than
+/// collapsing into an unplaceable `backoff_secs=3600`.
+#[derive(Debug, Clone, Copy)]
+struct TickBackoff {
+    wait: Duration,
     retry_after: Option<Duration>,
 }
 
@@ -4818,6 +4849,7 @@ mod tests {
                 Diagnostic::Tick {
                     decision: DecisionClass::Hold,
                     backoff_secs: None,
+                    retry_after_secs: None,
                 },
             ],
         );
@@ -4835,6 +4867,7 @@ mod tests {
                 Diagnostic::Tick {
                     decision: DecisionClass::Hold,
                     backoff_secs: None,
+                    retry_after_secs: None,
                 },
             ],
         );
@@ -5071,6 +5104,7 @@ mod tests {
             vec![Diagnostic::Tick {
                 decision: DecisionClass::KeychainLocked,
                 backoff_secs: Some(LOCK_BACKOFF_BASE.as_secs()),
+                retry_after_secs: None,
             }],
         );
 
@@ -5198,6 +5232,19 @@ mod tests {
         })
     }
 
+    /// The `retry_after_secs` the tick's decision diagnostic carried (issue #295) — the RAW
+    /// server-advised `Retry-After` (pre-cap) the throttled poll supplied, in whole seconds.
+    /// `None` when the server sent none (the wait is the self-capped exponential), or the
+    /// tick imposed no back-off at all — the source label that tells the two apart.
+    fn tick_retry_after_secs(outcome: &TickOutcome) -> Option<u64> {
+        outcome.diagnostics.iter().find_map(|d| match d {
+            Diagnostic::Tick {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
+        })
+    }
+
     /// Whether the tick actually POLLED an account (emitted a `Diagnostic::Poll`) rather
     /// than SKIPPING a backing-off one (issue #293) — the observable that a per-account
     /// back-off window suppressed the poll this tick.
@@ -5260,6 +5307,9 @@ mod tests {
                 Diagnostic::Tick {
                     decision: DecisionClass::SkipActiveUnavailable,
                     backoff_secs: Some(120),
+                    // No server `Retry-After` was scripted (issue #295): the 120 s wait is the
+                    // self-capped exponential, so the source label is absent.
+                    retry_after_secs: None,
                 },
             ],
         );
@@ -5361,6 +5411,59 @@ mod tests {
             tick_backoff_secs(&sane.tick().await),
             Some(just_under.as_secs()),
         );
+    }
+
+    #[tokio::test]
+    async fn the_tick_line_labels_the_back_off_source() {
+        // AC (issue #295): the tick line distinguishes a SERVER-ADVISED wait from the
+        // daemon's SELF-CAPPED exponential. `retry_after_secs` carries the RAW server
+        // `Retry-After` (pre-cap) when the response supplied one, and is ABSENT otherwise —
+        // so a `backoff_secs` an operator previously could not place now has a source. The
+        // sibling `backoff_secs` (the effective wait) is unchanged; this pins the new label.
+
+        // (1) Self-capped: no server `Retry-After` → the 120 s wait is the exponential, and
+        // the source label is absent (the unambiguous "our own back-off" case).
+        let (_d1, mut self_capped) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        let tick = self_capped.tick().await;
+        assert_eq!(tick_backoff_secs(&tick), Some(120));
+        assert_eq!(
+            tick_retry_after_secs(&tick),
+            None,
+            "no server Retry-After ⇒ self-capped, so no source label",
+        );
+
+        // (2) Server-advised, dominant: a `Retry-After` (900 s) ABOVE the 120 s exponential
+        // drives the wait, and the raw server value is surfaced beside it.
+        let (_d2, mut dominant) = rate_limit_daemon(
+            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(900))),
+        )
+        .await;
+        let tick = dominant.tick().await;
+        assert_eq!(tick_backoff_secs(&tick), Some(900));
+        assert_eq!(tick_retry_after_secs(&tick), Some(900));
+
+        // (3) Server-advised, dominated: a `Retry-After` (10 s) BELOW the 120 s exponential
+        // does NOT drive the wait, yet the label still surfaces the raw server value — so the
+        // operator sees the server WAS in the loop but our exponential (120 s) governed.
+        let (_d3, mut dominated) = rate_limit_daemon(
+            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(10))),
+        )
+        .await;
+        let tick = dominated.tick().await;
+        assert_eq!(tick_backoff_secs(&tick), Some(120));
+        assert_eq!(tick_retry_after_secs(&tick), Some(10));
+
+        // (4) Server-advised, capped: the flagship #295 case. A pathological `Retry-After`
+        // (a full day) the #294 cap clamps to 1 h is now VISIBLE as the raw pre-cap label —
+        // the exact `backoff_secs=3600` ambiguity (server-advised vs self-capped) resolved.
+        let (_d4, mut capped) = rate_limit_daemon(
+            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(86_400))),
+        )
+        .await;
+        let tick = capped.tick().await;
+        assert_eq!(tick_backoff_secs(&tick), Some(POLL_BACKOFF_CAP.as_secs()));
+        assert_eq!(tick_retry_after_secs(&tick), Some(86_400));
     }
 
     #[tokio::test]
@@ -6114,6 +6217,7 @@ mod tests {
                 Diagnostic::Tick {
                     decision: DecisionClass::Hold,
                     backoff_secs: None,
+                    retry_after_secs: None,
                 },
             ],
         );
