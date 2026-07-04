@@ -83,6 +83,13 @@ enum Idle {
     /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
     /// — reload + reconcile the in-memory roster, then re-tick.
     RosterReloadRequested,
+    /// An authenticated `restored` control command (#275) asked to un-quarantine the
+    /// account with this `uuid` WITHOUT activating it — apply the existing
+    /// [`Daemon::apply_refresh_restore`] primitive (best-effort log its edge-triggered
+    /// `CredentialRestored`), then re-tick so `status` reflects the un-quarantine within
+    /// the poll cadence rather than up to a full interval later. Carries the `uuid` moved
+    /// out of the [`ControlSignal::Restored`] payload.
+    Restored(String),
     /// The external-login watch (#140) saw the canonical credential change out-of-band
     /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
     /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
@@ -245,6 +252,10 @@ where
                     Some(ControlSignal::RosterReloadRequested) => {
                         break Idle::RosterReloadRequested
                     }
+                    // A `restored` (#275) breaks the idle to un-quarantine the named
+                    // account (moving the uuid payload out of the signal), then re-tick;
+                    // a `status` read (None) just continues serving until the wait elapses.
+                    Some(ControlSignal::Restored(uuid)) => break Idle::Restored(uuid),
                     None => continue,
                 },
                 // The periodic isolated-refresh tick (issue #105), in the idle path off
@@ -507,6 +518,16 @@ where
             // `config.toml` (#139) — the onboarded / relogged-in / removed account is
             // adopted into the live rotation — BEFORE looping back to re-tick.
             Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
+            // Apply the on-demand un-quarantine the `restored` control command asked for
+            // (#275): the SAME primitive the #106 sweep drives (`apply_refresh_restore`),
+            // best-effort logging its edge-triggered `CredentialRestored` — no canonical
+            // write, no active-account change — BEFORE looping back to re-tick. An unknown
+            // or already-non-quarantined uuid returns `None`: an idempotent, silent no-op.
+            Idle::Restored(uuid) => {
+                if let Some(event) = daemon.apply_refresh_restore(&uuid) {
+                    emit_best_effort(log, &event);
+                }
+            }
             // The external-login watch (#140) detected an out-of-band canonical change: just
             // re-tick — the next `tick` reads the canonical and its `reconcile_canonical_change`
             // does the authoritative re-stash / re-resolve / surface (no pre-tick adoption
