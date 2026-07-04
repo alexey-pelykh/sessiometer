@@ -1933,6 +1933,12 @@ where
                 Ok(report) => refresh_event_outcome(report),
                 Err(_) => RefreshEventOutcome::Error,
             },
+            // The AC-3 rotation flag on the poll path (issue #279): the completed cycle's
+            // own signal; an engine that could not even run (`Err`) renders `false`.
+            refresh_token_rotated: match &refreshed {
+                Ok(report) => report.refresh_token_rotated,
+                Err(_) => false,
+            },
         });
         match refreshed {
             // The refresh token was cleared in place → genuinely dead: let the 401 stand.
@@ -8407,6 +8413,7 @@ mod tests {
                 outcome: RefreshEventOutcome::Refreshed,
                 expires_before: Some(1_000_000),
                 expires_after: Some(1_003_600),
+                refresh_token_rotated: false,
             }],
             restored: vec!["u-B".to_owned()],
             observations: Vec::new(),
@@ -9103,7 +9110,10 @@ mod tests {
                 Ok(RefreshReport {
                     outcome: self.outcome,
                     expires_at_delta_secs: None,
-                    refresh_token_rotated: false,
+                    // A rotation only happens when CC actually performed the exchange (a real
+                    // `Refreshed`); NoChange / Dead / Error never rotate. Lets the #279
+                    // poll-refresh event test observe a `true` threaded from the report.
+                    refresh_token_rotated: matches!(self.outcome, RefreshOutcome::Refreshed),
                     re_stashed: matches!(self.outcome, RefreshOutcome::Refreshed),
                 })
             })
@@ -9401,7 +9411,9 @@ mod tests {
         // carrying the target PARKED account (redacted handle) and the classified refresh outcome
         // — the isolated-refresh ACTION the durable log lacked (only the DOWNSTREAM poll outcome
         // was evented, via `note_poll_outcome`). One firing per outcome branch, asserted like the
-        // `Monitor401` / `ReStash` event tests.
+        // `Monitor401` / `ReStash` event tests. The event also carries the cycle's rotation flag
+        // (issue #279): a real `Refreshed` threads `rotated=true` from the report, while an engine
+        // that could not run (`hard_error`) forces `false` via the `Err(_) => false` branch.
         let cases = [
             // (fake engine report outcome, hard engine error?, expected evented outcome)
             (
@@ -9428,14 +9440,20 @@ mod tests {
                 .filter(|e| matches!(e, Event::PollRefresh { .. }))
                 .cloned()
                 .collect::<Vec<_>>();
+            // The rotation flag threads from the cycle's report on the Ok path (a real
+            // `Refreshed` rotates in the seam fake), and is forced `false` when the engine
+            // could not even run (`hard_error` → the `Err(_) => false` branch of #279).
+            let expected_rotated =
+                matches!(report_outcome, RefreshOutcome::Refreshed) && !hard_error;
             assert_eq!(
                 poll_refreshes,
                 vec![Event::PollRefresh {
                     account: "spare".to_owned(),
                     outcome: expected,
+                    refresh_token_rotated: expected_rotated,
                 }],
                 "report {report_outcome:?} (hard_error={hard_error}) must emit exactly one \
-                 poll_refresh event with the redacted handle + mapped outcome",
+                 poll_refresh event with the redacted handle + mapped outcome + rotation flag",
             );
         }
     }
@@ -10457,6 +10475,7 @@ mod tests {
                 outcome: RefreshEventOutcome::Refreshed,
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_784_800_000),
+                refresh_token_rotated: true, // the #279 field joins the #15 all-channels corpus
             }
             .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
         );

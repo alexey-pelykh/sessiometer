@@ -394,6 +394,13 @@ pub(crate) enum Event {
         outcome: RefreshEventOutcome,
         expires_before: Option<i64>,
         expires_after: Option<i64>,
+        /// Whether the cycle ROTATED the refresh token (issue #279), sourced from the
+        /// cycle's [`crate::refresh::RefreshReport`] `refresh_token_rotated` — the AC-3
+        /// rotation signal made durable. A boolean only, never either token value, so the
+        /// #15 single-surface guarantee holds. A cycle that produced no report (a hard
+        /// engine `Err` / whole-cycle timeout — `refresh_tick::error_refresh_event`)
+        /// renders `false`.
+        refresh_token_rotated: bool,
     },
     /// The `#162` poll-path refresh-then-retry fired for the PARKED `account` (issue #255): on
     /// the FIRST usage-401 of a streak episode the daemon ran ONE isolated refresh (the #102
@@ -409,6 +416,12 @@ pub(crate) enum Event {
     PollRefresh {
         account: String,
         outcome: RefreshEventOutcome,
+        /// Whether the poll-path cycle ROTATED the refresh token (issue #279), sourced from
+        /// the cycle's [`crate::refresh::RefreshReport`] `refresh_token_rotated` — the same
+        /// non-secret rotation signal [`Event::Refresh`] carries. A boolean only, never a
+        /// token value (the #15 single-surface guarantee); an engine `Err` (could-not-run)
+        /// renders `false`.
+        refresh_token_rotated: bool,
     },
     /// `account`'s 4-state credential-health rollup (issue #119) TRANSITIONED to `state`
     /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
@@ -540,6 +553,7 @@ impl Event {
                 outcome,
                 expires_before,
                 expires_after,
+                refresh_token_rotated,
             } => {
                 let outcome = outcome.as_str();
                 // Each expiry is omitted when unreadable (an empty value after `=` would
@@ -564,9 +578,19 @@ impl Event {
                     }
                     None => String::new(),
                 };
-                format!("ts={ts} event=refresh account={account} outcome={outcome}{before}{after}")
+                // `rotated=` is always present (a bare bool) and trails the optional
+                // expiry fields (issue #279) — the AC-3 rotation signal made durable. It sits
+                // AFTER `outcome=`, so `last_refresh_outcomes`' ` outcome=`-then-first-token
+                // parse is unaffected.
+                format!(
+                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}"
+                )
             }
-            Event::PollRefresh { account, outcome } => {
+            Event::PollRefresh {
+                account,
+                outcome,
+                refresh_token_rotated,
+            } => {
                 // The isolated poll-refresh ACTION (issue #255). The trigger is the fixed
                 // `poll_401` — the only condition that fires the #162 path — rendered as a literal
                 // (a single-valued discriminant needs no enum field); `outcome` reuses the SAME
@@ -574,8 +598,10 @@ impl Event {
                 // event name keeps it clear of the periodic #106 `event=refresh` line that the
                 // `list` view's [`last_refresh_outcomes`] reader parses.
                 let outcome = outcome.as_str();
+                // `rotated=` trails `outcome=` (issue #279) — the same non-secret rotation
+                // signal `event=refresh` carries, on the poll path.
                 format!(
-                    "ts={ts} event=poll_refresh account={account} trigger=poll_401 outcome={outcome}"
+                    "ts={ts} event=poll_refresh account={account} trigger=poll_401 outcome={outcome} rotated={refresh_token_rotated}"
                 )
             }
             Event::CredentialHealth { account, state } => {
@@ -1314,28 +1340,32 @@ mod tests {
             outcome: RefreshEventOutcome::Refreshed,
             expires_before: Some(1_782_777_600_000),
             expires_after: Some(1_782_781_200_000), // +1h
+            refresh_token_rotated: true,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             refreshed,
             format!(
                 "{TS0} event=refresh account=spare outcome=refreshed \
-                 expires_before=2026-06-30T00:00:00Z expires_after=2026-06-30T01:00:00Z"
+                 expires_before=2026-06-30T00:00:00Z expires_after=2026-06-30T01:00:00Z \
+                 rotated=true"
             )
         );
 
-        // An unreadable expiry: both fields are OMITTED (never an empty value that would
-        // split the key=val grammar), leaving a well-formed line.
+        // An unreadable expiry: both expiry fields are OMITTED (never an empty value that
+        // would split the key=val grammar), yet `rotated=` still renders — it trails the
+        // (absent) expiries directly after `outcome=` (issue #279).
         let unknown = Event::Refresh {
             account: "spare".to_owned(),
             outcome: RefreshEventOutcome::Error,
             expires_before: None,
             expires_after: None,
+            refresh_token_rotated: false,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             unknown,
-            format!("{TS0} event=refresh account=spare outcome=error")
+            format!("{TS0} event=refresh account=spare outcome=error rotated=false")
         );
         assert!(!unknown.contains("expires_"), "got: {unknown}");
     }
@@ -1349,22 +1379,28 @@ mod tests {
         let dead = Event::PollRefresh {
             account: "spare".to_owned(),
             outcome: RefreshEventOutcome::Dead,
+            refresh_token_rotated: false,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             dead,
-            format!("{TS0} event=poll_refresh account=spare trigger=poll_401 outcome=dead")
+            format!(
+                "{TS0} event=poll_refresh account=spare trigger=poll_401 outcome=dead rotated=false"
+            )
         );
-        // The `outcome=` token tracks the variant (the shared refresh vocabulary), and no
-        // expiry fields ride this line (unlike `event=refresh`).
+        // The `outcome=` token tracks the variant (the shared refresh vocabulary); `rotated=`
+        // trails it (issue #279), and no expiry fields ride this line (unlike `event=refresh`).
         let refreshed = Event::PollRefresh {
             account: "spare".to_owned(),
             outcome: RefreshEventOutcome::Refreshed,
+            refresh_token_rotated: true,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             refreshed,
-            format!("{TS0} event=poll_refresh account=spare trigger=poll_401 outcome=refreshed")
+            format!(
+                "{TS0} event=poll_refresh account=spare trigger=poll_401 outcome=refreshed rotated=true"
+            )
         );
         assert!(!refreshed.contains("expires_"), "got: {refreshed}");
     }
@@ -1467,11 +1503,12 @@ mod tests {
                 outcome,
                 expires_before: None,
                 expires_after: None,
+                refresh_token_rotated: false,
             }
             .to_log_line(at_epoch(0));
             assert_eq!(
                 line,
-                format!("{TS0} event=refresh account=work outcome={token}")
+                format!("{TS0} event=refresh account=work outcome={token} rotated=false")
             );
         }
     }
@@ -1517,6 +1554,7 @@ mod tests {
                 outcome: RefreshEventOutcome::Refreshed,
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_781_200_000),
+                refresh_token_rotated: true,
             },
             Event::CredentialHealth {
                 account: "work".to_owned(),
@@ -1701,22 +1739,25 @@ ts=1970-01-01T00:00:40Z event=monitor_401 account=c consecutive=1\n";
     fn last_refresh_outcomes_maps_each_handle_to_its_latest_outcome() {
         // Issue #120: the daemon-independent read the offline `list` view surfaces.
         // The log is append-only chronological, so per handle the LAST `refresh` line
-        // wins; a non-refresh line is ignored, and the optional expiry fields after
-        // `outcome=` do not bleed into the parsed token.
+        // wins; a non-refresh line is ignored, and the optional expiry fields AND the
+        // trailing `rotated=` field (issue #279) after `outcome=` do not bleed into the
+        // parsed token. The lines deliberately mix formats: a pre-#279 line with no
+        // `rotated=` (`work`'s `no_change`) still parses, so historical logs keep working.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessiometer.log");
         let content = "\
 ts=1970-01-01T00:00:10Z event=refresh account=work outcome=no_change\n\
-ts=1970-01-01T00:00:20Z event=refresh account=spare outcome=refreshed expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T02:00:00Z\n\
+ts=1970-01-01T00:00:20Z event=refresh account=spare outcome=refreshed expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T02:00:00Z rotated=true\n\
 ts=1970-01-01T00:00:30Z event=monitor_401 account=work consecutive=1\n\
-ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead\n";
+ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n";
         std::fs::write(&path, content).unwrap();
         let outcomes = last_refresh_outcomes(&path);
         // `work`'s latest refresh is the `dead` at epoch 40 — not the earlier `no_change`,
-        // and the intervening `monitor_401` line is not a refresh.
+        // and the intervening `monitor_401` line is not a refresh. The trailing `rotated=false`
+        // does not corrupt the `dead` token.
         assert_eq!(outcomes.get("work"), Some(&RefreshEventOutcome::Dead));
-        // `spare`'s only refresh is `refreshed`; the trailing `expires_*` fields are
-        // stripped, leaving the bare outcome token.
+        // `spare`'s only refresh is `refreshed`; the trailing `expires_*` AND `rotated=true`
+        // fields are stripped, leaving the bare outcome token.
         assert_eq!(outcomes.get("spare"), Some(&RefreshEventOutcome::Refreshed));
         assert_eq!(outcomes.len(), 2);
     }
