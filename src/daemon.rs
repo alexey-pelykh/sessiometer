@@ -96,14 +96,14 @@ use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
 use crate::observability::{
-    CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, PollClass,
-    RefreshEventOutcome, SwapReason,
+    CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger,
+    PollClass, RefreshEventOutcome, SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
-use crate::swap::{self, SwapDecision};
-use crate::timing::{Jitter, SplitMix64, Strategy};
+use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
+use crate::timing::{Jitter, Rng, SplitMix64, Strategy};
 use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
 use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sample};
 
@@ -613,6 +613,69 @@ impl PollRefresh for RealRefreshEngine {
     }
 }
 
+/// The in-place ACTIVE-account keep-warm seam (issue #282) — the FOURTH refresh mechanism.
+/// Given the active account and its current CANONICAL blob it mints a fresh token by driving
+/// `claude` through the isolated back-dating spawn (there is no first-party OAuth exchange —
+/// a fresh token comes only from Claude Code, see [`crate::refresh`]) and RETURNS it, so the
+/// DAEMON promotes it to the canonical `Claude Code-credentials` item (atomic `-U`, under the
+/// swap lock, baseline-committed). It never writes the canonical item itself, keeping the
+/// daemon the single canonical writer (ADR-0003). Distinct from [`PollRefresh`] (the
+/// #253-excluded isolated engine that writes the STASH): this is the ONE refresh path that
+/// legitimately targets the active account, because its result lands where a live session reads.
+///
+/// Carried as an OPTIONAL [`Daemon`] field (`Option<Box<dyn KeepWarm>>`, like `poll_refresh`)
+/// so every hermetic-test `Daemon::new` site is untouched; `None` (the default) is the pre-#282
+/// behaviour. A hand-desugared `async fn` (a boxed future) so the trait is `dyn`-compatible; the
+/// current-thread runtime keeps the returned future free of a `Send` bound.
+pub(crate) trait KeepWarm {
+    /// Mint a fresh token for `account` from its `canonical` blob and return it for the daemon
+    /// to promote to the canonical item. `Ok((report, Some(credential)))` ONLY on a real refresh
+    /// ([`RefreshOutcome::Refreshed`]); `(report, None)` for `NoChange` / `Dead` / `Error` (the
+    /// daemon then leaves the canonical item untouched — a `Dead` outcome flows to the #42
+    /// streak). `Err` is a could-not-run (spawn / FS) failure the daemon treats fail-safe.
+    fn keep_warm<'a>(
+        &'a self,
+        account: &'a Account,
+        canonical: &'a Credential,
+    ) -> Pin<Box<dyn Future<Output = Result<KeepWarmMint>> + 'a>>;
+}
+
+/// The keep-warm mint result: the classified [`RefreshReport`] plus the fresh credential the
+/// daemon promotes to the canonical item — `Some` ONLY on a real [`RefreshOutcome::Refreshed`],
+/// `None` for `NoChange` / `Dead` / `Error`. Aliased so the `dyn`-compatible boxed-future
+/// signatures on the [`KeepWarm`] trait stay readable (`clippy::type_complexity`); the same tuple
+/// [`crate::refresh::keep_warm_cycle`] returns.
+type KeepWarmMint = (RefreshReport, Option<Credential>);
+
+/// The production [`KeepWarm`]: mints via [`crate::refresh::keep_warm_account`], which reuses
+/// the #102 isolated back-dating spawn on a COPY of the canonical blob and hands the fresh
+/// token back. Holds only the resolved `claude` binary path (the same one the periodic tick
+/// resolves); the ephemeral isolated dir + keychain are derived per-call from the account uuid.
+pub(crate) struct RealKeepWarmEngine {
+    claude_binary: PathBuf,
+}
+
+impl RealKeepWarmEngine {
+    pub(crate) fn new(claude_binary: PathBuf) -> Self {
+        Self { claude_binary }
+    }
+}
+
+impl KeepWarm for RealKeepWarmEngine {
+    fn keep_warm<'a>(
+        &'a self,
+        account: &'a Account,
+        canonical: &'a Credential,
+    ) -> Pin<Box<dyn Future<Output = Result<KeepWarmMint>> + 'a>> {
+        // Own the two non-borrowed inputs so the future needs only `canonical`'s lifetime.
+        let binary = self.claude_binary.clone();
+        let uuid = account.account_uuid.clone();
+        Box::pin(async move {
+            crate::refresh::keep_warm_account(canonical.expose(), &uuid, binary).await
+        })
+    }
+}
+
 /// A held single-instance lock: a kernel advisory `flock(LOCK_EX|LOCK_NB)` on the
 /// native-local `daemon.lock`. The file is held open for the process lifetime —
 /// the kernel releases the lock on death (or on drop), so there is no stale-PID
@@ -673,6 +736,58 @@ fn wall_clock_now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Current wall-clock as epoch MILLISECONDS — the unit CC's credential `expiresAt` uses (issue
+/// #282): the keep-warm near-expiry gate compares the active canonical token's ms `expiresAt`
+/// against this. The ms sibling of [`wall_clock_now_secs`]; `0` on the pre-1970 impossible case.
+/// Off the swap-DECISION path (only the proactive keep-warm horizon reads it), so a direct wall
+/// read keeps the deterministic decision logic on the injectable [`Clock`] while the horizon
+/// stays a pure function of an explicit `now_ms` — [`Daemon::keep_active_warm`] takes `now_ms` as
+/// a parameter so the gate is unit-tested without wall-clock flakiness.
+fn wall_clock_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether `canonical` carries a NON-empty refresh token — the one CC can exchange for a fresh
+/// access token (issue #282). `Some(empty)` (CC cleared the RT in place → a dead credential) and
+/// `None` (the field is absent) both mean "nothing to refresh", so a keep-warm mint would be a
+/// doomed `claude -p` spawn: the keep-warm short-circuits on `false` and lets the #42 death streak
+/// advance to the emergency swap (invariant 4 — a truly-dead active credential still quarantines).
+/// Reuses [`crate::refresh::refresh_token`], the one audited extractor, so the emptiness rule lives
+/// in a single place; the token bytes are only emptiness-checked here, never logged (the #15
+/// single-surface guarantee).
+fn has_live_refresh_token(canonical: &Credential) -> bool {
+    matches!(crate::refresh::refresh_token(canonical.expose()), Some(rt) if !rt.is_empty())
+}
+
+/// A deterministic per-account keep-warm stagger offset in `[0, cadence)` seconds (issue #282),
+/// ADDED to the near-expiry horizon so each account's proactive mint fires at a DIFFERENT phase of
+/// the shared ~8h token TTL. Without it a roster logged in together would all reach the same
+/// `remaining <= cadence` point at once and re-warm (or fail to) in lockstep — one shared failure
+/// domain. Derived from the account uuid so it is STABLE across restarts: a wall-clock- or
+/// entropy-seeded offset would move every launch and slowly re-correlate the roster. Reuses the
+/// same [`SplitMix64`] decorrelation PRNG as the poll jitter (no new dependency — `cargo deny`
+/// stays green), seeded from the uuid's SHA-256 so distinct accounts draw distinct, well-distributed
+/// offsets. A pure function of `(account_uuid, cadence)`, so the de-correlation AC is unit-tested
+/// directly.
+fn keep_warm_stagger_secs(account_uuid: &str, cadence: Duration) -> u64 {
+    let cadence_secs = cadence.as_secs();
+    // A zero cadence has no window to stagger within (and would scale to a degenerate 0).
+    if cadence_secs == 0 {
+        return 0;
+    }
+    // Seed from the first 64 bits of the uuid's SHA-256 hex digest — a stable, well-distributed
+    // per-account seed (the digest is ASCII hex; 16 chars = 8 bytes = one u64).
+    let digest = crate::sha256::sha256_hex(account_uuid.as_bytes());
+    let seed = u64::from_str_radix(&digest[..16], 16).unwrap_or(0);
+    // Scale a single `next_unit()` draw in `[0, 1)` — the same decorrelation primitive the poll
+    // jitter draws from — into `[0, cadence_secs)`, uniform across the window.
+    (SplitMix64::new(seed).next_unit() * cadence_secs as f64) as u64
 }
 
 /// Fold an access-token `expiresAt` from CC's native epoch MILLISECONDS to the epoch
@@ -872,6 +987,15 @@ pub(crate) struct AccountHealth {
     /// on a transient sweep failure and survives an un-quarantine, so keying the edge off it
     /// would both double-fire and miss-fire.
     unrecoverable_signaled: bool,
+    /// When the daemon last ATTEMPTED an in-place keep-warm of this account (issue #282),
+    /// on the monotonic [`Clock`] — set by BOTH the proactive and the reactive keep-warm
+    /// paths (`keep_warm_and_promote`). The proactive path throttles off it to at most one
+    /// mint per keep-warm cadence, so a persistently no-op mint (e.g. CC declines to refresh)
+    /// cannot spawn `claude -p` every tick while the token sits in the near-expiry window.
+    /// `None` until the first attempt; the reactive path (a live-session 401) is instead
+    /// throttled once-per-episode by `consec_401 == 0`, so it ignores this field but still
+    /// stamps it (a reactive mint suppresses a redundant proactive mint the same tick).
+    last_keep_warm_attempt: Option<Instant>,
 }
 
 /// Per-loop decision state carried across polls.
@@ -1068,6 +1192,22 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`with_refresh_enabled`](Self::with_refresh_enabled). Purely a display signal — never a
     /// swap/poll decision input.
     refresh_enabled: bool,
+    /// The in-place ACTIVE-account keep-warm seam (issue #282), or `None` to disable it (the
+    /// hermetic-test default AND a `[refresh]`-off daemon — the active account then simply
+    /// lapses at expiry exactly as before). This is the FOURTH refresh mechanism: unlike the
+    /// #253-excluded isolated engine ([`poll_refresh`](Self::poll_refresh) / the parked sweep),
+    /// which writes only the STASH, this mints a fresh token and the daemon PROMOTES it to the
+    /// canonical `Claude Code-credentials` item a live session reads — proactively before the
+    /// active token's expiry, and as a reactive backstop on an active 401. Wired by
+    /// [`with_keep_warm_engine`](Self::with_keep_warm_engine) on the SAME effective switch as
+    /// the periodic tick (`[refresh].enabled` + a resolvable `claude` binary).
+    keep_warm: Option<Box<dyn KeepWarm>>,
+    /// The keep-warm near-expiry horizon AND the proactive per-account attempt throttle
+    /// (issue #282), sourced from `[refresh].cadence_secs` — the SAME dual-purpose knob the
+    /// parked sweep uses for its own near-expiry horizon (no second config knob). A per-account
+    /// stagger offset in `[0, cadence)` is added on top for de-correlation. Only read when
+    /// [`keep_warm`](Self::keep_warm) is wired; the `new` default is an inert placeholder.
+    keep_warm_cadence: Duration,
     state: DecisionState,
 }
 
@@ -1129,6 +1269,12 @@ where
             // `config.refresh.enabled` via `with_refresh_enabled`. Left false, the #138 advisory
             // stays inert (it also requires an unhealthy non-active account to fire).
             refresh_enabled: false,
+            // No active-account keep-warm by default (issue #282); production opts in via
+            // `with_keep_warm_engine` on the same effective switch as the periodic tick. Left
+            // unset, the active account lapses at expiry exactly as before. The cadence is an
+            // inert placeholder until the engine is wired (it is read only when `keep_warm` is).
+            keep_warm: None,
+            keep_warm_cadence: Duration::from_secs(3600),
             state: DecisionState {
                 health,
                 last_readings,
@@ -1224,6 +1370,24 @@ where
     /// style to mirror `with_swap_lock` / `with_config_path` and keep `new`'s args stable.
     pub(crate) fn with_refresh_engine(mut self, engine: Box<dyn PollRefresh>) -> Self {
         self.poll_refresh = Some(engine);
+        self
+    }
+
+    /// Wire the in-place ACTIVE-account keep-warm seam (issue #282): the daemon then refreshes
+    /// the active account's CANONICAL token in place — proactively before it nears expiry, and
+    /// as a reactive backstop on an active 401 — so the overnight false-death cascade never
+    /// starts. `cadence` (from `[refresh].cadence_secs`) is both the near-expiry horizon and the
+    /// proactive per-account throttle. Production wires [`RealKeepWarmEngine`] on the SAME
+    /// effective switch as the periodic tick (`[refresh].enabled` + a resolvable `claude`
+    /// binary); left unset, the active account lapses at expiry exactly as before. Builder-style
+    /// to mirror `with_refresh_engine` and keep `new`'s args stable.
+    pub(crate) fn with_keep_warm_engine(
+        mut self,
+        engine: Box<dyn KeepWarm>,
+        cadence: Duration,
+    ) -> Self {
+        self.keep_warm = Some(engine);
+        self.keep_warm_cadence = cadence;
         self
     }
 
@@ -1394,6 +1558,18 @@ where
             // `with_refresh_engine` wired it, so every other path behaves exactly as before.
             if self.should_refresh_retry(i, &result) {
                 result = self.refresh_retry(i, &mut events).await;
+            } else if self.should_keep_warm_retry(i, &result) {
+                // Issue #282 REACTIVE backstop: the ACTIVE account's first usage-401. The #162
+                // path above EXCLUDES the active account (it writes the stash, #253); this mints
+                // and PROMOTES to the canonical a live session reads, then re-polls through it —
+                // reviving an expired-but-refreshable active token in place BEFORE the 401 counts
+                // toward the #42 death streak. Mutually exclusive with `should_refresh_retry` on
+                // `i` (active vs parked), so a 401 takes exactly one refresh path. A truly-dead
+                // credential (empty RT / a `Dead` mint) still returns the 401 → the streak
+                // advances to the emergency swap (invariant 4).
+                result = self
+                    .keep_warm_retry(i, canonical.as_ref(), &mut events)
+                    .await;
             }
             self.note_poll_outcome(i, &result, &mut events);
             diagnostics.push(Diagnostic::Poll {
@@ -1416,6 +1592,15 @@ where
             self.state.health[i].poll_expires_at = poll_expiry;
             self.note_polled(i);
         }
+
+        // Issue #282 PROACTIVE keep-warm: BEFORE deciding, if the active token is within its
+        // (staggered) near-expiry horizon, mint a fresh token in place and promote it to the
+        // canonical item — so the overnight false-death cascade never starts. Serialized here,
+        // inside `tick`, ahead of `decide_action`; inert unless the keep-warm seam is wired. The
+        // wall-clock `now_ms` is read here (off the swap-decision path) and passed in, so the
+        // near-expiry gate stays a pure, deterministically-testable function of an explicit clock.
+        self.keep_active_warm(active, canonical.as_ref(), wall_clock_now_ms(), &mut events)
+            .await;
 
         // Decide on the carried last-known readings, masking an out-of-rotation
         // (disabled / quarantined) non-active account back to `None` so its stale
@@ -1952,6 +2137,242 @@ where
             // Could not revive (spawn / read-back failure) → fail-safe: the 401 stands.
             Err(_) => Err(Error::UsageUnauthorized),
         }
+    }
+
+    /// Whether the active poll `i`'s outcome warrants a #282 REACTIVE keep-warm backstop,
+    /// evaluated on the PRE-fold state (before [`note_poll_outcome`](Self::note_poll_outcome)
+    /// advances the streak) — the ACTIVE-account counterpart of
+    /// [`should_refresh_retry`](Self::should_refresh_retry):
+    ///
+    /// - a keep-warm seam is wired ([`with_keep_warm_engine`](Self::with_keep_warm_engine)),
+    /// - the poll was a 401 ([`PollOutcome::Unauthorized`]),
+    /// - the account is not already quarantined (a dead account is left to the #42 streak /
+    ///   emergency swap — never re-warmed on every re-probe poll),
+    /// - this is the FIRST 401 of the current streak episode (`consec_401 == 0`), and
+    /// - the account IS the ACTIVE one (`state.active == Some(i)`).
+    ///
+    /// The last clause is the EXACT complement of `should_refresh_retry`'s active-EXCLUSION
+    /// (issue #253): the #162 isolated engine writes the STASH, so it must never touch the active
+    /// account; this keep-warm mints and PROMOTES to the canonical item a live session reads, so
+    /// it is the ONE path that legitimately targets the active account. The two are therefore
+    /// mutually exclusive on `i` and wired as an `if / else if` in [`tick`](Self::tick), so a 401
+    /// takes exactly one refresh path. `consec_401 == 0` is the same once-per-episode storm guard:
+    /// the first active 401 attempts the in-place revive; the rest of the episode advances the
+    /// streak directly toward the #42 emergency swap.
+    fn should_keep_warm_retry(&self, i: usize, result: &Result<Usage>) -> bool {
+        self.keep_warm.is_some()
+            && matches!(classify_poll(result), PollOutcome::Unauthorized)
+            && !self.state.health[i].quarantined
+            && self.state.health[i].consec_401 == 0
+            && self.state.active == Some(i)
+    }
+
+    /// The REACTIVE keep-warm backstop (issue #282): on the active account's FIRST usage-401,
+    /// mint a fresh token in place and PROMOTE it to the canonical item, then re-poll the active
+    /// account THROUGH the (now-fresh) canonical — the reading
+    /// [`note_poll_outcome`](Self::note_poll_outcome) then folds into the streak. Only called when
+    /// [`should_keep_warm_retry`](Self::should_keep_warm_retry) holds, so `keep_warm` is `Some` and
+    /// `i` is the ACTIVE account.
+    ///
+    /// - A successful promote + a re-poll that CLEARS → `Ok(usage)` resets the streak (the
+    ///   false-death this fixes: an expired-but-refreshable active token is revived in place before
+    ///   it counts toward the #42 quarantine).
+    /// - No promote (`NoChange` / a dead-or-absent refresh token / an engine error / a swap that
+    ///   raced the mint) → the 401 STANDS (`Err(UsageUnauthorized)`), so the streak advances toward
+    ///   quarantine → the #42 emergency swap. This is invariant 4: a truly-dead active credential
+    ///   still quarantines and the escape to a live spare is preserved.
+    /// - A re-poll that 401s AGAIN even after a fresh token → the 401 stands (a genuine problem the
+    ///   fresh token did not fix); the streak advances.
+    ///
+    /// `canonical` is the blob read once at top-of-tick; `None` (unreadable) → nothing to mint
+    /// from, fail-safe to the 401. The mint never crashes the poll loop (a spawn / FS failure is
+    /// an `Err` the keep-warm engine swallows into a no-promote).
+    async fn keep_warm_retry(
+        &mut self,
+        i: usize,
+        canonical: Option<&Credential>,
+        events: &mut Vec<Event>,
+    ) -> Result<Usage> {
+        // No readable canonical blob → cannot mint; fail-safe, let the 401 stand.
+        let Some(canonical) = canonical else {
+            return Err(Error::UsageUnauthorized);
+        };
+        if self
+            .keep_warm_and_promote(i, canonical, KeepWarmTrigger::Reactive, events)
+            .await
+        {
+            // The canonical now holds a fresh token → re-poll the ACTIVE account through it.
+            self.poller
+                .poll(&self.roster[i], true)
+                .await
+                .map(|reading| reading.usage)
+        } else {
+            // No fresh token promoted → the 401 stands so the #42 streak advances (invariant 4).
+            Err(Error::UsageUnauthorized)
+        }
+    }
+
+    /// The PROACTIVE keep-warm (issue #282): when the active token is within its (staggered)
+    /// near-expiry horizon, mint a fresh token in place and PROMOTE it to the canonical item —
+    /// BEFORE any 401 — so a live session always reads a warm token and the overnight false-death
+    /// cascade never starts. Serialized into [`tick`](Self::tick) just before
+    /// [`decide_action`](Self::decide_action). Inert (an immediate return) unless the keep-warm
+    /// seam is wired.
+    ///
+    /// Gates, in order (each a cheap check before the expensive `claude -p` mint):
+    /// - the seam is wired, an active account resolved, and its canonical blob is readable;
+    /// - the active account is NOT quarantined (a dead account is the streak's job, not re-warmed);
+    /// - the token is within `[refresh].cadence_secs + `[`keep_warm_stagger_secs`]` of expiry (the
+    ///   per-account stagger de-correlates the roster's mints across the shared ~8h TTL); and
+    /// - the proactive per-account throttle has elapsed (`last_keep_warm_attempt`), so a persistently
+    ///   no-op mint (CC declines to refresh) cannot spawn `claude -p` every tick in the window.
+    ///
+    /// `now_ms` is the wall-clock epoch-ms the horizon compares the token's `expiresAt` against,
+    /// taken as a parameter (not read inside) so the gate is unit-tested deterministically. Unlike
+    /// the reactive path there is NO re-poll: a proactive promote simply leaves a fresh token for
+    /// the NEXT tick's poll to read.
+    async fn keep_active_warm(
+        &mut self,
+        active: Option<usize>,
+        canonical: Option<&Credential>,
+        now_ms: i64,
+        events: &mut Vec<Event>,
+    ) {
+        if self.keep_warm.is_none() {
+            return;
+        }
+        let (Some(i), Some(canonical)) = (active, canonical) else {
+            return;
+        };
+        // A quarantined active account is a dead credential the #42 streak / emergency swap owns —
+        // never re-warmed every tick (invariant 4; mirrors `should_keep_warm_retry`'s guard).
+        if self.state.health[i].quarantined {
+            return;
+        }
+        // Near-expiry gate: fire only inside the token's staggered horizon. An unreadable expiry
+        // → skip (no basis to decide); a far-from-expiry token → skip (nothing to warm yet).
+        let Some(expires_at_ms) = crate::refresh::expires_at(canonical.expose()) else {
+            return;
+        };
+        let stagger = keep_warm_stagger_secs(&self.roster[i].account_uuid, self.keep_warm_cadence);
+        let horizon_ms = i64::try_from(self.keep_warm_cadence.as_secs().saturating_add(stagger))
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1000);
+        if expires_at_ms.saturating_sub(now_ms) > horizon_ms {
+            return;
+        }
+        // Proactive throttle: at most one mint per keep-warm cadence (the reactive path ignores
+        // this — it is once-per-episode-gated by `consec_401 == 0` — but a reactive mint still
+        // stamps `last_keep_warm_attempt`, so it suppresses a redundant proactive mint the same
+        // window).
+        let now = self.clock.now();
+        if let Some(last) = self.state.health[i].last_keep_warm_attempt {
+            if now.saturating_duration_since(last) < self.keep_warm_cadence {
+                return;
+            }
+        }
+        // The proactive path discards the promote result: it warms the canonical for the NEXT
+        // poll to read, it does not re-poll now.
+        let _ = self
+            .keep_warm_and_promote(i, canonical, KeepWarmTrigger::Proactive, events)
+            .await;
+    }
+
+    /// Mint a fresh token for the active account `i` from its `canonical` blob and, on a real
+    /// refresh, PROMOTE it to the canonical item (issue #282) — the shared core of the proactive
+    /// and reactive paths. Returns whether a fresh token was actually promoted to canonical.
+    ///
+    /// Steps: (1) short-circuit a dead/absent refresh token — CC has nothing to exchange, so skip
+    /// the doomed spawn and report no-promote (the caller lets the #42 streak advance: invariant
+    /// 4); (2) stamp `last_keep_warm_attempt` (the proactive throttle + reactive-suppresses-proactive
+    /// signal) BEFORE the mint, so even a could-not-run attempt counts; (3) drive the keep-warm
+    /// engine to mint; (4) push ONE durable [`Event::KeepWarm`] recording the action (mirrors
+    /// [`refresh_retry`](Self::refresh_retry)'s `PollRefresh` event); (5) promote ONLY a real mint
+    /// ([`RefreshOutcome::Refreshed`] → `Some(credential)`) via
+    /// [`promote_canonical`](Self::promote_canonical); every other outcome
+    /// (`NoChange` / `Dead` / `Error` / could-not-run) leaves the canonical item untouched.
+    async fn keep_warm_and_promote(
+        &mut self,
+        i: usize,
+        canonical: &Credential,
+        trigger: KeepWarmTrigger,
+        events: &mut Vec<Event>,
+    ) -> bool {
+        // A dead (empty) or absent refresh token cannot be revived by ANY mint — skip the doomed
+        // `claude -p` spawn and report no-promote so the caller lets the #42 streak advance to
+        // quarantine → emergency swap (invariant 4). Only a NON-empty RT is worth minting.
+        if !has_live_refresh_token(canonical) {
+            return false;
+        }
+        // Stamp the attempt up front so BOTH the proactive throttle and the
+        // reactive-suppresses-a-same-window-proactive signal count even a mint that cannot run.
+        self.state.health[i].last_keep_warm_attempt = Some(self.clock.now());
+        let minted = match self.keep_warm.as_ref() {
+            Some(engine) => engine.keep_warm(&self.roster[i], canonical).await,
+            // Unreachable given the callers' `keep_warm.is_some()` gate; treat as no-promote.
+            None => return false,
+        };
+        // Durably record the keep-warm ACTION (issue #282), for EVERY firing — the forensic trail
+        // mirroring `refresh_retry`'s `PollRefresh`. A completed cycle maps through the shared
+        // `refresh_event_outcome`; a cycle that could not even run (`Err`) is an `Error` outcome.
+        events.push(Event::KeepWarm {
+            account: self.roster[i].label.clone(),
+            trigger,
+            outcome: match &minted {
+                Ok((report, _)) => refresh_event_outcome(report),
+                Err(_) => RefreshEventOutcome::Error,
+            },
+            refresh_token_rotated: match &minted {
+                Ok((report, _)) => report.refresh_token_rotated,
+                Err(_) => false,
+            },
+        });
+        // Promote ONLY a real mint; NoChange / Dead / Error / could-not-run leave canonical as-is.
+        match minted {
+            Ok((_, Some(cred))) => self.promote_canonical(i, &cred).await.unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Promote a freshly-minted `cred` to the canonical `Claude Code-credentials` item for the
+    /// active account `i` (issue #282), serialized against the swap engine (ADR-0003 no-torn-swap).
+    /// Returns whether the canonical was actually written (`Ok(false)` = a deliberate abort, not an
+    /// error).
+    ///
+    /// The mint's `claude -p` spawn ran WITHOUT the swap lock (holding it across a multi-second
+    /// spawn would stall every swap), so a concurrent `use` / auto swap could have moved the active
+    /// account meanwhile. Under the SAME single-writer swap lock the swap engine holds, this
+    /// RE-READS the canonical and confirms it still resolves to account `i` BEFORE overwriting:
+    /// promoting a now-stale, account-`i`-derived token would CLOBBER that operator swap, so a
+    /// changed active identity ABORTS with zero writes (the minted token is simply discarded; the
+    /// #13/#42 recovery path reclaims a stranded credential if it ever matters). On the happy path
+    /// the write is the keychain's atomic `add-generic-password -U` (a live session's next read
+    /// sees the fresh token whole, never torn), then the canonical-watch baseline is committed so
+    /// the #140 external-login watch and the next-tick #13 reconcile do NOT misfire on the daemon's
+    /// OWN write. A contended lock exhausting its bounded wait fails closed (`Err(SwapLockBusy)`) —
+    /// the caller treats it as no-promote, exactly like any other swap-lock refusal.
+    async fn promote_canonical(&mut self, i: usize, cred: &Credential) -> Result<bool> {
+        // Serialize against the swap engine: take the SAME single-writer swap lock `use` / auto
+        // swaps hold (when one is configured — hermetic tests run lock-free, no second writer).
+        let _guard = match self.swap_lock_path.as_deref() {
+            Some(path) => Some(SwapLock::acquire(path, SWAP_LOCK_MAX_WAIT).await?),
+            None => None,
+        };
+        // Re-read UNDER THE LOCK and confirm account `i` is still active before overwriting — the
+        // mint ran unlocked, so a swap may have raced it. A changed / unreadable canonical aborts
+        // with zero writes rather than clobber a concurrent swap.
+        let still_active = match self.store.read().await {
+            Ok(current) => self.resolve_account_for(&current).await == Some(i),
+            Err(_) => false,
+        };
+        if !still_active {
+            return Ok(false);
+        }
+        // Atomic canonical write; the live session's next read sees the fresh token whole.
+        self.store.write(cred).await?;
+        // Baseline-commit so #140 / the #13 reconcile do not misfire on the daemon's own write.
+        self.state.canonical_watch.commit(cred);
+        Ok(true)
     }
 
     /// The per-roster-index enabled (in-rotation, issue #36) mask `pick_target`
@@ -9456,6 +9877,686 @@ mod tests {
                  poll_refresh event with the redacted handle + mapped outcome + rotation flag",
             );
         }
+    }
+
+    // --- #282 in-place ACTIVE-account keep-warm (the FOURTH refresh mechanism) ----
+    //
+    // The active account's canonical token is kept warm IN PLACE: minted via the isolated
+    // spawn on a COPY of the canonical blob, then PROMOTED to the canonical item a live
+    // session reads (never the STASH the #253-excluded engine writes). Two firing paths —
+    // PROACTIVE (before the token nears expiry) and REACTIVE (a backstop on an active 401,
+    // reviving before the 401 counts toward the #42 streak) — plus a per-account STAGGER that
+    // de-correlates the roster's mints across the shared ~8h TTL. These tests exercise the
+    // seam directly (the near-expiry gate + throttle are pure functions of an injected
+    // `now_ms` / [`FakeClock`]) and end-to-end through `tick`.
+
+    /// A far-future access-token expiry (epoch ms, ~year 2100): well beyond any keep-warm
+    /// horizon, so a canonical carrying it never trips the PROACTIVE near-expiry gate — used to
+    /// ISOLATE the reactive path in the `tick`-driven tests (only the scripted 401 fires it).
+    const FAR_FUTURE_MS: i64 = 4_102_444_800_000;
+
+    /// A realistic active canonical blob: the non-secret `expiresAt` (epoch ms) beside a
+    /// `refreshToken` — an EMPTY `refresh_token` is the DEAD signal (`has_live_refresh_token`
+    /// returns false), the invariant-4 case the keep-warm must NOT try to revive.
+    fn warm_canonical(expires_at_ms: i64, refresh_token: &str) -> Credential {
+        cred(
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat-ACTIVE00SECRET","refreshToken":"{refresh_token}","expiresAt":{expires_at_ms}}}}}"#
+            )
+            .as_bytes(),
+        )
+    }
+
+    /// A [`KeepWarm`] fake for the #282 seam tests: it COUNTS mint calls (asserting the proactive
+    /// throttle and the once-per-episode reactive guard), returns a scripted [`RefreshOutcome`]
+    /// with a `fresh` credential to promote (on `Refreshed`), and — when `revive_to` is set —
+    /// REVIVES the active account by flipping its shared [`SeamOutcomes`] entry to a live reading
+    /// (the false-death the reactive backstop rescues).
+    struct SeamKeepWarm {
+        outcomes: SeamOutcomes,
+        outcome: RefreshOutcome,
+        revive_to: Option<Usage>,
+        fresh: Option<Credential>,
+        calls: Rc<Cell<u32>>,
+    }
+
+    impl KeepWarm for SeamKeepWarm {
+        fn keep_warm<'a>(
+            &'a self,
+            account: &'a Account,
+            _canonical: &'a Credential,
+        ) -> Pin<Box<dyn Future<Output = Result<KeepWarmMint>> + 'a>> {
+            Box::pin(async move {
+                self.calls.set(self.calls.get() + 1);
+                if let Some(usage) = self.revive_to {
+                    self.outcomes
+                        .borrow_mut()
+                        .insert(account.account_uuid.clone(), Scripted::Ok(usage));
+                }
+                // A fresh credential to promote ONLY on a real refresh; every other outcome
+                // hands back `None` and the daemon leaves the canonical item untouched.
+                let credential = match self.outcome {
+                    RefreshOutcome::Refreshed => self.fresh.clone(),
+                    _ => None,
+                };
+                Ok((
+                    RefreshReport {
+                        outcome: self.outcome,
+                        expires_at_delta_secs: None,
+                        // Only a real exchange rotates the RT; NoChange / Dead / Error never do.
+                        refresh_token_rotated: matches!(self.outcome, RefreshOutcome::Refreshed),
+                        // A keep-warm PROMOTES rather than re-stashes — never `re_stashed`.
+                        re_stashed: false,
+                    },
+                    credential,
+                ))
+            })
+        }
+    }
+
+    /// A two-account keep-warm daemon (issue #282): `work` (`u-A`) is the ACTIVE account under
+    /// test, holding `canonical`; `spare` (`u-B`) polls healthy so an emergency swap has a
+    /// viable target (the invariant-4 escape). The `SeamKeepWarm` engine is wired with a 1-hour
+    /// cadence (the near-expiry horizon + proactive throttle). Returns the daemon plus the shared
+    /// outcome cell (to script the active poll / observe a revive) and the mint call-counter.
+    async fn keep_warm_daemon(
+        active_outcome: Scripted,
+        keep_warm_outcome: RefreshOutcome,
+        revive_to: Option<Usage>,
+        fresh: Option<Credential>,
+        canonical: Credential,
+    ) -> (
+        Daemon<SeamPoller, FakeCredentialStore, FakeAccountStash, FakeClock>,
+        SeamOutcomes,
+        Rc<Cell<u32>>,
+    ) {
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = FakeCredentialStore::empty();
+        store.write(&canonical).await.unwrap();
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        // The display resolves the active account to `u-A` (the canonical blob token-matches no
+        // stash, so resolution falls to the display — exactly the active-account signal #207 uses).
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let outcomes: SeamOutcomes = Rc::new(RefCell::new(HashMap::from([
+            ("u-A".to_owned(), active_outcome),
+            ("u-B".to_owned(), Scripted::Ok(reading(0.10, 0.10))),
+        ])));
+        let calls = Rc::new(Cell::new(0u32));
+        let daemon = Daemon::new(
+            roster,
+            SeamPoller {
+                outcomes: outcomes.clone(),
+            },
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_keep_warm_engine(
+            Box::new(SeamKeepWarm {
+                outcomes: outcomes.clone(),
+                outcome: keep_warm_outcome,
+                revive_to,
+                fresh,
+                calls: calls.clone(),
+            }),
+            Duration::from_secs(3600),
+        );
+        (daemon, outcomes, calls)
+    }
+
+    #[tokio::test]
+    async fn should_keep_warm_retry_is_the_active_only_complement_of_the_162_guard() {
+        // The reactive backstop fires on exactly the case #253's `should_refresh_retry` EXCLUDES:
+        // the ACTIVE account, first 401 of an episode, seam wired, not quarantined. The two guards
+        // partition a 401 by active-ness, so a 401 takes exactly one refresh path.
+        let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        let unauthorized = Err(Error::UsageUnauthorized);
+
+        // Active (idx 0), first 401, seam wired, not quarantined → the keep-warm fires; and the
+        // #162 isolated path does NOT (its active exclusion), so they never both fire.
+        daemon.state.active = Some(0);
+        assert!(daemon.should_keep_warm_retry(0, &unauthorized));
+        assert!(!daemon.should_refresh_retry(0, &unauthorized));
+
+        // NON-active (idx 1) is the #162 path's job, never the keep-warm's.
+        assert!(!daemon.should_keep_warm_retry(1, &unauthorized));
+
+        // A non-401 outcome never fires it.
+        assert!(!daemon.should_keep_warm_retry(0, &Ok(reading(0.1, 0.1))));
+
+        // Past the first 401 of the episode (`consec_401 > 0`) → suppressed (no mint storm; the
+        // rest of the episode advances the streak directly toward the #42 emergency swap).
+        daemon.state.health[0].consec_401 = 1;
+        assert!(!daemon.should_keep_warm_retry(0, &unauthorized));
+        daemon.state.health[0].consec_401 = 0;
+
+        // A quarantined active account is the streak's job — never re-warmed every re-probe poll.
+        daemon.state.health[0].quarantined = true;
+        assert!(!daemon.should_keep_warm_retry(0, &unauthorized));
+    }
+
+    #[tokio::test]
+    async fn should_keep_warm_retry_is_inert_without_a_wired_seam() {
+        // With no keep-warm engine wired (the default / `[refresh]`-off daemon) an active 401 is
+        // NEVER a keep-warm — the active account simply lapses exactly as before the fix.
+        let mut daemon = lifecycle_daemon().await;
+        daemon.state.active = Some(0);
+        assert!(daemon.keep_warm.is_none());
+        assert!(!daemon.should_keep_warm_retry(0, &Err(Error::UsageUnauthorized)));
+    }
+
+    #[tokio::test]
+    async fn a_reactive_backstop_revives_an_active_401_and_promotes_the_canonical() {
+        // AC-2 (positive): the active account's first 401, with a LIVE refresh token, mints a
+        // fresh token in place, PROMOTES it to the canonical item, re-polls through it, and the
+        // re-poll clears — so the #42 streak never advances (the false-death this fixes). The
+        // canonical now holds the FRESH token a live session reads.
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed,
+            Some(reading(0.10, 0.10)), // the mint REVIVES the active token
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        let mut events = Vec::new();
+        let result = daemon
+            .keep_warm_retry(
+                0,
+                Some(&warm_canonical(FAR_FUTURE_MS, "rt-live")),
+                &mut events,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a revived active 401 re-polls to a live reading"
+        );
+        assert_eq!(calls.get(), 1, "exactly one mint fired");
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "the fresh token was promoted to the canonical item a live session reads",
+        );
+        assert_eq!(
+            events,
+            vec![Event::KeepWarm {
+                account: "work".to_owned(),
+                trigger: KeepWarmTrigger::Reactive,
+                // A keep-warm promotes, so a real refresh renders `refreshed_not_restashed`.
+                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                refresh_token_rotated: true,
+            }],
+            "one durable keep_warm event records the reactive mint",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_refresh_token_active_401_advances_the_streak_without_minting() {
+        // AC-2 / invariant 4 (empty-RT): a dead (empty) refresh token cannot be revived by any
+        // mint, so the keep-warm SHORT-CIRCUITS — no `claude -p` spawn — and the 401 stands, so
+        // the streak advances toward the #42 emergency swap. A truly-dead active credential still
+        // quarantines; the escape to a live spare is preserved.
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed,
+            Some(reading(0.10, 0.10)), // would revive IF the mint ever ran — it must not
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, ""), // EMPTY refresh token → dead
+        )
+        .await;
+        let mut events = Vec::new();
+        let result = daemon
+            .keep_warm_retry(0, Some(&warm_canonical(FAR_FUTURE_MS, "")), &mut events)
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::UsageUnauthorized)),
+            "a dead-RT active 401 stands so the #42 streak advances (invariant 4)",
+        );
+        assert_eq!(
+            calls.get(),
+            0,
+            "a dead refresh token skips the doomed mint spawn"
+        );
+        assert!(
+            events.is_empty(),
+            "a skipped keep-warm emits no action event"
+        );
+        assert_ne!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "the canonical item is left untouched when there is nothing to revive",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reactive_mint_reporting_dead_advances_the_streak() {
+        // AC-2 / invariant 4 (Dead outcome): the RT was non-empty at mint time (so the mint DOES
+        // run), but CC cleared it in place and the cycle reports `Dead` — a genuine death. No
+        // promote, the 401 stands, the streak advances. The mint fired exactly once.
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Dead,
+            Some(reading(0.10, 0.10)), // a Dead outcome hands back no credential regardless
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        let mut events = Vec::new();
+        let result = daemon
+            .keep_warm_retry(
+                0,
+                Some(&warm_canonical(FAR_FUTURE_MS, "rt-live")),
+                &mut events,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::UsageUnauthorized)),
+            "a Dead mint lets the 401 stand so the streak advances (invariant 4)",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "the mint ran once (the RT was non-empty) and reported Dead"
+        );
+        assert_ne!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "a Dead outcome promotes nothing",
+        );
+        assert_eq!(
+            events,
+            vec![Event::KeepWarm {
+                account: "work".to_owned(),
+                trigger: KeepWarmTrigger::Reactive,
+                outcome: RefreshEventOutcome::Dead,
+                refresh_token_rotated: false,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reactive_backstop_end_to_end_never_quarantines_a_revivable_active_401() {
+        // AC-2 end-to-end through `tick`: the active `work` account 401s on its first poll; the
+        // reactive keep-warm mints + promotes + re-polls, the re-poll clears, and `work` is never
+        // quarantined. The FAR-FUTURE expiry keeps the proactive path inert, isolating the reactive
+        // one. The mint fired once (no storm) and the canonical carries the fresh token.
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed,
+            Some(reading(0.10, 0.10)),
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        // Tick 1 polls the active `work` first (issue #80 stagger) → its first 401 → the reactive
+        // backstop revives it in place.
+        let events = daemon.tick().await.events;
+
+        assert!(
+            !daemon.state.health[0].quarantined,
+            "a revivable active 401 is kept warm in place, never quarantined",
+        );
+        assert_eq!(
+            daemon.state.health[0].consec_401, 0,
+            "the cleared re-poll resets the streak",
+        );
+        assert_eq!(calls.get(), 1, "exactly one mint (no storm)");
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "the canonical item now holds the fresh token",
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::KeepWarm {
+                    trigger: KeepWarmTrigger::Reactive,
+                    ..
+                }
+            )),
+            "the tick emitted the reactive keep_warm action: {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_proactive_path_mints_within_the_near_expiry_horizon_and_promotes() {
+        // AC-1: a token INSIDE its (staggered) near-expiry horizon is minted BEFORE any 401 and
+        // the fresh token promoted to the canonical item — so a live session always reads a warm
+        // token and the overnight false-death cascade never starts.
+        let now_ms = 1_800_000_000_000;
+        // 60 s to expiry, well inside the 1-hour+stagger horizon.
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live");
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            canonical.clone(),
+        )
+        .await;
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "a near-expiry active token is minted proactively"
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "the proactive mint promotes the fresh token to the canonical item",
+        );
+        assert!(
+            daemon.state.health[0].last_keep_warm_attempt.is_some(),
+            "the attempt is stamped for the proactive throttle",
+        );
+        assert_eq!(
+            events,
+            vec![Event::KeepWarm {
+                account: "work".to_owned(),
+                trigger: KeepWarmTrigger::Proactive,
+                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                refresh_token_rotated: true,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn the_proactive_path_skips_far_from_expiry_and_when_quarantined() {
+        // AC-1 (negative) / no storm: a token far from expiry is NOT minted (nothing to warm yet),
+        // and a quarantined active account is never re-warmed (the #42 streak owns it).
+        let now_ms = 1_800_000_000_000;
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live"); // near expiry…
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            canonical.clone(),
+        )
+        .await;
+        let mut events = Vec::new();
+
+        // Far from expiry (100 days out) → skip.
+        let far = warm_canonical(now_ms + 100 * 86_400_000, "rt-live");
+        daemon
+            .keep_active_warm(Some(0), Some(&far), now_ms, &mut events)
+            .await;
+        assert_eq!(calls.get(), 0, "a far-from-expiry token is not warmed");
+
+        // …but even a near-expiry token is skipped once the account is quarantined.
+        daemon.state.health[0].quarantined = true;
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+        assert_eq!(
+            calls.get(),
+            0,
+            "a quarantined active account is never re-warmed"
+        );
+        assert!(events.is_empty(), "no mint → no event");
+    }
+
+    #[tokio::test]
+    async fn the_proactive_throttle_admits_one_mint_per_cadence() {
+        // No storm: while the token sits in the near-expiry window, the proactive path mints at
+        // most once per keep-warm cadence — so a persistently no-op mint cannot spawn `claude -p`
+        // every tick. The throttle RELEASES once the cadence elapses.
+        let now_ms = 1_800_000_000_000;
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live");
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            canonical.clone(),
+        )
+        .await;
+        let mut events = Vec::new();
+
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+        // A second attempt at the SAME instant (frozen clock) is throttled.
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+        assert_eq!(
+            calls.get(),
+            1,
+            "a second mint inside the cadence is throttled"
+        );
+
+        // Once the cadence elapses, the next attempt mints again.
+        daemon.clock.advance(Duration::from_secs(3601));
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+        assert_eq!(calls.get(), 2, "the throttle releases after one cadence");
+    }
+
+    #[tokio::test]
+    async fn a_promote_aborts_when_a_swap_raced_the_mint() {
+        // Invariant 2 (no-torn-swap, ADR-0003): the mint runs WITHOUT the swap lock, so a `use` /
+        // auto swap can land meanwhile. Under the lock, `promote_canonical` re-reads the canonical
+        // and, finding it no longer resolves to the account it minted for, ABORTS with ZERO writes
+        // — never clobbering the concurrent swap.
+        let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        // Simulate a swap that landed during the mint: the canonical now token-matches `spare`
+        // (`u-B` / idx 1), NOT the active `work` (idx 0) the mint targeted.
+        daemon.store.write(&cred(b"B-token")).await.unwrap();
+
+        let promoted = daemon
+            .promote_canonical(0, &cred(b"FRESH-A"))
+            .await
+            .unwrap();
+        assert!(
+            !promoted,
+            "a raced swap aborts the promote (Ok(false), a deliberate no-op)"
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            b"B-token",
+            "the concurrent swap's canonical is left intact — zero writes on abort",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keep_warm_promote_commits_the_baseline_so_the_140_watch_does_not_misfire() {
+        // Invariant 3 (#140 external-login watch): the daemon's OWN in-place canonical write must
+        // NOT read back as an operator re-login. `promote_canonical` baseline-commits the fresh
+        // credential, so the very next `reconcile_canonical_change` classifies it Unchanged and
+        // emits nothing (no ReStash / UncapturedLogin).
+        let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        daemon.state.active = Some(0);
+        // Seed the watch baseline to the current canonical (as top-of-tick does), then promote.
+        let seed = daemon.store.read().await.unwrap();
+        daemon.state.canonical_watch.commit(&seed);
+        let promoted = daemon
+            .promote_canonical(0, &cred(b"FRESH-A"))
+            .await
+            .unwrap();
+        assert!(promoted);
+
+        // The next reconcile against the just-promoted canonical sees NO change → no event.
+        let mut events = Vec::new();
+        let fresh = daemon.store.read().await.unwrap();
+        daemon.reconcile_canonical_change(&fresh, &mut events).await;
+        assert!(
+            events.is_empty(),
+            "the daemon's own keep-warm write must not misfire the #140 watch: {events:?}",
+        );
+    }
+
+    #[test]
+    fn the_keep_warm_stagger_is_deterministic_bounded_and_de_correlated() {
+        // AC-3: the per-account stagger de-correlates the roster's keep-warm mints across the
+        // shared TTL. It is (a) a deterministic pure function of the uuid — STABLE across restarts,
+        // (b) bounded to `[0, cadence)` so no account is ever starved past the `cadence` floor, and
+        // (c) DISTINCT across accounts (distinct uuids draw distinct offsets), which is the
+        // de-correlation.
+        let cadence = Duration::from_secs(3600);
+        let a = keep_warm_stagger_secs("u-A", cadence);
+        let b = keep_warm_stagger_secs("u-B", cadence);
+        let c = keep_warm_stagger_secs("u-C", cadence);
+
+        // Deterministic: same uuid → same offset, every call.
+        assert_eq!(
+            a,
+            keep_warm_stagger_secs("u-A", cadence),
+            "stagger is stable per uuid"
+        );
+        // Bounded to the window (never starves an account past the cadence floor).
+        for (uuid, offset) in [("u-A", a), ("u-B", b), ("u-C", c)] {
+            assert!(
+                offset < 3600,
+                "{uuid} stagger {offset} escaped [0, cadence)"
+            );
+        }
+        // De-correlated: distinct accounts draw distinct phases (the whole point).
+        assert!(
+            a != b && b != c && a != c,
+            "distinct uuids must de-correlate: {a}, {b}, {c}",
+        );
+        // A zero cadence degenerates safely to 0 (no window to stagger within).
+        assert_eq!(keep_warm_stagger_secs("u-A", Duration::ZERO), 0);
+    }
+
+    #[tokio::test]
+    async fn a_near_expiry_active_401_mints_once_not_twice_in_a_tick() {
+        // AC-1 "no storm" under the real overnight scenario: when the active token is BOTH inside
+        // its near-expiry horizon AND returns a 401 in the same tick, the reactive backstop fires
+        // and — because it stamps `last_keep_warm_attempt` — the proactive path that runs later the
+        // same tick is THROTTLED. Exactly ONE `claude -p` mint, never two. (Every other keep-warm
+        // test isolates one path — a healthy poll for proactive, `FAR_FUTURE_MS` for reactive — so
+        // this is the only test that intersects them, the crux of the no-double-mint property.)
+        let near = wall_clock_now_ms() + 60_000; // 60 s to expiry → inside the horizon
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized, // the active account 401s this tick
+            RefreshOutcome::Refreshed,
+            Some(reading(0.10, 0.10)), // the reactive mint revives it
+            Some(cred(b"FRESH-A")),
+            warm_canonical(near, "rt-live"),
+        )
+        .await;
+        // Tick 1 polls the active `work` first (#80 stagger): 401 → reactive mint → revive →
+        // re-poll clears; then the proactive pass runs (near-expiry gate TRUE) but is throttled.
+        daemon.tick().await;
+        assert_eq!(
+            calls.get(),
+            1,
+            "a near-expiry active 401 mints exactly once — the reactive stamp throttles proactive",
+        );
+        assert_eq!(
+            daemon.state.health[0].consec_401, 0,
+            "the revive reset the streak"
+        );
+        assert!(!daemon.state.health[0].quarantined);
+    }
+
+    #[tokio::test]
+    async fn a_promote_that_survives_a_still_401ing_token_lets_the_401_stand() {
+        // A genuine server-side revocation: the mint reports `Refreshed` and the fresh token IS
+        // promoted, but the re-poll through the (now-fresh) canonical STILL 401s — the fresh token
+        // did not actually fix the problem. The 401 must stand so the streak advances (never a
+        // false "revived" that masks a dead credential). `revive_to = None` keeps the active poll
+        // 401ing even after the promote.
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::Refreshed,
+            None, // the mint promotes a fresh token but does NOT revive the poll outcome
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        let mut events = Vec::new();
+        let result = daemon
+            .keep_warm_retry(
+                0,
+                Some(&warm_canonical(FAR_FUTURE_MS, "rt-live")),
+                &mut events,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(Error::UsageUnauthorized)),
+            "a fresh token that still 401s lets the 401 stand so the streak advances",
+        );
+        assert_eq!(calls.get(), 1, "the mint ran once");
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "the fresh token WAS promoted — the problem is server-side, not a mint failure",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promote_under_a_configured_swap_lock_acquires_and_writes() {
+        // Invariant 2 (production path): with a swap lock configured, `promote_canonical` acquires
+        // it (uncontended here), re-reads the canonical under it, confirms the account is still
+        // active, and writes the fresh token atomically. The daemon tests otherwise run lock-free
+        // (`swap_lock_path = None`); this exercises the `Some(path)` branch the daemon uses in
+        // production. (The contended `SwapLockBusy` fail-closed is covered in `swap.rs`.)
+        let lock_dir = tempfile::tempdir().unwrap();
+        let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        daemon = daemon.with_swap_lock(lock_dir.path().join("swap.lock"));
+        daemon.state.active = Some(0);
+
+        let promoted = daemon
+            .promote_canonical(0, &cred(b"FRESH-A"))
+            .await
+            .unwrap();
+        assert!(
+            promoted,
+            "an uncontended locked promote acquires and writes"
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            b"FRESH-A",
+            "the fresh token was written under the swap lock",
+        );
     }
 
     #[tokio::test]

@@ -386,9 +386,11 @@ The periodic tick is **off by default** (opt-in) and runs entirely in the daemon
 competes with the work that keeps the active session alive. Each refresh happens in
 an isolated `CLAUDE_CONFIG_DIR` (exactly as `poke`), so the live
 `Claude Code-credentials` item is never touched, and the **active account and the
-imminent swap target are always excluded** — it refreshes parked accounts only. A
-refresh failure (or a cycle that overruns its timeout) is non-fatal: it is logged,
-redacted, and the daemon returns to polling.
+imminent swap target are always excluded** — it refreshes parked accounts only (the
+active account is instead kept warm **in place**, see
+[below](#keeping-the-active-credential-warm-in-place)). A refresh failure (or a cycle
+that overruns its timeout) is non-fatal: it is logged, redacted, and the daemon
+returns to polling.
 
 Turn it on and tune it in the `[refresh]` table of `config.toml`:
 
@@ -419,6 +421,35 @@ recur on `cadence_secs` alone. Keep it comfortably below `cadence_secs`; the def
 > pinned, so the shipped cadence/idle defaults are deliberately conservative and may
 > change once the engine's own first-run telemetry establishes the real TTL. Pick a
 > `cadence_secs` comfortably shorter than your observed token lifetime.
+
+### Keeping the active credential warm in place
+
+The parked sweep above deliberately skips the **active** account — its refresh writes
+each account's *stash*, and rotating the active token there would strand the fresh
+value where no live session reads it. But an idle machine left overnight can let the
+active token lapse and, on the next poll, a `401` is mistaken for a dead credential —
+starting a false-death logout cascade. To close that gap, whenever `[refresh]` is
+enabled the daemon **also keeps the active account's canonical token warm in place**:
+
+- **Proactively** — before the active token nears expiry, the daemon mints a fresh
+  token (the same isolated spawn the parked sweep uses, on a *copy* of the canonical
+  blob) and **promotes it to the canonical `Claude Code-credentials` item** a live
+  session actually reads — so the token is refreshed *ahead* of any `401`.
+- **As a reactive backstop** — if the active account does return a `401` with a still-
+  live refresh token, the daemon refreshes it in place and re-polls **before** the
+  `401` counts toward the dead-credential streak. Only a genuinely dead credential (an
+  empty refresh token, or a refresh that reports `dead`) advances the streak — so a
+  truly-dead active account still quarantines and the emergency swap to a live spare is
+  preserved.
+
+The in-place canonical write is serialized against account swaps (the same single-
+writer lock, an atomic keychain update, re-checked each cycle), so it can never tear a
+swap. Each account's keep-warm timing is **staggered** by a stable per-account offset,
+so a roster that logged in together does not all reach expiry — and refresh — in
+lockstep. This needs no extra configuration: it shares the `[refresh].enabled` switch
+and reuses `cadence_secs` as its near-expiry horizon. Every keep-warm firing is logged
+as a redacted `event=keep_warm` line (`trigger=proactive`/`reactive`, the classified
+outcome, and whether the refresh token rotated), never a token or email.
 
 ## Configuration
 

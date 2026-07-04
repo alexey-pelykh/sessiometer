@@ -23,7 +23,7 @@ use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy};
 use crate::daemon::{
     run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, RealClock,
-    RealRosterPoller, RealShutdown, StatusResponse, UnixControl,
+    RealKeepWarmEngine, RealRosterPoller, RealShutdown, StatusResponse, UnixControl,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -861,6 +861,17 @@ async fn run(verbosity: Verbosity) -> Result<()> {
             RealAccountStash::new(),
             bin.clone(),
         )));
+        // Issue #282: the FOURTH refresh mechanism — the active account's canonical token is kept
+        // warm IN PLACE (proactively before expiry + a reactive backstop on an active 401), minted
+        // via the isolated spawn and promoted to the canonical item a live session reads. Gated on
+        // the SAME effective switch as the periodic tick and the #162 retry (a resolvable `claude`
+        // binary), so `[refresh]` off leaves the active account lapsing at expiry exactly as
+        // before. `cadence()` (`[refresh].cadence_secs`) is the near-expiry horizon and the
+        // proactive throttle — no second config knob.
+        daemon = daemon.with_keep_warm_engine(
+            Box::new(RealKeepWarmEngine::new(bin.clone())),
+            config.refresh.cadence(),
+        );
     }
     let mut refresh_tick = RefreshTick::new(
         config.roster.clone(),
