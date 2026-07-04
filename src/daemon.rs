@@ -22,8 +22,11 @@
 //!    own rate-limit window: the usage endpoint is source-scoped and serves ~one
 //!    request per short window, so the former poll-of-all BURST had all-but-one
 //!    `429`-fail at the CDN edge. The polled account's reading updates its slot in the
-//!    carried `last_readings`; a failed poll clears it. A `429` / `5xx` backs the
-//!    WHOLE loop off (issue #76) — rate-limiting is endpoint-global.
+//!    carried `last_readings`; a failed poll clears it. A `429` / `5xx` backs off
+//!    only THAT account's next poll (issue #293, revising #76): the `429` is
+//!    per-account (each token resolves to its own Anthropic org, so the throttle
+//!    buckets are independent), so the throttled account is skipped until its
+//!    back-off window elapses while the active account keeps polling.
 //! 3. **Decide and swap** on the LAST-KNOWN reading of each account (issue #80) — no
 //!    longer a single-instant poll-of-all, so one account's number may be ~a cycle
 //!    older than another's. If the active account's SESSION usage is at/above the
@@ -888,10 +891,11 @@ pub(crate) struct TickOutcome {
     /// The per-account readings this cycle, for the control socket (`status`).
     pub(crate) snapshot: StatusSnapshot,
     /// How long the run loop should wait before the next tick. `None` = the normal
-    /// jittered poll interval (issue #38); `Some(d)` = an explicit wait that widens
-    /// the gap between retries — either the locked-keychain back-off (issue #13,
-    /// while the keychain stays locked) or the rate-limit / transient poll back-off
-    /// (issue #76, while the usage endpoint keeps returning `429` / `5xx`).
+    /// jittered poll interval (issue #38); `Some(d)` = the locked-keychain back-off
+    /// (issue #13), imposed while the keychain stays locked and NOTHING can be polled.
+    /// The rate-limit / transient back-off is NO LONGER a whole-loop wait (issue #293):
+    /// it is scoped per-account and applied by skipping the throttled account's own poll
+    /// (see [`Daemon::note_account_backoff`]), so it never widens this loop-level wait.
     pub(crate) next_wait: Option<Duration>,
 }
 
@@ -998,6 +1002,23 @@ pub(crate) struct AccountHealth {
     /// throttled once-per-episode by `consec_401 == 0`, so it ignores this field but still
     /// stamps it (a reactive mint suppresses a redundant proactive mint the same tick).
     last_keep_warm_attempt: Option<Instant>,
+    /// Consecutive throttled polls on THIS account that backed off (issue #293, the
+    /// per-account revision of #76's endpoint-global `DecisionState::poll_backoff_streak`).
+    /// A `429` (rate-limited) or `5xx` / network transient advances it; any other poll
+    /// outcome resets it to 0. Drives the exponential widening of this account's back-off
+    /// window: the wait is the jittered poll interval times `2^min(streak,
+    /// POLL_BACKOFF_MAX_SHIFT)`, capped at [`POLL_BACKOFF_CAP`] (never below a server
+    /// `Retry-After`). Per-account so one account's throttle never widens another's cadence
+    /// — see [`note_account_backoff`](Daemon::note_account_backoff).
+    poll_backoff_streak: u32,
+    /// The monotonic-[`Clock`] instant before which this account's poll is SKIPPED (issue
+    /// #293): armed to `now + widened` on a throttled poll, cleared on any non-throttling
+    /// outcome. While [`Daemon::tick`] sees `now < poll_backoff_until` it skips this
+    /// account's poll (no usage request, carries its last reading) — so a `429` on one
+    /// account never silences the active account (the daemon's core job). `None` until the
+    /// first throttle; on the same monotonic clock as
+    /// [`last_keep_warm_attempt`](Self::last_keep_warm_attempt).
+    poll_backoff_until: Option<Instant>,
 }
 
 /// Per-loop decision state carried across polls.
@@ -1047,16 +1068,6 @@ struct DecisionState {
     /// backed-off retry while the keychain stays locked — mirroring
     /// `signaled_all_exhausted`.
     signaled_keychain_locked: bool,
-    /// Consecutive cycles whose polls saw a rate-limit (`429`) or transient (`5xx`
-    /// / network) failure and therefore backed off (issue #76). Drives the
-    /// exponential widening of [`TickOutcome::next_wait`]: the wait is this cycle's
-    /// jittered poll interval times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, capped
-    /// at [`POLL_BACKOFF_CAP`] (and never below a server-advised `Retry-After`).
-    /// Reset to 0 on the first cycle whose polls are all clean, so a later
-    /// throttling episode starts the climb afresh. Distinct from `lock_backoff`: the
-    /// keychain lock short-circuits the whole tick (`locked_tick`), whereas this
-    /// rides a tick that DID poll and was throttled.
-    poll_backoff_streak: u32,
     /// Last-known usage reading per roster account (issue #80), indexed by roster
     /// position. The daemon polls ONE account per tick (round-robin, active first),
     /// so a decision is taken on the most recent reading of EACH account rather than
@@ -1525,14 +1536,22 @@ where
         // re-probe), never a disabled / quarantined non-active. A locked keychain is
         // handled at top-of-tick, not here (see `locked_tick`).
         let poll_idx = self.next_poll_index(active);
-        // Whether THIS poll was rate-limited (`429`) or a transient (`5xx` / network)
-        // failure, with any server-advised `Retry-After` — the inputs to the poll
-        // back-off (issue #76). Rate-limiting is an endpoint-global signal (one usage
-        // endpoint for the whole roster), so the single account seeing it this tick
-        // backs off the WHOLE loop, not just itself.
-        let mut backed_off = false;
-        let mut retry_after_floor: Option<Duration> = None;
-        if let Some(i) = poll_idx {
+        // The per-account rate-limit / transient back-off this tick imposed (issue #293,
+        // the per-account revision of #76): the widened wait the account polled this tick
+        // earned by a `429` / `5xx`, surfaced on the diagnostic tick line below. `None`
+        // when this tick polled cleanly, skipped an account still inside its back-off
+        // window, or polled nothing.
+        let mut this_tick_backoff: Option<Duration> = None;
+        // Issue #293: the `429` is PER-ACCOUNT (each token resolves to its own Anthropic
+        // org, so the throttle buckets are independent), so a throttled account backs off
+        // ONLY its own next poll — the active account and every other account keep their
+        // normal cadence. `filter` drops the scheduled index while that account is still
+        // inside its back-off window, so the whole poll body below is SKIPPED (no usage
+        // request, no `Diagnostic::Poll`, `last_readings` carried untouched); the schedule
+        // cursor already advanced in `next_poll_index`, so the slot is consumed and the
+        // account is re-attempted once the window elapses. Transient (`5xx` / network) is
+        // scoped the same way — see `note_account_backoff`.
+        if let Some(i) = poll_idx.filter(|&i| !self.account_backing_off(i)) {
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
@@ -1578,10 +1597,10 @@ where
                 account: self.roster[i].label.clone(),
                 outcome: diag_poll_class(&result),
             });
-            if let Some(signal) = backoff_signal(&result) {
-                backed_off = true;
-                retry_after_floor = signal.retry_after;
-            }
+            // Fold the outcome into account `i`'s OWN back-off (issue #293): a `429` / `5xx`
+            // advances its per-account streak and arms its back-off window; any other
+            // outcome clears both. The returned widened wait rides the diagnostic tick line.
+            this_tick_backoff = self.note_account_backoff(i, &result);
             self.state.last_readings[i] = result.ok();
             // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
             // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
@@ -1625,22 +1644,21 @@ where
             }
             self.state.signaled_all_exhausted = false;
         }
-        // Rate-limit / transient back-off (issue #76): a cycle whose polls saw a
-        // `429` / `5xx` widens the next poll's spacing instead of re-polling at the
-        // fixed interval; a fully-clean cycle resets the climb so a later episode
-        // starts afresh.
-        let next_wait = if backed_off {
-            Some(self.note_poll_backoff(retry_after_floor))
-        } else {
-            self.state.poll_backoff_streak = 0;
-            None
-        };
+        // The rate-limit / transient back-off is PER-ACCOUNT now (issue #293): it is
+        // applied by skipping the throttled account's own poll above (`account_backing_off`
+        // / `note_account_backoff`), NOT by widening the WHOLE loop's wait — so the active
+        // account and every other account keep polling on their normal cadence. `next_wait`
+        // therefore stays `None` in the normal tick path; only the locked-keychain tick
+        // (#13, `locked_tick`) still returns a whole-loop wait.
+        let next_wait: Option<Duration> = None;
         // The per-tick decision diagnostic (issue #77), with any back-off this tick
         // imposed — the decision class names what the loop did (swap / hold / skip /
         // all_exhausted / …); a `None` back-off omits the field.
         diagnostics.push(Diagnostic::Tick {
             decision: action.decision_class(),
-            backoff_secs: next_wait.map(|wait| wait.as_secs()),
+            // The back-off imposed on the account polled THIS tick (issue #293, per-account);
+            // `None` on a clean poll, a skipped (already-backing-off) account, or a no-poll tick.
+            backoff_secs: this_tick_backoff.map(|wait| wait.as_secs()),
         });
         // Snapshot from the POST-swap active index (`self.state.active`), NOT the local
         // `active` captured at top-of-tick (`let active = self.state.active`): when
@@ -3212,9 +3230,10 @@ where
 
     /// Sleep until the next tick is due. `next_wait` is the just-finished tick's
     /// requested wait: `None` → the normal jittered poll interval (issue #38);
-    /// `Some(d)` → an explicit back-off duration — the locked-keychain back-off
-    /// (issue #13) or the rate-limit / transient poll back-off (issue #76). Behind
-    /// the [`Clock`] seam, so tests drive both paths deterministically.
+    /// `Some(d)` → the locked-keychain back-off (issue #13). The rate-limit / transient
+    /// back-off no longer rides this wait (issue #293): it is per-account, applied by
+    /// skipping the throttled account inside `tick`. Behind the [`Clock`] seam, so tests
+    /// drive both paths deterministically.
     pub(crate) async fn wait_after_tick(&mut self, next_wait: Option<Duration>) {
         match next_wait {
             Some(backoff) => self.clock.tick(backoff).await,
@@ -3222,29 +3241,67 @@ where
         }
     }
 
-    /// Fold a backed-off cycle (a `429` / `5xx` poll, issue #76) into the poll
-    /// back-off and return the wait that WIDENS the next poll's spacing. The base is
-    /// this cycle's freshly-drawn, jittered poll interval — so the back-off inherits
-    /// the #38 decorrelation — multiplied by `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`,
-    /// then clamped to [`POLL_BACKOFF_CAP`]. The first
-    /// backed-off cycle already waits ~2× the normal interval, so the effective
-    /// spacing is WIDER than re-polling at the fixed cadence — the issue's core ask.
-    /// A server-advised `Retry-After` is honoured as a MINIMUM: the wait is never
-    /// shorter than it, even past the cap. Advances and stores the streak so the next
-    /// consecutive backed-off cycle doubles again.
-    fn note_poll_backoff(&mut self, retry_after: Option<Duration>) -> Duration {
-        let streak = self.state.poll_backoff_streak.saturating_add(1);
-        self.state.poll_backoff_streak = streak;
+    /// Whether account `i` is inside its per-account rate-limit / transient back-off
+    /// window (issue #293): it earned a `429` / `5xx` and the widened wait it armed has
+    /// not yet elapsed on the monotonic [`Clock`]. While `true`, [`tick`](Self::tick)
+    /// SKIPS that account's poll this cycle — so the throttle stays scoped to the one
+    /// account and the active account (the daemon's core job) keeps polling. `false` once
+    /// the window elapses, or after any non-throttling poll clears it
+    /// ([`note_account_backoff`](Self::note_account_backoff)).
+    fn account_backing_off(&self, i: usize) -> bool {
+        self.state.health[i]
+            .poll_backoff_until
+            .is_some_and(|until| self.clock.now() < until)
+    }
+
+    /// Fold account `i`'s poll outcome into its OWN rate-limit / transient back-off (issue
+    /// #293, the per-account revision of #76's endpoint-global model). A `429`
+    /// (rate-limited) or a `5xx` / network transient advances the account's exponential
+    /// streak and arms its back-off window (its next poll is skipped until the window
+    /// elapses on the monotonic [`Clock`]); ANY other outcome (success / 401 / 403) clears
+    /// the account's streak and window. Returns the widened wait it imposed — for the
+    /// diagnostic tick line — or `None` when the outcome was not a throttle.
+    ///
+    /// The base is this cycle's freshly-drawn, jittered poll interval — inheriting the #38
+    /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, clamped to
+    /// [`POLL_BACKOFF_CAP`]. The first throttled poll already earns ~2× the interval, so
+    /// the account's re-poll spacing is WIDER than the fixed cadence — #76's core ask, now
+    /// per-account. A server-advised `Retry-After` is honoured as a MINIMUM: the wait is
+    /// never shorter than it, even past the cap (bounding a pathological value is #294).
+    ///
+    /// Scoping BOTH the `429` and the transient per-account is deliberate (issue #293): the
+    /// `429` is per-Anthropic-org (independent buckets), and under a genuine endpoint outage
+    /// every account fails its OWN poll and arms its OWN window anyway — so one per-account
+    /// path is the simplest correct design and needs no separate global case.
+    fn note_account_backoff(&mut self, i: usize, result: &Result<Usage>) -> Option<Duration> {
+        let Some(signal) = backoff_signal(result) else {
+            let health = &mut self.state.health[i];
+            health.poll_backoff_streak = 0;
+            health.poll_backoff_until = None;
+            return None;
+        };
+        let streak = self.state.health[i].poll_backoff_streak.saturating_add(1);
+        self.state.health[i].poll_backoff_streak = streak;
         let shift = streak.min(POLL_BACKOFF_MAX_SHIFT);
         let widened = self
             .next_poll_interval()
             .checked_mul(1u32 << shift)
             .unwrap_or(POLL_BACKOFF_CAP)
             .min(POLL_BACKOFF_CAP);
-        match retry_after {
+        let wait = match signal.retry_after {
             Some(ra) => widened.max(ra),
             None => widened,
-        }
+        };
+        // `checked_add` guards against an astronomically-large `Retry-After` overflowing
+        // the monotonic instant (which would panic and crash the long-running daemon) —
+        // a pure arithmetic-safety floor distinct from #294's policy cap; a value that far
+        // out is bounded to the exponential cap rather than honoured.
+        let now = self.clock.now();
+        self.state.health[i].poll_backoff_until = Some(
+            now.checked_add(wait)
+                .unwrap_or_else(|| now + POLL_BACKOFF_CAP),
+        );
+        Some(wait)
     }
 
     /// Draw the jittered start-up delay (issue #76): a uniform `[0,
@@ -5126,12 +5183,35 @@ mod tests {
         assert_eq!(relocked.next_wait, Some(LOCK_BACKOFF_BASE));
     }
 
-    // --- rate-limit / transient poll back-off (issue #76) ------------------
+    // --- per-account rate-limit / transient poll back-off (issue #293, revising #76) ---
 
-    /// A single-account ('u-A', active) daemon with the fixed 60 s poll interval —
-    /// the seam the poll back-off tests read `tick().next_wait` off (frozen clock,
-    /// no jitter, so the back-off is `60 s × 2^streak`). Returns the tempdir guard so
-    /// the caller keeps the displayed `~/.claude.json` alive for the daemon's life.
+    /// The `backoff_secs` the tick's decision diagnostic carried (issue #293) — the
+    /// per-account back-off imposed on the account polled this tick, in whole seconds.
+    /// `None` when the tick polled cleanly, skipped a backing-off account, or polled
+    /// nothing.
+    fn tick_backoff_secs(outcome: &TickOutcome) -> Option<u64> {
+        outcome.diagnostics.iter().find_map(|d| match d {
+            Diagnostic::Tick { backoff_secs, .. } => *backoff_secs,
+            _ => None,
+        })
+    }
+
+    /// Whether the tick actually POLLED an account (emitted a `Diagnostic::Poll`) rather
+    /// than SKIPPING a backing-off one (issue #293) — the observable that a per-account
+    /// back-off window suppressed the poll this tick.
+    fn tick_polled(outcome: &TickOutcome) -> bool {
+        outcome
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::Poll { .. }))
+    }
+
+    /// A single-account ('u-A', active) daemon with the fixed 60 s poll interval — the
+    /// seam the per-account poll back-off tests read (issue #293). Frozen clock (no jitter,
+    /// so the back-off is `60 s × 2^streak`); a throttled account stays inside its window
+    /// until a test `daemon.clock.advance(..)` moves the monotonic clock past the deadline,
+    /// so the tests drive the widened re-poll spacing deterministically. Returns the
+    /// tempdir guard so the caller keeps the displayed `~/.claude.json` alive.
     async fn rate_limit_daemon(poller: FakeRosterPoller) -> (tempfile::TempDir, FakeDaemon) {
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
@@ -5151,17 +5231,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_sustained_rate_limit_backs_off_instead_of_re_polling_at_the_fixed_interval() {
-        // AC: sustained 429 WIDENS the effective poll spacing rather than re-polling
-        // at the fixed interval. The first backed-off cycle already waits 2× the 60 s
-        // interval, and each consecutive 429 doubles it.
+        // AC (issue #293): a sustained 429 WIDENS the account's effective poll spacing —
+        // it is SKIPPED between re-attempts rather than re-polled at the fixed interval —
+        // and the loop itself no longer globally backs off (`next_wait` stays `None`). The
+        // first throttled poll arms a 2×-interval (120 s) window; each throttled re-poll
+        // doubles it.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
 
+        // Tick 1: A is polled and throttled → arms a 120 s per-account window. The loop
+        // does NOT globally back off; the back-off rides the decision diagnostic instead.
         let first = daemon.tick().await;
         assert_eq!(first.action, TickAction::SkippedActiveUnavailable);
-        assert_eq!(first.next_wait, Some(Duration::from_secs(120)));
-        // Diagnostic channel (#77): the poll surfaces as the `rate_limited` class —
-        // NOT a generic transient — and the per-tick decision carries the back-off in
+        assert_eq!(first.next_wait, None);
+        // Diagnostic channel (#77): the poll surfaces as the `rate_limited` class — NOT a
+        // generic transient — and the per-tick decision carries the per-account back-off in
         // whole seconds. This is exactly the `429` storm the issue says was previously
         // invisible (the event log emits no event for a rate-limited poll).
         assert_eq!(
@@ -5177,26 +5261,41 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(
-            daemon.tick().await.next_wait,
-            Some(Duration::from_secs(240))
+
+        // Tick 2 (clock unmoved, still inside the 120 s window): A is SKIPPED — no poll, no
+        // `Diagnostic::Poll`, no fresh back-off — which IS the widened spacing the AC asks
+        // for (backing off instead of re-polling at the fixed interval).
+        let skipped = daemon.tick().await;
+        assert!(
+            !tick_polled(&skipped),
+            "the backing-off account must be skipped"
         );
-        assert_eq!(
-            daemon.tick().await.next_wait,
-            Some(Duration::from_secs(480))
-        );
+        assert_eq!(skipped.next_wait, None);
+        assert_eq!(tick_backoff_secs(&skipped), None);
+
+        // Advancing past each window lets A be re-polled, and each throttled re-poll doubles
+        // the window: 240 s, then 480 s.
+        daemon.clock.advance(Duration::from_secs(120));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(240));
+        daemon.clock.advance(Duration::from_secs(240));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(480));
     }
 
     #[tokio::test]
     async fn the_rate_limit_back_off_doubles_then_caps() {
-        // The back-off grows exponentially from the interval and saturates at the cap,
-        // so sustained throttling settles at one poll per hour rather than growing
-        // without bound — mirroring the locked-keychain back-off shape.
+        // The per-account back-off grows exponentially from the interval and saturates at
+        // the cap, so a sustained-429 account settles at one re-poll per hour rather than
+        // growing without bound — mirroring the locked-keychain back-off shape. Advancing
+        // the clock past each window re-polls the (still-throttled) account, so its streak
+        // climbs tick over tick.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
         let mut waits = Vec::new();
         for _ in 0..8 {
-            waits.push(daemon.tick().await.next_wait.unwrap());
+            let secs = tick_backoff_secs(&daemon.tick().await).unwrap();
+            waits.push(Duration::from_secs(secs));
+            // Step past the just-armed window so the next tick re-polls (not skips) A.
+            daemon.clock.advance(Duration::from_secs(secs));
         }
         // 60 s × 2^streak: 120, 240, 480, 960, 1920, then 3840→capped 3600, then 3600.
         assert_eq!(
@@ -5216,87 +5315,105 @@ mod tests {
 
     #[tokio::test]
     async fn retry_after_is_honoured_as_a_minimum_wait() {
-        // AC: Retry-After is honoured as a MINIMUM. When it exceeds the exponential
-        // back-off it wins; when it is smaller, the larger exponential governs but the
-        // wait is never below Retry-After.
+        // AC: Retry-After is honoured as a MINIMUM for the account's back-off window. When
+        // it exceeds the exponential it wins; when it is smaller, the larger exponential
+        // governs but the window is never below Retry-After.
         // Larger than the 120 s first-cycle exponential → Retry-After (600 s) wins.
         let (_d1, mut bigger) = rate_limit_daemon(
             FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(600))),
         )
         .await;
-        assert_eq!(
-            bigger.tick().await.next_wait,
-            Some(Duration::from_secs(600))
-        );
+        assert_eq!(tick_backoff_secs(&bigger.tick().await), Some(600));
 
         // Smaller than the exponential → the 120 s exponential governs (and is ≥ 10 s).
         let (_d2, mut smaller) = rate_limit_daemon(
             FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(10))),
         )
         .await;
-        assert_eq!(
-            smaller.tick().await.next_wait,
-            Some(Duration::from_secs(120))
-        );
+        assert_eq!(tick_backoff_secs(&smaller.tick().await), Some(120));
     }
 
     #[tokio::test]
     async fn retry_after_overrides_the_cap_when_larger() {
-        // AC: Retry-After is a minimum even past POLL_BACKOFF_CAP — a server asking
-        // for 2 h is obeyed though the exponential ceiling is 1 h.
+        // AC: Retry-After is a minimum even past POLL_BACKOFF_CAP — a server asking for 2 h
+        // is obeyed though the exponential ceiling is 1 h. (Bounding a pathological value is
+        // a separate concern, issue #294.)
         let two_hours = Duration::from_secs(7200);
         assert!(two_hours > POLL_BACKOFF_CAP);
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(two_hours))).await;
-        assert_eq!(daemon.tick().await.next_wait, Some(two_hours));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(7200));
     }
 
     #[tokio::test]
     async fn a_clean_cycle_resets_the_rate_limit_back_off() {
-        // Once polls succeed again the back-off clears (next_wait None → normal
-        // interval) and the streak resets, so a LATER 429 restarts at 2× — not where
-        // the prior episode left off.
+        // Once the account polls clean again the back-off clears (no more skipping, streak
+        // reset), so a LATER 429 restarts at 2× — not where the prior episode left off.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
-        assert_eq!(
-            daemon.tick().await.next_wait,
-            Some(Duration::from_secs(120))
-        );
-        assert_eq!(
-            daemon.tick().await.next_wait,
-            Some(Duration::from_secs(240))
-        );
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+        daemon.clock.advance(Duration::from_secs(120));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(240));
 
-        // A clean poll clears the back-off and resets the streak.
+        // A clean poll clears the back-off and resets the streak. Advance past the window
+        // so the account is actually re-polled (not skipped) this tick.
+        daemon.clock.advance(Duration::from_secs(240));
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
-        assert_eq!(daemon.tick().await.next_wait, None);
-
-        // A later 429 restarts the climb at the base multiplier, not at 480.
-        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
-        assert_eq!(
-            daemon.tick().await.next_wait,
-            Some(Duration::from_secs(120))
+        let clean = daemon.tick().await;
+        assert!(
+            tick_polled(&clean),
+            "the window elapsed → the account is re-polled"
         );
+        assert_eq!(tick_backoff_secs(&clean), None);
+
+        // A later 429 restarts the climb at the base multiplier, not at 480 (the cleared
+        // window means the account is polled straightaway, no advance needed).
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
     }
 
     #[tokio::test]
     async fn only_throttling_outcomes_trigger_the_back_off() {
         // Back-off is scoped to 429 (rate-limit) and 5xx / network (transient). A 403
         // (scope) and a 401 (unauthorized) authenticate-or-reject the token but are not
-        // endpoint throttling — neither backs off; a transient does.
+        // throttling — neither arms a back-off window; a transient does.
         let (_d1, mut scope) =
             rate_limit_daemon(FakeRosterPoller::new().scope_missing("u-A")).await;
-        assert_eq!(scope.tick().await.next_wait, None);
+        assert_eq!(tick_backoff_secs(&scope.tick().await), None);
 
         let (_d2, mut unauth) =
             rate_limit_daemon(FakeRosterPoller::new().unauthorized("u-A")).await;
-        assert_eq!(unauth.tick().await.next_wait, None);
+        assert_eq!(tick_backoff_secs(&unauth.tick().await), None);
 
         let (_d3, mut transient) = rate_limit_daemon(FakeRosterPoller::new().failing("u-A")).await;
-        assert_eq!(
-            transient.tick().await.next_wait,
-            Some(Duration::from_secs(120))
+        assert_eq!(tick_backoff_secs(&transient.tick().await), Some(120));
+    }
+
+    #[tokio::test]
+    async fn a_non_throttling_outcome_clears_an_armed_back_off_window() {
+        // AC (issue #293): only 429 / transient SUSTAIN the per-account back-off — a
+        // non-throttling outcome (here a 403, like a 401 or a clean poll) CLEARS an
+        // already-armed window and resets the streak, so the account is re-polled
+        // straightaway and a later 429 restarts the climb at the base, not where the
+        // throttle episode left off.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        // Arm A's window (streak 1 → 120 s).
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+
+        // Past the window, a 403 poll clears the streak + window (no back-off imposed).
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.poller = FakeRosterPoller::new().scope_missing("u-A");
+        let cleared = daemon.tick().await;
+        assert!(
+            tick_polled(&cleared),
+            "the window elapsed → A is re-polled, not skipped"
         );
+        assert_eq!(tick_backoff_secs(&cleared), None);
+
+        // A later 429 restarts at the base 120 s (not 240 s), proving the streak was reset.
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
     }
 
     #[tokio::test]
@@ -5325,8 +5442,9 @@ mod tests {
     }
 
     /// A two-account daemon (`work` active + `spare`), both tokens stashed and the
-    /// canonical holding `work`'s — for the endpoint-global back-off tests (issue
-    /// #76), where a poll outcome on a NON-active account must steer the whole loop.
+    /// canonical holding `work`'s — for the per-account back-off tests (issue #293), where
+    /// a `429` on the NON-active `spare` must back off ONLY `spare` and leave the active
+    /// `work` polling on its normal cadence.
     async fn two_account_rate_limit_daemon(
         poller: FakeRosterPoller,
     ) -> (tempfile::TempDir, FakeDaemon) {
@@ -5351,13 +5469,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_active_rate_limit_backs_off_the_whole_loop() {
-        // AC: rate-limiting is endpoint-global — there is ONE usage endpoint for the
-        // whole roster, so a `429` on ANY polled account widens the next poll's
-        // spacing for the entire loop. Here the active `work` polls clean and holds
-        // (under its trigger), while the non-active `spare` is throttled: the loop
-        // still backs off (2× the 60 s interval). Were the back-off scoped only to an
-        // unavailable ACTIVE account, this cycle's `next_wait` would be `None`.
+    async fn a_non_active_rate_limit_backs_off_only_that_account() {
+        // AC (issue #293, replacing the former endpoint-global test): a `429` on a
+        // NON-active account backs off ONLY that account — the active account (and every
+        // other) keeps polling on its normal cadence, and the loop never globally waits.
+        // `spare` is throttled; `work` (active) polls clean under its trigger and holds.
         let (_dir, mut daemon) = two_account_rate_limit_daemon(
             FakeRosterPoller::new()
                 .ok("u-A", 0.10, 0.10)
@@ -5365,38 +5481,70 @@ mod tests {
         )
         .await;
 
-        // Tick 1 polls the ACTIVE A (clean) — no back-off from this account.
+        // Tick 1 polls the ACTIVE A (clean) — no back-off, loop keeps cadence.
         let first = daemon.tick().await;
         assert_eq!(first.next_wait, None);
-        // Tick 2 polls the NON-active B (the next round-robin entry), which is
-        // rate-limited — and the WHOLE loop backs off (2× the 60 s interval), even
-        // though B is not the active account: rate-limiting is endpoint-global.
+        assert_eq!(tick_backoff_secs(&first), None);
+
+        // Tick 2 polls the NON-active B (round-robin), which is throttled. The loop does
+        // NOT globally back off (`next_wait` stays `None` — the core AC); B's back-off is
+        // scoped to B (a 120 s window surfaced on the decision diagnostic). Under the former
+        // endpoint-global rule this `next_wait` would have been `Some(120 s)`.
         let second = daemon.tick().await;
-        assert_eq!(second.next_wait, Some(Duration::from_secs(120)));
+        assert_eq!(second.next_wait, None);
+        assert_eq!(tick_backoff_secs(&second), Some(120));
+
+        // Tick 3 wraps back to the ACTIVE A and re-polls it on the normal cadence — the
+        // non-active throttle never silenced the active account.
+        let third = daemon.tick().await;
+        assert!(
+            third.diagnostics.contains(&Diagnostic::Poll {
+                account: "work".to_owned(),
+                outcome: PollClass::Live,
+            }),
+            "tick 3 must re-poll the active account: {:?}",
+            third.diagnostics
+        );
+
+        // Tick 4 comes back around to B, still inside its 120 s window → SKIPPED (frozen
+        // clock), so B is not re-polled while it backs off.
+        assert!(
+            !tick_polled(&daemon.tick().await),
+            "the throttled non-active account is skipped while backing off"
+        );
+
+        // Advancing past B's window lets B be re-polled on its next turn: tick 5 → A,
+        // tick 6 → B (window elapsed → re-polled).
+        daemon.clock.advance(Duration::from_secs(120));
+        let _fifth = daemon.tick().await; // A
+        assert!(
+            tick_polled(&daemon.tick().await),
+            "B is re-polled once its back-off window elapses"
+        );
     }
 
     #[tokio::test]
-    async fn a_throttled_non_active_accounts_retry_after_governs_the_global_back_off() {
-        // The staggered loop (issue #80) polls ONE account per tick, so the former
-        // same-cycle fold across accounts no longer applies — but the back-off is still
-        // endpoint-global and still honours the throttled account's `Retry-After`,
-        // whichever account in the rotation hits it. Here the active A polls clean (no
-        // back-off) and the non-active B carries a `Retry-After` of 300 s on its
-        // round-robin tick; 300 s > the 120 s first-cycle exponential, so B's hint
-        // governs the WHOLE loop's wait even though B is not the active account.
+    async fn a_throttled_non_active_accounts_retry_after_governs_its_own_back_off() {
+        // The staggered loop (issue #80) polls ONE account per tick. A throttled NON-active
+        // account's `Retry-After` now governs ITS OWN back-off window (issue #293), not the
+        // whole loop: the active A keeps its cadence and the loop never globally waits. Here
+        // A polls clean and B carries a `Retry-After` of 300 s on its round-robin tick;
+        // 300 s > the 120 s first-cycle exponential, so B's hint governs B's own window.
         let (_dir, mut daemon) = two_account_rate_limit_daemon(
             FakeRosterPoller::new()
                 .ok("u-A", 0.10, 0.10)
                 .rate_limited("u-B", Some(Duration::from_secs(300))),
         )
         .await;
-        // Tick 1: active A, clean — no back-off.
-        assert_eq!(daemon.tick().await.next_wait, None);
-        // Tick 2: non-active B, throttled with Retry-After 300 → the loop waits 300 s.
-        assert_eq!(
-            daemon.tick().await.next_wait,
-            Some(Duration::from_secs(300))
-        );
+        // Tick 1: active A, clean — no back-off, loop keeps cadence.
+        let first = daemon.tick().await;
+        assert_eq!(first.next_wait, None);
+        assert_eq!(tick_backoff_secs(&first), None);
+        // Tick 2: non-active B, throttled with Retry-After 300 → B's OWN window is 300 s,
+        // and the loop still does not globally wait.
+        let second = daemon.tick().await;
+        assert_eq!(second.next_wait, None);
+        assert_eq!(tick_backoff_secs(&second), Some(300));
     }
 
     // --- #80 staggered round-robin poll scheduling -------------------------

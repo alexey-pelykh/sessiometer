@@ -75,8 +75,8 @@ fn emit_best_effort(log: &mut EventLog, event: &Event) {
 enum Idle {
     /// SIGINT / SIGTERM observed — exit the loop cleanly.
     Shutdown,
-    /// The poll interval (or a back-off wait — #13 locked-keychain or #76
-    /// rate-limit) elapsed — re-tick.
+    /// The poll interval (or the #13 locked-keychain back-off wait) elapsed — re-tick.
+    /// The #76 rate-limit back-off is per-account now (#293) and never a whole-loop wait.
     Elapsed,
     /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
     ManualSwapped,
@@ -491,9 +491,10 @@ where
     loop {
         let outcome = daemon.tick().await;
         report_tick_outcome(&outcome, log, diag);
-        // The wait this tick requested — an explicit back-off overrides the normal interval
-        // (locked-keychain #13, or rate-limit / transient #76) — captured before the snapshot is
-        // moved. The snapshot is what the control socket answers from until the next poll.
+        // The wait this tick requested — the locked-keychain back-off (#13) overrides the
+        // normal interval; the rate-limit / transient back-off is per-account now (#293) and
+        // never sets this. Captured before the snapshot is moved. The snapshot is what the
+        // control socket answers from until the next poll.
         let next_wait = outcome.next_wait;
         let snapshot = outcome.snapshot;
 
