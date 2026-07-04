@@ -137,7 +137,9 @@ pub(crate) use snapshot::RefreshHealth;
 
 mod socket;
 
-pub(crate) use socket::{notify_roster_reload, Control, ControlSignal, UnixControl};
+pub(crate) use socket::{
+    notify_restored, notify_roster_reload, Control, ControlSignal, UnixControl,
+};
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
 // in-module socket tests (production reaches them through `UnixControl::serve`); re-export
 // test-scoped so `use super::*` resolves them while a non-test build sees no unused re-export.
@@ -8401,6 +8403,51 @@ mod tests {
         let (reply, signal) = control_reply(r#"{"cmd":"restored"}"#, &snap, true);
         assert_eq!(reply, r#"{"error":"malformed request"}"#);
         assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn notify_restored_sends_the_uuid_command_and_reads_the_ack() {
+        // Issue #276: the client-side `restored` notify writes exactly one newline-delimited
+        // `{"cmd":"restored","uuid":"<uuid>"}` request — the uuid embedded and escaped by
+        // serde_json (unlike the payload-less `roster-reload`) — and returns Ok once the daemon
+        // acks. This is the CLI→daemon wire contract that #275's `control_reply` handler parses
+        // back into `Restored("u-B")`, closing the loop `reconcile_login` (#276) drives.
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        // Server: accept one connection, assert the exact request line, ack once.
+        let server = async move {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut buffered = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            buffered.read_line(&mut request).await.unwrap();
+            assert_eq!(request.trim_end(), r#"{"cmd":"restored","uuid":"u-B"}"#);
+            buffered.write_all(br#"{"ok":true}"#).await.unwrap();
+            buffered.write_all(b"\n").await.unwrap();
+            buffered.flush().await.unwrap();
+        };
+
+        let (_, result) = tokio::join!(server, notify_restored(&socket, "u-B"));
+        assert!(
+            result.is_ok(),
+            "a served restored notify returns Ok: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_restored_errs_when_no_daemon_is_listening() {
+        // Issue #276 (AC-2): with no socket bound, the notify surfaces an Err — which the
+        // best-effort `notify_daemon_restored` wrapper logs and swallows, so `login` still
+        // succeeds (the on-disk stash/roster write is authoritative). A missing / wedged daemon
+        // must never fail the verb — the daemon-down counterpart of the roster-reload best-effort
+        // contract (#139) and the `use` manual-hold notify (#64).
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock"); // never bound
+        assert!(notify_restored(&socket, "u-B").await.is_err());
     }
 
     #[tokio::test]
