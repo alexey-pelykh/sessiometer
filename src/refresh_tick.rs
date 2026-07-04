@@ -400,6 +400,8 @@ pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &Refres
         outcome: refresh_event_outcome(report),
         expires_before: before_ms,
         expires_after: expires_after(before_ms, report),
+        // The already-computed AC-3 rotation flag, threaded straight through (issue #279).
+        refresh_token_rotated: report.refresh_token_rotated,
     }
 }
 
@@ -413,6 +415,9 @@ fn error_refresh_event(label: &str, before_ms: Option<i64>) -> Event {
         outcome: RefreshEventOutcome::Error,
         expires_before: before_ms,
         expires_after: before_ms,
+        // No completed cycle, so no report to source a rotation from (issue #279): a hard
+        // engine `Err` / whole-cycle timeout renders `rotated=false`.
+        refresh_token_rotated: false,
     }
 }
 
@@ -991,7 +996,8 @@ mod tests {
     #[tokio::test]
     async fn sweep_emits_a_refresh_event_per_cycle_with_before_and_after() {
         // A successful, re-stashed refresh: the event carries the handle, the `refreshed`
-        // outcome, and the before/after expiry — after = before + the engine's slide delta.
+        // outcome, the before/after expiry — after = before + the engine's slide delta — and
+        // the cycle's `refresh_token_rotated` flag threaded straight through (issue #279).
         let now_ms = now_ms();
         let soon = now_ms + 60_000;
         let roster = vec![acct("work", "u-A")];
@@ -1002,7 +1008,7 @@ mod tests {
                 FakeRefresh::Report(RefreshReport {
                     outcome: RefreshOutcome::Refreshed,
                     expires_at_delta_secs: Some(7200), // +2h slide
-                    refresh_token_rotated: false,
+                    refresh_token_rotated: true,       // rotated — must reach the event
                     re_stashed: true,
                 }),
             );
@@ -1015,6 +1021,7 @@ mod tests {
                 outcome: RefreshEventOutcome::Refreshed,
                 expires_before: Some(soon),
                 expires_after: Some(soon + 7_200_000), // before + 7200 s in ms
+                refresh_token_rotated: true,           // sourced from the report above (#279)
             }]
         );
         assert!(
@@ -1050,6 +1057,7 @@ mod tests {
                 outcome: RefreshEventOutcome::RefreshedNotReStashed,
                 expires_before: Some(soon),
                 expires_after: Some(soon), // unchanged — the CAS discarded the fresh token
+                refresh_token_rotated: false, // this cycle's report did not rotate
             }]
         );
     }
@@ -1073,6 +1081,8 @@ mod tests {
                 outcome: RefreshEventOutcome::Error,
                 expires_before: Some(soon),
                 expires_after: Some(soon),
+                // A hard `Err` has no report to source a rotation from → `false` (#279).
+                refresh_token_rotated: false,
             }]
         );
     }
