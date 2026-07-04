@@ -136,7 +136,7 @@ use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::isolated_spawn::{ClaudeRefresh, IsolatedSession, SpawnClaude};
-use crate::keychain::IsolatedKeychain;
+use crate::keychain::{Credential, IsolatedKeychain};
 use crate::paths;
 use crate::stash::{AccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
@@ -223,7 +223,12 @@ pub(crate) fn expires_at(blob: &[u8]) -> Option<i64> {
 /// — a transient in-process structure that briefly holds the token un-zeroized before
 /// the wanted field is copied into a `Zeroizing` buffer; this never reaches an output
 /// channel (the redaction METER, #15, guards outputs, not in-process heap).
-fn refresh_token(blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+///
+/// `pub(crate)` so the daemon's keep-warm path (issue #282) can reuse this one audited
+/// extractor on the active account's canonical blob, the way [`expires_at`] is shared:
+/// an EMPTY refresh token is a dead credential the keep-warm must NOT revive (it is left
+/// to the #42 streak / operator re-login), and only a NON-empty one is worth refreshing.
+pub(crate) fn refresh_token(blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     let value: Value = serde_json::from_slice(blob).ok()?;
     let rt = value.get("claudeAiOauth")?.get("refreshToken")?.as_str()?;
     Some(Zeroizing::new(rt.as_bytes().to_vec()))
@@ -317,8 +322,57 @@ async fn acquire_swap_lock(lock: Option<(&Path, Duration)>) -> Result<Option<Swa
     }
 }
 
-/// Steps 3b–7 of the cycle, run while the [`IsolatedSession`] guard is armed so a
-/// failure here still hits the explicit teardown in [`refresh_cycle`]. Hard failures
+/// Steps 3b–6 of a cycle — seed → spawn → read-back → classify — shared by the parked
+/// re-stash cycle ([`run_isolated`], #102) and the active-account keep-warm cycle
+/// ([`keep_warm_cycle`], #282), which differ only in their SOURCE (a stash read vs the
+/// passed-in canonical blob) and their SINK (a stash CAS write vs a returned credential
+/// the daemon promotes to the canonical item). Extracting the mint once keeps the
+/// security-critical spawn orchestration a SINGLE implementation — a fork would risk the
+/// silent isolation / secret-handling drift [`crate::isolated_spawn`] warns of.
+///
+/// Runs while the [`IsolatedSession`] guard is armed so a failure still hits the explicit
+/// teardown in the caller. A hard failure (a locked keychain on seed, an FS error) returns
+/// `Err`; a soft failure (the spawn or read-back not producing a usable item) is an
+/// `Error` outcome with NO credential. `original` is the pre-back-date source blob
+/// [`classify`] measures the real window move against. The read-back credential's secret
+/// stays inside a `Credential`/`Zeroizing` (wiped on drop).
+async fn mint_isolated<K, R>(
+    session: &IsolatedSession<K>,
+    spawner: &R,
+    seed: &[u8],
+    original: &[u8],
+) -> Result<(RefreshOutcome, Option<i64>, bool, Option<Credential>)>
+where
+    K: IsolatedKeychain,
+    R: ClaudeRefresh,
+{
+    // STEP 3b: seed the isolated item + a minimal .claude.json. Hard failures (a locked
+    // keychain, an FS error) → Err; the caller's teardown still runs.
+    session.seed(seed).await?;
+    paths::write_private_file(&session.dir().join(".claude.json"), MINIMAL_CLAUDE_JSON)?;
+
+    // STEP 4: spawn `claude -p`. A spawn failure (binary missing / un-spawnable) is a
+    // soft, non-transient Error outcome — surface, do not retry as transient.
+    if spawner.run(session.dir()).await.is_err() {
+        return Ok((RefreshOutcome::Error, None, false, None));
+    }
+
+    // STEP 5: read the (CC-refreshed) blob back. Any read-back failure is a soft Error
+    // outcome (the spawn ran but produced no usable item); a transient locked keychain
+    // is retried by the next cycle.
+    let after = match session.read_back().await {
+        Ok(after) => after,
+        Err(_) => return Ok((RefreshOutcome::Error, None, false, None)),
+    };
+
+    // STEP 6: classify before/after (the secret RT/blob never escape `classify`).
+    let (outcome, delta, rotated) = classify(original, seed, after.expose());
+    Ok((outcome, delta, rotated, Some(after)))
+}
+
+/// Steps 3b–7 of the parked cycle, run while the [`IsolatedSession`] guard is armed so a
+/// failure here still hits the explicit teardown in [`refresh_cycle`]. Delegates the mint
+/// (steps 3b–6) to [`mint_isolated`], then does the STEP 7 CAS re-stash. Hard failures
 /// (a locked keychain on seed, an FS error, a contended lock / failed write on the CAS
 /// re-stash) return `Err`; soft failures (the spawn or read-back not producing a usable
 /// item) return an `Error`-outcome [`RefreshReport`].
@@ -336,51 +390,34 @@ where
     K: IsolatedKeychain,
     R: ClaudeRefresh,
 {
-    // STEP 3b: seed the isolated item + a minimal .claude.json. Hard failures (a locked
-    // keychain, an FS error) → Err; teardown still runs.
-    session.seed(seed).await?;
-    paths::write_private_file(&session.dir().join(".claude.json"), MINIMAL_CLAUDE_JSON)?;
-
-    // STEP 4: spawn `claude -p`. A spawn failure (binary missing / un-spawnable) is a
-    // soft, non-transient Error outcome — surface, do not retry as transient.
-    if spawner.run(session.dir()).await.is_err() {
-        return Ok(RefreshReport::indeterminate());
-    }
-
-    // STEP 5: read the (CC-refreshed) blob back. Any read-back failure is a soft Error
-    // outcome (the spawn ran but produced no usable item); a transient locked keychain
-    // is retried by the next periodic cycle.
-    let after = match session.read_back().await {
-        Ok(after) => after,
-        Err(_) => return Ok(RefreshReport::indeterminate()),
-    };
-
-    // STEP 6: classify before/after (the secret RT/blob never escape `classify`).
-    let (outcome, delta, rotated) = classify(snapshot.credential.expose(), seed, after.expose());
+    // STEPS 3b–6 (shared mint): seed → spawn → read-back → classify.
+    let (outcome, delta, rotated, after) =
+        mint_isolated(session, spawner, seed, snapshot.credential.expose()).await?;
 
     // STEP 7 (lock held only here): CAS re-stash. ONLY on a fresh token, and ONLY if the
     // account's stored credential is unchanged since step 1 — else a concurrent swap /
     // login re-stashed it and is authoritative, so discard. Identity is preserved from
     // the snapshot; the real stash is the LAST write. (Dead/NoChange/Error ⇒ no write.)
-    let re_stashed = if outcome == RefreshOutcome::Refreshed {
-        let _lock = acquire_swap_lock(lock).await?;
-        let current = stash.read(stash_service).await?;
-        if current.credential.matches(&snapshot.credential) {
-            stash
-                .write(
-                    stash_service,
-                    &StashedAccount {
-                        credential: after,
-                        oauth_account: snapshot.oauth_account.clone(),
-                    },
-                )
-                .await?;
-            true
-        } else {
-            false
+    let re_stashed = match (outcome, after) {
+        (RefreshOutcome::Refreshed, Some(after)) => {
+            let _lock = acquire_swap_lock(lock).await?;
+            let current = stash.read(stash_service).await?;
+            if current.credential.matches(&snapshot.credential) {
+                stash
+                    .write(
+                        stash_service,
+                        &StashedAccount {
+                            credential: after,
+                            oauth_account: snapshot.oauth_account.clone(),
+                        },
+                    )
+                    .await?;
+                true
+            } else {
+                false
+            }
         }
-    } else {
-        false
+        _ => false,
     };
 
     Ok(RefreshReport {
@@ -483,6 +520,96 @@ pub(crate) async fn refresh_account<S: AccountStash>(
         now_ms(),
     )
     .await
+}
+
+/// Mint a fresh token for the ACTIVE account IN PLACE (issue #282) and RETURN it for the
+/// daemon to promote to the canonical `Claude Code-credentials` item. This is the fourth
+/// refresh mechanism, added to stop an overnight false-death cascade: every OTHER refresh
+/// path is #253-excluded from the active account and writes the STASH, so nothing refreshes
+/// the active account's CANONICAL token while Claude Code is not running — its ~8h access
+/// token expires overnight → poll 401 → #42 streak → emergency swap onto another near-expiry
+/// account → cascade (the whole roster shares one ~8h TTL).
+///
+/// Distinct from [`refresh_cycle`] on BOTH ends: the SOURCE is the passed-in `canonical`
+/// blob (not a stash read), and the SINK is the RETURNED credential (not a stash CAS write).
+/// Writing NOTHING itself keeps the daemon the single canonical writer (ADR-0003): the
+/// caller promotes the returned token via the atomic `-U`
+/// [`crate::keychain::CredentialStore`] write UNDER the swap lock, then baseline-commits it
+/// so the #140 external-login watch does not mis-fire on the daemon's own write. It is NOT
+/// the isolated `engine.refresh` (#253) — that re-stashes and strands the fresh token where
+/// a live session never reads it (the "wrong keychain item").
+///
+/// Returns `(report, Some(credential))` ONLY on [`RefreshOutcome::Refreshed`]; every other
+/// outcome — `NoChange`, `Dead` (the refresh token was cleared in place → the caller lets
+/// the #42 streak advance to an operator re-login), `Error` — returns `(report, None)` and
+/// the daemon leaves the canonical item untouched. Mirrors [`refresh_cycle`]'s isolation
+/// discipline: back-date a COPY of the canonical blob (so the live item is never touched by
+/// the mint), spawn against an ephemeral isolated dir, teardown ALWAYS. The swap lock is
+/// NOT taken here — the mint's `claude -p` spawn must not hold it (that would stall the swap
+/// engine for the whole spawn runtime); the caller takes it around the canonical promote.
+pub(crate) async fn keep_warm_cycle<K, R>(
+    canonical: &[u8],
+    keychain: K,
+    spawner: &R,
+    iso_dir: PathBuf,
+    now_ms: i64,
+) -> Result<(RefreshReport, Option<Credential>)>
+where
+    K: IsolatedKeychain,
+    R: ClaudeRefresh,
+{
+    // Back-date a COPY of the canonical credential's expiry so CC's 5-minute pre-expiry
+    // predicate is unconditionally true — the same forcing trick the parked cycle uses,
+    // applied to an isolated COPY so the live canonical item is never touched by the mint.
+    // A malformed canonical blob cannot be back-dated → indeterminate, and NO spawn.
+    let seed = match backdate(canonical, now_ms) {
+        Some(seed) => seed,
+        None => return Ok((RefreshReport::indeterminate(), None)),
+    };
+
+    // Create the ephemeral isolated dir + ARM teardown, exactly as the parked cycle does.
+    paths::create_isolated_dir(&iso_dir)?;
+    let session = IsolatedSession::arm(keychain, iso_dir);
+
+    // STEPS 3b–6 (shared mint), then teardown ALWAYS — even on the `?` hard-error path.
+    let result = mint_isolated(&session, spawner, &seed, canonical).await;
+    session.teardown().await;
+    let (outcome, delta, rotated, after) = result?;
+
+    // Hand the fresh token back ONLY on a real refresh; the daemon promotes it to canonical.
+    // NoChange / Dead / Error yield no credential and the canonical item is left as-is.
+    let credential = match outcome {
+        RefreshOutcome::Refreshed => after,
+        _ => None,
+    };
+    Ok((
+        RefreshReport {
+            outcome,
+            expires_at_delta_secs: delta,
+            refresh_token_rotated: rotated,
+            // Keep-warm never re-stashes: the daemon promotes the returned token to canonical.
+            re_stashed: false,
+        },
+        credential,
+    ))
+}
+
+/// Mint a fresh token IN PLACE for the active account whose identity is `account_uuid`,
+/// sourcing from its current `canonical` blob — the production entry point for issue #282's
+/// keep-warm. Derives the ephemeral isolated dir + service from `account_uuid` (the active
+/// account is #253-excluded from the parked sweep, so the `refresh/<uuid>` dir never races
+/// a concurrent parked cycle), constructs the real isolated keychain + spawner, and runs
+/// [`keep_warm_cycle`]. Returns the classified report plus the fresh credential (on
+/// `Refreshed`) for the daemon to promote to the canonical item.
+pub(crate) async fn keep_warm_account(
+    canonical: &[u8],
+    account_uuid: &str,
+    claude_binary: PathBuf,
+) -> Result<(RefreshReport, Option<Credential>)> {
+    let iso_dir = paths::isolated_refresh_dir(account_uuid)?;
+    let keychain = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
+    let spawner = SpawnClaude::new(claude_binary);
+    keep_warm_cycle(canonical, keychain, &spawner, iso_dir, now_ms()).await
 }
 
 /// Read the stored credential's `expiresAt` (epoch milliseconds) for the account

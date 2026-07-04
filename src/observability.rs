@@ -143,6 +143,32 @@ impl RefreshEventOutcome {
     }
 }
 
+/// What prompted an in-place ACTIVE-account keep-warm cycle (issue #282) — the `trigger=`
+/// token of an [`Event::KeepWarm`] line. Unlike the poll-path [`Event::PollRefresh`]'s fixed
+/// `poll_401` literal, keep-warm fires from two distinct conditions, so the discriminant is a
+/// carried enum field: a `proactive` mint scheduled before the active token nears expiry, or a
+/// `reactive` backstop mint on an active usage-401 (revive the canonical before the 401 counts
+/// toward the #42 death streak). A non-secret classification only — never a token or email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeepWarmTrigger {
+    /// A scheduled mint fired because the active token entered its (staggered) near-expiry
+    /// horizon — the pre-emptive path that keeps the token warm BEFORE any 401.
+    Proactive,
+    /// A backstop mint fired on an active usage-401, reviving the canonical in place before
+    /// the 401 advances the #42 death streak toward a false quarantine.
+    Reactive,
+}
+
+impl KeepWarmTrigger {
+    /// The `trigger=` token — the same grep vocabulary the rest of the event log uses.
+    fn as_str(self) -> &'static str {
+        match self {
+            KeepWarmTrigger::Proactive => "proactive",
+            KeepWarmTrigger::Reactive => "reactive",
+        }
+    }
+}
+
 /// The 4-state per-account CREDENTIAL-health rollup `status` surfaces (issue #119): the
 /// daemon-computed verdict the thin read-only `status` client just projects to a glyph
 /// (🟢/🟡/🟠/🔴). Lives HERE — the base observability module, with no `daemon`
@@ -423,6 +449,28 @@ pub(crate) enum Event {
         /// renders `false`.
         refresh_token_rotated: bool,
     },
+    /// The in-place ACTIVE-account keep-warm (issue #282, the FOURTH refresh mechanism) ran one
+    /// cycle for `account`: the daemon minted a fresh token by driving `claude` and — on a real
+    /// refresh — PROMOTED it to the canonical `Claude Code-credentials` item a live session reads
+    /// (never the STASH the #253-excluded engine writes). Records the *action* — that a keep-warm
+    /// fired, what `trigger`ed it ([`KeepWarmTrigger::Proactive`] near-expiry schedule vs
+    /// [`KeepWarmTrigger::Reactive`] active-401 backstop), and how it classified. `outcome` is the
+    /// same non-secret [`RefreshEventOutcome`] projection [`Event::Refresh`] / [`Event::PollRefresh`]
+    /// carry (one shared refresh-outcome vocabulary): `refreshed_not_restashed` on a real mint (a
+    /// keep-warm PROMOTES rather than re-stashes, so it never renders `refreshed`), else
+    /// `no_change` / `dead` / `error`. `account` is the HANDLE (operator label), never a token or
+    /// email — the #15 single-surface guarantee.
+    KeepWarm {
+        account: String,
+        trigger: KeepWarmTrigger,
+        outcome: RefreshEventOutcome,
+        /// Whether the keep-warm cycle ROTATED the refresh token (issue #279/#282), sourced from
+        /// the cycle's [`crate::refresh::RefreshReport`] `refresh_token_rotated` — the same
+        /// non-secret rotation signal [`Event::Refresh`] carries. A boolean only, never a token
+        /// value (the #15 single-surface guarantee); an engine `Err` (could-not-run) renders
+        /// `false`.
+        refresh_token_rotated: bool,
+    },
     /// `account`'s 4-state credential-health rollup (issue #119) TRANSITIONED to `state`
     /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
     /// the state holds), so the event log carries the per-account health timeline. The
@@ -602,6 +650,24 @@ impl Event {
                 // signal `event=refresh` carries, on the poll path.
                 format!(
                     "ts={ts} event=poll_refresh account={account} trigger=poll_401 outcome={outcome} rotated={refresh_token_rotated}"
+                )
+            }
+            Event::KeepWarm {
+                account,
+                trigger,
+                outcome,
+                refresh_token_rotated,
+            } => {
+                // The in-place keep-warm ACTION (issue #282). `trigger=` carries the
+                // proactive-vs-reactive discriminant (a two-valued condition, unlike
+                // `poll_refresh`'s fixed `poll_401`); `outcome` reuses the SAME non-secret token
+                // vocabulary `event=refresh` renders. The DISTINCT `keep_warm` event name keeps it
+                // clear of both the periodic #106 `event=refresh` line and the #162 `poll_refresh`
+                // line — three separate refresh mechanisms, three separate event names.
+                let trigger = trigger.as_str();
+                let outcome = outcome.as_str();
+                format!(
+                    "ts={ts} event=keep_warm account={account} trigger={trigger} outcome={outcome} rotated={refresh_token_rotated}"
                 )
             }
             Event::CredentialHealth { account, state } => {
