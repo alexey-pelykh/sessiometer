@@ -675,7 +675,9 @@ long-running rotation hits:
   `429` (rate-limited) or a `5xx` / network error, the daemon **widens its poll
   spacing** instead of re-polling at the fixed interval — an exponential back-off
   that doubles each consecutive throttled cycle (capped at ~1 h) and honours any
-  `Retry-After` the server sends as a minimum wait; a clean poll resets it. The
+  `Retry-After` the server sends as a minimum wait — itself clamped to that same
+  ~1 h ceiling, so a pathological server value can't dark an account for longer; a
+  clean poll resets it. The
   default cadence also carries normal jitter so concurrent accounts decorrelate,
   and on start-up the daemon waits a small jittered delay before its first poll so
   repeated restarts don't synchronise a burst of requests.

@@ -194,7 +194,9 @@ const POLL_BACKOFF_MAX_SHIFT: u32 = 6;
 /// Ceiling on the rate-limit / transient poll back-off (issue #76). Under sustained
 /// `429` / `5xx` the effective poll spacing grows exponentially but settles here —
 /// one poll per hour, gentle on a throttling endpoint without going fully dark. A
-/// larger server-advised `Retry-After` still overrides this (honoured as a MINIMUM).
+/// server-advised `Retry-After` is honoured as a MINIMUM but is itself clamped to this
+/// ceiling (issue #294), so this is the absolute maximum any single account's
+/// poll-backoff window can reach.
 const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 /// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
 /// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
@@ -3266,8 +3268,9 @@ where
     /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, clamped to
     /// [`POLL_BACKOFF_CAP`]. The first throttled poll already earns ~2× the interval, so
     /// the account's re-poll spacing is WIDER than the fixed cadence — #76's core ask, now
-    /// per-account. A server-advised `Retry-After` is honoured as a MINIMUM: the wait is
-    /// never shorter than it, even past the cap (bounding a pathological value is #294).
+    /// per-account. A server-advised `Retry-After` is honoured as a MINIMUM (the wait is
+    /// never shorter than it) but clamped to [`POLL_BACKOFF_CAP`] as a MAXIMUM, so a
+    /// pathological value cannot dark the account past the exponential ceiling (issue #294).
     ///
     /// Scoping BOTH the `429` and the transient per-account is deliberate (issue #293): the
     /// `429` is per-Anthropic-org (independent buckets), and under a genuine endpoint outage
@@ -3288,19 +3291,18 @@ where
             .checked_mul(1u32 << shift)
             .unwrap_or(POLL_BACKOFF_CAP)
             .min(POLL_BACKOFF_CAP);
+        // Clamp to `POLL_BACKOFF_CAP` as a MAXIMUM (issue #294) — bounds a pathological or buggy
+        // `Retry-After` (e.g. `86400`). `widened` is already ≤ the cap, so this bites only the
+        // `Retry-After` arm.
         let wait = match signal.retry_after {
             Some(ra) => widened.max(ra),
             None => widened,
-        };
-        // `checked_add` guards against an astronomically-large `Retry-After` overflowing
-        // the monotonic instant (which would panic and crash the long-running daemon) —
-        // a pure arithmetic-safety floor distinct from #294's policy cap; a value that far
-        // out is bounded to the exponential cap rather than honoured.
-        let now = self.clock.now();
-        self.state.health[i].poll_backoff_until = Some(
-            now.checked_add(wait)
-                .unwrap_or_else(|| now + POLL_BACKOFF_CAP),
-        );
+        }
+        .min(POLL_BACKOFF_CAP);
+        // `wait` is bounded to `POLL_BACKOFF_CAP` above, so adding it to the monotonic
+        // instant cannot overflow — the value is bounded at the source (issue #294), which
+        // supersedes #293's `checked_add` guard against an unbounded `Retry-After`.
+        self.state.health[i].poll_backoff_until = Some(self.clock.now() + wait);
         Some(wait)
     }
 
@@ -5334,15 +5336,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_overrides_the_cap_when_larger() {
-        // AC: Retry-After is a minimum even past POLL_BACKOFF_CAP — a server asking for 2 h
-        // is obeyed though the exponential ceiling is 1 h. (Bounding a pathological value is
-        // a separate concern, issue #294.)
-        let two_hours = Duration::from_secs(7200);
-        assert!(two_hours > POLL_BACKOFF_CAP);
-        let (_dir, mut daemon) =
-            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(two_hours))).await;
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(7200));
+    async fn a_large_retry_after_is_clamped_to_the_cap() {
+        // AC (issue #294): a server `Retry-After` is honoured as a MINIMUM but clamped to a
+        // sane MAXIMUM — POLL_BACKOFF_CAP — so a pathological value cannot dark the account
+        // past the exponential ceiling. Supersedes the pre-#294 behaviour (a larger
+        // `Retry-After` overrode the cap unboundedly), whose premise this reverses.
+        //
+        // A full day of `Retry-After` clamps down to the 1 h cap.
+        let one_day = Duration::from_secs(86_400);
+        assert!(one_day > POLL_BACKOFF_CAP);
+        let (_d1, mut pathological) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(one_day))).await;
+        assert_eq!(
+            tick_backoff_secs(&pathological.tick().await),
+            Some(POLL_BACKOFF_CAP.as_secs()),
+        );
+
+        // Just below the cap is still honoured in full — the clamp bounds only the excess,
+        // it does not swallow a legitimate long-but-sane `Retry-After`.
+        let just_under = POLL_BACKOFF_CAP - Duration::from_secs(1);
+        let (_d2, mut sane) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(just_under))).await;
+        assert_eq!(
+            tick_backoff_secs(&sane.tick().await),
+            Some(just_under.as_secs()),
+        );
     }
 
     #[tokio::test]
