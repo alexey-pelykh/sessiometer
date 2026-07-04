@@ -12,8 +12,10 @@
 //! redacted [`crate::observability::Event::Login`] audit line for the outcome. They differ only in
 //! where the credential comes from and whether the login also becomes active:
 //! `capture` reads the already-active canonical credential and does not touch it,
-//! whereas the login reconcile re-points the canonical item to the fresh
-//! credential (the login takes effect) under the swap lock — see [`reconcile_login`].
+//! whereas the login reconcile re-points the canonical item to the fresh credential
+//! (the login takes effect) under the swap lock — but ONLY when the login is the
+//! current active account (re-auth in place) or none is active (bootstrap); a login
+//! for a DIFFERENT account preserves the active slot (#274). See [`reconcile_login`].
 //!
 //! While an account is the one currently logged in to Claude Code, `capture`:
 //!   1. reads that account's `~/.claude.json` `oauthAccount` block
@@ -44,7 +46,9 @@
 //! are unit-tested hermetically; [`capture`] only wires the real seams, persists,
 //! and prints.
 
-use crate::claude_state::{read_oauth_account, write_oauth_account, OauthAccount};
+use crate::claude_state::{
+    read_oauth_account, read_oauth_account_from, write_oauth_account, OauthAccount,
+};
 use crate::config::{
     Account, Config, LoginConfig, MigrationConfig, RefreshConfig, StatsConfig, Tunables,
 };
@@ -403,9 +407,12 @@ pub(crate) enum LoginOutcome {
     /// The harvested account was not in the roster — a new entry was appended.
     Onboarded,
     /// The harvested account was already in the roster — its entry was updated IN
-    /// PLACE (never duplicated) and its stash + canonical re-pointed to the fresh
-    /// credential; the running daemon's #107 path un-quarantines it on that canonical
-    /// change (clearing any "needs re-login").
+    /// PLACE (never duplicated) and its stash re-pointed to the fresh credential. The
+    /// canonical item is re-pointed too — the change the running daemon's #107 path
+    /// un-quarantines it on (clearing any "needs re-login") — ONLY when this login
+    /// becomes active (#274: it IS the current active account, or none is active);
+    /// reviving a NON-active account refreshes its stash + roster and leaves the active
+    /// slot untouched, so the immediate un-quarantine is deferred (a separate follow-up).
     Revived,
 }
 
@@ -431,19 +438,41 @@ struct LoginReport {
     count: usize,
 }
 
-/// Reconcile a freshly-harvested login ([`StashedAccount`] from the isolated capture
-/// engine, #132) into the roster — the hermetic core (issue #134). Generic over both
-/// keychain seams so it is unit-tested with in-memory fakes; performs NO lock, NO config
-/// persistence, and NO reads of the real environment (every input is passed in).
+/// A freshly-harvested login the reconcile lands, paired with the caller's verdict on
+/// whether it becomes the active account (#274). Bundled into one value — rather than two
+/// parallel `captured` + `activate` params — so [`run_login`] / [`run_login_locked`] stay
+/// within the 7-argument clippy bound (this repo never `#[allow]`s `too_many_arguments`),
+/// mirroring the daemon's `IdleSeams` grouping. The activation verdict travels WITH the
+/// harvest it applies to; [`reconcile_login`] decides it (see [`should_activate`]).
+struct HarvestedLogin {
+    /// The fresh credential + `oauthAccount` identity harvested in isolation (#132).
+    captured: StashedAccount,
+    /// Re-point the canonical item to `captured` (make it active) — `true` only when it IS
+    /// the current active account, or there is no active account (bootstrap).
+    activate: bool,
+}
+
+/// Reconcile a freshly-harvested login (the [`HarvestedLogin`]'s [`StashedAccount`] from the
+/// isolated capture engine, #132) into the roster — the hermetic core (issue #134). Generic
+/// over both keychain seams so it is unit-tested with in-memory fakes; performs NO lock, NO
+/// config persistence, and NO reads of the real environment (every input is passed in).
 ///
 /// Onboard (new account) or update-IN-PLACE (existing, matched by `account_uuid`) via
 /// the SHARED [`plan_capture`]; then, mirroring the swap engine's write ordering (#6):
-/// re-stash the fresh credential, re-point the canonical `Claude Code-credentials` item
-/// to it — this is the canonical change the running daemon's #107 path un-quarantines a
-/// re-logged-in account on (there is no roster-persisted quarantine flag a CLI could
-/// clear directly) — then best-effort co-write the identity into `~/.claude.json`.
+/// re-stash the fresh credential and — ONLY when `activate` (#274) — re-point the canonical
+/// `Claude Code-credentials` item to it, then best-effort co-write the identity into
+/// `~/.claude.json`. That re-point is the canonical change the running daemon's #107 path
+/// un-quarantines a re-logged-in account on (there is no roster-persisted quarantine flag a
+/// CLI could clear directly).
+///
+/// `activate` is the caller's ([`reconcile_login`]) verdict, keeping this core pure: the
+/// freshly-captured account becomes active only when it IS the current active account
+/// (re-auth in place) or there is no active account (bootstrap). When a DIFFERENT account is
+/// active, `activate` is false and BOTH active-slot writes are skipped — the account is
+/// stashed + rostered without stealing the active slot, leaving the canonical item and
+/// `~/.claude.json` byte-for-byte unchanged.
 async fn run_login<C, S>(
-    captured: StashedAccount,
+    login: HarvestedLogin,
     store: &C,
     stash: &S,
     existing: Option<Config>,
@@ -454,6 +483,8 @@ where
     C: CredentialStore,
     S: AccountStash,
 {
+    let HarvestedLogin { captured, activate } = login;
+
     // Preserve the operator's tunables + refresh schedule + `[login]` + `[stats]` + `[migration]`
     // settings across the reconcile, exactly like `run_capture` (#58/#105/#135/#161/#150): landing
     // a login must never reset any of them to defaults.
@@ -484,15 +515,20 @@ where
     // unstashed credential.
     stash.write(&stash_name, &captured).await?;
 
-    // Re-point the canonical item to the fresh credential: the freshly-logged-in account
-    // becomes the active one AND — being a canonical change — is what the running
-    // daemon's #107 reconcile un-quarantines the account on. Atomic (`security -U`),
-    // exactly like the swap engine's incoming write.
-    store.write(&captured.credential).await?;
+    // Re-point the canonical item to the fresh credential ONLY when this login should
+    // become active (#274): the freshly-logged-in account becomes the active one AND —
+    // being a canonical change — is what the running daemon's #107 reconcile un-quarantines
+    // the account on. When a DIFFERENT account is active (`activate` is false), the active
+    // slot is preserved: BOTH the canonical write and the `~/.claude.json` co-write below
+    // are skipped, so `login <other>` never steals the active slot.
+    if activate {
+        // Atomic (`security -U`), exactly like the swap engine's incoming write.
+        store.write(&captured.credential).await?;
 
-    // Best-effort honest-display co-write (the swap engine's step 4): a failure
-    // self-heals on the daemon's next reconcile, so it never fails the login.
-    let _ = write_oauth_account(claude_json, &captured.oauth_account);
+        // Best-effort honest-display co-write (the swap engine's step 4): a failure
+        // self-heals on the daemon's next reconcile, so it never fails the login.
+        let _ = write_oauth_account(claude_json, &captured.oauth_account);
+    }
 
     let count = roster.len();
     // The final label lives on the rostered account (an onboard auto-derived it; a
@@ -530,7 +566,7 @@ where
 #[cfg_attr(not(test), allow(dead_code))]
 async fn run_login_locked<C, S>(
     lock: Option<(&Path, Duration)>,
-    captured: StashedAccount,
+    login: HarvestedLogin,
     store: &C,
     stash: &S,
     existing: Option<Config>,
@@ -547,7 +583,21 @@ where
         Some((path, max_wait)) => Some(SwapLock::acquire(path, max_wait).await?),
         None => None,
     };
-    run_login(captured, store, stash, existing, label, claude_json).await
+    run_login(login, store, stash, existing, label, claude_json).await
+}
+
+/// Decide whether a freshly-harvested login should become the active account (#274) —
+/// i.e. whether [`run_login`] re-points the canonical item. Re-point ONLY when the captured
+/// account IS the current active one (`Some(active)` equal to `captured_uuid` — re-auth in
+/// place) or there is no active account (`None` — canonical absent / no readable identity →
+/// bootstrap). When a DIFFERENT account is active, return `false` so the active slot is
+/// preserved and the login is merely stashed + rostered. Pure over the two uuids so the gate
+/// is unit-tested hermetically, independent of the real `~/.claude.json`.
+fn should_activate(active_uuid: Option<&str>, captured_uuid: &str) -> bool {
+    match active_uuid {
+        Some(active) => active == captured_uuid,
+        None => true,
+    }
 }
 
 /// Reconcile a harvested login into the roster over the REAL seams — the production
@@ -572,9 +622,25 @@ pub(crate) async fn reconcile_login(
     let claude_json = paths::claude_json()?;
     let existing = load_existing()?;
 
+    // #274: preserve the currently-active account. Read the current canonical identity — the
+    // uuid displayed in `~/.claude.json`, the honest-display pair of the canonical token (the
+    // keychain blob carries no uuid, so identity lives only here) — and activate the fresh
+    // login ONLY when it IS that account (re-auth in place) or there is no readable active
+    // identity (bootstrap). An unreadable/absent `~/.claude.json` (not-found / no
+    // `oauthAccount` / malformed) reads as "no active account" via `.ok()` → bootstrap-
+    // activate, the safe default for an operator who just ran `login`. Read here (before the
+    // swap lock, like `load_existing`), keeping [`run_login`] pure — the verdict is passed in.
+    let active_uuid = read_oauth_account_from(&claude_json)
+        .ok()
+        .map(|o| o.account_uuid().to_owned());
+    let activate = should_activate(
+        active_uuid.as_deref(),
+        captured.oauth_account.account_uuid(),
+    );
+
     let report = run_login_locked(
         Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
-        captured,
+        HarvestedLogin { captured, activate },
         &RealCredentialStore::new(),
         &RealAccountStash::new(),
         existing,
@@ -1004,7 +1070,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let report = run_login(
-            stashed("u-new", b"fresh-token"),
+            HarvestedLogin {
+                captured: stashed("u-new", b"fresh-token"),
+                activate: true, // bootstrap (no active account) → re-point canonical
+            },
             &store,
             &stash,
             None,
@@ -1040,7 +1109,10 @@ mod tests {
         std::fs::write(&claude_json, b"{}").unwrap();
 
         run_login(
-            stashed("u-disp", b"tok"),
+            HarvestedLogin {
+                captured: stashed("u-disp", b"tok"),
+                activate: true, // proves the co-write WIRES when this login is active
+            },
             &store,
             &stash,
             None,
@@ -1075,7 +1147,10 @@ mod tests {
         };
 
         let report = run_login(
-            stashed("u-1", b"re-logged-in"),
+            HarvestedLogin {
+                captured: stashed("u-1", b"re-logged-in"),
+                activate: true, // re-auth in place (captured == active) → re-point canonical
+            },
             &store,
             &stash,
             Some(existing),
@@ -1122,7 +1197,10 @@ mod tests {
         };
 
         run_login(
-            stashed("u-1", b"fresh"),
+            HarvestedLogin {
+                captured: stashed("u-1", b"fresh"),
+                activate: true, // re-auth in place → re-point canonical (the #107 un-quarantine)
+            },
             &store,
             &stash,
             Some(existing),
@@ -1135,6 +1213,101 @@ mod tests {
         // Canonical re-pointed from the stale credential to the fresh one → the daemon's
         // #107 path sees a canonical change and un-quarantines the account.
         assert_eq!(store.read().await.unwrap().expose(), b"fresh");
+    }
+
+    #[tokio::test]
+    async fn login_keeps_a_different_active_account_in_place() {
+        // #274 AC: A is active and `login B` captures a uuid ≠ A → the canonical item AND
+        // `~/.claude.json` are byte-for-byte unchanged (A stays active); B is still stashed
+        // and written to the roster. The activation verdict (false here) is the caller's;
+        // this proves `run_login` PRESERVES the active slot when it is false — skipping BOTH
+        // the canonical write and the honest-display co-write.
+        let store = FakeCredentialStore::empty();
+        // A owns the live canonical token…
+        store
+            .write(&Credential::new(b"A-token".to_vec()))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        // …and `~/.claude.json` displays A's identity — it must survive byte-for-byte.
+        let claude_json = dir.path().join("claude.json");
+        let a_json: &[u8] =
+            br#"{"numStartups":3,"oauthAccount":{"accountUuid":"u-A","emailAddress":"a@example.com"}}"#;
+        std::fs::write(&claude_json, a_json).unwrap();
+        let existing = Config {
+            roster: vec![account("u-A", "work")],
+            tunables: Tunables::default(),
+            refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
+            stats: StatsConfig::default(),
+            migration: MigrationConfig::default(),
+        };
+
+        let report = run_login(
+            HarvestedLogin {
+                captured: stashed("u-B", b"B-token"),
+                // A is active and we captured B (≠ A) → preserve the active slot
+                activate: false,
+            },
+            &store,
+            &stash,
+            Some(existing),
+            Some("second"),
+            &claude_json,
+        )
+        .await
+        .unwrap();
+
+        // B is onboarded into the roster (added alongside A, not replacing it) and stashed…
+        assert_eq!(report.outcome, LoginOutcome::Onboarded);
+        assert_eq!(report.count, 2);
+        assert!(report.config.roster.iter().any(|a| a.account_uuid == "u-B"));
+        assert!(report.config.roster.iter().any(|a| a.account_uuid == "u-A"));
+        assert_eq!(
+            stash
+                .read("Sessiometer/u-B")
+                .await
+                .unwrap()
+                .credential
+                .expose(),
+            b"B-token"
+        );
+        // …but the active slot is preserved byte-for-byte: canonical still holds A's token…
+        assert_eq!(store.read().await.unwrap().expose(), b"A-token");
+        // …and `~/.claude.json` is byte-for-byte unchanged (still A, untouched).
+        assert_eq!(std::fs::read(&claude_json).unwrap(), a_json);
+    }
+
+    #[test]
+    fn the_active_identity_gates_the_canonical_repoint() {
+        // #274 decision, over the identity seam: read the active uuid from a `~/.claude.json`
+        // exactly as `reconcile_login` does, then gate — all three branches.
+        let dir = tempfile::tempdir().unwrap();
+
+        // A is the active account…
+        let a_json = dir.path().join("a.json");
+        std::fs::write(
+            &a_json,
+            br#"{"oauthAccount":{"accountUuid":"u-A","emailAddress":"a@example.com"}}"#,
+        )
+        .unwrap();
+        let active = read_oauth_account_from(&a_json)
+            .ok()
+            .map(|o| o.account_uuid().to_owned());
+        // …capturing a DIFFERENT account B → do NOT activate (A stays active).
+        assert!(!should_activate(active.as_deref(), "u-B"));
+        // …capturing A itself → activate (re-auth in place).
+        assert!(should_activate(active.as_deref(), "u-A"));
+
+        // No active account (absent `~/.claude.json`) → the read fails, `.ok()` = None →
+        // bootstrap-activate.
+        let absent = dir.path().join("nope.json");
+        let none = read_oauth_account_from(&absent)
+            .ok()
+            .map(|o| o.account_uuid().to_owned());
+        assert_eq!(none, None);
+        assert!(should_activate(none.as_deref(), "u-X"));
     }
 
     #[tokio::test]
@@ -1172,7 +1345,10 @@ mod tests {
 
         let report = run_login_locked(
             Some((&lock, SWAP_LOCK_MAX_WAIT)),
-            stashed("u-lock", b"tok"),
+            HarvestedLogin {
+                captured: stashed("u-lock", b"tok"),
+                activate: true, // bootstrap → re-point canonical through the locked path
+            },
             &store,
             &stash,
             None,
