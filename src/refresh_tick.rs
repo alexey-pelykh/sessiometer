@@ -168,7 +168,31 @@ impl<E, K> RefreshTick<E, K> {
     /// has elapsed since the last sweep"). Dropping the per-sweep idle debounce is safe: the
     /// sweep already excludes the active account and the imminent swap target and runs only in
     /// the idle path off the poll→usage→swap seam.
-    fn delay_until_due(&self, now: Instant, idle_anchor: Instant) -> Duration {
+    ///
+    /// `has_recovery_work` (issue #280) is the "≥1 quarantined-parked account is waiting for the
+    /// #106 restore probe" signal. When set, the CADENCE term is DROPPED and the wait gates ONLY
+    /// on the idle floor — so a freshly-quarantined account gets a restore attempt within a short
+    /// bounded interval (~the idle floor) rather than sitting dead up to a full `cadence_secs`
+    /// after an unrelated recent sweep. The idle floor stays anchored absolutely (as above), so a
+    /// steady stream of control-socket reads shrinks it toward zero rather than re-arming it — the
+    /// recovery path inherits #260's starvation immunity. This bypass cannot degenerate into the
+    /// sub-poll retry storm ADR-0007 decided against: the run loop only signals recovery-due until
+    /// THIS idle period's sweep has run, after which the (now-recent) cadence term re-throttles —
+    /// so the prompt fires at most once per idle period (poll cadence), even at `idle_after_secs`
+    /// = 0 (the post-sweep cadence term blocks a re-fire that would otherwise busy-spin).
+    fn delay_until_due(
+        &self,
+        now: Instant,
+        idle_anchor: Instant,
+        has_recovery_work: bool,
+    ) -> Duration {
+        let idle_remaining = self
+            .config
+            .idle_after()
+            .saturating_sub(now.saturating_duration_since(idle_anchor));
+        if has_recovery_work {
+            return idle_remaining;
+        }
         let cadence_remaining = match self.last_refresh {
             Some(last) => self
                 .config
@@ -176,10 +200,6 @@ impl<E, K> RefreshTick<E, K> {
                 .saturating_sub(now.saturating_duration_since(last)),
             None => Duration::ZERO,
         };
-        let idle_remaining = self
-            .config
-            .idle_after()
-            .saturating_sub(now.saturating_duration_since(idle_anchor));
         idle_remaining.max(cadence_remaining)
     }
 
@@ -306,7 +326,24 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
 }
 
 impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
-    async fn until_due(&mut self) {
+    fn recovery_pending(&self, excluded: &[String], quarantined: &[String]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        // The SAME per-account gate `run_sweep` applies before it reaches the quarantine bypass:
+        // parked (not excluded) AND allowlisted. An account that clears both AND is quarantined is
+        // one the sweep WOULD refresh for the #106 restore — the only kind worth prompting for
+        // (issue #280). Kept in lockstep with `run_sweep` so a quarantined account outside the
+        // allowlist, or an excluded dead active/target, never raises a prompt the sweep no-ops.
+        let allowlist = !self.config.accounts.is_empty();
+        self.roster.iter().any(|account| {
+            quarantined.iter().any(|uuid| uuid == &account.account_uuid)
+                && !excluded.iter().any(|uuid| uuid == &account.account_uuid)
+                && (!allowlist || self.account_listed(account))
+        })
+    }
+
+    async fn until_due(&mut self, has_recovery_work: bool) {
         if !self.enabled {
             // Disabled: never become due. This arm therefore never wins the idle select and
             // the ticker touches no clock — the idle loop behaves exactly as pre-#105.
@@ -316,9 +353,10 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
         let now = self.clock.now();
         // Seed the idle-floor anchor on the first re-arm of this idle window; later re-arms reuse
         // it, so a sub-`idle_after` sibling wake (the 15s login watch) shrinks the floor toward
-        // zero rather than resetting it to a full `idle_after` — the #260 fix.
+        // zero rather than resetting it to a full `idle_after` — the #260 fix. `has_recovery_work`
+        // (issue #280) drops the cadence term so a quarantined-parked account's restore is prompt.
         let anchor = *self.idle_anchor.get_or_insert(now);
-        let delay = self.delay_until_due(now, anchor);
+        let delay = self.delay_until_due(now, anchor, has_recovery_work);
         self.clock.tick(delay).await;
     }
 
@@ -580,7 +618,7 @@ mod tests {
         // now) waits the full idle floor.
         let t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
         let now = t.clock.now();
-        assert_eq!(t.delay_until_due(now, now), Duration::from_secs(60));
+        assert_eq!(t.delay_until_due(now, now, false), Duration::from_secs(60));
     }
 
     #[test]
@@ -590,7 +628,7 @@ mod tests {
         t.last_refresh = Some(base);
         // 100 s after a refresh (anchor ≈ the sweep instant): ~3500 s of cadence remain, well
         // above the idle floor, so the cadence term dominates.
-        let delay = t.delay_until_due(base + Duration::from_secs(100), base);
+        let delay = t.delay_until_due(base + Duration::from_secs(100), base, false);
         assert_eq!(delay, Duration::from_secs(3500));
     }
 
@@ -607,13 +645,13 @@ mod tests {
         // Two hours after the sweep (anchor seeded at the sweep instant): cadence long satisfied
         // AND the idle floor saturated → due now.
         assert_eq!(
-            t.delay_until_due(base + Duration::from_secs(7200), base),
+            t.delay_until_due(base + Duration::from_secs(7200), base, false),
             Duration::ZERO,
         );
         // 30 s before the cadence elapses, the idle floor is still saturated (anchor long aged),
         // so the cadence term alone sets the wait — the floor does not add a second 60 s.
         assert_eq!(
-            t.delay_until_due(base + Duration::from_secs(3570), base),
+            t.delay_until_due(base + Duration::from_secs(3570), base, false),
             Duration::from_secs(30),
         );
     }
@@ -629,11 +667,124 @@ mod tests {
         let t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
         for (elapsed, expected) in [(0, 60), (15, 45), (30, 30), (45, 15), (60, 0), (75, 0)] {
             assert_eq!(
-                t.delay_until_due(anchor + Duration::from_secs(elapsed), anchor),
+                t.delay_until_due(anchor + Duration::from_secs(elapsed), anchor, false),
                 Duration::from_secs(expected),
                 "a re-arm at +{elapsed}s must see the absolute floor shrink, not reset to 60",
             );
         }
+    }
+
+    #[test]
+    fn recovery_work_drops_the_cadence_term_for_a_prompt_restore() {
+        // Issue #280 AC1: a quarantined-parked account present (`has_recovery_work`) drops the
+        // cadence term, so even right after an unrelated sweep — when the cadence would otherwise
+        // defer the next sweep ~a full hour — the tick is due within the idle floor. Without the
+        // signal the cadence dominates (the pre-#280 behaviour, unchanged).
+        let base = Instant::now();
+        let mut t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
+        t.last_refresh = Some(base);
+        let now = base + Duration::from_secs(100); // 100 s after a refresh: ~3500 s cadence remains
+                                                   // Normal (no recovery work): the cadence term dominates, deferring the sweep ~3500 s.
+        assert_eq!(
+            t.delay_until_due(now, now, false),
+            Duration::from_secs(3500)
+        );
+        // Recovery work present: the cadence term is dropped, so only the (freshly-anchored) idle
+        // floor gates — a prompt restore attempt, not a full-cadence wait.
+        assert_eq!(t.delay_until_due(now, now, true), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn recovery_work_gates_on_the_idle_floor_even_with_no_prior_refresh() {
+        // With no prior refresh the cadence term is already zero, so recovery work does not change
+        // the delay — the idle floor gates either way. The recovery bypass is about DROPPING a
+        // non-zero cadence, never about tightening below the idle floor (which would risk a storm).
+        let anchor = Instant::now();
+        let t = tick(vec![], cfg(3600, 60, &[]), FakeEngine::new());
+        let now = anchor + Duration::from_secs(15); // 15 s into the idle window
+        assert_eq!(
+            t.delay_until_due(now, anchor, false),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            t.delay_until_due(now, anchor, true),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn recovery_pending_matches_what_the_sweep_would_restore() {
+        // Issue #280: `recovery_pending` gates on the SAME predicate `run_sweep` acts on —
+        // quarantined AND not excluded AND within the allowlist — so a prompt is never raised for a
+        // quarantined account the sweep would SKIP (an excluded active/target, or one outside a
+        // configured allowlist). Without this parity the tick would fire prompt (poll-cadence)
+        // sweeps that no-op on the dead account while over-refreshing the allowlisted ones.
+        let roster = vec![
+            acct("work", "u-A"),
+            acct("spare", "u-B"),
+            acct("backup", "u-C"),
+        ];
+        // No allowlist (empty = all parked): a quarantined, non-excluded account is recovery work.
+        let t = tick(roster.clone(), cfg(3600, 60, &[]), FakeEngine::new());
+        assert!(t.recovery_pending(&[], &["u-B".to_owned()]));
+        assert!(
+            !t.recovery_pending(&[], &[]),
+            "no quarantine → no recovery work"
+        );
+        assert!(
+            !t.recovery_pending(&["u-B".to_owned()], &["u-B".to_owned()]),
+            "an EXCLUDED quarantined account (dead active / target) is not recovery work — the sweep skips it",
+        );
+        // Allowlist of just `spare` (u-B): a quarantined account OUTSIDE it is NOT recovery work,
+        // because the sweep would skip it — so no prompt for a restore that cannot happen.
+        let t = tick(roster, cfg(3600, 60, &["spare"]), FakeEngine::new());
+        assert!(
+            t.recovery_pending(&[], &["u-B".to_owned()]),
+            "a quarantined ALLOWLISTED account is recovery work",
+        );
+        assert!(
+            !t.recovery_pending(&[], &["u-C".to_owned()]),
+            "a quarantined NON-allowlisted account is not recovery work (#280 allowlist parity)",
+        );
+    }
+
+    #[test]
+    fn a_disabled_tick_reports_no_recovery_work() {
+        // A disabled ticker is wholly inert (its `until_due` never resolves), so it has no restore
+        // work to prompt for regardless of the daemon's quarantine set.
+        let roster = vec![acct("spare", "u-B")];
+        let t = RefreshTick::new(
+            roster,
+            cfg(3600, 60, &[]),
+            false, // disabled
+            FakeEngine::new(),
+            FixedClock {
+                now: Instant::now(),
+            },
+        );
+        assert!(!t.recovery_pending(&[], &["u-B".to_owned()]));
+    }
+
+    #[test]
+    fn recovery_bypass_does_not_busy_spin_at_a_zero_idle_floor() {
+        // Issue #280 + ADR-0007 (no retry storm), the `idle_after_secs = 0` edge (a valid config).
+        // The recovery path's idle floor is then 0, so the FIRST prompt sweep is immediate — but the
+        // run loop disarms recovery after that sweep (`until_due` then sees `false`) and the CADENCE
+        // term (from the just-set `last_refresh`) gates the next wait, so there is no busy-spin. The
+        // two halves proven here: recovery=true → 0 (prompt), and the post-sweep normal path →
+        // ~cadence (never a 0-delay re-fire). The run loop's once-per-period disarm routes the
+        // second wait through `false`; see `run_loop_prompts_the_tick_...` for that coupling.
+        let base = Instant::now();
+        let mut t = tick(vec![], cfg(3600, 0, &[]), FakeEngine::new());
+        // Recovery-prompted, no prior refresh: idle floor 0 → immediate (the prompt).
+        assert_eq!(t.delay_until_due(base, base, true), Duration::ZERO);
+        // After a sweep sets `last_refresh`, the disarmed (`false`) wait gates on the cadence, not
+        // the 0 idle floor — a full cadence out, never a 0-delay spin.
+        t.last_refresh = Some(base);
+        assert_eq!(
+            t.delay_until_due(base, base, false),
+            Duration::from_secs(3600)
+        );
     }
 
     // --- #260: a faster re-arming watch must not starve the idle floor ------
@@ -662,7 +813,7 @@ mod tests {
             tokio::select! {
                 biased;
                 // Re-created every iteration, exactly as the run loop does.
-                () = t.until_due() => {
+                () = t.until_due(false) => {
                     became_due = true;
                     break;
                 }
@@ -673,6 +824,44 @@ mod tests {
         assert!(
             became_due,
             "a 15s-cadence watch must not starve the 60s idle floor forever (#260)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_until_due_is_not_starved_by_control_read_churn() {
+        // Issue #280 AC2/AC4(b): with a quarantined-parked account present AND a refresh that just
+        // ran — whose cadence term would otherwise defer the next sweep a full hour — a steady
+        // stream of control-socket reads (re-creating `until_due` faster than the idle floor) must
+        // NOT starve the restore. The recovery path drops the cadence and gates on the idle floor,
+        // which #260 anchored absolutely, so each re-created `until_due` SHRINKS toward due (60 →
+        // 45 → … → 0) rather than re-arming. Mirrors the #260 harness with recovery work + a LIVE
+        // cadence: without the bypass the cadence (3600 s) would win every churn iteration forever.
+        let mut t = RefreshTick::new(
+            vec![],
+            cfg(3600, 60, &[]),
+            true,
+            FakeEngine::new(),
+            TokioClock,
+        );
+        // A refresh just ran: the cadence term alone would defer the next sweep ~1 h.
+        t.last_refresh = Some(tokio::time::Instant::now().into_std());
+        let mut became_due = false;
+        for _ in 0..5 {
+            tokio::select! {
+                biased;
+                // Re-created every iteration with recovery work signalled, exactly as the run loop
+                // does while a quarantined-parked account is present (before this period's sweep).
+                () = t.until_due(true) => {
+                    became_due = true;
+                    break;
+                }
+                // A control-read churn cadence shorter than the idle floor, re-armed every iteration.
+                () = tokio::time::sleep(Duration::from_secs(15)) => {}
+            }
+        }
+        assert!(
+            became_due,
+            "recovery work must become due despite control-read churn and a live cadence (#280)"
         );
     }
 
@@ -963,6 +1152,37 @@ mod tests {
         // Refreshed despite not being near expiry (the quarantine bypass)…
         assert_eq!(t.engine.refreshed(), vec!["u-Q"]);
         // …and reported for restore.
+        assert_eq!(outcome.restored, vec!["u-Q".to_owned()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quarantined_account_triggers_a_prompt_sweep_and_restore_without_a_full_cadence() {
+        // Issue #280 AC4(a), end-to-end at the tick seam: a quarantined-parked account makes the
+        // tick due PROMPTLY (the idle floor, measured on the virtual clock) even though a refresh
+        // just ran and the cadence alone would defer it ~1 h — then the ensuing sweep RESTORES it
+        // with AC3 semantics unchanged (Refreshed && re_stashed). Ties the recovery-prompted DUE
+        // to the restore the whole change exists to make timely.
+        let now_ms = now_ms();
+        let far = now_ms + 30 * 24 * 3_600_000; // far from expiry — refreshed only via the quarantine bypass
+        let roster = vec![acct("dead", "u-Q")];
+        let engine = FakeEngine::new().with_expiry("u-Q", Some(far)).with_result(
+            "u-Q",
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+        );
+        let mut t = RefreshTick::new(roster, cfg(3600, 60, &[]), true, engine, TokioClock);
+        // A refresh just ran: without the recovery bypass the cadence would defer the sweep ~1 h.
+        t.last_refresh = Some(tokio::time::Instant::now().into_std());
+        // The tick becomes due within the idle floor (60 s virtual), NOT a full cadence (3600 s).
+        let start = tokio::time::Instant::now();
+        t.until_due(true).await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(60),
+            "recovery work makes the tick due within the idle floor, not a full cadence (#280)",
+        );
+        // The prompt sweep restores the quarantined account — AC3 restore semantics unchanged.
+        let outcome = t.sweep(&[], &["u-Q".to_owned()]).await;
+        assert_eq!(t.engine.refreshed(), vec!["u-Q"]);
         assert_eq!(outcome.restored, vec!["u-Q".to_owned()]);
     }
 

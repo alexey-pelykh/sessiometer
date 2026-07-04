@@ -57,11 +57,28 @@ impl Clock for RealClock {
 /// shutdown interrupts a sweep): [`until_due`](RefreshTicker::until_due) is the wait;
 /// [`sweep`](RefreshTicker::sweep) is the bounded work.
 pub(crate) trait RefreshTicker {
+    /// Whether the tick currently has #106 RESTORE work (issue #280): ≥1 account THIS sweep would
+    /// actually refresh for the restore path — quarantined (in the daemon's `quarantined` set), NOT
+    /// in `excluded` (the active account + imminent swap target), AND within the refresh allowlist.
+    /// It is the EXACT per-account predicate [`sweep`](RefreshTicker::sweep) gates on, evaluated by
+    /// the ticker (which owns the allowlist) and kept in one place so the two cannot drift — so a
+    /// quarantined account the sweep would SKIP (an excluded active/target, or one outside a
+    /// configured allowlist) never raises a prompt for a restore that would not happen. The run
+    /// loop threads the result into [`until_due`](RefreshTicker::until_due). `false` when disabled.
+    fn recovery_pending(&self, excluded: &[String], quarantined: &[String]) -> bool;
     /// Resolve when a refresh sweep is due (the ticker's own cadence/idle gating, on its own
     /// [`Clock`] seam). MUST never resolve when the feature is disabled, so it never wins the
     /// idle select and adds no clock activity. Re-armable: the run loop awaits it afresh each
     /// idle iteration, and a control read between waits simply restarts it.
-    async fn until_due(&mut self);
+    ///
+    /// `has_recovery_work` is the ticker's own [`recovery_pending`](RefreshTicker::recovery_pending)
+    /// verdict, gated by the run loop to fire at most once per idle period (issue #280). When set,
+    /// the ticker becomes due within a short bounded interval (the idle floor) instead of deferring
+    /// the restore up to a full refresh cadence after an unrelated recent sweep. The run loop
+    /// passes it TRUE only until the current idle period's sweep has run, so the prompt fires at
+    /// most once per idle period (poll cadence) — never the sub-poll retry storm ADR-0007 decided
+    /// against.
+    async fn until_due(&mut self, has_recovery_work: bool);
     /// Run ONE refresh sweep over the due parked accounts, EXCLUDING the `excluded` uuids
     /// (the active account + the imminent swap target the daemon supplies). `quarantined` is
     /// the daemon's currently-dead ("needs re-login") set: those accounts are refreshed even
