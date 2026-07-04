@@ -238,6 +238,24 @@ ts=2026-06-30T00:00:30Z diag=poll account=work outcome=live
 ts=2026-06-30T00:00:30Z diag=tick decision=hold
 ```
 
+When a `429` carries a `Retry-After`, the `tick` line adds `retry_after_secs=<n>`
+— the raw server-advised wait (delta-seconds, **before** the ~1 h cap) — so you
+can **place the back-off's source** (issue #295) by comparing it to `backoff_secs`:
+
+- **no `retry_after_secs`** — the server advised nothing; the wait is the daemon's
+  **self-capped** exponential (as in the `backoff_secs=120` line above).
+- **`retry_after_secs` == `backoff_secs`** — the **server-advised** wait governed.
+- **`retry_after_secs` < `backoff_secs`** — the server advised a smaller floor, but
+  the daemon's larger **self-capped** exponential governed the wait.
+- **`retry_after_secs` > `backoff_secs`** — the server advised more than the wait:
+  the ~1 h cap clamped a pathological value, which a bare `backoff_secs=3600` alone
+  could never tell you:
+
+```text
+ts=2026-06-30T00:02:00Z diag=poll account=work outcome=rate_limited
+ts=2026-06-30T00:02:00Z diag=tick decision=skip_active_unavailable backoff_secs=3600 retry_after_secs=86400
+```
+
 Both channels carry handles, enums, percentages, and timestamps only — and a CI
 redaction meter scans every rendered line of each (issues #9, #15, #77).
 
