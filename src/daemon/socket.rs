@@ -20,11 +20,16 @@ use tokio::net::UnixListener;
 use super::*;
 
 /// A side effect a served control connection asks the run loop to apply after the
-/// reply is sent. `status` produces none (a pure read); the only variant today is
-/// the manual-hold signal (issue #64). Returned by [`Control::serve`] so the
-/// mutation lands on the daemon's decision state in the run loop, where `&mut
-/// Daemon` is available — `serve` itself only borrows the read-only snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// reply is sent. `status` produces none (a pure read); each state-affecting command
+/// maps to a variant. Returned by [`Control::serve`] so the mutation lands on the
+/// daemon's decision state in the run loop, where `&mut Daemon` is available — `serve`
+/// itself only borrows the read-only snapshot.
+///
+/// Deliberately NOT `Copy`: [`Restored`](ControlSignal::Restored) carries an owned
+/// `uuid` payload (issue #275), unlike the two payload-less signals. The run loop
+/// consumes the signal by value out of the idle `select!`, so a move (not a copy) is
+/// all the handling needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlSignal {
     /// A manual `use` swap committed and notified the daemon (issue #64). The run
     /// loop adopts it ([`Daemon::adopt_manual_swap`]): arm the post-swap cooldown
@@ -42,6 +47,18 @@ pub(crate) enum ControlSignal {
     /// authoritative new roster is the on-disk `config.toml`, re-read from scratch — so
     /// a duplicate or out-of-order notification at worst re-reads an unchanged file.
     RosterReloadRequested,
+    /// An authenticated peer (the `login` verb re-logging in a parked account; in
+    /// principle a manual operator) asked to un-quarantine the account with this
+    /// `uuid` WITHOUT making it active (issue #275). The run loop applies the existing
+    /// [`Daemon::apply_refresh_restore`] primitive — the same one the #106 refresh
+    /// sweep drives — which flips `quarantined` off, resets `recovery_successes`, and
+    /// emits [`Event::CredentialRestored`], with NO canonical write and NO
+    /// active-account change. Unlike the two payload-less signals above it CARRIES the
+    /// target `uuid` (the reason this enum is not `Copy`). Idempotent at the primitive:
+    /// an unknown or already-non-quarantined `uuid` is a logged no-op. Decoupled from
+    /// the sweep (which is starved, #260), so this is the RELIABLE on-demand
+    /// un-quarantine path for a re-logged-in parked account.
+    Restored(String),
 }
 
 /// Control seam: serve control-socket connections. The production impl
@@ -90,10 +107,13 @@ impl Control for UnixControl {
     }
 }
 
-/// The `{"cmd": "..."}` control request.
+/// The `{"cmd": "..."}` control request. `uuid` is present only for the `restored`
+/// command (issue #275) — the payload-less commands (`status` / `manual-swapped` /
+/// `roster-reload`) omit it, and serde defaults a missing `Option` field to `None`.
 #[derive(Deserialize)]
 struct ControlRequest {
     cmd: String,
+    uuid: Option<String>,
 }
 
 /// Build the one-line reply to a control request line, plus any [`ControlSignal`]
@@ -137,6 +157,28 @@ pub(crate) fn control_reply(
                     r#"{"ok":true}"#.to_owned(),
                     Some(ControlSignal::RosterReloadRequested),
                 )
+            } else {
+                (r#"{"error":"unauthorized"}"#.to_owned(), None)
+            }
+        }
+        // `restored` (issue #275) un-quarantines the named account WITHOUT activating it.
+        // State-affecting, so — like `manual-swapped` / `roster-reload` — it is honored ONLY
+        // for an authenticated same-user peer; an unauthenticated one gets an error and
+        // produces NO signal (a stranger can never un-quarantine an account). Auth is checked
+        // FIRST, so a stranger learns nothing about the request's well-formedness. A `restored`
+        // that parses but carries no `uuid` has no target to restore, so it is malformed-safe
+        // like an unparseable line. The idempotent unknown-/already-restored no-op lives in
+        // `apply_refresh_restore` (run-loop side, where `&mut Daemon` is available); this pure
+        // reply always acks a well-formed authenticated request and lets the primitive decide.
+        Ok(request) if request.cmd == "restored" => {
+            if peer_authenticated {
+                match request.uuid {
+                    Some(uuid) => (
+                        r#"{"ok":true}"#.to_owned(),
+                        Some(ControlSignal::Restored(uuid)),
+                    ),
+                    None => (r#"{"error":"malformed request"}"#.to_owned(), None),
+                }
             } else {
                 (r#"{"error":"unauthorized"}"#.to_owned(), None)
             }

@@ -3910,6 +3910,37 @@ mod tests {
         }
     }
 
+    /// A control seam that yields `Restored(uuid)` exactly once, then never resolves
+    /// (issue #275) — so the run loop un-quarantines the named account on its first idle,
+    /// then idles normally on every later poll. The on-demand-restore analog of
+    /// [`OnceRosterReload`]: drives the live `Idle::Restored => apply_refresh_restore`
+    /// wiring that `NoControl` never does. Holds the target `uuid` and clones it into the
+    /// payload each `serve` (which borrows `&self`), mirroring the real socket path where
+    /// the uuid arrives in the request line.
+    struct OnceRestored {
+        uuid: String,
+        fired: Cell<bool>,
+    }
+
+    impl OnceRestored {
+        fn new(uuid: &str) -> Self {
+            Self {
+                uuid: uuid.to_owned(),
+                fired: Cell::new(false),
+            }
+        }
+    }
+
+    impl Control for OnceRestored {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                Some(ControlSignal::Restored(self.uuid.clone()))
+            }
+        }
+    }
+
     // --- builders ----------------------------------------------------------
 
     fn account(uuid: &str, label: &str) -> Account {
@@ -6912,6 +6943,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_refresh_restore_un_quarantines_once_and_is_a_noop_otherwise() {
+        // Issue #275 (AC-1 + AC-3): the primitive the new `restored` control command drives.
+        // A quarantined account is un-quarantined EXACTLY once — the first call flips
+        // `quarantined` off, resets `recovery_successes`, and returns its edge-triggered
+        // `CredentialRestored`; a second call is a silent `None` (already restored). An unknown
+        // uuid and an already-non-quarantined account are both idempotent `None` no-ops. Throughout,
+        // the ACTIVE account is untouched — the restore never re-points canonical or swaps active,
+        // the guarantee that lets `login <B>` clear B's quarantine WITHOUT activating B.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let active_before = daemon.state.active;
+
+        // An already-non-quarantined account: no-op, no event.
+        assert_eq!(daemon.apply_refresh_restore("u-B"), None);
+        // An unknown uuid: no-op, no event (the daemon no longer holds it).
+        assert_eq!(daemon.apply_refresh_restore("u-NOPE"), None);
+
+        // Quarantine the PARKED, non-active `spare` (index 1) — the #106 parked-and-stuck case —
+        // and seed a recovery streak the restore must clear.
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[1].recovery_successes = 2;
+
+        // First restore: un-quarantines and emits exactly the edge event, named by handle only.
+        assert_eq!(
+            daemon.apply_refresh_restore("u-B"),
+            Some(Event::CredentialRestored {
+                account: "spare".to_owned(),
+            })
+        );
+        assert!(!daemon.state.health[1].quarantined, "spare un-quarantined");
+        assert_eq!(
+            daemon.state.health[1].recovery_successes, 0,
+            "the recovery streak is reset on restore"
+        );
+
+        // Second restore of the now-eligible account: idempotent silent no-op.
+        assert_eq!(daemon.apply_refresh_restore("u-B"), None);
+
+        // The active account was never touched by any of the above (AC-1: active unchanged).
+        assert_eq!(
+            daemon.state.active, active_before,
+            "an on-demand restore never changes the active account"
+        );
+    }
+
+    #[tokio::test]
     async fn unrecoverable_signal_fires_once_and_only_when_quarantined() {
         // Issue #261: a QUARANTINED account whose isolated sweep-refresh returns `Dead` is
         // confirmed unrecoverable — `apply_refresh_observation` yields `credential_unrecoverable`
@@ -8293,6 +8369,40 @@ mod tests {
         assert_eq!(signal, None);
     }
 
+    #[test]
+    fn control_reply_restored_authenticated_signals_a_restore() {
+        // Issue #275: an authenticated same-user peer's `restored` acks and yields the
+        // `Restored(uuid)` signal the run loop applies via `apply_refresh_restore` — carrying
+        // the exact uuid from the request line, un-touched.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"restored","uuid":"u-B"}"#, &snap, true);
+        assert_eq!(reply, r#"{"ok":true}"#);
+        assert_eq!(signal, Some(ControlSignal::Restored("u-B".to_owned())));
+    }
+
+    #[test]
+    fn control_reply_restored_unauthenticated_is_refused_with_no_signal() {
+        // Issue #275 (AC-2): `restored` is state-affecting, so an UNauthenticated peer is refused
+        // and produces NO signal — a stranger can never un-quarantine an account (parity with the
+        // `manual-swapped` #64 / `roster-reload` #139 auth gate). Auth is checked FIRST: even a
+        // well-formed request carrying a uuid gets `unauthorized`, never leaking well-formedness.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"restored","uuid":"u-B"}"#, &snap, false);
+        assert_eq!(reply, r#"{"error":"unauthorized"}"#);
+        assert_eq!(signal, None);
+    }
+
+    #[test]
+    fn control_reply_restored_without_uuid_is_malformed_and_yields_no_signal() {
+        // Issue #275: a `restored` that parses but carries no `uuid` has no target to restore, so
+        // it is refused as malformed (bounded / malformed-safe like every command) — no signal, no
+        // spurious ack. Checked only after auth, so this is the authenticated-but-malformed branch.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"restored"}"#, &snap, true);
+        assert_eq!(reply, r#"{"error":"malformed request"}"#);
+        assert_eq!(signal, None);
+    }
+
     #[tokio::test]
     async fn adopt_roster_reload_reads_the_new_roster_from_disk() {
         // AC (end-to-end, no torn read): with a config path wired, the reload re-reads
@@ -8422,6 +8532,86 @@ mod tests {
             roster_uuids(&daemon),
             vec!["u-A", "u-B", "u-C"],
             "the onboarded account joined the live rotation without a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_restored_control_command_un_quarantines_without_activating() {
+        // Issue #275: the run loop's idle select must route a `Restored(uuid)` control signal
+        // into `apply_refresh_restore` — un-quarantining the named PARKED account and logging its
+        // edge-triggered `credential_restored` — WITHOUT a canonical write or an active-account
+        // change. This is the on-demand un-quarantine path, decoupled from the #106 sweep (which is
+        // starved, #260). The control-driven analog of `run_loop_emits_refresh_events_and_applies_restores`:
+        // a regression turning the `Some(Restored) => break` arm into a `continue`, or dropping the
+        // post-idle `apply_refresh_restore` call, would leave `spare` quarantined and fail here.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // holds-only — no swap perturbs the idle path
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        // `spare` (PARKED, non-active) is quarantined ("needs re-login"); `work` is active. The
+        // warm-up tick polls only the active `work`, so this flag survives untouched into the idle
+        // where the control signal delivers the on-demand restore.
+        daemon.state.health[1].quarantined = true;
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        // Tick 1 → idle delivers `Restored(u-B)` → tick 2 → shutdown. after(3): 1 start-up check
+        // (pends) + 2 idle shutdown-checks — the same cadence as the roster-reload adoption test.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = OnceRestored::new("u-B");
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        // The signal reached `apply_refresh_restore` through the idle select: `spare` is
+        // un-quarantined in memory and its edge-triggered `credential_restored` rode the event log
+        // exactly once — no sweep involved.
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "the restored account is un-quarantined"
+        );
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged
+                .matches("event=credential_restored account=spare")
+                .count(),
+            1,
+            "exactly one credential_restored logged: {logged:?}"
+        );
+        // The active account is UNCHANGED — `work` (index 0), never the restored `spare` (index 1).
+        // The on-demand restore never re-points canonical or swaps active (#275).
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "work stays active; restoring the parked spare never activates it"
         );
     }
 
@@ -11629,6 +11819,22 @@ mod tests {
         );
         corpus.push('\n');
 
+        // Channel — the `restored` control command (issue #275): the request line (which carries
+        // an account uuid) AND every reply — the authenticated ack, the unauthorized refusal, and
+        // the malformed-missing-uuid refusal — proving the new channel leaks no secret in EITHER
+        // direction. The uuid is the LOW-entropy fixture uuid, so it never trips the entropy
+        // backstop on its own; a future change echoing a real token/email into the reply would.
+        let restored_request = format!(r#"{{"cmd":"restored","uuid":"{}"}}"#, A.0);
+        corpus.push_str(&restored_request);
+        corpus.push('\n');
+        corpus.push_str(&control_reply(&restored_request, &StatusSnapshot::default(), true).0);
+        corpus.push('\n');
+        corpus.push_str(&control_reply(&restored_request, &StatusSnapshot::default(), false).0);
+        corpus.push('\n');
+        corpus
+            .push_str(&control_reply(r#"{"cmd":"restored"}"#, &StatusSnapshot::default(), true).0);
+        corpus.push('\n');
+
         // Channel — every error message Display.
         for err in every_error_variant() {
             corpus.push_str(&err.to_string());
@@ -11741,6 +11947,13 @@ mod tests {
         assert!(
             corpus.contains("diag=start accounts=3"),
             "diagnostic channel: lifecycle start summary missing"
+        );
+        // The `restored` control channel (#275): the request line is unique to this channel
+        // (`{"cmd":"restored"…}` appears on no other), so this keeps the clean verdict below
+        // non-vacuous for the new channel — a #15 gate that never saw it would prove nothing.
+        assert!(
+            corpus.contains(r#"{"cmd":"restored","uuid":"#),
+            "control channel: restored request missing"
         );
         assert!(
             corpus.len() > 800,
