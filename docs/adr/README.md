@@ -21,6 +21,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0006](0006-migration-schema-evolution-policy.md) | Migration-artifact schema-evolution policy; v1 format frozen | Accepted |
 | [0007](0007-decided-against-credential-recovery-options.md) | Decided-against credential-recovery options for dead accounts | Accepted |
 | [0008](0008-login-decouples-unquarantine-from-activation.md) | `login` decouples un-quarantine from activation | Accepted |
+| [0009](0009-rate-limit-backoff-per-account.md) | Rate-limit back-off is scoped per-account, not endpoint-global | Accepted |
 
 ## Conventions
 
