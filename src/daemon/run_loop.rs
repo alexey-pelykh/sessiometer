@@ -197,6 +197,14 @@ where
     // the sweep below needs nothing from it.
     let refresh_excluded = daemon.refresh_exclusions();
     let refresh_quarantined = daemon.refresh_quarantined();
+    // Whether the tick has #106 RESTORE work this idle period (issue #280): a quarantined account
+    // the sweep would actually act on. Evaluated by the tick (`recovery_pending`), which owns the
+    // refresh allowlist, so it matches EXACTLY what `sweep` will touch — a quarantined dead ACTIVE
+    // / imminent-target (excluded), or a quarantined account outside a configured allowlist, does
+    // NOT spuriously prompt a restore the sweep would skip. Threaded into `until_due` below so a
+    // restore is attempted within ~one poll interval of quarantine instead of a full refresh
+    // cadence; constant for the period (the excluded/quarantined sets are fixed pre-idle).
+    let recovery_pending = refresh.recovery_pending(&refresh_excluded, &refresh_quarantined);
     // Accounts the sweep proved still refreshable (issue #106) and the credential-clock
     // observations it read (issue #119): collected inside the idle loop (where `&mut daemon` is
     // held by `wait`) and returned for the caller to apply AFTER it, when `&mut daemon` is free
@@ -215,6 +223,13 @@ where
     let idle = {
         let wait = daemon.wait_after_tick(next_wait);
         tokio::pin!(wait);
+        // Issue #280: `recovery_pending` prompts the tick to become due within the idle floor (not
+        // the full refresh cadence) while a quarantined account the sweep can restore is present —
+        // but only until THIS idle period's sweep has run. `recovery_prompted` disarms it after the
+        // sweep, so a still-dead account rides the normal cadence for the rest of the period: the
+        // prompt fires at most once per idle period (poll cadence), never the sub-poll retry storm
+        // ADR-0007 decided against.
+        let mut recovery_prompted = false;
         loop {
             tokio::select! {
                 biased;
@@ -248,11 +263,23 @@ where
                 // ABSOLUTE instant precisely so that re-creation SHRINKS the remaining wait rather
                 // than resetting it to a full `idle_after`; a refactor that pins or reorders this
                 // arm must preserve that coupling or the sweep can starve again.
-                () = refresh.until_due() => {
+                //
+                // #280: `recovery_pending && !recovery_prompted` makes the tick due within the
+                // idle floor (dropping the cadence term) while a quarantined account the sweep can
+                // restore is present, so a restore is prompt rather than deferred a full cadence. It
+                // is armed only until this period's sweep runs (`recovery_prompted` set below), so
+                // the prompt fires at most once per idle period — the coupling that keeps this off
+                // the sub-poll retry storm ADR-0007 rejected. Re-created each iteration like the
+                // #260 wait; the same anchored idle floor keeps the recovery path un-starvable too.
+                () = refresh.until_due(recovery_pending && !recovery_prompted) => {
                     tokio::select! {
                         biased;
                         _ = shutdown.requested() => break Idle::Shutdown,
                         sweep = refresh.sweep(&refresh_excluded, &refresh_quarantined) => {
+                            // This period's sweep has run: disarm the #280 recovery prompt so a
+                            // still-quarantined account does not re-fire the sweep sub-cadence for
+                            // the rest of the period (the now-recent cadence term re-throttles).
+                            recovery_prompted = true;
                             // Emit each per-cycle refresh event (issue #106) to the event
                             // log — the SAME best-effort path the tick's events ride; `log`
                             // is not borrowed by `wait`, so it is free to use here. The

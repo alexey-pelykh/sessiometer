@@ -3229,7 +3229,10 @@ mod tests {
     struct NoopRefreshTicker;
 
     impl RefreshTicker for NoopRefreshTicker {
-        async fn until_due(&mut self) {
+        fn recovery_pending(&self, _excluded: &[String], _quarantined: &[String]) -> bool {
+            false
+        }
+        async fn until_due(&mut self, _has_recovery_work: bool) {
             std::future::pending::<()>().await;
         }
         async fn sweep(&mut self, _excluded: &[String], _quarantined: &[String]) -> SweepOutcome {
@@ -3346,6 +3349,10 @@ mod tests {
         swept: RefCell<Vec<Vec<String>>>,
         swept_quarantined: RefCell<Vec<Vec<String>>>,
         outcome: RefCell<SweepOutcome>,
+        /// The `has_recovery_work` flag each `until_due` call was handed (issue #280), in call
+        /// order — so a run-loop test can prove the daemon threads the "≥1 quarantined-parked"
+        /// signal into the tick's DUE computation (not only into `sweep`).
+        due_recovery: RefCell<Vec<bool>>,
     }
 
     impl OnceRefreshTicker {
@@ -3355,6 +3362,7 @@ mod tests {
                 swept: RefCell::new(Vec::new()),
                 swept_quarantined: RefCell::new(Vec::new()),
                 outcome: RefCell::new(SweepOutcome::default()),
+                due_recovery: RefCell::new(Vec::new()),
             }
         }
         /// Pre-load the [`SweepOutcome`] the single sweep returns — its refresh events to log
@@ -3367,7 +3375,16 @@ mod tests {
     }
 
     impl RefreshTicker for OnceRefreshTicker {
-        async fn until_due(&mut self) {
+        fn recovery_pending(&self, _excluded: &[String], quarantined: &[String]) -> bool {
+            // A simple stand-in for the real predicate (the allowlist/exclusion logic is unit-tested
+            // on `RefreshTick` itself): any quarantined account counts as restore work here, so the
+            // run loop threads a prompt whenever the daemon reports a quarantined-parked account.
+            !quarantined.is_empty()
+        }
+        async fn until_due(&mut self, has_recovery_work: bool) {
+            // Record the recovery signal the run loop threaded in (issue #280) before deciding
+            // readiness, so a test can assert the first wait saw the quarantined-parked prompt.
+            self.due_recovery.borrow_mut().push(has_recovery_work);
             // Ready the first time, pending forever after — so the sweep fires once, then the
             // idle select falls through to `wait`/shutdown on every later iteration.
             if self.fired.replace(true) {
@@ -3400,7 +3417,10 @@ mod tests {
     }
 
     impl RefreshTicker for HangingRefreshTicker {
-        async fn until_due(&mut self) {
+        fn recovery_pending(&self, _excluded: &[String], _quarantined: &[String]) -> bool {
+            false
+        }
+        async fn until_due(&mut self, _has_recovery_work: bool) {
             if self.fired.replace(true) {
                 std::future::pending::<()>().await;
             }
@@ -8268,6 +8288,13 @@ mod tests {
             "the active account is excluded from the sweep: {:?}",
             swept[0]
         );
+        // No account is quarantined here, so the tick is NEVER handed a recovery prompt — the
+        // #280 signal is false whenever there is no restore work (contrast to the quarantined case).
+        assert!(
+            ticker.due_recovery.borrow().iter().all(|&r| !r),
+            "no quarantine means no recovery prompt: {:?}",
+            ticker.due_recovery.borrow(),
+        );
     }
 
     #[tokio::test]
@@ -8422,6 +8449,76 @@ mod tests {
         assert!(
             !daemon.state.health[1].quarantined,
             "the restored account is un-quarantined"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_prompts_the_tick_when_a_quarantined_parked_account_is_present() {
+        // Issue #280: the run loop threads the "≥1 quarantined-PARKED account" signal into the
+        // tick's DUE computation (`until_due`), not only into `sweep`. With `spare` quarantined and
+        // parked, the FIRST idle wait is handed `has_recovery_work = true` — so the restore is
+        // prompt (the idle floor) instead of deferred a full refresh cadence. After that period's
+        // sweep the prompt is DISARMED (`recovery_prompted`), so every later wait this period sees
+        // `false` — the coupling that keeps a still-quarantined account off the sub-poll retry
+        // storm ADR-0007 rejected.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // holds-only — no swap perturbs the idle path
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        // `spare` is quarantined AND parked (u-A is active) — the exact "recovery work" the prompt
+        // targets. It survives the warm-up tick, which polls only the active `work`.
+        daemon.state.health[1].quarantined = true;
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // after(4): one sweep fires in idle-iter-1, then idle-iter-2 sees shutdown — the same
+        // cadence as the sibling refresh run-loop tests.
+        let mut shutdown = FakeShutdown::after(4);
+        let control = NoControl;
+        let mut ticker = OnceRefreshTicker::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut ticker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        // The tick was asked to become due WITH recovery work on the first wait — the prompt
+        // reached `until_due`, not just `sweep`.
+        let due_recovery = ticker.due_recovery.borrow();
+        assert_eq!(
+            due_recovery.first(),
+            Some(&true),
+            "the first idle wait must see the quarantined-parked recovery prompt: {due_recovery:?}",
+        );
+        // …and every wait AFTER the period's sweep is disarmed (once per period — no sub-poll storm).
+        assert!(
+            due_recovery.iter().skip(1).all(|&r| !r),
+            "the recovery prompt is disarmed after the sweep: {due_recovery:?}",
         );
     }
 
