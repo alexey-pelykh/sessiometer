@@ -339,8 +339,12 @@ currently live: it re-points the canonical `Claude Code-credentials` item to the
 fresh credential under the swap lock **only** when you re-authenticate the account
 that is already active (re-auth in place), or when no account is active yet
 (bootstrap). Logging in a **different** account while one is active adds or revives
-it **without** touching the active slot — the live session keeps working; switch to
-it with [`sessiometer use`](#switching-the-active-account) when you're ready:
+it **without** touching the active slot — the live session keeps working. If that
+account was **quarantined** (🔴 `dead` / `needs re-login`), the re-login also **clears
+the quarantine at once** — `login` signals the running daemon to return it to the
+rotation the moment the fresh credential lands, instead of waiting on the daemon's
+slower periodic recovery sweep. There is still no swap; the active account stays live.
+Switch to it with [`sessiometer use`](#switching-the-active-account) when you're ready:
 
 ```sh
 # Re-authenticate (or onboard) an account; the label is optional:

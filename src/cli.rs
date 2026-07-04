@@ -555,7 +555,7 @@ USAGE:
 
 COMMANDS:
     capture [<label>]    Stash the active account into the rotation
-    login [<label>]      Log in to an account (claude /login) in isolation and add it to the rotation
+    login [<label>]      Log in to an account (claude /login) in isolation and land it in the rotation, keeping the active account
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
@@ -587,13 +587,20 @@ USAGE:
     -h, --help  print this help
 ";
 
-const LOGIN_USAGE: &str = "sessiometer login — log in to an account (claude /login) in isolation and add it to the rotation
+const LOGIN_USAGE: &str = "sessiometer login — log in to an account (claude /login) in isolation and land it in the rotation, keeping the active account
 
 USAGE:
     sessiometer login [<label>]
 
     <label>     a name for the new account (auto-derived from its account-uuid if omitted)
     -h, --help  print this help
+
+Runs the interactive login in an isolated CLAUDE_CONFIG_DIR, so a live session is
+never disturbed. The login becomes the active account ONLY when it is the
+already-active account (re-auth in place) or no account is active (bootstrap);
+logging in a different account adds or revives it in the rotation without a swap,
+and a revived quarantined account is un-quarantined at once. Switch to it with
+`sessiometer use <account>` when you're ready.
 ";
 
 const RUN_USAGE: &str = "sessiometer run — run the foreground daemon (poll every account's usage and swap before exhaustion)
