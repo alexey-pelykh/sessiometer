@@ -235,7 +235,10 @@ pub(crate) enum LoginEventOutcome {
     /// The harvested account was NEW to the roster — a fresh entry was appended.
     Onboarded,
     /// The harvested account was ALREADY in the roster — its entry was updated in place and its
-    /// credential re-pointed (a re-login that un-quarantines a parked account).
+    /// stash re-pointed to the fresh credential. The canonical item is re-pointed too (the
+    /// re-login that un-quarantines a parked account in place) ONLY when the login becomes active
+    /// (#274: it IS the current active account, or none is); a `Revived` event for a NON-active
+    /// account means the stash + roster were refreshed while the active slot was preserved.
     Revived,
     /// The login did not land: the capture engine or the reconcile returned an error (e.g. a
     /// locked keychain, a spawn failure). Nothing was written to the roster.

@@ -333,8 +333,14 @@ Revive a **`dead`** account — or onboard a new one — by re-authenticating it
 `CLAUDE_CONFIG_DIR`** (the same isolation `poke` uses), so the browser OAuth
 handoff never touches the live `Claude Code-credentials` item a running session
 reads. It harvests the credential Claude Code writes there and lands it in the
-rotation, re-pointing the canonical credential to it under the swap lock — so the
-re-login also takes effect:
+rotation — stashing it and adding or refreshing its roster entry. Whether that
+re-login also becomes **active** is gated to preserve whichever account is
+currently live: it re-points the canonical `Claude Code-credentials` item to the
+fresh credential under the swap lock **only** when you re-authenticate the account
+that is already active (re-auth in place), or when no account is active yet
+(bootstrap). Logging in a **different** account while one is active adds or revives
+it **without** touching the active slot — the live session keeps working; switch to
+it with [`sessiometer use`](#switching-the-active-account) when you're ready:
 
 ```sh
 # Re-authenticate (or onboard) an account; the label is optional:
