@@ -77,11 +77,16 @@
 //!     `subscriptionType`, `rateLimitTier` — and NONE is a refresh-token expiry (the lone
 //!     `expiresAt` is the access token's). The refresh token is itself an opaque
 //!     `sk-ant-ort…` string, not a JWT, so it carries no decodable `exp` either. Claude
-//!     Code does not persist `refresh_token_expires_in` (the OAuth-response field that
-//!     carries the RT lifetime), so the number survives only in that single live
-//!     `/v1/oauth/token` response — an operator one-shot on a throwaway account is the
-//!     sole source (deferred, zero-impact mandate #101; see
-//!     the Deferred-live-check section). The sliding-window-vs-cap facet stays with the
+//!     Code's own credential path does not even READ `refresh_token_expires_in` (the
+//!     OAuth-response field carrying the RT lifetime): a static RE of the client
+//!     (v2.1.198) shows its `claudeAiOauth` write destructures
+//!     `accessToken`/`refreshToken`/`expiresAt`/`scopes` off the response and stores the
+//!     six-field blob, never the RT lifetime. (The field DOES appear elsewhere in the
+//!     binary — but only inside the bundled `@azure/msal-node` library on a separate
+//!     Microsoft-auth path; a red herring, not the Anthropic flow.) So the number
+//!     survives only in that single live `/v1/oauth/token` response — an operator
+//!     one-shot on a throwaway account is the sole source (deferred, zero-impact mandate
+//!     #101; see the Deferred-live-check section). The sliding-window-vs-cap facet stays with the
 //!     engine's own `expires_at_delta_secs` telemetry (above).
 //!
 //! ## Caller contract (the two thin callers must honor)
