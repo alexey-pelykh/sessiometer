@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The control socket: the `0600` Unix-domain server the daemon answers `status` /
-//! `manual-swapped` / `roster-reload` on, plus the client-side reload notify (issues #15, #64,
-//! #139; the #195 per-concern decomposition).
+//! `manual-swapped` / `roster-reload` on, plus the client-side reload / restore notifies
+//! (issues #15, #64, #139, #276; the #195 per-concern decomposition).
 //!
 //! [`UnixControl`] is the production [`Control`] seam the run loop's idle select drives between
 //! polls; [`serve_control`] is its core, testable over an in-memory duplex and bounded in space
@@ -242,12 +242,14 @@ where
     }
 }
 
-/// Upper bound on the client-side `roster-reload` notify exchange (issue #139) — the
-/// CLI-verb counterpart of the server's [`CONTROL_EXCHANGE_TIMEOUT`]. Mirrors the
-/// `use`-side manual-hold notify (#64): a missing / wedged daemon must never hang the
-/// `capture` / `login` / `remove` verb, so the whole connect→send→ack exchange is
-/// time-boxed and any failure degrades to a logged best-effort skip.
-const ROSTER_RELOAD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on a client-side control notify exchange — the CLI-verb counterpart of the
+/// server's [`CONTROL_EXCHANGE_TIMEOUT`], shared by every client notify (`roster-reload`
+/// #139, `restored` #276), just as the server bounds every command with the one
+/// `CONTROL_EXCHANGE_TIMEOUT`. Mirrors the `use`-side manual-hold notify (#64): a missing /
+/// wedged daemon must never hang the `capture` / `login` / `remove` verb, so the whole
+/// connect→send→ack exchange is time-boxed and any failure degrades to a logged best-effort
+/// skip.
+const CLIENT_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Notify a running daemon that the on-disk roster changed (issue #139), so it
 /// re-reads `config.toml` and reconciles its in-memory rotation WITHOUT a restart.
@@ -259,7 +261,7 @@ const ROSTER_RELOAD_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 /// on-disk `config.toml` is authoritative (the write already succeeded), so a notify
 /// failure — no daemon running (connect refused / socket absent), a timeout, an I/O
 /// error — is for the CALLER to log and ignore, never fatal. Bounded by
-/// [`ROSTER_RELOAD_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
+/// [`CLIENT_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
 /// verb. Carries NO credential and NO write target — a pure reload signal (the daemon
 /// re-reads the authoritative file itself).
 pub(crate) async fn notify_roster_reload(socket: &Path) -> Result<()> {
@@ -276,12 +278,59 @@ pub(crate) async fn notify_roster_reload(socket: &Path) -> Result<()> {
         buffered.read_line(&mut line).await?;
         Ok::<(), Error>(())
     };
-    tokio::time::timeout(ROSTER_RELOAD_NOTIFY_TIMEOUT, exchange)
+    tokio::time::timeout(CLIENT_NOTIFY_TIMEOUT, exchange)
         .await
         .map_err(|_| {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "roster-reload notify timed out",
+            ))
+        })?
+}
+
+/// Notify a running daemon to un-quarantine a re-logged-in parked account (issue #276)
+/// WITHOUT activating it — the CLI-verb counterpart of the daemon's `restored` control
+/// handler ([`control_reply`], issue #275). Sends one newline-delimited
+/// `{"cmd":"restored","uuid":"<uuid>"}` request and reads the one-line ack so the daemon has
+/// RECEIVED it before returning.
+///
+/// BEST-EFFORT by contract, exactly like [`notify_roster_reload`] (#139) and the `use`-side
+/// manual-hold notify (#64): the on-disk stash + roster write is authoritative (the revive
+/// already succeeded), so a notify failure — no daemon running (connect refused / socket
+/// absent), a timeout, an I/O error — is for the CALLER to log and ignore, never fatal.
+/// Bounded by [`CLIENT_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
+/// `login` verb. Carries the account `uuid` but NO credential and NO write target: the daemon
+/// un-quarantines from its own roster state (idempotent — an unknown / already-healthy uuid is
+/// a no-op, #275), with no canonical write and no active-account change.
+///
+/// Unlike the payload-less [`notify_roster_reload`], the `uuid` is a dynamic field, so the
+/// request is built with `serde_json` (correctly escaped) rather than a raw byte-literal.
+pub(crate) async fn notify_restored(socket: &Path, uuid: &str) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // Serializing a finite, string-keyed object cannot fail (mirrors the `json!` seed in
+    // `login::onboarding_seed`), so the encode is `.expect`-ed rather than propagated.
+    let request = serde_json::to_vec(&serde_json::json!({ "cmd": "restored", "uuid": uuid }))
+        .expect("serializing the restored control request");
+
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket).await?;
+        let mut buffered = tokio::io::BufReader::new(stream);
+        buffered.write_all(&request).await?;
+        buffered.write_all(b"\n").await?;
+        buffered.flush().await?;
+        // Read the one-line ack so the daemon has processed the request before we
+        // return; the content is irrelevant (any failure is non-fatal for the caller).
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        Ok::<(), Error>(())
+    };
+    tokio::time::timeout(CLIENT_NOTIFY_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "restored notify timed out",
             ))
         })?
 }

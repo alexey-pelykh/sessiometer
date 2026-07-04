@@ -217,6 +217,33 @@ pub(crate) async fn notify_daemon_roster_reload() {
     }
 }
 
+/// Best-effort notify a running daemon to un-quarantine a revived, non-activating parked
+/// account (issue #276): resolve the control socket and send `restored <uuid>` so the daemon
+/// clears the account's `needs re-login` quarantine WITHOUT activating it. Called by
+/// [`reconcile_login`] AFTER the roster save + `roster-reload` notify, ONLY for a
+/// non-activating revive (see [`should_signal_restored`]).
+///
+/// BEST-EFFORT, exactly like [`notify_daemon_roster_reload`] (#139) and the `use` manual-hold
+/// notify (#64): the on-disk stash + roster write is authoritative (the revive already
+/// succeeded), so a failure — no daemon running (connect refused / socket absent), a timeout,
+/// an unresolvable socket path — is logged and ignored, never failing the login. With no
+/// daemon running there is nothing to un-quarantine: the next `run` loads the fresh roster
+/// (with the revived account eligible) at startup.
+pub(crate) async fn notify_daemon_restored(uuid: &str) {
+    let socket = match paths::control_socket() {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!(
+                "sessiometer: restored notify skipped (cannot resolve control socket): {err}"
+            );
+            return;
+        }
+    };
+    if let Err(err) = crate::daemon::notify_restored(&socket, uuid).await {
+        eprintln!("sessiometer: restored notify skipped (is the daemon running?): {err}");
+    }
+}
+
 /// The operator-facing confirmation for a landed login (issue #135) — the `login` counterpart of
 /// [`confirmation`], in the onboarded/revived vocabulary. Names the account by its LABEL only,
 /// never the email or token (#15).
@@ -600,6 +627,19 @@ fn should_activate(active_uuid: Option<&str>, captured_uuid: &str) -> bool {
     }
 }
 
+/// Decide whether a landed login must EXPLICITLY signal the daemon to un-quarantine the
+/// account (#276) — i.e. whether [`reconcile_login`] sends the `restored` control notify.
+/// True only for a NON-ACTIVATING REVIVE: `activate` is false (the canonical item was NOT
+/// re-pointed, so the daemon's #107 auto-un-quarantine won't fire for it) AND the account
+/// already existed ([`LoginOutcome::Revived`]). An [`LoginOutcome::Onboarded`] account is
+/// brand-new and was never quarantined, so the daemon-side `restored` would be a pure no-op;
+/// and when `activate` is true the canonical re-point already un-quarantines via #107, so no
+/// separate signal is needed. Pure over the two verdicts so the gate is unit-tested
+/// hermetically, mirroring [`should_activate`].
+fn should_signal_restored(activate: bool, outcome: LoginOutcome) -> bool {
+    !activate && outcome == LoginOutcome::Revived
+}
+
 /// Reconcile a harvested login into the roster over the REAL seams — the production
 /// entry point (issue #134) the `login` verb (#135) calls after the capture engine
 /// (#132) hands back a [`StashedAccount`]. Wires the real keychain store + stash, holds
@@ -633,10 +673,11 @@ pub(crate) async fn reconcile_login(
     let active_uuid = read_oauth_account_from(&claude_json)
         .ok()
         .map(|o| o.account_uuid().to_owned());
-    let activate = should_activate(
-        active_uuid.as_deref(),
-        captured.oauth_account.account_uuid(),
-    );
+    // Hoist the captured account's uuid before `captured` is moved into [`HarvestedLogin`]:
+    // it feeds the #274 activation gate here AND names the account for the #276 restored
+    // notify below.
+    let captured_uuid = captured.oauth_account.account_uuid().to_owned();
+    let activate = should_activate(active_uuid.as_deref(), &captured_uuid);
 
     let report = run_login_locked(
         Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
@@ -653,6 +694,16 @@ pub(crate) async fn reconcile_login(
     // Tell a running daemon to pick up the onboarded / relogged-in account now (#139) —
     // best-effort, the login already committed to disk.
     notify_daemon_roster_reload().await;
+    // #276: a non-activating REVIVE did NOT re-point the canonical item, so the daemon's
+    // #107 path won't clear this account's `needs re-login` quarantine — signal it to
+    // un-quarantine the revived account NOW (the reliable on-demand path, since the #106
+    // sweep is starved, #260). Best-effort like the roster-reload notify above, and a
+    // daemon-side no-op when it isn't quarantined (#275); skipped when `activate` (the
+    // re-point already un-quarantines via #107) or on an onboard (a brand-new account was
+    // never quarantined). See [`should_signal_restored`].
+    if should_signal_restored(activate, report.outcome) {
+        notify_daemon_restored(&captured_uuid).await;
+    }
     Ok((report.outcome, report.label, report.count))
 }
 
@@ -1308,6 +1359,22 @@ mod tests {
             .map(|o| o.account_uuid().to_owned());
         assert_eq!(none, None);
         assert!(should_activate(none.as_deref(), "u-X"));
+    }
+
+    #[test]
+    fn only_a_non_activating_revive_signals_the_daemon_to_restore() {
+        // #276: the `restored` notify fires ONLY for a non-activating revive — the exact case
+        // where the canonical item was NOT re-pointed (so the daemon's #107 path won't
+        // un-quarantine this account) AND the account already existed (so it may be sitting
+        // `needs re-login`).
+        assert!(should_signal_restored(false, LoginOutcome::Revived));
+        // An ACTIVATING revive (re-auth in place / bootstrap) re-points canonical, which the
+        // daemon's #107 path already un-quarantines on — so no separate signal is sent.
+        assert!(!should_signal_restored(true, LoginOutcome::Revived));
+        // An onboard is a brand-new account that was never quarantined, so `restored` would be
+        // a pure daemon-side no-op — never sent, whether or not it activates.
+        assert!(!should_signal_restored(false, LoginOutcome::Onboarded));
+        assert!(!should_signal_restored(true, LoginOutcome::Onboarded));
     }
 
     #[tokio::test]
