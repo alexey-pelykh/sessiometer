@@ -1258,4 +1258,240 @@ mod tests {
         assert!(matches!(src.usage().await, Err(Error::UsageUnauthorized)));
         assert!(matches!(src.usage().await, Err(Error::Io(_))));
     }
+
+    // --- no-telemetry / no-other-egress privacy invariant (issue #271) ---
+    //
+    // Sessiometer phones home for nothing: no analytics, usage telemetry, crash
+    // reporting, update pings, or beacons. The ONLY outbound network egress it
+    // originates is the documented per-account usage GET the swap logic polls
+    // (`USAGE_URL`). These are *capability* guards — deliberately stronger than a
+    // behavioural "we observed no egress on this run" check: the same discipline
+    // as `scripts/check-no-security-framework.sh`, guarding what the binary CAN
+    // do so a refactor cannot silently open a second egress. Because the guarantee
+    // is about capability, it holds across every operating mode — start, poll,
+    // swap, idle — and everything else: there is simply no code path that could
+    // reach the network another way.
+    //
+    // The tool reaches the network through exactly one mechanism: spawning
+    // `/usr/bin/curl` (`CURL`). It links no in-process HTTP/TLS client and opens
+    // no raw TCP or UDP socket, so it *cannot* originate a connection except by
+    // that one subprocess — which only ever targets `USAGE_URL`. (The daemon's
+    // control socket is a local Unix-domain socket that never leaves the machine;
+    // the external `claude` CLI the daemon drives for refresh/login makes its own
+    // calls under the user's own credential — that is not Sessiometer's egress.)
+
+    /// Read a repo-root-relative file, anchored at `CARGO_MANIFEST_DIR` so the
+    /// scan is tied to the crate under test regardless of the test CWD.
+    fn repo_file(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// Every `.rs` file under `src/`, as `(path, contents)`.
+    fn source_files() -> Vec<(std::path::PathBuf, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir under src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read .rs source");
+                    out.push((path, text));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &mut out);
+        assert!(!out.is_empty(), "found no source files under src/ to scan");
+        out
+    }
+
+    #[test]
+    fn the_sole_egress_endpoint_is_the_documented_usage_url() {
+        // The one allowed destination, and the absolute (PATH-proof) binary that
+        // reaches it. A change here is a deliberate change to the privacy contract
+        // — keep it in step with the README no-telemetry statement.
+        assert_eq!(USAGE_URL, "https://api.anthropic.com/api/oauth/usage");
+        assert_eq!(CURL, "/usr/bin/curl");
+
+        // The request we actually build points nowhere else: its only `url = ` line
+        // is the documented endpoint.
+        let config = curl_config("sk-ant-oat-TESTTOKEN");
+        let url_lines: Vec<&str> = config
+            .lines()
+            .filter(|line| line.trim_start().starts_with("url = "))
+            .collect();
+        assert_eq!(url_lines.len(), 1, "exactly one request URL is configured");
+        assert_eq!(url_lines[0], format!("url = \"{USAGE_URL}\"").as_str());
+    }
+
+    #[test]
+    fn no_in_process_http_tls_or_telemetry_client_is_linked() {
+        // Without an HTTP/TLS client crate the process cannot originate an
+        // in-process HTTP(S) request; without a telemetry/analytics/crash SDK it
+        // cannot beacon to one. The Unix-domain daemon socket needs none of these,
+        // so the dependency graph stays empty of them — the network surface analogue
+        // of `scripts/check-no-security-framework.sh` and the CONTRIBUTING.md
+        // transport rule ("No TLS / HTTP client ... the one network call rides the
+        // system curl"). Scans the committed lockfile, where every package appears
+        // as a `name = "<crate>"` line.
+        //
+        // (`socket2` / `mio` — tokio's transitive socket layer, needed for the LOCAL
+        // Unix socket — are intentionally NOT listed; raw-socket *usage* is guarded
+        // by kind in the next test, not by banning the layer.)
+        const FORBIDDEN_CRATES: &[&str] = &[
+            // HTTP clients / stacks
+            "reqwest",
+            "hyper",
+            "h2",
+            "ureq",
+            "isahc",
+            "curl",
+            "curl-sys",
+            "surf",
+            "attohttpc",
+            "http-req",
+            "minreq",
+            // in-process TLS (only needed for in-process HTTPS; the curl subprocess needs none)
+            "native-tls",
+            "rustls",
+            "openssl",
+            "openssl-sys",
+            "boring",
+            "boring-sys",
+            "schannel",
+            // RPC clients
+            "tonic",
+            "grpcio",
+            // telemetry / analytics / crash-reporting SaaS SDKs
+            "sentry",
+            "sentry-core",
+            "opentelemetry",
+            "tracing-opentelemetry",
+            "posthog",
+            "posthog-rs",
+            "segment",
+            "amplitude",
+            "mixpanel",
+            "rudderanalytics",
+        ];
+        let lockfile = repo_file("Cargo.lock");
+        let has_crate = |name: &str| {
+            lockfile
+                .lines()
+                .any(|line| line.trim() == format!("name = \"{name}\""))
+        };
+
+        // Positive control: the same predicate MUST find a crate we know is present,
+        // so a passing test can never be a silently-broken matcher.
+        assert!(
+            has_crate("tokio"),
+            "lockfile scan is broken: did not find tokio"
+        );
+
+        let present: Vec<&str> = FORBIDDEN_CRATES
+            .iter()
+            .copied()
+            .filter(|name| has_crate(name))
+            .collect();
+        assert!(
+            present.is_empty(),
+            "forbidden network/telemetry crate(s) entered the dependency graph: {present:?}. \
+             Sessiometer must reach the network only by spawning /usr/bin/curl for the usage \
+             endpoint — no in-process HTTP/TLS client, no telemetry SDK (issue #271)."
+        );
+    }
+
+    #[test]
+    fn no_raw_tcp_or_udp_socket_primitive_is_used() {
+        // tokio's `net` feature is on for the daemon's LOCAL IPC — but that IPC is a
+        // Unix-domain socket (UnixStream / UnixListener), which never leaves the
+        // machine. A raw TCP or UDP socket WOULD be outbound egress that bypasses
+        // the curl seam, so guard the primitives by name; the Unix-socket types do
+        // not match. Tokens are assembled from fragments so this guard never matches
+        // its own source (usage.rs is itself scanned).
+        let forbidden: [String; 4] = [
+            concat!("Tcp", "Stream").to_string(),
+            concat!("Tcp", "Listener").to_string(),
+            concat!("Tcp", "Socket").to_string(),
+            concat!("Udp", "Socket").to_string(),
+        ];
+        let files = source_files();
+
+        // Positive control: the scanner must find a Unix-socket type we know is used,
+        // proving a clean result is a real scan, not a scan that read nothing.
+        assert!(
+            files
+                .iter()
+                .any(|(_, text)| text.contains(concat!("Unix", "Listener"))),
+            "source scan is broken: did not find UnixListener"
+        );
+
+        let mut offenders = Vec::new();
+        for (path, text) in &files {
+            for token in &forbidden {
+                if text.contains(token.as_str()) {
+                    offenders.push(format!("{}: {token}", path.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "raw TCP/UDP socket primitive(s) found — outbound egress must ride the curl seam, \
+             never a raw socket (issue #271): {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn curl_is_the_only_network_capable_binary_referenced() {
+        // The two guards above prove the tool cannot reach the network in-process,
+        // so the only residual egress vector is spawning an external network tool.
+        // The one sanctioned spawn is `/usr/bin/curl` -> USAGE_URL, in the usage
+        // poller (this file). Guard the two realistic shapes of a sneaked-in beacon:
+        //   (a) a curl binary literal in any OTHER module, and
+        //   (b) another well-known network fetcher anywhere in the tree.
+        // The other system tools the daemon drives — /usr/bin/security (keychain),
+        // /bin/launchctl, /usr/bin/plutil, osascript — are not network-capable and
+        // are not guarded here. The external `claude` CLI (isolated_spawn) is a
+        // separate program's egress, resolved dynamically rather than as an absolute
+        // literal. Fetcher tokens are assembled from fragments so this guard never
+        // matches its own source.
+        let other_fetchers: [String; 3] = [
+            concat!("wg", "et").to_string(),
+            concat!("so", "cat").to_string(),
+            concat!("tel", "net").to_string(),
+        ];
+        let files = source_files();
+
+        // Positive control: the sanctioned poller (skipped below) must itself
+        // reference the curl binary — proving the scan actually reads file contents.
+        assert!(
+            files
+                .iter()
+                .any(|(path, text)| path.ends_with("usage.rs") && text.contains(CURL)),
+            "source scan is broken: usage.rs does not reference the curl binary"
+        );
+
+        let mut offenders = Vec::new();
+        for (path, text) in &files {
+            for tool in &other_fetchers {
+                if text.contains(tool.as_str()) {
+                    offenders.push(format!("{}: references `{tool}`", path.display()));
+                }
+            }
+            // A curl binary literal is sanctioned ONLY in the usage poller.
+            if !path.ends_with("usage.rs") && text.contains(CURL) {
+                offenders.push(format!(
+                    "{}: references the curl binary `{CURL}`",
+                    path.display()
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an unsanctioned network CLI reference was found — the only sanctioned network spawn \
+             is /usr/bin/curl in the usage poller (issue #271): {offenders:?}"
+        );
+    }
 }
