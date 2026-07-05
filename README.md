@@ -536,7 +536,7 @@ The primary hand-editable block — the poll cadence and the swap thresholds.
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `poll_secs` | Seconds between re-polling a given account — the per-account cadence and the base of the rate-limit back-off. | `5..=3600` | `300` |
-| `cooldown_secs` | Seconds to wait after a swap before another swap is allowed. | `0..=3600` | `60` |
+| `cooldown_secs` | Seconds to wait after a swap before another is allowed — the swap-pacing floor. Tunable **above** a non-zero minimum but never down to zero, so rapid-fire account flapping can't be configured on. | `5..=3600` | `60` |
 | `session_trigger` | Swap **away** from the active account at or above this session-usage percent. | `50..=99` | `95` |
 | `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
 | `session_floor` | Opt-in guard: only swap **to** an account whose session usage is below this percent. Off unless set. | `0..=session_trigger` | off |

@@ -47,6 +47,28 @@ const DEFAULT_POLL_SECS: u64 = 300;
 const DEFAULT_POLL_JITTER_STDDEV: f64 = 60.0;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
+/// The NON-ZERO floor for `cooldown_secs` (issue #272): the smallest interval, in
+/// seconds, the daemon will pace account swaps by. The cooldown is an operator
+/// tunable, but it cannot be configured — or jittered — below this floor, so swap
+/// pacing can never be disabled to zero. Rapid-fire flapping between accounts is a
+/// safety hazard (each swap rewrites the live credential out-of-band), so the floor
+/// is a hard minimum, not a default.
+///
+/// Anchored to the poll-interval floor (`daemon::POLL_SECS_LO` = 5 s): a
+/// quota-driven swap can only fire on a poll tick, so a cooldown below the minimum
+/// poll cadence would be unobservable — 5 s is the smallest meaningful non-zero
+/// floor. It is enforced at BOTH edges: [`Config::validate`] rejects a smaller
+/// `cooldown_secs` base at config load, and the daemon's per-cycle draw clamps to it
+/// (`daemon::COOLDOWN_SECS_LO`, derived from this constant) so a configured jitter
+/// spread cannot dip a single cycle beneath it either. Emergency swaps away from a
+/// dead active bypass the cooldown entirely, so the floor never delays account-death
+/// recovery — it only paces non-urgent quota-driven swaps.
+pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
+// Compile-time guard (issue #272): the floor must stay strictly positive so swap
+// pacing can never be disabled to zero. Zeroing it is a BUILD failure here, not a
+// silent runtime gap — and because `daemon::COOLDOWN_SECS_LO` derives from this
+// constant, the guard covers the per-cycle jitter clamp too.
+const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
 /// Default `session_trigger` percent.
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// Default `weekly_trigger` percent — separate from and higher than
@@ -194,8 +216,9 @@ pub(crate) struct Tunables {
     /// per `poll_secs / N` sub-interval (issue #80), so a roster of N accounts is swept
     /// once per `poll_secs` without bursting all N requests at once.
     pub(crate) poll_secs: u64,
-    /// Seconds to wait after a swap before another is allowed (`0..=3600`).
-    /// Consumed by the cooldown logic (#10 / #11).
+    /// Seconds to wait after a swap before another is allowed
+    /// (`COOLDOWN_SECS_FLOOR..=3600` — a non-zero floor, #272). Consumed by the
+    /// cooldown logic (#10 / #11).
     #[allow(dead_code)]
     pub(crate) cooldown_secs: u64,
     /// Opt-in swap-target session guard (#10): when `Some(pct)`, only swap *to* an
@@ -241,8 +264,9 @@ pub(crate) struct Tunables {
     /// — the weekly-dimension counterpart of `trigger_strategy`.
     pub(crate) weekly_trigger_strategy: Strategy,
     /// Post-swap cooldown timing strategy (issue #38), in seconds: base =
-    /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to `0..=3600`
-    /// each cycle.
+    /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to
+    /// `COOLDOWN_SECS_FLOOR..=3600` each cycle — the low bound is the non-zero swap
+    /// floor (issue #272), so configured jitter can never draw a sub-floor cooldown.
     pub(crate) cooldown_strategy: Strategy,
 }
 
@@ -693,7 +717,16 @@ impl Config {
             }
         };
         range("poll_secs", t.poll_secs, 5, 3600)?;
-        range("cooldown_secs", t.cooldown_secs, 0, 3600)?;
+        // cooldown_secs has a NON-ZERO floor (issue #272): it is configurable ABOVE
+        // COOLDOWN_SECS_FLOOR but not below it, so swap pacing can never be tuned down
+        // to zero. The daemon's per-cycle draw clamps to the same floor, so a jitter
+        // spread cannot bypass it either.
+        range(
+            "cooldown_secs",
+            t.cooldown_secs,
+            COOLDOWN_SECS_FLOOR as i64,
+            3600,
+        )?;
         range("monitor_401_n", t.monitor_401_n, 1, 20)?;
         range("monitor_recovery_m", t.monitor_recovery_m, 1, 20)?;
 
@@ -911,7 +944,10 @@ impl Config {
              # honouring any Retry-After — instead of re-polling at the fixed interval.\n",
         );
         out.push_str(&format!("poll_secs = {}\n", t.poll_secs));
-        out.push_str("# Seconds to wait after a swap before another swap is allowed (0..=3600).\n");
+        out.push_str(&format!(
+            "# Seconds to wait after a swap before another swap is allowed \
+             ({COOLDOWN_SECS_FLOOR}..=3600; a non-zero floor — pacing can't be disabled to zero).\n"
+        ));
         out.push_str(&format!("cooldown_secs = {}\n", t.cooldown_secs));
         out.push_str(
             "# Only swap TO an account whose session usage is below this percent\n\
@@ -1752,6 +1788,8 @@ label = "personal"
         for (key, value) in [
             ("poll_secs", "4"),
             ("poll_secs", "3601"),
+            ("cooldown_secs", "0"), // below the non-zero floor (#272)
+            ("cooldown_secs", "4"), // still below the floor (#272)
             ("cooldown_secs", "3601"),
             ("monitor_401_n", "0"),
             ("monitor_401_n", "21"),
@@ -1764,6 +1802,55 @@ label = "personal"
                 "{key} = {value} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn cooldown_secs_has_a_non_zero_floor_it_cannot_be_configured_below() {
+        // Issue #272: the swap cooldown is tunable ABOVE a non-zero floor but can
+        // never be disabled to zero. A sub-floor `cooldown_secs` (including 0) is a
+        // load-time rejection whose message names the field and the floor, and the
+        // floor edge itself loads and is preserved through to the drawn strategy base.
+        // (The floor's non-zero-ness is a compile-time guard at COOLDOWN_SECS_FLOOR.)
+        for below in [0, COOLDOWN_SECS_FLOOR - 1] {
+            let toml = with_tunables(&format!("cooldown_secs = {below}"));
+            match Config::parse(&toml) {
+                Err(Error::ConfigInvalid(msg)) => assert!(
+                    msg.contains("cooldown_secs") && msg.contains(&COOLDOWN_SECS_FLOOR.to_string()),
+                    "rejection must name the field and the floor, got: {msg}"
+                ),
+                Ok(_) => panic!("cooldown_secs = {below} must be rejected, not accepted"),
+                Err(e) => panic!("cooldown_secs = {below} must be ConfigInvalid, got: {e}"),
+            }
+        }
+
+        // The floor edge loads and threads through to the timing-strategy base.
+        let at_floor = with_tunables(&format!("cooldown_secs = {COOLDOWN_SECS_FLOOR}"));
+        let config = Config::parse(&at_floor).unwrap();
+        assert_eq!(config.tunables.cooldown_secs, COOLDOWN_SECS_FLOOR);
+        assert_eq!(
+            config.tunables.cooldown_strategy.base,
+            COOLDOWN_SECS_FLOOR as f64
+        );
+    }
+
+    #[test]
+    fn rendered_config_documents_the_cooldown_floor_on_one_clean_line() {
+        // Operator-facing (#272): the generated `config.toml` cooldown comment states
+        // the non-zero floor range and is a single, cleanly-joined `#` line — a guard
+        // that the source line-continuation did not leave a torn double-space.
+        let text = Config::parse(VALID).unwrap().render();
+        let comment = text
+            .lines()
+            .find(|l| l.contains("Seconds to wait after a swap"))
+            .expect("the cooldown comment must be rendered");
+        assert!(
+            comment.starts_with("# ") && !comment.contains("  "),
+            "cooldown comment must be one clean line, got: {comment:?}"
+        );
+        assert!(
+            comment.contains(&format!("{COOLDOWN_SECS_FLOOR}..=3600")),
+            "cooldown comment must document the floor range, got: {comment:?}"
+        );
     }
 
     #[test]
@@ -2374,7 +2461,7 @@ label = "personal"
     #[test]
     fn accepts_inclusive_bounds() {
         // Each bound's edge is valid: trigger 50/99, floor == trigger, poll 5/3600,
-        // cooldown 0/3600, monitor 1/20.
+        // cooldown 5/3600 (5 = the non-zero floor, #272), monitor 1/20.
         for fragment in [
             "session_trigger = 50\nsession_floor = 0",
             "session_trigger = 99\nsession_floor = 99", // floor == trigger is allowed
@@ -2382,7 +2469,7 @@ label = "personal"
             "weekly_trigger = 99",
             "poll_secs = 5",
             "poll_secs = 3600",
-            "cooldown_secs = 0",
+            "cooldown_secs = 5",
             "cooldown_secs = 3600",
             "monitor_401_n = 1",
             "monitor_401_n = 20",

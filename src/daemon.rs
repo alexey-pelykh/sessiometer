@@ -170,8 +170,13 @@ const TRIGGER_PCT_HI: f64 = 99.0;
 /// independently bounded.
 const WEEKLY_TRIGGER_PCT_LO: f64 = 50.0;
 const WEEKLY_TRIGGER_PCT_HI: f64 = 99.0;
-/// Per-cycle clamp bounds for the cooldown draw, in seconds (config range).
-const COOLDOWN_SECS_LO: f64 = 0.0;
+/// Per-cycle clamp bounds for the cooldown draw, in seconds. The LOW bound is the
+/// non-zero swap-cooldown floor ([`crate::config::COOLDOWN_SECS_FLOOR`], issue #272),
+/// which the config `cooldown_secs` range mirrors (`floor..=3600`). Clamping every
+/// draw to the floor is what makes it NON-BYPASSABLE: even a wide configured jitter
+/// spread can never pull a cycle's cooldown below the floor, so swap pacing cannot be
+/// disabled to zero via jitter any more than via the base tunable.
+const COOLDOWN_SECS_LO: f64 = crate::config::COOLDOWN_SECS_FLOOR as f64;
 const COOLDOWN_SECS_HI: f64 = 3600.0;
 /// Per-cycle clamp bounds for the poll-interval draw, in seconds (config range).
 const POLL_SECS_LO: f64 = 5.0;
@@ -1153,8 +1158,9 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// reserve layered on top.
     session_floor: Option<f64>,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
-    /// [`DecisionState`]): drawn + clamped to `0..=3600` s each cycle. Replaces
-    /// the former fixed `cooldown` duration.
+    /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
+    /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
+    /// draw a sub-floor cooldown. Replaces the former fixed `cooldown` duration.
     cooldown_strategy: Strategy,
     /// Per-cycle poll-interval strategy (issue #38): drawn + clamped to
     /// `5..=3600` s each loop iteration by
@@ -6391,6 +6397,66 @@ mod tests {
         let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+    }
+
+    #[tokio::test]
+    async fn a_re_swap_within_the_floor_is_refused_even_with_wide_cooldown_jitter() {
+        // Issue #272 (AC #1 + #3): the cooldown floor is NON-BYPASSABLE by jitter. With
+        // the cooldown base pinned AT the floor and a spread an order of magnitude
+        // wider, every per-cycle draw still clamps to >= the floor, so a re-swap inside
+        // the floor window is refused — jitter cannot open a sub-floor gap to flap
+        // through. (Complements `an_over_trigger_active_within_the_cooldown_is_skipped`,
+        // which pins the fixed-cooldown case.)
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.05, 0.05);
+        // Cooldown pinned at the floor, jitter spread 20x wider than it.
+        let mut tun = tunables(95, 80, crate::config::COOLDOWN_SECS_FLOOR);
+        tun.cooldown_strategy = Strategy {
+            base: COOLDOWN_SECS_LO,
+            jitter: Jitter::Uniform {
+                spread: COOLDOWN_SECS_LO * 20.0,
+            },
+        };
+
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        )
+        .with_seed(0x0272_5EED);
+        daemon.state.active = Some(0);
+        daemon.state.last_swap = Some(LastSwap {
+            at: daemon.clock.now(),
+        });
+        // Just inside the floor window: any clamped draw is >= the floor, so this must
+        // skip regardless of what the wide jitter drew this cycle.
+        daemon
+            .clock
+            .advance(Duration::from_secs(crate::config::COOLDOWN_SECS_FLOOR - 1));
+
+        let outcome = warmed_tick(&mut daemon).await;
+
+        assert_eq!(outcome.action, TickAction::SkippedCooldown);
+        // Canonical still A: no swap slipped through the jittered cooldown.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
     }
 
     #[tokio::test]
