@@ -32,6 +32,15 @@ pub(crate) struct StatusSnapshot {
     /// non-active accounts get no maintenance). `false` by `Default` (an all-defaults snapshot
     /// reads as tick-off), matching the opt-in default.
     pub(crate) refresh_enabled: bool,
+    /// Wall-clock epoch SECONDS at which the daemon assembled this snapshot (issue #164) — the
+    /// freshness stamp the frozen wire contract carries so a read-only client (e.g. a menubar
+    /// app) can tell a LIVE snapshot from a STALE one: a healthy daemon advances it every cycle,
+    /// a wedged or dead one stops, so a client compares it against its own clock and greys out
+    /// once the gap grows. Stamped in [`Daemon::snapshot`] from the same `now_secs` the #119
+    /// health rollup reads, so ONE wall-clock read backs the whole cycle. Epoch seconds — the
+    /// unit the rest of the wire already speaks (`access_expires_at`, `session_resets_at`).
+    /// `0` by `Default` (an all-defaults snapshot has no generation instant).
+    pub(crate) generated_at: i64,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -100,11 +109,34 @@ pub(crate) struct AccountReading {
     pub(crate) health: CredentialHealth,
 }
 
-/// The control socket's `status` reply — handles + percentages + the forward-looking
+/// The status-snapshot wire contract's version (issue #164): a `major.minor` the daemon stamps
+/// on every reply so an independently-released read-only client (a menubar app) can bind to it
+/// safely. Semver-for-a-wire-struct: a MAJOR bump is a BREAKING change (a field removed /
+/// renamed / re-typed / re-meant) an older client MUST refuse to render rather than mis-read; a
+/// MINOR bump is ADDITIVE (a new optional field) an older client tolerates by ignoring what it
+/// does not know. Non-secret — two integers.
+///
+/// Derives `Default` (`{0, 0}`) so a `#[serde(default)]` decode of a PRE-#164 daemon's reply
+/// (which omits the field) yields major `0` — an "unknown, pre-freeze" version the client treats
+/// as a mismatched major and DEGRADES on, rather than assuming compatibility (fail-safe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct SchemaVersion {
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+}
+
+/// The status-snapshot contract version THIS build speaks (as the daemon) and understands (as
+/// the reference `status` client) — issue #164. `1.0` is the FIRST frozen contract: the 0.1.0
+/// status snapshot settled by #137–#143. Bump MAJOR on any breaking field change, MINOR on an
+/// additive one (see [`SchemaVersion`]).
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 0 };
+
+/// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
 /// Derives both `Serialize` (the daemon writes it) and `Deserialize` (the `status`
-/// client reads it), so this one definition is the whole wire contract. The durable,
-/// timestamped swap HISTORY remains the event-log view (#9), not `status`.
+/// client reads it). This is the payload the frozen wire envelope ([`VersionedStatus`], issue
+/// #164) carries; the durable, timestamped swap HISTORY remains the event-log view (#9), not
+/// `status`.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct StatusResponse {
     pub(crate) accounts: Vec<AccountStatusLine>,
@@ -122,6 +154,38 @@ pub(crate) struct StatusResponse {
     /// daemon. Non-secret — a plain flag.
     #[serde(default)]
     pub(crate) refresh_enabled: Option<bool>,
+}
+
+/// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
+/// two envelope fields that make it safe for an independently-released read-only client to bind
+/// to — the contract [`SchemaVersion`] and the `generated_at` freshness stamp. This is the exact
+/// struct the daemon serializes onto the control socket for a `status` request.
+///
+/// The payload is `#[serde(flatten)]`ed, so the wire JSON stays FLAT —
+/// `{"schema_version":…,"generated_at":…,"accounts":…,"next_swap":…,"refresh_enabled":…}` — the
+/// settled #137–#143 payload shape unchanged at top level, only PREFIXED with the two meta
+/// fields. So existing internal readers that decode a bare [`StatusResponse`] (`poke`,
+/// `use_account`) keep working: serde ignores the two extra top-level keys they do not name.
+/// Non-secret by construction: the envelope adds a version object and a timestamp, and the
+/// payload is the same redacted [`StatusResponse`] (issue #15).
+///
+/// `#[serde(default)]` on the two meta fields makes a PRE-#164 daemon's reply (which omits them)
+/// decode to `SchemaVersion { major: 0, minor: 0 }` / `generated_at: 0` — a mismatched major the
+/// client degrades on — rather than a decode error.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct VersionedStatus {
+    /// The contract version the payload conforms to ([`STATUS_SCHEMA_VERSION`] from a current
+    /// daemon). The reference client gates on `major` before rendering.
+    #[serde(default)]
+    pub(crate) schema_version: SchemaVersion,
+    /// Wall-clock epoch SECONDS at which the daemon assembled this snapshot — the client's
+    /// live-vs-stale signal. Copied from [`StatusSnapshot::generated_at`].
+    #[serde(default)]
+    pub(crate) generated_at: i64,
+    /// The redacted per-account payload (issue #15), flattened so its fields sit at the top
+    /// level of the wire JSON alongside the two envelope fields above.
+    #[serde(flatten)]
+    pub(crate) status: StatusResponse,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -258,6 +322,20 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // current daemon always knows it (the `Option` is purely pre-#138 wire compat, mirroring
         // `health`).
         refresh_enabled: Some(snapshot.refresh_enabled),
+    }
+}
+
+/// Wrap a [`StatusSnapshot`] into the FROZEN wire envelope (issue #164): stamp the current
+/// [`STATUS_SCHEMA_VERSION`] and copy the snapshot's `generated_at`, around the same
+/// [`status_response`] payload projection. This is the single function the control socket
+/// serializes for a `status` request, so EVERY reply carries the contract version + freshness
+/// stamp. Non-secret for the same reason `status_response` is — the envelope adds only a version
+/// object and a timestamp (issue #15).
+pub(crate) fn versioned_status_response(snapshot: &StatusSnapshot) -> VersionedStatus {
+    VersionedStatus {
+        schema_version: STATUS_SCHEMA_VERSION,
+        generated_at: snapshot.generated_at,
+        status: status_response(snapshot),
     }
 }
 

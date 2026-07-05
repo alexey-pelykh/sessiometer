@@ -132,8 +132,11 @@ pub(crate) fn control_reply(
     peer_authenticated: bool,
 ) -> (String, Option<ControlSignal>) {
     match serde_json::from_str::<ControlRequest>(line) {
+        // The reply is the FROZEN versioned envelope (issue #164): the redacted snapshot payload
+        // plus the contract `schema_version` + `generated_at`, so a read-only client binds to a
+        // stable, versioned struct. Still a non-secret read, answered for any peer.
         Ok(request) if request.cmd == "status" => (
-            serde_json::to_string(&status_response(snapshot))
+            serde_json::to_string(&versioned_status_response(snapshot))
                 .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.to_owned()),
             None,
         ),

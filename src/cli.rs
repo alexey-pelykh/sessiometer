@@ -23,7 +23,8 @@ use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy};
 use crate::daemon::{
     run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, RealClock,
-    RealKeepWarmEngine, RealRosterPoller, RealShutdown, StatusResponse, UnixControl,
+    RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl,
+    VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -965,38 +966,60 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
 /// carries the raw `access_expires_at` for every account (the full-data contract), so
 /// verbose adds nothing there.
 async fn status(json: bool, no_color: bool, verbose: bool) -> Result<()> {
-    let response = query_status(&paths::control_socket()?).await?;
+    let line = query_status(&paths::control_socket()?).await?;
     if json {
-        // The full-data contract, regardless of terminal width (issue #72): the
-        // raw response — both per-account reset instants AND the raw access-token
-        // expiry included — pretty-printed, for scripts (`status --json | jq`).
-        // Sourced from the same non-secret response as the text view, so it too can
-        // never carry a token or email. Never colored — scripts consume the bytes
-        // verbatim; `--verbose` is inert here (the raw clock is already present).
-        let rendered = serde_json::to_string_pretty(&response)
+        // The full-data machine contract, regardless of terminal width (issue #72/#164): the
+        // raw snapshot pretty-printed for scripts (`status --json | jq`) — the frozen envelope
+        // (`schema_version` + `generated_at`) AND the payload, so a machine consumer reads the
+        // version and self-gates. Emitted EVEN on a major mismatch (the raw data carries the
+        // version to gate on); decoded into the typed envelope and re-serialized so the key
+        // order is the struct's (serde_json has no `preserve_order`). Non-secret — the same
+        // redacted payload plus a version object and a timestamp (issue #15). Never colored;
+        // `--verbose` is inert here (the raw clock is already present).
+        let versioned: VersionedStatus =
+            serde_json::from_str(&line).map_err(|err| Error::Io(std::io::Error::other(err)))?;
+        let rendered = serde_json::to_string_pretty(&versioned)
             .map_err(|err| Error::Io(std::io::Error::other(err)))?;
         println!("{rendered}");
-    } else {
-        let color = should_colorize(no_color);
-        // One `now` for both the table's "resets in" and the verbose expiry block, so
-        // the two never read against different clocks within a single render.
-        let now = now_epoch();
-        print!("{}", render_status(&response, now, terminal_cols(), color));
-        // The verbose access-token expiry block (issue #143) trails the table — content,
-        // not color, so it shows through a pipe like the rest of the table (the
-        // color gate governs only the ANSI overlay).
-        if verbose {
-            print!("{}", render_access_token_expiry(&response, now));
+        return Ok(());
+    }
+    match gate_status(&line, STATUS_SCHEMA_VERSION)? {
+        // A mismatched contract MAJOR (issue #164): the daemon's snapshot field set may have
+        // changed incompatibly, so DEGRADE VISIBLY — one banner, no table — rather than
+        // mis-render. The raw snapshot is still available via `status --json`.
+        StatusView::Mismatch { wire, supported } => {
+            print!("{}", render_schema_mismatch(wire, supported));
+        }
+        StatusView::Render(versioned) => {
+            let color = should_colorize(no_color);
+            // One `now` for both the table's "resets in" and the verbose expiry block, so
+            // the two never read against different clocks within a single render.
+            let now = now_epoch();
+            print!(
+                "{}",
+                render_status(&versioned.status, now, terminal_cols(), color)
+            );
+            // The verbose access-token expiry block (issue #143) trails the table — content,
+            // not color, so it shows through a pipe like the rest of the table (the
+            // color gate governs only the ANSI overlay).
+            if verbose {
+                print!("{}", render_access_token_expiry(&versioned.status, now));
+            }
         }
     }
     Ok(())
 }
 
-/// Connect to the daemon's control socket at `path`, request `status`, and parse
-/// the one-line reply. A connect failure that means "no daemon" — the socket is
-/// absent, or present but refusing — maps to the friendly [`Error::DaemonNotRunning`];
-/// any other connect error surfaces as itself.
-async fn query_status(path: &Path) -> Result<StatusResponse> {
+/// Connect to the daemon's control socket at `path`, request `status`, and return the one-line
+/// JSON reply VERBATIM. A connect failure that means "no daemon" — the socket is absent, or
+/// present but refusing — maps to the friendly [`Error::DaemonNotRunning`]; any other connect
+/// error surfaces as itself.
+///
+/// Returns the raw line (not a decoded struct) so the caller can apply the issue-#164
+/// schema-version gate — probing the contract version INDEPENDENT of the payload
+/// ([`gate_status`]) so a future incompatible major degrades to a named mismatch rather than a
+/// field-level decode error — and so `--json` can re-emit the snapshot verbatim.
+async fn query_status(path: &Path) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     let stream = match UnixStream::connect(path).await {
@@ -1020,7 +1043,63 @@ async fn query_status(path: &Path) -> Result<StatusResponse> {
     buffered.flush().await?;
     let mut line = String::new();
     buffered.read_line(&mut line).await?;
-    serde_json::from_str(line.trim_end()).map_err(|err| Error::Io(std::io::Error::other(err)))
+    Ok(line.trim_end().to_owned())
+}
+
+/// A minimal probe over a status reply that reads ONLY the frozen contract version (issue #164),
+/// independent of the payload — so a future daemon whose MAJOR changed incompatibly (a field
+/// removed / renamed / re-typed) is reported as a clean version mismatch rather than a confusing
+/// field-level decode error. `#[serde(default)]` so a PRE-#164 reply (no `schema_version`) probes
+/// as major `0`, which mismatches the current major and degrades (fail-safe).
+#[derive(serde::Deserialize)]
+struct SchemaProbe {
+    #[serde(default)]
+    schema_version: SchemaVersion,
+}
+
+/// The reference `status` client's view of a reply after the issue-#164 MAJOR gate: either the
+/// compatible envelope to render, or a mismatch to report visibly.
+enum StatusView {
+    /// The daemon's contract major matches — render its payload.
+    Render(VersionedStatus),
+    /// The daemon speaks a major this build does not understand — degrade visibly.
+    Mismatch {
+        wire: SchemaVersion,
+        supported: SchemaVersion,
+    },
+}
+
+/// Apply the frozen-contract MAJOR gate (issue #164) to a raw status reply `line`: probe the
+/// schema version FIRST (independent of the payload), and only fully decode the snapshot when the
+/// major matches `supported`. A mismatched major returns [`StatusView::Mismatch`] so the client
+/// degrades visibly rather than mis-render a payload whose fields may have shifted. Pure over the
+/// line + the supported version, so the gate is unit-tested without a socket.
+fn gate_status(line: &str, supported: SchemaVersion) -> Result<StatusView> {
+    let probe: SchemaProbe =
+        serde_json::from_str(line).map_err(|err| Error::Io(std::io::Error::other(err)))?;
+    if probe.schema_version.major != supported.major {
+        return Ok(StatusView::Mismatch {
+            wire: probe.schema_version,
+            supported,
+        });
+    }
+    let versioned: VersionedStatus =
+        serde_json::from_str(line).map_err(|err| Error::Io(std::io::Error::other(err)))?;
+    Ok(StatusView::Render(versioned))
+}
+
+/// The visible degrade a text `status` prints when the daemon's snapshot contract MAJOR (issue
+/// #164) differs from the one this build renders: name BOTH versions and point at the raw
+/// `--json` view, rather than mis-render a table whose fields may have changed. Pure, so the
+/// message is unit-tested. Carries no account data — only the two version numbers and static
+/// text — so it is redaction-clean (issue #15) by construction.
+fn render_schema_mismatch(wire: SchemaVersion, supported: SchemaVersion) -> String {
+    format!(
+        "status: the daemon speaks snapshot schema v{}.{}, but this build renders v{}.{} — \
+         refusing to render a contract it may mis-read. Upgrade sessiometer; \
+         `sessiometer status --json` still emits the raw snapshot.\n",
+        wire.major, wire.minor, supported.major, supported.minor,
+    )
 }
 
 /// Render a [`StatusResponse`] as the text `status` prints: an aligned table with a
@@ -4880,14 +4959,20 @@ spare  22222222-2222\n\
         let path = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
 
-        let response = StatusResponse {
-            refresh_enabled: None,
-            accounts: vec![status_line("work", true, Some(50), Some(25))],
-            next_swap: Some(NextSwap::Target {
-                to: "spare".to_owned(),
-            }),
-        };
-        let wire = serde_json::to_string(&response).unwrap();
+        // The daemon replies with the FROZEN versioned envelope (issue #164): the payload plus
+        // the contract version + freshness stamp.
+        let wire = serde_json::to_string(&VersionedStatus {
+            schema_version: STATUS_SCHEMA_VERSION,
+            generated_at: 1_782_777_600,
+            status: StatusResponse {
+                refresh_enabled: None,
+                accounts: vec![status_line("work", true, Some(50), Some(25))],
+                next_swap: Some(NextSwap::Target {
+                    to: "spare".to_owned(),
+                }),
+            },
+        })
+        .unwrap();
 
         // Server side: accept one connection, expect the status request, reply once.
         let server = async {
@@ -4902,18 +4987,152 @@ spare  22222222-2222\n\
             buffered.flush().await.unwrap();
         };
 
-        let (_, parsed) = tokio::join!(server, query_status(&path));
-        let parsed = parsed.expect("a live socket round-trips");
-        assert_eq!(parsed.accounts.len(), 1);
-        assert_eq!(parsed.accounts[0].label, "work");
-        assert_eq!(parsed.accounts[0].session_pct, Some(50));
+        // `query_status` returns the raw line; decode it as the caller (`status`) does.
+        let (_, line) = tokio::join!(server, query_status(&path));
+        let line = line.expect("a live socket round-trips");
+        let parsed: VersionedStatus = serde_json::from_str(&line).unwrap();
+        // The contract version + freshness stamp survive the round trip (issue #164).
+        assert_eq!(parsed.schema_version, STATUS_SCHEMA_VERSION);
+        assert_eq!(parsed.generated_at, 1_782_777_600);
+        // The flattened payload round-trips intact.
+        assert_eq!(parsed.status.accounts.len(), 1);
+        assert_eq!(parsed.status.accounts[0].label, "work");
+        assert_eq!(parsed.status.accounts[0].session_pct, Some(50));
         // The next-swap candidate round-trips intact (#88).
         assert_eq!(
-            parsed.next_swap,
+            parsed.status.next_swap,
             Some(NextSwap::Target {
                 to: "spare".to_owned()
             })
         );
+    }
+
+    // --- the frozen snapshot contract's version gate (issue #164) --------------
+
+    /// A wire line for the frozen envelope at an arbitrary contract version, over a one-account
+    /// payload — the reference-client gate's input.
+    fn versioned_wire(major: u32, minor: u32, generated_at: i64) -> String {
+        serde_json::to_string(&VersionedStatus {
+            schema_version: SchemaVersion { major, minor },
+            generated_at,
+            status: StatusResponse {
+                refresh_enabled: None,
+                accounts: vec![status_line("work", true, Some(50), Some(25))],
+                next_swap: None,
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn gate_status_renders_a_matching_major() {
+        // A reply at the build's own contract major decodes to the payload to render.
+        let line = versioned_wire(
+            STATUS_SCHEMA_VERSION.major,
+            STATUS_SCHEMA_VERSION.minor,
+            1_782_777_600,
+        );
+        match gate_status(&line, STATUS_SCHEMA_VERSION).unwrap() {
+            StatusView::Render(versioned) => {
+                assert_eq!(versioned.schema_version, STATUS_SCHEMA_VERSION);
+                assert_eq!(versioned.generated_at, 1_782_777_600);
+                assert_eq!(versioned.status.accounts[0].label, "work");
+            }
+            StatusView::Mismatch { .. } => panic!("a matching major must render"),
+        }
+    }
+
+    #[test]
+    fn gate_status_tolerates_a_higher_minor_at_the_same_major() {
+        // A MINOR bump is additive (issue #164): an older client renders it, ignoring what it
+        // does not know — only the MAJOR gates.
+        let line = versioned_wire(
+            STATUS_SCHEMA_VERSION.major,
+            STATUS_SCHEMA_VERSION.minor + 7,
+            9,
+        );
+        assert!(matches!(
+            gate_status(&line, STATUS_SCHEMA_VERSION).unwrap(),
+            StatusView::Render(_)
+        ));
+    }
+
+    #[test]
+    fn gate_status_degrades_on_a_mismatched_major() {
+        // A MAJOR bump is breaking: the client must degrade (issue #164 AC-2), never render.
+        let line = versioned_wire(STATUS_SCHEMA_VERSION.major + 1, 0, 9);
+        match gate_status(&line, STATUS_SCHEMA_VERSION).unwrap() {
+            StatusView::Mismatch { wire, supported } => {
+                assert_eq!(wire.major, STATUS_SCHEMA_VERSION.major + 1);
+                assert_eq!(supported, STATUS_SCHEMA_VERSION);
+            }
+            StatusView::Render(_) => panic!("a mismatched major must degrade, not render"),
+        }
+    }
+
+    #[test]
+    fn gate_status_degrades_on_a_pre_freeze_reply() {
+        // A PRE-#164 daemon omits `schema_version`; it probes as major 0 (fail-safe default),
+        // which mismatches the frozen major, so the client degrades rather than assume compat.
+        let line = r#"{"accounts":[],"next_swap":null}"#;
+        match gate_status(line, STATUS_SCHEMA_VERSION).unwrap() {
+            StatusView::Mismatch { wire, .. } => assert_eq!(wire, SchemaVersion::default()),
+            StatusView::Render(_) => panic!("a versionless reply must degrade"),
+        }
+    }
+
+    #[test]
+    fn gate_status_probes_the_version_even_when_the_payload_is_incompatible() {
+        // The robustness the probe-first design buys (issue #164): a future major whose PAYLOAD
+        // no longer decodes into this build's struct (here `accounts` is renamed away and typed
+        // as a string) is STILL reported as a clean version mismatch — never a field-level decode
+        // error, never a silent mis-render.
+        let line = r#"{"schema_version":{"major":2,"minor":0},"generated_at":5,"accts":"gone"}"#;
+        match gate_status(line, STATUS_SCHEMA_VERSION).unwrap() {
+            StatusView::Mismatch { wire, .. } => assert_eq!(wire.major, 2),
+            StatusView::Render(_) => panic!("an incompatible-major payload must degrade"),
+        }
+    }
+
+    #[test]
+    fn render_schema_mismatch_names_both_versions_and_stays_redaction_clean() {
+        let banner =
+            render_schema_mismatch(SchemaVersion { major: 2, minor: 3 }, STATUS_SCHEMA_VERSION);
+        // Names the daemon's version and the build's version, and points at the raw view.
+        assert!(banner.contains("v2.3"), "got {banner}");
+        assert!(
+            banner.contains(&format!(
+                "v{}.{}",
+                STATUS_SCHEMA_VERSION.major, STATUS_SCHEMA_VERSION.minor
+            )),
+            "got {banner}"
+        );
+        assert!(banner.contains("--json"), "got {banner}");
+        // #15: the degrade banner is version integers + static text only — no account handle,
+        // no email, no token.
+        assert!(!banner.contains('@'), "got {banner}");
+        assert!(!banner.to_lowercase().contains("token"), "got {banner}");
+    }
+
+    #[test]
+    fn json_view_carries_schema_version_and_generated_at() {
+        // What the `--json` branch emits: the raw envelope re-serialized, carrying BOTH frozen
+        // meta fields (issue #164 AC-1) alongside the flat payload.
+        let line = versioned_wire(
+            STATUS_SCHEMA_VERSION.major,
+            STATUS_SCHEMA_VERSION.minor,
+            1_782_777_600,
+        );
+        let versioned: VersionedStatus = serde_json::from_str(&line).unwrap();
+        let json = serde_json::to_string_pretty(&versioned).unwrap();
+        assert!(json.contains("\"schema_version\""), "got {json}");
+        assert!(json.contains("\"major\": 1"), "got {json}");
+        assert!(json.contains("\"generated_at\": 1782777600"), "got {json}");
+        // The payload stays FLAT at the top level (not nested under a key).
+        assert!(json.contains("\"accounts\""), "got {json}");
+        // Redaction unchanged (issue #15): no email/token on the `--json` wire.
+        assert!(!json.contains('@'), "got {json}");
+        assert!(!json.to_lowercase().contains("token"), "got {json}");
     }
 
     #[test]
