@@ -627,6 +627,10 @@ OPTIONS:
     -V, --version  Print version
 
 Run `sessiometer <command> --help` for command-specific usage.
+
+sessiometer is unofficial: not affiliated with or endorsed by Anthropic. Claude
+and Claude Code are trademarks of Anthropic, referenced only to describe what
+sessiometer works with.
 ";
 
 /// Per-subcommand help (issue #175): a one-line summary, a usage line, then the accepted
@@ -5883,6 +5887,21 @@ spare  22222222-2222\n\
         assert_eq!(
             parse_argv(&["--help"]).unwrap(),
             Command::Help(HelpTopic::Root)
+        );
+    }
+
+    #[test]
+    fn root_help_carries_the_unofficial_not_affiliated_notice() {
+        // Issue #273: the root `--help` overview must carry the 'unofficial /
+        // not affiliated' notice, referencing Anthropic's marks only nominatively.
+        let help = HelpTopic::Root.help();
+        assert!(
+            help.contains("unofficial"),
+            "root help must state the tool is unofficial:\n{help}"
+        );
+        assert!(
+            help.contains("not affiliated with or endorsed by Anthropic"),
+            "root help must carry the not-affiliated notice:\n{help}"
         );
     }
 

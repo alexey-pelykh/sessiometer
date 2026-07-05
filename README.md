@@ -5,6 +5,11 @@ account's usage quota and swaps the active credential out-of-band before an
 account is exhausted, so a long session keeps running by rotating across
 accounts.
 
+> **Unofficial.** `sessiometer` is not affiliated with, endorsed by, or supported
+> by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic, referenced
+> here only nominatively to describe what `sessiometer` works with — no third-party
+> logos or marks are used. The project is [MIT-licensed](LICENSE).
+
 > **Status:** early scaffold (`0.1.0`, first workable slice). The subsystems
 > behind the CLI are still being implemented — see the
 > [open issues](https://github.com/alexey-pelykh/sessiometer/issues).
