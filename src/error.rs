@@ -294,6 +294,15 @@ pub(crate) enum Error {
     #[error("daemon not running — start it with `sessiometer run`")]
     DaemonNotRunning,
 
+    // --- Background service (`sessiometer service`, issue #166) ---------------
+    /// A `launchctl` invocation (`bootstrap` / `bootout`) while installing or
+    /// uninstalling the LaunchAgent exited non-zero. The wrapped detail is the
+    /// launchctl subcommand, its exit code, and its stderr — all non-secret (a
+    /// label, a plist path, a domain target), so it is safe to surface verbatim.
+    /// A generic failure exit `1` (via the `_` arm of [`Error::exit_code`]).
+    #[error("launchctl failed: {0}")]
+    LaunchctlFailed(String),
+
     // --- Manual account selection (`sessiometer use`, issue #63) -------------
     //
     // The one-shot `use <account>` verb's own exit conditions, EXTENDING the
@@ -631,6 +640,9 @@ mod tests {
         assert_eq!(Error::CredentialNotFound.exit_code(), 1);
         assert_eq!(Error::Unimplemented("x").exit_code(), 1);
         assert_eq!(Error::Io(std::io::Error::other("boom")).exit_code(), 1);
+        // A launchctl install/uninstall failure (issue #166) is a generic failure —
+        // it does not touch the swap/lock taxonomy (2–7).
+        assert_eq!(Error::LaunchctlFailed("boom".to_owned()).exit_code(), 1);
         // A strict-usage rejection (issue #175) is a generic failure, matching the
         // sibling `UnknownCommand` — both are "you asked for something that isn't a
         // thing", distinct from a runtime failure.

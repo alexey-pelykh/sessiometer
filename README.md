@@ -50,6 +50,44 @@ sessiometer run
 sessiometer status
 ```
 
+## Running in the background
+
+`sessiometer run` in the Quickstart is a **foreground** daemon: it stops when you
+close its terminal. To keep the rotation going across the whole login session — with
+no terminal open, and an always-present daemon for a future UI to attach to — install
+it as a per-user launchd **LaunchAgent**:
+
+```sh
+# Install + start the background agent (runs `sessiometer run` at login, kept up):
+sessiometer service install
+
+# Stop + remove it:
+sessiometer service uninstall
+```
+
+`service install` writes a LaunchAgent plist to
+`~/Library/LaunchAgents/io.github.alexey-pelykh.sessiometer.plist` and loads it into
+your login session (`launchctl bootstrap`). It is a LaunchAgent, not a system-wide
+LaunchDaemon, because the swap loop needs your **login keychain**, which only exists
+inside the per-user session. The agent is `RunAtLoad` + `KeepAlive`, so it starts at
+login and is brought back up if it ever exits. Its stdout/stderr land in
+`~/Library/Logs/sessiometer/daemon.out.log` and `daemon.err.log`.
+
+**One owner at a time — a safety guard.** Whatever launchd starts is the ordinary
+lock-guarded `sessiometer run`: it takes a single-owner lock on the roster before it
+polls or swaps. So the background agent and a foreground `sessiometer run` can never
+both drive the swap loop — whichever starts **second** refuses immediately with
+
+```text
+sessiometer: another sessiometer daemon is already running (the single-instance lock is held)
+```
+
+and exits `3`, performing **no** swap. This guard is deliberate and has **no**
+`--force`-style bypass: two processes rewriting the active credential on the same
+roster would fight over which account is canonical. If you want to run in the
+foreground temporarily, `sessiometer service uninstall` first (or stop the agent),
+then `sessiometer run`.
+
 ## Checking status
 
 `sessiometer status` queries the running daemon and prints each account as one
@@ -640,8 +678,10 @@ in-memory zeroization, redacted diagnostics — is stated in
 To remove `sessiometer` completely and hand credential custody back to plain
 Claude Code:
 
-1. **Stop the daemon.** Quit any running `sessiometer run` (Ctrl-C in its terminal,
-   or kill the process). Nothing else runs in the background.
+1. **Stop the daemon.** If you installed the background LaunchAgent, remove it with
+   `sessiometer service uninstall` (this unloads it and deletes its plist). Also quit
+   any running foreground `sessiometer run` (Ctrl-C in its terminal, or kill the
+   process). After that, nothing runs in the background.
 
 2. **Erase the per-account stashes.** The cleanest way is to `remove` each captured
    account, which deletes its `Sessiometer/<account_uuid>` keychain stash:
@@ -659,6 +699,8 @@ Claude Code:
    ```sh
    rm -rf ~/"Library/Application Support/sessiometer"
    rm -rf ~/"Library/Logs/sessiometer"
+   # only if `service uninstall` in step 1 did not already remove it:
+   rm -f ~/"Library/LaunchAgents/io.github.alexey-pelykh.sessiometer.plist"
    # only if you set $XDG_CONFIG_HOME:
    rm -rf "$XDG_CONFIG_HOME/sessiometer"
    ```
