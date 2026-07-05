@@ -18,6 +18,8 @@
 //! methods; `run_loop` is re-exported under `crate::daemon::*` for `crate::cli` and the
 //! in-module test suite.
 
+use tokio::net::UnixStream;
+
 use super::*;
 
 /// The console line for a swap this cycle, or `None` for any non-swap outcome.
@@ -90,6 +92,14 @@ enum Idle {
     /// the poll cadence rather than up to a full interval later. Carries the `uuid` moved
     /// out of the [`ControlSignal::Restored`] payload.
     Restored(String),
+    /// An authenticated `swap` control command (#167) asked the daemon to swap the active
+    /// account onto a target. Carries the still-OPEN connection + the parsed request (moved
+    /// out of the [`ControlYield::Swap`] handoff), so the post-idle applies it where
+    /// `&mut Daemon` is available ([`Daemon::perform_socket_swap`]) and writes the redacted
+    /// ack from the real outcome, then re-ticks so `status` reflects the swap within the poll
+    /// cadence. Unlike the payload-less signals, this must be answered INLINE here (not spawned)
+    /// because the swap needs the `!Send` daemon seams (ADR-0001).
+    SwapRequested(UnixStream, SwapCommand),
     /// The external-login watch (#140) saw the canonical credential change out-of-band
     /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
     /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
@@ -241,22 +251,29 @@ where
             tokio::select! {
                 biased;
                 _ = shutdown.requested() => break Idle::Shutdown,
-                // A served control connection may carry a signal (#64): a
-                // `manual-swapped` breaks the idle to adopt it; a `status` read
-                // (None) just continues serving until the wait elapses.
-                signal = control.serve(snapshot) => match signal {
-                    Some(ControlSignal::ManualSwapped) => break Idle::ManualSwapped,
+                // A served control connection yields to the run loop (#64): a fire-and-forget
+                // signal to apply, or a `swap` handoff (#167) to perform here. A `manual-swapped`
+                // breaks the idle to adopt it; a `status` read (`Signal(None)`) just continues
+                // serving until the wait elapses.
+                yielded = control.serve(snapshot) => match yielded {
+                    ControlYield::Signal(Some(ControlSignal::ManualSwapped)) => break Idle::ManualSwapped,
                     // A `roster-reload` (#139) breaks the idle to reconcile the
                     // in-memory roster to the freshly-written config; a `status`
                     // read (None) just continues serving until the wait elapses.
-                    Some(ControlSignal::RosterReloadRequested) => {
+                    ControlYield::Signal(Some(ControlSignal::RosterReloadRequested)) => {
                         break Idle::RosterReloadRequested
                     }
                     // A `restored` (#275) breaks the idle to un-quarantine the named
                     // account (moving the uuid payload out of the signal), then re-tick;
                     // a `status` read (None) just continues serving until the wait elapses.
-                    Some(ControlSignal::Restored(uuid)) => break Idle::Restored(uuid),
-                    None => continue,
+                    ControlYield::Signal(Some(ControlSignal::Restored(uuid))) => break Idle::Restored(uuid),
+                    // A `swap` (#167) breaks the idle to perform the swap (moving the open stream +
+                    // parsed request out of the handoff) where `&mut daemon` is available, write the
+                    // redacted ack, then re-tick. The auth + malformed rejections were already
+                    // answered inline in `serve_control`, so only an authenticated, well-formed
+                    // request reaches here.
+                    ControlYield::Swap(stream, command) => break Idle::SwapRequested(stream, command),
+                    ControlYield::Signal(None) => continue,
                 },
                 // The periodic isolated-refresh tick (issue #105), in the idle path off
                 // the poll→usage→swap seam. `until_due` resolves only when a refresh is
@@ -535,6 +552,21 @@ where
                 if let Some(event) = daemon.apply_refresh_restore(&uuid) {
                     emit_best_effort(log, &event);
                 }
+            }
+            // Perform the authenticated `swap` control command (#167) where `&mut daemon` is
+            // available: re-validate the target against the daemon's OWN live state, run the write
+            // through the single-writer swap lock, emit the durable `Event::Swap` (best-effort),
+            // then write the redacted ack back to the client — BEFORE looping back to re-tick so
+            // `status` reflects the swap. The ack write is best-effort and time-boxed
+            // (`SWAP_ACK_WRITE_TIMEOUT`): the ack carries nothing secret, so a disconnected /
+            // wedged client just drops it and can never stall the loop (issue #15/#167).
+            Idle::SwapRequested(stream, command) => {
+                let (ack, event) = daemon.perform_socket_swap(&command).await;
+                if let Some(event) = event {
+                    emit_best_effort(log, &event);
+                }
+                let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_swap_ack(stream, &ack))
+                    .await;
             }
             // The external-login watch (#140) detected an out-of-band canonical change: just
             // re-tick — the next `tick` reads the canonical and its `reconcile_canonical_change`

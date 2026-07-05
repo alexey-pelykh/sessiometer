@@ -421,6 +421,18 @@ pub(crate) enum Error {
     )]
     SwapWrongIdentityRestash,
 
+    // --- Daemon-routed swap (issue #167) -------------------------------------
+    /// The running daemon performed a `use` swap on our behalf (issue #167 — `use`
+    /// routes THROUGH the daemon when one is up) and its swap engine aborted for a
+    /// reason other than the redacted-and-remapped ones (a locked keychain → exit
+    /// `4`, a contended swap lock → exit `4`, a gone canonical → the recovery
+    /// signal): a wrong-identity re-stash guard (#211), an absent stash, or an I/O
+    /// error. The daemon aborted with ZERO writes. A generic exit `1`, like its
+    /// sibling engine aborts. Secret-free: the daemon's ack is redacted to a machine
+    /// reason code, never a token or email (issue #15).
+    #[error("the daemon could not complete the swap; check `sessiometer status` and retry")]
+    DaemonSwapFailed,
+
     // --- One-shot `poke` (issue #104) ----------------------------------------
     /// `poke <account>` named the ACTIVE account. The isolated-refresh engine
     /// refreshes only PARKED (non-active) accounts (`src/refresh.rs` Caller

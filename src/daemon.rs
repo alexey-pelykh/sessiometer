@@ -143,7 +143,8 @@ pub(crate) use snapshot::{status_response, RefreshHealth};
 mod socket;
 
 pub(crate) use socket::{
-    notify_restored, notify_roster_reload, Control, ControlSignal, UnixControl,
+    notify_restored, notify_roster_reload, request_swap, write_swap_ack, Control, ControlSignal,
+    ControlYield, SwapAck, SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
 // in-module socket tests (production reaches them through `UnixControl::serve`); `serve_watch` /
@@ -1168,6 +1169,14 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
     /// draw a sub-floor cooldown. Replaces the former fixed `cooldown` duration.
     cooldown_strategy: Strategy,
+    /// Base post-swap cooldown (issue #10) as a fixed [`Duration`] (`cooldown_secs`),
+    /// UN-jittered — the stable window the socket `swap` command (issue #167) gates a
+    /// manual swap on, so a non-`force` `use` routed THROUGH the daemon refuses inside
+    /// the cooldown exactly as the standalone `use` path does (which derives the same
+    /// window from `config.tunables.cooldown_secs`). Distinct from `cooldown_strategy`
+    /// (the per-cycle JITTERED draw the auto-swap path uses), mirroring how
+    /// `weekly_trigger_base` is the stable verdict distinct from `weekly_trigger_strategy`.
+    cooldown_base: Duration,
     /// Per-cycle poll-interval strategy (issue #38): drawn + clamped to
     /// `5..=3600` s each loop iteration by
     /// [`next_poll_interval`](Self::next_poll_interval).
@@ -1278,6 +1287,11 @@ where
             session_trigger_base: f64::from(tunables.session_trigger) / 100.0,
             session_floor: tunables.session_floor.map(|floor| f64::from(floor) / 100.0),
             cooldown_strategy: tunables.cooldown_strategy,
+            // The un-jittered cooldown window the socket `swap` command gates a manual
+            // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
+            // standalone `use` path uses, so routing through the daemon does not shift
+            // the cooldown behavior.
+            cooldown_base: Duration::from_secs(tunables.cooldown_secs),
             poll_strategy: tunables.poll_strategy,
             rng: SplitMix64::from_entropy(),
             monitor_401_n: tunables.monitor_401_n,
@@ -2705,6 +2719,149 @@ where
         self.state.last_swap = Some(LastSwap { at });
     }
 
+    /// Perform a socket `swap` command (issue #167) against the daemon's live state, returning the
+    /// redacted [`SwapAck`] plus any durable [`Event`] to log — WITHOUT touching the socket, so the
+    /// re-validation + write are unit-testable apart from the ack I/O (the run loop writes the ack
+    /// via [`write_swap_ack`]). Runs where `&mut Daemon` is available (the
+    /// run loop's post-idle), because the ack must reflect the REAL outcome (accepted /
+    /// rejected-with-reason).
+    ///
+    /// The daemon re-validates the target's viability from its OWN state — it resolves the handle
+    /// against its current roster and reads `quarantined` / weekly-exhaustion / cooldown from its
+    /// health + readings — NEVER a client hint (a client-side "greyed out" is UX only). `force` is
+    /// POLICY-only ([`swap_command_verdict`]): it bypasses those gates, but it can never manufacture
+    /// an outgoing account and never reaches the SAFETY aborts, which live in the swap engine below
+    /// — the write goes through the SAME single-writer swap lock (issue #64) the auto-swaps use, so
+    /// a contended lock fails closed ([`SwapRejection::SwapLockBusy`]), and the engine's step-1 read
+    /// aborts on a LOCKED keychain ([`SwapRejection::KeychainLocked`]) even under `force`. The
+    /// single-owner guard is upheld by CONSTRUCTION: the daemon (holding the single-instance lock)
+    /// is the SOLE writer, and this command routes the write THROUGH it rather than spawning a
+    /// second one.
+    ///
+    /// On a completed swap it mirrors [`record_swap`](Self::record_swap): caches active, arms the
+    /// post-swap cooldown (#10) so the next poll HOLDS on the operator's choice, primes the
+    /// canonical watch, drops a now-frozen recovery probe on the account swapped AWAY from (issue
+    /// #108, the same transition invariant [`adopt_manual_swap`](Self::adopt_manual_swap) upholds
+    /// for the standalone-`use` path), and returns the SAME `Event::Swap` (`Manual` / `Forced`) the
+    /// standalone `use` emits — so the cooldown derived from the durable log agrees whichever path
+    /// wrote.
+    async fn perform_socket_swap(&mut self, command: &SwapCommand) -> (SwapAck, Option<Event>) {
+        // 1. Resolve the target handle (label OR uuid) against the CURRENT roster — the daemon's
+        //    OWN resolution, never a client-provided index; it never guesses (issue #17).
+        let target_idx = match crate::use_account::resolve_target(&self.roster, &command.target) {
+            Ok(idx) => idx,
+            Err(Error::UseTargetAmbiguous { .. }) => {
+                return (
+                    SwapAck::Rejected {
+                        reason: SwapRejection::AmbiguousTarget,
+                    },
+                    None,
+                )
+            }
+            // Not found (or any other resolve failure) → unknown target.
+            Err(_) => {
+                return (
+                    SwapAck::Rejected {
+                        reason: SwapRejection::UnknownTarget,
+                    },
+                    None,
+                )
+            }
+        };
+
+        // 2. Re-validate viability from the daemon's LIVE state (health + last readings + the
+        //    un-jittered weekly threshold + the in-memory last-swap), never a client hint. The
+        //    `weekly_exhausted` computation is EXACTLY the snapshot's per-account verdict
+        //    (`weekly >= weekly_trigger_base`) — same data source AND formula, so the ack agrees with
+        //    what `status` shows. This is the daemon's LAST-KNOWN reading (≤ one poll interval old),
+        //    NOT the fresh poll the daemon-DOWN `use` runs: a target that crossed the threshold since
+        //    the last poll can be accepted here. The divergence is bounded and self-correcting — the
+        //    very next tick polls the now-active target and swaps away if it is truly exhausted — and
+        //    it deliberately keeps this re-validation off the network so it never blocks the
+        //    single-thread run loop (ADR-0001). `force` overrides it either way.
+        let now = self.clock.now();
+        let quarantined = self.state.health[target_idx].quarantined;
+        let weekly_exhausted = self.state.last_readings[target_idx]
+            .is_some_and(|usage| usage.weekly >= self.weekly_trigger_base);
+        let in_cooldown = self
+            .state
+            .last_swap
+            .as_ref()
+            .is_some_and(|last| now.saturating_duration_since(last.at) < self.cooldown_base);
+
+        match swap_command_verdict(
+            target_idx,
+            self.state.active,
+            quarantined,
+            weekly_exhausted,
+            in_cooldown,
+            command.force,
+        ) {
+            SwapVerdict::AlreadyActive => (
+                SwapAck::AlreadyActive {
+                    to: self.roster[target_idx].label.clone(),
+                },
+                None,
+            ),
+            SwapVerdict::Reject(reason) => (SwapAck::Rejected { reason }, None),
+            // The verdict returns `Swap` only when an active account exists (it rejects
+            // `NoActiveAccount` otherwise); re-match defensively rather than `expect` on the
+            // long-running daemon path.
+            SwapVerdict::Swap => match self.state.active {
+                None => (
+                    SwapAck::Rejected {
+                        reason: SwapRejection::NoActiveAccount,
+                    },
+                    None,
+                ),
+                Some(active_idx) => {
+                    let outgoing = self.roster[active_idx].stash();
+                    let incoming = self.roster[target_idx].stash();
+                    // The SAME lock-wrapped engine (#64) the auto-swaps use: #6 is no-half-swap, so
+                    // an error (a contended lock that fails closed, a locked keychain) leaves the
+                    // canonical item and both stashes coherent — ZERO writes — and becomes a
+                    // redacted rejection.
+                    match self.locked_swap(&outgoing, &incoming).await {
+                        Ok(_report) => {
+                            let prev_active = self.state.active;
+                            // Mirror the auto-swap tail: cache active, arm the cooldown, prime the
+                            // canonical watch (so this write is not re-detected as out-of-band #13).
+                            self.record_swap(target_idx, &incoming, now).await;
+                            // An operator-driven swap can move AWAY from a mid-recovery account
+                            // (unlike the auto-swap, which HOLDS on one): drop its now-frozen probe
+                            // so its dead-spare state is honest (issue #108).
+                            self.deactivate_recovery_probe(prev_active, Some(target_idx));
+                            let reason = if command.force {
+                                SwapReason::Forced
+                            } else {
+                                SwapReason::Manual
+                            };
+                            let from = self.roster[active_idx].label.clone();
+                            let to = self.roster[target_idx].label.clone();
+                            // The SAME durable `Event::Swap` the standalone `use` emits (issue #9),
+                            // so the log-derived cooldown agrees whichever path wrote. `session_pct`
+                            // = 0: a manual/forced swap is not session-triggered (the reason
+                            // distinguishes it). Non-secret handles only (issue #15).
+                            let event = Event::Swap {
+                                from: from.clone(),
+                                to: to.clone(),
+                                reason,
+                                session_pct: 0,
+                            };
+                            (SwapAck::Accepted { from, to }, Some(event))
+                        }
+                        Err(err) => (
+                            SwapAck::Rejected {
+                                reason: classify_swap_failure(&err),
+                            },
+                            None,
+                        ),
+                    }
+                }
+            },
+        }
+    }
+
     /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
     ///
     /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
@@ -3550,6 +3707,84 @@ fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
     soonest
 }
 
+/// The daemon's own re-validation verdict for a socket `swap` command (issue #167) — the pure
+/// core of [`Daemon::perform_socket_swap`], so the "the daemon re-validates the target itself,
+/// never the client hint" rule is unit-testable apart from the swap I/O (mirroring the pure
+/// [`pick_target`] / [`crate::use_account`] `cooldown_active`).
+enum SwapVerdict {
+    /// Proceed: swap the active account OFF and the target ON.
+    Swap,
+    /// The target is ALREADY active — a no-op success (nothing to write), the non-`force`
+    /// already-active case.
+    AlreadyActive,
+    /// Refused, with the redacted wire reason ([`SwapRejection`]).
+    Reject(SwapRejection),
+}
+
+/// Decide whether a socket `swap` command may proceed, PURELY from the daemon's live facts about
+/// the resolved `target` (issue #167). The viability facts (`quarantined`, `weekly_exhausted`,
+/// `in_cooldown`) are computed by the caller from the daemon's OWN state — never a client-supplied
+/// hint — mirroring how [`control_reply`](socket::control_reply) takes `peer_authenticated` as a plain bool for the
+/// same testability reason.
+///
+/// `force` is POLICY-only: it bypasses the viability + cooldown gates (a warn-and-proceed the
+/// standalone `use` also does), but it can NEVER manufacture an outgoing account, and it never
+/// reaches the SAFETY aborts — the locked-keychain abort and the single-writer swap lock live in
+/// the swap engine below this verdict ([`classify_swap_failure`]), so no verdict here can bypass
+/// them. A `force` swap onto the ALREADY-active account is NOT short-circuited (it proceeds as a
+/// self-swap — the `use --force <active>` display-repair path); only a NON-`force` already-active
+/// request is the no-op.
+fn swap_command_verdict(
+    target: usize,
+    active: Option<usize>,
+    quarantined: bool,
+    weekly_exhausted: bool,
+    in_cooldown: bool,
+    force: bool,
+) -> SwapVerdict {
+    // Already active + NON-force → a no-op success (nothing to write), matching the standalone
+    // `use` no-op. A `force` request falls through to the self-swap below (display repair).
+    if !force && active == Some(target) {
+        return SwapVerdict::AlreadyActive;
+    }
+    // A normal re-stash swap needs an OUTGOING (active) account to swap away from. With none, the
+    // daemon cannot run it — recovery (adopt-target, issue #212) is the standalone `use --force`
+    // path, decoupled from this channel per the issue. `force` cannot manufacture an outgoing.
+    if active.is_none() {
+        return SwapVerdict::Reject(SwapRejection::NoActiveAccount);
+    }
+    // POLICY gates — each bypassable by `force` (warn-and-proceed at the operator, silent here);
+    // NEVER a safety bypass (those live in the engine below this verdict).
+    if !force {
+        if quarantined {
+            return SwapVerdict::Reject(SwapRejection::Quarantined);
+        }
+        if weekly_exhausted {
+            return SwapVerdict::Reject(SwapRejection::WeeklyExhausted);
+        }
+        if in_cooldown {
+            return SwapVerdict::Reject(SwapRejection::Cooldown);
+        }
+    }
+    SwapVerdict::Swap
+}
+
+/// Map a swap-engine failure to the redacted wire reason for a `swap` ack (issue #167). The two
+/// SAFETY aborts `force` can NEVER bypass get their own codes — a LOCKED keychain
+/// ([`Error::KeychainLocked`], the engine's step-1 read aborts even under `force`) and a contended
+/// single-writer swap lock ([`Error::SwapLockBusy`], fail-closed) — so the "force cannot bypass the
+/// locked-keychain abort" invariant is observable in the ack. A canonical that is GONE
+/// ([`Error::CredentialNotFound`], scrubbed since the daemon last resolved active) routes to the
+/// recovery signal (adopt-target is the standalone path); everything else is the opaque `Failed`.
+fn classify_swap_failure(err: &Error) -> SwapRejection {
+    match err {
+        Error::KeychainLocked { .. } => SwapRejection::KeychainLocked,
+        Error::SwapLockBusy => SwapRejection::SwapLockBusy,
+        Error::CredentialNotFound => SwapRejection::NoActiveAccount,
+        _ => SwapRejection::Failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3754,7 +3989,7 @@ mod tests {
     struct NoControl;
 
     impl Control for NoControl {
-        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
             std::future::pending().await
         }
     }
@@ -3769,7 +4004,7 @@ mod tests {
     }
 
     impl Control for RecordingControl {
-        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
             std::future::pending().await
         }
         fn publish(&self, _snapshot: &StatusSnapshot) {
@@ -4002,11 +4237,11 @@ mod tests {
     }
 
     impl Control for OnceManualSwap {
-        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
             if self.fired.replace(true) {
                 std::future::pending().await
             } else {
-                Some(ControlSignal::ManualSwapped)
+                ControlYield::Signal(Some(ControlSignal::ManualSwapped))
             }
         }
     }
@@ -4029,11 +4264,11 @@ mod tests {
     }
 
     impl Control for OnceRosterReload {
-        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
             if self.fired.replace(true) {
                 std::future::pending().await
             } else {
-                Some(ControlSignal::RosterReloadRequested)
+                ControlYield::Signal(Some(ControlSignal::RosterReloadRequested))
             }
         }
     }
@@ -4060,11 +4295,36 @@ mod tests {
     }
 
     impl Control for OnceRestored {
-        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
             if self.fired.replace(true) {
                 std::future::pending().await
             } else {
-                Some(ControlSignal::Restored(self.uuid.clone()))
+                ControlYield::Signal(Some(ControlSignal::Restored(self.uuid.clone())))
+            }
+        }
+    }
+
+    /// A [`Control`] that hands back a single `swap` command (issue #167) on its first serve — the
+    /// run-loop counterpart of [`OnceRestored`], carrying a REAL socket end so a test can read the
+    /// redacted ack the loop writes back. Pends forever after, so the loop then idles on the tick
+    /// timer / shutdown exactly like [`NoControl`].
+    struct OnceSwap {
+        command: SwapCommand,
+        stream: RefCell<Option<tokio::net::UnixStream>>,
+        fired: Cell<bool>,
+    }
+
+    impl Control for OnceSwap {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                let stream = self
+                    .stream
+                    .borrow_mut()
+                    .take()
+                    .expect("the swap stream is handed back exactly once");
+                ControlYield::Swap(stream, self.command.clone())
             }
         }
     }
@@ -7980,6 +8240,9 @@ mod tests {
             ServeOutcome::OneShot(_) => {
                 panic!("a watch command must route to a stream, not a one-shot reply")
             }
+            ServeOutcome::Swap(..) => {
+                panic!("a watch command must route to a watch stream, not a swap handoff")
+            }
         }
     }
 
@@ -8004,9 +8267,9 @@ mod tests {
         // Publish the current snapshot, THEN accept: the spawned task subscribes at this value and
         // sends it as the initial frame — the same publish-then-serve order the run loop uses.
         control.publish(&watch_snapshot("work", 100, 0.20));
-        let signal = control.serve(&watch_snapshot("work", 100, 0.20)).await;
+        let yielded = control.serve(&watch_snapshot("work", 100, 0.20)).await;
         assert!(
-            signal.is_none(),
+            matches!(yielded, ControlYield::Signal(None)),
             "a watch subscription produces no control signal"
         );
 
@@ -8191,6 +8454,563 @@ mod tests {
             reply.contains("unauthorized"),
             "a foreign-uid manual-swapped must be rejected: {reply:?}"
         );
+    }
+
+    // --- socket `swap` command (issue #167) --------------------------------
+
+    #[tokio::test]
+    async fn serve_control_hands_back_an_authenticated_swap_command() {
+        use tokio::io::AsyncWriteExt;
+        // An AUTHENTICATED, well-formed `swap` is NOT answered inline: like `watch`, it hands the
+        // OPEN connection back (with the parsed target + force) so the run loop performs the swap
+        // against `&mut Daemon` and writes the redacted ack from the REAL outcome — an outcome this
+        // pure serve cannot know. No reply is written here.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"swap\",\"target\":\"spare\",\"force\":true}\n")
+            .await
+            .unwrap();
+        let (_stream, command) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .swap();
+        assert_eq!(
+            command,
+            SwapCommand {
+                target: "spare".to_owned(),
+                force: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_defaults_an_omitted_swap_force_flag_to_false() {
+        use tokio::io::AsyncWriteExt;
+        // `force` is `#[serde(default)]`: a `swap` that OMITS it is a NON-force request (the common
+        // `use <target>` case), never a parse error — so a plain policy-gated swap routes cleanly.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"swap\",\"target\":\"spare\"}\n")
+            .await
+            .unwrap();
+        let (_stream, command) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .swap();
+        assert_eq!(command.target, "spare");
+        assert!(!command.force, "an omitted force flag defaults to false");
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_unauthenticated_swap_command() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // AC (peer-credential authN): a `swap` is STATE-AFFECTING, so a non-owner peer is rejected
+        // BEFORE any handoff — the swap never reaches the run loop (`one_shot()` proves there is NO
+        // `Swap` handoff), and the peer gets `unauthorized` and learns nothing past the rejection.
+        // This is the socket-layer half of the guard; the real `getpeereid` euid comparison that
+        // computes the bool is proven by `serve_control_rejects_a_foreign_uid_peer` / `is_same_user`.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"swap\",\"target\":\"spare\",\"force\":true}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "an unauthenticated swap must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            reply.contains("unauthorized"),
+            "an unauthenticated swap is refused: {reply:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_authenticated_swap_with_no_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Authenticated but malformed: a `swap` carrying no `target` has nothing to resolve, so it is
+        // refused as `malformed request` (bounded / malformed-safe like an unparseable line) with NO
+        // handoff. Checked only AFTER auth — the authenticated-but-malformed branch.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"swap\",\"force\":true}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "a targetless swap must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.contains("malformed"), "got {reply:?}");
+    }
+
+    // --- swap_command_verdict (pure re-validation, issue #167) --------------
+
+    #[test]
+    fn swap_command_verdict_accepts_a_viable_target_without_force() {
+        // The happy path: an active account exists and the target is viable (not quarantined, weekly
+        // headroom, no cooldown) → proceed with the swap, no force needed.
+        assert!(matches!(
+            swap_command_verdict(1, Some(0), false, false, false, false),
+            SwapVerdict::Swap
+        ));
+    }
+
+    #[test]
+    fn swap_command_verdict_treats_a_non_force_already_active_target_as_a_noop() {
+        // Non-force + target already active → a no-op success (nothing to write), mirroring the
+        // standalone `use` no-op (the caller fills the `to` label).
+        assert!(matches!(
+            swap_command_verdict(0, Some(0), false, false, false, false),
+            SwapVerdict::AlreadyActive
+        ));
+    }
+
+    #[test]
+    fn swap_command_verdict_force_onto_the_active_account_proceeds_as_a_self_swap() {
+        // A `force` request onto the ALREADY-active account is NOT the no-op — it proceeds as a
+        // self-swap (the `use --force <active>` display-repair path), so force is honored end to end.
+        assert!(matches!(
+            swap_command_verdict(0, Some(0), false, false, false, true),
+            SwapVerdict::Swap
+        ));
+    }
+
+    #[test]
+    fn swap_command_verdict_rejects_with_no_active_account_even_under_force() {
+        // A normal re-stash swap needs an OUTGOING (active) account. With none, the daemon cannot run
+        // it, and `force` cannot MANUFACTURE one (adopt-target #212 is the decoupled standalone path).
+        // BOTH the non-force and the force request reject — force is policy-only, never a
+        // precondition bypass.
+        assert!(matches!(
+            swap_command_verdict(1, None, false, false, false, false),
+            SwapVerdict::Reject(SwapRejection::NoActiveAccount)
+        ));
+        assert!(matches!(
+            swap_command_verdict(1, None, false, false, false, true),
+            SwapVerdict::Reject(SwapRejection::NoActiveAccount)
+        ));
+    }
+
+    #[test]
+    fn swap_command_verdict_rejects_each_non_viable_target_without_force() {
+        // AC (daemon re-validates the target itself): a quarantined target, a weekly-exhausted
+        // target, and an in-cooldown swap each reject WITHOUT force, with the matching redacted
+        // reason. These facts are computed by the caller from the daemon's OWN state — never a
+        // client "greyed out" hint.
+        assert!(matches!(
+            swap_command_verdict(1, Some(0), true, false, false, false),
+            SwapVerdict::Reject(SwapRejection::Quarantined)
+        ));
+        assert!(matches!(
+            swap_command_verdict(1, Some(0), false, true, false, false),
+            SwapVerdict::Reject(SwapRejection::WeeklyExhausted)
+        ));
+        assert!(matches!(
+            swap_command_verdict(1, Some(0), false, false, true, false),
+            SwapVerdict::Reject(SwapRejection::Cooldown)
+        ));
+    }
+
+    #[test]
+    fn swap_command_verdict_force_bypasses_every_policy_gate_at_once() {
+        // `force` is POLICY-only: it bypasses ALL THREE viability/cooldown gates together
+        // (quarantined AND weekly-exhausted AND in-cooldown) → proceed. It never reaches the SAFETY
+        // aborts (the locked keychain / swap lock), which live in the engine BELOW this verdict — so
+        // this proves force relaxes POLICY, not that it can bypass a safety abort (that is
+        // `classify_swap_failure` + the locked-keychain integration test).
+        assert!(matches!(
+            swap_command_verdict(1, Some(0), true, true, true, true),
+            SwapVerdict::Swap
+        ));
+    }
+
+    // --- classify_swap_failure (engine error → redacted reason, issue #167) ---
+
+    #[test]
+    fn classify_swap_failure_maps_the_two_force_proof_safety_aborts_to_their_own_codes() {
+        // AC (force cannot bypass a SAFETY abort): both surface as their OWN redacted reason (not the
+        // opaque `Failed`), making "force cannot bypass the locked-keychain abort / the swap lock"
+        // observable in the ack. A locked keychain and a fail-closed single-writer lock each map
+        // through distinctly.
+        assert_eq!(
+            classify_swap_failure(&Error::KeychainLocked { op: "read" }),
+            SwapRejection::KeychainLocked
+        );
+        assert_eq!(
+            classify_swap_failure(&Error::SwapLockBusy),
+            SwapRejection::SwapLockBusy
+        );
+    }
+
+    #[test]
+    fn classify_swap_failure_routes_a_vanished_canonical_to_no_active_and_else_to_failed() {
+        // A canonical scrubbed since the daemon last resolved active → the recovery signal (adopt-
+        // target is the standalone path); every other engine error is the opaque `Failed` (#15: no
+        // internal detail on the wire). The #211 wrong-identity re-stash guard is one such `Failed`.
+        assert_eq!(
+            classify_swap_failure(&Error::CredentialNotFound),
+            SwapRejection::NoActiveAccount
+        );
+        assert_eq!(
+            classify_swap_failure(&Error::SwapWrongIdentityRestash),
+            SwapRejection::Failed
+        );
+    }
+
+    // --- perform_socket_swap (daemon swap-apply, issue #167) ----------------
+
+    #[tokio::test]
+    async fn perform_socket_swap_reroutes_the_canonical_and_arms_the_cooldown() {
+        // AC (unify `use` onto the daemon; no torn write): a well-formed `swap` runs the daemon's OWN
+        // single-writer swap — the SAME engine the auto-swaps use — rerouting the canonical OFF the
+        // active account ONTO the target, advancing in-memory active, arming the post-swap cooldown,
+        // and emitting the durable `Event::Swap` (reason Manual — operator-driven, not
+        // session-triggered). The ack carries the two non-secret labels and NOTHING else.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Both under the session trigger, so warm-up HOLDS (no auto-swap) and simply resolves active
+        // = work(0) with viable last-known readings — the realistic pre-swap state.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "warm-up resolved active = work"
+        );
+
+        let (ack, event) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "spare".to_owned(),
+                force: false,
+            })
+            .await;
+
+        // The ack names the two non-secret labels…
+        assert_eq!(
+            ack,
+            SwapAck::Accepted {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            }
+        );
+        // …and its SERIALIZED bytes leak neither the credential (named `*-token`) nor an email (#15).
+        let wire = serde_json::to_string(&ack).unwrap();
+        assert!(!wire.contains('@'), "the ack leaks no email: {wire}");
+        assert!(
+            !wire.to_lowercase().contains("token"),
+            "the ack leaks no credential: {wire}",
+        );
+        // The canonical now holds B's token and the display shows B — a REAL, complete write.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-B"));
+        // In-memory active advanced and the cooldown is armed, so the next auto-tick holds.
+        assert_eq!(daemon.state.active, Some(1));
+        assert!(
+            daemon.state.last_swap.is_some(),
+            "a completed swap arms the post-swap cooldown",
+        );
+        // The durable event is the MANUAL (operator-driven) swap, session_pct 0 (not session-driven).
+        assert_eq!(
+            event,
+            Some(Event::Swap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+                reason: SwapReason::Manual,
+                session_pct: 0,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_socket_swap_revalidates_a_weekly_exhausted_target_then_force_overrides_it() {
+        // AC (daemon's own re-validation + force is policy-only): the daemon computes weekly
+        // exhaustion from its OWN last-known reading (never a client hint). WITHOUT force the target
+        // is refused with ZERO writes; WITH force the SAME target swaps — the operator's explicit
+        // policy override, honored end to end (a REAL write lands, reason Forced).
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // spare's weekly (0.99) is at/above the 0.98 base (`tunables` WEEKLY_TRIGGER=98) → exhausted;
+        // work stays active and viable so warm-up holds.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.99);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+
+        // WITHOUT force: the daemon re-validates and refuses — ZERO writes, no event.
+        let (rejected, no_event) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "spare".to_owned(),
+                force: false,
+            })
+            .await;
+        assert_eq!(
+            rejected,
+            SwapAck::Rejected {
+                reason: SwapRejection::WeeklyExhausted,
+            }
+        );
+        assert!(no_event.is_none(), "a refused swap emits no event");
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "the refused swap wrote nothing",
+        );
+        assert_eq!(daemon.state.active, Some(0));
+
+        // WITH force: the SAME non-viable target now swaps (policy override).
+        let (accepted, event) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "spare".to_owned(),
+                force: true,
+            })
+            .await;
+        assert_eq!(
+            accepted,
+            SwapAck::Accepted {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            }
+        );
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(daemon.state.active, Some(1));
+        // A forced swap records the FORCED reason (distinct from Manual), still session_pct 0.
+        assert_eq!(
+            event,
+            Some(Event::Swap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+                reason: SwapReason::Forced,
+                session_pct: 0,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_socket_swap_force_cannot_bypass_a_locked_keychain() {
+        // AC (force cannot bypass the locked-keychain abort): `force` is POLICY-only. A forced swap
+        // onto a VIABLE target is still REFUSED when the keychain is locked (locked ≠ gone — retry
+        // when unlocked), with ZERO writes: canonical untouched, active unchanged, no event, no
+        // cooldown. The abort lives in the swap ENGINE (its read-everything-before-mutating step-1
+        // read), below the force-bypassable policy verdict, so no verdict can reach past it.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+
+        // Lock the keychain, THEN force-swap: the engine's step-1 read aborts before any mutation.
+        daemon.store.set_locked(true);
+        let (ack, event) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "spare".to_owned(),
+                force: true,
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            SwapAck::Rejected {
+                reason: SwapRejection::KeychainLocked,
+            }
+        );
+        assert!(event.is_none(), "a refused swap emits no event");
+        // ZERO writes: once unlocked the canonical still holds A's token, the display still shows A,
+        // in-memory active never advanced, and no cooldown was armed. `force` forged no torn write.
+        daemon.store.set_locked(false);
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-A"));
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(
+            daemon.state.last_swap.is_none(),
+            "a refused swap arms no cooldown",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_socket_swap_rejects_an_unknown_target_and_writes_nothing() {
+        // The daemon resolves the target against its OWN roster and NEVER guesses (#17): a handle
+        // matching no account is `UnknownTarget` with ZERO writes and no event — even under force
+        // (there is nothing to resolve, so resolution failure is not force-bypassable).
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+
+        let (ack, event) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "ghost".to_owned(),
+                force: true,
+            })
+            .await;
+        assert_eq!(
+            ack,
+            SwapAck::Rejected {
+                reason: SwapRejection::UnknownTarget,
+            }
+        );
+        assert!(event.is_none());
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "an unknown target wrote nothing",
+        );
+        assert_eq!(daemon.state.active, Some(0));
+    }
+
+    #[tokio::test]
+    async fn perform_socket_swap_reports_an_already_active_target_as_a_noop() {
+        // Non-force swap onto the ALREADY-active account: a no-op SUCCESS (nothing written), the
+        // `AlreadyActive` ack — the daemon-routed mirror of the standalone `use` no-op.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+
+        let (ack, event) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "work".to_owned(),
+                force: false,
+            })
+            .await;
+        assert_eq!(
+            ack,
+            SwapAck::AlreadyActive {
+                to: "work".to_owned(),
+            }
+        );
+        assert!(event.is_none());
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "an already-active no-op writes nothing",
+        );
+        assert!(daemon.state.last_swap.is_none(), "a no-op arms no cooldown");
     }
 
     // --- next_swap candidate (issue #88) + swap report ---------------------
@@ -8744,6 +9564,105 @@ mod tests {
 
         // The fake clock makes the cadence deterministic: exactly 3 ticks ran.
         assert_eq!(daemon.state.ticks, 3);
+    }
+
+    #[tokio::test]
+    async fn run_loop_performs_an_authenticated_swap_and_writes_a_redacted_ack() {
+        use tokio::io::AsyncReadExt;
+        // AC (unify `use` + redacted ack), END-TO-END through the run loop — the wiring the pieces
+        // can't prove alone: an authenticated `swap` handed back by `Control::serve` (as
+        // `ControlYield::Swap`) drives the post-idle glue — `perform_socket_swap` (the daemon's OWN
+        // single-writer swap) + the durable `Event::Swap` + `write_swap_ack` back to the client. The
+        // loop reroutes the canonical (no torn write) AND the client reads a redacted `accepted` ack
+        // (no token / email).
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // both viable + under trigger → the swap is accepted, no revert
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json.clone(),
+            &tun,
+        );
+
+        // A real socket pair: the loop writes the ack to the SERVER end (handed back by the fake
+        // control); the test reads it from the CLIENT end after the loop closes the server end.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let control = OnceSwap {
+            command: SwapCommand {
+                target: "spare".to_owned(),
+                force: false,
+            },
+            stream: RefCell::new(Some(server)),
+            fired: Cell::new(false),
+        };
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let mut shutdown = FakeShutdown::after(4);
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        // The loop performed the swap through the daemon's own writer: the canonical now holds B, the
+        // display shows B, and in-memory active advanced — a complete, un-torn write.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-B"));
+        assert_eq!(daemon.state.active, Some(1));
+
+        // The client reads the redacted ack the loop wrote back (server end closed → EOF after it).
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        let ack: SwapAck = serde_json::from_str(reply.trim_end()).expect("a one-line ack");
+        assert_eq!(
+            ack,
+            SwapAck::Accepted {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            }
+        );
+        // #15: the wire ack leaks neither the credential (named `*-token`) nor an email.
+        assert!(
+            !reply.contains('@'),
+            "the ack wire leaks no email: {reply:?}"
+        );
+        assert!(
+            !reply.to_lowercase().contains("token"),
+            "the ack wire leaks no credential: {reply:?}",
+        );
+        // The durable manual-swap event landed in the log (the best-effort emit before the ack).
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            logged.contains("event=swap from=work to=spare reason=manual"),
+            "the swap event is logged: {logged}",
+        );
     }
 
     #[tokio::test]
@@ -12679,6 +13598,26 @@ mod tests {
             .push_str(&control_reply(r#"{"cmd":"restored"}"#, &StatusSnapshot::default(), true).0);
         corpus.push('\n');
 
+        // Channel — the `swap` control ack (issue #167): both wire shapes — a completed swap's two
+        // labels, and a redacted rejection reason — carry NO secret (only a machine `result` tag and
+        // non-secret roster labels, #15). The labels are the fixture labels already in the corpus, so
+        // this stays non-vacuous while proving the new channel leaks nothing in either shape.
+        corpus.push_str(
+            &serde_json::to_string(&SwapAck::Accepted {
+                from: A.1.to_owned(),
+                to: B.1.to_owned(),
+            })
+            .unwrap(),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &serde_json::to_string(&SwapAck::Rejected {
+                reason: SwapRejection::KeychainLocked,
+            })
+            .unwrap(),
+        );
+        corpus.push('\n');
+
         // Channel — every error message Display.
         for err in every_error_variant() {
             corpus.push_str(&err.to_string());
@@ -12798,6 +13737,12 @@ mod tests {
         assert!(
             corpus.contains(r#"{"cmd":"restored","uuid":"#),
             "control channel: restored request missing"
+        );
+        // The `swap` ack channel (#167): the `accepted` result tag is unique to this channel, so it
+        // keeps the clean verdict below non-vacuous for the new channel.
+        assert!(
+            corpus.contains(r#""result":"accepted""#),
+            "control channel: swap ack missing"
         );
         assert!(
             corpus.len() > 800,

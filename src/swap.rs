@@ -1230,6 +1230,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_fallback_adopt_fails_closed_while_a_daemon_write_holds_the_lock() {
+        // Issue #167 / #212 fallback safety: when the daemon is UP, `use <spare> --force` adopt-
+        // recovery falls back to the STANDALONE adopt (`adopt_target_locked`), which takes the SAME
+        // cross-process swap lock (`paths::swap_lock`) that EVERY daemon canonical write holds — the
+        // auto / emergency / socket swaps via `swap_locked`, and the #282 `promote_canonical`. So
+        // while a daemon canonical write is IN FLIGHT (lock held), the fallback adopt CANNOT also
+        // write: a bounded acquire fails CLOSED (`SwapLockBusy`) with ZERO writes — exactly one
+        // writer ever touches the canonical, never a double / torn write. Once the daemon releases,
+        // the fallback acquires and installs the target in one clean write. (The daemon holds the
+        // full `SWAP_LOCK_MAX_WAIT`; the fallback is given a short bounded wait so the contention
+        // resolves fast — the same technique the sibling fail-closed test uses.)
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+        let (_jdir, json) = claude_json("u-O", 0o600);
+        let store = store_holding(b"O-token").await;
+        let stash = stash_with(stashed(b"O-token", "u-O"), stashed(b"R-token", "u-R")).await;
+
+        // A daemon canonical write is in flight: it holds the single-writer swap lock.
+        let held = SwapLock::acquire(&lock, SWAP_LOCK_MAX_WAIT).await.unwrap();
+
+        // The fallback adopt, given a bounded wait, fails CLOSED — no second writer, ZERO writes.
+        let busy = adopt_target_locked(
+            Some((lock.as_path(), Duration::from_millis(120))),
+            &store,
+            &stash,
+            ACCT_B,
+            &json,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(busy, Error::SwapLockBusy),
+            "the fallback adopt must fail closed while the daemon holds the lock, got {busy:?}",
+        );
+        // ZERO writes: the canonical still holds O and the display still shows O — no double write.
+        assert!(store.read().await.unwrap().matches(&cred(b"O-token")));
+        assert_eq!(displayed_uuid(&json), "u-O");
+
+        // Once the daemon releases, the fallback adopt acquires and installs R — one clean write.
+        drop(held);
+        adopt_target_locked(
+            Some((lock.as_path(), Duration::from_millis(500))),
+            &store,
+            &stash,
+            ACCT_B,
+            &json,
+        )
+        .await
+        .expect("the fallback adopt acquires once the daemon releases the lock");
+        assert!(store.read().await.unwrap().matches(&cred(b"R-token")));
+        assert_eq!(displayed_uuid(&json), "u-R");
+    }
+
     /// The mid-turn swap-correctness oracle (issue #12), driven end-to-end against
     /// the real `/usr/bin/security` CLI on a throwaway keychain — never the login
     /// keychain. macOS-only: the property rests on `security -U`'s atomic in-place
