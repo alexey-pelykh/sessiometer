@@ -146,10 +146,16 @@ pub(crate) use socket::{
     notify_restored, notify_roster_reload, Control, ControlSignal, UnixControl,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
-// in-module socket tests (production reaches them through `UnixControl::serve`); re-export
-// test-scoped so `use super::*` resolves them while a non-test build sees no unused re-export.
+// in-module socket tests (production reaches them through `UnixControl::serve`); `serve_watch` /
+// `parse_watch_frame` / `WatchFrame` / `ServeOutcome` are the issue-#165 watch surface the same
+// tests drive (`serve_watch` is reached in production through `UnixControl::serve`, but
+// `parse_watch_frame` / `WatchFrame` have no in-tree client yet). Re-export test-scoped so
+// `use super::*` resolves them while a non-test build sees no unused re-export.
 #[cfg(test)]
-pub(crate) use socket::{control_reply, serve_control, MAX_CONTROL_LINE_BYTES};
+pub(crate) use socket::{
+    control_reply, encode_heartbeat_frame, encode_snapshot_frame, parse_watch_frame, serve_control,
+    serve_watch, ServeOutcome, WatchFrame, MAX_CONTROL_LINE_BYTES,
+};
 
 mod run_loop;
 
@@ -3750,6 +3756,24 @@ mod tests {
     impl Control for NoControl {
         async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
             std::future::pending().await
+        }
+    }
+
+    /// A control seam that records how many snapshots the run loop PUBLISHED to `watch`
+    /// subscribers (issue #165), so a test can assert the loop feeds the channel once per tick.
+    /// Its `serve` never resolves (like [`NoControl`]), so it never wins the idle select — only the
+    /// default-overriding `publish` is exercised. Single-thread interior mutability (`Rc<Cell>`),
+    /// matching the other hermetic run-loop fakes (ADR-0001, `!Send`).
+    struct RecordingControl {
+        published: Rc<Cell<usize>>,
+    }
+
+    impl Control for RecordingControl {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+            std::future::pending().await
+        }
+        fn publish(&self, _snapshot: &StatusSnapshot) {
+            self.published.set(self.published.get() + 1);
         }
     }
 
@@ -7712,7 +7736,10 @@ mod tests {
         client.write_all(b"{\"cmd\":\"status\"}\n").await.unwrap();
         // `status` is a non-secret read — answered for any peer, and producing no
         // control signal (it never mutates daemon state).
-        let signal = serve_control(server, &snapshot, false).await.unwrap();
+        let signal = serve_control(server, &snapshot, false)
+            .await
+            .unwrap()
+            .one_shot();
         assert!(signal.is_none(), "status must not produce a control signal");
 
         let mut reply = String::new();
@@ -7735,7 +7762,8 @@ mod tests {
         client.write_all(b"{\"cmd\":\"nope\"}\n").await.unwrap();
         let signal = serve_control(server, &StatusSnapshot::default(), true)
             .await
-            .unwrap();
+            .unwrap()
+            .one_shot();
         assert!(signal.is_none(), "an unknown command produces no signal");
 
         let mut reply = String::new();
@@ -7757,7 +7785,8 @@ mod tests {
         client.write_all(&oversized).await.unwrap();
         let signal = serve_control(server, &StatusSnapshot::default(), true)
             .await
-            .unwrap();
+            .unwrap()
+            .one_shot();
         assert!(signal.is_none(), "an oversized request produces no signal");
 
         let mut reply = String::new();
@@ -7766,6 +7795,274 @@ mod tests {
             reply.contains("malformed"),
             "an over-long request is bounded and rejected: {reply:?}"
         );
+    }
+
+    // ---- `watch` subscription (issue #165) ------------------------------------------------
+
+    /// A one-account status snapshot for the `watch` tests, stamped with a chosen `generated_at`
+    /// and session fraction so a test can tell one pushed snapshot from the next.
+    fn watch_snapshot(label: &str, generated_at: i64, session: f64) -> StatusSnapshot {
+        StatusSnapshot {
+            generated_at,
+            refresh_enabled: false,
+            next_swap: None,
+            accounts: vec![AccountReading {
+                label: label.to_owned(),
+                active: true,
+                enabled: true,
+                usage: Some(Usage {
+                    session,
+                    weekly: 0.10,
+                    weekly_resets_at: None,
+                    session_resets_at: None,
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Read exactly one newline-delimited frame line from a `watch` stream, asserting the framing.
+    async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> String {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("read a frame line");
+        assert!(
+            line.ends_with('\n'),
+            "watch frames are newline-delimited: {line:?}"
+        );
+        line.trim_end().to_owned()
+    }
+
+    #[tokio::test]
+    async fn serve_watch_streams_the_initial_snapshot_then_one_per_update() {
+        // The daemon side of the latest-snapshot channel, seeded with the first snapshot.
+        let (tx, rx) = tokio::sync::watch::channel(versioned_status_response(&watch_snapshot(
+            "work", 100, 0.20,
+        )));
+        let (client, server) = tokio::io::duplex(4096);
+        // A far-off heartbeat keeps liveness beats out of this update-focused test.
+        let watcher = tokio::spawn(serve_watch(server, rx, Duration::from_secs(3600)));
+
+        let mut reader = tokio::io::BufReader::new(client);
+        // 1) The initial full snapshot arrives immediately on connect.
+        let initial = read_frame(&mut reader).await;
+        match parse_watch_frame(&initial).unwrap() {
+            WatchFrame::Snapshot(v) => {
+                assert_eq!(v.generated_at, 100);
+                assert_eq!(v.status.accounts[0].label, "work");
+                assert_eq!(v.status.accounts[0].session_pct, Some(20));
+                assert!(!initial.contains('@'), "no email can travel (issue #15)");
+            }
+            other => panic!("expected an initial snapshot, got {other:?}"),
+        }
+        // 2) A published state change streams the WHOLE new snapshot (never a delta).
+        tx.send_replace(versioned_status_response(&watch_snapshot(
+            "work", 200, 0.55,
+        )));
+        let update = read_frame(&mut reader).await;
+        match parse_watch_frame(&update).unwrap() {
+            WatchFrame::Snapshot(v) => {
+                assert_eq!(v.generated_at, 200);
+                assert_eq!(v.status.accounts[0].session_pct, Some(55));
+            }
+            other => panic!("expected an update snapshot, got {other:?}"),
+        }
+        drop(reader); // the client goes away → the stream ends cleanly
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_watch_beats_during_silence() {
+        // No state change ever occurs, so the ONLY frames after the initial snapshot are beats.
+        let (_tx, rx) = tokio::sync::watch::channel(versioned_status_response(&watch_snapshot(
+            "work", 500, 0.10,
+        )));
+        let (client, server) = tokio::io::duplex(4096);
+        let heartbeat = Duration::from_secs(15);
+        let watcher = tokio::spawn(serve_watch(server, rx, heartbeat));
+
+        let mut reader = tokio::io::BufReader::new(client);
+        let initial = read_frame(&mut reader).await;
+        assert!(matches!(
+            parse_watch_frame(&initial).unwrap(),
+            WatchFrame::Snapshot(_)
+        ));
+        // After one interval of SILENCE, a heartbeat fires (bounding a client's stale detection).
+        tokio::time::advance(heartbeat + Duration::from_millis(1)).await;
+        let beat = read_frame(&mut reader).await;
+        match parse_watch_frame(&beat).unwrap() {
+            WatchFrame::Heartbeat {
+                generated_at,
+                schema_version,
+            } => {
+                assert_eq!(
+                    generated_at, 500,
+                    "the beat carries the last-known freshness"
+                );
+                assert_eq!(schema_version, STATUS_SCHEMA_VERSION);
+            }
+            other => panic!("expected a heartbeat during silence, got {other:?}"),
+        }
+        drop(reader);
+        watcher.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_watch_ends_when_the_client_disconnects() {
+        // Issue #165 AC-2 (server side): a dropped subscriber must not leak the streaming task.
+        let (_tx, rx) =
+            tokio::sync::watch::channel(versioned_status_response(&watch_snapshot("work", 1, 0.0)));
+        let (client, server) = tokio::io::duplex(4096);
+        let watcher = tokio::spawn(serve_watch(server, rx, Duration::from_secs(3600)));
+
+        let mut reader = tokio::io::BufReader::new(client);
+        // The stream is live: the initial snapshot arrived.
+        let initial = read_frame(&mut reader).await;
+        assert!(matches!(
+            parse_watch_frame(&initial).unwrap(),
+            WatchFrame::Snapshot(_)
+        ));
+        // The subscriber goes away → the daemon detects it (read EOF) and ends the stream. Ending
+        // via EOF returns `Ok`; a race that ends via a broken write returns `Err` — both are a
+        // clean end (the property under test), never a hang, so the timeout is the real assertion.
+        drop(reader);
+        let ended = tokio::time::timeout(Duration::from_secs(5), watcher).await;
+        let joined = ended.expect("serve_watch must end promptly when the client disconnects");
+        joined.expect("the watch task must not panic").ok();
+    }
+
+    #[tokio::test]
+    async fn a_watch_client_detects_a_dropped_daemon_via_socket_close() {
+        use tokio::io::AsyncReadExt;
+        // Issue #165 AC-2 (client side): a client can tell "disconnected" from a frozen view.
+        let (tx, rx) = tokio::sync::watch::channel(versioned_status_response(&watch_snapshot(
+            "work", 7, 0.30,
+        )));
+        let (client, server) = tokio::io::duplex(4096);
+        let watcher = tokio::spawn(serve_watch(server, rx, Duration::from_secs(3600)));
+
+        let mut reader = tokio::io::BufReader::new(client);
+        // The client reads its initial snapshot — the stream is live.
+        let initial = read_frame(&mut reader).await;
+        assert!(matches!(
+            parse_watch_frame(&initial).unwrap(),
+            WatchFrame::Snapshot(_)
+        ));
+        // The daemon goes away: dropping the publisher ends `serve_watch`, which closes its end of
+        // the socket when the task finishes.
+        drop(tx);
+        let _ = watcher.await.unwrap();
+        // Client-side: the next read returns EOF (0 bytes) — a detectable "disconnected / stale"
+        // signal rather than a frozen view.
+        let mut rest = Vec::new();
+        let n = reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "a dropped daemon is detectable client-side as socket EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_a_watch_command_to_a_stream() {
+        use tokio::io::AsyncWriteExt;
+        // A `watch` command is NOT answered with a one-shot reply — it hands the connection back
+        // for the caller to stream on, keeping the long-lived stream off the idle select.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"watch\"}\n").await.unwrap();
+        match serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap()
+        {
+            ServeOutcome::Watch(_stream) => {}
+            ServeOutcome::OneShot(_) => {
+                panic!("a watch command must route to a stream, not a one-shot reply")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_control_streams_a_watch_subscription_over_a_real_socket() {
+        use tokio::io::AsyncWriteExt;
+        // The production path end-to-end: a real `0600` socket, `UnixControl::serve` accepting a
+        // `watch` request and SPAWNING the streaming task, and `publish` fanning a state change to
+        // it — the wiring the duplex-level `serve_watch` tests above cannot reach.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
+        let control = UnixControl::new(listener);
+
+        // A client opens the dedicated read-only connection and subscribes.
+        let mut client = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect");
+        client.write_all(b"{\"cmd\":\"watch\"}\n").await.unwrap();
+        client.flush().await.unwrap();
+
+        // Publish the current snapshot, THEN accept: the spawned task subscribes at this value and
+        // sends it as the initial frame — the same publish-then-serve order the run loop uses.
+        control.publish(&watch_snapshot("work", 100, 0.20));
+        let signal = control.serve(&watch_snapshot("work", 100, 0.20)).await;
+        assert!(
+            signal.is_none(),
+            "a watch subscription produces no control signal"
+        );
+
+        let mut reader = tokio::io::BufReader::new(client);
+        let initial = read_frame(&mut reader).await;
+        match parse_watch_frame(&initial).unwrap() {
+            WatchFrame::Snapshot(v) => assert_eq!(v.generated_at, 100),
+            other => panic!("expected an initial snapshot, got {other:?}"),
+        }
+        // A subsequent state change is pushed to the live subscription.
+        control.publish(&watch_snapshot("work", 200, 0.55));
+        let update = read_frame(&mut reader).await;
+        match parse_watch_frame(&update).unwrap() {
+            WatchFrame::Snapshot(v) => assert_eq!(v.generated_at, 200),
+            other => panic!("expected an update snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_watch_frame_classifies_each_frame_kind() {
+        // A snapshot line round-trips to the frozen #164 envelope (the `type` tag is ignored by the
+        // payload decode, so a snapshot frame carries the full contract a client already knows).
+        let snap = encode_snapshot_frame(&versioned_status_response(&watch_snapshot(
+            "work", 42, 0.60,
+        )));
+        match parse_watch_frame(&snap).unwrap() {
+            WatchFrame::Snapshot(v) => {
+                assert_eq!(v.generated_at, 42);
+                assert_eq!(v.schema_version, STATUS_SCHEMA_VERSION);
+                assert_eq!(v.status.accounts[0].session_pct, Some(60));
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        // A heartbeat line round-trips to its freshness envelope.
+        match parse_watch_frame(&encode_heartbeat_frame(42)).unwrap() {
+            WatchFrame::Heartbeat {
+                generated_at,
+                schema_version,
+            } => {
+                assert_eq!(generated_at, 42);
+                assert_eq!(schema_version, STATUS_SCHEMA_VERSION);
+            }
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+        // An unknown (future) frame kind — or a line with no `type` tag — is IGNORED, not an error:
+        // a forward-compatible client skips what it does not understand (the #164 additive ethos).
+        assert!(matches!(
+            parse_watch_frame(r#"{"type":"future","x":1}"#).unwrap(),
+            WatchFrame::Unknown
+        ));
+        assert!(matches!(
+            parse_watch_frame(r#"{"nope":1}"#).unwrap(),
+            WatchFrame::Unknown
+        ));
+        // A malformed line is a hard error.
+        assert!(parse_watch_frame("not json").is_err());
     }
 
     #[test]
@@ -7881,7 +8178,8 @@ mod tests {
             .expect("write request");
         let signal = serve_control(server, &StatusSnapshot::default(), authenticated)
             .await
-            .expect("serve");
+            .expect("serve")
+            .one_shot();
         assert!(
             signal.is_none(),
             "a foreign-uid peer must NOT arm the daemon (no control signal)"
@@ -8446,6 +8744,65 @@ mod tests {
 
         // The fake clock makes the cadence deterministic: exactly 3 ticks ran.
         assert_eq!(daemon.state.ticks, 3);
+    }
+
+    #[tokio::test]
+    async fn run_loop_publishes_a_snapshot_to_watchers_every_tick() {
+        // Issue #165: the run loop must feed the `watch` channel each cycle, so a subscriber gets a
+        // whole snapshot on every state change. Every `NoControl`-based run-loop test leaves
+        // `publish` undriven; this recording seam counts the calls. Same deterministic harness as
+        // `run_loop_ticks_deterministically_and_stops_on_shutdown` — `after(4)` runs exactly 3
+        // ticks — so the loop must have published 3 times; a regression that dropped the per-tick
+        // `publish` (or gated it behind a subscriber count) would record 0.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10); // all Hold
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        let mut shutdown = FakeShutdown::after(4);
+        let published = Rc::new(Cell::new(0usize));
+        let control = RecordingControl {
+            published: Rc::clone(&published),
+        };
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(daemon.state.ticks, 3);
+        assert_eq!(
+            published.get(),
+            3,
+            "the run loop publishes a snapshot to watchers once per tick"
+        );
     }
 
     #[tokio::test]

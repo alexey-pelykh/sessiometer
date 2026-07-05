@@ -498,6 +498,13 @@ where
         let next_wait = outcome.next_wait;
         let snapshot = outcome.snapshot;
 
+        // Push this cycle's snapshot to any live `watch` subscribers (issue #165), off the
+        // one-shot `status` path — a no-op for a control seam without a subscriber channel (every
+        // hermetic test seam). Whole snapshots, so a subscriber that missed an intermediate value
+        // still converges on the latest. Every state-changing idle exit re-ticks, so publishing
+        // once per tick here catches manual swaps / roster reloads / restores / external logins too.
+        seams.control.publish(&snapshot);
+
         // Idle until the next tick, collecting the sweep's deferred restores + observations to
         // apply once the idle's `&mut daemon` borrow has dropped.
         let (idle, refresh_restored, refresh_observations) =
