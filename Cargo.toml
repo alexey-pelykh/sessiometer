@@ -26,7 +26,11 @@ libc = "0.2.186"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt", "macros", "time", "process", "io-util", "net", "signal"] }
+# `sync` (issue #165) is enabled only for `tokio::sync::watch` — the latest-snapshot
+# channel that fans a full status snapshot out to each `watch` subscriber. It is an
+# in-tree tokio feature (no new crate enters the graph), so the minimal-dependency line
+# is preserved; the rest are the async primitives the daemon has always needed.
+tokio = { version = "1.52.3", features = ["rt", "macros", "time", "process", "io-util", "net", "signal", "sync"] }
 toml = "1.1.2"
 # The canonical UAX #11 display-width table (issue #176), replacing a hand-rolled
 # wcwidth approximation that guessed the whole emoji block as uniformly width-2 and

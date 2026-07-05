@@ -14,8 +14,9 @@
 //! `crate::daemon::*`, so relocating them is source-compatible for cli / capture and the
 //! in-module test suite (`mod tests`' `use super::*`).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
+use tokio::sync::watch;
 
 use super::*;
 
@@ -70,17 +71,39 @@ pub(crate) trait Control {
     /// Serve at most one control connection from `snapshot`, then resolve to any
     /// [`ControlSignal`] the exchange produced (`None` if none).
     async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal>;
+
+    /// Publish `snapshot` to any live `watch` subscribers (issue #165). The run loop calls this
+    /// once per tick, so a subscriber gets a fresh WHOLE snapshot on every state change. Default:
+    /// a no-op — a control seam without a subscriber channel (every hermetic test seam) simply
+    /// drops it, so publishing stays invisible to the existing run-loop tests. Only [`UnixControl`]
+    /// overrides it, feeding its latest-snapshot channel.
+    fn publish(&self, _snapshot: &StatusSnapshot) {}
 }
 
 /// Production control: accept one client at a time on the bound socket and answer
 /// from the latest snapshot.
 pub(crate) struct UnixControl {
     listener: UnixListener,
+    /// The latest-snapshot channel (issue #165): the run loop feeds it each cycle through
+    /// [`publish`](UnixControl::publish), and every `watch` subscription
+    /// ([`serve`](UnixControl::serve)) streams from a [`subscribe`](watch::Sender::subscribe)d
+    /// receiver. A `watch` channel (not `broadcast`) precisely because whole snapshots are
+    /// idempotent: a subscriber only ever needs the LATEST, so coalescing an intermediate value a
+    /// slow client missed is correct, not lossy — the issue's "whole snapshots, not deltas" rule.
+    snapshots: watch::Sender<VersionedStatus>,
 }
 
 impl UnixControl {
     pub(crate) fn new(listener: UnixListener) -> Self {
-        Self { listener }
+        // Seed the channel with an all-defaults snapshot so a subscriber that connects before the
+        // first tick still gets a well-formed frame (empty accounts, `generated_at: 0`) it reads
+        // as "starting / stale" rather than nothing; the first tick's `publish` replaces it.
+        let (snapshots, _rx) =
+            watch::channel(versioned_status_response(&StatusSnapshot::default()));
+        Self {
+            listener,
+            snapshots,
+        }
     }
 }
 
@@ -98,12 +121,39 @@ impl Control for UnixControl {
                 let peer_authenticated = peer_is_same_user(&stream);
                 // Best-effort: a malformed or disconnected client must never crash
                 // the daemon — drop the exchange (the reply carries nothing secret).
-                serve_control(stream, snapshot, peer_authenticated)
-                    .await
-                    .unwrap_or(None)
+                match serve_control(stream, snapshot, peer_authenticated).await {
+                    // A one-shot command — hand its signal (if any) to the run loop.
+                    Ok(ServeOutcome::OneShot(signal)) => signal,
+                    // A `watch` subscription (issue #165): hand the connection to a SPAWNED
+                    // streaming task so the run loop's idle select is never held for the
+                    // subscription's lifetime — an inline stream would stall every tick on the
+                    // single-thread runtime (ADR-0001). The task owns only `Send` data (the
+                    // stream + a `watch::Receiver` + a timer), never the `!Send` daemon seams, so
+                    // `tokio::spawn` is `Send`-clean; it runs cooperatively on the one thread. A
+                    // `watch` never mutates daemon state, so it produces no signal.
+                    Ok(ServeOutcome::Watch(stream)) => {
+                        let receiver = self.snapshots.subscribe();
+                        tokio::spawn(async move {
+                            // Best-effort: a disconnected subscriber or any I/O error just ends the
+                            // stream (the frames carry nothing secret) — never affects the daemon.
+                            let _ = serve_watch(stream, receiver, WATCH_HEARTBEAT).await;
+                        });
+                        None
+                    }
+                    Err(_) => None,
+                }
             }
             Err(_) => None,
         }
+    }
+
+    fn publish(&self, snapshot: &StatusSnapshot) {
+        // Store the freshest snapshot and wake every subscriber. `send_replace` is infallible (no
+        // error with zero subscribers) and always updates the stored value, so a subscriber that
+        // connects later still borrows current state as its initial frame. Cheap: one non-secret
+        // projection (issue #15) plus a wake.
+        self.snapshots
+            .send_replace(versioned_status_response(snapshot));
     }
 }
 
@@ -203,18 +253,35 @@ pub(crate) const MAX_CONTROL_LINE_BYTES: u64 = 8 * 1024;
 /// poll tick, so this is the tighter, dedicated time bound (issue #64).
 const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Serve one control exchange: read one newline-delimited JSON request and write
-/// one newline-delimited JSON reply, returning any [`ControlSignal`] the request
-/// produced. Generic over the stream so it is testable over an in-memory duplex
-/// without binding a real socket; `peer_authenticated` is the caller's
-/// peer-credential verdict (issue #64), gating the state-affecting commands. The
-/// receive path is BOUNDED in space (the read is capped at [`MAX_CONTROL_LINE_BYTES`])
-/// and in time (the exchange is wrapped in [`CONTROL_EXCHANGE_TIMEOUT`]).
+/// What serving one control connection produced (issue #165). Every command except `watch` is a
+/// single request→reply [`OneShot`](ServeOutcome::OneShot) exchange carrying an optional
+/// [`ControlSignal`] for the run loop; a `watch` subscription instead hands the still-open
+/// connection back as [`Watch`](ServeOutcome::Watch) for the caller to stream on — kept OFF the
+/// one-shot reply path so the long-lived stream is never served inline in the run loop's idle
+/// select (an inline stream would stall every tick on the single-thread runtime, ADR-0001).
+pub(crate) enum ServeOutcome<RW> {
+    /// A one-shot command was answered with a single reply line; the optional signal is the
+    /// run-loop mutation it asks for (`None` for a pure `status` read or a rejected command).
+    OneShot(Option<ControlSignal>),
+    /// A `watch` subscription was requested; the connection is handed back for the caller to
+    /// stream snapshots + heartbeats on (production spawns [`serve_watch`]).
+    Watch(RW),
+}
+
+/// Serve one control exchange: read one newline-delimited JSON request and either write one
+/// newline-delimited JSON reply (returning any [`ControlSignal`] the request produced) or, for a
+/// `watch` subscription (issue #165), hand the connection back for the caller to stream on.
+/// Generic over the stream so it is testable over an in-memory duplex without binding a real
+/// socket; `peer_authenticated` is the caller's peer-credential verdict (issue #64), gating the
+/// state-affecting commands. The receive path is BOUNDED in space (the read is capped at
+/// [`MAX_CONTROL_LINE_BYTES`]) and in time (the request read + one-shot reply is wrapped in
+/// [`CONTROL_EXCHANGE_TIMEOUT`]); the `watch` stream is unbounded by design and runs OUTSIDE that
+/// timeout, in the caller's spawned task.
 pub(crate) async fn serve_control<RW>(
     stream: RW,
     snapshot: &StatusSnapshot,
     peer_authenticated: bool,
-) -> Result<Option<ControlSignal>>
+) -> Result<ServeOutcome<RW>>
 where
     RW: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -230,18 +297,248 @@ where
             .take(MAX_CONTROL_LINE_BYTES)
             .read_line(&mut line)
             .await?;
-        let (reply, signal) = control_reply(line.trim_end(), snapshot, peer_authenticated);
+        let trimmed = line.trim_end();
+        // A `watch` subscription (issue #165) hands the connection off to the streaming path
+        // rather than writing a one-shot reply: the caller spawns `serve_watch` on it. Parsed with
+        // the same `ControlRequest` shape as every other command; `into_inner` drops the (empty — a
+        // watch client sends only this one line) read buffer to yield a bare stream to stream on.
+        if matches!(
+            serde_json::from_str::<ControlRequest>(trimmed),
+            Ok(request) if request.cmd == "watch"
+        ) {
+            return Ok(ServeOutcome::Watch(buffered.into_inner()));
+        }
+        let (reply, signal) = control_reply(trimmed, snapshot, peer_authenticated);
         buffered.write_all(reply.as_bytes()).await?;
         buffered.write_all(b"\n").await?;
         buffered.flush().await?;
-        Ok::<_, Error>(signal)
+        Ok::<_, Error>(ServeOutcome::OneShot(signal))
     };
     // A peer that stalls mid-line must not hold the exchange open: time-box it and
     // drop on elapse. The reply carries nothing secret, so a dropped exchange is
     // harmless — the caller maps both a timeout and an error to "no signal".
     match tokio::time::timeout(CONTROL_EXCHANGE_TIMEOUT, exchange).await {
         Ok(result) => result,
-        Err(_elapsed) => Ok(None),
+        Err(_elapsed) => Ok(ServeOutcome::OneShot(None)),
+    }
+}
+
+/// Test helper: the one-shot signal, panicking on a `watch` outcome — for the one-shot command
+/// tests, which never expect a subscription.
+#[cfg(test)]
+impl<RW> ServeOutcome<RW> {
+    pub(crate) fn one_shot(self) -> Option<ControlSignal> {
+        match self {
+            ServeOutcome::OneShot(signal) => signal,
+            ServeOutcome::Watch(_) => {
+                panic!("expected a one-shot reply, got a watch subscription")
+            }
+        }
+    }
+}
+
+/// How often a `watch` subscription (issue #165) emits a heartbeat frame during SILENCE — a
+/// liveness beat so a client can tell a live-but-idle daemon (state simply unchanged) from a
+/// dropped connection, and show "disconnected / stale" rather than a frozen view. The timer is
+/// reset on every snapshot, so a beat fires only after this long with NO state change; on a local
+/// Unix socket a dropped peer also delivers EOF/EPIPE promptly, so this bounds detection of the
+/// rarer silently-wedged-daemon case. Low-frequency by intent — a monitoring cadence, not a data
+/// stream.
+const WATCH_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Stream one `watch` subscription (issue #165) until the client disconnects: an initial full
+/// snapshot on connect, then a full snapshot on every state change, plus a low-frequency heartbeat
+/// ([`WATCH_HEARTBEAT`]) during silence. WHOLE snapshots, never deltas — a client that misses an
+/// intermediate value still converges on the latest (a missed delta would silently desync it).
+/// Newline-delimited JSON, the same framing `serve_control` speaks; each line is a `type`-tagged
+/// frame ([`encode_snapshot_frame`] / [`encode_heartbeat_frame`]). Generic over the stream so it is
+/// testable over an in-memory duplex, exactly like `serve_control`.
+///
+/// Ends (returning `Ok`) when the client goes away — detected by the read half hitting EOF (the
+/// read-only client closed its end) or by a write failing (broken pipe) — or when the daemon drops
+/// the publisher on shutdown (which errors `changed()`). Best-effort: any I/O error just ends the
+/// stream; a dropped subscriber never affects the daemon.
+pub(crate) async fn serve_watch<RW>(
+    stream: RW,
+    mut snapshots: watch::Receiver<VersionedStatus>,
+    heartbeat: Duration,
+) -> Result<()>
+where
+    RW: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    // Split the connection so the read half (EOF detection) and the write half (pushes) can be
+    // driven in one `select!` without aliasing a single `&mut`.
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+    // The initial full snapshot, immediately on connect. `borrow_and_update` marks the current
+    // value seen, so the first `changed()` below waits for the NEXT state change rather than
+    // re-firing on the value just sent.
+    let initial = encode_snapshot_frame(&snapshots.borrow_and_update());
+    write_line(&mut write_half, &initial).await?;
+
+    // The heartbeat fires only after `heartbeat` of SILENCE: it is reset on every snapshot, so a
+    // steadily-updating daemon sends few (or no) beats and an idle one sends one per interval.
+    // `Delay` (not the default `Burst`) so a slow task never catches up with a beat storm.
+    let mut beat = tokio::time::interval(heartbeat);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat.reset(); // first beat one interval from now, not immediately
+
+    // A tiny sink for the read side: a read-only `watch` client sends nothing, so this only ever
+    // observes EOF (`Ok(0)`); any stray bytes are ignored — the stream is push-only.
+    let mut discard = [0u8; 64];
+
+    loop {
+        tokio::select! {
+            biased;
+            // The client closed its end (EOF) or the read errored → the subscription is over.
+            read = read_half.read(&mut discard) => match read {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => {} // ignore any client input; `watch` is push-only
+            },
+            // A new snapshot was published → stream it, and reset the heartbeat (it fills silence
+            // only). A `changed()` error means the daemon dropped the publisher (shutdown) → end.
+            changed = snapshots.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let frame = encode_snapshot_frame(&snapshots.borrow_and_update());
+                write_line(&mut write_half, &frame).await?;
+                beat.reset();
+            },
+            // Silence for a full interval → a liveness beat carrying the last-known freshness.
+            _ = beat.tick() => {
+                let frame = encode_heartbeat_frame(snapshots.borrow().generated_at);
+                write_line(&mut write_half, &frame).await?;
+            },
+        }
+    }
+}
+
+/// Write one newline-delimited frame and flush it — the `watch` stream's counterpart of the
+/// one-shot reply write in `serve_control`. A write failure (broken pipe: the client went away)
+/// propagates so [`serve_watch`] ends the subscription.
+async fn write_line<W>(writer: &mut W, line: &str) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// The `type` tag on every `watch` stream frame (issue #165): a self-describing discriminator so a
+/// client routes each newline-delimited line without positional assumptions. Serialized snake_case
+/// (`"snapshot"` / `"heartbeat"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WatchFrameKind {
+    Snapshot,
+    Heartbeat,
+}
+
+/// A `watch` SNAPSHOT frame (issue #165): the `type` tag plus the FLATTENED frozen #164 envelope,
+/// so the wire line is `{"type":"snapshot","schema_version":…,"generated_at":…,"accounts":…,…}` —
+/// the exact `status` payload shape a client already knows, only prefixed with the tag. Borrows the
+/// envelope (`&VersionedStatus`) so encoding never clones the snapshot. Struct-level `flatten` with
+/// a sibling field is the same pattern [`VersionedStatus`] itself uses (its `status` payload), so
+/// both serialize and deserialize cleanly — unlike `flatten` inside a tagged enum.
+#[derive(Serialize)]
+struct SnapshotFrame<'a> {
+    #[serde(rename = "type")]
+    kind: WatchFrameKind,
+    #[serde(flatten)]
+    versioned: &'a VersionedStatus,
+}
+
+/// A `watch` HEARTBEAT frame (issue #165): the `type` tag plus the freshness envelope
+/// (`schema_version` + `generated_at`) and no payload — a self-describing liveness beat a client
+/// can version-gate exactly like a snapshot. `generated_at` carries the last-known snapshot instant
+/// (the daemon's #164 stamp), so even a beat conveys how fresh the daemon's data is.
+#[derive(Serialize, Deserialize)]
+struct HeartbeatFrame {
+    #[serde(rename = "type")]
+    kind: WatchFrameKind,
+    generated_at: i64,
+    #[serde(default)]
+    schema_version: SchemaVersion,
+}
+
+/// Encode a `watch` snapshot frame (issue #165) as one JSON line. Non-secret for the same reason
+/// `versioned_status_response` is — the frame adds only a `type` tag around the redacted #164
+/// envelope (issue #15). Serializing a finite struct cannot realistically fail; a defensive
+/// fallback keeps the stream total rather than dropping a subscriber on an impossible encode error.
+pub(crate) fn encode_snapshot_frame(versioned: &VersionedStatus) -> String {
+    serde_json::to_string(&SnapshotFrame {
+        kind: WatchFrameKind::Snapshot,
+        versioned,
+    })
+    .unwrap_or_else(|_| r#"{"type":"snapshot","error":"encode failed"}"#.to_owned())
+}
+
+/// Encode a `watch` heartbeat frame (issue #165) as one JSON line, stamping the current contract
+/// version ([`STATUS_SCHEMA_VERSION`]) and the last-known `generated_at`.
+pub(crate) fn encode_heartbeat_frame(generated_at: i64) -> String {
+    serde_json::to_string(&HeartbeatFrame {
+        kind: WatchFrameKind::Heartbeat,
+        generated_at,
+        schema_version: STATUS_SCHEMA_VERSION,
+    })
+    .unwrap_or_else(|_| r#"{"type":"heartbeat","error":"encode failed"}"#.to_owned())
+}
+
+/// A decoded `watch` stream frame (issue #165), the client-side counterpart of the daemon's
+/// encoders — the reference decoder a `watch` client (a future menubar, #168) reuses, and the typed
+/// surface the stream tests assert against. Test-scoped for now: the daemon PUSHES in production,
+/// but no in-tree client CONSUMES yet, so a non-test build would see it unused.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum WatchFrame {
+    /// A full status snapshot (the frozen #164 envelope).
+    Snapshot(VersionedStatus),
+    /// A liveness beat carrying the last-known freshness.
+    Heartbeat {
+        generated_at: i64,
+        schema_version: SchemaVersion,
+    },
+    /// A frame whose `type` this build does not understand (or a missing tag) — ignored by a
+    /// forward-compatible client (the additive-minor philosophy of the #164 contract), never a
+    /// hard error.
+    Unknown,
+}
+
+/// Classify + decode one `watch` stream line (issue #165). Probes the `type` tag FIRST — the same
+/// probe-then-decode shape the `status` client's #164 major gate uses — then decodes the matching
+/// frame. A malformed line is an error; an unknown or missing `type` decodes to
+/// [`WatchFrame::Unknown`] so a client skips a future frame kind rather than break.
+#[cfg(test)]
+pub(crate) fn parse_watch_frame(line: &str) -> Result<WatchFrame> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(rename = "type", default)]
+        kind: Option<String>,
+    }
+    let probe: Probe =
+        serde_json::from_str(line).map_err(|err| Error::Io(std::io::Error::other(err)))?;
+    match probe.kind.as_deref() {
+        // A snapshot line IS the #164 envelope with an extra `type` key serde ignores.
+        Some("snapshot") => {
+            let versioned: VersionedStatus =
+                serde_json::from_str(line).map_err(|err| Error::Io(std::io::Error::other(err)))?;
+            Ok(WatchFrame::Snapshot(versioned))
+        }
+        Some("heartbeat") => {
+            let frame: HeartbeatFrame =
+                serde_json::from_str(line).map_err(|err| Error::Io(std::io::Error::other(err)))?;
+            Ok(WatchFrame::Heartbeat {
+                generated_at: frame.generated_at,
+                schema_version: frame.schema_version,
+            })
+        }
+        _ => Ok(WatchFrame::Unknown),
     }
 }
 
