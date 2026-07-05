@@ -620,6 +620,38 @@ mode `0600`; with no `PATH` the artifact goes to standard output. Cross-machine
 credential portability on macOS is verified (build spike #145), so an exported artifact
 restores on another Mac.
 
+## Privacy: no telemetry
+
+`sessiometer` phones home for nothing. It sends **no** analytics, usage
+telemetry, crash reports, update pings, or beacons of any kind. The **only**
+outbound network request it makes is the read-only per-account usage poll the
+swap logic runs — `GET https://api.anthropic.com/api/oauth/usage`, under your own
+account's bearer token — so the daemon can tell when an account is near its quota
+and swap before exhaustion. Nothing else leaves the machine during normal
+operation (start, poll, swap, idle).
+
+This is an architectural guarantee, not just a policy:
+
+- **No HTTP or TLS client is linked.** `sessiometer` pulls in no `reqwest` /
+  `hyper` / `rustls` / `native-tls` (the
+  [transport rule](CONTRIBUTING.md#system-clis-not-client-crates-the-transport-rule));
+  the one usage `GET` rides the system `/usr/bin/curl` at an absolute path. With
+  no in-process HTTP/TLS stack and no raw TCP/UDP socket — the daemon's control
+  socket is a local Unix-domain socket that never leaves the machine — the process
+  has no way to open a second connection.
+- **A test enforces it.** The no-other-egress invariant is a capability guard in
+  the test suite ([`src/usage.rs`](src/usage.rs), run by `cargo test` in CI): it
+  fails the build if an HTTP/TLS/telemetry crate ever enters the dependency graph,
+  if a raw TCP/UDP socket appears, or if any network binary other than the
+  sanctioned usage-endpoint `curl` is referenced — so a future change cannot
+  silently open a telemetry channel.
+
+`sessiometer` also *drives* the official Claude Code CLI (`claude`) to refresh a
+parked account's token and to log in; that separate program makes its own network
+calls to Anthropic under your credential, exactly as it would if you ran it
+yourself. That is the official client's traffic, not `sessiometer` reporting on
+you.
+
 ## What it stores
 
 `sessiometer` takes custody of Claude Code credentials, so it is worth knowing
