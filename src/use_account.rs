@@ -830,13 +830,21 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
     // the lock, write-ordering, and redaction. `request_swap` carries only the target handle + the
     // POLICY force flag; the daemon re-validates the target's viability ITSELF and returns a
     // redacted ack. A reachable daemon's verdict is authoritative — `use` does NOT also write
-    // standalone (that is exactly the torn / double write the unification removes). Only when NO
-    // daemon is reachable (`Ok(None)`) does `use` fall through to the standalone write path below
-    // (the daemon-down fallback, which also owns the adopt-target #212 recovery decoupled from this
-    // channel). A reached-but-failed exchange (`Err`) is surfaced here, never retried standalone:
-    // the daemon may already have written, so a standalone retry could double-write.
-    if let Some(ack) = crate::daemon::request_swap(&control_socket, &query, force).await? {
-        return report_swap_ack(ack, &query);
+    // standalone (that is exactly the torn / double write the unification removes). A reached-but-
+    // failed exchange (`Err`) is surfaced here (the `?`), never retried standalone: the daemon may
+    // already have written, so a standalone retry could double-write.
+    match crate::daemon::request_swap(&control_socket, &query, force).await? {
+        // EXACTLY the daemon's `no active account` rejection falls THROUGH to the standalone adopt
+        // path below (issue #212 recovery) — see [`ack_falls_back_to_standalone`] for why this one
+        // ack is a guaranteed zero-write and why the fallback is lock-safe.
+        Some(ack) if ack_falls_back_to_standalone(&ack) => {}
+        // Every OTHER reachable-daemon ack is authoritative: a completed / already-active swap, or a
+        // policy/safety rejection (unknown / ambiguous / quarantined / weekly-exhausted / cooldown /
+        // keychain-locked / swap-lock-busy / failed) the daemon already resolved. Report it and do
+        // NOT also write standalone (that is the torn / double write the unification removes).
+        Some(ack) => return report_swap_ack(ack, &query),
+        // No daemon reachable (`Ok(None)`) — fall through to the standalone write path (daemon-down).
+        None => {}
     }
 
     let cache = ControlSocketCache {
@@ -865,12 +873,41 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
     .await
 }
 
+/// Whether a reachable daemon's `swap` ack should FALL THROUGH to the standalone write path
+/// (issue #167 / #212 recovery) rather than be reported as the final outcome. TRUE for EXACTLY one
+/// ack — the [`SwapRejection::NoActiveAccount`] rejection — and FALSE for every other ack (a
+/// completed / already-active swap, or ANY of the other six rejections). Pure, so the discriminator
+/// is unit-testable apart from the socket I/O and seam wiring.
+///
+/// Why ONLY this one: `NoActiveAccount` is a VERDICT-time reject — the daemon has no active account
+/// to swap away from (its canonical was scrubbed, e.g. a forced logout), so it rejects BEFORE the
+/// swap engine runs. It is therefore a GUARANTEED zero-write: the daemon performed nothing, so
+/// falling back to the standalone adopt-target recovery (#212) — the operator-directed
+/// adopt-a-named-spare path the daemon does not run over this channel — can never double-write.
+/// The fallback is safe against the daemon's own autonomous reconcile because the standalone adopt
+/// acquires the SAME cross-process swap lock (`paths::swap_lock`) that EVERY daemon canonical write
+/// holds (the auto / emergency / socket swaps via `swap_locked`, and the #282 `promote_canonical`):
+/// the two serialize, and a contended acquire fails closed ([`Error::SwapLockBusy`], zero writes) —
+/// never a torn or double write. A reached-but-FAILED exchange never reaches this predicate: it
+/// surfaced as `Err` from `request_swap` (propagated by `?` before the match), never a silent
+/// standalone retry — the daemon may already have written, so retrying could double-write.
+fn ack_falls_back_to_standalone(ack: &SwapAck) -> bool {
+    matches!(
+        ack,
+        SwapAck::Rejected {
+            reason: SwapRejection::NoActiveAccount,
+        }
+    )
+}
+
 /// Report the daemon's redacted `swap` ack (issue #167) to the operator: print the standard
 /// confirmation for a completed / already-active swap (the SAME lines the standalone path prints,
 /// from non-secret labels), or map a rejection to the typed [`Error`] whose `exit_code` the
 /// standalone path would have produced — so routing THROUGH the daemon leaves `use`'s stdout and
 /// exit codes unchanged. Pure but for the confirmation print, so the ack→outcome mapping is
-/// unit-testable.
+/// unit-testable. NOTE: the `NoActiveAccount` rejection never reaches here on the wired path — the
+/// caller ([`use_account`]) intercepts it via [`ack_falls_back_to_standalone`] and falls through to
+/// the standalone adopt recovery — but the arm is retained (and directly tested) for completeness.
 fn report_swap_ack(ack: SwapAck, query: &str) -> Result<()> {
     match ack {
         SwapAck::Accepted { from, to } => {
@@ -1944,6 +1981,57 @@ mod tests {
         // target in the surfaced message — non-secret operator input, never a daemon-side echo.
         let err = swap_rejection_error(SwapRejection::UnknownTarget, "my-target");
         assert!(err.to_string().contains("my-target"), "got {err}");
+    }
+
+    #[test]
+    fn ack_falls_back_to_standalone_only_for_no_active_account() {
+        // The fallback discriminator (issue #167 / #212): EXACTLY the `NoActiveAccount` rejection
+        // falls back to the standalone adopt path — the one guaranteed-zero-write verdict-time reject
+        // where the daemon performed nothing and `use <spare> --force` must still be able to adopt a
+        // named spare while the daemon runs. NO other ack falls back: a completed / already-active
+        // swap is authoritative, and each of the OTHER SIX rejections is a policy/safety verdict the
+        // daemon already resolved (falling back on those would double-act or wrongly override). A
+        // reached-but-failed `Err` never reaches this predicate — `request_swap` surfaces it and the
+        // `?` propagates it BEFORE the match — so it too can never fall back (the daemon may already
+        // have written; a standalone retry could double-write).
+        assert!(
+            ack_falls_back_to_standalone(&SwapAck::Rejected {
+                reason: SwapRejection::NoActiveAccount,
+            }),
+            "NoActiveAccount MUST fall back to standalone adopt recovery",
+        );
+        // Completed / already-active acks are authoritative — never fall back.
+        for ack in [
+            SwapAck::Accepted {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            },
+            SwapAck::AlreadyActive {
+                to: "spare".to_owned(),
+            },
+        ] {
+            assert!(
+                !ack_falls_back_to_standalone(&ack),
+                "a completed/already-active ack must NOT fall back: {ack:?}",
+            );
+        }
+        // Every OTHER rejection is authoritative — never fall back. Exhaustive over the non-
+        // NoActiveAccount rejections so a future rejection variant forces a deliberate decision here.
+        for reason in [
+            SwapRejection::UnknownTarget,
+            SwapRejection::AmbiguousTarget,
+            SwapRejection::Quarantined,
+            SwapRejection::WeeklyExhausted,
+            SwapRejection::Cooldown,
+            SwapRejection::KeychainLocked,
+            SwapRejection::SwapLockBusy,
+            SwapRejection::Failed,
+        ] {
+            assert!(
+                !ack_falls_back_to_standalone(&SwapAck::Rejected { reason }),
+                "the {reason:?} rejection is authoritative and must NOT fall back",
+            );
+        }
     }
 
     // --- acceptance: not-found / ambiguous through run_use (#63) -------------
