@@ -129,14 +129,16 @@ pub(crate) use peer_auth::{is_same_user, peer_euid};
 mod snapshot;
 
 pub(crate) use snapshot::{
-    credential_health, refresh_health_view, status_response, to_pct, AccountReading,
-    AccountStatusLine, NextSwap, StatusResponse, StatusSnapshot,
+    credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
+    AccountStatusLine, NextSwap, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
-// `RefreshHealth` is named only by the in-module snapshot tests (production builds it through
-// `refresh_health_view` without naming the type); re-export test-scoped so `use super::*`
-// resolves it while a non-test build sees no unused re-export.
+// `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
+// tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
+// the health view through `refresh_health_view` without naming the type. Re-export test-scoped so
+// `use super::*` resolves them while a non-test build sees no unused re-export.
 #[cfg(test)]
-pub(crate) use snapshot::RefreshHealth;
+pub(crate) use snapshot::{status_response, RefreshHealth};
 
 mod socket;
 
@@ -3202,6 +3204,10 @@ where
             // advisory — the CONFIG value, so the advisory keys off what the operator set
             // (AC-2: "suppressed when [refresh] is enabled").
             refresh_enabled: self.refresh_enabled,
+            // The snapshot's freshness stamp for the frozen wire contract (issue #164): the SAME
+            // `now_secs` the #119 health rollup reads above, so one wall-clock read backs the
+            // whole cycle and the client's live-vs-stale check agrees with the rollup's clock.
+            generated_at: now_secs,
         }
     }
 
@@ -6917,6 +6923,7 @@ mod tests {
     #[test]
     fn status_response_carries_handles_and_percentages_and_never_a_secret() {
         let snapshot = StatusSnapshot {
+            generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
                 AccountReading {
@@ -7531,6 +7538,7 @@ mod tests {
         // surface it — and prove the value-based meter (#15) still reads clean.
         let secrets = Secrets::meter_fixture();
         let snapshot = StatusSnapshot {
+            generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -7615,6 +7623,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let snapshot = StatusSnapshot {
+            generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -7826,11 +7835,10 @@ mod tests {
     fn status_response_projects_the_next_swap_candidate_and_drops_last_swap() {
         // A viable candidate projects as a label (#88), never a token/email (#15).
         let target = StatusSnapshot {
-            refresh_enabled: false,
-            accounts: vec![],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
             }),
+            ..Default::default()
         };
         let json = serde_json::to_string(&status_response(&target)).unwrap();
         assert!(json.contains("\"next_swap\":"), "got {json}");
@@ -7843,17 +7851,15 @@ mod tests {
         // The two no-candidate verdicts project as bare reasons (no label at all), so
         // the client can tell `no viable target` from `awaiting usage data`.
         let no_target = StatusSnapshot {
-            refresh_enabled: false,
-            accounts: vec![],
             next_swap: Some(NextSwap::NoViableTarget),
+            ..Default::default()
         };
         assert!(serde_json::to_string(&status_response(&no_target))
             .unwrap()
             .contains("\"next_swap\":{\"state\":\"no_viable_target\"}"));
         let awaiting = StatusSnapshot {
-            refresh_enabled: false,
-            accounts: vec![],
             next_swap: Some(NextSwap::AwaitingData),
+            ..Default::default()
         };
         assert!(serde_json::to_string(&status_response(&awaiting))
             .unwrap()
@@ -7861,13 +7867,110 @@ mod tests {
 
         // No anchor → null candidate; and the dropped `last_swap` field never appears.
         let none = StatusSnapshot {
-            refresh_enabled: false,
-            accounts: vec![],
             next_swap: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&status_response(&none)).unwrap();
         assert!(json.contains("\"next_swap\":null"), "got {json}");
         assert!(!json.contains("last_swap"), "got {json}");
+    }
+
+    // --- the frozen versioned wire contract (issue #164) -----------------------
+
+    #[test]
+    fn versioned_status_response_stamps_the_current_version_and_generated_at() {
+        let snapshot = StatusSnapshot {
+            generated_at: 1_782_777_600,
+            ..Default::default()
+        };
+        let versioned = versioned_status_response(&snapshot);
+        assert_eq!(versioned.schema_version, STATUS_SCHEMA_VERSION);
+        assert_eq!(versioned.generated_at, 1_782_777_600);
+    }
+
+    #[test]
+    fn the_status_wire_is_flat_and_carries_the_frozen_meta() {
+        // AC-1: the snapshot carries `schema_version` + `generated_at`, and the payload stays
+        // FLAT at the top level (the settled #137–#143 shape, only prefixed with the two meta
+        // fields — so existing internal readers that decode a bare `StatusResponse` still work).
+        let snapshot = StatusSnapshot {
+            generated_at: 1_782_777_600,
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
+        assert!(
+            json.contains(r#""schema_version":{"major":1,"minor":0}"#),
+            "got {json}"
+        );
+        assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
+        // Flat: the payload's `accounts` sits at the top level, not nested under a wrapper key.
+        assert!(json.contains(r#""accounts":[{"#), "got {json}");
+    }
+
+    #[test]
+    fn the_control_status_reply_is_the_versioned_envelope() {
+        // The end-to-end wire: a `status` control request replies with the frozen envelope a
+        // read-only client decodes (issue #164) — version + freshness stamp + payload, no signal.
+        let snapshot = StatusSnapshot {
+            generated_at: 42,
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (reply, signal) = control_reply(r#"{"cmd":"status"}"#, &snapshot, false);
+        assert!(signal.is_none(), "status is a pure read");
+        let parsed: VersionedStatus = serde_json::from_str(reply.trim_end()).unwrap();
+        assert_eq!(parsed.schema_version, STATUS_SCHEMA_VERSION);
+        assert_eq!(parsed.generated_at, 42);
+        assert_eq!(parsed.status.accounts[0].label, "work");
+    }
+
+    #[test]
+    fn a_bare_status_response_decodes_from_the_versioned_wire() {
+        // The flatten envelope keeps the wire FLAT (issue #164), so the internal readers that
+        // decode a BARE `StatusResponse` (`poke::daemon_status_best_effort`,
+        // `use_account::query_status`) are UNAFFECTED by the two meta fields — serde ignores the
+        // extra top-level `schema_version` / `generated_at` keys they do not name. This is the
+        // backward-compat guarantee the flatten design rests on.
+        let snapshot = StatusSnapshot {
+            generated_at: 1_782_777_600,
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            next_swap: Some(NextSwap::NoViableTarget),
+            refresh_enabled: false,
+        };
+        let wire = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
+        let bare: StatusResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(bare.accounts.len(), 1);
+        assert_eq!(bare.accounts[0].label, "work");
+        assert!(bare.accounts[0].active);
+        assert_eq!(bare.next_swap, Some(NextSwap::NoViableTarget));
+    }
+
+    #[test]
+    fn the_versioned_status_wire_carries_no_secret() {
+        // AC-3 (redaction unchanged): the envelope adds only a version object + a timestamp, so
+        // the wire still carries no email / token / fingerprint (issue #15).
+        let snapshot = StatusSnapshot {
+            generated_at: 1_782_777_600,
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
+        assert!(!json.contains('@'), "got {json}");
+        assert!(!json.to_lowercase().contains("token"), "got {json}");
     }
 
     #[tokio::test]
@@ -7959,6 +8062,7 @@ mod tests {
     #[test]
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
+            generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
                 AccountReading {
