@@ -27,7 +27,10 @@ const FILE_MODE: u32 = 0o600;
 const APP: &str = "sessiometer";
 
 /// The current real user id (`getuid(2)`).
-fn current_uid() -> u32 {
+///
+/// Exposed `pub(crate)` for the launchd domain target `gui/<uid>` the background
+/// service installer builds (issue #166); every other caller is in-module.
+pub(crate) fn current_uid() -> u32 {
     // SAFETY: `getuid` cannot fail and has no preconditions.
     unsafe { libc::getuid() }
 }
@@ -196,6 +199,18 @@ pub(crate) fn config_file() -> Result<PathBuf> {
 /// The log directory: `~/Library/Logs/sessiometer`.
 pub(crate) fn logs_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/Logs").join(APP))
+}
+
+/// The per-user LaunchAgents directory: `~/Library/LaunchAgents`.
+///
+/// Where the background service's launchd plist lives (issue #166). Unlike this
+/// crate's private state dirs, it is a shared, system-defined location
+/// (conventionally `0755`), so the installer creates it with `create_dir_all` —
+/// NOT [`ensure_private_dir`], which would narrow it to `0700` and assert sole
+/// ownership. Native-local (never XDG-relative): the login-session launchd domain
+/// reads agents only from here.
+pub(crate) fn launch_agents_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join("Library/LaunchAgents"))
 }
 
 /// The native-local application-support directory, **always**

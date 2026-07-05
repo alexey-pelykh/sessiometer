@@ -28,6 +28,7 @@ mod poke;
 mod redaction;
 mod refresh;
 mod refresh_tick;
+mod service;
 mod sha256;
 mod stash;
 mod stats;

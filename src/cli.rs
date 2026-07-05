@@ -81,6 +81,8 @@ enum Command {
     Login { label: Option<String> },
     /// `run [-v|--verbose]` — the foreground poll+swap daemon.
     Run { verbose: bool },
+    /// `service install|uninstall` — manage the background launchd LaunchAgent.
+    Service { action: ServiceAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
         json: bool,
@@ -125,6 +127,17 @@ enum Command {
     Help(HelpTopic),
 }
 
+/// The `service` sub-action (issue #166): install/start the background LaunchAgent,
+/// or uninstall/stop it. A plain data enum, like [`Command`] — the parser resolves
+/// the sub-verb so `execute` just dispatches.
+#[derive(Debug, PartialEq)]
+enum ServiceAction {
+    /// `service install` — write + load the LaunchAgent so `run` starts at login.
+    Install,
+    /// `service uninstall` — unload + remove the LaunchAgent.
+    Uninstall,
+}
+
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
 /// subcommand's own usage. Doubles as the subcommand identity in a [`Error::CliUsage`]
 /// hint, so a rejected flag points at the exact `--help` to run.
@@ -134,6 +147,7 @@ enum HelpTopic {
     Capture,
     Login,
     Run,
+    Service,
     Status,
     List,
     Use,
@@ -154,6 +168,7 @@ impl HelpTopic {
             HelpTopic::Capture => "sessiometer capture --help",
             HelpTopic::Login => "sessiometer login --help",
             HelpTopic::Run => "sessiometer run --help",
+            HelpTopic::Service => "sessiometer service --help",
             HelpTopic::Status => "sessiometer status --help",
             HelpTopic::List => "sessiometer list --help",
             HelpTopic::Use => "sessiometer use --help",
@@ -176,6 +191,7 @@ impl HelpTopic {
             HelpTopic::Capture => CAPTURE_USAGE,
             HelpTopic::Login => LOGIN_USAGE,
             HelpTopic::Run => RUN_USAGE,
+            HelpTopic::Service => SERVICE_USAGE,
             HelpTopic::Status => STATUS_USAGE,
             HelpTopic::List => LIST_USAGE,
             HelpTopic::Use => USE_USAGE,
@@ -264,6 +280,37 @@ fn parse_run(parser: &mut lexopt::Parser) -> Result<Command> {
         }
     }
     Ok(Command::Run { verbose })
+}
+
+/// Parse `service <install|uninstall>` (issue #166): the first positional is the sub-action,
+/// `-h`/`--help` short-circuits to help, an unknown flag is rejected, and an unrecognized
+/// action is a strict-usage error. Bare `service` (no action) prints the service help.
+fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut action = None;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Service)),
+            Value(value) if action.is_none() => {
+                let name = value.to_string_lossy();
+                action = Some(match name.as_ref() {
+                    "install" => ServiceAction::Install,
+                    "uninstall" => ServiceAction::Uninstall,
+                    other => {
+                        return Err(Error::CliUsage {
+                            message: format!("unknown service action `{other}`"),
+                            usage_hint: HelpTopic::Service.hint(),
+                        })
+                    }
+                });
+            }
+            Value(_) => {} // extra positional ignored, matching the other parsers
+            other => return Err(unexpected(other, HelpTopic::Service)),
+        }
+    }
+    match action {
+        Some(action) => Ok(Command::Service { action }),
+        None => Ok(Command::Help(HelpTopic::Service)),
+    }
 }
 
 /// Parse `status [--json] [--no-color] [-v|--verbose]` (issues #72/#73/#143) — all flags
@@ -455,6 +502,7 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         }),
         "login" => parse_positional(parser, HelpTopic::Login, |label| Command::Login { label }),
         "run" => parse_run(parser),
+        "service" => parse_service(parser),
         "status" => parse_status(parser),
         "list" => parse_list(parser),
         "use" => parse_use(parser),
@@ -496,6 +544,10 @@ async fn execute(command: Command) -> Result<()> {
             };
             run(verbosity).await
         }
+        Command::Service { action } => match action {
+            ServiceAction::Install => crate::service::install().await,
+            ServiceAction::Uninstall => crate::service::uninstall().await,
+        },
         Command::Status {
             json,
             no_color,
@@ -558,6 +610,7 @@ COMMANDS:
     capture [<label>]    Stash the active account into the rotation
     login [<label>]      Log in to an account (claude /login) in isolation and land it in the rotation, keeping the active account
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
+    service install|uninstall  Run the daemon in the background via a launchd LaunchAgent (persists across the login session)
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -611,6 +664,21 @@ USAGE:
 
     -v, --verbose  emit per-tick run diagnostics on stderr
     -h, --help     print this help
+";
+
+const SERVICE_USAGE: &str = "sessiometer service — run the daemon in the background via a launchd LaunchAgent
+
+USAGE:
+    sessiometer service <install|uninstall>
+
+    install     write + load a per-user LaunchAgent that runs `sessiometer run` at login and keeps it up across the session
+    uninstall   unload + remove that LaunchAgent
+    -h, --help  print this help
+
+The agent invokes the lock-guarded `sessiometer run`, so the background agent and a
+foreground `run` can never both drive the swap loop: whichever starts second refuses
+with a clear message and exits 3, performing no swap. This single-owner guard is a
+safety guard — nothing bypasses it.
 ";
 
 const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
@@ -5830,6 +5898,66 @@ spare  22222222-2222\n\
             "the --version line must print CARGO_PKG_VERSION: {}",
             version_line()
         );
+    }
+
+    #[test]
+    fn service_install_and_uninstall_parse_to_their_actions() {
+        // Issue #166: the two background-service sub-verbs route to their actions.
+        assert_eq!(
+            parse_argv(&["service", "install"]).unwrap(),
+            Command::Service {
+                action: ServiceAction::Install
+            }
+        );
+        assert_eq!(
+            parse_argv(&["service", "uninstall"]).unwrap(),
+            Command::Service {
+                action: ServiceAction::Uninstall
+            }
+        );
+    }
+
+    #[test]
+    fn service_help_and_bare_service_print_help_never_a_mutating_action() {
+        // `service --help` and a bare `service` (no sub-action) both resolve to HELP —
+        // pure `Help`, so neither can load/unload a LaunchAgent as a side effect.
+        assert_eq!(
+            parse_argv(&["service", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Service)
+        );
+        assert_eq!(
+            parse_argv(&["service"]).unwrap(),
+            Command::Help(HelpTopic::Service)
+        );
+    }
+
+    #[test]
+    fn service_rejects_an_unknown_action_instead_of_silently_installing() {
+        // A typo'd sub-action (`instal`) must not fall through to a default — it errors,
+        // naming the bad action and pointing at `service --help`.
+        match parse_argv(&["service", "instal"]).unwrap_err() {
+            Error::CliUsage {
+                message,
+                usage_hint,
+            } => {
+                assert!(
+                    message.contains("instal"),
+                    "names the bad action: {message}"
+                );
+                assert_eq!(usage_hint, "sessiometer service --help");
+            }
+            other => panic!("expected a CliUsage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_install_rejects_a_force_style_flag_so_nothing_can_pretend_to_bypass_the_guard() {
+        // The single-owner guard is a SAFETY guard with no bypass. A `--force` on
+        // `service install` is not a silently-accepted no-op — it is rejected as an
+        // unknown flag, so no `--force`-shaped incantation can appear to disable it.
+        let err = parse_argv(&["service", "install", "--force"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("--force"), "got: {err}");
     }
 
     #[test]
