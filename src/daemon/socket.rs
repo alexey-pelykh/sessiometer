@@ -15,7 +15,7 @@
 //! in-module test suite (`mod tests`' `use super::*`).
 
 use serde::{Deserialize, Serialize};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
 use super::*;
@@ -62,15 +62,35 @@ pub(crate) enum ControlSignal {
     Restored(String),
 }
 
+/// What serving one control connection yielded to the run loop. Most commands are fire-and-forget
+/// [`Signal`](ControlYield::Signal)s applied AFTER the reply is already sent (`None` for a pure
+/// `status` read or a rejected command); a `swap` command (issue #167) instead hands the
+/// still-open connection back as [`Swap`](ControlYield::Swap) so the run loop performs the swap
+/// where `&mut Daemon` is available and writes the REDACTED ack from the real outcome — an outcome
+/// the read-only serve seam cannot know (accepted / rejected-with-reason).
+///
+/// The stream is the concrete production [`UnixStream`] (the sole real [`Control`] impl,
+/// [`UnixControl`], accepts one); the hermetic test seams never yield a [`Swap`](ControlYield::Swap)
+/// (they only fire signals), so the concrete type costs the trait no generality it uses.
+pub(crate) enum ControlYield {
+    /// A fire-and-forget signal (or none) for the run loop to apply — the existing
+    /// `manual-swapped` / `roster-reload` / `restored` commands and every non-signal read.
+    Signal(Option<ControlSignal>),
+    /// A `swap` command (issue #167): the open connection + the parsed request, handed to the run
+    /// loop to perform the swap (needs `&mut Daemon`) and write the redacted ack.
+    Swap(UnixStream, SwapCommand),
+}
+
 /// Control seam: serve control-socket connections. The production impl
 /// ([`UnixControl`]) accepts on a `UnixListener`; the run loop's idle select
 /// drives it between polls. The test no-op never resolves, so it never wins the
-/// select. A served connection may return a [`ControlSignal`] for the run loop to
-/// apply (`None` for a pure `status` read).
+/// select. A served connection yields a [`ControlYield`] for the run loop — a
+/// [`Signal`](ControlYield::Signal) to apply (`None` for a pure `status` read) or a
+/// [`Swap`](ControlYield::Swap) handoff the run loop performs itself (issue #167).
 pub(crate) trait Control {
-    /// Serve at most one control connection from `snapshot`, then resolve to any
-    /// [`ControlSignal`] the exchange produced (`None` if none).
-    async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal>;
+    /// Serve at most one control connection from `snapshot`, then resolve to the
+    /// [`ControlYield`] the exchange produced.
+    async fn serve(&self, snapshot: &StatusSnapshot) -> ControlYield;
 
     /// Publish `snapshot` to any live `watch` subscribers (issue #165). The run loop calls this
     /// once per tick, so a subscriber gets a fresh WHOLE snapshot on every state change. Default:
@@ -108,22 +128,22 @@ impl UnixControl {
 }
 
 impl Control for UnixControl {
-    async fn serve(&self, snapshot: &StatusSnapshot) -> Option<ControlSignal> {
+    async fn serve(&self, snapshot: &StatusSnapshot) -> ControlYield {
         match self.listener.accept().await {
             Ok((stream, _addr)) => {
                 // Authenticate the peer as the SAME local user (issue #64): a
-                // state-affecting command (`manual-swapped`) is honored only from
-                // our own uid. The socket is already `0600` in a `0700` dir, so
-                // this is defense-in-depth — but the manual-hold receive path must
-                // be authenticated, never trust-by-reachability. Peer creds are read
-                // from the real fd here; `serve_control` takes the verdict as a
-                // plain bool so it stays testable over an in-memory duplex.
+                // state-affecting command (`manual-swapped`, `swap` #167) is honored
+                // only from our own uid. The socket is already `0600` in a `0700`
+                // dir, so this is defense-in-depth — but the state-affecting receive
+                // path must be authenticated, never trust-by-reachability. Peer creds
+                // are read from the real fd here; `serve_control` takes the verdict as
+                // a plain bool so it stays testable over an in-memory duplex.
                 let peer_authenticated = peer_is_same_user(&stream);
                 // Best-effort: a malformed or disconnected client must never crash
                 // the daemon — drop the exchange (the reply carries nothing secret).
                 match serve_control(stream, snapshot, peer_authenticated).await {
                     // A one-shot command — hand its signal (if any) to the run loop.
-                    Ok(ServeOutcome::OneShot(signal)) => signal,
+                    Ok(ServeOutcome::OneShot(signal)) => ControlYield::Signal(signal),
                     // A `watch` subscription (issue #165): hand the connection to a SPAWNED
                     // streaming task so the run loop's idle select is never held for the
                     // subscription's lifetime — an inline stream would stall every tick on the
@@ -138,12 +158,18 @@ impl Control for UnixControl {
                             // stream (the frames carry nothing secret) — never affects the daemon.
                             let _ = serve_watch(stream, receiver, WATCH_HEARTBEAT).await;
                         });
-                        None
+                        ControlYield::Signal(None)
                     }
-                    Err(_) => None,
+                    // A `swap` command (issue #167): an authenticated, well-formed request whose
+                    // ack must reflect the REAL swap outcome. `serve_control` already answered a
+                    // stranger / malformed request inline (a `OneShot(None)` above); here it hands
+                    // the OPEN connection back so the run loop performs the swap where
+                    // `&mut Daemon` is available and writes the redacted ack itself.
+                    Ok(ServeOutcome::Swap(stream, command)) => ControlYield::Swap(stream, command),
+                    Err(_) => ControlYield::Signal(None),
                 }
             }
-            Err(_) => None,
+            Err(_) => ControlYield::Signal(None),
         }
     }
 
@@ -158,12 +184,93 @@ impl Control for UnixControl {
 }
 
 /// The `{"cmd": "..."}` control request. `uuid` is present only for the `restored`
-/// command (issue #275) — the payload-less commands (`status` / `manual-swapped` /
-/// `roster-reload`) omit it, and serde defaults a missing `Option` field to `None`.
+/// command (issue #275); `target` / `force` only for the `swap` command (issue #167)
+/// — the payload-less commands (`status` / `manual-swapped` / `roster-reload`) omit
+/// them all, and serde defaults a missing field (`Option` → `None`, `bool` → `false`).
 #[derive(Deserialize)]
 struct ControlRequest {
     cmd: String,
     uuid: Option<String>,
+    /// The `swap` target handle (label OR account-uuid), present only for the `swap`
+    /// command (issue #167) — an operator-supplied handle, NEVER a credential and
+    /// NEVER a usage decision. `#[serde(default)]` so every other command omits it.
+    #[serde(default)]
+    target: Option<String>,
+    /// The `swap` command's POLICY-only force flag (issue #167): bypasses the policy
+    /// gates (weekly-exhausted / cooldown / quarantined), NEVER a safety invariant
+    /// (the locked-keychain abort, the single-writer swap lock). `#[serde(default)]`
+    /// so every other command omits it (and a `swap` without it defaults to `false`).
+    #[serde(default)]
+    force: bool,
+}
+
+/// A parsed `swap` control request (issue #167): an operator-supplied target handle plus the
+/// POLICY-only force flag, and NOTHING else — never a credential, never a viability hint the daemon
+/// would trust. Handed from [`serve_control`] to the run loop (via [`ServeOutcome::Swap`] →
+/// [`ControlYield::Swap`]) so the swap is performed where `&mut Daemon` is available and the daemon
+/// re-validates the target's viability ITSELF (a client-side "greyed out" is UX only, not trusted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwapCommand {
+    /// The target account's label or account-uuid, resolved by the daemon against its own roster.
+    pub(crate) target: String,
+    /// Whether to bypass the POLICY gates (weekly-exhausted / cooldown / quarantined). NEVER
+    /// bypasses a safety invariant — the daemon's swap engine still aborts on a locked keychain
+    /// and still serializes behind the single-writer swap lock.
+    pub(crate) force: bool,
+}
+
+/// The redacted acknowledgement the daemon returns for a `swap` control command (issue #167) —
+/// the ONLY thing a `swap` client learns about the outcome. Non-secret by construction (issue
+/// #15): a machine `result` tag plus, for a completed swap, the two non-secret roster LABELS
+/// (`from` / `to`) — a swap ack NEVER carries a credential or an email. Internally tagged on
+/// `result`, so the three cases stay one self-describing, forward-compatible field a client routes
+/// on (mirroring [`NextSwap`]'s `state` tag). Derives `Serialize` (the daemon writes it) and
+/// `Deserialize` (the `use` client reads it back).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub(crate) enum SwapAck {
+    /// The swap COMMITTED: the active credential was rerouted OFF `from` ONTO `to` (both
+    /// non-secret labels). The daemon's own single-writer swap already did the write.
+    Accepted { from: String, to: String },
+    /// A no-op success: `to` was ALREADY the active account, so nothing was written (the
+    /// non-`force` already-active case, mirroring the standalone `use` no-op). Label only.
+    AlreadyActive { to: String },
+    /// The daemon REFUSED with a redacted machine reason — ZERO writes happened.
+    Rejected { reason: SwapRejection },
+}
+
+/// Why the daemon refused a `swap` command (issue #167) — a redacted, stable machine code the
+/// `use` client maps back to its exit-code taxonomy (never a secret, never free-form). Splits the
+/// daemon's own POLICY re-validation verdicts (viability + cooldown, all `force`-bypassable) from
+/// the SAFETY / write-time aborts `force` can NEVER bypass (the locked-keychain abort, the
+/// single-writer swap lock), plus the target-resolution failures. Serialized kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum SwapRejection {
+    /// The target handle matched no roster account.
+    UnknownTarget,
+    /// The target handle matched more than one account (a duplicated label) — the daemon never
+    /// guesses (issue #17).
+    AmbiguousTarget,
+    /// The target is quarantined (a dead credential, issue #42) — refused WITHOUT `force`.
+    Quarantined,
+    /// The target's weekly window is exhausted (issue #11/#37) — refused WITHOUT `force`.
+    WeeklyExhausted,
+    /// A post-swap cooldown is active (issue #10) — refused WITHOUT `force`.
+    Cooldown,
+    /// No active account to swap AWAY from (or its canonical credential is gone): the daemon
+    /// cannot run a normal re-stash swap. Recovery (adopt-target, issue #212) is the standalone
+    /// `use --force` path, decoupled from this channel per the issue.
+    NoActiveAccount,
+    /// The keychain is LOCKED — a SAFETY abort the swap engine makes even under `force` (locked ≠
+    /// gone; retry when unlocked). ZERO writes.
+    KeychainLocked,
+    /// The single-writer swap lock (issue #64) stayed held the whole bounded wait — fail-closed,
+    /// ZERO writes. `force` never bypasses the lock.
+    SwapLockBusy,
+    /// The swap engine aborted for another reason (a wrong-identity re-stash guard #211, an I/O
+    /// error). ZERO writes.
+    Failed,
 }
 
 /// Build the one-line reply to a control request line, plus any [`ControlSignal`]
@@ -261,11 +368,16 @@ const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 /// select (an inline stream would stall every tick on the single-thread runtime, ADR-0001).
 pub(crate) enum ServeOutcome<RW> {
     /// A one-shot command was answered with a single reply line; the optional signal is the
-    /// run-loop mutation it asks for (`None` for a pure `status` read or a rejected command).
+    /// run-loop mutation it asks for (`None` for a pure `status` read or a rejected command —
+    /// including a `swap` already answered inline as unauthorized / malformed, issue #167).
     OneShot(Option<ControlSignal>),
     /// A `watch` subscription was requested; the connection is handed back for the caller to
     /// stream snapshots + heartbeats on (production spawns [`serve_watch`]).
     Watch(RW),
+    /// An authenticated, well-formed `swap` command was requested (issue #167); the connection is
+    /// handed back — NO reply written yet — for the caller (the run loop) to perform the swap and
+    /// write the redacted ack from the real outcome.
+    Swap(RW, SwapCommand),
 }
 
 /// Serve one control exchange: read one newline-delimited JSON request and either write one
@@ -298,15 +410,43 @@ where
             .read_line(&mut line)
             .await?;
         let trimmed = line.trim_end();
-        // A `watch` subscription (issue #165) hands the connection off to the streaming path
-        // rather than writing a one-shot reply: the caller spawns `serve_watch` on it. Parsed with
-        // the same `ControlRequest` shape as every other command; `into_inner` drops the (empty — a
-        // watch client sends only this one line) read buffer to yield a bare stream to stream on.
-        if matches!(
-            serde_json::from_str::<ControlRequest>(trimmed),
-            Ok(request) if request.cmd == "watch"
-        ) {
-            return Ok(ServeOutcome::Watch(buffered.into_inner()));
+        // `watch` (issue #165) and `swap` (issue #167) hand the connection OFF rather than write a
+        // one-shot reply here; every other command falls through to the pure `control_reply`. Parse
+        // once and branch. `into_inner` drops the (empty — these clients send only this one line)
+        // read buffer to yield a bare stream to hand back.
+        match serde_json::from_str::<ControlRequest>(trimmed) {
+            // A `watch` subscription (issue #165): a non-secret read stream (like `status`), so —
+            // unlike `swap` below — it is NOT auth-gated; hand the connection to the streaming path.
+            Ok(request) if request.cmd == "watch" => {
+                return Ok(ServeOutcome::Watch(buffered.into_inner()));
+            }
+            // A `swap` command (issue #167): STATE-AFFECTING, so authenticate FIRST (like
+            // `manual-swapped`). An unauthenticated peer gets `{"error":"unauthorized"}` and NO
+            // stream handoff — the swap never reaches the run loop, and a stranger learns nothing
+            // past the rejection. A `swap` with no `target` is malformed-safe, like an unparseable
+            // line. An authenticated, well-formed request hands the OPEN connection back so the run
+            // loop performs the swap (needs `&mut Daemon`) and writes the redacted ack from the
+            // REAL outcome — an outcome this pure serve cannot know.
+            Ok(request) if request.cmd == "swap" => {
+                if !peer_authenticated {
+                    write_line(&mut buffered, r#"{"error":"unauthorized"}"#).await?;
+                    return Ok(ServeOutcome::OneShot(None));
+                }
+                return match request.target {
+                    Some(target) => Ok(ServeOutcome::Swap(
+                        buffered.into_inner(),
+                        SwapCommand {
+                            target,
+                            force: request.force,
+                        },
+                    )),
+                    None => {
+                        write_line(&mut buffered, r#"{"error":"malformed request"}"#).await?;
+                        Ok(ServeOutcome::OneShot(None))
+                    }
+                };
+            }
+            _ => {}
         }
         let (reply, signal) = control_reply(trimmed, snapshot, peer_authenticated);
         buffered.write_all(reply.as_bytes()).await?;
@@ -333,6 +473,19 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Watch(_) => {
                 panic!("expected a one-shot reply, got a watch subscription")
             }
+            ServeOutcome::Swap(..) => {
+                panic!("expected a one-shot reply, got a swap handoff")
+            }
+        }
+    }
+
+    /// The handed-back stream + parsed command of a [`Swap`](ServeOutcome::Swap) outcome, panicking
+    /// on any other — for the issue-#167 swap-handoff tests, which always expect a swap.
+    pub(crate) fn swap(self) -> (RW, SwapCommand) {
+        match self {
+            ServeOutcome::Swap(stream, command) => (stream, command),
+            ServeOutcome::OneShot(_) => panic!("expected a swap handoff, got a one-shot reply"),
+            ServeOutcome::Watch(_) => panic!("expected a swap handoff, got a watch subscription"),
         }
     }
 }
@@ -428,6 +581,28 @@ where
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Upper bound on writing one `swap` ack (issue #167). The ack carries nothing secret, so a
+/// disconnected / wedged `swap` client just drops it; time-box the write so it can never stall the
+/// run loop (the ack is written INLINE in the run loop's post-idle, unlike the `watch` stream that
+/// runs in a spawned task). Mirrors [`CONTROL_EXCHANGE_TIMEOUT`], the serve-side one-shot bound.
+pub(crate) const SWAP_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Write a redacted [`SwapAck`] as one newline-delimited JSON line to a `swap` client (issue
+/// #167) — the run loop's counterpart of `serve_control`'s one-shot reply, written AFTER the swap
+/// is performed (the ack must reflect the real outcome). Non-secret by construction: the ack
+/// carries only a `result` tag and roster labels (issue #15). Takes the stream BY VALUE so it is
+/// closed on return; a write failure (the client went away) propagates so the caller drops it
+/// best-effort. Serializing a finite enum cannot realistically fail; a defensive fallback keeps
+/// the write total rather than dropping a completed swap's ack on an impossible encode error.
+pub(crate) async fn write_swap_ack<W>(mut stream: W, ack: &SwapAck) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(ack)
+        .unwrap_or_else(|_| r#"{"result":"rejected","reason":"failed"}"#.to_owned());
+    write_line(&mut stream, &line).await
 }
 
 /// The `type` tag on every `watch` stream frame (issue #165): a self-describing discriminator so a
@@ -631,6 +806,85 @@ pub(crate) async fn notify_restored(socket: &Path, uuid: &str) -> Result<()> {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "restored notify timed out",
+            ))
+        })?
+}
+
+/// Extra head-room the `swap` command exchange allows ON TOP of the swap lock's own bounded wait
+/// (issue #167): enough for the daemon's post-lock `security` subprocesses plus a tick in flight.
+const SWAP_COMMAND_SLACK: Duration = Duration::from_secs(5);
+
+/// Upper bound on the whole `swap` command exchange from the `use` client (issue #167). Longer than
+/// the fire-and-forget [`CLIENT_NOTIFY_TIMEOUT`] because the ack arrives only AFTER the daemon
+/// performs the swap — which may wait the full single-writer swap-lock budget
+/// ([`crate::swap::SWAP_LOCK_MAX_WAIT`]) and then run several `security` subprocesses. DERIVED from
+/// that budget + [`SWAP_COMMAND_SLACK`] (rather than a bare literal) so the two can never silently
+/// drift apart if the lock's max-wait is retuned. A wedged daemon can therefore never hang `use`
+/// past this bound; a timeout AFTER connecting surfaces as an error rather than a silent standalone
+/// fallback (never a double write, see [`request_swap`]).
+const SWAP_COMMAND_TIMEOUT: Duration =
+    crate::swap::SWAP_LOCK_MAX_WAIT.saturating_add(SWAP_COMMAND_SLACK);
+
+/// Send a `swap` control command to a running daemon (issue #167) and read its redacted ack — the
+/// CLI-verb counterpart of the daemon's `swap` handler ([`ServeOutcome::Swap`] → the run loop's
+/// swap-apply). `use` calls this to route a swap THROUGH the daemon when one is up, so there is a
+/// SINGLE writer and a single place for the lock, write-ordering, and redaction. Carries ONLY the
+/// operator's target handle + the POLICY force flag — never a credential, never a viability
+/// decision (the daemon re-validates the target itself).
+///
+/// Three outcomes, distinguished so `use` routes correctly:
+///   - `Ok(Some(ack))` — a daemon answered; `use` reports its redacted verdict (the daemon already
+///     did any write). This is the load-bearing UNIFY case.
+///   - `Ok(None)` — NO daemon is reachable (connect refused / socket absent), so `use` falls back
+///     to the standalone write path (the daemon-down fallback). Reachability is decided by the
+///     CONNECT alone, so a fallback happens ONLY when nothing was sent — never after a write the
+///     daemon may already have performed.
+///   - `Err(..)` — a daemon was reached but the exchange failed (a mid-exchange I/O error, a
+///     malformed ack, or a timeout after connecting). Surfaced, NOT retried standalone: the daemon
+///     may have performed the write, so a standalone retry could DOUBLE-write. Bounded by
+///     [`SWAP_COMMAND_TIMEOUT`] so a wedged daemon can never hang `use`.
+pub(crate) async fn request_swap(
+    socket: &Path,
+    target: &str,
+    force: bool,
+) -> Result<Option<SwapAck>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // Serializing a finite, string-keyed object cannot fail (mirrors `notify_restored`), so the
+    // encode is `.expect`-ed rather than propagated.
+    let request = serde_json::to_vec(&serde_json::json!({
+        "cmd": "swap",
+        "target": target,
+        "force": force,
+    }))
+    .expect("serializing the swap control request");
+
+    let exchange = async {
+        // Connect FIRST: a refused connect / absent socket is the "no daemon" signal (→ `Ok(None)`,
+        // fall back to standalone), distinct from a mid-exchange failure (→ `Err`, do NOT fall
+        // back — the daemon may already have written). This split is what keeps `use` from ever
+        // double-writing when the daemon is up.
+        let stream = match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => stream,
+            Err(_) => return Ok::<Option<SwapAck>, Error>(None),
+        };
+        let mut buffered = tokio::io::BufReader::new(stream);
+        buffered.write_all(&request).await?;
+        buffered.write_all(b"\n").await?;
+        buffered.flush().await?;
+        // Read the one-line redacted ack, then decode it into the shared wire type.
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        let ack: SwapAck = serde_json::from_str(line.trim_end())
+            .map_err(|err| Error::Io(std::io::Error::other(err)))?;
+        Ok(Some(ack))
+    };
+    tokio::time::timeout(SWAP_COMMAND_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "swap command timed out",
             ))
         })?
 }
