@@ -862,6 +862,12 @@ async fn run(verbosity: Verbosity) -> Result<()> {
             .stats
             .retention_policy(config.tunables.poll_secs as i64),
     )
+    // Wire the per-poll usage-sample collector (#156) at the real store path so the daemon
+    // records one redacted sample per successful poll. The path is INJECTED here rather than
+    // resolved inside the collector (#315), so the hermetic test harness — which never wires
+    // it — writes nothing to the real store. `support_dir()` already gated startup via
+    // `.with_swap_lock(paths::swap_lock()?)` above, so this `?` adds no new failure mode.
+    .with_usage_samples(paths::usage_samples()?)
     // Carry the CONFIG `[refresh].enabled` (#105) onto the display snapshot so the thin
     // `status` client can surface the isolated-refresh discoverability advisory (#138): with
     // the tick OFF, non-active accounts get no maintenance and their credentials silently
