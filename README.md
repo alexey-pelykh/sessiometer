@@ -71,7 +71,7 @@ sessiometer service uninstall
 ```
 
 `service install` writes a LaunchAgent plist to
-`~/Library/LaunchAgents/io.github.alexey-pelykh.sessiometer.plist` and loads it into
+`~/Library/LaunchAgents/org.sessiometer.agent.plist` and loads it into
 your login session (`launchctl bootstrap`). It is a LaunchAgent, not a system-wide
 LaunchDaemon, because the swap loop needs your **login keychain**, which only exists
 inside the per-user session. The agent is `RunAtLoad` + `KeepAlive`, so it starts at
@@ -737,7 +737,7 @@ Claude Code:
    rm -rf ~/"Library/Application Support/sessiometer"
    rm -rf ~/"Library/Logs/sessiometer"
    # only if `service uninstall` in step 1 did not already remove it:
-   rm -f ~/"Library/LaunchAgents/io.github.alexey-pelykh.sessiometer.plist"
+   rm -f ~/"Library/LaunchAgents/org.sessiometer.agent.plist"
    # only if you set $XDG_CONFIG_HOME:
    rm -rf "$XDG_CONFIG_HOME/sessiometer"
    ```
