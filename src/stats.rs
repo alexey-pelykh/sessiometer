@@ -52,7 +52,7 @@
 //! fabricated calm. Everything is whole UTC epoch seconds end to end; only the human
 //! window echo is rendered in the operator's local time zone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -274,6 +274,13 @@ struct Report {
     summary: UsageReport,
     series: Vec<UsageReport>,
     offset: i64,
+    /// Handles present in the store's window but NOT in the live roster (issue #314):
+    /// removed/renamed accounts, or stray samples. Split OUT of `summary.per_account` (and
+    /// every `series` bucket) so they never render as peers of live accounts — they surface
+    /// only in the dedicated "not in roster" section of each view. Empty when the roster is
+    /// unknown (no config loaded) — see [`split_orphans`] — so a pre-`capture` `stats` reads
+    /// exactly as before. Summary-window stats only (the series need not re-carry them).
+    orphans: BTreeMap<String, AccountStats>,
 }
 
 /// Entry point for the `stats` verb: read the store once, resolve the window, aggregate,
@@ -286,10 +293,21 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     let offset = local_offset_secs(now);
 
     let window = plan_window(args.period.as_deref(), args.since.as_deref(), now, &data)?;
-    // Tunables drive the aggregator's thresholds; a missing config is not fatal for a
-    // read-only view — fall back to the built-in defaults so `stats` works pre-`capture`.
-    let params = params_from(Config::load().ok().as_ref());
-    let report = build_report(&data, window, args.accounts, &params, offset);
+    // One config load feeds BOTH the aggregator thresholds AND the roster reconciliation
+    // (issue #314). A missing/malformed config is not fatal for a read-only view — the
+    // thresholds fall back to built-in defaults, and an unknown roster simply disables the
+    // orphan partition (every handle renders as before), so `stats` still works pre-`capture`.
+    let config = Config::load().ok();
+    let params = params_from(config.as_ref());
+    let roster = config.as_ref().map(roster_handles);
+    let report = build_report(
+        &data,
+        window,
+        args.accounts,
+        roster.as_ref(),
+        &params,
+        offset,
+    );
 
     let out = if args.json {
         render_json(&report)?
@@ -471,6 +489,16 @@ fn params_from(config: Option<&Config>) -> AggregateParams {
     AggregateParams::new(poll_secs.max(1), cap, cap)
 }
 
+/// The live-roster handle set for the orphan partition (issue #314): every account's
+/// `label`, which is EXACTLY what the daemon freezes into each `Sample.acct`
+/// ([`crate::daemon`] writes the label verbatim), so set membership is a plain string
+/// compare against the [`aggregate`] output's `per_account` keys. DISABLED accounts are
+/// KEPT — a disabled account is still in the roster (its samples are legitimate); only
+/// removed / renamed / stray handles fall outside this set and become orphans.
+fn roster_handles(config: &Config) -> BTreeSet<String> {
+    config.roster.iter().map(|a| a.label.clone()).collect()
+}
+
 /// Aggregate the window's samples into a filtered summary + series.
 ///
 /// The summary is one whole-window `aggregate`; the series is one `aggregate` per bucket.
@@ -481,6 +509,7 @@ fn build_report(
     data: &StoreData,
     window: Window,
     accounts: Vec<String>,
+    roster: Option<&BTreeSet<String>>,
     params: &AggregateParams,
     offset: i64,
 ) -> Report {
@@ -493,12 +522,19 @@ fn build_report(
         params,
     );
     apply_filter(&mut summary.per_account, &accounts);
+    // Split non-roster handles out of the SUMMARY view — they render in their own section
+    // (issue #314), never as peers of live accounts. The summary partition is the one every
+    // view surfaces; the series buckets are cleaned below only so they never PLOT an orphan.
+    let orphans = split_orphans(&mut summary.per_account, roster);
 
     let series = bucket_bounds(window.start, window.end, window.base_bucket())
         .into_iter()
         .map(|(lo, hi)| {
             let mut bucket = aggregate(&data.samples, &swaps, Period::new(lo, hi), params);
             apply_filter(&mut bucket.per_account, &accounts);
+            // Drop orphans from each series bucket too, so the charts' per-account series
+            // (and the JSON `series`) only ever plot live-roster accounts.
+            split_orphans(&mut bucket.per_account, roster);
             bucket
         })
         .collect();
@@ -509,6 +545,7 @@ fn build_report(
         summary,
         series,
         offset,
+        orphans,
     }
 }
 
@@ -518,6 +555,40 @@ fn apply_filter(per_account: &mut BTreeMap<String, AccountStats>, accounts: &[St
         return;
     }
     per_account.retain(|handle, _| accounts.iter().any(|a| a == handle));
+}
+
+/// Split the non-roster ("orphan") handles OUT of `per_account`, returning them (issue #314).
+///
+/// A handle is an orphan when it is absent from the live `roster` — a removed/renamed
+/// account, or a stray sample. Retaining roster handles in place and extracting the rest
+/// mirrors [`apply_filter`]'s removal shape, so the three render surfaces keep iterating a
+/// live-accounts-only `per_account` UNCHANGED; orphans surface only through the returned map
+/// (and thence each view's dedicated "not in roster" section). Roster-wide statistics
+/// (`swap_count`, all-high) are computed by [`aggregate`] over the full sample set and are
+/// independent of this display subset, exactly as they already are under [`apply_filter`].
+///
+/// When `roster` is `None` (no config / roster known) NOTHING is split — every handle stays
+/// and the caller gets an empty orphan map, so a pre-`capture` `stats` (or one whose config
+/// failed to load) reads exactly as it did before roster-awareness. An EMPTY roster (config
+/// present, zero accounts) is distinct from `None`: every present handle is then a genuine
+/// orphan.
+fn split_orphans(
+    per_account: &mut BTreeMap<String, AccountStats>,
+    roster: Option<&BTreeSet<String>>,
+) -> BTreeMap<String, AccountStats> {
+    let Some(roster) = roster else {
+        return BTreeMap::new();
+    };
+    let mut orphans = BTreeMap::new();
+    per_account.retain(|handle, stats| {
+        if roster.contains(handle) {
+            true
+        } else {
+            orphans.insert(handle.clone(), *stats);
+            false
+        }
+    });
+    orphans
 }
 
 /// Split `[start, end)` into uniform sub-buckets of at most `MAX_BUCKETS` at `base` width,
@@ -549,46 +620,79 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 
 // --- rendering: numeric text ------------------------------------------------
 
-/// Render the numeric text view: the window echo, the per-account summary table, the
-/// neutral summary band (issue #160), and the roster line. This is the NON-TTY surface
-/// (issue #159): a piped / redirected `stats` renders exactly this — plain, greppable, zero
-/// ANSI, no chart glyph — while an interactive TTY gets [`render_charts`]. Reports only
-/// magnitudes and neutral descriptors — no recommendation, no forecast (issue #160).
+/// The per-account table header, sized to the handle column. Shared by the live-account
+/// table and the "not in roster" section (issue #314) so both foot identical columns.
+fn text_table_header(handle_w: usize) -> String {
+    format!(
+        "{}  cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share\n",
+        pad_end("account", handle_w),
+    )
+}
+
+/// One per-account table row, sized to the handle column. Shared by the live-account table
+/// and the orphan section, so an orphan row is column-identical to a live one — the ONLY
+/// difference is which section it sits under.
+fn text_account_row(handle: &str, a: &AccountStats, handle_w: usize) -> String {
+    format!(
+        "{}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%\n",
+        pad_end(handle, handle_w),
+        pct(a.coverage),
+        triple(&a.session),
+        triple(&a.weekly),
+        a.cap_hits,
+        fmt_dur(a.time_at_cap_secs),
+        pct(a.contribution_share),
+    )
+}
+
+/// Render the numeric text view: the window echo, the per-account summary table, an optional
+/// "not in roster" section (issue #314), the neutral summary band (issue #160), and the
+/// roster line. This is the NON-TTY surface (issue #159): a piped / redirected `stats`
+/// renders exactly this — plain, greppable, zero ANSI, no chart glyph — while an interactive
+/// TTY gets [`render_charts`]. Reports only magnitudes and neutral descriptors — no
+/// recommendation, no forecast (issue #160).
 fn render_text(report: &Report) -> String {
     let mut out = String::new();
     let label = format_window_label(&report.window, report.offset);
     out.push_str(&format!("usage — {label}\n\n"));
 
     let summary = &report.summary;
-    if summary.per_account.is_empty() {
+    let has_live = !summary.per_account.is_empty();
+    let has_orphans = !report.orphans.is_empty();
+    if !has_live && !has_orphans {
         out.push_str("  no per-account usage in this window\n");
     } else {
         // Size the label column on DISPLAY width, not `String::len()` bytes (issue #249):
         // a wide glyph spans fewer bytes than its terminal footprint, so byte sizing AND
         // char-count `{:<hw$}` padding both mis-aligned the numeric columns. Those numeric
-        // fields stay literal `{:>N}` / `{:<15}` fills — they are ASCII-only.
+        // fields stay literal `{:>N}` / `{:<15}` fills — they are ASCII-only. Sized across
+        // BOTH the live table and the orphan section so the two align under one column width.
         let handle_w = summary
             .per_account
             .keys()
+            .chain(report.orphans.keys())
             .map(|handle| display_width(handle))
             .max()
             .unwrap_or(0)
             .max(display_width("account"));
-        out.push_str(&format!(
-            "{}  cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share\n",
-            pad_end("account", handle_w),
-        ));
-        for (handle, a) in &summary.per_account {
-            out.push_str(&format!(
-                "{}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%\n",
-                pad_end(handle, handle_w),
-                pct(a.coverage),
-                triple(&a.session),
-                triple(&a.weekly),
-                a.cap_hits,
-                fmt_dur(a.time_at_cap_secs),
-                pct(a.contribution_share),
-            ));
+        if has_live {
+            out.push_str(&text_table_header(handle_w));
+            for (handle, a) in &summary.per_account {
+                out.push_str(&text_account_row(handle, a, handle_w));
+            }
+        }
+        // Non-roster handles (issue #314): a clearly-labelled, self-contained section so an
+        // orphan is never read as a live account. Shown, not hidden — this is reconciliation,
+        // not deletion (a store `gc` that DROPS them is issue #314 option (c), out of scope).
+        if has_orphans {
+            if has_live {
+                out.push('\n');
+            }
+            out.push_str(&format!("not in roster ({}):\n", report.orphans.len()));
+            out.push_str(&text_table_header(handle_w));
+            for (handle, a) in &report.orphans {
+                out.push_str(&text_account_row(handle, a, handle_w));
+            }
         }
     }
 
@@ -870,6 +974,14 @@ struct StatsWire<'a> {
     accounts: &'a [String],
     series: Vec<BucketWire>,
     summary: PeriodWire,
+    /// Non-roster handles present in the window (issue #314): removed / renamed accounts or
+    /// stray samples, keyed exactly like `summary.accounts` but held apart so a consumer
+    /// never reads an orphan as a live account. OMITTED entirely when there are none (or when
+    /// no roster is known — a pre-`capture` read), so the key appears only when orphans exist.
+    /// Additive to `schema:1` (matches the `#159`/`#160` extend-without-bumping precedent);
+    /// summary-window only — the `series` buckets never carry orphans.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    orphans: BTreeMap<String, AccountWire>,
 }
 
 #[derive(Serialize)]
@@ -1030,6 +1142,7 @@ fn render_json(report: &Report) -> Result<String> {
             roster: roster_wire(&report.summary.roster),
             accounts: accounts_wire(&report.summary.per_account),
         },
+        orphans: accounts_wire(&report.orphans),
     };
     let mut json = serde_json::to_string_pretty(&wire)
         .map_err(|_| Error::StatsSerialize("a usage value was not a finite number"))?;
@@ -1453,19 +1566,42 @@ fn render_percentiles(
     Some(out)
 }
 
+/// The compact "not in roster" footer line for the CHARTS view (issue #314): the orphan
+/// handles named inline, e.g. `not in roster (2): backup, spare`. `None` when there are no
+/// orphans (the caller appends nothing). The numeric view renders the fuller orphan TABLE
+/// instead; the charts view keeps it to a single named line so orphans never take a peer
+/// chart slot, yet remain impossible to mistake for live accounts.
+fn orphan_names_line(orphans: &BTreeMap<String, AccountStats>) -> Option<String> {
+    if orphans.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = orphans.keys().map(String::as_str).collect();
+    Some(format!(
+        "not in roster ({}): {}\n",
+        orphans.len(),
+        names.join(", ")
+    ))
+}
+
 /// Compose the HUMAN-facing charts view for an interactive TTY (issue #159): the window
 /// echo, the per-account chart table (with inline sparkline), then the bars / heatmap /
 /// percentile blocks (each degrading away cleanly when the terminal is too narrow), footed
-/// by the same roster line the numeric view uses. Pure over `(w, color, ascii)` so the
-/// whole view is golden-testable at a fixed width / colour / ramp.
+/// by an optional "not in roster" line (issue #314) and the same roster line the numeric
+/// view uses. Pure over `(w, color, ascii)` so the whole view is golden-testable at a fixed
+/// width / colour / ramp.
 fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String {
     let mut out = format!(
         "usage — {}\n\n",
         format_window_label(&report.window, report.offset)
     );
+    // `per_account` is already live-roster-only (orphans were split out in `build_report`),
+    // so every chart below plots live accounts; orphans surface only in the footer line.
     let accounts: Vec<&String> = report.summary.per_account.keys().collect();
     if accounts.is_empty() {
         out.push_str("  no per-account usage in this window\n\n");
+        if let Some(line) = orphan_names_line(&report.orphans) {
+            out.push_str(&line);
+        }
         out.push_str(&roster_line(&report.summary.roster));
         return out;
     }
@@ -1482,13 +1618,16 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
         out.push_str(&block);
     }
     out.push('\n');
-    // The neutral summary band (issue #160), then the roster line. Honours the shared
-    // colour gate (symmetric emphasis when open; the descriptor word still carries the
-    // signal when closed).
+    // The neutral summary band (issue #160), the "not in roster" line (issue #314), then the
+    // roster line. Honours the shared colour gate (symmetric emphasis when open; the
+    // descriptor word still carries the signal when closed).
     let band = render_summary(report, color);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
+    }
+    if let Some(line) = orphan_names_line(&report.orphans) {
+        out.push_str(&line);
     }
     out.push_str(&roster_line(&report.summary.roster));
     out
@@ -1550,6 +1689,7 @@ mod tests {
             summary: ureport(summary),
             series: series.iter().map(|b| ureport(b)).collect(),
             offset: 0,
+            orphans: BTreeMap::new(),
         }
     }
 
@@ -2188,7 +2328,7 @@ mod tests {
             end: 1_000,
             kind: WindowKind::Period(PeriodSpec::Day),
         };
-        let report = build_report(&read, window, vec![], &params(), 0);
+        let report = build_report(&read, window, vec![], None, &params(), 0);
         assert_eq!(report.summary.per_account["work"].seen, 1);
         assert_eq!(report.summary.roster.swaps.manual, 1);
     }
@@ -2225,7 +2365,7 @@ mod tests {
         };
         let read = StoreData::read(&store).unwrap();
         let window = plan_window(Some("day"), None, now, &read).unwrap();
-        let report = build_report(&read, window, vec![], &params(), 0);
+        let report = build_report(&read, window, vec![], None, &params(), 0);
 
         assert_eq!(
             report.summary.per_account["work"].seen, 3,
@@ -2256,7 +2396,7 @@ mod tests {
              ts=2026-07-01T11:00:00Z event=emergency_swap from=work to=play\n";
         let store = data(samples, events);
         let window = plan_window(Some("day"), None, now, &store).unwrap();
-        build_report(&store, window, vec![], &params(), 0)
+        build_report(&store, window, vec![], None, &params(), 0)
     }
 
     #[test]
@@ -2356,6 +2496,7 @@ mod tests {
             &data(vec![], ""),
             plan_window(None, None, now, &data(vec![], "")).unwrap(),
             vec![],
+            None,
             &params(),
             0,
         );
@@ -2379,7 +2520,7 @@ mod tests {
             "ts=2026-07-01T11:30:00Z event=swap from=play to=work reason=manual\n",
         );
         let window = plan_window(Some("day"), None, now, &store).unwrap();
-        let report = build_report(&store, window, vec!["work".to_owned()], &params(), 0);
+        let report = build_report(&store, window, vec!["work".to_owned()], None, &params(), 0);
         assert!(report.summary.per_account.contains_key("work"));
         assert!(
             !report.summary.per_account.contains_key("play"),
@@ -2492,6 +2633,7 @@ mod tests {
             summary: bucket(0, 6 * HOUR_SECS),
             series: vec![bucket(0, 6 * HOUR_SECS)],
             offset: 0,
+            orphans: BTreeMap::new(),
         }
     }
 
@@ -2897,5 +3039,278 @@ mod tests {
         // A roster of ONLY unsampled accounts has nothing measured to summarise → empty band.
         let all_dark = charts_report(&[("dark", stat(0, ds(0.0, 0.0, 0.0), 0.0, 1.0))], &[]);
         assert_eq!(render_summary(&all_dark, false), "");
+    }
+
+    // --- issue #314: non-roster ("orphan") handle partition --------------------------
+
+    /// A roster handle set from literals.
+    fn roster(handles: &[&str]) -> BTreeSet<String> {
+        handles.iter().map(|h| (*h).to_string()).collect()
+    }
+
+    /// A store with two in-roster handles (`work`, `spare`) and two non-roster ones
+    /// (`backup`, `third`) sampled once each in a single `week` window, built against the
+    /// given `live` roster. `live = None` models a store read with no config loaded.
+    fn orphan_report(live: Option<&BTreeSet<String>>) -> Report {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let samples = vec![
+            sample(now - HOUR_SECS, "work", 0.9, 0.4),
+            sample(now - HOUR_SECS, "spare", 0.5, 0.3),
+            sample(now - HOUR_SECS, "backup", 0.2, 0.1),
+            sample(now - HOUR_SECS, "third", 0.7, 0.2),
+        ];
+        let store = data(samples, "");
+        let window = plan_window(Some("week"), None, now, &store).unwrap();
+        build_report(&store, window, vec![], live, &params(), 0)
+    }
+
+    #[test]
+    fn text_lists_non_roster_handles_in_a_separate_section() {
+        let live = roster(&["work", "spare"]);
+        let out = render_text(&orphan_report(Some(&live)));
+        // Two orphans get their own counted, labelled section.
+        assert!(
+            out.contains("not in roster (2):"),
+            "orphans surface in a counted section:\n{out}"
+        );
+        // Everything BEFORE that section is the live-account table: the two live handles, and
+        // neither orphan (an orphan is never a peer of a live account).
+        let head = out.split("not in roster").next().unwrap();
+        assert!(
+            head.contains("work") && head.contains("spare"),
+            "live accounts head the view"
+        );
+        assert!(
+            !head.contains("backup"),
+            "orphan 'backup' never sits among live accounts"
+        );
+        assert!(
+            !head.contains("third"),
+            "orphan 'third' never sits among live accounts"
+        );
+        // The orphan handles do appear (in the section).
+        assert!(
+            out.contains("backup") && out.contains("third"),
+            "orphans are listed, not hidden"
+        );
+    }
+
+    #[test]
+    fn charts_exclude_orphans_from_peer_charts_and_name_them_in_a_footer() {
+        let live = roster(&["work", "spare"]);
+        let out = render_charts(&orphan_report(Some(&live)), 120, false, false);
+        // A compact, counted footer names the orphans.
+        assert!(
+            out.contains("not in roster (2): "),
+            "charts foot with a named orphan line:\n{out}"
+        );
+        assert!(out.contains("backup") && out.contains("third"));
+        // The charted region (everything before that footer) plots the live accounts and
+        // NEITHER orphan — an orphan never takes a peer chart slot.
+        let charted = out.split("not in roster").next().unwrap();
+        assert!(
+            charted.contains("work") && charted.contains("spare"),
+            "live accounts are charted"
+        );
+        assert!(
+            !charted.contains("backup"),
+            "an orphan is never charted as a peer"
+        );
+        assert!(
+            !charted.contains("third"),
+            "an orphan is never charted as a peer"
+        );
+    }
+
+    #[test]
+    fn json_places_orphans_apart_from_live_accounts() {
+        let live = roster(&["work", "spare"]);
+        let json = render_json(&orphan_report(Some(&live))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Live accounts under `summary.accounts`; an orphan is absent there.
+        assert!(v["summary"]["accounts"]["work"].is_object());
+        assert!(v["summary"]["accounts"]["spare"].is_object());
+        assert!(
+            v["summary"]["accounts"]["backup"].is_null(),
+            "an orphan is not a live account: {json}"
+        );
+        // Orphans carried under the dedicated top-level `orphans` map; a live handle is absent.
+        assert!(
+            v["orphans"]["backup"].is_object(),
+            "orphan under top-level `orphans`"
+        );
+        assert!(v["orphans"]["third"].is_object());
+        assert!(
+            v["orphans"]["work"].is_null(),
+            "a live account is not an orphan"
+        );
+        // Series buckets never carry an orphan (they only ever plot live accounts).
+        for bucket in v["series"].as_array().unwrap() {
+            assert!(
+                bucket["accounts"]["backup"].is_null(),
+                "series never plots an orphan: {bucket}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_omits_orphans_key_when_no_orphans() {
+        // Roster covers every present handle → no orphans → the key is omitted entirely
+        // (additive to schema:1; a consumer sees `orphans` only when there are some).
+        let live = roster(&["work", "spare", "backup", "third"]);
+        let json = render_json(&orphan_report(Some(&live))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("orphans").is_none(),
+            "no `orphans` key when there are none: {json}"
+        );
+        assert!(
+            v["summary"]["accounts"]["backup"].is_object(),
+            "'backup' is now a live account"
+        );
+    }
+
+    #[test]
+    fn absent_roster_leaves_every_handle_in_the_main_table() {
+        // No config / roster (None) → no partition: every handle stays a live row, no section
+        // — a pre-`capture` `stats` reads exactly as before roster-awareness.
+        let out = render_text(&orphan_report(None));
+        assert!(
+            !out.contains("not in roster"),
+            "no orphan section without a roster:\n{out}"
+        );
+        for h in ["work", "spare", "backup", "third"] {
+            assert!(out.contains(h), "{h} still rendered in the main table");
+        }
+        let json = render_json(&orphan_report(None)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("orphans").is_none(), "no roster ⇒ no orphans key");
+        assert!(
+            v["summary"]["accounts"]["backup"].is_object(),
+            "every handle is a live account"
+        );
+    }
+
+    #[test]
+    fn empty_roster_makes_every_handle_an_orphan() {
+        // Config present but EMPTY (Some, zero accounts) is distinct from None: every present
+        // handle is a genuine orphan.
+        let empty = roster(&[]);
+        let report = orphan_report(Some(&empty));
+        assert_eq!(report.summary.per_account.len(), 0, "no live accounts");
+        assert_eq!(report.orphans.len(), 4, "every handle is an orphan");
+        let out = render_text(&report);
+        assert!(
+            out.contains("not in roster (4):"),
+            "all four surface in the section:\n{out}"
+        );
+        assert!(
+            out.contains("backup") && out.contains("work"),
+            "handles listed under the section"
+        );
+    }
+
+    #[test]
+    fn roster_handles_uses_labels_verbatim_and_keeps_disabled_accounts() {
+        // The join key is `Account.label` verbatim (what the daemon freezes into `Sample.acct`),
+        // and a DISABLED account is still in the roster — only removed/renamed handles orphan.
+        let toml = "[[account]]\naccount_uuid = \"u1\"\nlabel = \"work\"\n\
+                    [[account]]\naccount_uuid = \"u2\"\nlabel = \"spare\"\nenabled = false\n";
+        let config = Config::from_toml_str(toml).expect("valid config");
+        let set = roster_handles(&config);
+        assert!(
+            set.contains("work"),
+            "enabled account label is in the roster"
+        );
+        assert!(
+            set.contains("spare"),
+            "DISABLED account label is STILL in the roster (issue #314)"
+        );
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn orphan_split_preserves_roster_wide_swap_stats() {
+        // Splitting orphans out of the DISPLAY must never drop roster-wide stats — those are
+        // computed over the FULL sample/event set, independent of which rows are shown.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let samples = vec![
+            sample(now - HOUR_SECS, "work", 0.9, 0.4),
+            sample(now - HOUR_SECS, "backup", 0.2, 0.1),
+        ];
+        let events = "ts=2026-07-01T09:00:00Z event=swap from=backup to=work reason=session\n";
+        let store = data(samples, events);
+        let window = plan_window(Some("week"), None, now, &store).unwrap();
+        let live = roster(&["work"]);
+        let report = build_report(&store, window, vec![], Some(&live), &params(), 0);
+        assert_eq!(report.summary.per_account.len(), 1, "only 'work' is live");
+        assert!(
+            report.orphans.contains_key("backup"),
+            "'backup' split into orphans"
+        );
+        assert_eq!(
+            report.summary.roster.swap_count, 1,
+            "the swap is still counted"
+        );
+    }
+
+    #[test]
+    fn charts_all_orphan_store_still_names_them_via_the_empty_path() {
+        // Reachable state: EVERY handle is an orphan, so the live-account list is empty and
+        // `render_charts` takes its `no per-account usage` early return. That path must still
+        // surface the orphan footer (and never call the peer chart sub-renderers).
+        let empty = roster(&[]);
+        let out = render_charts(&orphan_report(Some(&empty)), 120, false, false);
+        assert!(
+            out.contains("no per-account usage in this window"),
+            "no LIVE accounts:\n{out}"
+        );
+        assert!(
+            out.contains("not in roster (4): "),
+            "orphans still named on the empty path"
+        );
+        assert!(
+            out.contains("backup") && out.contains("work"),
+            "every handle named"
+        );
+    }
+
+    #[test]
+    fn positional_filter_selecting_an_orphan_shows_it_as_not_in_roster() {
+        // Reachable state: the positional filter narrows to a single handle that is itself an
+        // orphan. It must render UNDER the orphan section (honest), never as a live account —
+        // the filter runs first, then the roster split classifies what remains.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let samples = vec![
+            sample(now - HOUR_SECS, "work", 0.9, 0.4),
+            sample(now - HOUR_SECS, "backup", 0.2, 0.1),
+        ];
+        let store = data(samples, "");
+        let window = plan_window(Some("week"), None, now, &store).unwrap();
+        let live = roster(&["work"]);
+        // `stats backup` — filter to the orphan handle.
+        let report = build_report(
+            &store,
+            window,
+            vec!["backup".to_owned()],
+            Some(&live),
+            &params(),
+            0,
+        );
+        assert!(
+            report.summary.per_account.is_empty(),
+            "no LIVE account survives the filter"
+        );
+        assert!(
+            report.orphans.contains_key("backup"),
+            "the filtered-to handle is the orphan"
+        );
+        let out = render_text(&report);
+        assert!(
+            out.contains("not in roster (1):"),
+            "shown, honestly, as an orphan:\n{out}"
+        );
+        let head = out.split("not in roster").next().unwrap();
+        assert!(!head.contains("backup"), "never rendered as a live account");
     }
 }
