@@ -36,10 +36,22 @@ use tokio::process::Command;
 use crate::error::{Error, Result};
 use crate::paths;
 
-/// The canonical launchd label — reverse-DNS from the project's GitHub home
-/// (`github.com/alexey-pelykh/sessiometer`). Doubles as the plist filename stem
-/// (`<label>.plist`) and the trailing component of the `bootout` service target.
-const AGENT_LABEL: &str = "io.github.alexey-pelykh.sessiometer";
+/// The canonical launchd label — the ratified `org.sessiometer` bundle namespace
+/// (grounded by the owned `sessiometer.org`; issue #329), which the macOS app and this
+/// embedded daemon share for a coherent `org.sessiometer.*` identity. It is the exact
+/// label the app's `SMAppService` registration (#170) will register. Doubles as the
+/// plist filename stem (`<label>.plist`) and the trailing component of the `bootout`
+/// service target.
+const AGENT_LABEL: &str = "org.sessiometer.agent";
+
+/// The label this daemon shipped under before the `org.sessiometer` rename (issue #329).
+/// It is booted out and its plist deleted on every `install`/`uninstall`, so upgrading
+/// past the rename never orphans a stale `io.github.alexey-pelykh.sessiometer.plist` or
+/// a crash-looping agent (the old `RunAtLoad` + `KeepAlive` agent would otherwise keep
+/// losing the single-instance lock to the new one and be restarted forever). Pre-0.1.0 /
+/// unreleased ⇒ in practice this matches nothing; the cleanup is a defensive, idempotent
+/// no-op.
+const LEGACY_AGENT_LABEL: &str = "io.github.alexey-pelykh.sessiometer";
 
 /// `/bin/launchctl`, absolute (the transport rule): a hijacked `$PATH` cannot
 /// substitute a different binary for the service-control call.
@@ -80,7 +92,12 @@ pub(crate) async fn install() -> Result<()> {
     // Best-effort pre-clean so a re-install is idempotent (tolerate "not loaded"),
     // then bootstrap the freshly-written plist. `bootstrap`/`bootout` are the modern
     // replacements for the deprecated `load -w`/`unload -w`.
-    let _ = launchctl(&["bootout", &service_target()]).await;
+    let _ = launchctl(&["bootout", &service_target(AGENT_LABEL)]).await;
+    // Migration (#329): also retire any agent left over from the pre-rename label, so an
+    // upgrade past the rename doesn't leave the old one crash-looping beside this one.
+    // Best-effort (like the bootouts above): installing THIS agent must not be blocked by
+    // trouble removing a stale OLD file — `uninstall` propagates the cleanup as the backstop.
+    let _ = remove_legacy_agent().await;
     launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
 
     // Operational status → stderr, matching the daemon's own `sessiometer: daemon
@@ -101,14 +118,15 @@ pub(crate) async fn install() -> Result<()> {
 /// is success, so `service uninstall` is safe to run twice.
 pub(crate) async fn uninstall() -> Result<()> {
     // Tolerate "not loaded" so the unload half is idempotent.
-    let _ = launchctl(&["bootout", &service_target()]).await;
+    let _ = launchctl(&["bootout", &service_target(AGENT_LABEL)]).await;
 
     let plist = paths::launch_agents_dir()?.join(format!("{AGENT_LABEL}.plist"));
-    match std::fs::remove_file(&plist) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::Io(e)),
-    }
+    remove_plist_file(&plist)?;
+
+    // Migration (#329): also retire any leftover pre-rename agent + plist, so a user who
+    // upgrades past the rename and then uninstalls isn't left with a stale
+    // `io.github.alexey-pelykh.sessiometer.plist` / running agent behind.
+    remove_legacy_agent().await?;
 
     eprintln!("sessiometer: background service uninstalled ({AGENT_LABEL}).");
     Ok(())
@@ -119,10 +137,36 @@ fn domain_target() -> String {
     format!("gui/{}", paths::current_uid())
 }
 
-/// The launchd **service** target: `gui/<uid>/<label>` — the domain target plus the
-/// agent's label, the form `bootout` takes to unload one named service.
-fn service_target() -> String {
-    format!("gui/{}/{AGENT_LABEL}", paths::current_uid())
+/// The launchd **service** target: `gui/<uid>/<label>` — the domain target plus an
+/// agent's label, the form `bootout` takes to unload one named service. Parameterized by
+/// label so the same builder targets both the current agent and the [`LEGACY_AGENT_LABEL`]
+/// the #329 migration cleans up.
+fn service_target(label: &str) -> String {
+    format!("gui/{}/{label}", paths::current_uid())
+}
+
+/// Remove a LaunchAgent plist by path, tolerating absence (`NotFound` = success). The
+/// file half of an uninstall / migration cleanup — factored out so it is exercised
+/// directly in tests against a temp dir (the `launchctl bootout` half needs a live GUI
+/// login domain and cannot run hermetically).
+fn remove_plist_file(plist: &Path) -> Result<()> {
+    match std::fs::remove_file(plist) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e)),
+    }
+    Ok(())
+}
+
+/// Retire any LaunchAgent left over from the pre-rename [`LEGACY_AGENT_LABEL`] (issue #329
+/// migration): boot it out of the per-user domain (best-effort, tolerating "not loaded")
+/// and delete its plist (tolerating absence). Idempotent, and a no-op in the common
+/// unreleased case where the old label was never installed. Called from both `install`
+/// and `uninstall` so neither path can orphan the old identity.
+async fn remove_legacy_agent() -> Result<()> {
+    let _ = launchctl(&["bootout", &service_target(LEGACY_AGENT_LABEL)]).await;
+    let plist = paths::launch_agents_dir()?.join(format!("{LEGACY_AGENT_LABEL}.plist"));
+    remove_plist_file(&plist)
 }
 
 /// The absolute path to THIS running `sessiometer` binary — what the plist must
@@ -296,6 +340,50 @@ mod tests {
                     .map(str::to_owned)
             })
             .collect()
+    }
+
+    #[test]
+    fn the_agent_label_is_the_ratified_org_sessiometer_namespace() {
+        // Issue #329 AC: the daemon label is exactly `org.sessiometer.agent`. It is the
+        // plist filename stem, the trailing component of the launchctl service target,
+        // and the exact label #170 (SMAppService) will register — so the app and this
+        // embedded daemon share one `org.sessiometer.*` identity.
+        assert_eq!(AGENT_LABEL, "org.sessiometer.agent");
+        assert_eq!(
+            service_target(AGENT_LABEL),
+            format!("gui/{}/org.sessiometer.agent", paths::current_uid()),
+            "the service target's trailing component is the new label",
+        );
+    }
+
+    #[test]
+    fn the_pre_rename_agent_plist_is_cleaned_up_and_the_cleanup_is_idempotent() {
+        // Issue #329 migration + AC: an install → uninstall cycle must leave no
+        // `io.github.alexey-pelykh.sessiometer.plist` behind. The migration still knows
+        // the OLD stem so it can target it, and — because the project is unreleased, so
+        // nothing was installed under it in practice — the cleanup must be a tolerated
+        // no-op when the legacy plist is absent. This exercises the file half against a
+        // temp `LaunchAgents` dir; the `launchctl bootout` half needs a live GUI login
+        // domain and is not hermetic.
+        assert_eq!(
+            LEGACY_AGENT_LABEL, "io.github.alexey-pelykh.sessiometer",
+            "the migration targets the exact pre-rename label",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(format!("{LEGACY_AGENT_LABEL}.plist"));
+
+        // A leftover legacy plist is removed …
+        std::fs::write(&legacy, "stale").unwrap();
+        remove_plist_file(&legacy).expect("removing an existing legacy plist succeeds");
+        assert!(
+            !legacy.exists(),
+            "no `io.github.alexey-pelykh.sessiometer.plist` remains after cleanup",
+        );
+
+        // … and cleaning up again with nothing there is a no-op, not an error — the
+        // unreleased common case, and what keeps install/uninstall idempotent.
+        remove_plist_file(&legacy).expect("removing an absent legacy plist is a tolerated no-op");
     }
 
     #[test]
