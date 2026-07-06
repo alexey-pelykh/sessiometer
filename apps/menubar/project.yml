@@ -24,10 +24,35 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Info.plist
+  # Wire-decoder unit tests (#322). A STANDALONE logic-test bundle: no TEST_HOST, so it
+  # never launches the app — it compiles the pure decoder source (Sources/WireModel.swift)
+  # directly alongside the tests, and exercises `parseWatchFrame` over inline golden fixtures
+  # (no bundle resources). Runs headless under `xcodebuild test`.
+  MenubarTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Sources/WireModel.swift
+      - path: Tests
+    settings:
+      base:
+        PRODUCT_NAME: MenubarTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.sessiometer.menubar.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        # Standalone logic-test bundle: no host app to launch (the decoder is pure), so null
+        # out the unit-test preset's default host wiring explicitly rather than relying on an
+        # undefined TEST_HOST.
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
 schemes:
   Menubar:
     build:
       targets:
         Menubar: all
+        MenubarTests: [test]
+    test:
+      config: Debug
+      targets:
+        - MenubarTests
     run:
       config: Debug
