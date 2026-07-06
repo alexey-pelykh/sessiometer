@@ -111,6 +111,14 @@ Before adding a dependency, weigh:
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build if
   `security-framework` appears anywhere in the dependency graph, so a refactor
   cannot silently reintroduce the SDK write path.
+- [`scripts/check-gate-change-ack.sh`](scripts/check-gate-change-ack.sh)
+  — a CI guard (the `gate-change-ack` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build
+  when a PR touches a gate-definition path (`.github/workflows/**`, `scripts/**`,
+  `deny.toml`, `.cargo/**`) without a `Gate-Change-Acknowledged: <reason>` trailer
+  on one of its commits, so a change to the merge gate's own definition lands
+  deliberately and auditably rather than slipping through green in this solo repo
+  (issue #317).
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing
