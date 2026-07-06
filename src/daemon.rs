@@ -328,22 +328,26 @@ impl<S: AccountStash> CredentialStore for StashCredentialStore<'_, S> {
 /// future multi-provider store stays distinguishable, so the collector names it.
 const USAGE_PROVIDER: &str = "claude";
 
-/// Record ONE usage sample for a poll (issue #156), fail-open.
+/// Record ONE usage sample for a poll (issue #156), fail-open, to the INJECTED store path.
 ///
-/// The poll-loop entry point: resolve the store path, then delegate to
-/// [`append_sample_for_poll`]. Splitting path resolution out keeps that core
-/// hermetically testable with an injected path + clock. A path-resolution failure is
-/// logged and swallowed — usage sampling is telemetry and must never break the
-/// poll/swap loop (see [`append_sample_for_poll`] for the full fail-open contract).
-fn record_usage_sample(account_label: &str, polled: &Result<PolledReading>) {
-    let samples_path = match crate::paths::usage_samples() {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("sessiometer: usage-sample path unavailable, skipped: {err}");
-            return;
-        }
+/// The poll-loop entry point. `samples_path` is `Some` when production wired the real
+/// `crate::paths::usage_samples()` path via `Daemon::with_usage_samples` — then delegate to
+/// [`append_sample_for_poll`] with the poll reading + wall clock. When `None` — the
+/// hermetic-test default — record NOTHING, so ticking a `FakeDaemon` never writes to the
+/// developer's real store (issue #315). The path is injected, never resolved inline, so the
+/// collector cannot reach the real support dir from a test. A store-WRITE failure is still
+/// swallowed inside [`append_sample_for_poll`] — sampling telemetry must never break the
+/// poll/swap loop.
+fn record_usage_sample(
+    samples_path: Option<&std::path::Path>,
+    account_label: &str,
+    polled: &Result<PolledReading>,
+    now: i64,
+) {
+    let Some(samples_path) = samples_path else {
+        return; // collector not wired (hermetic-test default) → write nothing (issue #315)
     };
-    append_sample_for_poll(&samples_path, account_label, polled, wall_clock_now_secs());
+    append_sample_for_poll(samples_path, account_label, polled, now);
 }
 
 /// Append one usage [`Sample`] for a poll to `samples_path`, fail-open (issue #156).
@@ -1219,8 +1223,18 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`with_stats`](Self::with_stats); when `Some`, each poll runs the cadence-gated
     /// `compact_and_roll` (emitting a redacted `usage_rollup` when a pass folds samples) and
     /// records a rate-limited redacted `usage_gap` on a no-reading poll. The append-per-poll
-    /// collector (#156) runs regardless — this seam adds only the roll + gap-event layer.
+    /// collector (#156) runs independently, gated on its own `usage_samples_path` seam — this
+    /// `stats` seam adds only the roll + gap-event layer.
     stats: Option<RetentionPolicy>,
+    /// The per-poll usage-sample store path (issue #156/#315), or `None` to disable the
+    /// collector (the hermetic-test default — a test with no on-disk store wires nothing, so
+    /// ticking a `FakeDaemon` writes NO sample and the developer's real store stays untouched).
+    /// Production wires the real `crate::paths::usage_samples()` path via
+    /// [`with_usage_samples`](Self::with_usage_samples); when `Some`, each successful poll
+    /// appends one redacted `Sample` to it. The path is INJECTED, never resolved inline, so a
+    /// test cannot reach the real support dir (issue #315) — the same reason `NativeHistoryStore`
+    /// holds its paths so a test can point one at a temp dir.
+    usage_samples_path: Option<PathBuf>,
     /// Whether the operator turned the periodic isolated-refresh tick ON in config
     /// (`[refresh].enabled`, issue #105) — the CONFIG value, NOT the effective switch (which
     /// also requires a resolvable `claude` binary). Carried onto the display snapshot so the
@@ -1308,6 +1322,10 @@ where
             // No usage-stats store maintenance by default (issue #161); production opts in via
             // `with_stats`. Left unset, the collector's roll/gap-event layer is inert.
             stats: None,
+            // No per-poll usage-sample collector by default (issue #156/#315); production opts
+            // in via `with_usage_samples`. Left unset, ticking writes NO sample, so `cargo test`
+            // never touches the developer's real store — the isolation the injected path buys.
+            usage_samples_path: None,
             // The periodic-refresh tick defaults OFF (opt-in, #105); production sets the real
             // `config.refresh.enabled` via `with_refresh_enabled`. Left false, the #138 advisory
             // stays inert (it also requires an unhealthy non-active account to fire).
@@ -1367,6 +1385,17 @@ where
     /// stable; a hermetic test drives the pure [`stats_events_for_poll`] core directly instead.
     pub(crate) fn with_stats(mut self, policy: RetentionPolicy) -> Self {
         self.stats = Some(policy);
+        self
+    }
+
+    /// Wire the per-poll usage-sample store path (issue #156/#315): the daemon then appends one
+    /// redacted `Sample` to `path` after each successful poll. Production sets the real
+    /// `crate::paths::usage_samples()` path; left unset, the collector is inert so a hermetic
+    /// `FakeDaemon` tick writes nothing to the real support dir. The path is INJECTED rather than
+    /// resolved inline precisely so a test cannot reach the real store (issue #315).
+    /// Builder-style to mirror `with_stats` / `with_swap_lock` and keep `new`'s args stable.
+    pub(crate) fn with_usage_samples(mut self, path: PathBuf) -> Self {
+        self.usage_samples_path = Some(path);
         self
     }
 
@@ -1585,9 +1614,15 @@ where
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
-            // gap and swallowing any store error. Off the swap-decision path — a
-            // sampling failure never perturbs the loop below.
-            record_usage_sample(&self.roster[i].label, &polled);
+            // gap and swallowing any store error. The store path is INJECTED (issue #315):
+            // `None` in the hermetic-test default, so ticking a `FakeDaemon` writes nothing —
+            // off the swap-decision path, so a sampling failure never perturbs the loop below.
+            record_usage_sample(
+                self.usage_samples_path.as_deref(),
+                &self.roster[i].label,
+                &polled,
+                wall_clock_now_secs(),
+            );
             // Usage-stats store maintenance (issue #161): a cadence-gated `compact_and_roll`
             // (emitting a redacted `usage_rollup` when a pass folds aged samples) plus a
             // rate-limited redacted `usage_gap` on a no-reading poll. Inert unless `with_stats`
@@ -14131,6 +14166,73 @@ mod tests {
         append_sample_for_poll(&unwritable, "work", &reading, 7);
 
         assert!(!unwritable.exists(), "no partial file left behind");
+    }
+
+    /// ISOLATION (issue #315): the hermetic `FakeDaemon` default wires NO usage-sample path,
+    /// so ticking it records nothing to the developer's real store. `record_usage_sample`
+    /// short-circuits on the `None` path, so a `cargo test` run can never append a sample to
+    /// `~/Library/Application Support/sessiometer/usage-samples.jsonl`. This is the regression
+    /// guard: defaulting the field to a real path in `new` would reintroduce the defect and
+    /// this test would fail. It asserts the `None` field default — the structural guarantee that
+    /// makes a real-store write impossible — not an observed absence-of-write (the real store
+    /// can't be inspected without racing a concurrent writer); the companion
+    /// `tick_appends_a_usage_sample_to_the_injected_path` proves the injected path is honored.
+    #[tokio::test]
+    async fn tick_records_no_usage_sample_without_an_injected_path() {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await;
+        // The hermetic default holds no store path — the collector is inert.
+        assert!(
+            daemon.usage_samples_path.is_none(),
+            "a FakeDaemon must not wire a usage-sample path (issue #315 isolation)",
+        );
+        // Ticking never resolves one, so the real store stays untouched across the suite.
+        let _ = warmed_tick(&mut daemon).await;
+        assert!(
+            daemon.usage_samples_path.is_none(),
+            "ticking must not resolve a real store path (issue #315)",
+        );
+    }
+
+    /// SEAM HONORED (issue #156/#315): with the path injected via `with_usage_samples`, a
+    /// successful poll appends its per-poll sample to THAT path — proving the production
+    /// collector still records per poll while the injected seam keeps every write inside a
+    /// test-owned temp dir (never the real support dir). Each sample carries a redacted roster
+    /// handle, so nothing escapes to the real store even in the wired case.
+    #[tokio::test]
+    async fn tick_appends_a_usage_sample_to_the_injected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await
+        .with_usage_samples(samples_path.clone());
+
+        let _ = warmed_tick(&mut daemon).await;
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert!(
+            !samples.is_empty(),
+            "the injected path must receive the per-poll sample(s)",
+        );
+        // Every sample carries a redacted roster handle — the write lands in the temp store,
+        // never the real support dir.
+        for s in &samples {
+            assert!(
+                ["work", "spare", "backup"].contains(&s.acct.as_str()),
+                "unexpected acct handle in the injected store: {}",
+                s.acct,
+            );
+        }
     }
 
     // --- Usage-stats store maintenance events (issue #161) ------------------
