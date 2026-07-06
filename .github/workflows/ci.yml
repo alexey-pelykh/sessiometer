@@ -20,10 +20,47 @@ env:
   RUST_MSRV: "1.87.0"
 
 jobs:
+  # Per-job path filtering. The workflow has NO top-level `on: paths:` filter on purpose:
+  # a workflow-level path filter makes the required status contexts stop reporting on any
+  # PR that misses the filter, which wedges branch protection forever. Instead each real
+  # job runs conditionally on these outputs, and `ci-ok` (below) is the single always-running
+  # required check. A change to this workflow file re-runs BOTH toolchains — it is
+  # listed in both filters — so CI edits are always validated end to end.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      swift: ${{ steps.filter.outputs.swift }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              # `include_str!` compile-time inputs for the migration tests (src/migration.rs);
+              # a fixture-only edit is still a Rust-affecting change and must run the Rust jobs.
+              - 'build/fixtures/**'
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+            swift:
+              - 'apps/menubar/**'
+              - '.github/workflows/ci.yml'
+
   # Full gate: format, lints, docs, build, tests. `-D warnings` clippy/rustdoc behavior is
   # toolchain-version-sensitive, so the toolchain is pinned (RUST_STABLE) rather than `stable`.
   test:
     name: test
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -51,6 +88,8 @@ jobs:
   # churn unrelated to whether the crate actually works on the MSRV.
   msrv:
     name: msrv
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -65,6 +104,8 @@ jobs:
 
   deny:
     name: deny
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -79,3 +120,54 @@ jobs:
           tool: cargo-deny
       - name: Supply-chain gates (advisories, sources, licenses)
         run: cargo deny check advisories sources licenses
+
+  # Swift menu-bar app (apps/menubar/, issue #311). Generates the Xcode project from
+  # project.yml with XcodeGen, then builds the LSUIElement skeleton. macos-latest ships a
+  # full Xcode; XcodeGen comes from Homebrew. The build is unsigned (CODE_SIGNING_ALLOWED=NO)
+  # — Developer-ID signing + notarization is #171. No test target yet (skeleton only), so
+  # this is a build, not a test run.
+  swift:
+    name: swift
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: apps/menubar
+        run: xcodegen generate
+      - name: Build
+        working-directory: apps/menubar
+        run: |
+          xcodebuild build \
+            -project Menubar.xcodeproj \
+            -scheme Menubar \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO
+
+  # Single always-running summary gate. This is the ONE check branch protection should
+  # require: it runs on every PR/push regardless of path filters, and passes only when every
+  # real job either succeeded or was legitimately path-skipped. That way a path-skipped
+  # `test`/`msrv`/`deny`/`swift` can never wedge a merge, while a genuine failure (or a
+  # failed `changes` job) still blocks. Keep `test`/`msrv`/`deny` as named contexts for
+  # history/visibility, but make `ci-ok` the required one.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes, test, msrv, deny, swift]
+    runs-on: ubuntu-latest
+    steps:
+      # `needs.*.result` auto-covers every job in `needs:` above — add a job there and it is
+      # gated here automatically, with no second list to keep in sync. A path-skipped job has
+      # result `skipped`, which is a pass; only `failure`/`cancelled` fail this gate.
+      - name: Fail if any required job did not pass
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "::error::A required job failed or was cancelled (results: ${{ join(needs.*.result, ', ') }})"
+          exit 1
+      - name: Summary
+        run: |
+          echo "All required jobs passed or were legitimately skipped (results: ${{ join(needs.*.result, ', ') }})."
