@@ -160,6 +160,20 @@ jobs:
             -destination 'generic/platform=macOS' \
             CODE_SIGNING_ALLOWED=NO
 
+  # Meta-check (issue #318): assert `ci-ok.needs` names every other job, so a new job can't be
+  # added to this workflow and silently sit outside the merge gate's `needs.*.result` rollup.
+  # GitHub exposes no "all jobs in this workflow" context, so the parse lives in a script — like
+  # the `deny` job's `check-no-security-framework.sh`, and runnable locally. Runs always (no path
+  # filter): the invariant must hold on every PR, including docs-only. Its result feeds `ci-ok`
+  # below, so a failure here fails the gate — which is why it appears in `ci-ok.needs` itself.
+  ci-ok-needs-complete:
+    name: ci-ok-needs-complete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Assert ci-ok.needs covers every job
+        run: ./scripts/check-ci-ok-needs.sh
+
   # Single always-running summary gate. This is the ONE check branch protection should
   # require: it runs on every PR/push regardless of path filters, and passes only when every
   # real job either succeeded or was legitimately path-skipped. That way a path-skipped
@@ -169,12 +183,13 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, test, msrv, deny, swift]
+    needs: [changes, test, msrv, deny, swift, ci-ok-needs-complete]
     runs-on: ubuntu-latest
     steps:
-      # `needs.*.result` auto-covers every job in `needs:` above — add a job there and it is
-      # gated here automatically, with no second list to keep in sync. A path-skipped job has
-      # result `skipped`, which is a pass; only `failure`/`cancelled` fail this gate.
+      # `needs.*.result` auto-covers every job in `needs:` above — and the `ci-ok-needs-complete`
+      # job asserts that list names every other job, so a new job can't be added to the workflow
+      # and silently escape this rollup. A path-skipped job has result `skipped`, which is a pass;
+      # only `failure`/`cancelled` fail this gate.
       - name: Fail if any required job did not pass
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
         run: |
