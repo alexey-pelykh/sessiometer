@@ -1,0 +1,33 @@
+# XcodeGen spec for the sessiometer macOS menu-bar app.
+#
+# The Xcode project is generated from this file — run `xcodegen generate` (the
+# resulting `Menubar.xcodeproj` is git-ignored). Per ADR-0010 the Swift app is a
+# sibling directory to the Rust crate at the repo root; it links no Rust and is
+# NOT a Cargo workspace member. This is the #311 scaffold only — the real
+# menu-bar UI and socket client are #168, signing/notarization is #171.
+name: Menubar
+options:
+  bundleIdPrefix: com.sessiometer
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+targets:
+  Menubar:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_NAME: Menubar
+        PRODUCT_BUNDLE_IDENTIFIER: com.sessiometer.menubar
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Info.plist
+schemes:
+  Menubar:
+    build:
+      targets:
+        Menubar: all
+    run:
+      config: Debug

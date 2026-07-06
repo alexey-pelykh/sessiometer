@@ -827,6 +827,10 @@ cargo build --release
 ./target/release/sessiometer --help
 ```
 
+The macOS menu-bar app lives in [`apps/menubar/`](apps/menubar/) — a Swift/XcodeGen
+sibling to the Rust crate at the repo root, not a Cargo workspace member (see
+[ADR-0010](docs/adr/0010-macos-app-repo-topology.md)).
+
 ## Support
 
 `sessiometer` is free and MIT-licensed. If you find it useful, you can support
