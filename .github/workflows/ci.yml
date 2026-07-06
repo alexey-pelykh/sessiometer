@@ -50,6 +50,18 @@ jobs:
               # a fixture-only edit is still a Rust-affecting change and must run the Rust jobs.
               - 'build/fixtures/**'
               - 'scripts/**'
+              # Cargo auto-detects these inputs, so a PR that adds one must run the Rust jobs — else
+              # `deny` (no-Security.framework linkage + supply-chain gates) silently skips and the
+              # security invariant self-bypasses: `.cargo/**` can inject linker flags or a source
+              # replacement, `build.rs`/`**/build.rs` run arbitrary build-time code, and the
+              # toolchain/fmt/lint files reconfigure the very gates below.
+              - '.cargo/**'
+              - 'build.rs'
+              - '**/build.rs'
+              - 'rust-toolchain.toml'
+              - 'rust-toolchain'
+              - 'rustfmt.toml'
+              - 'clippy.toml'
               - '.github/workflows/ci.yml'
             swift:
               - 'apps/menubar/**'
