@@ -284,6 +284,133 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertTrue(m.rows.isEmpty)
     }
 
+    // MARK: - AC (#344): the store-side valid-frame watchdog
+
+    // THE #344 regression, closed. A daemon that holds the connection open and streams ONLY
+    // undecodable / unknown / error frames (spaced < the window, so the TRANSPORT's byte timer is
+    // perpetually re-armed and never emits `.stale`) after one healthy snapshot must NOT keep the
+    // store healthy. The store's OWN watchdog — keyed on VALID decodable frames, not raw bytes — trips
+    // `.stale`. This is the exact scenario the 130 prior tests missed; asserted deterministically here
+    // via the generation-guarded watchdog seam (no real clock), exactly as `WatchStateMachineTests`
+    // drives the transport's liveness timer by feeding a generation-guarded `livenessElapsed`.
+    func testContinuousUndecodableFramesAfterHealthyTripWatchdogToStale() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connected, "healthy after the snapshot")
+        let armed = m.watchdogGeneration                  // the watchdog armed by the healthy snapshot
+
+        // A continuous stream of NON-decodable frames — garbage, a pre-#164 error line, an unknown
+        // future frame, a type-less line — none of which is valid liveness. Each re-arms the
+        // TRANSPORT's byte timer in production; NONE must advance the store's valid-frame watchdog.
+        for line in ["not json", #"{"error":"unknown command"}"#, "@@@garbage@@@",
+                     Fixtures.unknownFutureType, Fixtures.noTypeTag, "still not json"] {
+            _ = m.apply(.line(line))
+            XCTAssertEqual(m.connectionState, .connected,
+                           "still healthy WHILE garbage flows < window — the watchdog has not elapsed yet")
+        }
+        XCTAssertEqual(m.watchdogGeneration, armed,
+                       "garbage / unknown / error lines must NOT re-arm the valid-frame watchdog")
+
+        // The window elapses with no valid frame → the store downgrades ITSELF to stale, independent
+        // of the transport (which, byte-live, would never have emitted `.stale`).
+        m.watchdogElapsed(generation: armed)
+        XCTAssertEqual(m.connectionState, .stale, "no valid frame in the window → the store goes stale")
+        XCTAssertFalse(m.connectionState.isHealthy, "MUST NOT render healthy on a garbage-emitting daemon")
+        XCTAssertEqual(m.presentation.glyph, .stale)
+    }
+
+    // The general never-healthy case: a daemon that connects and then streams ONLY garbage — never a
+    // single valid snapshot — must not sit at `.connecting` forever on a byte-live socket. The
+    // watchdog (armed by `.connected`, never re-armed absent a valid frame) downgrades it to `.stale`.
+    func testConnectThenOnlyGarbageTripsWatchdogFromConnecting() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        XCTAssertEqual(m.connectionState, .connecting)
+        let armed = m.watchdogGeneration                   // armed by `.connected`; no valid frame re-arms it
+        for line in ["not json", #"{"error":"unknown command"}"#, Fixtures.noTypeTag, "@@@garbage@@@"] {
+            _ = m.apply(.line(line))
+            XCTAssertEqual(m.connectionState, .connecting, "no valid frame yet → still connecting, never healthy")
+        }
+        XCTAssertEqual(m.watchdogGeneration, armed, "garbage never re-armed the watchdog")
+        m.watchdogElapsed(generation: armed)
+        XCTAssertEqual(m.connectionState, .stale, "connect-then-only-garbage goes stale, not stuck connecting")
+        XCTAssertFalse(m.connectionState.isHealthy)
+    }
+
+    // AC (#344): a HEARTBEAT is a valid frame — it RESETS the watchdog (re-arms under a new token) and
+    // keeps a still-open healthy connection healthy, so a daemon beating within the window is NEVER
+    // falsely marked stale (no over-correction into flagging healthy daemons). The superseded
+    // pre-heartbeat token is ignored; only elapsing the CURRENT token trips stale.
+    func testHeartbeatWithinWindowResetsWatchdogAndKeepsHealthy() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        let beforeBeat = m.watchdogGeneration
+
+        XCTAssertEqual(m.apply(.line(Fixtures.heartbeatBasic)), .appliedHeartbeat)
+        XCTAssertNotEqual(m.watchdogGeneration, beforeBeat, "a heartbeat re-arms the watchdog")
+        XCTAssertEqual(m.connectionState, .connected, "the beat keeps the healthy roster healthy")
+
+        // The SUPERSEDED (pre-heartbeat) timer firing late is ignored — the beat reset the countdown.
+        m.watchdogElapsed(generation: beforeBeat)
+        XCTAssertEqual(m.connectionState, .connected, "a superseded watchdog token must not trip stale")
+        XCTAssertTrue(m.connectionState.isHealthy)
+
+        // Only after the CURRENT window elapses with no further valid frame does it finally go stale.
+        m.watchdogElapsed(generation: m.watchdogGeneration)
+        XCTAssertEqual(m.connectionState, .stale)
+    }
+
+    // The watchdog is a strictly-narrow downgrade: it fires only on the CURRENT token AND only on a
+    // LIVE connection, so a stale token, or an elapse after a drop, is a harmless no-op — it can never
+    // manufacture `.stale` from `.disconnected` / `.initial`, nor fire twice.
+    func testWatchdogElapseIsGenerationGuardedLiveOnlyAndIdempotent() {
+        // A stale token after a fresh snapshot re-armed the watchdog → ignored.
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        m.watchdogElapsed(generation: 0)                   // an old token → ignored
+        XCTAssertEqual(m.connectionState, .connected)
+
+        // After a disconnect the connection is not live → an elapse cannot resurrect a `.stale`.
+        var n = HonestStateMachine()
+        _ = n.apply(.connected)
+        _ = n.apply(.line(Fixtures.snapshotBasic))
+        let tokenBeforeDrop = n.watchdogGeneration
+        _ = n.apply(.disconnected(reason: "EOF"))
+        n.watchdogElapsed(generation: tokenBeforeDrop)     // token superseded by the drop anyway
+        if case .disconnected = n.connectionState {} else {
+            XCTFail("an elapse after disconnect must stay disconnected, got \(n.connectionState)")
+        }
+
+        // Idempotent: once stale, a repeat elapse of the same token stays stale (no double-fire).
+        var p = HonestStateMachine()
+        _ = p.apply(.connected)
+        _ = p.apply(.line(Fixtures.snapshotBasic))
+        let t = p.watchdogGeneration
+        p.watchdogElapsed(generation: t)
+        XCTAssertEqual(p.connectionState, .stale)
+        p.watchdogElapsed(generation: t)
+        XCTAssertEqual(p.connectionState, .stale, "a second elapse of the same token is a no-op")
+    }
+
+    // The watchdog un-stales exactly like the transport's `.stale`: after it trips, a fresh snapshot
+    // (or heartbeat) on the still-open connection re-earns healthy and re-arms the watchdog.
+    func testValidFrameAfterWatchdogStaleReturnsHealthyAndReArms() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        m.watchdogElapsed(generation: m.watchdogGeneration)
+        XCTAssertEqual(m.connectionState, .stale)
+
+        _ = m.apply(.line(Fixtures.snapshotBasic))         // a fresh valid frame un-stales + re-arms
+        XCTAssertEqual(m.connectionState, .connected)
+        let rearmed = m.watchdogGeneration
+        m.watchdogElapsed(generation: rearmed)             // and the watchdog can trip again
+        XCTAssertEqual(m.connectionState, .stale)
+    }
+
     // MARK: - Presentation labels (spot-check the a11y surface per state)
 
     func testPresentationAccessibilityLabelsPerState() {

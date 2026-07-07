@@ -30,6 +30,19 @@
 // SCOPE (#324): the MINIMAL honest-state baseline only — connecting / connected / empty-roster /
 // stale / disconnected / unsupported. The FULL degraded-state map (crash-loop debounce,
 // keychain-locked, stale-snapshot detail, the rich version-skew upgrade UX) is #169.
+//
+// STORE-SIDE STALENESS WATCHDOG (#344): staleness must NOT depend solely on the transport's
+// byte-level liveness timer. The transport re-arms that timer on ANY non-empty line — garbage,
+// `{"error":…}`, unknown frames included — so a daemon holding the connection open while streaming
+// only UNDECODABLE frames (spaced < the transport's window) after one healthy snapshot would keep
+// the transport perpetually live → it never emits `.stale` → the last healthy snapshot is retained
+// → the menubar renders healthy on a garbage-emitting daemon. This machine therefore runs its OWN
+// generation-guarded watchdog keyed on VALID DECODABLE FRAMES (a `snapshot` or `heartbeat`), NOT raw
+// bytes: `watchdogElapsed(generation:)` downgrades a live connection to `.stale` once the window has
+// passed with no valid frame. It is an ADDITIONAL, independent path to `.stale` that fires even while
+// the transport still thinks the connection is live; the transport's own `.stale` continues to work
+// unchanged. The pure core stays clock-free (mirroring `WatchStateMachine`) — the `WatchStatusStore`
+// shell performs the real `Task.sleep(for:)` and feeds the elapse back.
 
 // MARK: - The honest connection states (the UI's single source of truth)
 
@@ -185,6 +198,21 @@ enum LineOutcome: Equatable, Sendable {
     case ignoredUndecodable(String)
 }
 
+extension LineOutcome {
+    /// Whether this line was a VALID DECODABLE FRAME — a `snapshot` or `heartbeat` (schema-supported
+    /// or not; an unsupported-major frame still decoded as a real protocol frame, proving the daemon
+    /// is speaking the wire contract) — and therefore proves liveness and RESETS the store-side
+    /// valid-frame watchdog (#344). An undecodable line or an unknown/`type`-less frame does NOT: that
+    /// is precisely the honesty the watchdog enforces — raw bytes that re-arm the transport's timer
+    /// must not masquerade as valid daemon liveness in the store.
+    var resetsValidFrameWatchdog: Bool {
+        switch self {
+        case .appliedSnapshot, .appliedHeartbeat, .unsupportedSchema: return true
+        case .ignoredUnknownFrame, .ignoredUndecodable: return false
+        }
+    }
+}
+
 // MARK: - The machine
 
 /// The pure honest-state reducer. Fold transport events in with `apply`; read the derived
@@ -212,6 +240,18 @@ struct HonestStateMachine {
 
     private var liveness: Liveness = .initial
     private var snapshotClass: SnapshotClass = .none
+
+    /// The store-side valid-frame watchdog token (#344), mirroring `WatchStateMachine`'s
+    /// `livenessGeneration`: bumped every time the watchdog is (re)armed by a valid decodable frame
+    /// or a (re)connect, and every time it is invalidated by a drop / transport-stale. A fired
+    /// `watchdogElapsed` whose `generation` ≠ this is a superseded timer and is ignored. The shell
+    /// re-arms its real `Task.sleep` timer whenever this value changes across an `apply`.
+    private(set) var watchdogGeneration = 0
+
+    /// Whether a valid-frame watchdog should currently be running: only on a LIVE connection, where a
+    /// valid frame is expected within the window. `.initial` / `.stale` / `.disconnected` are already
+    /// non-live, so the shell cancels (not re-arms) its timer when this is `false`.
+    var isWatchingForValidFrames: Bool { liveness == .live }
 
     /// The derived view outputs (mirrored into the store's `@Published` surface).
     private(set) var rows: [AccountRow] = []
@@ -255,6 +295,7 @@ struct HonestStateMachine {
             // blanked) until a fresh snapshot confirms them.
             liveness = .live
             snapshotClass = .none
+            watchdogGeneration += 1        // ARM: expect a valid frame within the window (#344)
             return nil
         case .disconnected(let reason):
             // Socket dropped: last-good rows/nextSwap/generatedAt are RETAINED but the state is now
@@ -265,14 +306,36 @@ struct HonestStateMachine {
             // transport orders `.connected` first, but the invariant must not depend on that).
             liveness = .disconnected(reason: reason)
             snapshotClass = .none
+            watchdogGeneration += 1        // INVALIDATE: already non-live, no watchdog needed (#344)
             return nil
         case .stale:
             // Connection still open, daemon silent: last-good data retained but MARKED stale.
             liveness = .stale
+            watchdogGeneration += 1        // INVALIDATE: transport already declared stale (#344)
             return nil
         case .line(let line):
-            return applyLine(line)
+            let outcome = applyLine(line)
+            // RE-ARM the watchdog ONLY for a valid decodable frame; an undecodable/unknown line does
+            // not advance the token, so the timer armed by the last valid frame keeps counting down —
+            // that is how continuous garbage after a healthy snapshot still trips `.stale` (#344).
+            if outcome.resetsValidFrameWatchdog { watchdogGeneration += 1 }
+            return outcome
         }
+    }
+
+    /// Fold in an elapsed store-side valid-frame watchdog (#344): "no VALID decodable frame in the
+    /// window → `.stale`", the store's own staleness path, independent of the transport's byte-level
+    /// liveness timer. Generation-guarded exactly like `WatchStateMachine`'s liveness timer — a token
+    /// superseded by a later valid frame (or a connect / drop / transport-stale) is ignored — and it
+    /// only downgrades a currently-LIVE connection, so it can never override an already-`.disconnected`
+    /// / `.stale` / `.initial` state, nor fire twice. This closes the honest-state hole where a daemon
+    /// holding the connection open while streaming only undecodable/unknown frames (which re-arm the
+    /// transport's byte timer but are not valid liveness here) would otherwise hold the last healthy
+    /// snapshot forever. A later valid frame (`snapshot`/`heartbeat`) re-arms and un-stales as before.
+    mutating func watchdogElapsed(generation: Int) {
+        guard generation == watchdogGeneration else { return }  // superseded by a later frame → ignore
+        guard liveness == .live else { return }                 // only a live connection can go stale
+        liveness = .stale
     }
 
     // MARK: - Line handling (decode-defensive)

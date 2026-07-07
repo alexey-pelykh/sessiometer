@@ -13,9 +13,14 @@
 //
 // ALL honest-state logic — and the crown-jewel "never healthy on a degraded/absent daemon" invariant
 // (ADR-0003 UI analogue) — lives in the pure core, so this shell has no branching state logic to get
-// wrong: it pumps events in and copies derived values out. Because the store consumes an INJECTED
-// stream (not a `WatchTransport` it builds), it is unit-testable against a synthetic
-// `AsyncStream<TransportEvent>` — no socket, and independent of #328's mock-socket harness.
+// wrong: it pumps events in and copies derived values out. The one piece of MECHANISM it owns is the
+// store-side valid-frame watchdog's real timer (#344): the pure core decides WHEN the watchdog should
+// (re)arm (it bumps a generation token) and WHAT elapsing means (`watchdogElapsed` → `.stale`); this
+// shell only performs the `Task.sleep(for:)` and feeds the elapse back — exactly as `WatchTransport`
+// performs `WatchStateMachine`'s `armLiveness` effect. Because the store consumes an INJECTED stream
+// (not a `WatchTransport` it builds), it is unit-testable against a synthetic
+// `AsyncStream<TransportEvent>` — no socket, and independent of #328's mock-socket harness; the
+// watchdog window is injected too, so the timer path is driven deterministically in tests.
 //
 // macOS 13 floor → `ObservableObject` + `@Published` (Combine), not the 14+ `@Observable` macro. The
 // consume loop runs ON the MainActor (the `Task` inherits `@MainActor`), so every `@Published`
@@ -65,7 +70,27 @@ final class WatchStatusStore: ObservableObject {
     private var machine = HonestStateMachine()
     private var consumeTask: Task<Void, Never>?
 
-    init() {
+    /// The default store-side valid-frame watchdog window (#344): 32 s — identical to the transport's
+    /// `livenessWindow`. A healthy daemon emits a snapshot or heartbeat every ≤ 15 s
+    /// (`WATCH_HEARTBEAT`), so 32 s (> 2× that, plus scheduling grace) means TWO consecutive expected
+    /// valid frames were missed = unambiguously degraded, while a single late/dropped beat never
+    /// false-trips. Matching the transport's window keeps the two staleness paths coherent: the store
+    /// never declares stale SOONER than the transport for a genuinely silent daemon; it only ADDS a
+    /// path for a byte-live-but-frame-dead daemon (the #344 hole).
+    ///
+    /// `nonisolated` so it is referenceable from the `init` default-argument expression (a nonisolated
+    /// context) — safe because it is an immutable `Sendable` `Duration` constant.
+    nonisolated static let defaultValidFrameWindow: Duration = .seconds(32)
+
+    /// How long the store tolerates a live connection with NO valid decodable frame before it drives
+    /// itself `.stale` — injected so tests drive the timer deterministically (as `WatchTransport`
+    /// injects `livenessWindow`).
+    private let validFrameWindow: Duration
+    /// The in-flight watchdog timer, re-armed whenever the pure core bumps its watchdog generation.
+    private var watchdogTask: Task<Void, Never>?
+
+    init(validFrameWindow: Duration = WatchStatusStore.defaultValidFrameWindow) {
+        self.validFrameWindow = validFrameWindow
         (presentations, presentationsContinuation) =
             AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
         // Seed the glance with the initial `.connecting` so a consumer attaching before the first
@@ -84,19 +109,59 @@ final class WatchStatusStore: ObservableObject {
                 self?.ingest(event)
             }
             self?.presentationsContinuation.finish()
+            self?.watchdogTask?.cancel()          // teardown: drop the in-flight valid-frame watchdog
         }
     }
 
     private func ingest(_ event: TransportEvent) {
+        let watchdogGenerationBefore = machine.watchdogGeneration
         let outcome = machine.apply(event)
         log(outcome)
-        // Mirror the pure core's derived state onto the published surface + the glance stream.
+        // The pure core bumps its watchdog token whenever a valid frame (re)arms it, or a
+        // connect / drop / transport-stale arms/invalidates it. When it changed, mirror that intent
+        // onto the real timer — (re)arm on a live connection, cancel otherwise (#344).
+        if machine.watchdogGeneration != watchdogGenerationBefore {
+            rearmValidFrameWatchdog()
+        }
+        publish()
+    }
+
+    /// Mirror the pure core's derived state onto the published surface + the glance stream. Shared by
+    /// event ingestion and the watchdog-fired path so both surfaces stay in lock-step with the core.
+    private func publish() {
         connectionState = machine.connectionState
         rows = machine.rows
         nextSwap = machine.nextSwap
         refreshEnabled = machine.refreshEnabled
         generatedAt = machine.generatedAt
         presentationsContinuation.yield(machine.presentation)
+    }
+
+    // MARK: - Store-side valid-frame watchdog (#344)
+
+    /// (Re)arm — or cancel — the store-side valid-frame watchdog to match the pure core's current
+    /// intent. Real-timer analogue of `WatchTransport.armLiveness`: cancel any prior timer, and if the
+    /// core is still watching for valid frames, sleep the window then feed the (generation-guarded)
+    /// elapse back. The generation guard makes a superseded timer that still fires a harmless no-op,
+    /// so a late cancellation never mis-fires `.stale`.
+    private func rearmValidFrameWatchdog() {
+        watchdogTask?.cancel()
+        guard machine.isWatchingForValidFrames else { watchdogTask = nil; return }
+        let generation = machine.watchdogGeneration
+        let window = validFrameWindow
+        // Created in this `@MainActor` context, so the closure is MainActor-isolated: the elapse hop
+        // back to the machine + published surface runs on main, where SwiftUI expects mutations.
+        watchdogTask = Task { [weak self] in
+            do { try await Task.sleep(for: window) } catch { return }   // cancelled → drop
+            self?.validFrameWatchdogElapsed(generation: generation)
+        }
+    }
+
+    /// The watchdog fired: fold the elapse into the machine (a superseded token is ignored there) and
+    /// re-publish in case it downgraded a live connection to `.stale`.
+    private func validFrameWatchdogElapsed(generation: Int) {
+        machine.watchdogElapsed(generation: generation)
+        publish()
     }
 
     /// Log a line's decode outcome. The `watch` stream is redacted at source (no token / email /
