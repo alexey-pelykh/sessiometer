@@ -65,6 +65,12 @@ jobs:
               - '.github/workflows/ci.yml'
             swift:
               - 'apps/menubar/**'
+              # The Rust-emitted wire goldens the Swift byte-drift guard pins against (issue #340,
+              # apps/menubar/Tests/WireGoldenTests.swift). A daemon wire change regenerates these
+              # under src/** with no apps/menubar/** touch, so without this the swift job would skip
+              # and the cross-language drift would land uncaught. (Broad build/fixtures/** matches the
+              # rust filter above; an unrelated migration-fixture edit just re-runs swift, which passes.)
+              - 'build/fixtures/**'
               - '.github/workflows/ci.yml'
 
   # Full gate: format, lints, docs, build, tests. `-D warnings` clippy/rustdoc behavior is

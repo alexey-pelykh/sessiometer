@@ -8363,6 +8363,104 @@ mod tests {
         assert!(parse_watch_frame("not json").is_err());
     }
 
+    // --- Cross-language wire golden fixtures (issue #340) ----------------------------------
+    //
+    // The byte-frozen goldens the Swift menubar wire fixtures (`apps/menubar/Tests/Fixtures.swift`)
+    // are pinned against. #322 hand-mirrored the daemon's frozen #164 wire contract into Swift
+    // `Codable` types + byte-exact fixtures, but nothing caught a FUTURE daemon wire change silently
+    // diverging from that hand-written mirror — ADR-0010 keeps Rust out of the Swift build, so the
+    // Swift-only suite validates against its OWN now-stale fixtures and stays green. These goldens
+    // close that gap: the daemon serializes its own wire encoders here (the single source of truth),
+    // the byte-equality pin test below asserts the committed bytes still match (so a wire change
+    // can't land without regenerating them), and CI asserts the Swift fixtures are byte-identical to
+    // the same bytes (`apps/menubar/Tests/WireGoldenTests.swift`) — forcing the Swift mirror to move
+    // in lockstep with any daemon wire change.
+    //
+    // Unlike the `src/migration.rs` golden (non-deterministic AEAD salt/nonce → a one-time
+    // `#[ignore]` emitter, read-only thereafter), wire serialization is DETERMINISTIC, so the pin
+    // test re-emits in-process and asserts byte-equality directly — a stronger gate than a frozen
+    // read-only capture.
+
+    /// The canonical snapshot frame the golden freezes: `encode_snapshot_frame` for
+    /// `watch_snapshot("work", 42, 0.60)` — the SAME input
+    /// [`parse_watch_frame_classifies_each_frame_kind`] decodes, so the golden and that test can
+    /// never disagree on the representative healthy frame. Mirrored by Swift `Fixtures.snapshotBasic`.
+    fn wire_golden_snapshot_frame() -> String {
+        encode_snapshot_frame(&versioned_status_response(&watch_snapshot(
+            "work", 42, 0.60,
+        )))
+    }
+
+    /// The canonical heartbeat frame the golden freezes: `encode_heartbeat_frame(42)` — mirrored by
+    /// Swift `Fixtures.heartbeatBasic`.
+    fn wire_golden_heartbeat_frame() -> String {
+        encode_heartbeat_frame(42)
+    }
+
+    /// One-time emitter for the committed wire goldens. `#[ignore]` — NOT part of the suite; it
+    /// WRITES the bytes the pin test and the Swift fixtures consume. Run it ONLY alongside a
+    /// deliberate wire-contract change:
+    ///   `cargo test -- --ignored emit_wire_golden_fixtures`
+    /// then update the Swift mirror (`apps/menubar/Sources/WireModel.swift`) and fixtures
+    /// (`apps/menubar/Tests/Fixtures.swift`) so the cross-language byte-equality holds again.
+    #[test]
+    #[ignore = "one-time wire-golden emitter — run ONLY alongside a deliberate wire-contract change"]
+    fn emit_wire_golden_fixtures() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/fixtures");
+        std::fs::create_dir_all(&dir).expect("create build/fixtures");
+        std::fs::write(
+            dir.join("wire-snapshot-basic.json"),
+            wire_golden_snapshot_frame(),
+        )
+        .expect("write wire-snapshot golden");
+        std::fs::write(
+            dir.join("wire-heartbeat-basic.json"),
+            wire_golden_heartbeat_frame(),
+        )
+        .expect("write wire-heartbeat golden");
+    }
+
+    /// The committed snapshot-frame golden — the exact bytes Swift `Fixtures.snapshotBasic` is
+    /// pinned to. `include_str!` makes the file a compile-time input, so it must exist before this
+    /// module compiles (emit once via [`emit_wire_golden_fixtures`]).
+    const WIRE_SNAPSHOT_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-snapshot-basic.json"
+    ));
+
+    /// The committed heartbeat-frame golden — the exact bytes Swift `Fixtures.heartbeatBasic` is
+    /// pinned to.
+    const WIRE_HEARTBEAT_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-heartbeat-basic.json"
+    ));
+
+    #[test]
+    fn the_committed_wire_goldens_still_match_the_daemon_encoders() {
+        // The load-bearing gate. Wire serialization is deterministic, so re-emitting in-process and
+        // comparing to the COMMITTED bytes catches any daemon wire-type change — a renamed / added /
+        // reordered / re-typed field, a changed enum tag, a `STATUS_SCHEMA_VERSION` bump — that
+        // shifts the bytes: the committed golden goes stale and this fails, forcing a regenerate
+        // (`emit_wire_golden_fixtures`) that in turn breaks the Swift byte-equality check until the
+        // hand-written Swift mirror is updated too. That is the cross-language lockstep #340 exists
+        // to enforce — no same-language test can witness a divergence between the Rust wire types
+        // and the independently-maintained Swift mirror.
+        assert_eq!(
+            wire_golden_snapshot_frame(),
+            WIRE_SNAPSHOT_GOLDEN,
+            "the committed wire-snapshot golden drifted from encode_snapshot_frame — re-run \
+             `cargo test -- --ignored emit_wire_golden_fixtures`, then update the Swift mirror \
+             (apps/menubar) so its fixtures stay byte-identical"
+        );
+        assert_eq!(
+            wire_golden_heartbeat_frame(),
+            WIRE_HEARTBEAT_GOLDEN,
+            "the committed wire-heartbeat golden drifted from encode_heartbeat_frame — re-run \
+             `cargo test -- --ignored emit_wire_golden_fixtures`, then update the Swift mirror \
+             (apps/menubar) so its fixtures stay byte-identical"
+        );
+    }
+
     #[test]
     fn control_reply_rejects_malformed_json() {
         let (reply, signal) = control_reply("not json", &StatusSnapshot::default(), true);
