@@ -55,6 +55,13 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":1893456200,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false}
     """#
 
+    /// A schema-supported snapshot with ZERO accounts — the real first-run / empty-roster frame the
+    /// daemon emits before any account is captured (B-014). Supported major, so it is a DISTINCT
+    /// "connected but empty" state, NOT the pre-freeze / unsupported empty snapshots below.
+    static let snapshotEmptyRoster = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":100,"accounts":[],"next_swap":null,"refresh_enabled":false}
+    """#
+
     /// `encode_heartbeat_frame(42)` — the canonical beat the Rust test decodes.
     static let heartbeatBasic = #"""
     {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":0}}

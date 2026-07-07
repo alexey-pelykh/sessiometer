@@ -24,13 +24,14 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Info.plist
-  # Wire-decoder (#322) + socket-transport (#323) unit tests. A STANDALONE logic-test bundle:
-  # no TEST_HOST, so it never launches the app — it compiles the pure production sources
-  # directly alongside the tests (NOT the whole Sources dir: main.swift is the app's top-level
-  # AppKit entry, which cannot live in a unit-test bundle). The transport sources are compiled
-  # here so the state machine, backoff schedule, path resolver, and the actor shell (driven by an
-  # in-process fake connector) are exercised without a real socket. Runs headless under
-  # `xcodebuild test`.
+  # Wire-decoder (#322) + socket-transport (#323) + status-store (#324) unit tests. A STANDALONE
+  # logic-test bundle: no TEST_HOST, so it never launches the app — it compiles the pure production
+  # sources directly alongside the tests (NOT the whole Sources dir: main.swift is the app's
+  # top-level AppKit entry, which cannot live in a unit-test bundle). The transport sources are
+  # compiled here so the state machine, backoff schedule, path resolver, and the actor shell (driven
+  # by an in-process fake connector) are exercised without a real socket; the honest-state machine +
+  # `WatchStatusStore` are driven by a synthetic `AsyncStream<TransportEvent>` (no socket, no
+  # transport). Runs headless under `xcodebuild test`.
   MenubarTests:
     type: bundle.unit-test
     platform: macOS
@@ -41,6 +42,8 @@ targets:
       - path: Sources/SocketPathResolver.swift
       - path: Sources/WatchConnection.swift
       - path: Sources/WatchTransport.swift
+      - path: Sources/HonestStateMachine.swift
+      - path: Sources/WatchStatusStore.swift
       - path: Tests
     settings:
       base:
