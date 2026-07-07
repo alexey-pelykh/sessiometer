@@ -133,11 +133,12 @@ jobs:
       - name: Supply-chain gates (advisories, sources, licenses)
         run: cargo deny check advisories sources licenses
 
-  # Swift menu-bar app (apps/menubar/, issue #311). Generates the Xcode project from
-  # project.yml with XcodeGen, then builds the LSUIElement skeleton. macos-latest ships a
-  # full Xcode; XcodeGen comes from Homebrew. The build is unsigned (CODE_SIGNING_ALLOWED=NO)
-  # — Developer-ID signing + notarization is #171. No test target yet (skeleton only), so
-  # this is a build, not a test run.
+  # Swift menu-bar app (apps/menubar/, issues #311, #322). Generates the Xcode project from
+  # project.yml with XcodeGen, then builds the LSUIElement app AND runs the wire-decoder unit
+  # tests (#322 added the MenubarTests standalone logic-test bundle). macos-latest ships a
+  # full Xcode; XcodeGen comes from Homebrew. `xcodebuild test` builds `Menubar: all` (so the
+  # app skeleton is still compiled) plus the test bundle, then runs it. Unsigned
+  # (CODE_SIGNING_ALLOWED=NO) — Developer-ID signing + notarization is #171.
   swift:
     name: swift
     needs: changes
@@ -150,14 +151,14 @@ jobs:
       - name: Generate Xcode project
         working-directory: apps/menubar
         run: xcodegen generate
-      - name: Build
+      - name: Build and test
         working-directory: apps/menubar
         run: |
-          xcodebuild build \
+          xcodebuild test \
             -project Menubar.xcodeproj \
             -scheme Menubar \
             -configuration Debug \
-            -destination 'generic/platform=macOS' \
+            -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO
 
   # Meta-check (issue #318): assert `ci-ok.needs` names every other job, so a new job can't be
