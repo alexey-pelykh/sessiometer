@@ -240,7 +240,7 @@ requirement above.
 ## Related
 
 - **Issues**: **#321** (this spike / ADR). Governs **#323** (`WatchTransport`, WI-2 —
-  **open**). Consumes **#322** (the Swift `watch` decoder — **closed**), **#165** (the
+  **closed via #342**). Consumes **#322** (the Swift `watch` decoder — **closed**), **#165** (the
   daemon `watch` subscription — **closed**), **#164** (the frozen versioned snapshot
   contract — **closed**). Part of **#168** (the menu-bar app). Rationale touchpoints:
   **#271** (no network egress), **#209** (the credential-capture boundary the spike

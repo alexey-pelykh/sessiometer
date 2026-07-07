@@ -129,6 +129,12 @@ Before adding a dependency, weigh:
   on one of its commits, so a change to the merge gate's own definition lands
   deliberately and auditably rather than slipping through green in this solo repo
   (issue #317).
+- [`scripts/check-ci-ok-needs.sh`](scripts/check-ci-ok-needs.sh)
+  — a CI guard (the `ci-ok-needs-complete` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that parses the workflow
+  and fails the build if any job other than `ci-ok` is missing from `ci-ok.needs`,
+  so a newly added job cannot silently escape the `ci-ok` summary gate's rollup
+  (issue #318).
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing
