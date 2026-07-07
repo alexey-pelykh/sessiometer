@@ -24,15 +24,23 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Info.plist
-  # Wire-decoder unit tests (#322). A STANDALONE logic-test bundle: no TEST_HOST, so it
-  # never launches the app — it compiles the pure decoder source (Sources/WireModel.swift)
-  # directly alongside the tests, and exercises `parseWatchFrame` over inline golden fixtures
-  # (no bundle resources). Runs headless under `xcodebuild test`.
+  # Wire-decoder (#322) + socket-transport (#323) unit tests. A STANDALONE logic-test bundle:
+  # no TEST_HOST, so it never launches the app — it compiles the pure production sources
+  # directly alongside the tests (NOT the whole Sources dir: main.swift is the app's top-level
+  # AppKit entry, which cannot live in a unit-test bundle). The transport sources are compiled
+  # here so the state machine, backoff schedule, path resolver, and the actor shell (driven by an
+  # in-process fake connector) are exercised without a real socket. Runs headless under
+  # `xcodebuild test`.
   MenubarTests:
     type: bundle.unit-test
     platform: macOS
     sources:
       - path: Sources/WireModel.swift
+      - path: Sources/TransportEvent.swift
+      - path: Sources/WatchStateMachine.swift
+      - path: Sources/SocketPathResolver.swift
+      - path: Sources/WatchConnection.swift
+      - path: Sources/WatchTransport.swift
       - path: Tests
     settings:
       base:
