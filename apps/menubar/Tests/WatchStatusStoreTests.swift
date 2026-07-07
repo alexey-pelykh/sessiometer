@@ -106,6 +106,76 @@ final class WatchStatusStoreTests: XCTestCase {
         continuation.finish()
     }
 
+    // MARK: - AC (#344): the store's own valid-frame watchdog trips stale on a byte-live daemon
+
+    // The store-level end-to-end proof of the #344 fix: a daemon holding the connection open and
+    // streaming ONLY undecodable frames (spaced well under the window) after a healthy snapshot drives
+    // the STORE to `.stale` on its own. The injected window is the "clock" the test advances (real
+    // `Task.sleep`), mirroring how `WatchTransportTests` drives the transport's liveness timer with a
+    // small injected `livenessWindow`. Before the watchdog, this stream held the store healthy forever.
+    func testContinuousUndecodableStreamTripsTheStoreWatchdogToStale() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(validFrameWindow: .milliseconds(200))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotBasic))
+        try await waitForGlyph(recorder, .healthy)
+
+        // Keep the byte stream "live" with continuous garbage spaced well under the window — exactly
+        // what perpetually re-arms the transport and starves the store of a transport `.stale`.
+        let emitter = Task {
+            for i in 0..<40 {
+                continuation.yield(.line("garbage line \(i) — not a frame"))
+                try? await Task.sleep(for: .milliseconds(40))
+            }
+        }
+
+        // The store's valid-frame watchdog trips ~one window after the snapshot, DESPITE the garbage.
+        try await waitForGlyph(recorder, .stale)
+        XCTAssertEqual(store.connectionState, .stale)
+        XCTAssertFalse(store.connectionState.isHealthy, "never healthy on a garbage-emitting daemon")
+
+        emitter.cancel()
+        continuation.finish()
+    }
+
+    // AC (#344): a heartbeat RE-ARMS the store watchdog end-to-end. After the watchdog trips stale on
+    // a silent connection, a heartbeat un-stales to healthy AND re-arms — proven by the watchdog
+    // tripping stale a SECOND time. (That a beat *keeps* a fresh connection healthy WITHIN the window
+    // is proven deterministically in `HonestStateMachineTests`.)
+    func testHeartbeatReArmsTheStoreWatchdog() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(validFrameWindow: .milliseconds(200))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotBasic))
+        try await waitForGlyph(recorder, .healthy)
+        try await waitForGlyph(recorder, .stale)           // watchdog trips on the now-silent connection
+
+        continuation.yield(.line(Fixtures.heartbeatBasic)) // a valid beat un-stales AND re-arms
+        try await waitForGlyph(recorder, .healthy)
+        try await waitForGlyph(recorder, .stale)           // the re-armed watchdog trips again
+
+        continuation.finish()
+    }
+
+    // AC (#344) window rationale: the store's valid-frame window must exceed 2× the daemon's 15 s
+    // heartbeat (a healthy daemon beating every ≤ 15 s is never falsely marked stale) — the same
+    // contract the transport's liveness window is pinned to. Pinning it here means a future edit can't
+    // quietly shrink it below the threshold without turning this test red.
+    func testDefaultValidFrameWindowExceedsTwiceTheDaemonHeartbeat() {
+        let daemonHeartbeat = Duration.seconds(15)         // src/daemon/socket.rs WATCH_HEARTBEAT
+        let window = WatchStatusStore.defaultValidFrameWindow
+        XCTAssertGreaterThan(window, daemonHeartbeat * 2, "must tolerate one missed heartbeat (>2×15s)")
+        XCTAssertGreaterThan(window, .seconds(30), "in the same ballpark as the transport's 32 s window")
+    }
+
     // MARK: - Event-stream awaiting helpers (mirror of the transport suite's)
 
     private enum WaitError: Error { case timeout }
