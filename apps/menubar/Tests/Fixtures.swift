@@ -15,12 +15,16 @@
 // contract to exercise cases the CURRENT daemon never emits but the #164 additive contract
 // requires a client to tolerate (or, for a breaking major / a malformed body, to flag / reject).
 //
-// NOTE: byte-fidelity of the current-daemon fixtures is a HAND-MAINTAINED mirror — ADR-0010
-// keeps Rust out of the Swift build, so a future daemon wire change would desync them while
-// these tests (which assert semantic values, order-independently) stay green. A cross-language
-// golden regression guard (Rust emits a committed golden; CI diffs the Swift bytes against it,
-// mirroring the `src/migration.rs` fixture pattern) is tracked as a follow-up — it spans the
-// Rust crate + CI, outside this Swift-only leaf's scope (#322).
+// NOTE: byte-fidelity of the `snapshotBasic` / `heartbeatBasic` current-daemon fixtures is a
+// HAND-MAINTAINED mirror — ADR-0010 keeps Rust out of the Swift build, so a future daemon wire
+// change could desync them while the semantic decoder tests (which assert values order-
+// independently) stay green. That drift is now GUARDED (issue #340): the Rust crate emits a
+// committed golden by serializing its own wire encoders (`build/fixtures/wire-*.json`, emitted +
+// byte-equality-pinned in `src/daemon.rs`), and `WireGoldenTests.swift` asserts these two fixtures
+// are byte-identical to it — so a daemon wire change not mirrored here fails CI (the `swift` job's
+// path filter covers `build/fixtures/**`, so a golden regeneration re-runs the check). The
+// backward/forward-compat + rejected fixtures below are hand-built to states the current daemon
+// never emits, so they have no golden and are intentionally outside that guard.
 //
 // Kept in a dedicated file with no `XCTest` dependency so the fixtures are one source of truth
 // shared by the XCTest suite (`WireDecoderTests.swift`, under `xcodebuild test`) and any plain
