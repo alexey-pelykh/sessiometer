@@ -144,7 +144,13 @@ jobs:
   # tests (#322 added the MenubarTests standalone logic-test bundle). macos-latest ships a
   # full Xcode; XcodeGen comes from Homebrew. `xcodebuild test` builds `Menubar: all` (so the
   # app skeleton is still compiled) plus the test bundle, then runs it. Unsigned
-  # (CODE_SIGNING_ALLOWED=NO) — Developer-ID signing + notarization is #171.
+  # (CODE_SIGNING_ALLOWED=NO) — Developer-ID signing + notarization is #171. The first step is
+  # the zero-egress / pure-client guard (#328): the Swift-side peer of the `deny` job's
+  # check-no-security-framework.sh, a source-level regression gate that fails if the app grows
+  # a Security/Network-framework import, a host-networking symbol, or a network entitlement. It
+  # runs here (not a new top-level job) so `ci-ok.needs` — asserted complete by
+  # ci-ok-needs-complete (#318) — stays unchanged; the `swift` filter already gates it on
+  # apps/menubar/** so it runs whenever the app changes.
   swift:
     name: swift
     needs: changes
@@ -152,6 +158,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Zero egress / pure-client (no Security/Network import, no network entitlement)
+        run: ./scripts/check-menubar-zero-egress.sh
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate Xcode project

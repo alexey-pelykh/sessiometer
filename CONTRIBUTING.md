@@ -111,6 +111,16 @@ Before adding a dependency, weigh:
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build if
   `security-framework` appears anywhere in the dependency graph, so a refactor
   cannot silently reintroduce the SDK write path.
+- [`scripts/check-menubar-zero-egress.sh`](scripts/check-menubar-zero-egress.sh)
+  — the Swift-side peer of the guard above (the `swift` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)). The menu-bar app is a
+  pure local-socket client — it reaches the daemon over a raw POSIX AF_UNIX socket
+  only ([ADR-0011](docs/adr/0011-menubar-transport-raw-posix-af-unix.md)), never the
+  host network or the keychain — and this fails the build if `apps/menubar/Sources`
+  grows a `Security`/`Network`-framework import, a host-networking symbol
+  (`URLSession`, `NWConnection`, …), or a network entitlement. Like the daemon
+  guard it works at the source (build-input) level, not on the linked binary (issue
+  #328).
 - [`scripts/check-gate-change-ack.sh`](scripts/check-gate-change-ack.sh)
   — a CI guard (the `gate-change-ack` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build
