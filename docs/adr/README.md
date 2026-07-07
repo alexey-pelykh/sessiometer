@@ -23,6 +23,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0008](0008-login-decouples-unquarantine-from-activation.md) | `login` decouples un-quarantine from activation | Accepted |
 | [0009](0009-rate-limit-backoff-per-account.md) | Rate-limit back-off is scoped per-account, not endpoint-global | Accepted |
 | [0010](0010-macos-app-repo-topology.md) | macOS app repo topology — monorepo, first-party daemon, Rust crate at root | Accepted |
+| [0011](0011-menubar-transport-raw-posix-af-unix.md) | menubar↔daemon transport — raw POSIX AF_UNIX from Swift (not Network.framework) | Accepted |
 
 ## Conventions
 
