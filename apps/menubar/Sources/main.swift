@@ -1,18 +1,77 @@
+// Copyright (c) 2026 Oleksii PELYKH
+// SPDX-License-Identifier: MIT
+
+// The menu-bar app entry point (issue #325, part of #168). An LSUIElement / `.accessory` agent app —
+// no Dock icon, no main window, just the always-visible `NSStatusItem` chrome. It wires the honest
+// vertical slice built across #322–#325:
+//
+//   WatchTransport (#323, raw AF_UNIX, zero egress) → AsyncStream<TransportEvent>
+//     → WatchStatusStore (#324, the honest-state store)
+//       → StatusItemController (#325, the shape-encoded gauge + VoiceOver + click-to-toggle panel)
+//
+// The transport is built via `WatchTransport.production()`, which resolves the daemon's control-socket
+// path and applies the ADR-0011 non-sandbox tripwire. If it CANNOT resolve (sandboxed / home
+// unresolved), the app degrades LOUDLY and honestly: the store is fed a single `.disconnected`, so the
+// menu bar shows the slashed "disconnected" glyph — never a dishonest "connecting" that will never
+// resolve. The specific reason is logged and carried on the event; the D2 baseline glance (#324)
+// speaks a fixed "disconnected" sentence, so surfacing the reason itself is #169's richer degraded UX.
+
 import AppKit
+import os
 
-// Skeleton menu-bar (LSUIElement) app: it creates a single NSStatusItem and does
-// nothing else. The real menu-bar surface — icon, panel, and the AF_UNIX socket
-// client that consumes the daemon's frozen status snapshot — is #168. This target
-// exists only to prove the apps/menubar/ home and the dual-toolchain CI harness
-// (#311), per ADR-0010. It links no Rust and shares no build graph with the crate.
+private let appLog = Logger(subsystem: "com.sessiometer.menubar", category: "app")
 
+// The `NSApplicationDelegate` methods are already `@MainActor` (the AppKit protocol is), so all the
+// AppKit + store wiring below runs on the main actor without annotating the class — mirroring the
+// original skeleton, which built the `NSStatusItem` here. The stored references are each Sendable (two
+// `@MainActor` classes + an actor), so holding them on a non-isolated delegate is race-free.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem?
+    private var store: WatchStatusStore?
+    private var statusItemController: StatusItemController?
+    private var transport: WatchTransport?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "S"
-        statusItem = item
+        // The always-visible chrome: the status item consumes the store's glance stream.
+        let store = WatchStatusStore()
+        self.store = store
+        let controller = StatusItemController(store: store)
+        controller.start()
+        statusItemController = controller
+
+        // Feed the store from the daemon's watch socket — or degrade loudly if the path won't resolve.
+        switch WatchTransport.production() {
+        case .success(let transport):
+            self.transport = transport
+            store.start(consuming: transport.events)
+            Task { await transport.start() }
+        case .failure(let error):
+            appLog.error("watch transport unavailable: \(String(describing: error), privacy: .public)")
+            store.start(consuming: Self.disconnectedStream(reason: Self.reason(for: error)))
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        guard let transport else { return }
+        Task { await transport.stop() }
+    }
+
+    /// A one-shot event stream that yields a single `.disconnected` then finishes — the honest feed for
+    /// an unresolvable socket path, so the glance renders the "disconnected" glyph (the reason is logged
+    /// above and carried on the event) instead of a perpetual "connecting".
+    private static func disconnectedStream(reason: String) -> AsyncStream<TransportEvent> {
+        AsyncStream { continuation in
+            continuation.yield(.disconnected(reason: reason))
+            continuation.finish()
+        }
+    }
+
+    private static func reason(for error: SocketPathResolver.ResolveError) -> String {
+        switch error {
+        case .homeUnresolved:
+            return "home directory unresolved"
+        case .sandboxed:
+            return "app is sandboxed — the daemon socket is unreachable"
+        }
     }
 }
 
