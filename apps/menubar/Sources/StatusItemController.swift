@@ -38,7 +38,9 @@ final class StatusItemController {
         // `.transient` gave us.
         popover.behavior = .applicationDefined
         popover.animates = false
-        popover.contentViewController = NSHostingController(rootView: StatusPanelView(store: store))
+        // #326's status panel reads the store via `@EnvironmentObject` (a thin view over the
+        // `src/cli.rs`-mirroring `StatusPanelFormat`), so inject it here rather than through an init.
+        popover.contentViewController = NSHostingController(rootView: StatusPanelView().environmentObject(store))
         self.popover = popover
 
         // Seed the glyph + label synchronously from the store's current glance so the item is never

@@ -1,0 +1,286 @@
+// Copyright (c) 2026 Oleksii PELYKH
+// SPDX-License-Identifier: MIT
+
+// Parity + behavior tests for `StatusPanelFormat` (issue #326): the pure formatting the SwiftUI panel
+// renders. Because the panel draws NOTHING it did not format here, these tests are the panel's
+// acceptance gate — they pin every AC:
+//
+//   * rows render all wire fields (pct, reset-in, auth glyph/cue) — mirrored BYTE-FOR-BYTE against
+//     `src/cli.rs` `pct` / `reset_cell` / `humanize_until` / `health_glyph` / `health_cell` /
+//     `legacy_health_tags`, the same cases the Rust unit tests pin;
+//   * the single reset-in picks the WEEKLY reset when weekly-exhausted, else the SESSION reset;
+//   * the auth glyph == `health_glyph`, with `dead` → `claude /login`, `recovering` distinct, disabled
+//     tagged;
+//   * each honest state shows its banner;
+//   * the footer renders `next_swap` (forward candidate), not history;
+//   * the empty-roster card copies `sessiometer capture`;
+//   * every row is VoiceOver-navigable (one spoken label).
+//
+// The wire → row → panel integration cases decode the shared golden fixtures through `parseWatchFrame`
+// + `AccountRow.rows(from:)`, proving the panel formatting is fed by the real store projection (and
+// that `recovering` survives it — the field #326 added to `AccountRow`).
+
+import XCTest
+
+final class StatusPanelFormatTests: XCTestCase {
+
+    // MARK: - pct (mirror `src/cli.rs` `pct`)
+
+    func testPctRendersPercentOrNA() {
+        XCTAssertEqual(StatusPanelFormat.pct(60), "60%")
+        XCTAssertEqual(StatusPanelFormat.pct(0), "0%")     // never fabricated away
+        XCTAssertEqual(StatusPanelFormat.pct(100), "100%")
+        XCTAssertEqual(StatusPanelFormat.pct(nil), "n/a")  // failed poll, not a fake 0
+    }
+
+    // MARK: - humanizeUntil (mirror `src/cli.rs` `humanize_until`)
+
+    func testHumanizeUntilMatchesCliTwoLargestUnits() {
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(0), "now")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(-5), "now")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(30), "<1m")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(59), "<1m")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(600), "10m")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(2 * 3600), "2h")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(3600 + 5 * 60), "1h5m")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(3 * 86400), "3d")
+        XCTAssertEqual(StatusPanelFormat.humanizeUntil(86400 + 4 * 3600), "1d4h")
+    }
+
+    // MARK: - resetCell (mirror `src/cli.rs` `reset_cell`)
+
+    func testResetCellRendersEachWindowDirectlyOrNA() {
+        let now: Int64 = 1_000_000
+        XCTAssertEqual(StatusPanelFormat.resetCell(now + 600, now: now), "10m")
+        XCTAssertEqual(StatusPanelFormat.resetCell(now + 2 * 3600, now: now), "2h")
+        XCTAssertEqual(StatusPanelFormat.resetCell(now + 3 * 86400, now: now), "3d")
+        XCTAssertEqual(StatusPanelFormat.resetCell(nil, now: now), "n/a")
+    }
+
+    // MARK: - resetIn (issue #326 AC: weekly-exhausted → weekly, else session)
+
+    func testResetInPicksWeeklyWhenExhaustedElseSession() {
+        let now: Int64 = 1_000_000
+        let session: Int64 = now + 3600          // 1h
+        let weekly: Int64 = now + 3 * 86400       // 3d
+
+        // Not exhausted → the SESSION reset governs.
+        XCTAssertEqual(
+            StatusPanelFormat.resetIn(weeklyExhausted: false, sessionResetsAt: session, weeklyResetsAt: weekly, now: now),
+            "1h")
+        // Exhausted → the WEEKLY reset governs, regardless of the (sooner) session window.
+        XCTAssertEqual(
+            StatusPanelFormat.resetIn(weeklyExhausted: true, sessionResetsAt: session, weeklyResetsAt: weekly, now: now),
+            "3d")
+        // Unknown chosen instant → n/a (never a fabricated duration).
+        XCTAssertEqual(
+            StatusPanelFormat.resetIn(weeklyExhausted: false, sessionResetsAt: nil, weeklyResetsAt: weekly, now: now),
+            "n/a")
+        XCTAssertEqual(
+            StatusPanelFormat.resetIn(weeklyExhausted: true, sessionResetsAt: session, weeklyResetsAt: nil, now: now),
+            "n/a")
+    }
+
+    // MARK: - healthGlyph (mirror `src/cli.rs` `health_glyph`)
+
+    func testHealthGlyphMapsEachRollupState() {
+        XCTAssertEqual(StatusPanelFormat.healthGlyph(.healthy), "🟢")
+        XCTAssertEqual(StatusPanelFormat.healthGlyph(.unknown), "⚪")
+        XCTAssertEqual(StatusPanelFormat.healthGlyph(.stale), "🟡")
+        XCTAssertEqual(StatusPanelFormat.healthGlyph(.atRisk), "🟠")
+        XCTAssertEqual(StatusPanelFormat.healthGlyph(.dead), "🔴")
+    }
+
+    // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
+
+    func testAuthCellMirrorsHealthCell() {
+        // A current daemon: glyph, with the DEAD `claude /login` cue softened to `recovering`.
+        XCTAssertEqual(cell(.healthy), "🟢")
+        XCTAssertEqual(cell(.unknown), "⚪")
+        XCTAssertEqual(cell(.stale), "🟡")
+        XCTAssertEqual(cell(.atRisk), "🟠")
+        XCTAssertEqual(cell(.dead), "🔴 claude /login")
+        XCTAssertEqual(cell(.dead, recovering: true), "🔴 recovering")
+        // `disabled` (rotation #36) trails the glyph, independent of credential health.
+        XCTAssertEqual(cell(.healthy, enabled: false), "🟢 disabled")
+        XCTAssertEqual(cell(.dead, enabled: false), "🔴 claude /login disabled")
+        XCTAssertEqual(cell(.dead, recovering: true, enabled: false), "🔴 recovering disabled")
+    }
+
+    func testAuthCellFallsBackToLegacyTagsWhenAuthNil() {
+        // Pre-#119 daemon (auth nil) → the comma-joined legacy tags, never a defaulted glyph.
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: nil, recovering: false, enabled: true, quarantined: false), "")
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: nil, recovering: false, enabled: false, quarantined: false), "disabled")
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: nil, recovering: false, enabled: true, quarantined: true), "needs re-login")
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: nil, recovering: true, enabled: true, quarantined: true), "recovering")
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: nil, recovering: false, enabled: false, quarantined: true), "disabled, needs re-login")
+    }
+
+    // MARK: - authCue (glyphless trailing cue for the modern path)
+
+    func testAuthCueSplitsTheTrailingCueFromTheGlyph() {
+        XCTAssertNil(StatusPanelFormat.authCue(auth: .healthy, recovering: false, enabled: true))
+        XCTAssertNil(StatusPanelFormat.authCue(auth: .stale, recovering: false, enabled: true))
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .dead, recovering: false, enabled: true), "claude /login")
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .dead, recovering: true, enabled: true), "recovering")
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .healthy, recovering: false, enabled: false), "disabled")
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .dead, recovering: false, enabled: false), "claude /login disabled")
+    }
+
+    // MARK: - legacyHealthTags (mirror `src/cli.rs` `legacy_health_tags`)
+
+    func testLegacyHealthTagsMirrorCli() {
+        XCTAssertEqual(StatusPanelFormat.legacyHealthTags(enabled: true, quarantined: false, recovering: false), "")
+        XCTAssertEqual(StatusPanelFormat.legacyHealthTags(enabled: false, quarantined: false, recovering: false), "disabled")
+        XCTAssertEqual(StatusPanelFormat.legacyHealthTags(enabled: true, quarantined: true, recovering: false), "needs re-login")
+        XCTAssertEqual(StatusPanelFormat.legacyHealthTags(enabled: true, quarantined: true, recovering: true), "recovering")
+        XCTAssertEqual(StatusPanelFormat.legacyHealthTags(enabled: false, quarantined: true, recovering: false), "disabled, needs re-login")
+    }
+
+    // MARK: - banner (issue #326 AC: each honest state shows its banner)
+
+    func testBannerCoversEveryHonestState() {
+        XCTAssertEqual(StatusPanelFormat.banner(for: .connecting, accountCount: 0).kind, .info)
+        XCTAssertEqual(StatusPanelFormat.banner(for: .connecting, accountCount: 0).title, "Connecting…")
+
+        let connected = StatusPanelFormat.banner(for: .connected, accountCount: 3)
+        XCTAssertEqual(connected.kind, .healthy)          // the ONLY healthy banner
+        XCTAssertEqual(connected.title, "Live")
+        XCTAssertEqual(connected.detail, "3 accounts.")
+        XCTAssertEqual(StatusPanelFormat.banner(for: .connected, accountCount: 1).detail, "1 account.")  // singular
+
+        XCTAssertEqual(StatusPanelFormat.banner(for: .emptyRoster, accountCount: 0).kind, .info)
+        XCTAssertEqual(StatusPanelFormat.banner(for: .stale, accountCount: 2).kind, .warning)
+        XCTAssertEqual(StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2).kind, .error)
+        XCTAssertEqual(StatusPanelFormat.banner(for: .unsupported, accountCount: 0).kind, .error)
+
+        // Only `.connected` is ever the healthy kind (the never-healthy-when-dead invariant).
+        for state in Self.allNonConnectedStates {
+            XCTAssertNotEqual(StatusPanelFormat.banner(for: state, accountCount: 1).kind, .healthy,
+                              "state \(state) must not render a healthy banner")
+        }
+    }
+
+    // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
+
+    func testNextSwapFooterWording() {
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal")), "Next swap → personal")
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.noViableTarget), "No viable target")
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.awaitingData), "Awaiting data")
+        XCTAssertNil(StatusPanelFormat.nextSwapFooter(nil))   // no active anchor → no footer
+    }
+
+    // MARK: - captureCommand (issue #326 AC: onboarding copies the exact command)
+
+    func testCaptureCommandIsTheExactSubcommand() {
+        XCTAssertEqual(StatusPanelFormat.captureCommand, "sessiometer capture")
+    }
+
+    // MARK: - rowAccessibilityLabel (issue #326 AC: VoiceOver-navigable rows)
+
+    func testRowAccessibilityLabelSpeaksTheRow() {
+        let active = StatusPanelFormat.rowAccessibilityLabel(
+            label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
+            quarantined: false, sessionPct: 60, weeklyPct: 10, resetIn: "10m", isNextSwapTarget: false)
+        XCTAssertEqual(active, "work, active, auth healthy, session 60%, weekly 10%, resets in 10m")
+
+        let dead = StatusPanelFormat.rowAccessibilityLabel(
+            label: "old", isActive: false, auth: .dead, recovering: false, enabled: true,
+            quarantined: true, sessionPct: nil, weeklyPct: nil, resetIn: "n/a", isNextSwapTarget: true)
+        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a, weekly n/a, resets in n/a, next swap target")
+
+        // A healthy pre-#119 legacy account speaks no auth verdict (empty phrase dropped).
+        let legacy = StatusPanelFormat.rowAccessibilityLabel(
+            label: "leg", isActive: false, auth: nil, recovering: false, enabled: true,
+            quarantined: false, sessionPct: 5, weeklyPct: 5, resetIn: "2h", isNextSwapTarget: false)
+        XCTAssertEqual(legacy, "leg, session 5%, weekly 5%, resets in 2h")
+
+        // A parked (disabled) account speaks the `parked` tag.
+        let parked = StatusPanelFormat.rowAccessibilityLabel(
+            label: "p", isActive: false, auth: .healthy, recovering: false, enabled: false,
+            quarantined: false, sessionPct: 1, weeklyPct: 1, resetIn: "1h", isNextSwapTarget: false)
+        XCTAssertEqual(parked, "p, auth healthy, parked, session 1%, weekly 1%, resets in 1h")
+    }
+
+    // MARK: - Integration: wire → AccountRow → panel format (recovering distinct from dead)
+
+    func testDeadVersusRecoveringSurviveTheStoreProjection() throws {
+        // A dead, NOT-recovering account (shared golden) → the actionable re-login cue.
+        let deadRows = try rows(from: Fixtures.snapshotAwaitingDead)
+        let dead = try XCTUnwrap(deadRows.first)
+        XCTAssertEqual(dead.auth, .dead)
+        XCTAssertFalse(dead.isRecovering)
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: dead.auth, recovering: dead.isRecovering,
+                                                  enabled: dead.isEnabled, quarantined: dead.isQuarantined),
+                       "🔴 claude /login")
+
+        // The SAME dead rollup but mid-recovery (#109) → held, not re-logged: "recovering", NOT the
+        // command. This is the AC's "recovering distinct from dead", proven through the projection.
+        let healRows = try rows(from: Self.snapshotDeadRecovering)
+        let heal = try XCTUnwrap(healRows.first)
+        XCTAssertEqual(heal.auth, .dead)
+        XCTAssertTrue(heal.isRecovering)
+        XCTAssertEqual(StatusPanelFormat.authCell(auth: heal.auth, recovering: heal.isRecovering,
+                                                  enabled: heal.isEnabled, quarantined: heal.isQuarantined),
+                       "🔴 recovering")
+    }
+
+    func testResetInBindingWindowThroughTheProjection() throws {
+        // A weekly-exhausted account (shared golden) → the single reset-in keys off the WEEKLY reset,
+        // never the sooner session window.
+        let exhaustedRows = try rows(from: Fixtures.snapshotNoViable)
+        let exhausted = try XCTUnwrap(exhaustedRows.first)
+        XCTAssertTrue(exhausted.weeklyExhausted)
+        let now: Int64 = 1_893_456_100   // == the fixture's generated_at
+        let picked = StatusPanelFormat.resetIn(weeklyExhausted: exhausted.weeklyExhausted,
+                                               sessionResetsAt: exhausted.sessionResetsAt,
+                                               weeklyResetsAt: exhausted.weeklyResetsAt, now: now)
+        XCTAssertEqual(picked, StatusPanelFormat.resetCell(exhausted.weeklyResetsAt, now: now))
+        XCTAssertNotEqual(picked, StatusPanelFormat.resetCell(exhausted.sessionResetsAt, now: now))
+
+        // A non-exhausted account → the SESSION reset governs.
+        let liveRows = try rows(from: Fixtures.snapshotRichTarget)
+        let live = try XCTUnwrap(liveRows.first)            // "work": weekly_exhausted false
+        XCTAssertFalse(live.weeklyExhausted)
+        let picked2 = StatusPanelFormat.resetIn(weeklyExhausted: live.weeklyExhausted,
+                                                sessionResetsAt: live.sessionResetsAt,
+                                                weeklyResetsAt: live.weeklyResetsAt, now: now)
+        XCTAssertEqual(picked2, StatusPanelFormat.resetCell(live.sessionResetsAt, now: now))
+    }
+
+    func testNextSwapTargetMarkerSurvivesTheProjection() throws {
+        // The store resolves the `next_swap` target label onto the matching row.
+        let rows = try rows(from: Fixtures.snapshotRichTarget)   // next_swap → "personal"
+        let target = try XCTUnwrap(rows.first { $0.label == "personal" })
+        XCTAssertTrue(target.isNextSwapTarget)
+        let other = try XCTUnwrap(rows.first { $0.label == "work" })
+        XCTAssertFalse(other.isNextSwapTarget)
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal")), "Next swap → personal")
+    }
+
+    // MARK: - Helpers
+
+    private func cell(_ auth: CredentialHealth, recovering: Bool = false, enabled: Bool = true) -> String {
+        StatusPanelFormat.authCell(auth: auth, recovering: recovering, enabled: enabled, quarantined: false)
+    }
+
+    private func rows(from fixture: String) throws -> [AccountRow] {
+        let frame = try parseWatchFrame(fixture)
+        guard case .snapshot(let status) = frame else {
+            XCTFail("expected a snapshot frame")
+            return []
+        }
+        return AccountRow.rows(from: status)
+    }
+
+    private static let allNonConnectedStates: [ConnectionState] = [
+        .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported,
+    ]
+
+    /// A DEAD account that is mid-recovery (#109) — the current daemon's `snapshotAwaitingDead` golden
+    /// has `recovering:false`, so this hand-built frame is the only way to exercise the recovering
+    /// branch through the real decoder. Same contract, `recovering:true`.
+    private static let snapshotDeadRecovering = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":1,"accounts":[{"label":"heal","active":false,"enabled":true,"quarantined":true,"recovering":true,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":null,"refresh_enabled":false}
+    """#
+}
