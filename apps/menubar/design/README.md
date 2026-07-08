@@ -52,7 +52,7 @@ healthy on a degraded daemon.
 - **Identity** — each row leads with the account's operator-chosen **label** (never the email;
   defaults to the account UUID when unset), provider on a quieter secondary line.
 - **Provider-neutral** — a monochrome monogram badge + plain-text label, no brand color or logo.
-- **Copy-command, never a runner** — `capture` / `brew upgrade` buttons copy the command to the
+- **Copy-command, never a runner** — `sessiometer capture` / `brew upgrade sessiometer` buttons copy the command to the
   clipboard; the app never runs them, and there is **no fake spinner** (daemon-starting shows a
   static "forming" glyph).
 - **Honest state** — disconnected rows are dimmed + "stale", never frozen-as-live.
