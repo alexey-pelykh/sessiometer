@@ -44,15 +44,15 @@
    *  BOTH themes explicitly regardless.                            *
    * ============================================================= */
   :root{
-    --page-bg:#eaecef; --page-text:#1d1d1f; --page-text-2:#6b6b72; --page-text-3:#9a9aa1;
+    --page-bg:#eaecef; --page-text:#1d1d1f; --page-text-2:#6b6b72;
     --card:#ffffff; --card-border:#e2e2e8;
-    --priv-bg:#ffffff; --priv-border:#ecd9d9; --priv-text:#8a5a5a; --priv-strong:#b0322c;
+    --accent-mark:#b0322c;
   }
   @media (prefers-color-scheme:dark){
     :root{
-      --page-bg:#151517; --page-text:#f1f1f4; --page-text-2:#9d9da4; --page-text-3:#6e6e75;
+      --page-bg:#151517; --page-text:#f1f1f4; --page-text-2:#9d9da4;
       --card:#1f1f23; --card-border:#323238;
-      --priv-bg:#231a1a; --priv-border:#4a3131; --priv-text:#d7a4a4; --priv-strong:#ff6d62;
+      --accent-mark:#ff6d62;
     }
   }
   *{box-sizing:border-box; margin:0; padding:0}
@@ -68,15 +68,6 @@
   .doc-head h1{ font-size:20px; font-weight:700; letter-spacing:-.02em; margin-bottom:6px }
   .doc-head .lede{ font-size:13.5px; color:var(--page-text-2); max-width:74ch; margin-bottom:16px }
   .doc-head .lede b{ color:var(--page-text); font-weight:600 }
-
-  .priv{
-    display:inline-flex; align-items:center; gap:9px; padding:8px 14px; border-radius:9px;
-    background:var(--priv-bg); border:1px solid var(--priv-border);
-    color:var(--priv-text); font-size:12px; letter-spacing:.005em;
-  }
-  .priv svg{ flex:0 0 auto; opacity:.85 }
-  .priv b{ color:var(--priv-strong); font-weight:700; letter-spacing:.02em }
-  .doc-head .priv{ margin-bottom:26px }
 
   /* ============================================================= *
    *  STAGE  (a faux macOS desktop holding the menubar + popovers) *
@@ -189,7 +180,7 @@
     flex:0 0 auto; width:27px; height:27px; border-radius:7px; display:grid; place-items:center;
     background:var(--badge-bg); color:var(--text);
   }
-  .app-meta{ min-width:0; display:flex; flex-direction:column; gap:0 }
+  .app-meta{ min-width:0; display:flex; flex-direction:column }
   .app-name{ font-size:13.5px; font-weight:600; letter-spacing:-.01em }
   .app-sub{ font-size:11px; color:var(--text-2); font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .seg{ margin-left:auto; flex:0 0 auto; display:inline-flex; gap:2px; padding:2px; border-radius:7px; background:var(--seg-bg); border:.5px solid var(--seg-border) }
@@ -205,8 +196,8 @@
 
   .acct-id{ display:flex; align-items:center; gap:9px }
   .dot{ flex:0 0 8px; width:8px; height:8px; border-radius:50% }
-  .acct.active .dot{ background:var(--accent); box-shadow:0 0 0 3px var(--accent-halo) }
-  .acct:not(.active) .dot{ box-shadow:inset 0 0 0 1.5px var(--text-3) }
+  .acct.active .dot, .stat.active .dot{ background:var(--accent); box-shadow:0 0 0 3px var(--accent-halo) }
+  .acct:not(.active) .dot, .stat:not(.active) .dot{ box-shadow:inset 0 0 0 1.5px var(--text-3) }
   .badge{
     flex:0 0 auto; width:30px; height:30px; border-radius:8px; display:grid; place-items:center;
     background:var(--badge-bg); color:var(--text-2);
@@ -278,7 +269,7 @@
   .stat{ padding:10px 8px; border-radius:9px }
   .stat.active{ background:var(--active-bg); box-shadow:inset 0 0 0 .5px var(--active-ring) }
   .stat-head{ display:flex; align-items:center; gap:9px }
-  .s-meta{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:0 }
+  .s-meta{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column }
   .s-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .s-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .spark{ flex:0 0 auto; display:block }
@@ -315,9 +306,7 @@
   .sig-legend .signal{ font-size:10px; padding:2px 7px }
   .sig-legend .lg-note{ margin-left:auto; font-size:10px; color:var(--text-3); font-style:italic }
 
-  /* ============================================================= *
-   *  DESIGN NOTES + closing banner                                *
-   * ============================================================= */
+  /* ===== design notes ===== */
   .notes{
     margin-top:30px; background:var(--card); border:1px solid var(--card-border); border-radius:14px;
     padding:20px 22px;
@@ -325,14 +314,12 @@
   .notes h2{ font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--page-text-2); margin-bottom:12px }
   .notes ul{ list-style:none; display:grid; gap:9px }
   .notes li{ position:relative; padding-left:20px; font-size:12.5px; color:var(--page-text); line-height:1.5 }
-  .notes li::before{ content:""; position:absolute; left:2px; top:7px; width:6px; height:6px; border-radius:2px; background:var(--priv-strong); opacity:.55 }
+  .notes li::before{ content:""; position:absolute; left:2px; top:7px; width:6px; height:6px; border-radius:2px; background:var(--accent-mark); opacity:.55 }
   .notes li b{ font-weight:600 }
   .notes li code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:11px; background:var(--page-bg); padding:1px 5px; border-radius:4px }
-  .doc-foot{ margin-top:22px; display:flex; justify-content:center }
 
   @media (max-width:520px){
     body{ padding:22px 12px 34px }
-    .pop, .notch{ }
     .gallery{ padding:22px 12px 34px; gap:34px 20px }
   }
 
@@ -372,7 +359,6 @@
   .msg-cmd-wrap{ display:flex; flex-direction:column; align-items:center; gap:9px; margin-top:16px }
   .msg-cmd-wrap .add-hint{ text-align:center }
   .msg-hint{ font-size:10.5px; color:var(--text-3); max-width:34ch; line-height:1.4; margin-top:13px; font-style:italic }
-  .msg-hint code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10px; font-style:normal; background:var(--code-bg); color:var(--text-2); padding:1px 4px; border-radius:4px }
 
   /* buttons (message-card scope) */
   .btn{
@@ -629,7 +615,7 @@
             <div class="stats">
               <div class="stat active">
                 <div class="stat-head">
-                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-halo)"></span>
+                  <span class="dot"></span>
                   <span class="badge">W</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
@@ -643,7 +629,7 @@
               </div>
               <div class="stat">
                 <div class="stat-head">
-                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="dot"></span>
                   <span class="badge">P</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
@@ -657,7 +643,7 @@
               </div>
               <div class="stat">
                 <div class="stat-head">
-                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="dot"></span>
                   <span class="badge">S</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
@@ -702,7 +688,7 @@
             <div class="stats">
               <div class="stat active">
                 <div class="stat-head">
-                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-halo)"></span>
+                  <span class="dot"></span>
                   <span class="badge">W</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
@@ -716,7 +702,7 @@
               </div>
               <div class="stat">
                 <div class="stat-head">
-                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="dot"></span>
                   <span class="badge">P</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
@@ -730,7 +716,7 @@
               </div>
               <div class="stat">
                 <div class="stat-head">
-                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="dot"></span>
                   <span class="badge">S</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
