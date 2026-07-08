@@ -44,6 +44,13 @@ targets:
       - path: Sources/WatchTransport.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
+      # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
+      # StatusItemController/StatusPanelView/main.swift — those touch NSStatusBar/AppKit UI that a
+      # headless logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
+      - path: Sources/StatusGauge.swift
+      # Status-panel format (#326): the pure, `src/cli.rs`-mirroring presentation layer (health/reset/pct).
+      # Added here (NOT StatusPanelView.swift/main.swift — SwiftUI/AppKit the headless bundle can't drive)
+      # so the byte-parity contract with the Rust `status` verb is tested in isolation.
       - path: Sources/StatusPanelFormat.swift
       - path: Tests
     settings:
