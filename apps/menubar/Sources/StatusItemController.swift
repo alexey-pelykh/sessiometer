@@ -64,7 +64,13 @@ final class StatusItemController {
     private func configureButton() {
         guard let button = statusItem.button else { return }
         button.target = self
-        button.action = #selector(togglePanel)
+        button.action = #selector(handleClick)
+        // Fire on BOTH mouse buttons so a secondary (right / control) click can raise the lifecycle
+        // menu (Quit) while a primary click toggles the panel. Assigning `statusItem.menu`
+        // permanently would hijack the primary click too and disable the click-to-toggle design
+        // (#325/#326), so we route on the event in `handleClick` and set the menu only transiently
+        // while it is shown (see `showLifecycleMenu`).
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
     /// Mirror one glance onto the button: the shape-encoded template gauge PLUS the spoken VoiceOver
@@ -75,13 +81,59 @@ final class StatusItemController {
         button.setAccessibilityLabel(presentation.accessibilityLabel)
     }
 
-    /// Click handler: toggle the panel (AC — clicking the item shows AND hides it).
-    @objc private func togglePanel() {
+    /// The status-item action, fired on a primary OR secondary mouse-up (see `configureButton`). A
+    /// secondary click (see `isSecondaryClick`) raises the lifecycle menu; a primary click toggles
+    /// the panel.
+    @objc private func handleClick() {
+        if isSecondaryClick(NSApp.currentEvent) {
+            showLifecycleMenu()
+        } else {
+            togglePanel()
+        }
+    }
+
+    /// A secondary (menu-summoning) click: a right mouse-up, or a control-held left mouse-up. A
+    /// `nil` event (the programmatic-click path) is treated as primary.
+    private func isSecondaryClick(_ event: NSEvent?) -> Bool {
+        guard let event else { return false }
+        return event.type == .rightMouseUp
+            || (event.type == .leftMouseUp && event.modifierFlags.contains(.control))
+    }
+
+    /// Toggle the panel (AC — clicking the item shows AND hides it).
+    private func togglePanel() {
         if popover.isShown {
             closePanel()
         } else {
             openPanel()
         }
+    }
+
+    /// The secondary-click lifecycle menu. Today it carries only "Quit Sessiometer" — a pure-CLIENT
+    /// control that terminates the menu-bar app itself (`NSApp.terminate`, which runs the clean
+    /// `applicationWillTerminate` transport-stop path); it does NOT touch the daemon, whose
+    /// quit/restart lifecycle is #170. It is a right-click menu rather than a panel button so the
+    /// status panel stays a pure display + manual-swap surface (design C-005 IA scope guard), and is
+    /// the natural future home for the other runtime controls (#170 daemon quit/restart,
+    /// launch-at-login). Shown via a TRANSIENT `statusItem.menu` so AppKit positions and highlights
+    /// it natively under the item, then cleared so the primary click keeps toggling the panel.
+    private func showLifecycleMenu() {
+        // Close the panel first if it is open: the click-outside global monitor never sees our own
+        // status-item events, so without this a secondary click would leave the popover lingering
+        // behind the menu.
+        if popover.isShown { closePanel() }
+        let menu = NSMenu()
+        let quitItem = NSMenuItem(title: "Quit Sessiometer", action: #selector(quit), keyEquivalent: "")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    /// Quit the menu-bar app (a pure-client control). The daemon keeps running — its lifecycle is #170.
+    @objc private func quit() {
+        NSApp.terminate(nil)
     }
 
     private func openPanel() {

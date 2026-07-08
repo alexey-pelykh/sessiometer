@@ -17,7 +17,7 @@ import os
 import Darwin
 #endif
 
-private let transportLog = Logger(subsystem: "com.sessiometer.menubar", category: "watch-transport")
+private let transportLog = Logger(subsystem: "org.sessiometer.menubar", category: "watch-transport")
 
 // MARK: - The seam
 
@@ -145,7 +145,7 @@ final class PosixSocketConnection: WatchConnection, @unchecked Sendable {
             }
             continuation.finish()   // EOF or read error → the stream ends
         }
-        thread.name = "com.sessiometer.menubar.watch-reader"
+        thread.name = "org.sessiometer.menubar.watch-reader"
         thread.stackSize = 512 * 1024
         // When the stream terminates (finished, OR the consumer stops / cancels), close the fd —
         // which unblocks a pending read() so the reader Thread exits.

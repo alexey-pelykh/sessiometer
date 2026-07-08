@@ -19,7 +19,7 @@
 import AppKit
 import os
 
-private let appLog = Logger(subsystem: "com.sessiometer.menubar", category: "app")
+private let appLog = Logger(subsystem: "org.sessiometer.menubar", category: "app")
 
 // The `NSApplicationDelegate` methods are already `@MainActor` (the AppKit protocol is), so all the
 // AppKit + store wiring below runs on the main actor without annotating the class — mirroring the

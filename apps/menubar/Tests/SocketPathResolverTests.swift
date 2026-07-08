@@ -58,7 +58,7 @@ final class SocketPathResolverTests: XCTestCase {
     // → `.sandboxed`, carrying both paths so the caller degrades loudly rather than connecting to a
     // wrong / denied path.
     func testSandboxCheckDetectsContainerDivergence() {
-        let container = "/Users/x/Library/Containers/com.sessiometer.menubar/Data"
+        let container = "/Users/x/Library/Containers/org.sessiometer.menubar/Data"
         XCTAssertEqual(
             SocketPathResolver.sandboxCheck(passwdHome: "/Users/x", nsHome: container),
             .sandboxed(passwdHome: "/Users/x", containerHome: container))
