@@ -145,6 +145,11 @@ struct AccountRow: Identifiable, Equatable, Sendable {
     let isActive: Bool
     let isEnabled: Bool
     let isQuarantined: Bool
+    /// Whether a quarantined account is mid-recovery (issue #109) — the panel softens a DEAD account's
+    /// `claude /login` cue to `recovering` so the operator holds rather than re-authing (issue #326 AC:
+    /// "recovering distinct from dead"). Orthogonal to `auth`, exactly as `src/cli.rs` `health_cell`
+    /// reads `account.recovering` alongside the rollup.
+    let isRecovering: Bool
     let auth: CredentialHealth?
     let sessionPct: UInt8?
     let weeklyPct: UInt8?
@@ -166,6 +171,7 @@ struct AccountRow: Identifiable, Equatable, Sendable {
                 isActive: account.active,
                 isEnabled: account.enabled,
                 isQuarantined: account.quarantined,
+                isRecovering: account.recovering,
                 auth: account.auth,
                 sessionPct: account.sessionPct,
                 weeklyPct: account.weeklyPct,
