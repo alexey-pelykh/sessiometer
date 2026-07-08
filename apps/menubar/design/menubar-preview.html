@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sessiometer — menubar popover · all 9 states</title>
+<!--
+  Sessiometer — menubar popover: ALL 9 launch-or-attach states in ONE polished surface.
+  Canonical VISUAL build-reference for the SwiftUI menubar panel (alexey-pelykh/sessiometer#168/#169).
+  A design mock, not shippable code — translate each treatment to its native equivalent:
+  vibrancy → NSVisualEffectView material, hex → system semantic Color/NSColor,
+  tabular numerals → .monospacedDigit(), health glyph → SF Symbol template image.
+
+  VISUAL LANGUAGE: 380px native popover, vibrancy
+  (backdrop-filter blur+saturate over a wallpaper), SF-symbol-style drawn glyphs, tabular
+  numerals, usage meters (session + weekly bars; green<70 / amber70-90 / red>=90),
+  drawn SVG area+line sparklines (Stats), label-primary two-line identity (Work/Personal/Scratch
+  monogram badge + provider secondary line), light + dark, no-wrap-by-construction.
+
+  IDENTITY MODEL: each account leads with a short user-chosen ALIAS (illustrative: Work / Personal
+  / Scratch) as the primary label; the provider alone is demoted to a secondary line (Claude Code).
+  In the code this primary label IS the account's `label` field — "alias" here is just the friendly
+  term for it, NOT a separate field (the redundant-alias premise is retired: `label` already is the
+  operator-chosen name). When an account has no custom label, `label` defaults to its account UUID
+  (shown truncated, e.g. a1b2c3… · Claude Code) — still the same field, still on the primary line;
+  there is no separate "handle". The label owns the truncating line; the monogram badge shows its
+  initial (W / P / S). Labels here are ILLUSTRATIVE, not real user data.
+
+  Hard invariants honored across ALL 9 states:
+    - identifiers minimized — the operator-chosen label leads, provider-only secondary. With no
+      custom label the field defaults to the account UUID (e.g. a1b2c3…); the label is never the
+      email (the roster stores no email — it lives only in the encrypted credential). No full email renders.
+    - provider-neutral — monochrome monogram badge + plain text label, no brand colour/logo.
+    - capture AND `brew upgrade` are COPY-command buttons — the app never runs them; NO fake
+      spinner (daemon-starting uses a STATIC "forming" glyph, not an animated spinner).
+    - never render healthy on a degraded/dead daemon (#137); disconnected rows are dimmed + "stale",
+      never frozen-as-live; crash-loop debounces the healthy-flash.
+  Self-contained: inline CSS/SVG, system font stack only, no external deps - opens over file://.
+-->
+<style>
+  /* ============================================================= *
+   *  PAGE CHROME  (the reference document frame)          *
+   *  Follows the viewer's OS light/dark; the popovers below show   *
+   *  BOTH themes explicitly regardless.                            *
+   * ============================================================= */
+  :root{
+    --page-bg:#eaecef; --page-text:#1d1d1f; --page-text-2:#6b6b72; --page-text-3:#9a9aa1;
+    --card:#ffffff; --card-border:#e2e2e8;
+    --priv-bg:#ffffff; --priv-border:#ecd9d9; --priv-text:#8a5a5a; --priv-strong:#b0322c;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --page-bg:#151517; --page-text:#f1f1f4; --page-text-2:#9d9da4; --page-text-3:#6e6e75;
+      --card:#1f1f23; --card-border:#323238;
+      --priv-bg:#231a1a; --priv-border:#4a3131; --priv-text:#d7a4a4; --priv-strong:#ff6d62;
+    }
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  html{ -webkit-text-size-adjust:100% }
+  body{
+    background:var(--page-bg); color:var(--page-text);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+    line-height:1.45; padding:34px 22px 46px;
+  }
+  .wrap{ max-width:984px; margin:0 auto }
+
+  .doc-head h1{ font-size:20px; font-weight:700; letter-spacing:-.02em; margin-bottom:6px }
+  .doc-head .lede{ font-size:13.5px; color:var(--page-text-2); max-width:74ch; margin-bottom:16px }
+  .doc-head .lede b{ color:var(--page-text); font-weight:600 }
+
+  .priv{
+    display:inline-flex; align-items:center; gap:9px; padding:8px 14px; border-radius:9px;
+    background:var(--priv-bg); border:1px solid var(--priv-border);
+    color:var(--priv-text); font-size:12px; letter-spacing:.005em;
+  }
+  .priv svg{ flex:0 0 auto; opacity:.85 }
+  .priv b{ color:var(--priv-strong); font-weight:700; letter-spacing:.02em }
+  .doc-head .priv{ margin-bottom:26px }
+
+  /* ============================================================= *
+   *  STAGE  (a faux macOS desktop holding the menubar + popovers) *
+   * ============================================================= */
+  .stage{
+    position:relative; border-radius:20px; overflow:hidden;
+    box-shadow:0 30px 70px -20px rgba(20,22,30,.55), 0 0 0 1px rgba(0,0,0,.04);
+    /* desaturated "wallpaper" blobs give the frosted-glass vibrancy something to blur */
+    background:
+      radial-gradient(680px 460px at 16% 8%,  rgba(120,150,225,.55), transparent 62%),
+      radial-gradient(560px 520px at 88% 4%,  rgba(205,140,190,.42), transparent 60%),
+      radial-gradient(720px 560px at 74% 104%, rgba(105,195,180,.42), transparent 62%),
+      radial-gradient(600px 520px at 6% 96%,  rgba(150,160,235,.34), transparent 60%),
+      linear-gradient(158deg,#5b6479 0%,#474f61 52%,#3b4253 100%);
+  }
+  /* faux menubar strip */
+  .menubar{
+    height:26px; display:flex; align-items:center; gap:18px; padding:0 13px;
+    background:rgba(255,255,255,.16);
+    -webkit-backdrop-filter:blur(22px) saturate(1.5); backdrop-filter:blur(22px) saturate(1.5);
+    border-bottom:.5px solid rgba(255,255,255,.16);
+    color:#fff; font-size:12.5px; font-weight:500;
+    text-shadow:0 0 6px rgba(0,0,0,.25);
+  }
+  .menubar .mb-apple{ font-size:13px; font-weight:700 }
+  .menubar .mb-menus{ display:flex; gap:16px; opacity:.9 }
+  .menubar .mb-menus b{ font-weight:700 }
+  .menubar .mb-right{ margin-left:auto; display:flex; align-items:center; gap:13px; font-variant-numeric:tabular-nums }
+  .menubar .mb-status{ display:inline-flex; align-items:center; opacity:.92 }
+  .menubar .mb-sess{
+    display:inline-flex; align-items:center; padding:3px 6px; border-radius:6px;
+    background:rgba(255,255,255,.22); box-shadow:0 0 0 .5px rgba(255,255,255,.12);
+  }
+  .menubar .mb-clock{ opacity:.95 }
+
+  .stage-cap{
+    display:flex; align-items:center; gap:8px; padding:16px 22px 0; flex-wrap:wrap;
+    color:rgba(255,255,255,.82); font-size:11.5px; letter-spacing:.02em;
+    text-shadow:0 0 6px rgba(0,0,0,.3);
+  }
+  .stage-cap .dotsep{ opacity:.5 }
+
+  .gallery{
+    display:flex; flex-wrap:wrap; justify-content:center; align-items:flex-start;
+    gap:42px 40px; padding:26px 26px 48px;
+  }
+  .frame{ display:flex; flex-direction:column; align-items:center; gap:14px }
+  .frame .fcap{
+    display:inline-flex; align-items:center; gap:7px;
+    color:#fff; font-size:11px; font-weight:600; letter-spacing:.09em; text-transform:uppercase;
+    opacity:.92; text-shadow:0 0 6px rgba(0,0,0,.3);
+  }
+  .frame .fcap svg{ opacity:.85 }
+
+  /* ============================================================= *
+   *  POPOVER  (the product surface - NSStatusItem -> NSPopover)    *
+   *  380px true width. Theme via .theme-light / .theme-dark.       *
+   * ============================================================= */
+  .pop-wrap{ position:relative }
+  .pop{
+    position:relative; width:380px; border-radius:13px; overflow:hidden;
+    background:var(--pop-bg);
+    -webkit-backdrop-filter:blur(42px) saturate(1.75); backdrop-filter:blur(42px) saturate(1.75);
+    border:.5px solid var(--pop-border);
+    box-shadow:
+      inset 0 .5px 0 var(--pop-hl),
+      0 22px 48px -14px rgba(0,0,0,.55),
+      0 8px 18px -10px rgba(0,0,0,.42);
+    color:var(--text); font-size:13px;
+  }
+
+  .pop.theme-light{
+    --pop-bg:rgba(247,247,250,.72); --pop-border:rgba(0,0,0,.13); --pop-hl:rgba(255,255,255,.75);
+    --text:#1d1d1f; --text-2:rgba(60,60,67,.62); --text-3:rgba(60,60,67,.4);
+    --divider:rgba(0,0,0,.08); --card-bg:rgba(120,120,128,.08);
+    --active-bg:rgba(0,122,255,.08); --active-ring:rgba(0,122,255,.28);
+    --accent:#007aff; --accent-halo:rgba(0,122,255,.2); --accent-ring:rgba(0,122,255,.42);
+    --accent-tint:rgba(0,122,255,.10); --accent-tint-border:rgba(0,122,255,.2);
+    --badge-bg:rgba(120,120,128,.16); --track:rgba(120,120,128,.22);
+    --seg-bg:rgba(120,120,128,.12); --seg-border:rgba(0,0,0,.05); --seg-on:#ffffff;
+    --btn-bg:rgba(255,255,255,.72); --btn-border:rgba(0,0,0,.14); --code-bg:rgba(120,120,128,.15);
+    --ok:#2ba24a; --spark:rgba(60,60,67,.55);
+    --u-g:#34c759; --u-a:#ff9f0a; --u-r:#ff3b30;
+    --ut-g:#268a3f; --ut-a:#976300; --ut-r:#c8261d;
+    --sig-under-bg:rgba(0,122,255,.12);  --sig-under-fg:#2668bd;
+    --sig-bal-bg:rgba(30,150,105,.13);   --sig-bal-fg:#1c8a5f;
+    --sig-sat-bg:rgba(178,120,20,.15);   --sig-sat-fg:#966611;
+  }
+  .pop.theme-dark{
+    --pop-bg:rgba(38,38,43,.64); --pop-border:rgba(255,255,255,.12); --pop-hl:rgba(255,255,255,.09);
+    --text:#f5f5f7; --text-2:rgba(235,235,245,.6); --text-3:rgba(235,235,245,.36);
+    --divider:rgba(255,255,255,.09); --card-bg:rgba(255,255,255,.05);
+    --active-bg:rgba(10,132,255,.15); --active-ring:rgba(10,132,255,.42);
+    --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3); --accent-ring:rgba(10,132,255,.5);
+    --accent-tint:rgba(10,132,255,.16); --accent-tint-border:rgba(10,132,255,.3);
+    --badge-bg:rgba(255,255,255,.10); --track:rgba(255,255,255,.14);
+    --seg-bg:rgba(255,255,255,.08); --seg-border:rgba(255,255,255,.06); --seg-on:rgba(255,255,255,.18);
+    --btn-bg:rgba(255,255,255,.10); --btn-border:rgba(255,255,255,.16); --code-bg:rgba(255,255,255,.10);
+    --ok:#30d158; --spark:rgba(235,235,245,.5);
+    --u-g:#30d158; --u-a:#ff9f0a; --u-r:#ff453a;
+    --ut-g:#4fd873; --ut-a:#ffb340; --ut-r:#ff6961;
+    --sig-under-bg:rgba(64,140,230,.20); --sig-under-fg:#82b3ed;
+    --sig-bal-bg:rgba(50,180,130,.18);   --sig-bal-fg:#60cfa1;
+    --sig-sat-bg:rgba(210,160,80,.20);   --sig-sat-fg:#e0b268;
+  }
+
+  /* ---- header ---- */
+  .pop-head{ display:flex; align-items:center; gap:10px; padding:12px 14px 11px }
+  .app-glyph{
+    flex:0 0 auto; width:27px; height:27px; border-radius:7px; display:grid; place-items:center;
+    background:var(--badge-bg); color:var(--text);
+  }
+  .app-meta{ min-width:0; display:flex; flex-direction:column; gap:0 }
+  .app-name{ font-size:13.5px; font-weight:600; letter-spacing:-.01em }
+  .app-sub{ font-size:11px; color:var(--text-2); font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .seg{ margin-left:auto; flex:0 0 auto; display:inline-flex; gap:2px; padding:2px; border-radius:7px; background:var(--seg-bg); border:.5px solid var(--seg-border) }
+  .seg button{ font:inherit; font-size:11px; font-weight:500; padding:2.5px 9px; border:0; border-radius:5px; background:transparent; color:var(--text-2); cursor:default }
+  .seg button.on{ background:var(--seg-on); color:var(--text); font-weight:600; box-shadow:0 .5px 1.5px rgba(0,0,0,.18) }
+
+  .div{ height:.5px; background:var(--divider); margin:0 14px }
+
+  /* ---- account cards (Status) ---- */
+  .accts{ padding:6px 8px 2px; display:flex; flex-direction:column; gap:2px }
+  .acct{ padding:9px 8px 10px; border-radius:9px }
+  .acct.active{ background:var(--active-bg); box-shadow:inset 0 0 0 .5px var(--active-ring) }
+
+  .acct-id{ display:flex; align-items:center; gap:9px }
+  .dot{ flex:0 0 8px; width:8px; height:8px; border-radius:50% }
+  .acct.active .dot{ background:var(--accent); box-shadow:0 0 0 3px var(--accent-halo) }
+  .acct:not(.active) .dot{ box-shadow:inset 0 0 0 1.5px var(--text-3) }
+  .badge{
+    flex:0 0 auto; width:30px; height:30px; border-radius:8px; display:grid; place-items:center;
+    background:var(--badge-bg); color:var(--text-2);
+    font-size:13px; font-weight:700; letter-spacing:.03em; font-variant-numeric:tabular-nums;
+  }
+  .id-meta{ flex:1 1 auto; min-width:0 }
+  .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .id-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .id-trail{ flex:0 0 auto; display:flex; align-items:center; gap:8px; margin-left:6px }
+  .tag{
+    font-size:9px; font-weight:700; letter-spacing:.07em; text-transform:uppercase;
+    color:var(--accent); border:.5px solid var(--accent-ring); padding:1px 5px; border-radius:4px;
+  }
+  .health{ display:inline-flex; color:var(--ok) }
+
+  .meters{ margin-top:9px; display:grid; gap:6px }
+  .meter{ display:grid; grid-template-columns:52px 1fr 40px 52px; align-items:center; column-gap:9px }
+  .m-label{ font-size:10px; font-weight:600; letter-spacing:.04em; text-transform:uppercase; color:var(--text-2) }
+  .m-track{ height:6px; border-radius:3px; background:var(--track); overflow:hidden }
+  .m-fill{ display:block; height:100%; border-radius:3px; min-width:5px }
+  .m-fill.g{ background:var(--u-g) }
+  .m-fill.a{ background:var(--u-a) }
+  .m-fill.r{ background:var(--u-r) }
+  .m-pct{ font-size:12px; font-weight:600; letter-spacing:-.01em; text-align:right; font-variant-numeric:tabular-nums }
+  .m-pct.g{ color:var(--ut-g) } .m-pct.a{ color:var(--ut-a) } .m-pct.r{ color:var(--ut-r) }
+  .m-reset{ font-size:11px; color:var(--text-2); text-align:right; font-variant-numeric:tabular-nums }
+
+  /* ---- swap callout (primary action) ---- */
+  .swap-row{
+    margin:9px 8px 4px; padding:9px 8px 9px 11px; border-radius:9px;
+    display:flex; align-items:center; gap:10px;
+    background:var(--accent-tint); border:.5px solid var(--accent-tint-border);
+  }
+  .swap-ico{ flex:0 0 auto; color:var(--accent); display:grid; place-items:center }
+  .swap-txt{ flex:1 1 auto; min-width:0; font-size:12px; line-height:1.3 }
+  .swap-txt .lead{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .swap-txt .lead b{ font-weight:600 }
+  .swap-txt .why{ color:var(--text-2); font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .swap-btn{
+    flex:0 0 auto; font:inherit; font-size:12px; font-weight:600; padding:5px 15px; border:0; border-radius:7px;
+    background:var(--accent); color:#fff; cursor:default; box-shadow:0 1px 2px rgba(0,0,0,.22);
+  }
+
+  /* ---- add account (copy-command) ---- */
+  .add-row{ display:flex; align-items:center; gap:10px; padding:5px 12px 3px }
+  .add-btn{
+    flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; font:inherit; font-size:12px; font-weight:500;
+    padding:6px 11px; border-radius:8px; border:.5px solid var(--btn-border); background:var(--btn-bg); color:var(--text); cursor:default;
+  }
+  .add-btn:active{ transform:translateY(.5px) }
+  .add-hint{ min-width:0; font-size:11px; color:var(--text-2) }
+  .add-hint code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10.5px; background:var(--code-bg); color:var(--text); padding:1px 5px; border-radius:4px }
+  .add-hint .copied{ color:var(--ok); font-weight:600 }
+
+  /* ---- footer ---- */
+  .pop-foot{
+    display:flex; flex-direction:column; gap:3px; padding:9px 14px 11px; margin-top:5px;
+    border-top:.5px solid var(--divider);
+    font-size:11px; color:var(--text-2); font-variant-numeric:tabular-nums;
+  }
+  .pop-foot .fl1{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .pop-foot .fl1 b{ font-weight:600; color:var(--text) }
+  .pop-foot .fl2{ display:inline-flex; align-items:center; gap:4px; color:var(--text-3) }
+
+  /* ============================================================= *
+   *  STATS VIEW                                                    *
+   * ============================================================= */
+  .stats{ padding:6px 8px 2px; display:flex; flex-direction:column; gap:2px }
+  .stat{ padding:10px 8px; border-radius:9px }
+  .stat.active{ background:var(--active-bg); box-shadow:inset 0 0 0 .5px var(--active-ring) }
+  .stat-head{ display:flex; align-items:center; gap:9px }
+  .s-meta{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:0 }
+  .s-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .s-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .spark{ flex:0 0 auto; display:block }
+  .spark .sp-area{ fill:var(--spark); fill-opacity:.2; stroke:none }
+  .spark .sp-line{ fill:none; stroke:var(--spark); stroke-width:1.75; stroke-linecap:round; stroke-linejoin:round }
+  .spark .sp-dot{ fill:var(--spark) }
+
+  .signal{ flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:6px; font-size:11px; font-weight:600; letter-spacing:.005em }
+  .signal .sig-dot{ width:6px; height:6px; border-radius:50% }
+  .signal.underused{ background:var(--sig-under-bg); color:var(--sig-under-fg) }
+  .signal.underused .sig-dot{ background:var(--sig-under-fg) }
+  .signal.balanced{ background:var(--sig-bal-bg); color:var(--sig-bal-fg) }
+  .signal.balanced .sig-dot{ background:var(--sig-bal-fg) }
+  .signal.saturated{ background:var(--sig-sat-bg); color:var(--sig-sat-fg) }
+  .signal.saturated .sig-dot{ background:var(--sig-sat-fg) }
+
+  .stat-body{ margin-top:9px; margin-left:17px; display:grid; grid-template-columns:repeat(3,1fr); gap:8px }
+  .sc-label{ font-size:9px; font-weight:600; letter-spacing:.05em; text-transform:uppercase; color:var(--text-3) }
+  .sc-val{ font-size:13px; font-weight:600; letter-spacing:-.01em; font-variant-numeric:tabular-nums; margin-top:2px }
+  .sc-val .peak{ color:var(--text-2); font-weight:500 }
+
+  .agg{
+    margin:6px 12px; padding:9px 11px; border-radius:9px; background:var(--card-bg);
+    display:flex; align-items:flex-start; gap:8px; font-size:11.5px; color:var(--text-2); line-height:1.35; font-variant-numeric:tabular-nums;
+  }
+  .agg svg{ flex:0 0 auto; margin-top:1px; color:var(--text-2) }
+  .agg b{ color:var(--text); font-weight:600 }
+
+  .sig-legend{
+    margin:2px 12px 13px; padding-top:10px; border-top:.5px solid var(--divider);
+    display:flex; align-items:center; gap:7px; flex-wrap:wrap;
+  }
+  .sig-legend .lg-t{ font-size:9.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--text-3); margin-right:1px }
+  .sig-legend .signal{ font-size:10px; padding:2px 7px }
+  .sig-legend .lg-note{ margin-left:auto; font-size:10px; color:var(--text-3); font-style:italic }
+
+  /* ============================================================= *
+   *  DESIGN NOTES + closing banner                                *
+   * ============================================================= */
+  .notes{
+    margin-top:30px; background:var(--card); border:1px solid var(--card-border); border-radius:14px;
+    padding:20px 22px;
+  }
+  .notes h2{ font-size:12px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--page-text-2); margin-bottom:12px }
+  .notes ul{ list-style:none; display:grid; gap:9px }
+  .notes li{ position:relative; padding-left:20px; font-size:12.5px; color:var(--page-text); line-height:1.5 }
+  .notes li::before{ content:""; position:absolute; left:2px; top:7px; width:6px; height:6px; border-radius:2px; background:var(--priv-strong); opacity:.55 }
+  .notes li b{ font-weight:600 }
+  .notes li code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:11px; background:var(--page-bg); padding:1px 5px; border-radius:4px }
+  .doc-foot{ margin-top:22px; display:flex; justify-content:center }
+
+  @media (max-width:520px){
+    body{ padding:22px 12px 34px }
+    .pop, .notch{ }
+    .gallery{ padding:22px 12px 34px; gap:34px 20px }
+  }
+
+  /* ===== 9-state section (appended below the shared component CSS) ===== */
+
+  /* additive theme tokens (append; multiple rules for one selector merge) */
+  .pop.theme-light{
+    --strip-attn-bg:rgba(190,120,20,.16); --strip-attn-fg:#8a5a12; --strip-attn-line:rgba(190,120,20,.3);
+    --fault-bg:rgba(201,38,29,.12);       --fault-fg:#bf2a20;
+  }
+  .pop.theme-dark{
+    --strip-attn-bg:rgba(224,178,104,.18); --strip-attn-fg:#e6bd76; --strip-attn-line:rgba(224,178,104,.32);
+    --fault-bg:rgba(255,105,97,.17);       --fault-fg:#ff6f66;
+  }
+
+  /* group label — spans the gallery, forces a section break in the flex-wrap */
+  .group-cap{
+    flex:1 1 100%; display:flex; align-items:center; gap:11px; margin:10px 2px -6px;
+    color:#fff; opacity:.92; text-shadow:0 0 6px rgba(0,0,0,.32);
+  }
+  .group-cap .gc-t{ font-size:11px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; white-space:nowrap }
+  .group-cap .gc-line{ flex:1 1 auto; height:1px; background:rgba(255,255,255,.24) }
+  .group-cap .gc-note{ flex:0 0 auto; font-size:10.5px; font-weight:500; letter-spacing:.01em; opacity:.85 }
+
+  /* message / degraded card (centered icon + title + sub + actions) */
+  .pop-msg{ padding:26px 22px 22px; display:flex; flex-direction:column; align-items:center; text-align:center }
+  .msg-badge{
+    width:54px; height:54px; border-radius:15px; display:grid; place-items:center; margin-bottom:14px;
+    background:var(--badge-bg); color:var(--text-2);
+  }
+  .msg-badge.attn{ background:var(--strip-attn-bg); color:var(--strip-attn-fg) }
+  .msg-badge.fault{ background:var(--fault-bg); color:var(--fault-fg) }
+  .msg-badge.invite{ background:var(--accent-tint); color:var(--accent) }
+  .msg-title{ font-size:15px; font-weight:600; letter-spacing:-.01em }
+  .msg-sub{ font-size:12.5px; color:var(--text-2); max-width:31ch; line-height:1.42; margin-top:5px }
+  .msg-actions{ display:flex; align-items:center; gap:10px; margin-top:16px }
+  .msg-cmd-wrap{ display:flex; flex-direction:column; align-items:center; gap:9px; margin-top:16px }
+  .msg-cmd-wrap .add-hint{ text-align:center }
+  .msg-hint{ font-size:10.5px; color:var(--text-3); max-width:34ch; line-height:1.4; margin-top:13px; font-style:italic }
+  .msg-hint code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10px; font-style:normal; background:var(--code-bg); color:var(--text-2); padding:1px 4px; border-radius:4px }
+
+  /* buttons (message-card scope) */
+  .btn{
+    font:inherit; font-size:12.5px; font-weight:500; padding:7px 14px; border-radius:8px;
+    border:.5px solid var(--btn-border); background:var(--btn-bg); color:var(--text); cursor:default;
+    display:inline-flex; align-items:center; gap:7px; white-space:nowrap;
+  }
+  .btn:active{ transform:translateY(.5px) }
+  .btn.primary{ border:0; background:var(--accent); color:#fff; font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,.22) }
+  .btn.link{ border:0; background:transparent; color:var(--text-2); padding:6px 8px }
+
+  /* status strip (disconnected / paused) — thin banner atop the panel */
+  .pop-strip{ display:flex; align-items:center; gap:8px; padding:9px 14px; font-size:11.5px; font-weight:500; border-bottom:.5px solid var(--divider) }
+  .pop-strip .st-ico{ flex:0 0 auto; display:grid; place-items:center }
+  .pop-strip .st-txt{ flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .pop-strip .st-txt b{ font-weight:700 }
+  .pop-strip .st-act{ flex:0 0 auto; font:inherit; font-size:11px; font-weight:600; padding:3px 10px; border-radius:6px; border:.5px solid currentColor; background:transparent; color:inherit; cursor:default }
+  .pop-strip.disconnected{ background:var(--strip-attn-bg); color:var(--strip-attn-fg); box-shadow:inset 0 -.5px 0 var(--strip-attn-line) }
+  .pop-strip.paused{ background:var(--card-bg); color:var(--text-2) }
+  .pop-strip.paused .st-ico{ color:var(--strip-attn-fg) }
+
+  /* dimmed (stale) rows — disconnected: last-known values, never frozen-as-live (#137) */
+  .accts.dim .acct{ opacity:.5 }
+  .accts.dim .acct.active{ box-shadow:inset 0 0 0 .5px var(--divider) }
+
+  /* row-health variants */
+  .acct .health.locked{ color:var(--ut-a) }
+  .acct .health.muted{ color:var(--text-3) }
+
+  /* paused swap callout (keychain-locked) */
+  .swap-row.paused{ background:var(--card-bg); border-color:var(--divider) }
+  .swap-row.paused .swap-ico{ color:var(--text-3) }
+  .swap-row.paused .lead{ color:var(--text-2) }
+  .swap-btn.off{ background:var(--track); color:var(--text-3); box-shadow:none }
+
+  /* stale-snapshot modifiers (mild — still connected) */
+  .app-sub .sub-stale{ color:var(--ut-a); font-weight:600 }
+  .pop-foot .fl2.stale{ color:var(--ut-a) }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ============ DOCUMENT HEAD ============ -->
+  <header class="doc-head">
+    <h1>Sessiometer &mdash; menubar popover &middot; all 9 states</h1>
+    <p class="lede">
+      The macOS status-bar popover across <b>every launch-or-attach state</b>, at true <b>380&nbsp;px</b> width, in the
+      native macOS language &mdash; vibrancy, meters, drawn sparklines, label-primary identity. Each state is a
+      <b>distinct icon-shape + panel message + affordance</b>; the menubar never renders healthy on a degraded daemon.
+      A visual build-reference for the SwiftUI panel (#168/#169) &mdash; it does not port to code.
+    </p>
+  </header>
+
+  <!-- ============ STAGE (desktop mock) ============ -->
+  <div class="stage">
+    <div class="menubar">
+      <span class="mb-apple">&#63743;</span>
+      <span class="mb-menus"><b>Finder</b><span>File</span><span>Edit</span><span>View</span></span>
+      <span class="mb-right">
+        <span class="mb-status" title="control center" aria-hidden="true">
+          <svg width="16" height="13" viewBox="0 0 16 13" fill="none"><rect x="1" y="1.5" width="8" height="3.2" rx="1.6" stroke="currentColor" stroke-width="1.1"/><circle cx="3" cy="3.1" r="1" fill="currentColor"/><rect x="1" y="7.8" width="8" height="3.2" rx="1.6" stroke="currentColor" stroke-width="1.1"/><circle cx="7" cy="9.4" r="1" fill="currentColor"/></svg>
+        </span>
+        <span class="mb-sess" title="Sessiometer — icon-only glance, shape-coded per state (no live %)">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="12" cy="15.6" r="1.7" fill="currentColor"/>
+          </svg>
+        </span>
+        <span class="mb-clock">9:41</span>
+      </span>
+    </div>
+
+    <div class="stage-cap">
+      <span>The glance is <b>icon-only</b>, shape-coded &mdash; click the gauge and the popover renders the <b>same detail as the <code style="font-family:ui-monospace,'SF Mono',Menlo,monospace">status</code> verb</b></span>
+      <span class="dotsep">&middot;</span>
+      <span>each frame&rsquo;s caption glyph is that state&rsquo;s menubar shape</span>
+      <span class="dotsep">&middot;</span>
+      <span>healthy shown in both themes; degraded states in Light with Dark spot-checks &mdash; the theme tokens apply <b>uniformly</b> to every state</span>
+    </div>
+
+    <div class="gallery">
+
+      <!-- ===================================================================== -->
+      <!-- GROUP 1 · HEALTHY            -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">1 &middot; Healthy</span><span class="gc-line"></span>
+        <span class="gc-note">the steady state &mdash; Status + Stats, light + dark</span>
+      </div>
+
+      <!-- STATUS · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          Healthy &middot; Status &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- active -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">W</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <!-- codex -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">P</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <!-- gemini -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">S</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="add-row">
+              <button class="add-btn" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                <span class="add-label">Add account&hellip;</span>
+              </button>
+              <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code></span></span>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- STATUS · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          Healthy &middot; Status &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">W</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">P</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">S</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="add-row">
+              <button class="add-btn" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                <span class="add-label">Add account&hellip;</span>
+              </button>
+              <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code></span></span>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- STATS · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          Healthy &middot; Stats &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Usage stats &middot; last 7 days</span></span>
+              <span class="seg"><button>Status</button><button class="on">Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="stats">
+              <div class="stat active">
+                <div class="stat-head">
+                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-halo)"></span>
+                  <span class="badge">W</span>
+                  <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
+                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
+                  <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
+                </div>
+                <div class="stat-body">
+                  <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">42<span class="peak"> / 100%</span></div></div>
+                  <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">88%</div></div>
+                  <div class="sc"><div class="sc-label">Cap-hits</div><div class="sc-val">42</div></div>
+                </div>
+              </div>
+              <div class="stat">
+                <div class="stat-head">
+                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="badge">P</span>
+                  <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
+                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
+                  <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
+                </div>
+                <div class="stat-body">
+                  <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">31<span class="peak"> / 96%</span></div></div>
+                  <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">71%</div></div>
+                  <div class="sc"><div class="sc-label">Cap-hits</div><div class="sc-val">11</div></div>
+                </div>
+              </div>
+              <div class="stat">
+                <div class="stat-head">
+                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="badge">S</span>
+                  <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
+                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
+                  <span class="signal underused"><span class="sig-dot"></span>underused</span>
+                </div>
+                <div class="stat-body">
+                  <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">4<span class="peak"> / 22%</span></div></div>
+                  <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">18%</div></div>
+                  <div class="sc"><div class="sc-label">Cap-hits</div><div class="sc-val">0</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="agg">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5M4 19h16M8 15l3-4 3 2 4-6"/></svg>
+              <span>All accounts &ge;90% at once &mdash; <b>3 episodes</b> (1h40m) &middot; swaps <b>28</b> &middot; last 7 days</span>
+            </div>
+            <div class="sig-legend">
+              <span class="lg-t">Signal</span>
+              <span class="signal underused"><span class="sig-dot"></span>underused</span>
+              <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
+              <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
+              <span class="lg-note">descriptive &middot; equal weight &middot; no action implied</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- STATS · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          Healthy &middot; Stats &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Usage stats &middot; last 7 days</span></span>
+              <span class="seg"><button>Status</button><button class="on">Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="stats">
+              <div class="stat active">
+                <div class="stat-head">
+                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 3px var(--accent-halo)"></span>
+                  <span class="badge">W</span>
+                  <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
+                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
+                  <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
+                </div>
+                <div class="stat-body">
+                  <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">42<span class="peak"> / 100%</span></div></div>
+                  <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">88%</div></div>
+                  <div class="sc"><div class="sc-label">Cap-hits</div><div class="sc-val">42</div></div>
+                </div>
+              </div>
+              <div class="stat">
+                <div class="stat-head">
+                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="badge">P</span>
+                  <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
+                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
+                  <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
+                </div>
+                <div class="stat-body">
+                  <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">31<span class="peak"> / 96%</span></div></div>
+                  <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">71%</div></div>
+                  <div class="sc"><div class="sc-label">Cap-hits</div><div class="sc-val">11</div></div>
+                </div>
+              </div>
+              <div class="stat">
+                <div class="stat-head">
+                  <span class="dot" style="flex:0 0 8px;width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px var(--text-3)"></span>
+                  <span class="badge">S</span>
+                  <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
+                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
+                  <span class="signal underused"><span class="sig-dot"></span>underused</span>
+                </div>
+                <div class="stat-body">
+                  <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">4<span class="peak"> / 22%</span></div></div>
+                  <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">18%</div></div>
+                  <div class="sc"><div class="sc-label">Cap-hits</div><div class="sc-val">0</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="agg">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5M4 19h16M8 15l3-4 3 2 4-6"/></svg>
+              <span>All accounts &ge;90% at once &mdash; <b>3 episodes</b> (1h40m) &middot; swaps <b>28</b> &middot; last 7 days</span>
+            </div>
+            <div class="sig-legend">
+              <span class="lg-t">Signal</span>
+              <span class="signal underused"><span class="sig-dot"></span>underused</span>
+              <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
+              <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
+              <span class="lg-note">descriptive &middot; equal weight &middot; no action implied</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================================================================== -->
+      <!-- GROUP 2 · STARTING & LIFECYCLE                                         -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">2 &middot; Starting &amp; lifecycle</span><span class="gc-line"></span>
+        <span class="gc-note">daemon-starting &middot; not-running &middot; crash-looping</span>
+      </div>
+
+      <!-- 2 · DAEMON-STARTING · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="2.4 3.2"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          Daemon-starting &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Connecting to the daemon&hellip;</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="2.4 3.2"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <div class="msg-title">Starting&hellip;</div>
+              <div class="msg-sub">Waiting for the first snapshot from the daemon. No numbers yet.</div>
+              <div class="msg-actions">
+                <button class="btn link"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3.5" width="14" height="17" rx="2.4"/><path d="M8.5 8h7M8.5 12h7M8.5 16h4"/></svg>View log</button>
+              </div>
+              <div class="msg-hint">Bounded, not a dead-end &mdash; escalates to &ldquo;not running&rdquo; or &ldquo;crash-looping&rdquo; if no snapshot arrives. A static forming glyph, never a fake spinner.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3 · NOT-RUNNING · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          Not-running &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon offline</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge attn"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <div class="msg-title">Daemon not running</div>
+              <div class="msg-sub">The background service isn&rsquo;t running. Start it to resume live status.</div>
+              <div class="msg-actions">
+                <button class="btn primary"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5.5l10 6.5-10 6.5z"/></svg>Start daemon</button>
+              </div>
+              <div class="msg-hint">Distinct from crash-looping and from disconnected. Start is a runtime/lifecycle action &mdash; it touches no credentials.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3 · NOT-RUNNING · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          Not-running &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon offline</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge attn"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <div class="msg-title">Daemon not running</div>
+              <div class="msg-sub">The background service isn&rsquo;t running. Start it to resume live status.</div>
+              <div class="msg-actions">
+                <button class="btn primary"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5.5l10 6.5-10 6.5z"/></svg>Start daemon</button>
+              </div>
+              <div class="msg-hint">Distinct from crash-looping and from disconnected. Start is a runtime/lifecycle action &mdash; it touches no credentials.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 · CRASH-LOOPING · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 4.2L21 19.8a1.3 1.3 0 0 1-1.1 2H4.1a1.3 1.3 0 0 1-1.1-2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17.7" r="1.15" fill="currentColor"/></svg>
+          Crash-looping &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon fault</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge fault"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><path d="M12 4.2L21 19.8a1.3 1.3 0 0 1-1.1 2H4.1a1.3 1.3 0 0 1-1.1-2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17.7" r="1.15" fill="currentColor"/></svg></span>
+              <div class="msg-title">Daemon crash-looping</div>
+              <div class="msg-sub">Restarted 5&times; in the last minute. Holding status until it stays up.</div>
+              <div class="msg-actions">
+                <button class="btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3.5" width="14" height="17" rx="2.4"/><path d="M8.5 8h7M8.5 12h7M8.5 16h4"/></svg>View log</button>
+                <button class="btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.6"/><path d="M20 5v6h-6"/></svg>Restart&hellip;</button>
+              </div>
+              <div class="msg-hint">Persists a <b>fault</b> shape and never renders healthy &mdash; the healthy-flash is debounced (a fresh snapshot must hold past a stability window). Restart is behind a confirm.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================================================================== -->
+      <!-- GROUP 3 · CONNECTION & FRESHNESS                                       -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">3 &middot; Connection &amp; freshness</span><span class="gc-line"></span>
+        <span class="gc-note">disconnected (dimmed, never frozen-as-live) &middot; stale-snapshot</span>
+      </div>
+
+      <!-- 5 · UDS-DROP / DISCONNECTED · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="5" cy="12" r="2.6" stroke="currentColor" stroke-width="2"/><circle cx="19" cy="12" r="2.6" stroke="currentColor" stroke-width="2"/><path d="M8 12h2.4M13.6 12H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          Disconnected &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; last-known</span></span>
+            </div>
+            <div class="pop-strip disconnected">
+              <span class="st-ico"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="5" cy="12" r="2.4" stroke="currentColor" stroke-width="2"/><circle cx="19" cy="12" r="2.4" stroke="currentColor" stroke-width="2"/><path d="M8 12h2.4M13.6 12H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <span class="st-txt"><b>Disconnected</b> &middot; data 45s old</span>
+              <button class="st-act">Reconnect</button>
+            </div>
+            <div class="accts dim">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">W</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">P</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">S</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last-known values &middot; dimmed as <b>stale</b> &middot; swaps paused</span>
+              <span class="fl2 stale"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>45s ago</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · STALE-SNAPSHOT · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.8" stroke="currentColor" stroke-width="2"/><path d="M12 6.8V12l3.4 2.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Stale-snapshot &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active &middot; <span class="sub-stale">stale 6m</span></span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">W</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">P</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">S</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="add-row">
+              <button class="add-btn" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                <span class="add-label">Add account&hellip;</span>
+              </button>
+              <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code></span></span>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2 stale"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 6m old &middot; past freshness threshold</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================================================================== -->
+      <!-- GROUP 4 · BLOCKED & GATED                                              -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">4 &middot; Blocked &amp; gated</span><span class="gc-line"></span>
+        <span class="gc-note">keychain-locked (waits, never prompts) &middot; version-skew (refuses numbers)</span>
+      </div>
+
+      <!-- 6 · KEYCHAIN-LOCKED · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.3" r="1.5" fill="currentColor"/></svg>
+          Keychain-locked &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+            </div>
+            <div class="pop-strip paused">
+              <span class="st-ico"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <span class="st-txt">Waiting for keychain unlock &middot; swaps paused</span>
+            </div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">W</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health locked"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">P</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">S</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row paused">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Swaps paused</div><div class="why">waiting for keychain unlock</div></span>
+              <button class="swap-btn off" disabled>Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Unlock your login keychain to resume &middot; the app only waits, never prompts</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 3s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 6 · KEYCHAIN-LOCKED · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.3" r="1.5" fill="currentColor"/></svg>
+          Keychain-locked &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+            </div>
+            <div class="pop-strip paused">
+              <span class="st-ico"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <span class="st-txt">Waiting for keychain unlock &middot; swaps paused</span>
+            </div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">W</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health locked"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">P</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">S</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row paused">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Swaps paused</div><div class="why">waiting for keychain unlock</div></span>
+              <button class="swap-btn off" disabled>Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Unlock your login keychain to resume &middot; the app only waits, never prompts</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 3s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 8 · VERSION-SKEW · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M5 4.5h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 21V9.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6.8 14.2L12 9l5.2 5.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Version-skew &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Version mismatch</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge attn"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><path d="M5 4.5h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 21V9.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6.8 14.2L12 9l5.2 5.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              <div class="msg-title">Update required</div>
+              <div class="msg-sub">The app and daemon versions differ &mdash; refusing to show numbers until they match.</div>
+              <div class="msg-cmd-wrap">
+                <button class="btn primary" data-cmd="brew upgrade sessiometer" onclick="copyCmd(this)">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.4"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  <span class="add-label">Copy update command</span>
+                </button>
+                <span class="add-hint"><span class="hint-default">copies <code>brew upgrade sessiometer</code> &middot; the app can&rsquo;t update itself</span></span>
+              </div>
+              <div class="msg-hint">Refuses to render any % on schema/version skew (I-002). A copy-command button, not a runner &mdash; the same rule as capture (consistency).</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================================================================== -->
+      <!-- GROUP 5 · ONBOARDING                                                   -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">5 &middot; Onboarding</span><span class="gc-line"></span>
+        <span class="gc-note">empty-roster / first run &mdash; distinct from daemon-down</span>
+      </div>
+
+      <!-- 9 · EMPTY-ROSTER / FIRST-RUN · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          Empty-roster &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Welcome</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge invite"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <div class="msg-title">No accounts yet</div>
+              <div class="msg-sub">Add an account to get started. Sessiometer tracks usage across all of them.</div>
+              <div class="msg-cmd-wrap">
+                <button class="btn primary" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                  <span class="add-label">Add account&hellip;</span>
+                </button>
+                <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code> &middot; paste in Terminal</span></span>
+              </div>
+              <div class="msg-hint">Calm base mark, distinct from &ldquo;disconnected.&rdquo; The button <b>copies</b> the command &mdash; the app never runs capture, so there is no fake &ldquo;capturing&rdquo; spinner.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 9 · EMPTY-ROSTER / FIRST-RUN · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          Empty-roster &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Welcome</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="pop-msg">
+              <span class="msg-badge invite"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+              <div class="msg-title">No accounts yet</div>
+              <div class="msg-sub">Add an account to get started. Sessiometer tracks usage across all of them.</div>
+              <div class="msg-cmd-wrap">
+                <button class="btn primary" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                  <span class="add-label">Add account&hellip;</span>
+                </button>
+                <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code> &middot; paste in Terminal</span></span>
+              </div>
+              <div class="msg-hint">Calm base mark, distinct from &ldquo;disconnected.&rdquo; The button <b>copies</b> the command &mdash; the app never runs capture, so there is no fake &ldquo;capturing&rdquo; spinner.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /gallery -->
+  </div><!-- /stage -->
+
+  <!-- ============ DESIGN NOTES ============ -->
+  <section class="notes">
+    <h2>Design notes &mdash; the 9-state map in the native macOS language</h2>
+    <ul>
+      <li><b>One surface, nine states, one language.</b> Every state is a render of the same 380&nbsp;px vibrancy popover &mdash; healthy rosters and degraded messages share the frosted material, hairline dividers, SF-symbol-style glyphs and tabular numerals. Each state is a <b>distinct icon-shape + panel message + affordance</b> (the 9-state map); the caption glyph above each card is that state&rsquo;s <b>menubar</b> shape.</li>
+      <li><b>Healthy = the <code>status</code> render.</b> Status and Stats share one language: label-primary two-line identity (<code>Work</code> / <code>Personal</code> / <code>Scratch</code> + monogram badge, provider below), session &amp; weekly usage meters (green&nbsp;&lt;70 / amber&nbsp;70&ndash;90 / red&nbsp;&ge;90), the smart <b>swap</b> hero callout, and drawn SVG sparklines with the neutral symmetric SIGNAL band.</li>
+      <li><b>Never healthy on a degraded daemon (#137).</b> <b>Disconnected</b> shows the last-known roster <i>dimmed + &ldquo;stale&rdquo;</i> with a broken-link badge and a <i>Reconnect</i> escape &mdash; never frozen-as-live; swaps paused. <b>Crash-looping</b> persists a <b>fault</b> shape and holds status until a fresh snapshot survives a stability window (the healthy-flash is debounced).</li>
+      <li><b>Freshness is a spectrum.</b> <b>Stale-snapshot</b> is milder than disconnected &mdash; still connected, so the full roster renders live with only a subtle amber <code>stale&nbsp;6m</code> modifier in the header and an amber freshness line in the footer; the swap stays enabled (the daemon re-mints viability on swap).</li>
+      <li><b>Blocked states are honest and non-intrusive.</b> <b>Keychain-locked</b> keeps the fresh roster but marks the active account with an amber lock, pauses the swap callout, and only <i>waits</i> &mdash; the app never prompts or auto-unlocks. <b>Version-skew</b> refuses to render any % and offers a copy-command instead.</li>
+      <li><b>Copy-command, never a runner.</b> <b>Add account</b> (<code>sessiometer capture</code>), first-run onboarding, and version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>) all copy to the clipboard for you to paste in Terminal. The app never runs them, and <b>daemon-starting</b> uses a <i>static</i> forming glyph &mdash; there is no fake &ldquo;capturing&rdquo; or &ldquo;starting&rdquo; spinner anywhere.</li>
+      <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
+      <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each provider gets the same monochrome monogram badge and a plain text label (no brand colour or logo). The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
+      <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
+      <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges, the amber lock and stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>
+    </ul>
+  </section>
+
+</div><!-- /wrap -->
+
+<script>
+  // Add-account / Copy-update = COPY the command. Never runs it; never a fake spinner.
+  function copyCmd(btn){
+    var cmd = btn.getAttribute('data-cmd') || '';
+    var hint = btn.parentNode.querySelector('.add-hint');
+    var reveal = function(){
+      if(!hint) return;
+      hint.innerHTML = '<span class="copied">&#10003; Copied &mdash; paste in Terminal</span>';
+      setTimeout(function(){
+        hint.innerHTML = '<span class="hint-default">copies <code>'+cmd+'</code></span>';
+      }, 1900);
+    };
+    try{
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(cmd).then(reveal, function(){ fallbackCopy(cmd); reveal(); });
+      } else { fallbackCopy(cmd); reveal(); }
+    }catch(e){ fallbackCopy(cmd); reveal(); }
+  }
+  function fallbackCopy(text){
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly','');
+      ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+    }catch(e){/* clipboard blocked over file:// — the command is visible for manual copy */}
+  }
+</script>
+</body>
+</html>
