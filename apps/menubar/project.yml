@@ -44,6 +44,10 @@ targets:
       - path: Sources/WatchTransport.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
+      # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
+      # StatusItemController/StatusPanelView/main.swift — those touch NSStatusBar/AppKit UI that a
+      # headless logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
+      - path: Sources/StatusGauge.swift
       - path: Tests
     settings:
       base:
