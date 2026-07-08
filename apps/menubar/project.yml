@@ -3,11 +3,11 @@
 # The Xcode project is generated from this file — run `xcodegen generate` (the
 # resulting `Menubar.xcodeproj` is git-ignored). Per ADR-0010 the Swift app is a
 # sibling directory to the Rust crate at the repo root; it links no Rust and is
-# NOT a Cargo workspace member. This is the #311 scaffold only — the real
-# menu-bar UI and socket client are #168, signing/notarization is #171.
+# NOT a Cargo workspace member. The menu-bar UI + socket client landed across
+# #322–#327 (#327 reconciled the bundle identity below); signing/notarization is #171.
 name: Menubar
 options:
-  bundleIdPrefix: com.sessiometer
+  bundleIdPrefix: org.sessiometer
   deploymentTarget:
     macOS: "13.0"
   createIntermediateGroups: true
@@ -19,8 +19,15 @@ targets:
       - Sources
     settings:
       base:
-        PRODUCT_NAME: Menubar
-        PRODUCT_BUNDLE_IDENTIFIER: com.sessiometer.menubar
+        # Bundle identity per /council 2026-07-06: `org.sessiometer` is the product-FAMILY
+        # namespace — never itself a concrete bundle id; every artifact is a peer child (the app
+        # here; the embedded daemon LaunchAgent → org.sessiometer.agent, #329). PROVISIONAL,
+        # #170-spike-gated: falls back to bare `org.sessiometer` ONLY if the SMAppService spike
+        # (#170) shows the agent Label must be prefixed by the app's CFBundleIdentifier. The id
+        # needn't freeze until the first Sparkle release (#171). Supersedes the #311 scaffold's
+        # com-prefixed id and `Menubar` product name.
+        PRODUCT_NAME: Sessiometer
+        PRODUCT_BUNDLE_IDENTIFIER: org.sessiometer.menubar
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Info.plist
@@ -56,7 +63,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: MenubarTests
-        PRODUCT_BUNDLE_IDENTIFIER: com.sessiometer.menubar.tests
+        PRODUCT_BUNDLE_IDENTIFIER: org.sessiometer.menubar.tests
         GENERATE_INFOPLIST_FILE: "YES"
         # Standalone logic-test bundle: no host app to launch (the decoder is pure), so null
         # out the unit-test preset's default host wiring explicitly rather than relying on an

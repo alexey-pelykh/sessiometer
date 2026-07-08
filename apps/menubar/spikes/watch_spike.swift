@@ -37,7 +37,7 @@ import os
 import Darwin
 #endif
 
-let log = Logger(subsystem: "com.sessiometer.menubar.spike", category: "watch")
+let log = Logger(subsystem: "org.sessiometer.menubar.spike", category: "watch")
 
 /// Mirror `os_log` to stdout so a standalone (non-app-bundle) run captures evidence in the
 /// terminal — the unified-log sink is invisible to a piped run. #323 uses `Logger` alone.

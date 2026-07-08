@@ -31,7 +31,7 @@ import Combine
 import Foundation
 import os
 
-private let storeLog = Logger(subsystem: "com.sessiometer.menubar", category: "watch-store")
+private let storeLog = Logger(subsystem: "org.sessiometer.menubar", category: "watch-store")
 
 @MainActor
 final class WatchStatusStore: ObservableObject {

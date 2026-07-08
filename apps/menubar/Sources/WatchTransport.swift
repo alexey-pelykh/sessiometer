@@ -19,7 +19,7 @@
 import Foundation
 import os
 
-private let log = Logger(subsystem: "com.sessiometer.menubar", category: "watch-transport")
+private let log = Logger(subsystem: "org.sessiometer.menubar", category: "watch-transport")
 
 /// The `{"cmd":"watch"}\n` subscribe request the daemon's `serve_control` dispatches to `serve_watch`.
 private let watchSubscribeCommand: [UInt8] = Array(#"{"cmd":"watch"}"#.utf8) + [0x0A]
