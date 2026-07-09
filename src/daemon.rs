@@ -15,8 +15,8 @@
 //!    swap — see [`Daemon::resolve_active`]. `None` (un-identifiable) → poll-only,
 //!    never swap.
 //! 2. **Poll ONE account** (issue #80). Each tick polls a single account — the next
-//!    entry in a staggered round-robin schedule (the active account first, then each
-//!    enabled non-active in turn) — through the canonical credential when it is the
+//!    entry in a staggered schedule that interleaves the active account before each
+//!    enabled non-active peer (issue #366) — through the canonical credential when it is the
 //!    active account (freshest token) or its stash otherwise. Spreading a cycle's N
 //!    polls across N sub-intervals (≈`poll_secs / N` apart) keeps each request in its
 //!    own rate-limit window: the usage endpoint is source-scoped and serves ~one
@@ -1090,27 +1090,31 @@ struct DecisionState {
     /// `signaled_all_exhausted`.
     signaled_keychain_locked: bool,
     /// Last-known usage reading per roster account (issue #80), indexed by roster
-    /// position. The daemon polls ONE account per tick (round-robin, active first),
-    /// so a decision is taken on the most recent reading of EACH account rather than
-    /// a single-instant poll-of-all — one account's number may be ~a cycle older than
-    /// another's. `None` until an account is first polled (or after a poll fails).
+    /// position. The daemon polls ONE account per tick (staggered, the active
+    /// interleaved before each peer — #366), so a decision is taken on the most recent
+    /// reading of EACH account rather than a single-instant poll-of-all — one account's
+    /// number may be ~a cycle older than another's. `None` until an account is first
+    /// polled (or after a poll fails).
     /// Sized to the roster in [`Daemon::new`]. The decision/snapshot view masks an
     /// out-of-rotation (disabled / quarantined) non-active account back to `None`
     /// ([`decision_readings`](Daemon::decision_readings)), so stale carried data can
     /// never leak into [`pick_target`].
     last_readings: Vec<Option<Usage>>,
-    /// The staggered poll schedule for the CURRENT cycle (issue #80): the roster
-    /// indices to poll, in order — the active account first (its swap-away trigger is
-    /// the most time-sensitive), then every enabled, non-quarantined non-active
-    /// account. One entry is consumed per tick; when [`poll_pos`](Self::poll_pos)
-    /// reaches its end the schedule is rebuilt for the next cycle (re-resolving active
-    /// and re-reading rotation membership). Empty only for a degenerate roster (no
-    /// active and nothing enabled), in which case a tick polls nothing.
+    /// The staggered poll schedule for the CURRENT cycle (issues #80, #366): the roster
+    /// indices to poll, in order — the active account INTERLEAVED before each enabled,
+    /// non-quarantined non-active peer (`[active, p1, active, p2, …]`, issue #366), so
+    /// the active is re-observed roughly every second tick without raising the poll rate
+    /// (see [`build_poll_schedule`](Daemon::build_poll_schedule)). One entry is consumed
+    /// per tick; when [`poll_pos`](Self::poll_pos) reaches its end the schedule is
+    /// rebuilt for the next cycle (re-resolving active and re-reading rotation
+    /// membership). Empty only for a degenerate roster (no active and nothing enabled),
+    /// in which case a tick polls nothing.
     poll_schedule: Vec<usize>,
     /// Cursor into [`poll_schedule`](Self::poll_schedule): the position to poll this
     /// tick. Advances by one per tick and triggers a schedule rebuild on wrap, so the
-    /// daemon walks active → spare → spare → … one account per sub-interval instead of
-    /// bursting all at once (issue #80).
+    /// daemon walks active → spare → active → spare → … one account per sub-interval
+    /// (the active interleaved between peers, issue #366) instead of bursting all at
+    /// once (issue #80).
     poll_pos: usize,
     /// Whether each roster account has been polled at least once this run (issue #80),
     /// indexed by roster position. Drives the warm-up latch below; sized to the roster
@@ -1582,9 +1586,9 @@ where
         let active = self.state.active;
 
         // Poll ONE account this tick — the next entry in the staggered schedule
-        // (issue #80): active first, then each enabled, non-quarantined non-active in
-        // turn, one account per sub-interval, so the N requests of a cycle land in N
-        // separate rate-limit windows instead of a single back-to-back burst (most of
+        // (issue #80): the active account interleaved before each enabled,
+        // non-quarantined peer (#366), one account per sub-interval, so each poll lands
+        // in its own rate-limit window instead of a single back-to-back burst (most of
         // which the source-scoped usage endpoint `429`s at the CDN edge). The polled
         // account's reading replaces its slot in the carried `last_readings`; every
         // OTHER slot keeps its most-recent value, so the decision below is taken on
@@ -1756,9 +1760,10 @@ where
 
     /// The roster index to poll THIS tick — the next entry in the staggered schedule
     /// (issue #80) — advancing the cursor and rebuilding the schedule at the start of
-    /// each cycle. The schedule is the active account first, then every enabled,
-    /// non-quarantined non-active account (see [`build_poll_schedule`](Self::build_poll_schedule));
-    /// consuming one entry per tick spaces a cycle's N polls across N sub-intervals.
+    /// each cycle. The schedule interleaves the active account before each enabled,
+    /// non-quarantined non-active peer (see [`build_poll_schedule`](Self::build_poll_schedule),
+    /// issue #366); consuming one entry per tick keeps each poll `poll_secs/N` apart (the
+    /// divisor is [`rotation_len`](Self::rotation_len) = N, unchanged by the interleave).
     /// `None` only for a degenerate roster whose schedule is empty (no active and
     /// nothing enabled) — that tick polls nothing and simply decides + waits.
     fn next_poll_index(&mut self, active: Option<usize>) -> Option<usize> {
@@ -1774,24 +1779,56 @@ where
         idx
     }
 
-    /// Build this cycle's poll schedule (issue #80): the active account FIRST (its
-    /// swap-away trigger is the most time-sensitive), then every enabled (#36),
-    /// non-quarantined (#42) non-active account in roster order. The active account is
-    /// always included even when disabled / quarantined (its swap-AWAY trigger must
-    /// still fire and a dead active is re-probed), exactly as the former poll-all loop
-    /// did; a disabled / quarantined non-active is excluded (never a swap target, and
-    /// polling its dead token would waste a `curl`).
+    /// Build this cycle's poll schedule: the active account INTERLEAVED before each
+    /// peer — `[active, p1, active, p2, …, active, p_{N-1}]` (issue #366) — rather than
+    /// once at the head (the original #80 shape, `[active, p1, p2, …]`). The active
+    /// account is the only one that can reach its ceiling WHILE active (hence the only
+    /// one whose swap-AWAY trigger is time-sensitive), so it is re-observed every ~2
+    /// sub-intervals (≈`2·poll_secs/N`) instead of once per full sweep. The peers are
+    /// every enabled (#36), non-quarantined (#42) non-active account in roster order,
+    /// each still appearing ONCE — so a peer re-observes every `2·poll_secs·(N-1)/N`,
+    /// which is `< 2·poll_secs` for all N (peers are only swap targets, ranked by weekly
+    /// reset, so relaxing their cadence is fine). This 1:1 interleave IS the cap the
+    /// acceptance asks for: inserting the active more than once per peer would push a
+    /// peer's re-observation past `2·poll_secs`.
+    ///
+    /// Rate-neutral (load-bearing, #366): interleaving only lengthens the schedule
+    /// VECTOR. The tick divisor is [`rotation_len`](Self::rotation_len) = N — the count
+    /// of DISTINCT rotation accounts, taken from the roster, NOT the schedule length —
+    /// so [`next_subinterval`](Self::next_subinterval) keeps ticks `poll_secs/N` apart —
+    /// the per-tick spacing, the aggregate request rate, and the `poll_secs/N` per-source
+    /// FLOOR are all unchanged (the active's re-observation deliberately tightens to
+    /// `2·poll_secs/N`, still 2× slower than that floor). No new timer / async task
+    /// / concurrent poller (one would fire outside the stagger and re-open the #80/#293
+    /// burst); the change is purely this vector plus leaving `rotation_len` at N.
+    ///
+    /// The active account is always included even when disabled / quarantined (its
+    /// swap-AWAY trigger must still fire and a dead active is re-probed), exactly as the
+    /// former poll-all loop did; a disabled / quarantined non-active is excluded (never a
+    /// swap target, and polling its dead token would waste a `curl`). Degenerate rosters:
+    /// with no active, the schedule is just the peers in order (nothing to interleave);
+    /// with an active but no peers, it is the active alone (still must be polled).
     fn build_poll_schedule(&self, active: Option<usize>) -> Vec<usize> {
-        let mut schedule = Vec::with_capacity(self.roster.len());
-        if let Some(a) = active {
-            schedule.push(a);
-        }
+        // Upper bound on length: the active (≤ 1) interleaved before each of ≤ roster
+        // peers, so ≤ 2·roster.len().
+        let mut schedule = Vec::with_capacity(2 * self.roster.len());
         for i in 0..self.roster.len() {
             if active == Some(i) {
-                continue; // already first
+                continue; // the active account is interleaved below, never listed as a peer
             }
             if self.roster[i].enabled && !self.state.health[i].quarantined {
+                if let Some(a) = active {
+                    schedule.push(a); // re-observe the active account before each peer (#366)
+                }
                 schedule.push(i);
+            }
+        }
+        // Every push above is peer-driven, so an empty schedule here means the active
+        // account had NO peers to interleave against — it still must be polled (its
+        // swap-away trigger / dead-active re-probe), so schedule it alone.
+        if let Some(a) = active {
+            if schedule.is_empty() {
+                schedule.push(a);
             }
         }
         schedule
@@ -1836,10 +1873,15 @@ where
             .collect()
     }
 
-    /// The number of accounts in the current poll rotation (issue #80): the active
-    /// account plus every enabled, non-quarantined non-active account — the schedule
-    /// length, and the divisor that spreads a cycle's polls across the interval (see
-    /// [`next_subinterval`](Self::next_subinterval)). At least 0; callers clamp to ≥ 1.
+    /// The number of DISTINCT accounts in the current poll rotation (issue #80): the
+    /// active account plus every enabled, non-quarantined non-active account. This is the
+    /// divisor that spreads a cycle's polls across the interval (see
+    /// [`next_subinterval`](Self::next_subinterval)) — deliberately the count of distinct
+    /// rotation accounts (N), NOT the length of [`poll_schedule`](DecisionState::poll_schedule),
+    /// which the #366 active-interleave makes ~2N. Keeping the divisor at N is what holds
+    /// the per-tick spacing at `poll_secs/N` (and thus the aggregate request rate, and
+    /// the `poll_secs/N` per-source floor), unchanged by the interleave. At least 0;
+    /// callers clamp to ≥ 1.
     fn rotation_len(&self) -> usize {
         (0..self.roster.len())
             .filter(|&i| {
@@ -3122,7 +3164,8 @@ where
         self.state.polled_once = polled_once;
         self.state.active = active;
         // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
-        // fresh one (active-first, then enabled non-quarantined) at the next cycle start.
+        // fresh one (the active interleaved before each enabled non-quarantined peer,
+        // #366) at the next cycle start.
         self.state.poll_schedule.clear();
         self.state.poll_pos = 0;
     }
@@ -3547,12 +3590,16 @@ where
     }
 
     /// The wait between two consecutive single-account polls (issue #80): the full
-    /// jittered interval divided by the rotation size, so the N accounts of a cycle
-    /// are spaced ~`poll_secs / N` apart (≈40–45 s for a typical roster) and a full
-    /// sweep still takes ~one `poll_secs`. Each sub-interval draws a fresh full
-    /// interval (inheriting the #38 jitter decorrelation) before dividing. The divisor
-    /// is clamped to ≥ 1 so a single-account roster simply waits the whole interval —
-    /// there is nothing to stagger and no burst is possible.
+    /// jittered interval divided by the rotation SIZE (the distinct-account count N, see
+    /// [`rotation_len`](Self::rotation_len)), so consecutive polls stay ~`poll_secs / N`
+    /// apart (≈40–45 s for a typical roster) — the per-source FLOOR the stagger exists to
+    /// enforce (no account is polled faster than this). The #366 active-interleave
+    /// lengthens the schedule (a full sweep of it now
+    /// spans ~`2·poll_secs`, re-observing the active every ~2 sub-intervals) but does NOT
+    /// touch this divisor, so the per-tick spacing is unchanged. Each sub-interval draws a
+    /// fresh full interval (inheriting the #38 jitter decorrelation) before dividing. The
+    /// divisor is clamped to ≥ 1 so a single-account roster simply waits the whole
+    /// interval — there is nothing to stagger and no burst is possible.
     fn next_subinterval(&mut self) -> Duration {
         let interval = self.next_poll_interval();
         let len = self.rotation_len().max(1) as u32;
@@ -4680,12 +4727,14 @@ mod tests {
     /// set inside the tick that polls the last schedule entry (before its
     /// `decide_action`), so the returned outcome already reflects the warmed decision.
     async fn warmed_tick(daemon: &mut FakeDaemon) -> TickOutcome {
-        // Warm-up latches within one full cycle — at most one tick per in-rotation
-        // account, so never more than the roster size. Bound the loop accordingly (+1
-        // slack) so a misuse on a roster that can NEVER warm up — no identifiable
-        // active AND nothing enabled, i.e. an empty schedule whose `note_polled` never
-        // fires — fails LOUDLY here instead of hanging the test forever.
-        let max_ticks = daemon.roster.len() + 1;
+        // Warm-up latches when the schedule's last distinct account is first polled. The
+        // #366 active-interleave makes the schedule up to ~2·N long (the active re-inserted
+        // before each peer), so warm-up can take up to 2·(N-1) ticks — bound the loop by
+        // the max schedule length (2·roster + slack) so a misuse on a roster that can
+        // NEVER warm up (no identifiable active AND nothing enabled → an empty schedule
+        // whose `note_polled` never fires) still fails LOUDLY here instead of hanging the
+        // test forever.
+        let max_ticks = 2 * daemon.roster.len() + 1;
         for _ in 0..max_ticks {
             let outcome = daemon.tick().await;
             if daemon.state.warmed_up {
@@ -6184,15 +6233,17 @@ mod tests {
         assert_eq!(tick_backoff_secs(&second), Some(300));
     }
 
-    // --- #80 staggered round-robin poll scheduling -------------------------
+    // --- #80 staggered poll scheduling, #366 active interleave -------------
     //
     // The cycle no longer bursts every account in one tick. Each tick polls ONE
-    // account from a round-robin schedule — the active first (its swap-away trigger
-    // is the most time-sensitive, so it is polled every cycle), then the enabled,
-    // non-quarantined non-actives — carrying the rest at their last-known reading.
-    // The swap-away decision HOLDS until a warm-up cycle has polled everyone once,
-    // and the per-poll wait is the full interval spread across the rotation. Every
-    // seam is hermetic — no real clock or network (AC #4).
+    // account from a staggered schedule that interleaves the active account before
+    // each peer (`[active, p1, active, p2, …]`, #366) — so the active (its swap-away
+    // trigger is the most time-sensitive) is re-observed every ~2 ticks, while the
+    // enabled non-quarantined peers are each polled once — carrying the rest at their
+    // last-known reading. The swap-away decision HOLDS until a warm-up cycle has polled
+    // everyone once, and the per-poll wait is the full interval spread across the
+    // rotation SIZE N (NOT the schedule length — #366 rate-neutrality). Every seam is
+    // hermetic — no real clock or network (AC #4).
 
     /// A three-account daemon (`work` active, `spare`, `backup`) with the canonical
     /// holding `work`'s token — the fixture for the scheduling tests below. The
@@ -6231,8 +6282,9 @@ mod tests {
         // AC #1/#2: no N-request burst — each tick polls exactly ONE account, and the
         // decision set accumulates the others as last-known readings rather than
         // re-polling them. Distinct per-account session values make the polled slot
-        // identifiable: exactly one new reading lands per tick, in round-robin order
-        // (active `work` first, then `spare`, then `backup`).
+        // identifiable: exactly one new reading lands per tick, in the interleaved order
+        // (active `work`, `spare`, active `work` AGAIN, `backup` — issue #366), so the
+        // full peer set is carried only once the schedule's last peer is reached.
         let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
                 .ok("u-A", 0.11, 0.10)
@@ -6263,16 +6315,23 @@ mod tests {
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
+            vec![Some(0.11), Some(0.22), None],
+            "tick 3 RE-polls the interleaved active work (#366); backup is still unread"
+        );
+        daemon.tick().await;
+        assert_eq!(
+            sessions(&daemon),
             vec![Some(0.11), Some(0.22), Some(0.33)],
-            "tick 3 completes the cycle — every account now carried at its last reading"
+            "tick 4 adds backup — the schedule's last peer — so every account is now carried"
         );
     }
 
     #[tokio::test]
-    async fn the_poll_schedule_leads_with_the_active_then_round_robins_and_wraps() {
-        // AC #1/#2: the schedule is the active account FIRST (polled every cycle),
-        // then the enabled non-quarantined non-actives in roster order; the cursor
-        // advances one entry per tick and wraps at the cycle boundary.
+    async fn the_poll_schedule_interleaves_the_active_before_each_peer_and_wraps() {
+        // AC #1/#2 (issue #366): the schedule interleaves the active account before each
+        // enabled non-quarantined peer — `[active, p1, active, p2, …]` — so the active is
+        // re-observed every ~2 ticks; the cursor advances one entry per tick and wraps at
+        // the (now longer) cycle boundary.
         let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
                 .ok("u-A", 0.10, 0.10)
@@ -6281,18 +6340,50 @@ mod tests {
         )
         .await;
 
-        // With `spare` (index 1) active, the schedule leads with it, then the others.
-        assert_eq!(daemon.build_poll_schedule(Some(1)), vec![1, 0, 2]);
+        // With `spare` (index 1) active, the active leads and is re-inserted before the
+        // second peer: [active, peer0, active, peer2].
+        assert_eq!(daemon.build_poll_schedule(Some(1)), vec![1, 0, 1, 2]);
 
-        // Driving the cursor a full cycle plus one yields the wrap back to the lead.
-        let polled: Vec<usize> = (0..4)
+        // Driving the cursor a full cycle (4 entries) plus one yields the wrap to the lead.
+        let polled: Vec<usize> = (0..5)
             .map(|_| daemon.next_poll_index(Some(1)).unwrap())
             .collect();
         assert_eq!(
             polled,
-            vec![1, 0, 2, 1],
-            "active-first, then round-robin, then wrap to the lead"
+            vec![1, 0, 1, 2, 1],
+            "active interleaved before each peer, then wrap to the lead"
         );
+    }
+
+    #[tokio::test]
+    async fn the_poll_schedule_interleaves_before_each_peer_and_handles_degenerate_rosters() {
+        // #366 branch coverage: the active is interleaved before EVERY enabled
+        // non-quarantined peer, an excluded peer gets NO active insertion, and the two
+        // degenerate shapes (no active / an active with no peers) still yield a valid
+        // schedule rather than an empty one.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // Active 0 with two enabled peers (1, 2): the active is re-inserted before EACH.
+        assert_eq!(daemon.build_poll_schedule(Some(0)), vec![0, 1, 0, 2]);
+
+        // No active: just the peers in roster order, nothing to interleave.
+        assert_eq!(daemon.build_poll_schedule(None), vec![0, 1, 2]);
+
+        // Quarantine peer 2: it drops out entirely — the active is NOT interleaved before
+        // an excluded peer (so no `2`, and no extra leading `0` for it).
+        daemon.state.health[2].quarantined = true;
+        assert_eq!(daemon.build_poll_schedule(Some(0)), vec![0, 1]);
+
+        // Quarantine the last remaining peer too: an active with NO peers still polls
+        // itself (its swap-away trigger / dead-active re-probe), never an empty schedule.
+        daemon.state.health[1].quarantined = true;
+        assert_eq!(daemon.build_poll_schedule(Some(0)), vec![0]);
     }
 
     #[tokio::test]
@@ -6332,8 +6423,10 @@ mod tests {
         // AC #2: until the staggered loop has polled every account once the carried
         // readings are partial — swapping then could pick a suboptimal target or
         // declare a spurious all-exhausted. So the swap-away decision HOLDS through the
-        // warm-up cycle and fires only on the full last-known set. Active `work` is
-        // over its trigger from tick 1, yet the swap waits for the third (final) tick.
+        // warm-up cycle and fires only on the full last-known set. Active `work` is over
+        // its trigger from tick 1, yet the swap waits until every account has been polled
+        // once — which the #366 active-interleave (`[work, spare, work, backup]`) reaches
+        // at the FOURTH tick (tick 3 re-observes the active before the last peer).
         let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
                 .ok("u-A", 0.97, 0.10) // active, over the 95 % session trigger
@@ -6353,8 +6446,16 @@ mod tests {
         let third = daemon.tick().await;
         assert_eq!(
             third.action,
+            TickAction::Held,
+            "tick 3: re-observes the interleaved active — backup still unpolled, still warming up"
+        );
+        assert!(!daemon.state.warmed_up);
+
+        let fourth = daemon.tick().await;
+        assert_eq!(
+            fourth.action,
             TickAction::Swapped { from: 0, to: 1 },
-            "tick 3: warm-up complete → the swap fires on the full last-known set"
+            "tick 4: warm-up complete → the swap fires on the full last-known set"
         );
         assert!(daemon.state.warmed_up);
     }
@@ -11890,13 +11991,12 @@ mod tests {
         // rejection — a 401 and a 403 (missing usage scope) — emits EXACTLY one
         // structured line per occurrence. A per-account keychain-lock is now SILENT
         // here: the lock is process-global and signaled once at top-of-tick (#13),
-        // not per poll. The staggered loop (#80) polls ONE account per tick in
-        // round-robin (active A first, then B, then C), so a full sweep of the
-        // 3-account roster takes three ticks; running FOUR ticks polls A twice
-        // (ticks 1 and 4) — proving the per-account 401 streak climbs 1 → 2 across
-        // its own re-polls — with B's (silent) lock on tick 2 and C's 403 on tick 3
-        // in between, demonstrating `note_poll_outcome` is wired into the loop and
-        // serialized.
+        // not per poll. The staggered loop (#80) polls ONE account per tick, the active
+        // interleaved before each peer (#366 → A, B, A, C), so a full sweep of the
+        // 3-account roster takes four ticks; those four ticks poll A twice (ticks 1 and
+        // 3) — proving the per-account 401 streak climbs 1 → 2 across its own re-polls —
+        // with B's (silent) lock on tick 2 and C's 403 on tick 4, demonstrating
+        // `note_poll_outcome` is wired into the loop and serialized.
         let roster = vec![
             account("u-A", "work"),
             account("u-B", "spare"),
@@ -11929,7 +12029,7 @@ mod tests {
         let log_path = logdir.path().join("sessiometer.log");
         let mut log = EventLog::at(&log_path).unwrap();
         // after(5): 4 idle shutdown-checks + 1 start-up check (#76 de-burst) — four
-        // staggered ticks (A, B, C, A).
+        // staggered ticks; the #366 active-interleave makes them (A, B, A, C).
         let mut shutdown = FakeShutdown::after(5);
         let control = NoControl;
 
@@ -11948,10 +12048,10 @@ mod tests {
 
         assert_eq!(daemon.state.ticks, 4);
 
-        // Across the four staggered ticks (#80), A 401s twice (ticks 1, 4) and C 403s
-        // once (tick 3) → three event lines, each stamped, none carrying secret
-        // material (handles only — never a token or email). The locked account B
-        // contributes nothing per-account (#13).
+        // Across the four staggered ticks (#80, interleaved #366 → A, B, A, C), A 401s
+        // twice (ticks 1, 3) and C 403s once (tick 4) → three event lines, each stamped,
+        // none carrying secret material (handles only — never a token or email). The
+        // locked account B contributes nothing per-account (#13).
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(logged.lines().count(), 3, "three lines: {logged:?}");
         assert!(
@@ -14191,11 +14291,12 @@ mod tests {
                 .scope_missing(C.0); // usage_scope_fail (403)
             let tun = tunables(95, 80, 0);
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B, C], poller, &tun).await;
-            // One poll per staggered tick (#80): work (401), then the silent
-            // per-account lock on spare, then backup (403). Harvest the whole rotation
-            // so both the monitor_401 and usage_scope_fail channels are exercised. The
+            // One poll per staggered tick (#80), interleaved (#366): work (401), the
+            // silent per-account lock on spare, work AGAIN (401), then backup (403). Four
+            // ticks cover the full interleaved schedule `[work, spare, work, backup]`, so
+            // both the monitor_401 and usage_scope_fail (403) channels are exercised. The
             // active account's reading is unavailable every tick → SkippedActiveUnavailable.
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let outcome = daemon.tick().await;
                 assert_eq!(outcome.action, TickAction::SkippedActiveUnavailable);
                 harvest_channels(&outcome, &mut corpus);
