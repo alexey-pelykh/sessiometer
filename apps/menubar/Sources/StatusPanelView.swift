@@ -217,9 +217,11 @@ private struct AccountRowView: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
-            // Keep the metrics on ONE line — never wrap; an unusually long value truncates rather than
-            // wraps. (Dynamic Type at large accessibility sizes still needs a look — tracked, task #8.)
+            // Keep the metrics on ONE line (a deliberate no-wrap choice, 715dc2d), but let the text
+            // shrink to fit rather than truncate under large Dynamic Type — the numbers stay visible
+            // down to 75%, and the row's VoiceOver label speaks the full metrics regardless.
             .lineLimit(1)
+            .minimumScaleFactor(0.75)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)

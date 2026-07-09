@@ -23,7 +23,7 @@ import SwiftUI
 @MainActor
 final class StatusItemController {
     private let statusItem: NSStatusItem
-    private let panel: NSPanel
+    private let panel: FloatingPanel
     /// The SwiftUI host, kept so `openPanel` can size the panel to the current content.
     private let hostingView: NSView
     private let store: WatchStatusStore
@@ -55,9 +55,9 @@ final class StatusItemController {
 
         // Borderless + NON-activating: non-activating keeps the menu-bar icon live so a second click on
         // it toggles the panel closed; borderless + clear background gives the floating-card look.
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 200),
-                            styleMask: [.borderless, .nonactivatingPanel],
-                            backing: .buffered, defer: false)
+        let panel = FloatingPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 200),
+                                  styleMask: [.borderless, .nonactivatingPanel],
+                                  backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .popUpMenu
         panel.hidesOnDeactivate = false
@@ -181,6 +181,12 @@ final class StatusItemController {
         let y = iconFrame.minY - panelGap - size.height   // hang below the icon's bottom edge, with the gap
         panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
         panel.orderFrontRegardless()
+        // Make the panel key so VoiceOver focus moves INTO it (the borderless-panel regression: a
+        // non-key window is not in VoiceOver's navigation, leaving the well-labelled rows unreachable).
+        // `.nonactivatingPanel` keeps the app inactive, so keying it does NOT steal app activation — the
+        // icon stays live for the second-click toggle. `orderFrontRegardless` still governs SHOWING it
+        // while the accessory app is inactive; `makeKey` only adds focus.
+        panel.makeKey()
 
         // Click-outside-to-dismiss. A GLOBAL monitor CAN also observe the menu-bar mouse-DOWN on our OWN
         // status item; ignore a click that lands on the icon so `togglePanel` owns the toggle-closed
@@ -209,4 +215,16 @@ final class StatusItemController {
         presentationTask?.cancel()
         if let monitor = dismissMonitor { NSEvent.removeMonitor(monitor) }
     }
+}
+
+/// A borderless `NSPanel` that CAN become key — the one override a borderless window needs so the
+/// status panel is VoiceOver-navigable. A plain borderless window returns `false` from `canBecomeKey`,
+/// so VoiceOver never focuses into it and the well-labelled rows stay unreachable (the regression from
+/// the `NSPopover`, which auto-focused). The panel is still constructed `.nonactivatingPanel`, so
+/// becoming key does NOT activate the accessory app — the non-activating design (icon stays live for
+/// the second-click toggle) is preserved; only keyboard / VoiceOver focus is enabled while it is open.
+/// Never main — it is a transient utility surface, not a document window.
+final class FloatingPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
 }
