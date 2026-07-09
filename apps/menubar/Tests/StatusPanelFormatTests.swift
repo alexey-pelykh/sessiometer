@@ -180,6 +180,63 @@ final class StatusPanelFormatTests: XCTestCase {
         }
     }
 
+    // MARK: - snapshot age (council: the panel↔CLI parity render of the wire `generated_at`)
+
+    func testSnapshotAgeTextRendersUpdatedAgoOrNilWhenNoInstant() {
+        let now: Int64 = 1_000_000
+        // No generation instant (the wire's `0` sentinel for a never-generated snapshot) → no age line.
+        XCTAssertNil(StatusPanelFormat.snapshotAgeText(generatedAt: 0, now: now))
+        XCTAssertNil(StatusPanelFormat.snapshotAgeText(generatedAt: -5, now: now))
+        // A same-instant snapshot reads "just now"; older ones humanize with the reset-in vocabulary
+        // (the same `humanizeUntil` two-largest-unit format, so the panel↔CLI parity is inherited).
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now, now: now), "updated just now")
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now - 45, now: now), "updated <1m ago")
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now - 600, now: now), "updated 10m ago")
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now - 2 * 3600, now: now), "updated 2h ago")
+        // Client-ahead clock skew clamps to "just now" — never a negative age.
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now + 30, now: now), "updated just now")
+    }
+
+    func testSnapshotIsStaleBeyondMaxPollCadence() {
+        let now: Int64 = 1_000_000
+        // Absent freshness is unknown, not stale.
+        XCTAssertFalse(StatusPanelFormat.snapshotIsStale(generatedAt: 0, now: now))
+        // Within the max poll cadence (3600 s = POLL_SECS_HI) → fresh, even AT the boundary.
+        XCTAssertFalse(StatusPanelFormat.snapshotIsStale(generatedAt: now - 3600, now: now))
+        // One second past it → unambiguously stale (outlived any legitimate poll cadence).
+        XCTAssertTrue(StatusPanelFormat.snapshotIsStale(generatedAt: now - 3601, now: now))
+    }
+
+    func testBannerFoldsSnapshotAgeIntoRetainingStates() {
+        // The three RETAINING states (connected / stale / disconnected) surface the age in the detail…
+        XCTAssertEqual(
+            StatusPanelFormat.banner(for: .connected, accountCount: 3, ageText: "updated 12s ago").detail,
+            "3 accounts · updated 12s ago.")
+        XCTAssertTrue(
+            StatusPanelFormat.banner(for: .stale, accountCount: 2, ageText: "updated 4m ago")
+                .detail.contains("· updated 4m ago."))
+        XCTAssertTrue(
+            StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2, ageText: "updated 4m ago")
+                .detail.contains("· updated 4m ago."))
+        // …while transient / refused states never do (no retained reading to age).
+        for state in [ConnectionState.connecting, .emptyRoster, .unsupported] {
+            XCTAssertFalse(
+                StatusPanelFormat.banner(for: state, accountCount: 0, ageText: "updated 12s ago")
+                    .detail.contains("updated"),
+                "state \(state) must not fold in a snapshot age")
+        }
+        // A Live daemon whose data is stale escalates healthy → warning (the connected-but-stale cell).
+        XCTAssertEqual(
+            StatusPanelFormat.banner(for: .connected, accountCount: 3, ageText: "updated 2h ago", ageStale: true).kind,
+            .warning)
+        // A fresh Live daemon stays healthy.
+        XCTAssertEqual(
+            StatusPanelFormat.banner(for: .connected, accountCount: 3, ageText: "updated 12s ago", ageStale: false).kind,
+            .healthy)
+        // The no-age path reproduces the original detail exactly (existing callers unaffected).
+        XCTAssertEqual(StatusPanelFormat.banner(for: .connected, accountCount: 3).detail, "3 accounts.")
+    }
+
     // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
 
     func testNextSwapFooterWording() {

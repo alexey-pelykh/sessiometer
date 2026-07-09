@@ -41,10 +41,23 @@ struct StatusPanelView: View {
 
     @ViewBuilder
     private func content(now: Int64) -> some View {
+        // The snapshot's freshness, re-derived against the client's own clock on each `TimelineView`
+        // tick so a resting panel's "updated Ns ago" keeps advancing (and a wedged-but-heartbeating
+        // daemon's growing age is visible without a manual refresh). `nil` generatedAt → no age.
+        let ageText = store.generatedAt.flatMap {
+            StatusPanelFormat.snapshotAgeText(generatedAt: $0, now: now)
+        }
+        let ageStale = store.generatedAt.map {
+            StatusPanelFormat.snapshotIsStale(generatedAt: $0, now: now)
+        } ?? false
+
         VStack(alignment: .leading, spacing: 14) {
-            // The banner is the live honest-state indicator — always full strength.
+            // The banner is the live honest-state indicator — always full strength. It folds in the
+            // snapshot age (connected/stale/disconnected) so "Live" never implies "fresh".
             BannerView(banner: StatusPanelFormat.banner(for: store.connectionState,
-                                                        accountCount: store.rows.count))
+                                                        accountCount: store.rows.count,
+                                                        ageText: ageText,
+                                                        ageStale: ageStale))
 
             if case .emptyRoster = store.connectionState {
                 // A live onboarding state, not stale data — full strength, distinct from daemon-down.

@@ -206,7 +206,18 @@ enum StatusPanelFormat {
     /// Pure — the same state always yields the same banner. The `disconnected` reason is deliberately
     /// NOT surfaced verbatim (it is transport jargon, e.g. "connection closed (EOF)"); the banner is a
     /// plain operator-facing sentence.
-    static func banner(for state: ConnectionState, accountCount: Int) -> Banner {
+    ///
+    /// `ageText` (from `snapshotAgeText`) folds the snapshot's freshness into the detail for the three
+    /// states that RETAIN a reading (connected / stale / disconnected) — so a persistent "Live" never
+    /// silently implies the numbers are fresh (the council's "don't let Live imply fresh"). It is
+    /// deliberately omitted for `connecting` (no snapshot yet), `emptyRoster` (no reading to age), and
+    /// `unsupported` (numbers refused — the banner shows no freshness). `ageStale` (from
+    /// `snapshotIsStale`) escalates a Live-but-stale daemon (transport up, data outlived any poll
+    /// cadence) from `.healthy` to `.warning` — the connected-but-stale cell of the matrix.
+    static func banner(for state: ConnectionState,
+                       accountCount: Int,
+                       ageText: String? = nil,
+                       ageStale: Bool = false) -> Banner {
         switch state {
         case .connecting:
             return Banner(title: "Connecting…",
@@ -214,26 +225,63 @@ enum StatusPanelFormat {
                           kind: .info)
         case .connected:
             let plural = accountCount == 1 ? "" : "s"
+            let base = "\(accountCount) account\(plural)"
             return Banner(title: "Live",
-                          detail: "\(accountCount) account\(plural).",
-                          kind: .healthy)
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
+                          kind: ageStale ? .warning : .healthy)
         case .emptyRoster:
             return Banner(title: "No accounts yet",
                           detail: "Connected to the daemon — no accounts configured.",
                           kind: .info)
         case .stale:
+            let base = "The daemon has gone quiet; showing the last-known reading"
             return Banner(title: "Data may be stale",
-                          detail: "The daemon has gone quiet; showing the last-known reading.",
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .warning)
         case .disconnected:
+            let base = "Reconnecting; showing the last-known reading"
             return Banner(title: "Daemon not responding",
-                          detail: "Reconnecting; showing the last-known reading.",
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .error)
         case .unsupported:
             return Banner(title: "Update required",
                           detail: "The daemon speaks a newer version this app can't read.",
                           kind: .error)
         }
+    }
+
+    // MARK: - Snapshot age (issue #326 / council — the CLI's parity render of the wire `generated_at`)
+
+    /// The age (in seconds) past which a snapshot's data is UNAMBIGUOUSLY stale — the maximum possible
+    /// poll cadence (`POLL_SECS_HI` = 3600 in `src/daemon.rs`). A snapshot older than this has outlived
+    /// even the slowest legitimate poll interval, so it cannot be dismissed as "just a long cadence."
+    /// Deliberately conservative: it NEVER false-alarms a healthy-but-slow daemon (the client does not
+    /// know the configured cadence, so a lower bar would cry wolf), and the transport-liveness watchdog
+    /// (#344, 32 s) already catches a DROPPED connection far sooner. This is the backstop for the one
+    /// gap the watchdog misses — a daemon that keeps HEARTBEATING while its poll loop is wedged (frames
+    /// still arrive, so the connection reads live, but `generated_at` stops advancing). Mirrors the Rust
+    /// `STALE_AGE_SECS` (`src/cli.rs`); the two thresholds move together.
+    static let staleAgeSecs: Int64 = 3600
+
+    /// "updated Ns ago" for a snapshot's freshness, or `nil` when there is no generation instant
+    /// (`generatedAt <= 0` — the wire's `0` sentinel for an all-defaults / never-generated snapshot).
+    /// The age is `now - generatedAt` against the client's OWN clock, humanized with the SAME
+    /// two-largest-unit `humanizeUntil` the reset-in uses (so the vocabulary matches and the panel↔CLI
+    /// parity is inherited from that already-byte-mirrored humanizer). Clamped at 0 for a benign
+    /// client-ahead clock skew. This is the field the wire contract itself earmarks for exactly this UX
+    /// (`snapshot.rs`: "a client compares it against its own clock and greys out once the gap grows").
+    static func snapshotAgeText(generatedAt: Int64, now: Int64) -> String? {
+        guard generatedAt > 0 else { return nil }
+        let age = max(0, now - generatedAt)
+        return age == 0 ? "updated just now" : "updated \(humanizeUntil(age)) ago"
+    }
+
+    /// Whether a snapshot is unambiguously stale — older than `staleAgeSecs`. `false` for a snapshot
+    /// with no generation instant (`generatedAt <= 0`): absent freshness is NOT stale (it is unknown).
+    /// Drives the connected-but-stale banner escalation (a `Live` daemon whose data has outlived any
+    /// poll cadence is flagged `.warning`).
+    static func snapshotIsStale(generatedAt: Int64, now: Int64) -> Bool {
+        generatedAt > 0 && (now - generatedAt) > staleAgeSecs
     }
 
     // MARK: - `next_swap` footer (issue #326 AC — renders the FORWARD candidate, not swap history)
