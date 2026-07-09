@@ -675,15 +675,28 @@ type KeepWarmMint = (RefreshReport, Option<Credential>);
 
 /// The production [`KeepWarm`]: mints via [`crate::refresh::keep_warm_account`], which reuses
 /// the #102 isolated back-dating spawn on a COPY of the canonical blob and hands the fresh
-/// token back. Holds only the resolved `claude` binary path (the same one the periodic tick
-/// resolves); the ephemeral isolated dir + keychain are derived per-call from the account uuid.
+/// token back. Holds the `[refresh].claude_bin` OVERRIDE (issue #375), NOT a resolved path:
+/// like the periodic tick's [`RealRefreshEngine`] it resolves `claude` PER CYCLE at the spawn
+/// site via [`resolve_binary`](Self::resolve_binary), so a symlink / `$PATH` / version change
+/// after the daemon started is picked up on the next keep-warm with no restart. The ephemeral
+/// isolated dir + keychain are derived per-call from the account uuid.
 pub(crate) struct RealKeepWarmEngine {
-    claude_binary: PathBuf,
+    claude_bin: Option<PathBuf>,
 }
 
 impl RealKeepWarmEngine {
-    pub(crate) fn new(claude_binary: PathBuf) -> Self {
-        Self { claude_binary }
+    pub(crate) fn new(claude_bin: Option<PathBuf>) -> Self {
+        Self { claude_bin }
+    }
+
+    /// Resolve the `claude` binary to spawn THIS keep-warm cycle (issue #375) via the UNCHANGED
+    /// policy ([`crate::paths::claude_binary_with_override`]: `[refresh].claude_bin` →
+    /// `$CLAUDE_BIN` → `$PATH`) — only the timing moved to per-cycle; which binary is chosen is
+    /// identical to before (no canonicalization, no validation — a wrapper symlink spawns as-is).
+    /// A failure surfaces as the mint's `Err`, which the daemon treats non-fatally: the canonical
+    /// item is left untouched and the mint is retried next cycle.
+    fn resolve_binary(&self) -> Result<PathBuf> {
+        crate::paths::claude_binary_with_override(self.claude_bin.as_deref())
     }
 }
 
@@ -693,10 +706,13 @@ impl KeepWarm for RealKeepWarmEngine {
         account: &'a Account,
         canonical: &'a Credential,
     ) -> Pin<Box<dyn Future<Output = Result<KeepWarmMint>> + 'a>> {
-        // Own the two non-borrowed inputs so the future needs only `canonical`'s lifetime.
-        let binary = self.claude_binary.clone();
+        // Resolve THIS cycle (issue #375), not from a frozen field, then own the non-borrowed
+        // inputs so the future needs only `canonical`'s lifetime. A resolution failure is carried
+        // into the future as the `Err` the daemon handles fail-safe (canonical left untouched).
+        let resolved = self.resolve_binary();
         let uuid = account.account_uuid.clone();
         Box::pin(async move {
+            let binary = resolved?;
             crate::refresh::keep_warm_account(canonical.expose(), &uuid, binary).await
         })
     }
@@ -1217,9 +1233,10 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// The poll-path refresh-then-retry seam (issue #162), or `None` to disable it (the
     /// hermetic-test default AND a `[refresh]`-off daemon — a 401 then flows straight to
     /// the #42 streak exactly as before). Production wires the #102 engine
-    /// ([`RealRefreshEngine`]) via [`with_refresh_engine`](Self::with_refresh_engine),
-    /// gated on the same effective switch as the periodic tick; when `Some`, a usage 401
-    /// attempts one isolated refresh + re-poll before it can quarantine the account.
+    /// ([`RealRefreshEngine`]) via [`with_refresh_engine`](Self::with_refresh_engine), wired
+    /// on the same `[refresh].enabled` switch as the periodic tick (issue #375: `claude` is
+    /// resolved per-cycle at the spawn site, not gated on a startup resolution); when `Some`,
+    /// a usage 401 attempts one isolated refresh + re-poll before it can quarantine the account.
     poll_refresh: Option<Box<dyn PollRefresh>>,
     /// The usage-stats store maintenance seam (issue #161), or `None` to disable it (the
     /// hermetic-test default — a test with no on-disk store wires nothing, so the collector's
@@ -1241,8 +1258,9 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// holds its paths so a test can point one at a temp dir.
     usage_samples_path: Option<PathBuf>,
     /// Whether the operator turned the periodic isolated-refresh tick ON in config
-    /// (`[refresh].enabled`, issue #105) — the CONFIG value, NOT the effective switch (which
-    /// also requires a resolvable `claude` binary). Carried onto the display snapshot so the
+    /// (`[refresh].enabled`, issue #105). Since #375 this CONFIG value IS the tick's effective
+    /// switch (the `claude` binary is resolved per-cycle, not gated at startup). Carried onto the
+    /// display snapshot so the
     /// thin `status` client can surface the issue-#138 discoverability advisory: with the tick
     /// OFF, non-active accounts get no maintenance and their credentials can silently lapse.
     /// `false` by default (the opt-in default, #105); production sets the real config value via
@@ -1256,8 +1274,9 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// which writes only the STASH, this mints a fresh token and the daemon PROMOTES it to the
     /// canonical `Claude Code-credentials` item a live session reads — proactively before the
     /// active token's expiry, and as a reactive backstop on an active 401. Wired by
-    /// [`with_keep_warm_engine`](Self::with_keep_warm_engine) on the SAME effective switch as
-    /// the periodic tick (`[refresh].enabled` + a resolvable `claude` binary).
+    /// [`with_keep_warm_engine`](Self::with_keep_warm_engine) on the SAME `[refresh].enabled`
+    /// switch as the periodic tick (issue #375: `claude` is resolved per-cycle at the spawn
+    /// site, not gated on a startup resolution).
     keep_warm: Option<Box<dyn KeepWarm>>,
     /// The keep-warm near-expiry horizon AND the proactive per-account attempt throttle
     /// (issue #282), sourced from `[refresh].cadence_secs` — the SAME dual-purpose knob the
@@ -1336,8 +1355,8 @@ where
             // stays inert (it also requires an unhealthy non-active account to fire).
             refresh_enabled: false,
             // No active-account keep-warm by default (issue #282); production opts in via
-            // `with_keep_warm_engine` on the same effective switch as the periodic tick. Left
-            // unset, the active account lapses at expiry exactly as before. The cadence is an
+            // `with_keep_warm_engine` on the same `[refresh].enabled` switch as the periodic tick.
+            // Left unset, the active account lapses at expiry exactly as before. The cadence is an
             // inert placeholder until the engine is wired (it is read only when `keep_warm` is).
             keep_warm: None,
             keep_warm_cadence: Duration::from_secs(3600),
@@ -1442,9 +1461,10 @@ where
     /// then attempts one isolated refresh (the #102 engine) + a single re-poll BEFORE the
     /// 401 counts toward the #42 death streak, so a merely-expired access token is revived
     /// instead of quarantining a healthy account. Production wires [`RealRefreshEngine`]
-    /// (gated on the same effective switch as the periodic tick — a resolvable `claude`
-    /// binary); left unset, a test / feature-off daemon behaves exactly as before. Builder-
-    /// style to mirror `with_swap_lock` / `with_config_path` and keep `new`'s args stable.
+    /// (on the same `[refresh].enabled` switch as the periodic tick — the `claude` binary is
+    /// resolved per-cycle at the spawn site, issue #375); left unset, a test / feature-off daemon
+    /// behaves exactly as before. Builder-style to mirror `with_swap_lock` / `with_config_path`
+    /// and keep `new`'s args stable.
     pub(crate) fn with_refresh_engine(mut self, engine: Box<dyn PollRefresh>) -> Self {
         self.poll_refresh = Some(engine);
         self
@@ -1455,8 +1475,8 @@ where
     /// as a reactive backstop on an active 401 — so the overnight false-death cascade never
     /// starts. `cadence` (from `[refresh].cadence_secs`) is both the near-expiry horizon and the
     /// proactive per-account throttle. Production wires [`RealKeepWarmEngine`] on the SAME
-    /// effective switch as the periodic tick (`[refresh].enabled` + a resolvable `claude`
-    /// binary); left unset, the active account lapses at expiry exactly as before. Builder-style
+    /// `[refresh].enabled` switch as the periodic tick (the `claude` binary is resolved per-cycle,
+    /// issue #375); left unset, the active account lapses at expiry exactly as before. Builder-style
     /// to mirror `with_refresh_engine` and keep `new`'s args stable.
     pub(crate) fn with_keep_warm_engine(
         mut self,
@@ -12806,6 +12826,35 @@ mod tests {
     // de-correlates the roster's mints across the shared ~8h TTL. These tests exercise the
     // seam directly (the near-expiry gate + throttle are pure functions of an injected
     // `now_ms` / [`FakeClock`]) and end-to-end through `tick`.
+
+    #[test]
+    fn real_keep_warm_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
+        // Issue #375, the #282 keep-warm engine's half of the fix (sibling to `refresh_tick`'s
+        // `RealRefreshEngine` test). `RealKeepWarmEngine` holds the `[refresh].claude_bin` OVERRIDE
+        // and resolves the spawn binary PER CYCLE, so a mid-run symlink re-point is picked up on the
+        // next keep-warm with no daemon restart. Built ONCE, resolved across a re-point: the
+        // frozen-at-startup design this fixes could only ever return its first result.
+        let tmp = tempfile::tempdir().unwrap();
+        let installed = tmp.path().join("claude-installed");
+        std::fs::write(&installed, b"#!/bin/sh\n").unwrap();
+        let link = tmp.path().join("claude");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+
+        let engine = RealKeepWarmEngine::new(Some(link.clone()));
+
+        // Cycle 1: link → installed (exists) → Ok, returning the symlink path UNCANONICALIZED
+        // (issue constraint [C1]: a wrapper symlink is spawned as-is, never resolved to its target).
+        assert_eq!(engine.resolve_binary().unwrap(), link);
+
+        // The updater removes the pointed-at binary: the SAME engine resolves to a NON-FATAL error
+        // on its next cycle (the daemon leaves the canonical item untouched, retried next cycle),
+        // never a reuse of a stale frozen path.
+        std::fs::remove_file(&installed).unwrap();
+        assert!(matches!(
+            engine.resolve_binary(),
+            Err(crate::error::Error::ClaudeBinaryNotFound)
+        ));
+    }
 
     /// A far-future access-token expiry (epoch ms, ~year 2100): well beyond any keep-warm
     /// horizon, so a canonical carrying it never trips the PROACTIVE near-expiry gate — used to

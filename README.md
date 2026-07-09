@@ -477,9 +477,12 @@ timeout_secs = 90         # whole-cycle bound for one account's refresh (10..=60
 
 An account is **due** when its stored token would expire within one `cadence_secs`
 of now — i.e. it would not survive until the next tick — so the cadence doubles as
-the near-expiry horizon (no second knob). Changes take effect at the next daemon
-start. If the `claude` binary cannot be resolved when the tick is enabled, the tick
-is disabled with a warning rather than failing the daemon.
+the near-expiry horizon (no second knob). `[refresh]` config changes take effect at
+the next daemon start. The `claude` binary, however, is resolved **per refresh cycle**
+(honoring `claude_bin` → `$CLAUDE_BIN` → `$PATH`), not frozen at start-up — so a Claude
+Code auto-update that re-points the binary is picked up on the next cycle with no daemon
+restart. A cycle that cannot resolve `claude` records a non-fatal error and retries next
+cycle; it never disables the tick.
 
 `idle_after_secs` sets how long the daemon must idle before the **first** refresh
 sweep after start-up. Since issue #260 the idle floor is anchored to an absolute

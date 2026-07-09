@@ -871,8 +871,9 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // Carry the CONFIG `[refresh].enabled` (#105) onto the display snapshot so the thin
     // `status` client can surface the isolated-refresh discoverability advisory (#138): with
     // the tick OFF, non-active accounts get no maintenance and their credentials silently
-    // lapse. The CONFIG value (not the effective switch below, which also needs a resolvable
-    // `claude` binary) — the advisory keys off what the operator set, per AC-2.
+    // lapse. The advisory keys off the CONFIG value — what the operator set, per AC-2 — which
+    // since #375 is exactly the tick's effective switch (the `claude` binary is resolved
+    // per-cycle at the spawn site, no longer gated on a startup resolution below).
     .with_refresh_enabled(config.refresh.enabled);
     let mut shutdown = RealShutdown::new()?;
 
@@ -918,57 +919,47 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     refresh::reap_login_orphan().await;
 
     // The periodic isolated-refresh tick (issue #105): opt-in, driven from `run_loop`'s idle
-    // path off the poll→usage→swap seam. Resolve the spawn binary ONLY when enabled — a
-    // resolution failure DISABLES the tick (logged) rather than failing the daemon, whose
-    // core job is polling/swapping. When disabled the tick is wholly inert.
+    // path off the poll→usage→swap seam. Wired whenever `[refresh]` is enabled — the spawn
+    // binary is NO LONGER resolved here. Issue #375: each engine holds the `[refresh].claude_bin`
+    // OVERRIDE and resolves `claude` PER CYCLE at its spawn site (via
+    // `paths::claude_binary_with_override`), so a symlink / `$PATH` / version change AFTER startup
+    // is picked up on the next cycle with no daemon restart. Resolving once here froze a `PathBuf`
+    // for the daemon's whole life, so a mid-run change silently failed EVERY refresh until a manual
+    // restart. A per-cycle resolution failure is non-fatal (the sweep records an `error` event; the
+    // #162 poll / #282 keep-warm paths treat the `Err` fail-safe) and retried next cycle — it never
+    // permanently disables the tick. When disabled nothing is wired and no resolution is attempted.
     let refresh_enabled = config.refresh.enabled;
-    let claude_binary = if refresh_enabled {
-        match paths::claude_binary_with_override(config.refresh.claude_bin.as_deref()) {
-            Ok(bin) => Some(bin),
-            Err(err) => {
-                eprintln!(
-                    "sessiometer: periodic refresh disabled — cannot resolve the claude binary: {err}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Issue #162: the poll path's refresh-then-retry reuses the SAME #102 engine, so a
-    // usage 401 (usually a merely-expired access token) attempts one isolated refresh +
-    // re-poll BEFORE it counts toward the #42 dead-credential streak — closing the
-    // false-death window the ~10×-slower periodic sweep (#105) structurally cannot. Gated
-    // on the SAME effective switch as the periodic tick (a resolvable `claude` binary);
-    // with refresh off the seam stays unset and the poll path behaves exactly as before.
-    // `as_ref` + `clone` so `claude_binary` is still owned for the tick's engine below.
-    if let Some(bin) = claude_binary.as_ref() {
+    if refresh_enabled {
+        // Issue #162: the poll path's refresh-then-retry reuses the SAME #102 engine, so a
+        // usage 401 (usually a merely-expired access token) attempts one isolated refresh +
+        // re-poll BEFORE it counts toward the #42 dead-credential streak — closing the
+        // false-death window the ~10×-slower periodic sweep (#105) structurally cannot. Wired on
+        // the SAME switch as the periodic tick (`[refresh].enabled`); with refresh off the seam
+        // stays unset and the poll path behaves exactly as before.
         daemon = daemon.with_refresh_engine(Box::new(RealRefreshEngine::new(
             RealAccountStash::new(),
-            bin.clone(),
+            config.refresh.claude_bin.clone(),
         )));
         // Issue #282: the FOURTH refresh mechanism — the active account's canonical token is kept
         // warm IN PLACE (proactively before expiry + a reactive backstop on an active 401), minted
-        // via the isolated spawn and promoted to the canonical item a live session reads. Gated on
-        // the SAME effective switch as the periodic tick and the #162 retry (a resolvable `claude`
-        // binary), so `[refresh]` off leaves the active account lapsing at expiry exactly as
-        // before. `cadence()` (`[refresh].cadence_secs`) is the near-expiry horizon and the
-        // proactive throttle — no second config knob.
+        // via the isolated spawn and promoted to the canonical item a live session reads. Wired on
+        // the SAME switch as the periodic tick and the #162 retry (`[refresh].enabled`), so
+        // `[refresh]` off leaves the active account lapsing at expiry exactly as before.
+        // `cadence()` (`[refresh].cadence_secs`) is the near-expiry horizon and the proactive
+        // throttle — no second config knob.
         daemon = daemon.with_keep_warm_engine(
-            Box::new(RealKeepWarmEngine::new(bin.clone())),
+            Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
             config.refresh.cadence(),
         );
     }
     let mut refresh_tick = RefreshTick::new(
         config.roster.clone(),
         config.refresh.clone(),
-        refresh_enabled && claude_binary.is_some(),
-        RealRefreshEngine::new(
-            RealAccountStash::new(),
-            // Unused while the tick is disabled (the effective-enabled flag above gates every
-            // spawn); a placeholder keeps the engine total.
-            claude_binary.unwrap_or_else(|| PathBuf::from("claude")),
-        ),
+        // The effective switch is now `[refresh].enabled` ALONE (issue #375): the engine resolves
+        // `claude` per cycle, so the tick is no longer gated on a successful startup resolution —
+        // that gate is exactly what froze a stale path and blocked self-healing.
+        refresh_enabled,
+        RealRefreshEngine::new(RealAccountStash::new(), config.refresh.claude_bin.clone()),
         RealClock::new(),
     );
     // The external-login watch (issue #140): a short-cadence LOCAL probe of the canonical item
