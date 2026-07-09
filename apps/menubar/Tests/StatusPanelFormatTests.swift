@@ -291,25 +291,25 @@ final class StatusPanelFormatTests: XCTestCase {
     func testRowAccessibilityLabelSpeaksTheRow() {
         let active = StatusPanelFormat.rowAccessibilityLabel(
             label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
-            quarantined: false, sessionPct: 60, weeklyPct: 10, resetIn: "10m")
-        XCTAssertEqual(active, "work, active, auth healthy, session 60%, weekly 10%, resets in 10m")
+            quarantined: false, sessionPct: 60, weeklyPct: 10, sessionReset: "10m", weeklyReset: "5d")
+        XCTAssertEqual(active, "work, active, auth healthy, session 60% resets in 10m, weekly 10% resets in 5d")
 
         let dead = StatusPanelFormat.rowAccessibilityLabel(
             label: "old", isActive: false, auth: .dead, recovering: false, enabled: true,
-            quarantined: true, sessionPct: nil, weeklyPct: nil, resetIn: "n/a")
-        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a, weekly n/a, resets in n/a")
+            quarantined: true, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a")
+        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a resets in n/a, weekly n/a resets in n/a")
 
         // A healthy pre-#119 legacy account speaks no auth verdict (empty phrase dropped).
         let legacy = StatusPanelFormat.rowAccessibilityLabel(
             label: "leg", isActive: false, auth: nil, recovering: false, enabled: true,
-            quarantined: false, sessionPct: 5, weeklyPct: 5, resetIn: "2h")
-        XCTAssertEqual(legacy, "leg, session 5%, weekly 5%, resets in 2h")
+            quarantined: false, sessionPct: 5, weeklyPct: 5, sessionReset: "2h", weeklyReset: "6d")
+        XCTAssertEqual(legacy, "leg, session 5% resets in 2h, weekly 5% resets in 6d")
 
         // A parked (disabled) account speaks the `parked` tag.
         let parked = StatusPanelFormat.rowAccessibilityLabel(
             label: "p", isActive: false, auth: .healthy, recovering: false, enabled: false,
-            quarantined: false, sessionPct: 1, weeklyPct: 1, resetIn: "1h")
-        XCTAssertEqual(parked, "p, auth healthy, parked, session 1%, weekly 1%, resets in 1h")
+            quarantined: false, sessionPct: 1, weeklyPct: 1, sessionReset: "1h", weeklyReset: "3d")
+        XCTAssertEqual(parked, "p, auth healthy, parked, session 1% resets in 1h, weekly 1% resets in 3d")
     }
 
     // MARK: - Integration: wire → AccountRow → panel format (recovering distinct from dead)

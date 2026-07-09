@@ -345,8 +345,8 @@ enum StatusPanelFormat {
 
     /// One spoken, comma-separated sentence for a row's VoiceOver label, so the whole row reads as a
     /// single accessible element rather than a scatter of unlabeled glyphs. Speaks identity, the active
-    /// marker, the auth verdict + its cue, both usage percents, and the reset-in — the same facts the row
-    /// shows visually. Next-swap is NOT per-row (R-2 re-ratified 2026-07-09): it is a single-cardinality
+    /// marker, the auth verdict + its cue, both usage percents each with its own reset-in — the same facts
+    /// the row shows visually. Next-swap is NOT per-row (R-2 re-ratified 2026-07-09): it is a single-cardinality
     /// fact spoken once by the footer, mirroring the CLI (which has no per-row next marker).
     static func rowAccessibilityLabel(
         label: String,
@@ -357,14 +357,15 @@ enum StatusPanelFormat {
         quarantined: Bool,
         sessionPct: UInt8?,
         weeklyPct: UInt8?,
-        resetIn: String
+        sessionReset: String,
+        weeklyReset: String
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
         parts.append(authSpoken(auth: auth, recovering: recovering, enabled: enabled, quarantined: quarantined))
-        parts.append("session \(pct(sessionPct))")
-        parts.append("weekly \(pct(weeklyPct))")
-        parts.append("resets in \(resetIn)")
+        // Both windows, each with its reset — matching the row's two meters and the CLI's two columns.
+        parts.append("session \(pct(sessionPct)) resets in \(sessionReset)")
+        parts.append("weekly \(pct(weeklyPct)) resets in \(weeklyReset)")
         // Drop any empty auth phrase (a healthy pre-#119 legacy account speaks no auth verdict).
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }

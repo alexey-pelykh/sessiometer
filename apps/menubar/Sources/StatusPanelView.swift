@@ -37,6 +37,12 @@ struct StatusPanelView: View {
         }
         .frame(width: 360, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
+        // An OPAQUE, appearance-adaptive backing so the panel reads at full contrast regardless of what
+        // is behind it. The `.popover` vibrancy (StatusItemController) blended with the desktop/terminal
+        // behind the panel — dropping every label + metric onto a SHIFTING mid-tone — so text contrast
+        // was at the mercy of the wallpaper. A solid `windowBackgroundColor` (clipped to the panel's
+        // rounded corners by the host effect view) gives a stable, high-contrast card in light OR dark.
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     @ViewBuilder
@@ -128,7 +134,7 @@ private struct RosterView: View {
     let now: Int64
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 4) {
             ForEach(rows) { row in
                 AccountRowView(row: row, now: now)
             }
@@ -136,23 +142,23 @@ private struct RosterView: View {
     }
 }
 
-/// One account row: the active marker + label + auth glyph/cue on the top line, then the usage
-/// percents, the single reset-in, and the next-swap marker on a quieter second line. The whole row is
-/// one VoiceOver element.
+/// One account row, built to the design reference (`apps/menubar/design/menubar-preview.html`). BOTH
+/// reset windows show — R-2 parity with the `status` CLI, which prints both — never collapsed to one.
+/// The whole row is a single VoiceOver element.
 private struct AccountRowView: View {
     let row: AccountRow
     let now: Int64
 
-    private var resetIn: String {
-        StatusPanelFormat.resetIn(weeklyExhausted: row.weeklyExhausted,
-                                  sessionResetsAt: row.sessionResetsAt,
-                                  weeklyResetsAt: row.weeklyResetsAt,
-                                  now: now)
+    /// Each window's reset-in against the client's own clock — both shown, never collapsed to one pick.
+    private var sessionReset: String {
+        StatusPanelFormat.resetCell(row.sessionResetsAt, now: now)
+    }
+    private var weeklyReset: String {
+        StatusPanelFormat.resetCell(row.weeklyResetsAt, now: now)
     }
 
     /// SESSION is the swap-triggering (binding) window unless the account is weekly-exhausted — the
-    /// metric that earns typographic primacy (the same window `resetIn` shows, so the emphasized
-    /// percent and the reset stay coherent).
+    /// meter that earns typographic primacy (its percent renders semibold).
     private var sessionIsPrimary: Bool {
         StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: row.weeklyExhausted)
     }
@@ -164,16 +170,9 @@ private struct AccountRowView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                // Active marker: SHAPE-encoded, never color (R-2 "shape + 'ACTIVE', not color") — a
-                // filled inset circle for the active account, a hollow ring otherwise (mirrors the
-                // `status` table's `*`). The accent that used to fill this ALSO marked "→ next", so blue
-                // meant two things; it is freed. Idiom-consistent with the health SF Symbol beside it.
-                Image(systemName: row.isActive ? "circle.inset.filled" : "circle")
-                    .font(.caption)
-                    .foregroundStyle(row.isActive ? Color.primary : Color.secondary)
-                    .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                MonogramBadge(label: row.label)
 
                 Text(row.label)
                     .font(.body)
@@ -181,8 +180,8 @@ private struct AccountRowView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                // The word-half of "shape + 'ACTIVE'": a quiet, accent-free tag on the active row that
-                // also carries the emphasis the active account earns (it is the one in use).
+                Spacer(minLength: 6)
+
                 if row.isActive {
                     Text("ACTIVE")
                         .font(.caption2).fontWeight(.semibold)
@@ -192,37 +191,27 @@ private struct AccountRowView: View {
                         .accessibilityHidden(true)
                 }
 
-                Spacer(minLength: 6)
-
                 authView
             }
 
-            HStack(spacing: 8) {
-                // The swap-triggering metric (session, or weekly when week-blocked) carries typographic
-                // PRIMACY — semibold + full-strength; the other stays quiet. Both take a threshold color
-                // only when depleted (≥75% Yellow, ≥90% / exhausted Red), so a healthy row gains NO
-                // color — just the one semibold percent (issue #84 bands, shared with the CLI overlay).
-                Text("session \(StatusPanelFormat.pct(row.sessionPct))")
-                    .monospacedDigit()
-                    .fontWeight(sessionIsPrimary ? .semibold : .regular)
-                    .foregroundStyle(usageColor(sessionSeverity, primary: sessionIsPrimary))
-                Text("·").foregroundStyle(.tertiary)
-                Text("weekly \(StatusPanelFormat.pct(row.weeklyPct))")
-                    .monospacedDigit()
-                    .fontWeight(sessionIsPrimary ? .regular : .semibold)
-                    .foregroundStyle(usageColor(weeklySeverity, primary: !sessionIsPrimary))
-                Text("·").foregroundStyle(.tertiary)
-                Text("resets in \(resetIn)")
-                    .monospacedDigit()
+            VStack(spacing: 6) {
+                UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
+                           reset: sessionReset, emphasized: sessionIsPrimary)
+                UsageMeter(label: "Weekly", pct: row.weeklyPct, severity: weeklySeverity,
+                           reset: weeklyReset, emphasized: !sessionIsPrimary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            // Keep the metrics on ONE line (a deliberate no-wrap choice, 715dc2d), but let the text
-            // shrink to fit rather than truncate under large Dynamic Type — the numbers stay visible
-            // down to 75%, and the row's VoiceOver label speaks the full metrics regardless.
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
         }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 9)
+        // Active emphasis is a neutral fill, never an accent hue (R-2: active is shape/weight, not color).
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(row.isActive ? Color.primary.opacity(0.05) : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9)
+                        .strokeBorder(Color.primary.opacity(row.isActive ? 0.08 : 0), lineWidth: 0.5)
+                )
+        )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -261,18 +250,6 @@ private struct AccountRowView: View {
         auth == .dead && !row.isRecovering ? .red : .secondary
     }
 
-    /// The metrics-line color for a usage severity: Red / Yellow escalate a depleted metric; Green (or a
-    /// failed poll, `nil`) takes NO alarm color — the swap-triggering metric then shows full-strength
-    /// (`.primary`) to carry its weight-primacy while the other recedes to `.secondary`. So color marks
-    /// urgency and weight marks the swap-trigger, independently.
-    private func usageColor(_ severity: StatusPanelFormat.UsageSeverity?, primary: Bool) -> Color {
-        switch severity {
-        case .red:          return .red
-        case .yellow:       return .yellow
-        case .green, .none: return primary ? .primary : .secondary
-        }
-    }
-
     /// Map the pure `HealthTint` role to a system semantic color — never `accentColor` (the AUTH glyph
     /// is never app-tinted, #84); `.neutral` (unknown) is `.secondary`, the #137 "no false green".
     private func healthColor(_ tint: StatusPanelFormat.HealthTint) -> Color {
@@ -295,7 +272,117 @@ private struct AccountRowView: View {
             quarantined: row.isQuarantined,
             sessionPct: row.sessionPct,
             weeklyPct: row.weeklyPct,
-            resetIn: resetIn)
+            sessionReset: sessionReset,
+            weeklyReset: weeklyReset)
+    }
+}
+
+// MARK: - Row building blocks (per the design reference)
+
+/// The account's monogram — provider-neutral by construction (issue #15: the label's initial, never a
+/// brand mark or color). Accessibility-hidden; the row's VoiceOver label already speaks the identity.
+private struct MonogramBadge: View {
+    let label: String
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 7)
+            .fill(Color.secondary.opacity(0.16))
+            .frame(width: 28, height: 28)
+            .overlay(
+                Text(initial)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary)
+            )
+            .accessibilityHidden(true)
+    }
+
+    /// The first character of the operator label, uppercased — `?` for an empty/whitespace label.
+    private var initial: String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first else { return "?" }
+        return String(first).uppercased()
+    }
+}
+
+/// One usage window's meter. `emphasized` bolds the swap-triggering window's percent; the fixed column
+/// widths + monospaced digits keep Session and Weekly aligned.
+private struct UsageMeter: View {
+    let label: String
+    let pct: UInt8?
+    let severity: StatusPanelFormat.UsageSeverity?
+    let reset: String
+    let emphasized: Bool
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Text(label.uppercased())
+                .font(.caption2).fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+                .frame(width: 46, alignment: .leading)
+
+            UsageBar(fraction: fraction, color: barColor)
+
+            Text(StatusPanelFormat.pct(pct))
+                .font(.caption).monospacedDigit()
+                .fontWeight(emphasized ? .semibold : .regular)
+                .foregroundStyle(pctColor)
+                .frame(width: 40, alignment: .trailing)
+
+            Text(reset)
+                .font(.caption).monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 52, alignment: .trailing)
+                .lineLimit(1)
+        }
+    }
+
+    private var fraction: Double {
+        pct.map { Double($0) / 100.0 } ?? 0
+    }
+
+    /// Bar fill = the green/amber/red usage band; a failed poll (`nil`) is muted, never a false green (#137).
+    private var barColor: Color {
+        switch severity {
+        case .red:    return .red
+        case .yellow: return .orange
+        case .green:  return .green
+        case .none:   return Color.secondary.opacity(0.45)
+        }
+    }
+
+    /// The percent TEXT escalates to a threshold color only when depleted (≥75% orange, ≥90%/exhausted
+    /// red); green and `n/a` stay full-strength `.primary` (orange, not yellow — yellow reads poorly).
+    private var pctColor: Color {
+        switch severity {
+        case .red:          return .red
+        case .yellow:       return .orange
+        case .green, .none: return .primary
+        }
+    }
+}
+
+/// A capsule fill proportional to `fraction` (0…1), with a minimum sliver so a live-but-tiny percent
+/// never reads as empty; a zero/failed reading shows a bare track. The number carries the real value.
+private struct UsageBar: View {
+    let fraction: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.20))
+                Capsule().fill(color)
+                    .frame(width: fillWidth(geo.size.width))
+            }
+        }
+        .frame(height: 5)
+        .accessibilityHidden(true)
+    }
+
+    private func fillWidth(_ full: CGFloat) -> CGFloat {
+        let clamped = min(1, max(0, fraction))
+        guard clamped > 0 else { return 0 }
+        return max(4, full * clamped)
     }
 }
 
