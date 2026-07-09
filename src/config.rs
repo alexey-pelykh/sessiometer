@@ -103,6 +103,14 @@ const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
 /// daemon's return to polling. Cancelling mid-cycle is safe — the engine's RAII teardown
 /// always runs (#102) and a forfeited token is bounded/recoverable (the engine Caller contract).
 const DEFAULT_REFRESH_TIMEOUT_SECS: u64 = 90;
+/// Default consecutive all-eligible-account refresh-error sweeps before the daemon surfaces a
+/// SYSTEMIC refresh-mechanism failure (issue #378). Three sweeps balances early warning against a
+/// transient blip: a stale-`claude`-path (#375) style outage errors every sweep and trips it fast,
+/// while a single flaky sweep does not. A conservative default, tunable per the ADR-0005 hand-emit
+/// pattern; the near-expiry cadence governs how quickly three sweeps accrue in wall-clock.
+/// `pub(crate)` so the daemon's `new` can seed its inert `systemic_failure_n` placeholder from the
+/// same source of truth (production overrides it via `with_systemic_failure_n`).
+pub(crate) const DEFAULT_REFRESH_SYSTEMIC_FAILURE_N: u32 = 3;
 
 /// Default seconds bounding one whole interactive `login` capture (issue #135). Mirrors
 /// [`crate::login::DEFAULT_LOGIN_TIMEOUT`] — the engine's per-call fallback — kept in sync by
@@ -347,6 +355,13 @@ pub(crate) struct RefreshConfig {
     /// (absolutized, validated to exist) before any spawn by
     /// [`crate::paths::claude_binary_with_override`].
     pub(crate) claude_bin: Option<PathBuf>,
+    /// Consecutive refresh sweeps that must fail with `outcome=error` across EVERY eligible
+    /// account before the daemon surfaces a SYSTEMIC refresh-mechanism failure (issue #378) — the
+    /// edge-triggered `refresh_systemic_failure` event + the `status` refresh-health indicator. A
+    /// mechanism-down signal distinct from per-account `at_risk`, so an operator sees a stale-path
+    /// (#375) style outage without waiting for an account to die. Bounds `1..=100`; **default**
+    /// [`DEFAULT_REFRESH_SYSTEMIC_FAILURE_N`]. Governs detection only — never a swap/poll decision.
+    pub(crate) systemic_failure_n: u32,
 }
 
 impl Default for RefreshConfig {
@@ -358,6 +373,7 @@ impl Default for RefreshConfig {
             idle_after_secs: DEFAULT_REFRESH_IDLE_AFTER_SECS,
             timeout_secs: DEFAULT_REFRESH_TIMEOUT_SECS,
             claude_bin: None,
+            systemic_failure_n: DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
         }
     }
 }
@@ -827,6 +843,7 @@ impl Config {
         range("refresh.cadence_secs", r.cadence_secs, 60, 86_400)?;
         range("refresh.idle_after_secs", r.idle_after_secs, 0, 3_600)?;
         range("refresh.timeout_secs", r.timeout_secs, 10, 600)?;
+        range("refresh.systemic_failure_n", r.systemic_failure_n, 1, 100)?;
         let refresh = RefreshConfig {
             enabled: r.enabled,
             accounts: r.accounts,
@@ -837,6 +854,7 @@ impl Config {
                 .claude_bin
                 .filter(|bin| !bin.trim().is_empty())
                 .map(PathBuf::from),
+            systemic_failure_n: r.systemic_failure_n as u32,
         };
 
         // The one-shot `login` verb's settings (issue #135). The timeout is bounds-checked like the
@@ -1049,6 +1067,12 @@ impl Config {
              # cycle is cancelled and reported (non-fatal). Keep above the ~40s spawn.\n",
         );
         out.push_str(&format!("timeout_secs = {}\n", r.timeout_secs));
+        out.push_str(
+            "# Consecutive refresh sweeps failing with error across ALL eligible accounts before\n\
+             # the daemon flags a SYSTEMIC refresh-mechanism failure (1..=100) — a mechanism-down\n\
+             # signal (event + `status` indicator) distinct from per-account at-risk.\n",
+        );
+        out.push_str(&format!("systemic_failure_n = {}\n", r.systemic_failure_n));
         out.push_str(
             "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave\n\
              # empty) to resolve from $CLAUDE_BIN then $PATH.\n",
@@ -1433,6 +1457,8 @@ struct RawRefresh {
     timeout_secs: i64,
     #[serde(default)]
     claude_bin: Option<String>,
+    #[serde(default = "default_refresh_systemic_failure_n")]
+    systemic_failure_n: i64,
 }
 
 impl Default for RawRefresh {
@@ -1444,6 +1470,7 @@ impl Default for RawRefresh {
             idle_after_secs: default_refresh_idle_after_secs(),
             timeout_secs: default_refresh_timeout_secs(),
             claude_bin: None,
+            systemic_failure_n: default_refresh_systemic_failure_n(),
         }
     }
 }
@@ -1456,6 +1483,9 @@ fn default_refresh_idle_after_secs() -> i64 {
 }
 fn default_refresh_timeout_secs() -> i64 {
     DEFAULT_REFRESH_TIMEOUT_SECS as i64
+}
+fn default_refresh_systemic_failure_n() -> i64 {
+    i64::from(DEFAULT_REFRESH_SYSTEMIC_FAILURE_N)
 }
 
 /// Permissive deserialization of the optional `[login]` table (issue #135): both keys optional
@@ -1967,6 +1997,7 @@ label = "personal"
         assert_eq!(
             config.refresh,
             RefreshConfig {
+                systemic_failure_n: 3,
                 enabled: true,
                 accounts: vec![
                     "work".to_owned(),
@@ -2027,6 +2058,25 @@ label = "personal"
         assert!(
             matches!(Config::parse(&timeout), Err(Error::ConfigInvalid(msg)) if msg.contains("refresh.timeout_secs"))
         );
+    }
+
+    #[test]
+    fn refresh_systemic_failure_n_out_of_range_is_rejected() {
+        // The #378 systemic threshold is bounded `1..=100`: a `0` (which would arm the detector
+        // before a single failed sweep) and an above-ceiling value both fail, naming the field.
+        for bad in ["systemic_failure_n = 0", "systemic_failure_n = 101"] {
+            let toml = format!("{VALID}\n[refresh]\n{bad}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(&err, Error::ConfigInvalid(msg) if msg.contains("refresh.systemic_failure_n")),
+                "expected a refresh.systemic_failure_n range error, got {err:?}"
+            );
+        }
+        // Both inclusive endpoints parse.
+        for ok in ["systemic_failure_n = 1", "systemic_failure_n = 100"] {
+            let toml = format!("{VALID}\n[refresh]\n{ok}\n");
+            assert!(Config::parse(&toml).is_ok(), "{ok} should parse");
+        }
     }
 
     #[test]

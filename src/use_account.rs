@@ -1456,6 +1456,7 @@ mod tests {
     fn cached_viability_for_requires_a_unique_handle_match() {
         // A unique handle match → its verdict.
         let unique = StatusResponse {
+            systemic_refresh_failure: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),
@@ -1473,6 +1474,7 @@ mod tests {
         // (labels are not unique, and the reply carries no account-uuid) → live
         // fallback, never a guess.
         let duped = StatusResponse {
+            systemic_refresh_failure: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("dup", false, false, Some(10)),
@@ -1787,6 +1789,7 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
 
         let response = StatusResponse {
+            systemic_refresh_failure: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),

@@ -15,11 +15,12 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 0))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 1))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
         XCTAssertEqual(v.refreshEnabled, false)
+        XCTAssertNil(v.systemicRefreshFailure, "systemic_refresh_failure null decodes to nil")
         XCTAssertEqual(v.accounts.count, 1)
 
         let a = v.accounts[0]
@@ -41,8 +42,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 0)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 0))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 1)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 1))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 

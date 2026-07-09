@@ -87,7 +87,7 @@ use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::claude_state;
-use crate::config::{Account, Config, Tunables};
+use crate::config::{Account, Config, Tunables, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N};
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
 // `refresh_tick` can depend on it without depending on the whole daemon. Re-exported under
 // `crate::daemon::*` so every existing `daemon::Clock` / `daemon::RealClock` caller is unchanged.
@@ -106,6 +106,7 @@ use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
+use crate::systemic_refresh::{SweepHealth, SystemicRefreshHealth};
 use crate::timing::{Jitter, Rng, SplitMix64, Strategy};
 use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
 use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sample};
@@ -1150,6 +1151,14 @@ struct DecisionState {
     /// it stays at its empty default and the collector's roll/gap layer is inert. See
     /// [`StatsState`].
     stats_state: StatsState,
+    /// Daemon-level SYSTEMIC refresh-failure detector (issue #378): the consecutive all-eligible-
+    /// account refresh-error sweep streak plus the once-per-episode edge latch. Fed one classified
+    /// sweep at a time via [`Daemon::note_systemic_refresh`] (post-idle, like the sweep's #106
+    /// restores / #119 observations), it edge-triggers a distinct `refresh_systemic_failure` when
+    /// the streak crosses [`Daemon::systemic_failure_n`] and clears on the first working sweep — a
+    /// mechanism-down signal distinct from the per-account `at_risk` rollup. `Default` (healthy,
+    /// no streak) is the fresh-daemon state. See [`SystemicRefreshHealth`].
+    systemic_refresh: SystemicRefreshHealth,
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -1284,6 +1293,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// stagger offset in `[0, cadence)` is added on top for de-correlation. Only read when
     /// [`keep_warm`](Self::keep_warm) is wired; the `new` default is an inert placeholder.
     keep_warm_cadence: Duration,
+    /// The systemic refresh-failure threshold (issue #378): consecutive all-eligible-account
+    /// refresh-error sweeps before the daemon surfaces a mechanism-down signal. Sourced from
+    /// `[refresh].systemic_failure_n` (`1..=100`) via
+    /// [`with_systemic_failure_n`](Self::with_systemic_failure_n); `new`'s default is the config
+    /// default (an inert placeholder for hermetic tests, which drive the detector directly). Read
+    /// only by [`note_systemic_refresh`](Self::note_systemic_refresh).
+    systemic_failure_n: u32,
     state: DecisionState,
 }
 
@@ -1360,6 +1376,11 @@ where
             // inert placeholder until the engine is wired (it is read only when `keep_warm` is).
             keep_warm: None,
             keep_warm_cadence: Duration::from_secs(3600),
+            // The #378 systemic-failure threshold defaults to the config default (opt-in wiring
+            // via `with_systemic_failure_n`); hermetic tests that exercise the detector pass the
+            // threshold directly to `SystemicRefreshHealth::note`, so this placeholder only sets
+            // the value for a `note_systemic_refresh` call an integration test drives at defaults.
+            systemic_failure_n: DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
             state: DecisionState {
                 health,
                 last_readings,
@@ -1386,6 +1407,17 @@ where
     /// (`false`, set in `new`) leaves the advisory inert.
     pub(crate) fn with_refresh_enabled(mut self, enabled: bool) -> Self {
         self.refresh_enabled = enabled;
+        self
+    }
+
+    /// Wire the systemic refresh-failure threshold (`[refresh].systemic_failure_n`, issue #378):
+    /// the consecutive all-eligible-account refresh-error sweep count at which
+    /// [`note_systemic_refresh`](Self::note_systemic_refresh) surfaces a mechanism-down signal.
+    /// Production sets the real `config.refresh.systemic_failure_n`; the `new` default (the config
+    /// default) leaves hermetic tests unaffected. Builder-style to keep `new`'s arg list stable,
+    /// mirroring `with_refresh_enabled` / `with_swap_lock`.
+    pub(crate) fn with_systemic_failure_n(mut self, n: u32) -> Self {
+        self.systemic_failure_n = n;
         self
     }
 
@@ -3458,6 +3490,24 @@ where
         })
     }
 
+    /// Fold one sweep's [`SweepHealth`] classification into the daemon-level systemic-refresh
+    /// detector (issue #378), returning the edge-triggered [`Event`] to emit at an episode
+    /// boundary — [`Event::RefreshSystemicFailure`] on the streak crossing
+    /// [`systemic_failure_n`](Self::systemic_failure_n), [`Event::RefreshSystemicRecovered`] on
+    /// recovery — or `None` on a neutral / mid-episode sweep.
+    ///
+    /// Driven from the run loop AFTER the idle borrow drops (like the #106 restores + #119
+    /// observations), once PER SWEEP: the classification is captured per sweep in
+    /// `idle_until_next_tick` so multiple sweeps in one idle period (a low cadence under a long
+    /// poll interval) each advance the streak individually rather than merging into one. The
+    /// per-account observation fold ([`apply_refresh_observation`](Self::apply_refresh_observation))
+    /// updates the `at_risk` rollup independently — this is the orthogonal MECHANISM-level signal.
+    fn note_systemic_refresh(&mut self, health: SweepHealth) -> Option<Event> {
+        self.state
+            .systemic_refresh
+            .note(health, self.systemic_failure_n)
+    }
+
     /// Read the just-polled account's stored access-token expiry (epoch SECONDS, issue
     /// #141) — the DISPLAY clock the poll path feeds into [`AccountHealth::poll_expires_at`],
     /// so `status --json` surfaces an expiry even with `[refresh]` off. Reads the SAME
@@ -3593,6 +3643,11 @@ where
             // `now_secs` the #119 health rollup reads above, so one wall-clock read backs the
             // whole cycle and the client's live-vs-stale check agrees with the rollup's clock.
             generated_at: now_secs,
+            // The daemon-level systemic refresh-health indicator (issue #378): `Some(n)` while a
+            // systemic-failure episode is active (n consecutive all-account error sweeps), `None`
+            // when healthy — surfaced by `status` so the mechanism-down state is visible without
+            // waiting for an account to die. A COUNT only (#15).
+            systemic_refresh: self.state.systemic_refresh.status(),
         }
     }
 
@@ -7697,6 +7752,7 @@ mod tests {
     #[test]
     fn status_response_carries_handles_and_percentages_and_never_a_secret() {
         let snapshot = StatusSnapshot {
+            systemic_refresh: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -8302,6 +8358,54 @@ mod tests {
         );
     }
 
+    /// The #378 daemon-side wiring the pure `SystemicRefreshHealth` unit tests can't reach:
+    /// `note_systemic_refresh` folds each sweep through the daemon's OWN configured threshold — here
+    /// the default 3, since `three_account_daemon` leaves `systemic_failure_n` at the config default
+    /// (the "drives at defaults" integration case the field's doc-comment anticipates) — and an
+    /// active episode surfaces in `snapshot`'s `systemic_refresh` projection, the `status`-visible
+    /// indicator that shows the mechanism is down without waiting for an account to die.
+    #[tokio::test]
+    async fn note_systemic_refresh_threads_the_configured_threshold_and_projects_into_snapshot() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        const NOW: i64 = 1_782_777_600;
+        let no_readings: [Option<Usage>; 3] = [None, None, None];
+        let indicator = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh;
+
+        // Below the default threshold the mechanism-down streak climbs but stays silent, and the
+        // indicator reads healthy — proving the daemon threads its own `systemic_failure_n`, not a
+        // hardcoded N (a broken default or field-plumbing would fire early here).
+        assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
+        assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
+        assert_eq!(indicator(&daemon), None, "healthy below the threshold");
+
+        // The 3rd consecutive all-error sweep crosses the threshold → exactly one edge-triggered
+        // failure carrying the count, and the snapshot now surfaces the mechanism-down count.
+        assert_eq!(
+            daemon.note_systemic_refresh(SweepHealth::AllError),
+            Some(Event::RefreshSystemicFailure { consecutive: 3 })
+        );
+        assert_eq!(
+            indicator(&daemon),
+            Some(3),
+            "active episode is status-visible"
+        );
+
+        // A further all-error sweep keeps climbing but does NOT re-emit (edge-, not level-triggered).
+        assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
+        assert_eq!(indicator(&daemon), Some(4));
+
+        // A single working sweep is the recovery edge: one recovery event, and the indicator clears.
+        assert_eq!(
+            daemon.note_systemic_refresh(SweepHealth::Working),
+            Some(Event::RefreshSystemicRecovered)
+        );
+        assert_eq!(
+            indicator(&daemon),
+            None,
+            "recovery clears the status indicator"
+        );
+    }
+
     #[test]
     fn redaction_meter_covers_the_new_credential_clock_fields() {
         use crate::redaction::meter::{assert_clean, Secrets};
@@ -8312,6 +8416,7 @@ mod tests {
         // surface it — and prove the value-based meter (#15) still reads clean.
         let secrets = Secrets::meter_fixture();
         let snapshot = StatusSnapshot {
+            systemic_refresh: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -8397,6 +8502,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let snapshot = StatusSnapshot {
+            systemic_refresh: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -8487,6 +8593,7 @@ mod tests {
     /// and session fraction so a test can tell one pushed snapshot from the next.
     fn watch_snapshot(label: &str, generated_at: i64, session: f64) -> StatusSnapshot {
         StatusSnapshot {
+            systemic_refresh: None,
             generated_at,
             refresh_enabled: false,
             next_swap: None,
@@ -9968,7 +10075,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":0}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":1}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -10004,6 +10111,7 @@ mod tests {
         // extra top-level `schema_version` / `generated_at` keys they do not name. This is the
         // backward-compat guarantee the flatten design rests on.
         let snapshot = StatusSnapshot {
+            systemic_refresh: None,
             generated_at: 1_782_777_600,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -10127,6 +10235,7 @@ mod tests {
     #[test]
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
+            systemic_refresh: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![

@@ -33,6 +33,7 @@ mod sha256;
 mod stash;
 mod stats;
 mod swap;
+mod systemic_refresh;
 mod timing;
 mod usage;
 mod usage_stats;

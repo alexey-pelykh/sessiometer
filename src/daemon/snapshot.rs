@@ -41,6 +41,15 @@ pub(crate) struct StatusSnapshot {
     /// unit the rest of the wire already speaks (`access_expires_at`, `session_resets_at`).
     /// `0` by `Default` (an all-defaults snapshot has no generation instant).
     pub(crate) generated_at: i64,
+    /// The daemon-level SYSTEMIC refresh-health indicator (issue #378): `Some(n)` while the
+    /// refresh MECHANISM is down — `n` consecutive sweeps failed with `outcome=error` across every
+    /// eligible account, past the configured threshold — else `None`. Copied from
+    /// [`SystemicRefreshHealth::status`](crate::systemic_refresh::SystemicRefreshHealth::status) at
+    /// build. Distinct from the per-account [`AccountReading::health`] `at_risk` rollup: it
+    /// reflects the whole mechanism, visible without waiting for an account to die. `None` by
+    /// `Default` (an all-defaults snapshot reads as healthy). A COUNT only — never a token,
+    /// path, or email (the #15 discipline).
+    pub(crate) systemic_refresh: Option<u32>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -128,8 +137,10 @@ pub(crate) struct SchemaVersion {
 /// The status-snapshot contract version THIS build speaks (as the daemon) and understands (as
 /// the reference `status` client) — issue #164. `1.0` is the FIRST frozen contract: the 0.1.0
 /// status snapshot settled by #137–#143. Bump MAJOR on any breaking field change, MINOR on an
-/// additive one (see [`SchemaVersion`]).
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 0 };
+/// additive one (see [`SchemaVersion`]). `1.1` ADDED the daemon-level
+/// [`StatusResponse::systemic_refresh_failure`] indicator (issue #378) — an optional field an
+/// older client tolerates by ignoring.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 1 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -154,6 +165,16 @@ pub(crate) struct StatusResponse {
     /// daemon. Non-secret — a plain flag.
     #[serde(default)]
     pub(crate) refresh_enabled: Option<bool>,
+    /// The daemon-level SYSTEMIC refresh-failure indicator (issue #378): `Some(n)` while the
+    /// refresh MECHANISM is down (`n` consecutive all-eligible-account `outcome=error` sweeps past
+    /// the configured threshold), else `None`/absent when healthy. Lets `sessiometer status` show
+    /// the mechanism is down — a signal distinct from the per-account `auth` rollup, visible
+    /// without waiting for an account to die. `Option` + `#[serde(default)]` per the added-field
+    /// convention (this is the MINOR [`STATUS_SCHEMA_VERSION`] bump 1.0 → 1.1): a pre-#378 daemon
+    /// omits the field → `None`, which the client renders as healthy. A COUNT only — never a token,
+    /// path, or email (issue #15).
+    #[serde(default)]
+    pub(crate) systemic_refresh_failure: Option<u32>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -322,6 +343,9 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // current daemon always knows it (the `Option` is purely pre-#138 wire compat, mirroring
         // `health`).
         refresh_enabled: Some(snapshot.refresh_enabled),
+        // The daemon-level systemic refresh-failure indicator (issue #378), copied straight to the
+        // wire: `Some(n)` while the mechanism is down, `None` when healthy.
+        systemic_refresh_failure: snapshot.systemic_refresh,
     }
 }
 

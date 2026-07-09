@@ -564,6 +564,24 @@ pub(crate) enum Event {
         /// `false`.
         refresh_token_rotated: bool,
     },
+    /// The refresh MECHANISM is systemically DOWN (issue #378): `consecutive` refresh sweeps in a
+    /// row failed with `outcome=error` across EVERY eligible (parked, allowlisted) account — a
+    /// failure of the mechanism itself (a stale `claude` path #375, a wedged spawn), not one
+    /// account's credentials. Edge-triggered: emitted exactly ONCE per episode, on the sweep that
+    /// crosses the configured threshold ([`crate::config::RefreshConfig::systemic_failure_n`]),
+    /// NOT re-emitted per subsequent all-error sweep; the matching [`Event::RefreshSystemicRecovered`]
+    /// signals the clear. Distinct from the per-account [`Event::CredentialHealth`] `at_risk`
+    /// rollup — visible without waiting for any account to die. Carries only the COUNT — never a
+    /// token, path, or email (the #15 single-surface guarantee).
+    RefreshSystemicFailure { consecutive: u32 },
+    /// The refresh mechanism RECOVERED from a systemic failure (issue #378): after a
+    /// [`Event::RefreshSystemicFailure`] episode, a sweep produced at least one non-`error`
+    /// refresh cycle, so the mechanism demonstrably works again. Edge-triggered: emitted exactly
+    /// ONCE, on the first working sweep that clears the episode — the closing bracket of the
+    /// systemic-failure edge, mirroring the [`Event::CredentialDead`] / [`Event::CredentialRestored`]
+    /// two-edge idiom at the refresh-MECHANISM scope. No fields — a daemon-global recovery with
+    /// nothing account-specific to carry (#15).
+    RefreshSystemicRecovered,
     /// `account`'s 4-state credential-health rollup (issue #119) TRANSITIONED to `state`
     /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
     /// the state holds), so the event log carries the per-account health timeline. The
@@ -795,6 +813,16 @@ impl Event {
                 format!(
                     "ts={ts} event=keep_warm account={account} trigger={trigger} outcome={outcome} rotated={refresh_token_rotated}"
                 )
+            }
+            Event::RefreshSystemicFailure { consecutive } => {
+                // The systemic refresh-mechanism-down edge (issue #378): the streak count is the
+                // only field — no account (a whole-mechanism condition), no token/path (#15).
+                format!("ts={ts} event=refresh_systemic_failure consecutive={consecutive}")
+            }
+            Event::RefreshSystemicRecovered => {
+                // The closing edge of the #378 systemic-failure episode — a daemon-global recovery
+                // with nothing account-specific to carry.
+                format!("ts={ts} event=refresh_systemic_recovered")
             }
             Event::CredentialHealth { account, state } => {
                 let state = state.as_str();
@@ -1510,6 +1538,24 @@ mod tests {
             line,
             format!("{TS0} event=credential_unrecoverable account=work")
         );
+    }
+
+    #[test]
+    fn refresh_systemic_failure_carries_only_the_consecutive_count() {
+        // Issue #378: the systemic-down edge renders just the streak count — no account, no path,
+        // no token (a whole-mechanism condition, #15-clean by construction).
+        let line = Event::RefreshSystemicFailure { consecutive: 3 }.to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=refresh_systemic_failure consecutive=3")
+        );
+    }
+
+    #[test]
+    fn refresh_systemic_recovered_carries_nothing_account_specific() {
+        // Issue #378: the recovery edge is a bare daemon-global line — nothing to leak.
+        let line = Event::RefreshSystemicRecovered.to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=refresh_systemic_recovered"));
     }
 
     #[test]
