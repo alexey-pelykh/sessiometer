@@ -374,7 +374,10 @@ impl ImportRollup {
 pub(crate) enum Event {
     /// The active credential was rotated away from `from` to `to` because `reason`
     /// reached its trigger; `session_pct` is the outgoing account's session usage
-    /// (percent) at swap time.
+    /// (percent) at swap time. When `session_pct >= 100` the account was already at
+    /// the usage ceiling, so [`Event::to_log_line`] appends a `late=true` marker
+    /// (issue #365); the marker is omitted otherwise, leaving the in-band swap line
+    /// unchanged. It is a formatter-derived flag, not a stored field.
     ///
     /// `from`/`to` are HANDLES (operator labels), NOT roster indices — unlike the
     /// same-named fields of [`crate::daemon::TickAction::Swapped`].
@@ -612,8 +615,19 @@ impl Event {
                 session_pct,
             } => {
                 let reason = reason.as_str();
+                // `late=true` marks a swap whose outgoing account was already at the
+                // usage ceiling (`session_pct >= 100`) when it fired (issue #365).
+                // Appended only when true — a trailing `key=val` existing parsers
+                // ignore, mirroring the optional `resets_at` / `expires_*` fields —
+                // so a normal in-band swap line is byte-for-byte unchanged. A
+                // number-derived bool: no new field type, no new redaction surface (#15).
+                let late = if *session_pct >= 100 {
+                    " late=true"
+                } else {
+                    ""
+                };
                 format!(
-                    "ts={ts} event=swap from={from} to={to} reason={reason} session_pct={session_pct}"
+                    "ts={ts} event=swap from={from} to={to} reason={reason} session_pct={session_pct}{late}"
                 )
             }
             Event::ReStash { account } => {
@@ -1305,6 +1319,43 @@ mod tests {
             line,
             format!("{TS0} event=swap from=work to=spare reason=session session_pct=97")
         );
+    }
+
+    #[test]
+    fn swap_line_marks_late_when_at_or_above_the_ceiling() {
+        // `session_pct >= 100` — the outgoing account was already at the usage
+        // ceiling, so the line carries a `late=true` marker (issue #365), appended
+        // after `session_pct` as a trailing key=val.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::Session,
+            session_pct: 100,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=swap from=work to=spare reason=session session_pct=100 late=true")
+        );
+    }
+
+    #[test]
+    fn swap_line_omits_late_below_the_ceiling() {
+        // Below the ceiling the marker is absent — a normal in-band swap line is
+        // byte-for-byte what it was before the field existed (backward-compatible,
+        // issue #365). 99 pins the `>= 100` boundary from just below.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::Session,
+            session_pct: 99,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=swap from=work to=spare reason=session session_pct=99")
+        );
+        assert!(!line.contains("late"), "got: {line}");
     }
 
     #[test]
