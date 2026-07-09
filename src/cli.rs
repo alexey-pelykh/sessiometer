@@ -5136,7 +5136,10 @@ spare  22222222-2222\n\
     fn render_snapshot_age_marks_stale_beyond_the_max_poll_cadence() {
         let now = 1_000_000;
         // AT the boundary (== the max poll cadence) → fresh, no marker.
-        assert_eq!(render_snapshot_age(now - STALE_AGE_SECS, now), "updated 1h ago\n");
+        assert_eq!(
+            render_snapshot_age(now - STALE_AGE_SECS, now),
+            "updated 1h ago\n"
+        );
         // One second past it → the ` (stale)` marker, even though the humanized age is unchanged:
         // the threshold is the exact second, not the humanized unit.
         assert_eq!(
@@ -5144,7 +5147,10 @@ spare  22222222-2222\n\
             "updated 1h ago (stale)\n"
         );
         // A comfortably-stale snapshot.
-        assert_eq!(render_snapshot_age(now - 2 * 3_600, now), "updated 2h ago (stale)\n");
+        assert_eq!(
+            render_snapshot_age(now - 2 * 3_600, now),
+            "updated 2h ago (stale)\n"
+        );
     }
 
     #[test]
