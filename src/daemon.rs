@@ -6461,6 +6461,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_interleave_re_observes_the_active_in_band_and_swaps_before_the_ceiling() {
+        // #367 regression lock (umbrella #363) — the reaction-latency PAYOFF of the #366
+        // interleave, pinning the #365 `late=` marker. The active account's session usage
+        // CLIMBS while it is active: it reads ~0.93 now, and one full round-robin sweep
+        // later it would already be at the 1.00 ceiling. Pre-#366 the active was
+        // re-observed only ONCE per full sweep (`[active, p1, p2, …]`), so the daemon's
+        // next look already read 1.00 and it swapped LATE (session_pct=100, `late=true`).
+        // The #366 interleave (`[active, p1, active, p2, …]`) re-observes the active every
+        // ~2 ticks, so it catches an IN-BAND reading (∈ [95 %, 100 %)) and swaps BEFORE the
+        // ceiling (session_pct < 100, `late=false`).
+        //
+        // The test drives the REAL staggered loop, so `build_poll_schedule` (#366) is what
+        // decides WHEN the climbing value is re-observed: reverting #366 restores the
+        // sweep-latency schedule → the active is next seen at 1.00 → the swap lands at
+        // session_pct=100 and this test FAILS. Hermetic: fake clock + fake poller via
+        // `FakeDaemon`, no real clock/network, no new test infrastructure (AC).
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+
+        // The active account's TRUE session usage as a function of wall-time (ticks
+        // elapsed); the peers stay idle at 0.10. Re-scripting the injected poller each tick
+        // models "the world moved on between polls" — and it is the SCHEDULE, not the test,
+        // that decides which of these climbing values the daemon actually observes:
+        // interleaved (`[work, spare, work, backup]`) re-looks at `work` at tick 2 (0.97,
+        // in-band); the pre-#366 (`[work, spare, backup]`) would only re-look at tick 3
+        // (1.00, at the ceiling).
+        let active_session = |tick: usize| -> f64 {
+            match tick {
+                0 | 1 => 0.93, // first observation: below the 95 % trigger → hold
+                2 => 0.97,     // in-band on the interleaved re-observation ∈ [95 %, 100 %)
+                _ => 1.00,     // one full sweep later it has hit the ceiling
+            }
+        };
+
+        // Drive the staggered loop until the first swap fires — bounded, so a
+        // never-swapping regression fails loudly here instead of hanging the test.
+        let mut swap = None;
+        for tick in 0..8 {
+            // Re-script only the active's climbing reading each tick; peers stay idle. This
+            // reuses `FakeRosterPoller` verbatim (no new infrastructure) — the field write
+            // mirrors the existing `daemon.state.…` in-module test idiom.
+            daemon.poller = FakeRosterPoller::new()
+                .ok("u-A", active_session(tick), 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10);
+            let outcome = daemon.tick().await;
+            if matches!(outcome.action, TickAction::Swapped { .. }) {
+                swap = Some(outcome);
+                break;
+            }
+        }
+        let outcome = swap.expect("the climbing active must trigger a swap-away within the sweep");
+
+        // The swap fired OFF the active (`work`, 0) onto the soonest-reset viable peer
+        // (`spare`, 1, by the earliest-index tie-break).
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+
+        let swap_event = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::Swap { .. }))
+            .expect("a swap surfaces a structured Event::Swap (#9)");
+        let Event::Swap { session_pct, .. } = swap_event else {
+            unreachable!("filtered to Event::Swap above")
+        };
+        // AC: the interleave re-observed the active WITHIN the sweep, so the swap was taken
+        // on an in-band reading — at/above the 95 % trigger yet strictly below the 100 %
+        // ceiling. On the pre-#366 sweep-latency schedule this reading would be 100.
+        assert!(
+            *session_pct >= 95 && *session_pct < 100,
+            "expected an in-band swap ∈ [95, 100); got session_pct={session_pct}",
+        );
+
+        // Companion AC (#365 marker): an in-band swap is NOT late — `Event::to_log_line`
+        // appends `late=true` only at/above the ceiling (session_pct >= 100), so the
+        // rendered line must carry no `late` marker.
+        let line = swap_event.to_log_line(std::time::SystemTime::UNIX_EPOCH);
+        assert!(
+            !line.contains("late"),
+            "an in-band swap must not be marked late; got `{line}`",
+        );
+    }
+
+    #[tokio::test]
     async fn a_reauth_rewrites_the_canonical_and_the_daemon_restashes_the_account() {
         // #13 core: tick 1 primes the watch on A's token. The operator then re-auths
         // A via `claude /login`, rewriting the canonical to a FRESH token (display
