@@ -237,6 +237,40 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.banner(for: .connected, accountCount: 3).detail, "3 accounts.")
     }
 
+    // MARK: - usage severity + swap-trigger (mirror `src/cli.rs` `util_severity` / `weekly_cell_severity`)
+
+    func testUtilSeverityBandsMirrorTheCli() {
+        // Bands: >= 90 Red, >= 75 Yellow, else Green (RED_UTIL_PCT / YELLOW_UTIL_PCT in src/cli.rs).
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(0), .green)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(74), .green)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(75), .yellow)   // Yellow boundary
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(89), .yellow)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(90), .red)      // Red boundary (≈ the swap trigger)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(100), .red)
+    }
+
+    func testSessionSeverityMapsPercentOrNil() {
+        XCTAssertEqual(StatusPanelFormat.sessionSeverity(20), .green)
+        XCTAssertEqual(StatusPanelFormat.sessionSeverity(92), .red)
+        XCTAssertNil(StatusPanelFormat.sessionSeverity(nil))          // failed poll → no color, not a fake green
+    }
+
+    func testWeeklySeverityRedWhenExhaustedRegardlessOfPercent() {
+        // A weekly-EXHAUSTED account is Red whatever its rounded percent (the week-blocked verdict).
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 3, weeklyExhausted: true), .red)
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 100, weeklyExhausted: true), .red)
+        // Not exhausted → the raw bands.
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 10, weeklyExhausted: false), .green)
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 80, weeklyExhausted: false), .yellow)
+        // Failed poll → nil even when flagged exhausted (no present reading to color, mirrors the CLI).
+        XCTAssertNil(StatusPanelFormat.weeklySeverity(weeklyPct: nil, weeklyExhausted: true))
+    }
+
+    func testSessionIsSwapTriggerUnlessWeeklyExhausted() {
+        XCTAssertTrue(StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: false))  // session forces the swap
+        XCTAssertFalse(StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: true))  // week-blocked → weekly binds
+    }
+
     // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
 
     func testNextSwapFooterWording() {

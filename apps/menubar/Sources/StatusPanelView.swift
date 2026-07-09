@@ -150,6 +150,19 @@ private struct AccountRowView: View {
                                   now: now)
     }
 
+    /// SESSION is the swap-triggering (binding) window unless the account is weekly-exhausted — the
+    /// metric that earns typographic primacy (the same window `resetIn` shows, so the emphasized
+    /// percent and the reset stay coherent).
+    private var sessionIsPrimary: Bool {
+        StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: row.weeklyExhausted)
+    }
+    private var sessionSeverity: StatusPanelFormat.UsageSeverity? {
+        StatusPanelFormat.sessionSeverity(row.sessionPct)
+    }
+    private var weeklySeverity: StatusPanelFormat.UsageSeverity? {
+        StatusPanelFormat.weeklySeverity(weeklyPct: row.weeklyPct, weeklyExhausted: row.weeklyExhausted)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
@@ -185,11 +198,19 @@ private struct AccountRowView: View {
             }
 
             HStack(spacing: 8) {
+                // The swap-triggering metric (session, or weekly when week-blocked) carries typographic
+                // PRIMACY — semibold + full-strength; the other stays quiet. Both take a threshold color
+                // only when depleted (≥75% Yellow, ≥90% / exhausted Red), so a healthy row gains NO
+                // color — just the one semibold percent (issue #84 bands, shared with the CLI overlay).
                 Text("session \(StatusPanelFormat.pct(row.sessionPct))")
                     .monospacedDigit()
+                    .fontWeight(sessionIsPrimary ? .semibold : .regular)
+                    .foregroundStyle(usageColor(sessionSeverity, primary: sessionIsPrimary))
                 Text("·").foregroundStyle(.tertiary)
                 Text("weekly \(StatusPanelFormat.pct(row.weeklyPct))")
                     .monospacedDigit()
+                    .fontWeight(sessionIsPrimary ? .regular : .semibold)
+                    .foregroundStyle(usageColor(weeklySeverity, primary: !sessionIsPrimary))
                 Text("·").foregroundStyle(.tertiary)
                 Text("resets in \(resetIn)")
                     .monospacedDigit()
@@ -236,6 +257,18 @@ private struct AccountRowView: View {
 
     private func cueColor(for auth: CredentialHealth) -> Color {
         auth == .dead && !row.isRecovering ? .red : .secondary
+    }
+
+    /// The metrics-line color for a usage severity: Red / Yellow escalate a depleted metric; Green (or a
+    /// failed poll, `nil`) takes NO alarm color — the swap-triggering metric then shows full-strength
+    /// (`.primary`) to carry its weight-primacy while the other recedes to `.secondary`. So color marks
+    /// urgency and weight marks the swap-trigger, independently.
+    private func usageColor(_ severity: StatusPanelFormat.UsageSeverity?, primary: Bool) -> Color {
+        switch severity {
+        case .red:          return .red
+        case .yellow:       return .yellow
+        case .green, .none: return primary ? .primary : .secondary
+        }
     }
 
     /// Map the pure `HealthTint` role to a system semantic color — never `accentColor` (the AUTH glyph

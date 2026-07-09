@@ -284,6 +284,49 @@ enum StatusPanelFormat {
         generatedAt > 0 && (now - generatedAt) > staleAgeSecs
     }
 
+    // MARK: - Usage severity + swap-trigger (mirror `src/cli.rs` `util_severity` / `weekly_cell_severity`)
+
+    /// One utilization urgency band. Mirrors the subset of `src/cli.rs` `Severity` the per-cell
+    /// utilization overlay uses — the reset-proximity `Dim` and the account-aggregate's reset-soon
+    /// downgrade are CLI-table concerns (the `ACCOUNT` cell), NOT the per-metric panel color, so the
+    /// panel mirror is the three utilization bands only.
+    enum UsageSeverity: Equatable { case green, yellow, red }
+
+    /// The urgency band for a utilization percent — the panel's mirror of `src/cli.rs` `util_severity`:
+    /// `>= 90` Red (at/near the ~95% session swap-away trigger, #41), `>= 75` Yellow (worth watching),
+    /// else Green. One shared "how full is too full" definition (issue #84), so the panel's per-metric
+    /// threshold color keys off the SAME bands as the CLI's per-cell overlay for the same reading.
+    static func utilSeverity(_ pct: UInt8) -> UsageSeverity {
+        if pct >= 90 { return .red }
+        if pct >= 75 { return .yellow }
+        return .green
+    }
+
+    /// The SESSION metric's severity — the raw `utilSeverity` of its percent, or `nil` when the poll
+    /// failed (the `n/a` text carries the truth; an uncolored metric is not a false "healthy"). Mirrors
+    /// the CLI's `session_severity` (`account.session_pct.map(util_severity)`).
+    static func sessionSeverity(_ sessionPct: UInt8?) -> UsageSeverity? {
+        sessionPct.map(utilSeverity)
+    }
+
+    /// The WEEKLY metric's severity — `utilSeverity` of its percent, EXCEPT a weekly-EXHAUSTED account
+    /// (the daemon's blocked-for-the-week verdict, #11/#37) reads Red whatever the rounded percent — a
+    /// week-blocked account is never painted "healthy", even under a lowered `weekly_trigger`. `nil`
+    /// when the weekly poll failed. Mirrors the CLI's `weekly_cell_severity`.
+    static func weeklySeverity(weeklyPct: UInt8?, weeklyExhausted: Bool) -> UsageSeverity? {
+        weeklyPct.map { weeklyExhausted ? .red : utilSeverity($0) }
+    }
+
+    /// Whether SESSION is the swap-triggering (binding) window — TRUE unless the account is weekly-
+    /// EXHAUSTED, in which case WEEKLY is the window blocking it (and the one whose reset the row's
+    /// single reset-in shows). The swap-triggering metric earns the row's typographic PRIMACY: the
+    /// daemon swaps away at the ~95% session limit (#41), or holds a week-blocked account on its weekly
+    /// window — so the metric governing "when does this account force a swap" is the one to emphasize.
+    /// The same window `resetIn` picks, so the emphasized percent and the shown reset stay coherent.
+    static func sessionIsSwapTrigger(weeklyExhausted: Bool) -> Bool {
+        !weeklyExhausted
+    }
+
     // MARK: - `next_swap` footer (issue #326 AC — renders the FORWARD candidate, not swap history)
 
     /// The footer line for the daemon's `next_swap` candidate, or `nil` when there is no active anchor
