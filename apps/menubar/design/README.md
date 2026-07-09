@@ -55,6 +55,21 @@ which is the mock). Light shown here:
 - the **Swap** button is present-but-disabled — its click action is #169
 - no Status/Stats segmented control — Stats has no socket data path (spike #356)
 
+### Design vs. capture, screen by screen
+
+`build-comparison.py` assembles a single self-contained page that puts the mock's **live** `.pop`
+blocks next to the built-panel captures, state by state — the fastest way to eyeball parity across the
+six states the panel implements (the mock's `not-running` / `crash-looping` / `keychain-locked` are the
+fuller 9-state map, #169):
+
+```sh
+# from apps/menubar, after a Debug build
+BIN=".build/xcode/Build/Products/Debug/Sessiometer.app/Contents/MacOS/Sessiometer"
+"$BIN" --render-panel /tmp/panelcaps                         # render all six states, both themes
+python3 design/build-comparison.py /tmp/panelcaps /tmp/design-vs-capture.html
+open /tmp/design-vs-capture.html
+```
+
 ## It's a mock, not code
 
 The mock approximates native treatments in HTML/CSS. When building the SwiftUI panel, translate

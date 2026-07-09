@@ -19,8 +19,18 @@ import SwiftUI
 
 @MainActor
 enum RenderPanelTool {
-    /// Render the healthy-Status panel (light + dark) into `outputDir`. Any failure is written to
-    /// stderr; the caller (`AppDelegate`) exits after this returns.
+    /// A named panel state to render, so one run emits the whole set the panel supports for a
+    /// screen-by-screen diff against the mock's `.pop` states.
+    private struct Fixture {
+        let name: String
+        let state: ConnectionState
+        let rows: [AccountRow]
+        let nextSwap: NextSwap?
+        let generatedAt: Int64?
+    }
+
+    /// Render every panel-supported state (light + dark) into `outputDir` as `panel-<state>-<theme>.png`.
+    /// Any failure is written to stderr; the caller (`AppDelegate`) exits after this returns.
     static func run(outputDir: String) {
         let now = Int64(Date().timeIntervalSince1970)
         let day: Int64 = 86_400
@@ -43,21 +53,39 @@ enum RenderPanelTool {
                        sessionResetsAt: now + 5 * 3600 + 20 * 60, weeklyResetsAt: now + 3 * day,
                        weeklyExhausted: false, isNextSwapTarget: true),
         ]
-        let store = WatchStatusStore.preview(state: .connected, rows: rows,
-                                             nextSwap: .target(to: "Scratch"), generatedAt: now - 12)
 
-        for scheme in [ColorScheme.light, .dark] {
-            let name = scheme == .light ? "panel-healthy-light.png" : "panel-healthy-dark.png"
-            let view = StatusPanelView()
-                .environmentObject(store)
-                .environment(\.colorScheme, scheme)
-            let renderer = ImageRenderer(content: view)
-            renderer.scale = 2
-            guard let cg = renderer.cgImage else {
-                FileHandle.standardError.write(Data("render failed: \(name)\n".utf8))
-                continue
+        // The six D2 states the panel actually renders (the fuller 9-state fidelity is #169). `stale` and
+        // `disconnected` retain the last-good roster (disconnected dims it); the three account-less states
+        // show a banner / onboarding card. Ages chosen so the footer reads live / stale as intended.
+        let fixtures = [
+            Fixture(name: "healthy", state: .connected, rows: rows,
+                    nextSwap: .target(to: "Scratch"), generatedAt: now - 12),
+            Fixture(name: "stale", state: .stale, rows: rows,
+                    nextSwap: .target(to: "Scratch"), generatedAt: now - 5400),
+            Fixture(name: "disconnected", state: .disconnected(reason: "the daemon is not responding"),
+                    rows: rows, nextSwap: nil, generatedAt: now - 240),
+            Fixture(name: "connecting", state: .connecting, rows: [], nextSwap: nil, generatedAt: nil),
+            Fixture(name: "unsupported", state: .unsupported, rows: [], nextSwap: nil, generatedAt: nil),
+            Fixture(name: "empty-roster", state: .emptyRoster, rows: [], nextSwap: nil, generatedAt: nil),
+        ]
+
+        for fixture in fixtures {
+            let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
+                                                 nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt)
+            for scheme in [ColorScheme.light, .dark] {
+                let theme = scheme == .light ? "light" : "dark"
+                let name = "panel-\(fixture.name)-\(theme).png"
+                let view = StatusPanelView()
+                    .environmentObject(store)
+                    .environment(\.colorScheme, scheme)
+                let renderer = ImageRenderer(content: view)
+                renderer.scale = 2
+                guard let cg = renderer.cgImage else {
+                    FileHandle.standardError.write(Data("render failed: \(name)\n".utf8))
+                    continue
+                }
+                write(cg, to: outputDir + "/" + name)
             }
-            write(cg, to: outputDir + "/" + name)
         }
     }
 
