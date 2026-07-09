@@ -624,16 +624,24 @@ impl Config {
         Self::parse(text)
     }
 
-    /// Persist this config to `config.toml` (`0600`, parent `0700`), with the
-    /// inline tunable-documenting comments. The write path for `capture` (#4).
+    /// Persist this config to the canonical `config.toml` (`0600`, parent `0700`), with the
+    /// inline tunable-documenting comments. The write path for the standalone `capture` (#4).
     #[allow(dead_code)]
     pub(crate) fn save(&self) -> Result<()> {
-        let path = paths::config_file()?;
+        self.save_to(&paths::config_file()?)
+    }
+
+    /// Persist this config to an EXPLICIT `path` (`0600`, parent `0700`) — the injectable-path
+    /// write seam, the counterpart of [`load_path`](Config::load_path). The daemon-routed
+    /// `cmd:capture` (#359) writes back through its wired `config_path` (so a hermetic test lands
+    /// the new roster in a temp file, not the real support dir), exactly as [`save`](Config::save)
+    /// writes the canonical location for the standalone `capture` (#4).
+    pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
         paths::ensure_private_dir(
             path.parent()
-                .expect("config_file() always has a parent directory"),
+                .expect("a config path always has a parent directory"),
         )?;
-        paths::write_private_file(&path, self.render().as_bytes())
+        paths::write_private_file(path, self.render().as_bytes())
     }
 
     /// The base poll interval — the un-jittered `poll_secs`. The run loop now

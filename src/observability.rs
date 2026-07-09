@@ -260,6 +260,46 @@ impl LoginEventOutcome {
     }
 }
 
+/// The outcome of one daemon-routed `capture` control command (issue #359) — the `outcome=`
+/// token of the single redacted [`Event::Capture`] the run loop emits. Folds the two SUCCESS
+/// kinds and the redacted FAILURE tags into ONE self-describing token (the same single-field
+/// shape [`LoginEventOutcome`] uses): a new account (`Captured`) vs an idempotent refresh of an
+/// already-rostered one (`Refreshed`), and — on refusal — the SAME bare machine reason the
+/// redacted ack carries (`CaptureRejection`) folded onto this axis, so a `grep` of the event log
+/// tells WHY a capture failed. A bare classification, never a token or email (#15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureEventOutcome {
+    /// A NEW account was captured into the roster.
+    Captured,
+    /// An already-rostered active account was refreshed IN PLACE — no duplicate row.
+    Refreshed,
+    /// No active account to capture: not logged in to Claude Code (absent / unreadable identity),
+    /// or the canonical credential is gone.
+    NoActiveAccount,
+    /// The keychain was LOCKED when the daemon went to read the active credential — a SAFETY
+    /// abort; the capture read nothing and wrote nothing (retry when unlocked).
+    KeychainLocked,
+    /// The single-writer swap lock (#64) stayed held the whole bounded wait — fail-closed, ZERO
+    /// work (no read, no stash, no roster write).
+    SwapLockBusy,
+    /// The capture aborted for another reason (an I/O error, or the post-stash roster save failed).
+    Failed,
+}
+
+impl CaptureEventOutcome {
+    /// The `outcome=` token for the [`Event::Capture`] log line.
+    fn as_str(self) -> &'static str {
+        match self {
+            CaptureEventOutcome::Captured => "captured",
+            CaptureEventOutcome::Refreshed => "refreshed",
+            CaptureEventOutcome::NoActiveAccount => "no_active_account",
+            CaptureEventOutcome::KeychainLocked => "keychain_locked",
+            CaptureEventOutcome::SwapLockBusy => "swap_lock_busy",
+            CaptureEventOutcome::Failed => "failed",
+        }
+    }
+}
+
 /// Whether an `export` carried credential material or only the roster/config — the `mode=` of the
 /// redacted [`Event::Export`] (issue #150). A bare classification (never a handle, token, or
 /// email): the SAME #15 discipline as the other outcome enums here. Maps from the `export` verb's
@@ -494,6 +534,17 @@ pub(crate) enum Event {
         account: Option<String>,
         outcome: LoginEventOutcome,
     },
+    /// One daemon-routed `capture` control command completed (issue #359) — the single redacted
+    /// audit line the run loop emits after performing the capture inside the swap lock (the #357
+    /// `capture_locked` primitive). `account` is the operator HANDLE (the resolved roster label on
+    /// success, or the operator-supplied label hint on a failure) — a redacted, non-PII handle,
+    /// never the email or token; it is `None` when no account handle was available (a failure with
+    /// no label hint), in which case the `account=` field is omitted. `outcome` is the terminal
+    /// classification (a capture / an idempotent refresh, or a redacted failure tag).
+    Capture {
+        account: Option<String>,
+        outcome: CaptureEventOutcome,
+    },
     /// The usage-stats store compacted and rolled aged raw samples down into its hourly/daily
     /// aggregates (issue #161). Edge-ish: emitted only when a pass actually folds something
     /// (`raw_lines > 0`), so a no-op maintenance pass is silent. `rolled_through` is the roll
@@ -687,6 +738,18 @@ impl Event {
                         format!("ts={ts} event=login account={handle} outcome={outcome}")
                     }
                     None => format!("ts={ts} event=login outcome={outcome}"),
+                }
+            }
+            Event::Capture { account, outcome } => {
+                let outcome = outcome.as_str();
+                // The account handle is omitted when absent (a failure with no label hint) —
+                // mirroring `login`'s optional `account=`, so the key=val grammar never carries an
+                // empty `account=`. The handle is a redacted label; `outcome` is a bare tag (#15).
+                match account {
+                    Some(handle) => {
+                        format!("ts={ts} event=capture account={handle} outcome={outcome}")
+                    }
+                    None => format!("ts={ts} event=capture outcome={outcome}"),
                 }
             }
             Event::UsageRollup {
