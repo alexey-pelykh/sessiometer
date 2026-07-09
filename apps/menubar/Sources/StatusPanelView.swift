@@ -35,7 +35,7 @@ struct StatusPanelView: View {
         TimelineView(.periodic(from: .now, by: Self.clockTick)) { context in
             content(now: Int64(context.date.timeIntervalSince1970))
         }
-        .frame(width: 360, alignment: .leading)
+        .frame(width: 380, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         // An OPAQUE, appearance-adaptive backing so the panel reads at full contrast regardless of what
         // is behind it. The `.popover` vibrancy (StatusItemController) blended with the desktop/terminal
@@ -163,11 +163,15 @@ private struct RosterView: View {
     let now: Int64
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             ForEach(rows) { row in
                 AccountRowView(row: row, now: now)
             }
         }
+        // The design reference insets the roster 8px from the panel edge (`.accts` padding), so the
+        // active row's accent card aligns with the swap-callout card below (also inset 8) instead of
+        // bleeding edge-to-edge.
+        .padding(.horizontal, 8)
     }
 }
 
@@ -186,11 +190,6 @@ private struct AccountRowView: View {
         StatusPanelFormat.resetCell(row.weeklyResetsAt, now: now)
     }
 
-    /// SESSION is the swap-triggering (binding) window unless the account is weekly-exhausted — the
-    /// meter that earns typographic primacy (its percent renders semibold).
-    private var sessionIsPrimary: Bool {
-        StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: row.weeklyExhausted)
-    }
     private var sessionSeverity: StatusPanelFormat.UsageSeverity? {
         StatusPanelFormat.sessionSeverity(row.sessionPct)
     }
@@ -206,9 +205,9 @@ private struct AccountRowView: View {
 
                 Text(row.label)
                     .font(.body)
-                    .fontWeight(row.isActive ? .semibold : .regular)
+                    .fontWeight(.semibold)
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
 
                 Spacer(minLength: 6)
 
@@ -231,13 +230,14 @@ private struct AccountRowView: View {
 
             VStack(spacing: 6) {
                 UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
-                           reset: sessionReset, emphasized: sessionIsPrimary)
+                           reset: sessionReset)
                 UsageMeter(label: "Weekly", pct: row.weeklyPct, severity: weeklySeverity,
-                           reset: weeklyReset, emphasized: !sessionIsPrimary)
+                           reset: weeklyReset)
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 8)
+        .padding(.top, 9)
+        .padding(.bottom, 10)
         // Active emphasis follows the design reference: an accent-tint fill + ring. Active is redundantly
         // encoded — the filled leading dot (shape) + the "ACTIVE" tag carry it too — so color is never the
         // SOLE signal (WCAG 1.4.1 / R-2 state-parity holds; the accent here is a redundant cue, and the
@@ -323,13 +323,14 @@ private struct MonogramBadge: View {
     let label: String
 
     var body: some View {
-        RoundedRectangle(cornerRadius: 7)
+        RoundedRectangle(cornerRadius: 8)
             .fill(Color.secondary.opacity(0.16))
-            .frame(width: 28, height: 28)
+            .frame(width: 30, height: 30)
             .overlay(
                 Text(initial)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary)
+                    .font(.system(size: 13, weight: .bold))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
             )
             .accessibilityHidden(true)
     }
@@ -342,32 +343,31 @@ private struct MonogramBadge: View {
     }
 }
 
-/// One usage window's meter. `emphasized` bolds the swap-triggering window's percent; the fixed column
-/// widths + monospaced digits keep Session and Weekly aligned.
+/// One usage window's meter. Both percents render at a uniform weight — the design reference (and the
+/// `status` CLI) carry severity in COLOR, not weight; the fixed column widths + monospaced digits keep
+/// Session and Weekly aligned.
 private struct UsageMeter: View {
     let label: String
     let pct: UInt8?
     let severity: StatusPanelFormat.UsageSeverity?
     let reset: String
-    let emphasized: Bool
 
     var body: some View {
         HStack(spacing: 9) {
             Text(label.uppercased())
-                .font(.caption2).fontWeight(.semibold)
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 46, alignment: .leading)
+                .frame(width: 52, alignment: .leading)
 
             UsageBar(fraction: fraction, color: barColor)
 
             Text(StatusPanelFormat.pct(pct))
-                .font(.caption).monospacedDigit()
-                .fontWeight(emphasized ? .semibold : .regular)
+                .font(.system(size: 12, weight: .semibold)).monospacedDigit()
                 .foregroundStyle(pctColor)
                 .frame(width: 40, alignment: .trailing)
 
             Text(reset)
-                .font(.caption).monospacedDigit()
+                .font(.system(size: 11)).monospacedDigit()
                 .foregroundStyle(.secondary)
                 .frame(width: 52, alignment: .trailing)
                 .lineLimit(1)
@@ -388,13 +388,16 @@ private struct UsageMeter: View {
         }
     }
 
-    /// The percent TEXT escalates to a threshold color only when depleted (≥75% orange, ≥90%/exhausted
-    /// red); green and `n/a` stay full-strength `.primary` (orange, not yellow — yellow reads poorly).
+    /// The percent TEXT carries its severity band in color, matching the `status` CLI (which colors green
+    /// percents green too — `Severity::Green => "32"`) and the design reference: green healthy, ≥75% amber
+    /// (orange reads better than yellow), ≥90%/exhausted red. A failed poll (`n/a`) stays neutral — no
+    /// false green (#137).
     private var pctColor: Color {
         switch severity {
-        case .red:          return .red
-        case .yellow:       return .orange
-        case .green, .none: return .primary
+        case .red:    return .red
+        case .yellow: return .orange
+        case .green:  return .green
+        case .none:   return .primary
         }
     }
 }
@@ -413,7 +416,7 @@ private struct UsageBar: View {
                     .frame(width: fillWidth(geo.size.width))
             }
         }
-        .frame(height: 5)
+        .frame(height: 6)
         .accessibilityHidden(true)
     }
 
@@ -475,6 +478,13 @@ private struct StatusDot: View {
                 Circle().strokeBorder(Color.secondary.opacity(0.55), lineWidth: isActive ? 0 : 1.5)
             )
             .frame(width: 8, height: 8)
+            // The design reference rings the active disc with a soft accent halo (`box-shadow 0 0 0 3px`) —
+            // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue.
+            .background {
+                if isActive {
+                    Circle().fill(Color.accentColor.opacity(0.20)).frame(width: 14, height: 14)
+                }
+            }
             .accessibilityHidden(true)
     }
 }
@@ -528,14 +538,14 @@ private struct SwapCalloutCard: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "arrow.left.arrow.right")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.tint)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 1) {
                 (Text("Next swap → ") + Text(target).fontWeight(.semibold))
                     .font(.system(size: 12))
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
                 Text(reason)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
@@ -592,11 +602,25 @@ private struct AddAccountRow: View {
             .controlSize(.small)
             .accessibilityLabel(copied ? "Copied the capture command"
                                        : "Add account — copies the capture command")
-            Text(copied ? "Copied — paste in Terminal" : "copies \(StatusPanelFormat.captureCommand)")
-                .font(.system(size: 11))
-                .foregroundStyle(copied ? Color.green : .secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            if copied {
+                Text("Copied — paste in Terminal")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.green)
+                    .lineLimit(1)
+            } else {
+                // The design reference renders the copy-command as a monospaced chip, not plain prose.
+                HStack(spacing: 4) {
+                    Text("copies")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(StatusPanelFormat.captureCommand)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.14)))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12).padding(.top, 5).padding(.bottom, 3)

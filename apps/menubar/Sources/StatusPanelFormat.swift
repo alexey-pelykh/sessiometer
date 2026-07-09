@@ -317,16 +317,6 @@ enum StatusPanelFormat {
         weeklyPct.map { weeklyExhausted ? .red : utilSeverity($0) }
     }
 
-    /// Whether SESSION is the swap-triggering (binding) window — TRUE unless the account is weekly-
-    /// EXHAUSTED, in which case WEEKLY is the window blocking it (and the one whose reset the row's
-    /// single reset-in shows). The swap-triggering metric earns the row's typographic PRIMACY: the
-    /// daemon swaps away at the ~95% session limit (#41), or holds a week-blocked account on its weekly
-    /// window — so the metric governing "when does this account force a swap" is the one to emphasize.
-    /// The same window `resetIn` picks, so the emphasized percent and the shown reset stay coherent.
-    static func sessionIsSwapTrigger(weeklyExhausted: Bool) -> Bool {
-        !weeklyExhausted
-    }
-
     // MARK: - `next_swap` footer (issue #326 AC — renders the FORWARD candidate, not swap history)
 
     /// The footer line for the daemon's `next_swap` candidate, or `nil` when there is no active anchor

@@ -266,11 +266,6 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertNil(StatusPanelFormat.weeklySeverity(weeklyPct: nil, weeklyExhausted: true))
     }
 
-    func testSessionIsSwapTriggerUnlessWeeklyExhausted() {
-        XCTAssertTrue(StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: false))  // session forces the swap
-        XCTAssertFalse(StatusPanelFormat.sessionIsSwapTrigger(weeklyExhausted: true))  // week-blocked → weekly binds
-    }
-
     // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
 
     func testNextSwapFooterWording() {
