@@ -165,8 +165,42 @@ pub(crate) enum RefreshOutcome {
     Dead,
     /// The cycle ran but produced no usable result (the spawn failed, the read-back
     /// was unreadable / unparseable, or the stored credential was malformed). NOT
-    /// re-stashed.
-    Error,
+    /// re-stashed. The carried [`RefreshErrorReason`] names WHICH sub-cause fired
+    /// (issue #377) — the non-secret classification the tick renders as the `reason=`
+    /// of an error `event=refresh` line.
+    Error(RefreshErrorReason),
+}
+
+/// WHY a refresh cycle produced a [`RefreshOutcome::Error`] (issue #377) — the non-secret
+/// error sub-class the periodic tick renders as the `reason=` field of the error
+/// `event=refresh` line. A FIXED, secret-free-BY-CONSTRUCTION classification (never dynamic
+/// error text): a wholesale refresh-mechanism failure (the #375 incident — every account a
+/// bare `error` for hours) becomes diagnosable from the log without ever folding a token /
+/// path / email onto the #15 channel.
+///
+/// These are the three sub-causes a cycle that RAN can tell apart. The clean discriminator is
+/// *the read failed* vs *a blob was read but would not parse*: only a failed read-back is
+/// [`ReadbackUnreadable`](Self::ReadbackUnreadable); every "obtained bytes, then could not
+/// parse them" case is [`Malformed`](Self::Malformed). The whole-cycle TIMEOUT is a fourth
+/// `reason=`, but NOT here — it is the tick's `tokio::time::timeout` bound
+/// ([`crate::refresh_tick`]) firing, never a value a completed cycle produces, so only the
+/// event-level [`crate::observability::RefreshEventReason`] carries it (the same split by which
+/// [`crate::observability::RefreshEventOutcome`] adds a variant this engine enum lacks). A hard
+/// engine `Err` (a locked keychain, a contended lock, an FS error, an unresolved binary) is
+/// likewise NOT one of these — it yields no `RefreshOutcome` at all — so it renders a bare
+/// `outcome=error` with no `reason=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshErrorReason {
+    /// The `claude` binary resolved but could not be spawned / exec'd (the STEP 4 spawn
+    /// returned `Err`).
+    SpawnFailed,
+    /// The spawn ran but the refreshed item could not be read back (the STEP 5 read-back
+    /// returned `Err`).
+    ReadbackUnreadable,
+    /// A blob was obtained but was unparseable: the stored credential could not be back-dated
+    /// (STEP 3 [`backdate`] returned `None`), or the read-back carried no parseable refresh
+    /// token / expiry (STEP 6 [`classify`]).
+    Malformed,
 }
 
 /// The result of one [`refresh_cycle`] — the breadcrumb the engine surfaces.
@@ -196,11 +230,13 @@ pub(crate) struct RefreshReport {
 }
 
 impl RefreshReport {
-    /// An indeterminate (`Error`) outcome with no telemetry and no re-stash — used when
-    /// the cycle ran but produced nothing classifiable.
+    /// A [`Malformed`](RefreshErrorReason::Malformed) `Error` outcome with no telemetry and no
+    /// re-stash — used when the stored / canonical blob could not even be back-dated (STEP 3
+    /// [`backdate`] returned `None`), so the cycle bailed before any spawn with nothing
+    /// classifiable.
     fn indeterminate() -> Self {
         Self {
-            outcome: RefreshOutcome::Error,
+            outcome: RefreshOutcome::Error(RefreshErrorReason::Malformed),
             expires_at_delta_secs: None,
             refresh_token_rotated: false,
             re_stashed: false,
@@ -275,8 +311,8 @@ fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Op
     let seeded_exp = expires_at(seeded);
 
     let outcome = match &after_rt {
-        // The read-back had no parseable refresh token → indeterminate.
-        None => RefreshOutcome::Error,
+        // The read-back had no parseable refresh token → a malformed read-back blob.
+        None => RefreshOutcome::Error(RefreshErrorReason::Malformed),
         // CC cleared the refresh token in place → the token is DEAD (#101 dead signal).
         Some(rt) if rt.is_empty() => RefreshOutcome::Dead,
         // A non-empty refresh token: did the expiry slide forward past our back-dated
@@ -286,8 +322,9 @@ fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Op
                 RefreshOutcome::Refreshed
             }
             (Some(_), Some(_)) => RefreshOutcome::NoChange,
-            // The expiry was unreadable on one side — cannot tell refreshed from not.
-            _ => RefreshOutcome::Error,
+            // The expiry was unreadable on one side — cannot tell refreshed from not; the
+            // read-back parsed a token but no usable expiry, so it is malformed.
+            _ => RefreshOutcome::Error(RefreshErrorReason::Malformed),
         },
     };
 
@@ -356,18 +393,31 @@ where
     session.seed(seed).await?;
     paths::write_private_file(&session.dir().join(".claude.json"), MINIMAL_CLAUDE_JSON)?;
 
-    // STEP 4: spawn `claude -p`. A spawn failure (binary missing / un-spawnable) is a
-    // soft, non-transient Error outcome — surface, do not retry as transient.
+    // STEP 4: spawn `claude -p`. A spawn failure (binary un-spawnable) is a soft,
+    // non-transient Error outcome — surface (`reason=spawn_failed`, #377), do not retry as
+    // transient.
     if spawner.run(session.dir()).await.is_err() {
-        return Ok((RefreshOutcome::Error, None, false, None));
+        return Ok((
+            RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
+            None,
+            false,
+            None,
+        ));
     }
 
     // STEP 5: read the (CC-refreshed) blob back. Any read-back failure is a soft Error
-    // outcome (the spawn ran but produced no usable item); a transient locked keychain
-    // is retried by the next cycle.
+    // outcome (`reason=readback_unreadable`, #377 — the spawn ran but produced no usable
+    // item); a transient locked keychain is retried by the next cycle.
     let after = match session.read_back().await {
         Ok(after) => after,
-        Err(_) => return Ok((RefreshOutcome::Error, None, false, None)),
+        Err(_) => {
+            return Ok((
+                RefreshOutcome::Error(RefreshErrorReason::ReadbackUnreadable),
+                None,
+                false,
+                None,
+            ))
+        }
     };
 
     // STEP 6: classify before/after (the secret RT/blob never escape `classify`).
@@ -1029,9 +1079,9 @@ mod tests {
         let (o, delta, _) = classify(&original, &seeded, &seeded);
         assert_eq!(o, RefreshOutcome::NoChange);
         assert_eq!(delta, None, "no delta unless refreshed");
-        // Error: the read-back is unparseable.
+        // Error: the read-back is unparseable → a malformed read-back blob (#377).
         let (o, _, _) = classify(&original, &seeded, b"garbage");
-        assert_eq!(o, RefreshOutcome::Error);
+        assert_eq!(o, RefreshOutcome::Error(RefreshErrorReason::Malformed));
     }
 
     #[test]
@@ -1113,10 +1163,19 @@ mod tests {
             // The stored credential is untouched in every non-refresh outcome.
             let kept = stash.read(STASH).await.unwrap();
             assert_eq!(kept.credential.expose(), original.as_slice());
-            // NoChange classifies as NoChange; the two failure modes classify as Error.
+            // NoChange classifies as NoChange; the two failure modes classify as Error with
+            // their #377 sub-reasons — an un-spawnable `claude` vs an unparseable read-back.
             match behavior {
                 CcBehavior::NoChange => assert_eq!(report.outcome, RefreshOutcome::NoChange),
-                _ => assert_eq!(report.outcome, RefreshOutcome::Error),
+                CcBehavior::SpawnFails => assert_eq!(
+                    report.outcome,
+                    RefreshOutcome::Error(RefreshErrorReason::SpawnFailed)
+                ),
+                CcBehavior::Garble => assert_eq!(
+                    report.outcome,
+                    RefreshOutcome::Error(RefreshErrorReason::Malformed)
+                ),
+                _ => unreachable!("the loop only exercises NoChange / SpawnFails / Garble"),
             }
         }
     }
@@ -1135,7 +1194,11 @@ mod tests {
 
         let report = run_cycle(&stash, keychain.clone(), &spawner).await.unwrap();
 
-        assert_eq!(report.outcome, RefreshOutcome::Error);
+        // A stored blob that cannot be back-dated is a malformed-blob Error (#377).
+        assert_eq!(
+            report.outcome,
+            RefreshOutcome::Error(RefreshErrorReason::Malformed)
+        );
         assert!(!report.re_stashed);
         // The spawn never ran (nothing was seeded into the isolated item).
         assert!(keychain.item.borrow().is_none());
@@ -1697,6 +1760,37 @@ mod tests {
         assert!(
             line.contains("event=refresh"),
             "built the event line: {line}"
+        );
+        crate::redaction::meter::assert_clean(&line, &secrets);
+    }
+
+    #[tokio::test]
+    async fn an_error_refresh_event_with_a_reason_leaks_no_secret() {
+        // Issue #377: the error `reason=` sub-class is a FIXED enum token, never dynamic error
+        // text — so a FAILING cycle over the real-secret fixture must still leave the emitted
+        // event line clean. The #106 "an unexercised channel is unmetered" discipline: the
+        // sibling meter above runs only a `Refreshed` cycle and so never renders the new
+        // `reason=` branch. Metering the error path is the durable guard the "NO dynamic error
+        // text" AC leans on — a future regression that folded an error `Display` into `reason`
+        // would trip here on the exact production builder's output.
+        let secrets = crate::redaction::meter::Secrets::meter_fixture();
+        let stash = seeded_stash(secrets.blob(), "u-1").await;
+        let keychain = FakeIsolatedKeychain::empty();
+        // The spawn fails → an `Error(SpawnFailed)` cycle whose event renders `reason=spawn_failed`.
+        let spawner = FakeSpawn::new(keychain.item.clone(), CcBehavior::SpawnFails);
+
+        let report = run_cycle(&stash, keychain, &spawner).await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RefreshOutcome::Error(RefreshErrorReason::SpawnFailed)
+        );
+
+        // The EXACT production builder's error line, over the real-secret cycle.
+        let line = crate::refresh_tick::refresh_event("work", Some(NOW_MS), &report)
+            .to_log_line(UNIX_EPOCH);
+        assert!(
+            line.contains("reason=spawn_failed"),
+            "the error line carries the #377 reason: {line}"
         );
         crate::redaction::meter::assert_clean(&line, &secrets);
     }

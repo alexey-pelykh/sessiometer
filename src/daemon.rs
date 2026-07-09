@@ -11773,6 +11773,7 @@ mod tests {
                 expires_before: Some(1_000_000),
                 expires_after: Some(1_003_600),
                 refresh_token_rotated: false,
+                reason: None,
             }],
             restored: vec!["u-B".to_owned()],
             observations: Vec::new(),
@@ -12623,7 +12624,8 @@ mod tests {
         // dead account still quarantines after N.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Error, // unused: `hard_error` short-circuits before the report
+            // unused: `hard_error` short-circuits before the report; any error sub-reason stands in.
+            RefreshOutcome::Error(crate::refresh::RefreshErrorReason::SpawnFailed),
             None,
             true,
             3,
@@ -12785,7 +12787,11 @@ mod tests {
                 RefreshEventOutcome::NoChange,
             ),
             (RefreshOutcome::Dead, false, RefreshEventOutcome::Dead),
-            (RefreshOutcome::Error, false, RefreshEventOutcome::Error),
+            (
+                RefreshOutcome::Error(crate::refresh::RefreshErrorReason::SpawnFailed),
+                false,
+                RefreshEventOutcome::Error,
+            ),
             // The engine could not even RUN (spawn / lock failure): the fail-safe `Error`
             // outcome, mirroring `refresh_tick`'s `error_refresh_event`. The report `outcome`
             // is unused on this path, so any value stands in.
@@ -14544,6 +14550,7 @@ mod tests {
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_784_800_000),
                 refresh_token_rotated: true, // the #279 field joins the #15 all-channels corpus
+                reason: None,
             }
             .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
         );

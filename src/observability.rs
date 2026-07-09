@@ -143,6 +143,45 @@ impl RefreshEventOutcome {
     }
 }
 
+/// WHY an isolated-refresh cycle produced an `outcome=error` — the non-secret `reason=` sub-class
+/// of an error [`Event::Refresh`] line (issue #377). The event-level mirror of the engine's
+/// [`crate::refresh::RefreshErrorReason`], carrying one variant the engine cannot: [`Timeout`],
+/// the tick's `tokio::time::timeout` bound firing — never a value a completed cycle produces (the
+/// same event-adds-a-variant split by which [`RefreshEventOutcome`] adds `RefreshedNotReStashed`).
+/// A FIXED, secret-free-BY-CONSTRUCTION classification: it makes a wholesale refresh failure (the
+/// #375 incident — every account a bare `error` for hours) diagnosable from the log without ever
+/// folding a token / path / email onto the #15 channel.
+///
+/// Rendered ONLY on an error line, and ONLY for a sub-cause classifiable secret-free — a hard
+/// engine `Err` (a locked keychain, a contended lock, an FS error, an unresolved binary) has no
+/// such class, so it stays a bare `outcome=error` with no `reason=`.
+///
+/// [`Timeout`]: RefreshEventReason::Timeout
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshEventReason {
+    /// The `claude` binary resolved but could not be spawned / exec'd.
+    SpawnFailed,
+    /// The read-back item was unreadable.
+    ReadbackUnreadable,
+    /// The stored / read-back blob was unparseable.
+    Malformed,
+    /// The cycle exceeded `[refresh].timeout_secs` — the tick's whole-cycle timeout bound (the
+    /// one sub-cause detected OUTSIDE a completed engine cycle, hence event-level only).
+    Timeout,
+}
+
+impl RefreshEventReason {
+    /// The `reason=` token — the same snake_case grep vocabulary as the rest of this module.
+    fn as_str(self) -> &'static str {
+        match self {
+            RefreshEventReason::SpawnFailed => "spawn_failed",
+            RefreshEventReason::ReadbackUnreadable => "readback_unreadable",
+            RefreshEventReason::Malformed => "malformed",
+            RefreshEventReason::Timeout => "timeout",
+        }
+    }
+}
+
 /// What prompted an in-place ACTIVE-account keep-warm cycle (issue #282) — the `trigger=`
 /// token of an [`Event::KeepWarm`] line. Unlike the poll-path [`Event::PollRefresh`]'s fixed
 /// `poll_401` literal, keep-warm fires from two distinct conditions, so the discriminant is a
@@ -473,6 +512,14 @@ pub(crate) enum Event {
         /// engine `Err` / whole-cycle timeout — `refresh_tick::error_refresh_event`)
         /// renders `false`.
         refresh_token_rotated: bool,
+        /// The non-secret error sub-class on an `outcome=error` line (issue #377), rendered as
+        /// an additive TRAILING `reason=` field (precedent: `late=` / `rotated=`) so existing
+        /// `key=val` parsers are unaffected. `Some` ONLY on an error whose sub-cause is
+        /// classifiable secret-free (the three completed-cycle sub-causes plus `timeout`);
+        /// `None` on every non-error outcome AND on a hard engine `Err` that carries no such
+        /// class — in both cases NO `reason=` is rendered. A [`RefreshEventReason`] is a fixed
+        /// enum token, never dynamic error text, so it cannot carry a secret onto the line.
+        reason: Option<RefreshEventReason>,
     },
     /// The `#162` poll-path refresh-then-retry fired for the PARKED `account` (issue #255): on
     /// the FIRST usage-401 of a streak episode the daemon ran ONE isolated refresh (the #102
@@ -670,6 +717,7 @@ impl Event {
                 expires_before,
                 expires_after,
                 refresh_token_rotated,
+                reason,
             } => {
                 let outcome = outcome.as_str();
                 // Each expiry is omitted when unreadable (an empty value after `=` would
@@ -698,8 +746,18 @@ impl Event {
                 // expiry fields (issue #279) — the AC-3 rotation signal made durable. It sits
                 // AFTER `outcome=`, so `last_refresh_outcomes`' ` outcome=`-then-first-token
                 // parse is unaffected.
+                //
+                // `reason=` (issue #377) trails the WHOLE line — after the always-present
+                // `rotated=` — mirroring the swap line's optional trailing `late=`. Present
+                // ONLY on an error whose sub-cause is classifiable secret-free; omitted
+                // otherwise (a non-error outcome, or a hard `Err`), so a normal refresh line is
+                // byte-for-byte unchanged and every existing `key=val` parser is unaffected.
+                let reason = match reason {
+                    Some(reason) => format!(" reason={}", reason.as_str()),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}"
+                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}{reason}"
                 )
             }
             Event::PollRefresh {
@@ -1544,6 +1602,7 @@ mod tests {
             expires_before: Some(1_782_777_600_000),
             expires_after: Some(1_782_781_200_000), // +1h
             refresh_token_rotated: true,
+            reason: None, // a success carries no error reason (#377)
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -1554,16 +1613,19 @@ mod tests {
                  rotated=true"
             )
         );
+        assert!(!refreshed.contains("reason="), "got: {refreshed}");
 
         // An unreadable expiry: both expiry fields are OMITTED (never an empty value that
         // would split the key=val grammar), yet `rotated=` still renders — it trails the
-        // (absent) expiries directly after `outcome=` (issue #279).
+        // (absent) expiries directly after `outcome=` (issue #279). With `reason: None`
+        // (e.g. a hard `Err`), no `reason=` rides the error line either (#377).
         let unknown = Event::Refresh {
             account: "spare".to_owned(),
             outcome: RefreshEventOutcome::Error,
             expires_before: None,
             expires_after: None,
             refresh_token_rotated: false,
+            reason: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -1571,6 +1633,40 @@ mod tests {
             format!("{TS0} event=refresh account=spare outcome=error rotated=false")
         );
         assert!(!unknown.contains("expires_"), "got: {unknown}");
+        assert!(!unknown.contains("reason="), "got: {unknown}");
+    }
+
+    #[test]
+    fn refresh_error_line_carries_the_trailing_reason() {
+        // Issue #377: the non-secret error sub-class rides an additive TRAILING `reason=` field,
+        // AFTER the always-present `rotated=` (mirroring the swap line's optional trailing
+        // `late=`), so a normal-outcome line is byte-for-byte unchanged and existing `key=val`
+        // parsers are unaffected. Each fixed class renders its documented token.
+        for (reason, token) in [
+            (RefreshEventReason::SpawnFailed, "spawn_failed"),
+            (
+                RefreshEventReason::ReadbackUnreadable,
+                "readback_unreadable",
+            ),
+            (RefreshEventReason::Malformed, "malformed"),
+            (RefreshEventReason::Timeout, "timeout"),
+        ] {
+            let line = Event::Refresh {
+                account: "spare".to_owned(),
+                outcome: RefreshEventOutcome::Error,
+                expires_before: None,
+                expires_after: None,
+                refresh_token_rotated: false,
+                reason: Some(reason),
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!(
+                    "{TS0} event=refresh account=spare outcome=error rotated=false reason={token}"
+                )
+            );
+        }
     }
 
     #[test]
@@ -1707,6 +1803,7 @@ mod tests {
                 expires_before: None,
                 expires_after: None,
                 refresh_token_rotated: false,
+                reason: None, // outcome-token render only — the #377 reason has its own test
             }
             .to_log_line(at_epoch(0));
             assert_eq!(
@@ -1758,6 +1855,7 @@ mod tests {
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_781_200_000),
                 refresh_token_rotated: true,
+                reason: None,
             },
             Event::CredentialHealth {
                 account: "work".to_owned(),

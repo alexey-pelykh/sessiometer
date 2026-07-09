@@ -51,9 +51,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::{Account, RefreshConfig};
 use crate::contract::{Clock, RefreshDelta, RefreshObservation, RefreshTicker, SweepOutcome};
 use crate::error::Result;
-use crate::observability::{Event, RefreshEventOutcome};
+use crate::observability::{Event, RefreshEventOutcome, RefreshEventReason};
 use crate::paths;
-use crate::refresh::{self, RefreshOutcome, RefreshReport};
+use crate::refresh::{self, RefreshErrorReason, RefreshOutcome, RefreshReport};
 use crate::stash::RealAccountStash;
 
 /// The per-account isolated-refresh operations [`RefreshTick`] drives, injected as a seam so
@@ -292,55 +292,59 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // + the non-secret before/after expiry (issue #106, via the single #15 surface).
             // The same report also yields the #119 observation: the post-cycle expiry plus
             // the refresh-health delta (classification + token-rotation) the rollup keys off.
-            let (event, observation) =
-                match tokio::time::timeout(self.config.timeout(), self.engine.refresh(account))
-                    .await
-                {
-                    Ok(Ok(report)) => {
-                        // RESTORE a quarantined account ONLY when THIS cycle persisted the fresh
-                        // token (`Refreshed` AND `re_stashed`): then the canonical demonstrably
-                        // holds a token we know is good. On a CAS-discarded refresh (`Refreshed`
-                        // but not `re_stashed`) a concurrent swap/login changed the stash and is
-                        // authoritative — it OWNS the un-quarantine (the #42 poll once it polls
-                        // active, or #107's re-login), so we do not second-guess its credential.
-                        if is_quarantined
-                            && report.outcome == RefreshOutcome::Refreshed
-                            && report.re_stashed
-                        {
-                            outcome.restored.push(account.account_uuid.clone());
-                        }
-                        let observation = RefreshObservation {
-                            account_uuid: account.account_uuid.clone(),
-                            // The post-cycle stored expiry (the event's `expires_after`): a
-                            // re-stashed refresh slid it forward; every other terminal state
-                            // left the stash — and so the expiry — unchanged.
-                            expires_at_ms: expires_after(before_ms, &report),
-                            refresh: Some(RefreshDelta {
-                                outcome: refresh_event_outcome(&report),
-                                token_rotated: report.refresh_token_rotated,
-                            }),
-                        };
-                        (
-                            refresh_event(&account.label, before_ms, &report),
-                            observation,
-                        )
+            let cycle =
+                tokio::time::timeout(self.config.timeout(), self.engine.refresh(account)).await;
+            // The OUTER `Err` is the whole-cycle timeout bound firing → `reason=timeout` (#377);
+            // a hard engine `Err` (`Ok(Err)`) has no secret-free sub-class → no `reason=`.
+            // Computed before the match consumes `cycle`.
+            let timeout_reason = cycle.is_err().then_some(RefreshEventReason::Timeout);
+            let (event, observation) = match cycle {
+                Ok(Ok(report)) => {
+                    // RESTORE a quarantined account ONLY when THIS cycle persisted the fresh
+                    // token (`Refreshed` AND `re_stashed`): then the canonical demonstrably
+                    // holds a token we know is good. On a CAS-discarded refresh (`Refreshed`
+                    // but not `re_stashed`) a concurrent swap/login changed the stash and is
+                    // authoritative — it OWNS the un-quarantine (the #42 poll once it polls
+                    // active, or #107's re-login), so we do not second-guess its credential.
+                    if is_quarantined
+                        && report.outcome == RefreshOutcome::Refreshed
+                        && report.re_stashed
+                    {
+                        outcome.restored.push(account.account_uuid.clone());
                     }
-                    // Secret-free: a hard `Err` / a timeout is an `error` outcome. The engine's
-                    // error Display is NOT folded into the structured event — only the class is.
-                    // The stash is untouched, so the rollup sees a refresh failure (→ at-risk)
-                    // with the expiry held at the before, never a misleading slide.
-                    Ok(Err(_)) | Err(_) => (
-                        error_refresh_event(&account.label, before_ms),
-                        RefreshObservation {
-                            account_uuid: account.account_uuid.clone(),
-                            expires_at_ms: before_ms,
-                            refresh: Some(RefreshDelta {
-                                outcome: RefreshEventOutcome::Error,
-                                token_rotated: false,
-                            }),
-                        },
-                    ),
-                };
+                    let observation = RefreshObservation {
+                        account_uuid: account.account_uuid.clone(),
+                        // The post-cycle stored expiry (the event's `expires_after`): a
+                        // re-stashed refresh slid it forward; every other terminal state
+                        // left the stash — and so the expiry — unchanged.
+                        expires_at_ms: expires_after(before_ms, &report),
+                        refresh: Some(RefreshDelta {
+                            outcome: refresh_event_outcome(&report),
+                            token_rotated: report.refresh_token_rotated,
+                        }),
+                    };
+                    (
+                        refresh_event(&account.label, before_ms, &report),
+                        observation,
+                    )
+                }
+                // Secret-free: a hard `Err` (`Ok(Err)`) or a timeout (`Err`) is an `error`
+                // outcome. The engine's error Display is NOT folded into the structured event —
+                // only the class, plus the `timeout` reason when the bound fired (#377); a hard
+                // `Err` carries no secret-free reason. The stash is untouched, so the rollup sees
+                // a refresh failure (→ at-risk) with the expiry held at the before, never a slide.
+                Ok(Err(_)) | Err(_) => (
+                    error_refresh_event(&account.label, before_ms, timeout_reason),
+                    RefreshObservation {
+                        account_uuid: account.account_uuid.clone(),
+                        expires_at_ms: before_ms,
+                        refresh: Some(RefreshDelta {
+                            outcome: RefreshEventOutcome::Error,
+                            token_rotated: false,
+                        }),
+                    },
+                ),
+            };
             outcome.events.push(event);
             outcome.observations.push(observation);
         }
@@ -425,6 +429,9 @@ pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &Refres
         expires_after: expires_after(before_ms, report),
         // The already-computed AC-3 rotation flag, threaded straight through (issue #279).
         refresh_token_rotated: report.refresh_token_rotated,
+        // The non-secret error sub-class (issue #377): `Some` iff the completed cycle
+        // classified `Error`, mapped from the engine's `RefreshErrorReason`; `None` otherwise.
+        reason: refresh_event_reason(report),
     }
 }
 
@@ -432,7 +439,16 @@ pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &Refres
 /// whole-cycle timeout: an `error` outcome with the stored expiry unchanged. The engine's
 /// error Display is deliberately NOT folded in — the structured event carries only the
 /// non-secret class, and that field discipline is what keeps the channel #15-clean.
-fn error_refresh_event(label: &str, before_ms: Option<i64>) -> Event {
+///
+/// `reason` is the non-secret `reason=` sub-class (issue #377): `Some(Timeout)` when the
+/// whole-cycle timeout bound fired, `None` for a hard engine `Err` (a locked keychain, a
+/// contended lock, an FS error, an unresolved binary) — that carries no secret-free class, so
+/// it renders a bare `outcome=error`.
+fn error_refresh_event(
+    label: &str,
+    before_ms: Option<i64>,
+    reason: Option<RefreshEventReason>,
+) -> Event {
     Event::Refresh {
         account: label.to_owned(),
         outcome: RefreshEventOutcome::Error,
@@ -441,6 +457,7 @@ fn error_refresh_event(label: &str, before_ms: Option<i64>) -> Event {
         // No completed cycle, so no report to source a rotation from (issue #279): a hard
         // engine `Err` / whole-cycle timeout renders `rotated=false`.
         refresh_token_rotated: false,
+        reason,
     }
 }
 
@@ -457,8 +474,31 @@ pub(crate) fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutco
         RefreshOutcome::Refreshed => RefreshEventOutcome::RefreshedNotReStashed,
         RefreshOutcome::NoChange => RefreshEventOutcome::NoChange,
         RefreshOutcome::Dead => RefreshEventOutcome::Dead,
-        RefreshOutcome::Error => RefreshEventOutcome::Error,
+        // The `outcome=` token folds every error sub-cause to `error`; the sub-reason rides the
+        // separate `reason=` field (issue #377, via `refresh_event_reason`).
+        RefreshOutcome::Error(_) => RefreshEventOutcome::Error,
     }
+}
+
+/// Map a completed cycle's [`RefreshReport`] to its non-secret `reason=` sub-class (issue #377),
+/// or `None` for any non-error outcome — the event-level [`RefreshEventReason`] mirror of the
+/// engine's [`RefreshErrorReason`]. Every arm is explicit (no `_`), exactly like
+/// [`refresh_event_outcome`]: a future engine [`RefreshOutcome`] or [`RefreshErrorReason`] variant
+/// is then a COMPILE error here, never a silently dropped `reason=`. [`RefreshEventReason::Timeout`]
+/// has no arm — it is NOT reachable from a completed report (it is the tick's `timeout` bound,
+/// supplied directly at the error arm of the sweep).
+fn refresh_event_reason(report: &RefreshReport) -> Option<RefreshEventReason> {
+    let reason = match report.outcome {
+        RefreshOutcome::Error(reason) => reason,
+        RefreshOutcome::Refreshed | RefreshOutcome::NoChange | RefreshOutcome::Dead => {
+            return None;
+        }
+    };
+    Some(match reason {
+        RefreshErrorReason::SpawnFailed => RefreshEventReason::SpawnFailed,
+        RefreshErrorReason::ReadbackUnreadable => RefreshEventReason::ReadbackUnreadable,
+        RefreshErrorReason::Malformed => RefreshEventReason::Malformed,
+    })
 }
 
 /// The stored token's `expiresAt` AFTER the cycle (epoch ms). ONLY a re-stashed refresh
@@ -1090,6 +1130,7 @@ mod tests {
                 expires_before: Some(soon),
                 expires_after: Some(soon + 7_200_000), // before + 7200 s in ms
                 refresh_token_rotated: true,           // sourced from the report above (#279)
+                reason: None, // a successful refresh carries no reason (#377)
             }]
         );
         assert!(
@@ -1126,6 +1167,7 @@ mod tests {
                 expires_before: Some(soon),
                 expires_after: Some(soon), // unchanged — the CAS discarded the fresh token
                 refresh_token_rotated: false, // this cycle's report did not rotate
+                reason: None,              // not an error outcome — no reason (#377)
             }]
         );
     }
@@ -1133,7 +1175,9 @@ mod tests {
     #[tokio::test]
     async fn sweep_records_an_error_event_for_a_hard_failure() {
         // A hard engine `Err` is an `error` event with the stored expiry unchanged — the
-        // error Display never reaches the structured event (only the class does).
+        // error Display never reaches the structured event (only the class does). A hard
+        // `Err` has NO secret-free sub-class among the fixed #377 set, so it renders a bare
+        // `outcome=error` with `reason: None` — distinct from a timeout (which is `Timeout`).
         let now_ms = now_ms();
         let soon = now_ms + 60_000;
         let roster = vec![acct("work", "u-A")];
@@ -1151,6 +1195,36 @@ mod tests {
                 expires_after: Some(soon),
                 // A hard `Err` has no report to source a rotation from → `false` (#279).
                 refresh_token_rotated: false,
+                reason: None, // hard `Err`: no secret-free sub-class → no `reason=` (#377)
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sweep_records_a_timeout_reason_on_a_hung_cycle() {
+        // Issue #377: a whole-cycle TIMEOUT is the one error sub-cause detected OUTSIDE a
+        // completed engine cycle — the tick's `tokio::time::timeout` bound firing — so it is
+        // event-level only and renders `reason=timeout`, distinct from a hard `Err`'s bare
+        // `outcome=error`. `start_paused` auto-advances the virtual clock past the 5 s bound.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::Hang); // sleeps far past the timeout
+        let mut config = cfg(3600, 60, &[]);
+        config.timeout_secs = 5;
+        let mut t = tick(roster, config, engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Error,
+                expires_before: Some(soon),
+                expires_after: Some(soon),
+                refresh_token_rotated: false,
+                reason: Some(RefreshEventReason::Timeout), // the whole-cycle bound fired (#377)
             }]
         );
     }
