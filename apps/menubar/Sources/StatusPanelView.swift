@@ -56,35 +56,64 @@ struct StatusPanelView: View {
         let ageStale = store.generatedAt.map {
             StatusPanelFormat.snapshotIsStale(generatedAt: $0, now: now)
         } ?? false
-
-        VStack(alignment: .leading, spacing: 14) {
-            // The banner is the live honest-state indicator — always full strength. It folds in the
-            // snapshot age (connected/stale/disconnected) so "Live" never implies "fresh".
-            BannerView(banner: StatusPanelFormat.banner(for: store.connectionState,
+        let state = store.connectionState
+        let activeLabel = store.rows.first(where: \.isActive)?.label
+        let subtitle = StatusPanelFormat.headerSubtitle(state: state,
                                                         accountCount: store.rows.count,
-                                                        ageText: ageText,
-                                                        ageStale: ageStale))
+                                                        activeLabel: activeLabel,
+                                                        ageStale: ageStale)
 
-            if case .emptyRoster = store.connectionState {
-                // A live onboarding state, not stale data — full strength, distinct from daemon-down.
+        // The design reference's chrome (`apps/menubar/design/menubar-preview.html`): an app-identity
+        // header, a hairline divider, the state's body, and a snapshot-age footer. Sections own their
+        // insets (no uniform padding) so the header/roster/callout/footer spacing matches the reference.
+        // Honest-state is carried by the header sub-line (never a false "active" on a degraded daemon)
+        // plus, on a dropped connection, an explicit strip over a dimmed last-known roster.
+        VStack(alignment: .leading, spacing: 0) {
+            PanelHeader(subtitle: subtitle)
+
+            switch state {
+            case .emptyRoster:
+                // A live onboarding state, not stale data — distinct from daemon-down.
+                Divider().padding(.horizontal, 14)
                 OnboardingCard()
-            } else {
-                // The RETAINED reading (roster + its `next_swap` footer): shown LIVE only on
-                // `.connected`, DIMMED as one on every degraded/absent state so last-known data is
-                // never mistaken for live (the never-healthy-when-dead discipline). `.unsupported`
-                // clears both (numbers refused), so this block renders nothing but the banner.
-                VStack(alignment: .leading, spacing: 14) {
-                    if !store.rows.isEmpty {
-                        RosterView(rows: store.rows, now: now)
-                    }
-                    if let footer = StatusPanelFormat.nextSwapFooter(store.nextSwap) {
-                        FooterView(text: footer)
-                    }
+                    .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+
+            case .connecting, .unsupported:
+                // No retained reading — a plain honest message (the reference's centered message card
+                // for these states, with its distinct per-state glyph, is #169).
+                Divider().padding(.horizontal, 14)
+                BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
+                    .padding(.horizontal, 14).padding(.vertical, 14)
+
+            case .disconnected:
+                // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
+                // frozen-as-live (#137). No swap callout / add-account (swaps are paused while dropped).
+                HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
+                                                             ageText: ageText, ageStale: ageStale))
+                if !store.rows.isEmpty {
+                    RosterView(rows: store.rows, now: now).opacity(0.55)
                 }
-                .opacity(store.connectionState.isHealthy ? 1 : 0.55)
+
+            case .connected, .stale:
+                // Live (or connected-but-stale — the roster stays full-strength, the header/footer carry
+                // the "stale" mark). The full design reference: roster, swap-callout hero, add-account.
+                Divider().padding(.horizontal, 14)
+                if !store.rows.isEmpty {
+                    RosterView(rows: store.rows, now: now)
+                }
+                if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
+                    SwapCalloutCard(target: target, rows: store.rows)
+                }
+                AddAccountRow()
+            }
+
+            if let ageText {
+                // Freshness reads amber whenever the numbers should be distrusted — a wedged-but-
+                // heartbeating poll loop (ageStale) OR any non-live connection (stale / disconnected)
+                // showing a last-known reading — never a frozen-as-fresh green (#137).
+                FooterView(text: ageText, stale: ageStale || !state.isHealthy)
             }
         }
-        .padding(16)
     }
 }
 
@@ -171,7 +200,8 @@ private struct AccountRowView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 8) {
+            HStack(spacing: 9) {
+                StatusDot(isActive: row.isActive)
                 MonogramBadge(label: row.label)
 
                 Text(row.label)
@@ -183,11 +213,16 @@ private struct AccountRowView: View {
                 Spacer(minLength: 6)
 
                 if row.isActive {
+                    // The design reference's accent "ACTIVE" tag — one of the row's THREE active cues
+                    // (leading filled dot + this tag + accent-tint row), so active never rides on color
+                    // alone (R-2 / WCAG 1.4.1).
                     Text("ACTIVE")
-                        .font(.caption2).fontWeight(.semibold)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4).padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.14)))
+                        .font(.system(size: 9, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(.tint)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .overlay(RoundedRectangle(cornerRadius: 4)
+                            .strokeBorder(Color.accentColor.opacity(0.42), lineWidth: 0.5))
                         .accessibilityHidden(true)
                 }
 
@@ -203,13 +238,16 @@ private struct AccountRowView: View {
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 9)
-        // Active emphasis is a neutral fill, never an accent hue (R-2: active is shape/weight, not color).
+        // Active emphasis follows the design reference: an accent-tint fill + ring. Active is redundantly
+        // encoded — the filled leading dot (shape) + the "ACTIVE" tag carry it too — so color is never the
+        // SOLE signal (WCAG 1.4.1 / R-2 state-parity holds; the accent here is a redundant cue, and the
+        // now-dropped per-row next badge means accent is no longer overloaded).
         .background(
             RoundedRectangle(cornerRadius: 9)
-                .fill(row.isActive ? Color.primary.opacity(0.05) : Color.clear)
+                .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
                 .overlay(
                     RoundedRectangle(cornerRadius: 9)
-                        .strokeBorder(Color.primary.opacity(row.isActive ? 0.08 : 0), lineWidth: 0.5)
+                        .strokeBorder(Color.accentColor.opacity(row.isActive ? 0.28 : 0), lineWidth: 0.5)
                 )
         )
         .accessibilityElement(children: .ignore)
@@ -386,6 +424,197 @@ private struct UsageBar: View {
     }
 }
 
+// MARK: - Header + callouts (per the design reference)
+
+/// The app-identity header — a neutral gauge glyph, the product name, and the honest identity sub-line
+/// (`StatusPanelFormat.headerSubtitle`). Always present; the SUB-LINE — never the glyph — carries the
+/// connection state, so a degraded daemon reads "last-known" / "· stale", never a false "active".
+/// Provider-neutral (issue #15): a generic gauge, no brand mark or color.
+private struct PanelHeader: View {
+    let subtitle: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color.secondary.opacity(0.16))
+                .frame(width: 27, height: 27)
+                .overlay(
+                    Image(systemName: "gauge.medium")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                )
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Sessiometer")
+                    .font(.system(size: 13.5, weight: .semibold))
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 11)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Sessiometer. \(subtitle)")
+    }
+}
+
+/// The leading status dot — the design reference's per-row marker: a filled accent disc for the active
+/// (being-consumed) account, a hollow ring otherwise. FILL-vs-RING is a SHAPE difference, so active is
+/// legible without color (WCAG 1.4.1); the accent is a redundant cue and the row's "ACTIVE" tag +
+/// VoiceOver label state it in words.
+private struct StatusDot: View {
+    let isActive: Bool
+
+    var body: some View {
+        Circle()
+            .fill(isActive ? Color.accentColor : Color.clear)
+            .overlay(
+                Circle().strokeBorder(Color.secondary.opacity(0.55), lineWidth: isActive ? 0 : 1.5)
+            )
+            .frame(width: 8, height: 8)
+            .accessibilityHidden(true)
+    }
+}
+
+/// The honest strip shown over a dimmed last-known roster on a DROPPED connection — the design
+/// reference's disconnected bar. States the degradation loudly (tinted, titled) so the retained numbers
+/// below are never mistaken for live (#137). Richer per-state strips (keychain-locked "paused", a
+/// Reconnect action) are #169.
+private struct HonestStrip: View {
+    let banner: StatusPanelFormat.Banner
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "bolt.horizontal.circle")
+                .font(.caption)
+                .accessibilityHidden(true)
+            Text(banner.title)
+                .font(.system(size: 11.5, weight: .semibold))
+            Text(banner.detail)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(stripTint)
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(stripTint.opacity(0.12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(banner.title). \(banner.detail)")
+    }
+
+    private var stripTint: Color {
+        switch banner.kind {
+        case .healthy: return .green
+        case .info:    return .secondary
+        case .warning: return .orange
+        case .error:   return .red
+        }
+    }
+}
+
+/// The swap-callout hero — the design reference's primary action: the daemon's `next_swap` target, a
+/// client-derived "why" line, and the Swap button. Accent-tinted (the panel's ONE accent action). The
+/// button's on-click WIRING is #169 (the daemon swap command #167 already exists); until then it is
+/// present-but-DISABLED — honest that the affordance is not yet live, never a dead-click.
+private struct SwapCalloutCard: View {
+    let target: String
+    let rows: [AccountRow]
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.left.arrow.right")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                (Text("Next swap → ") + Text(target).fontWeight(.semibold))
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(reason)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 6)
+            Button("Swap") {}
+                .font(.system(size: 12, weight: .semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(true)
+                .help("Swap-on-click wiring is tracked in #169")
+        }
+        .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(Color.accentColor.opacity(0.10))
+                .overlay(RoundedRectangle(cornerRadius: 9)
+                    .strokeBorder(Color.accentColor.opacity(0.20), lineWidth: 0.5))
+        )
+        .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Next swap to \(target). \(reason). Swap action pending.")
+    }
+
+    /// The client-derived "why" line — the wire carries only the target label (#15), so the reason is
+    /// computed here: the target's weekly headroom, flagged "lowest weekly" ONLY when it truly has the
+    /// least weekly usage among the viable (non-active, enabled) swap candidates.
+    private var reason: String {
+        let targetRow = rows.first { $0.label == target }
+        let candidates = rows.filter { !$0.isActive && $0.isEnabled }
+        let knownWeekly = candidates.compactMap(\.weeklyPct)
+        let isLowest = targetRow?.weeklyPct.map { tw in knownWeekly.allSatisfy { tw <= $0 } } ?? false
+        return StatusPanelFormat.swapCalloutReason(targetWeeklyPct: targetRow?.weeklyPct,
+                                                   isLowestWeekly: isLowest)
+    }
+}
+
+/// The always-on "Add account…" row — the design reference's populated-roster affordance. COPIES
+/// `sessiometer capture` to the clipboard (the app never runs it — C-005: no roster/credential mutation
+/// from the client); the same copy-command as the empty-roster onboarding, always available.
+private struct AddAccountRow: View {
+    @State private var copied = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: copy) {
+                Label(copied ? "Copied" : "Add account…",
+                      systemImage: copied ? "checkmark" : "rectangle.badge.plus")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel(copied ? "Copied the capture command"
+                                       : "Add account — copies the capture command")
+            Text(copied ? "Copied — paste in Terminal" : "copies \(StatusPanelFormat.captureCommand)")
+                .font(.system(size: 11))
+                .foregroundStyle(copied ? Color.green : .secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12).padding(.top, 5).padding(.bottom, 3)
+    }
+
+    /// Copy the capture command — a pure AppKit pasteboard write, no execution (pure client). Brief
+    /// "Copied" confirmation, mirroring the onboarding card.
+    private func copy() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(StatusPanelFormat.captureCommand, forType: .string)
+        copied = true
+        Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            copied = false
+        }
+    }
+}
+
 // MARK: - Empty-roster onboarding
 
 /// The first-run onboarding card (issue #326 AC): visually distinct from daemon-down, it explains the
@@ -441,22 +670,31 @@ private struct OnboardingCard: View {
 
 // MARK: - Footer
 
-/// The `next_swap` footer (issue #326): the forward swap candidate, or absent when there is no active
-/// anchor. Not swap history (that needs a new daemon source — deferred).
+/// The snapshot-age footer (issue #355 / #164 `generated_at`) — the design reference's freshness line,
+/// "updated Ns ago". `next_swap` is NOT here (it lives in the swap-callout hero; a dropped daemon shows
+/// no card, so the two never collide). Amber when the reading should be distrusted (a wedged poll loop,
+/// or a stale/disconnected connection), never frozen-as-fresh (#137).
 private struct FooterView: View {
     let text: String
+    let stale: Bool
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.caption2)
-                .accessibilityHidden(true)
-            Text(text)
-                .font(.caption)
-            Spacer(minLength: 0)
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 5) {
+                Image(systemName: "clock")
+                    .font(.caption2)
+                    .accessibilityHidden(true)
+                Text(text)
+                    .font(.caption)
+                    .monospacedDigit()
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(stale ? Color.orange : Color.secondary)
+            .padding(.horizontal, 14).padding(.top, 9).padding(.bottom, 11)
         }
-        .foregroundStyle(.secondary)
+        .padding(.top, 5)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(text)
+        .accessibilityLabel(stale ? "\(text), stale" : text)
     }
 }

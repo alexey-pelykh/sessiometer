@@ -341,6 +341,49 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Header identity + swap callout (issue #355 — design-reference parity)
+
+    /// The header's identity sub-line — the design reference's `app-sub` ("N accounts · {active}
+    /// active"). Honest per connection state: a degraded roster reads "last-known" and a Live-but-wedged
+    /// or gone-quiet snapshot appends "· stale", so the always-present identity line NEVER implies the
+    /// numbers are live/fresh (the never-healthy-on-degraded discipline, carried into the header).
+    static func headerSubtitle(state: ConnectionState,
+                               accountCount: Int,
+                               activeLabel: String?,
+                               ageStale: Bool) -> String {
+        let plural = accountCount == 1 ? "" : "s"
+        let count = "\(accountCount) account\(plural)"
+        switch state {
+        case .connecting:   return "Connecting to the daemon…"
+        case .emptyRoster:  return "Welcome"
+        case .unsupported:  return "Version mismatch"
+        case .disconnected: return "\(count) · last-known"
+        case .connected, .stale:
+            let base = activeLabel.map { "\(count) · \($0) active" } ?? count
+            let isStale: Bool = { if case .stale = state { return true } else { return ageStale } }()
+            return isStale ? "\(base) · stale" : base
+        }
+    }
+
+    /// The swap-callout target label (the design reference's hero card), or `nil` when there is no
+    /// forward candidate — the card is then absent (same single-cardinality as `nextSwapFooter`; a
+    /// `noViableTarget` / `awaitingData` / absent anchor shows no card).
+    static func swapCalloutTarget(_ nextSwap: NextSwap?) -> String? {
+        if case .target(let to) = nextSwap { return to }
+        return nil
+    }
+
+    /// The swap-callout's muted "why" line — a CLIENT-derived description of the target row, because
+    /// the wire's `next_swap` carries only the label, never a reason (#15). Facts only: the target's
+    /// weekly headroom, flagged "lowest weekly" ONLY when it genuinely has the least weekly usage among
+    /// the viable swap candidates (computed by the caller) — never an invented rationale.
+    static func swapCalloutReason(targetWeeklyPct: UInt8?, isLowestWeekly: Bool) -> String {
+        guard let weekly = targetWeeklyPct else {
+            return isLowestWeekly ? "most headroom" : "next candidate"
+        }
+        return isLowestWeekly ? "lowest weekly · \(pct(weekly)) · most headroom" : "weekly \(pct(weekly))"
+    }
+
     // MARK: - Row VoiceOver label (issue #326 AC — VoiceOver-navigable rows)
 
     /// One spoken, comma-separated sentence for a row's VoiceOver label, so the whole row reads as a

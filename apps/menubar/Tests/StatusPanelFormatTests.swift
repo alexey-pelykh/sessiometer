@@ -368,6 +368,74 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal")), "Next swap → personal")
     }
 
+    // MARK: - Header subtitle (issue #355 — design-reference parity)
+
+    func testHeaderSubtitleSpeaksTheHonestStatePerConnection() {
+        // Connected: identity — "N accounts · {active} active".
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .connected, accountCount: 3,
+                                             activeLabel: "work", ageStale: false),
+            "3 accounts · work active")
+        // Singular account, no active anchor → just the count (correct pluralization).
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .connected, accountCount: 1,
+                                             activeLabel: nil, ageStale: false),
+            "1 account")
+        // Connected but the snapshot has outlived any poll cadence → "· stale", never a false "fresh".
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .connected, accountCount: 3,
+                                             activeLabel: "work", ageStale: true),
+            "3 accounts · work active · stale")
+        // The gone-quiet `.stale` connection is always marked stale, regardless of age.
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .stale, accountCount: 2,
+                                             activeLabel: "work", ageStale: false),
+            "2 accounts · work active · stale")
+        // Dropped connection → last-known, never "active" (honest-state discipline in the header).
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .disconnected(reason: "EOF"), accountCount: 3,
+                                             activeLabel: "work", ageStale: false),
+            "3 accounts · last-known")
+        // Absent / transitional states speak their status, not a roster count.
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .connecting, accountCount: 0,
+                                                        activeLabel: nil, ageStale: false),
+                       "Connecting to the daemon…")
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .emptyRoster, accountCount: 0,
+                                                        activeLabel: nil, ageStale: false),
+                       "Welcome")
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .unsupported, accountCount: 3,
+                                                        activeLabel: "work", ageStale: false),
+                       "Version mismatch")
+    }
+
+    // MARK: - Swap callout (issue #355 — design-reference parity)
+
+    func testSwapCalloutTargetIsPresentOnlyForAViableForwardCandidate() {
+        XCTAssertEqual(StatusPanelFormat.swapCalloutTarget(.target(to: "personal")), "personal")
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.noViableTarget))
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.awaitingData))
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(nil))
+    }
+
+    func testSwapCalloutReasonIsFactualAndNeverInventsLowest() {
+        // Genuinely lowest-weekly target → the full reference-style reason with its weekly %.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: 18, isLowestWeekly: true),
+            "lowest weekly · 18% · most headroom")
+        // Not the lowest → just the factual weekly %, no "most headroom" claim it can't support.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: 71, isLowestWeekly: false),
+            "weekly 71%")
+        // Weekly unknown (failed poll) but lowest → headroom without a fabricated %.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: nil, isLowestWeekly: true),
+            "most headroom")
+        // Weekly unknown and not lowest → the neutral fallback.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: nil, isLowestWeekly: false),
+            "next candidate")
+    }
+
     // MARK: - Helpers
 
     private func cell(_ auth: CredentialHealth, recovering: Bool = false, enabled: Bool = true) -> String {
