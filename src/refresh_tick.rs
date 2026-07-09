@@ -551,6 +551,7 @@ mod tests {
     /// enabled, everything else default.
     fn cfg(cadence_secs: u64, idle_after_secs: u64, accounts: &[&str]) -> RefreshConfig {
         RefreshConfig {
+            systemic_failure_n: 3,
             enabled: true,
             accounts: accounts.iter().map(|s| s.to_string()).collect(),
             cadence_secs,

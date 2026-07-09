@@ -197,7 +197,7 @@ async fn idle_until_next_tick<P, C, S, K, Sh, Ctl, R, LW>(
     seams: &mut IdleSeams<'_, Sh, Ctl, R, LW>,
     snapshot: &StatusSnapshot,
     next_wait: Option<Duration>,
-) -> (Idle, Vec<String>, Vec<RefreshObservation>)
+) -> (Idle, Vec<String>, Vec<RefreshObservation>, Vec<SweepHealth>)
 where
     P: RosterPoller,
     C: CredentialStore,
@@ -237,6 +237,12 @@ where
     // again — the same post-idle pattern as the manual-swap adoption.
     let mut refresh_restored: Vec<String> = Vec::new();
     let mut refresh_observations: Vec<RefreshObservation> = Vec::new();
+    // One [`SweepHealth`] classification PER sweep this idle period (issue #378), preserving the
+    // per-sweep boundary the merged `refresh_observations` above loses — multiple sweeps can fall
+    // in one idle period (a low `cadence_secs` under a long poll interval), and the systemic
+    // streak must count each individually. Folded post-idle via `apply_post_idle` (which holds the
+    // `&mut daemon` the detector needs), the same deferral pattern as the restores + observations.
+    let mut sweep_healths: Vec<SweepHealth> = Vec::new();
     // The canonical the daemon last COMMITTED to its watch (issue #140), snapshotted HERE — before
     // the idle borrows `&mut daemon` — so the external-login watch arm can tell an out-of-band
     // write it reads DURING the idle from the daemon's own last state, without needing
@@ -334,6 +340,16 @@ where
                             for event in &sweep.events {
                                 emit_best_effort(log, event);
                             }
+                            // Classify THIS sweep's refresh-mechanism health (issue #378) from the
+                            // per-cycle outcomes BEFORE the observations move below, so each sweep
+                            // in this idle period contributes one systemic-streak input. The daemon
+                            // folds it post-idle (`&mut daemon` is held by `wait` here).
+                            sweep_healths.push(SweepHealth::classify(
+                                sweep
+                                    .observations
+                                    .iter()
+                                    .filter_map(|obs| obs.refresh.map(|delta| delta.outcome)),
+                            ));
                             refresh_restored.extend(sweep.restored);
                             // The #119 credential-clock observations, deferred like the
                             // restores: folding them mutates the health machine.
@@ -367,7 +383,7 @@ where
             }
         }
     };
-    (idle, refresh_restored, refresh_observations)
+    (idle, refresh_restored, refresh_observations, sweep_healths)
 }
 
 /// Apply the mutations the idle period deferred until its `&mut daemon` borrow dropped, then
@@ -390,6 +406,7 @@ fn apply_post_idle<P, C, S, K>(
     log: &mut EventLog,
     refresh_restored: &[String],
     refresh_observations: &[RefreshObservation],
+    sweep_healths: &[SweepHealth],
 ) -> Vec<String>
 where
     P: RosterPoller,
@@ -419,6 +436,15 @@ where
     }
     for event in daemon.note_health_transitions(wall_clock_now_secs()) {
         emit_best_effort(log, &event);
+    }
+    // Fold each sweep's systemic-refresh classification (issue #378) into the daemon-level
+    // detector, one per sweep (never merged), emitting the edge-triggered `refresh_systemic_failure`
+    // / `refresh_systemic_recovered` at each episode boundary. AFTER the per-account transitions
+    // above so the log reads "accounts at_risk … then the mechanism-level verdict."
+    for health in sweep_healths {
+        if let Some(event) = daemon.note_systemic_refresh(*health) {
+            emit_best_effort(log, &event);
+        }
     }
     unrecoverable
 }
@@ -539,15 +565,22 @@ where
         // once per tick here catches manual swaps / roster reloads / restores / external logins too.
         seams.control.publish(&snapshot);
 
-        // Idle until the next tick, collecting the sweep's deferred restores + observations to
-        // apply once the idle's `&mut daemon` borrow has dropped.
-        let (idle, refresh_restored, refresh_observations) =
+        // Idle until the next tick, collecting the sweep's deferred restores + observations + the
+        // per-sweep systemic-refresh classifications (#378) to apply once the idle's `&mut daemon`
+        // borrow has dropped.
+        let (idle, refresh_restored, refresh_observations, sweep_healths) =
             idle_until_next_tick(daemon, log, &mut seams, &snapshot, next_wait).await;
 
         // Apply the deferred mutations + log this cycle's edges, then surface any newly-confirmed
         // unrecoverable death (#261) to the operator from here — the async context `notify_macos`
         // needs to fire-and-forget its `osascript` child.
-        let unrecoverable = apply_post_idle(daemon, log, &refresh_restored, &refresh_observations);
+        let unrecoverable = apply_post_idle(
+            daemon,
+            log,
+            &refresh_restored,
+            &refresh_observations,
+            &sweep_healths,
+        );
         notify_unrecoverable(&unrecoverable);
 
         match idle {

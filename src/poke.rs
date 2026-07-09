@@ -494,6 +494,7 @@ mod tests {
     /// returns to poke's best-effort control-socket read.
     fn status_snapshot(lines: Vec<AccountStatusLine>) -> StatusResponse {
         StatusResponse {
+            systemic_refresh_failure: None,
             refresh_enabled: None,
             accounts: lines,
             next_swap: None,

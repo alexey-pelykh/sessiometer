@@ -239,6 +239,13 @@ struct VersionedStatus: Decodable, Equatable {
     /// Whether the daemon's periodic isolated-refresh tick is enabled (issue #105/#138); `nil`
     /// for a pre-#138 daemon (client treats unknown as "suppress the advisory").
     let refreshEnabled: Bool?
+    /// The daemon-level SYSTEMIC refresh-failure indicator (`src/daemon/snapshot.rs`
+    /// `StatusResponse.systemic_refresh_failure`, issue #378): a COUNT (never a token — issue #15)
+    /// of consecutive all-eligible-account `outcome=error` sweeps while the refresh MECHANISM is
+    /// down, or `nil`/absent when healthy. A signal distinct from the per-account `auth` rollup,
+    /// visible without waiting for an account to die; `nil` for a pre-#378 daemon (rendered as
+    /// healthy). Added by the MINOR `1.0 → 1.1` bump — an older client tolerates it by ignoring.
+    let systemicRefreshFailure: UInt32?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -246,6 +253,7 @@ struct VersionedStatus: Decodable, Equatable {
         case accounts
         case nextSwap = "next_swap"
         case refreshEnabled = "refresh_enabled"
+        case systemicRefreshFailure = "systemic_refresh_failure"
     }
 
     init(from decoder: Decoder) throws {
@@ -257,6 +265,7 @@ struct VersionedStatus: Decodable, Equatable {
         accounts = try c.decode([AccountStatusLine].self, forKey: .accounts)
         nextSwap = try c.decodeIfPresent(NextSwap.self, forKey: .nextSwap)
         refreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .refreshEnabled)
+        systemicRefreshFailure = try c.decodeIfPresent(UInt32.self, forKey: .systemicRefreshFailure)
     }
 
     /// Whether this snapshot's contract major is one the client can render (`WireContract`).
