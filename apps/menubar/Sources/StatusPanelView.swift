@@ -35,7 +35,7 @@ struct StatusPanelView: View {
         TimelineView(.periodic(from: .now, by: Self.clockTick)) { context in
             content(now: Int64(context.date.timeIntervalSince1970))
         }
-        .frame(width: 320, alignment: .leading)
+        .frame(width: 360, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
     }
 
@@ -177,6 +177,10 @@ private struct AccountRowView: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+            // Keep the metrics on ONE line — never wrap. The next-swap row adds "→ next", which at the
+            // old width pushed "resets in …" onto a second line; the widened panel fits it, and this is
+            // the belt-and-suspenders guard so an unusually long value truncates rather than wraps.
+            .lineLimit(1)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
