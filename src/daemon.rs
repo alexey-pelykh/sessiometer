@@ -99,8 +99,8 @@ use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
 use crate::observability::{
-    CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger,
-    PollClass, RefreshEventOutcome, SwapReason,
+    CaptureEventOutcome, CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event,
+    EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome, SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
@@ -143,8 +143,9 @@ pub(crate) use snapshot::{status_response, RefreshHealth};
 mod socket;
 
 pub(crate) use socket::{
-    notify_restored, notify_roster_reload, request_swap, write_swap_ack, Control, ControlSignal,
-    ControlYield, SwapAck, SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
+    notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_swap_ack,
+    CaptureAck, CaptureCommand, CaptureRejection, Control, ControlSignal, ControlYield, SwapAck,
+    SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
 // in-module socket tests (production reaches them through `UnixControl::serve`); `serve_watch` /
@@ -2897,6 +2898,123 @@ where
         }
     }
 
+    /// Perform a socket `capture` command (issue #359) against the daemon's live state, returning
+    /// the redacted [`CaptureAck`] plus the durable [`Event::Capture`] to log — WITHOUT touching the
+    /// socket, so the read + stash + reconcile are unit-testable apart from the ack I/O (the run
+    /// loop writes the ack via [`write_capture_ack`]). Runs where `&mut Daemon` is available (the run
+    /// loop's post-idle), because the ack must reflect the REAL outcome (captured / refreshed /
+    /// rejected). The daemon-routed sibling of [`perform_socket_swap`](Self::perform_socket_swap),
+    /// mirroring it 1:1.
+    ///
+    /// The daemon does ALL the credential work itself — the client never touches a credential (the
+    /// panel-originates-no-seam invariant, REQ-MBR-C-005). It reuses the #357
+    /// [`capture_locked`](crate::capture::capture_locked) primitive with its OWN seams (the same
+    /// `store` / `stash` / `claude_json` the swaps use), so the identity read → token read → stash
+    /// write run under the SAME single-writer swap lock the auto-swaps use: a contended acquire fails
+    /// closed ([`CaptureRejection::SwapLockBusy`]) BEFORE any read, and a LOCKED keychain aborts the
+    /// token read ([`CaptureRejection::KeychainLocked`]) — the same safety aborts `force` can never
+    /// bypass on the swap path. Capture is canonical-READ-ONLY: it never writes the canonical
+    /// keychain item or `~/.claude.json`, only a per-account stash + a roster row, so a mid-write
+    /// crash cannot corrupt the active account or the live session.
+    ///
+    /// After the locked stash lands, the new roster is persisted to the wired `config_path` (the
+    /// authoritative on-disk `config.toml`, OUTSIDE the lock — a swap never contends on it,
+    /// stash-before-roster like the standalone `capture`) and the in-memory rotation is reconciled to
+    /// it ([`reconcile_roster`](Self::reconcile_roster), the SAME core the #139 roster-reload
+    /// drives): an already-rostered active account is an idempotent REFRESH (its per-account state
+    /// preserved, NO duplicate row), and a newly-captured one joins the live rotation without a
+    /// restart. The daemon-`None` `config_path` (the hermetic-test default with no reload wired)
+    /// fails closed — the capture cannot be persisted, so nothing is stashed-then-lost.
+    async fn perform_socket_capture(
+        &mut self,
+        command: &CaptureCommand,
+    ) -> (CaptureAck, Option<Event>) {
+        // The authoritative on-disk roster path — required to persist the capture. Production always
+        // wires it (`with_config_path`); with none wired the daemon cannot persist the new roster, so
+        // fail closed BEFORE any read rather than land a stash + in-memory row the next restart loses.
+        let Some(config_path) = self.config_path.clone() else {
+            return self.capture_failure(command, CaptureRejection::Failed);
+        };
+        // Load the existing roster to plan against (absent → a first capture, malformed → a failure)
+        // — read BEFORE the lock, exactly like the standalone `capture`'s `load_existing`.
+        let existing = match Config::load_path(&config_path) {
+            Ok(config) => Some(config),
+            Err(Error::ConfigNotFound { .. }) => None,
+            Err(err) => return self.capture_failure(command, classify_capture_failure(&err)),
+        };
+        // Reuse the #357 primitive with the daemon's OWN seams + swap lock. `None` lock is the
+        // hermetic-test default (no second in-process writer to serialize against); production threads
+        // the real `swap.lock` path, so a concurrent auto-swap cannot interleave with the two reads.
+        let lock = self
+            .swap_lock_path
+            .as_deref()
+            .map(|path| (path, SWAP_LOCK_MAX_WAIT));
+        match crate::capture::capture_locked(
+            lock,
+            &self.store,
+            &self.stash,
+            &self.claude_json,
+            existing,
+            command.label.as_deref(),
+        )
+        .await
+        {
+            Ok(report) => {
+                // Persist the new roster OUTSIDE the lock (a swap never contends on `config.toml`),
+                // stash-before-roster. A save failure leaves an inert ORPHAN stash, never a partial
+                // roster — report it `Failed` (the stash landed, but the roster row did not).
+                if let Err(err) = report.config.save_to(&config_path) {
+                    return self.capture_failure(command, classify_capture_failure(&err));
+                }
+                let crate::capture::CaptureReport {
+                    config,
+                    outcome,
+                    label,
+                    count,
+                } = report;
+                // Reconcile the in-memory rotation to the freshly-written roster (the SAME core the
+                // #139 roster-reload drives): an already-rostered active account keeps its per-account
+                // state (the idempotent refresh, no duplicate row), a new one joins with default state
+                // and becomes a swap target once it has a reading.
+                self.reconcile_roster(config.roster);
+                // The durable audit line (best-effort logged by the run loop): the resolved roster
+                // LABEL handle + the outcome token — non-secret by construction (#15).
+                let event = Event::Capture {
+                    account: Some(label.clone()),
+                    outcome: capture_event_outcome(outcome),
+                };
+                let ack = match outcome {
+                    crate::capture::CaptureOutcome::Captured => {
+                        CaptureAck::Captured { label, count }
+                    }
+                    crate::capture::CaptureOutcome::Refreshed => {
+                        CaptureAck::Refreshed { label, count }
+                    }
+                };
+                (ack, Some(event))
+            }
+            Err(err) => self.capture_failure(command, classify_capture_failure(&err)),
+        }
+    }
+
+    /// Build the redacted `(CaptureAck, Event)` for a REFUSED capture (issue #359): the bare machine
+    /// `reason` on the ack, and the SAME reason folded onto the event's outcome axis. The event's
+    /// handle is the operator's label HINT (the only handle a pre-stash failure has — the daemon
+    /// never read an identity), or `None` when none was given, so the audit line still names WHY the
+    /// capture failed without ever carrying a secret. A pure builder (no `&mut self` mutation), so
+    /// the mapping is unit-testable and a refusal is a true no-op on the daemon's state.
+    fn capture_failure(
+        &self,
+        command: &CaptureCommand,
+        reason: CaptureRejection,
+    ) -> (CaptureAck, Option<Event>) {
+        let event = Event::Capture {
+            account: command.label.clone(),
+            outcome: capture_event_outcome_rejected(reason),
+        };
+        (CaptureAck::Rejected { reason }, Some(event))
+    }
+
     /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
     ///
     /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
@@ -3820,6 +3938,48 @@ fn classify_swap_failure(err: &Error) -> SwapRejection {
     }
 }
 
+/// Map a capture failure (from the #357 [`capture_locked`](crate::capture::capture_locked)
+/// primitive, or a post-stash roster save) to the redacted wire reason for a `capture` ack (issue
+/// #359) — the capture counterpart of [`classify_swap_failure`]. The two SAFETY aborts get their own
+/// codes: a LOCKED keychain ([`Error::KeychainLocked`], the token read aborts even mid-capture) and
+/// a contended single-writer swap lock ([`Error::SwapLockBusy`], fail-closed BEFORE any read). A
+/// missing active account — not logged in to Claude Code (an absent / no-`oauthAccount`
+/// `~/.claude.json`) or the canonical credential gone — routes to
+/// [`CaptureRejection::NoActiveAccount`]; everything else (an I/O error, a roster save failure) is
+/// the opaque `Failed`. Secret-free by construction: it inspects only the error's discriminant.
+fn classify_capture_failure(err: &Error) -> CaptureRejection {
+    match err {
+        Error::KeychainLocked { .. } => CaptureRejection::KeychainLocked,
+        Error::SwapLockBusy => CaptureRejection::SwapLockBusy,
+        // Not logged in (absent `~/.claude.json` or no `oauthAccount` block) or the canonical token
+        // is gone — there is no active account to capture.
+        Error::ClaudeStateNotFound { .. }
+        | Error::OauthAccountMissing
+        | Error::CredentialNotFound => CaptureRejection::NoActiveAccount,
+        _ => CaptureRejection::Failed,
+    }
+}
+
+/// Fold a captured/refreshed [`CaptureOutcome`](crate::capture::CaptureOutcome) onto the event's
+/// [`CaptureEventOutcome`] axis (issue #359) — the two SUCCESS tokens the durable audit line carries.
+fn capture_event_outcome(outcome: crate::capture::CaptureOutcome) -> CaptureEventOutcome {
+    match outcome {
+        crate::capture::CaptureOutcome::Captured => CaptureEventOutcome::Captured,
+        crate::capture::CaptureOutcome::Refreshed => CaptureEventOutcome::Refreshed,
+    }
+}
+
+/// Fold a redacted [`CaptureRejection`] onto the event's [`CaptureEventOutcome`] axis (issue #359) —
+/// the failure tags, so the durable [`Event::Capture`] carries the SAME machine reason the ack does.
+fn capture_event_outcome_rejected(reason: CaptureRejection) -> CaptureEventOutcome {
+    match reason {
+        CaptureRejection::NoActiveAccount => CaptureEventOutcome::NoActiveAccount,
+        CaptureRejection::KeychainLocked => CaptureEventOutcome::KeychainLocked,
+        CaptureRejection::SwapLockBusy => CaptureEventOutcome::SwapLockBusy,
+        CaptureRejection::Failed => CaptureEventOutcome::Failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4360,6 +4520,31 @@ mod tests {
                     .take()
                     .expect("the swap stream is handed back exactly once");
                 ControlYield::Swap(stream, self.command.clone())
+            }
+        }
+    }
+
+    /// A [`Control`] that hands back a single `capture` command (issue #359) on its first serve — the
+    /// capture counterpart of [`OnceSwap`], carrying a REAL socket end so a test can read the
+    /// redacted ack the loop writes back. Pends forever after, so the loop then idles on the tick
+    /// timer / shutdown exactly like [`NoControl`].
+    struct OnceCapture {
+        command: CaptureCommand,
+        stream: RefCell<Option<tokio::net::UnixStream>>,
+        fired: Cell<bool>,
+    }
+
+    impl Control for OnceCapture {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                let stream = self
+                    .stream
+                    .borrow_mut()
+                    .take()
+                    .expect("the capture stream is handed back exactly once");
+                ControlYield::Capture(stream, self.command.clone())
             }
         }
     }
@@ -8278,6 +8463,9 @@ mod tests {
             ServeOutcome::Swap(..) => {
                 panic!("a watch command must route to a watch stream, not a swap handoff")
             }
+            ServeOutcome::Capture(..) => {
+                panic!("a watch command must route to a watch stream, not a capture handoff")
+            }
         }
     }
 
@@ -8683,6 +8871,73 @@ mod tests {
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.contains("malformed"), "got {reply:?}");
+    }
+
+    // --- socket `capture` command (issue #359) ------------------------------
+
+    #[tokio::test]
+    async fn serve_control_hands_back_an_authenticated_capture_command() {
+        use tokio::io::AsyncWriteExt;
+        // An AUTHENTICATED `capture` is NOT answered inline: like `swap`, it hands the OPEN
+        // connection back (with the parsed label) so the run loop performs the capture against
+        // `&mut Daemon` and writes the redacted ack from the REAL outcome. No reply is written here.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"capture\",\"label\":\"work\"}\n")
+            .await
+            .unwrap();
+        let (_stream, command) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .capture();
+        assert_eq!(
+            command,
+            CaptureCommand {
+                label: Some("work".to_owned()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_defaults_an_omitted_capture_label_to_none() {
+        use tokio::io::AsyncWriteExt;
+        // `label` is `#[serde(default)]` and OPTIONAL: a `capture` that omits it is well-formed (the
+        // daemon auto-derives the label from the account uuid, never the email — #15/#134), never a
+        // parse error and never a `malformed request` — so, unlike a targetless `swap`, it hands off.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"capture\"}\n").await.unwrap();
+        let (_stream, command) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .capture();
+        assert_eq!(command, CaptureCommand { label: None });
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_unauthenticated_capture_command() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // AC (peer-credential authN): a `capture` is STATE-AFFECTING, so a non-owner peer is rejected
+        // BEFORE any handoff — the capture never reaches the run loop (`one_shot()` proves there is NO
+        // `Capture` handoff, so ZERO credential work happens), and the peer gets `unauthorized` and
+        // learns nothing past the rejection. The socket-layer half of the guard, exactly like `swap`.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"capture\",\"label\":\"work\"}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "an unauthenticated capture must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            reply.contains("unauthorized"),
+            "an unauthenticated capture is refused: {reply:?}",
+        );
     }
 
     // --- swap_command_verdict (pure re-validation, issue #167) --------------
@@ -9144,6 +9399,295 @@ mod tests {
             "an already-active no-op writes nothing",
         );
         assert!(daemon.state.last_swap.is_none(), "a no-op arms no cooldown");
+    }
+
+    // --- classify_capture_failure (engine error → redacted reason, issue #359) ---
+
+    #[test]
+    fn classify_capture_failure_maps_each_engine_error_to_its_redacted_reason() {
+        // The two SAFETY aborts surface as their OWN redacted codes (not the opaque `Failed`): a
+        // LOCKED keychain (the token read aborts mid-capture; locked ≠ gone) and a contended
+        // single-writer swap lock (fail-closed BEFORE any read). A missing active account — an
+        // absent / no-`oauthAccount` `~/.claude.json`, or a vanished canonical credential — routes
+        // to `NoActiveAccount`; every other engine error is the opaque `Failed` (#15: no internal
+        // detail on the wire). The capture mirror of `classify_swap_failure`.
+        assert_eq!(
+            classify_capture_failure(&Error::KeychainLocked { op: "read" }),
+            CaptureRejection::KeychainLocked
+        );
+        assert_eq!(
+            classify_capture_failure(&Error::SwapLockBusy),
+            CaptureRejection::SwapLockBusy
+        );
+        assert_eq!(
+            classify_capture_failure(&Error::ClaudeStateNotFound {
+                path: PathBuf::from("/nope/.claude.json"),
+            }),
+            CaptureRejection::NoActiveAccount
+        );
+        assert_eq!(
+            classify_capture_failure(&Error::OauthAccountMissing),
+            CaptureRejection::NoActiveAccount
+        );
+        assert_eq!(
+            classify_capture_failure(&Error::CredentialNotFound),
+            CaptureRejection::NoActiveAccount
+        );
+        assert_eq!(
+            classify_capture_failure(&Error::SwapWrongIdentityRestash),
+            CaptureRejection::Failed
+        );
+    }
+
+    // --- perform_socket_capture (daemon capture-apply, issue #359) -----------
+
+    #[tokio::test]
+    async fn perform_socket_capture_captures_the_active_account_and_reconciles_the_roster() {
+        // AC (authenticated peer → redacted success ack; capture is the daemon's OWN work): a
+        // well-formed `capture` reads the active identity + token through the #357 `capture_locked`
+        // primitive, stashes BOTH halves, appends the new roster row, persists `config.toml`, and
+        // reconciles the in-memory rotation to it — emitting one redacted `Event::Capture`. The ack
+        // carries the operator LABEL + running count and NOTHING secret. Canonical-READ-ONLY: the
+        // keychain token and `~/.claude.json` are never rewritten (#359 — capture only writes a
+        // per-account stash + a roster row).
+        let roster = vec![account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-B", b"B-token", "u-B")]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-B", "spare")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        // Label GIVEN → names the new account; the account is not yet rostered, so this captures.
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand {
+                label: Some("work".to_owned()),
+            })
+            .await;
+
+        // The ack names the operator LABEL + the running count (2 in rotation now)…
+        assert_eq!(
+            ack,
+            CaptureAck::Captured {
+                label: "work".to_owned(),
+                count: 2,
+            }
+        );
+        // …and its SERIALIZED bytes leak neither the credential (named `*-token`) nor an email (#15).
+        let wire = serde_json::to_string(&ack).unwrap();
+        assert!(!wire.contains('@'), "the ack leaks no email: {wire}");
+        assert!(
+            !wire.to_lowercase().contains("token"),
+            "the ack leaks no credential: {wire}",
+        );
+        // The durable audit line: the resolved roster LABEL handle + the `captured` outcome token.
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: Some("work".to_owned()),
+                outcome: CaptureEventOutcome::Captured,
+            })
+        );
+        // The in-memory rotation reconciled to the freshly-written roster: u-A joined u-B.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-A"]);
+        // The on-disk `config.toml` grew the SAME row — persisted, so a restart keeps it.
+        let on_disk = Config::load_path(&config_path).unwrap();
+        assert_eq!(on_disk.roster.len(), 2);
+        assert_eq!(on_disk.roster[1].account_uuid, "u-A");
+        assert_eq!(on_disk.roster[1].label, "work");
+        // Both credential halves are stashed together under u-A's uuid-derived service.
+        let stashed = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(stashed.credential.expose(), b"A-token");
+        assert_eq!(stashed.oauth_account.account_uuid(), "u-A");
+        // Canonical-READ-ONLY: the keychain still holds A's token and `~/.claude.json` still shows
+        // u-A — capture rewrote NEITHER (it is not a swap).
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-A"));
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_refreshes_an_already_rostered_account_without_a_duplicate_row()
+    {
+        // AC (already-rostered active account → idempotent refresh, NOT a duplicate row): capturing
+        // the active account when it is ALREADY rostered re-points its stash to the current token
+        // and updates its row IN PLACE — the count is unchanged and no second row appears. An
+        // omitted label keeps the operator's existing name (never clobbered by an auto-derived
+        // uuid). The ack is `Refreshed`, the event outcome `refreshed`.
+        let roster = vec![account("u-A", "work")];
+        let store = store_holding(b"A-token-v2").await; // the canonical rotated since the last stash
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token-v1", "u-A")]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        // Label OMITTED → the existing "work" is kept (an auto-derived uuid never clobbers it).
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand { label: None })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Refreshed {
+                label: "work".to_owned(),
+                count: 1,
+            }
+        );
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: Some("work".to_owned()),
+                outcome: CaptureEventOutcome::Refreshed,
+            })
+        );
+        // NO duplicate row — in-memory AND on-disk stay a single u-A account.
+        assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
+        assert_eq!(Config::load_path(&config_path).unwrap().roster.len(), 1);
+        // The stash re-pointed to the CURRENT token under the SAME single service (no new entry).
+        assert_eq!(daemon.stash.len(), 1);
+        let stashed = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        assert_eq!(stashed.credential.expose(), b"A-token-v2");
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_refuses_when_no_active_account_and_writes_nothing() {
+        // AC (no active account → redacted refusal, ZERO writes): with no readable `~/.claude.json`
+        // identity there is nothing to capture. The identity read fails FIRST (before the token),
+        // so the capture is a true no-op: no stash, no roster row, no `config.toml` change, no
+        // in-memory reconcile. The ack is the redacted `NoActiveAccount`; the event still names the
+        // operator's label HINT (the only handle a pre-stash failure has) + the `no_active_account`
+        // outcome.
+        let roster = vec![account("u-B", "spare")];
+        let store = store_holding(b"A-token").await; // a token exists, but the identity read aborts first
+        let stash = stash_with(&[("Sessiometer/u-B", b"B-token", "u-B")]).await;
+        let absent_dir = tempfile::tempdir().unwrap();
+        let absent_json = absent_dir.path().join("absent.json"); // never created
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-B", "spare")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            absent_json,
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand {
+                label: Some("work".to_owned()),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::NoActiveAccount,
+            }
+        );
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: Some("work".to_owned()),
+                outcome: CaptureEventOutcome::NoActiveAccount,
+            })
+        );
+        // ZERO writes: the roster is untouched in memory AND on disk, and nothing new was stashed.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B"]);
+        assert_eq!(Config::load_path(&config_path).unwrap().roster.len(), 1);
+        assert_eq!(daemon.stash.len(), 1);
+        assert!(!daemon.stash.contains("Sessiometer/u-A"));
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_refuses_a_locked_keychain_and_writes_nothing() {
+        // AC (locked keychain → redacted SAFETY abort, ZERO writes): the identity reads fine but the
+        // active-token read hits a LOCKED keychain (locked ≠ gone — retry when unlocked). The
+        // capture aborts with the redacted `KeychainLocked` reason and writes NOTHING — no stash, no
+        // roster row, no reconcile. An omitted label leaves the event handle `None` (no identity was
+        // ever paired to a label).
+        let roster = vec![account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-B", b"B-token", "u-B")]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-B", "spare")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        // Lock the keychain, THEN capture: the token read aborts after the (successful) identity read.
+        daemon.store.set_locked(true);
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand { label: None })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::KeychainLocked,
+            }
+        );
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: None,
+                outcome: CaptureEventOutcome::KeychainLocked,
+            })
+        );
+        // ZERO writes: the roster is untouched in memory AND on disk, and nothing new was stashed.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B"]);
+        assert_eq!(Config::load_path(&config_path).unwrap().roster.len(), 1);
+        assert_eq!(daemon.stash.len(), 1);
+        assert!(!daemon.stash.contains("Sessiometer/u-A"));
+        // Once unlocked the canonical still holds A's token — the abort forged no write.
+        daemon.store.set_locked(false);
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
     }
 
     // --- next_swap candidate (issue #88) + swap report ---------------------
@@ -9795,6 +10339,110 @@ mod tests {
         assert!(
             logged.contains("event=swap from=work to=spare reason=manual"),
             "the swap event is logged: {logged}",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_performs_an_authenticated_capture_and_writes_a_redacted_ack() {
+        use tokio::io::AsyncReadExt;
+        // AC (daemon does ALL the credential work + redacted ack), END-TO-END through the run loop —
+        // the wiring the pieces can't prove alone: an authenticated `capture` handed back by
+        // `Control::serve` (as `ControlYield::Capture`) drives the post-idle glue —
+        // `perform_socket_capture` (the daemon's OWN #357-locked capture) + the durable
+        // `Event::Capture` + `write_capture_ack` back to the client. The loop stashes the active
+        // account and grows the roster (a REAL write), AND the client reads a redacted `captured` ack
+        // (no token / email). The active account (u-A) starts OUTSIDE the roster — capture is what
+        // adds it.
+        let roster = vec![account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-B", b"B-token", "u-B")]).await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-B", "spare")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json.clone(),
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        // A real socket pair: the loop writes the ack to the SERVER end (handed back by the fake
+        // control); the test reads it from the CLIENT end after the loop closes the server end.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let control = OnceCapture {
+            command: CaptureCommand {
+                label: Some("work".to_owned()),
+            },
+            stream: RefCell::new(Some(server)),
+            fired: Cell::new(false),
+        };
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let mut shutdown = FakeShutdown::after(4);
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        // The loop captured through the daemon's own #357-locked path: the new account joined the
+        // in-memory rotation, the on-disk roster grew, and both credential halves were stashed under
+        // u-A — a complete write.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-A"]);
+        assert_eq!(Config::load_path(&config_path).unwrap().roster.len(), 2);
+        assert!(daemon.stash.contains("Sessiometer/u-A"));
+        // Canonical-READ-ONLY: capture rewrote neither the keychain nor `~/.claude.json`.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-A"));
+
+        // The client reads the redacted ack the loop wrote back (server end closed → EOF after it).
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        let ack: CaptureAck = serde_json::from_str(reply.trim_end()).expect("a one-line ack");
+        assert_eq!(
+            ack,
+            CaptureAck::Captured {
+                label: "work".to_owned(),
+                count: 2,
+            }
+        );
+        // #15: the wire ack leaks neither the credential (named `*-token`) nor an email.
+        assert!(
+            !reply.contains('@'),
+            "the ack wire leaks no email: {reply:?}"
+        );
+        assert!(
+            !reply.to_lowercase().contains("token"),
+            "the ack wire leaks no credential: {reply:?}",
+        );
+        // The durable capture event landed in the log (the best-effort emit before the ack).
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            logged.contains("event=capture account=work outcome=captured"),
+            "the capture event is logged: {logged}",
         );
     }
 
@@ -13690,6 +14338,29 @@ mod tests {
         );
         corpus.push('\n');
 
+        // Channel — the `capture` command's redacted audit event (issue #359), emitted only by the
+        // daemon-routed capture path, so (like the login line above) it is planted here rather than
+        // tick-harvested. `account` is the operator HANDLE (a label, or the account uuid when the
+        // label is omitted) — the SAME #15 bar as every other channel; a captured account carries a
+        // handle, while a pre-identity failure with no label hint (a locked keychain) is accountless
+        // (the omit branch), so BOTH shapes of the line join the all-channels clean verdict below.
+        corpus.push_str(
+            &Event::Capture {
+                account: Some(A.1.to_owned()),
+                outcome: CaptureEventOutcome::Captured,
+            }
+            .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &Event::Capture {
+                account: None,
+                outcome: CaptureEventOutcome::KeychainLocked,
+            }
+            .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
+        );
+        corpus.push('\n');
+
         // Channel — the UDS error replies (malformed request / unknown command) and
         // the `manual-swapped` ack / unauthorized replies (#64), all secret-free.
         corpus.push_str(&control_reply("not json", &StatusSnapshot::default(), true).0);
@@ -13746,6 +14417,35 @@ mod tests {
         corpus.push_str(
             &serde_json::to_string(&SwapAck::Rejected {
                 reason: SwapRejection::KeychainLocked,
+            })
+            .unwrap(),
+        );
+        corpus.push('\n');
+
+        // Channel — the `capture` control ack (issue #359): all three wire shapes — a captured
+        // account's label + count, a refreshed account's label + count, and a redacted rejection
+        // reason — carry NO secret (only a machine `result` tag, a non-secret roster label, and a
+        // count, #15). The labels are the fixture labels already in the corpus, so this stays
+        // non-vacuous while proving the new channel leaks nothing in any of its shapes.
+        corpus.push_str(
+            &serde_json::to_string(&CaptureAck::Captured {
+                label: A.1.to_owned(),
+                count: 2,
+            })
+            .unwrap(),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &serde_json::to_string(&CaptureAck::Refreshed {
+                label: B.1.to_owned(),
+                count: 2,
+            })
+            .unwrap(),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &serde_json::to_string(&CaptureAck::Rejected {
+                reason: CaptureRejection::KeychainLocked,
             })
             .unwrap(),
         );
@@ -13808,6 +14508,17 @@ mod tests {
         assert!(
             corpus.contains("event=login outcome=cancelled"),
             "log channel: accountless (cancelled) login event missing"
+        );
+        // The `capture` command channel (issue #359): the handle-carrying captured line AND the
+        // accountless locked-keychain line both contributed, so the clean verdict below is
+        // non-vacuous for the capture event on BOTH its shapes.
+        assert!(
+            corpus.contains("event=capture account=work outcome=captured"),
+            "log channel: capture event missing"
+        );
+        assert!(
+            corpus.contains("event=capture outcome=keychain_locked"),
+            "log channel: accountless (locked-keychain) capture event missing"
         );
         assert!(
             corpus.contains(r#""quarantined":true"#),
@@ -13876,6 +14587,12 @@ mod tests {
         assert!(
             corpus.contains(r#""result":"accepted""#),
             "control channel: swap ack missing"
+        );
+        // The `capture` ack channel (#359): the `captured` result tag is unique to this channel, so
+        // it keeps the clean verdict below non-vacuous for the new channel.
+        assert!(
+            corpus.contains(r#""result":"captured""#),
+            "control channel: capture ack missing"
         );
         assert!(
             corpus.len() > 800,

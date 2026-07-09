@@ -1,9 +1,24 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! The control socket: the `0600` Unix-domain server the daemon answers `status` /
-//! `manual-swapped` / `roster-reload` on, plus the client-side reload / restore notifies
-//! (issues #15, #64, #139, #276; the #195 per-concern decomposition).
+//! The control socket: the `0600` Unix-domain server the daemon answers the local control protocol
+//! on, plus the client-side reload / restore notifies (issues #15, #64, #139, #276, #359; the #195
+//! per-concern decomposition). The protocol is a newline-delimited `{"cmd":"…"}` request → one
+//! newline-delimited JSON reply. The commands:
+//!   - `status` (#9/#164) — a non-secret READ, answered for ANY peer (the frozen versioned snapshot).
+//!   - `watch` (#165) — a non-secret snapshot STREAM, also un-auth-gated (ADR-0011).
+//!   - `manual-swapped` (#64) / `roster-reload` (#139) / `restored` (#275) — state-affecting
+//!     fire-and-forget signals, honored ONLY for an authenticated same-user peer (an unauthenticated
+//!     one gets `{"error":"unauthorized"}` and produces NO signal).
+//!   - `swap` (#167) — a state-affecting command the daemon performs ITSELF (needs `&mut Daemon`),
+//!     re-validating the target against its own roster and returning a REDACTED ack from the real
+//!     outcome (`{"cmd":"swap","target":"<label|uuid>","force":<bool>}`).
+//!   - `capture` (#359) — the daemon-routed capture, mirroring `swap` 1:1
+//!     (`{"cmd":"capture","label":"<label>"}`; `label` optional → the daemon derives it from the
+//!     account uuid, NEVER the email, #15/#134). The daemon reads the active credential + identity
+//!     and stashes them under the swap lock (the #357 `capture_locked` primitive), reconciles the
+//!     in-memory roster, and returns a REDACTED ack (label + count, or a bare machine reason). The
+//!     client never touches a credential (the panel-originates-no-seam invariant, REQ-MBR-C-005).
 //!
 //! [`UnixControl`] is the production [`Control`] seam the run loop's idle select drives between
 //! polls; [`serve_control`] is its core, testable over an in-memory duplex and bounded in space
@@ -79,6 +94,10 @@ pub(crate) enum ControlYield {
     /// A `swap` command (issue #167): the open connection + the parsed request, handed to the run
     /// loop to perform the swap (needs `&mut Daemon`) and write the redacted ack.
     Swap(UnixStream, SwapCommand),
+    /// A `capture` command (issue #359): the open connection + the parsed request, handed to the
+    /// run loop to perform the capture (needs `&mut Daemon`) and write the redacted ack — the
+    /// daemon-routed sibling of `swap`, mirroring it 1:1.
+    Capture(UnixStream, CaptureCommand),
 }
 
 /// Control seam: serve control-socket connections. The production impl
@@ -166,6 +185,14 @@ impl Control for UnixControl {
                     // the OPEN connection back so the run loop performs the swap where
                     // `&mut Daemon` is available and writes the redacted ack itself.
                     Ok(ServeOutcome::Swap(stream, command)) => ControlYield::Swap(stream, command),
+                    // A `capture` command (issue #359): an authenticated, well-formed request whose
+                    // ack must reflect the REAL capture outcome (captured / refreshed / rejected).
+                    // Like `swap`, a stranger was already answered inline (a `OneShot(None)` above);
+                    // here the OPEN connection is handed back so the run loop performs the capture
+                    // where `&mut Daemon` is available and writes the redacted ack itself.
+                    Ok(ServeOutcome::Capture(stream, command)) => {
+                        ControlYield::Capture(stream, command)
+                    }
                     Err(_) => ControlYield::Signal(None),
                 }
             }
@@ -184,9 +211,10 @@ impl Control for UnixControl {
 }
 
 /// The `{"cmd": "..."}` control request. `uuid` is present only for the `restored`
-/// command (issue #275); `target` / `force` only for the `swap` command (issue #167)
-/// — the payload-less commands (`status` / `manual-swapped` / `roster-reload`) omit
-/// them all, and serde defaults a missing field (`Option` → `None`, `bool` → `false`).
+/// command (issue #275); `target` / `force` only for the `swap` command (issue #167);
+/// `label` only for the `capture` command (issue #359) — the payload-less commands
+/// (`status` / `manual-swapped` / `roster-reload`) omit them all, and serde defaults a
+/// missing field (`Option` → `None`, `bool` → `false`).
 #[derive(Deserialize)]
 struct ControlRequest {
     cmd: String,
@@ -202,6 +230,12 @@ struct ControlRequest {
     /// so every other command omits it (and a `swap` without it defaults to `false`).
     #[serde(default)]
     force: bool,
+    /// The `capture` command's OPTIONAL operator label (issue #359): names the account
+    /// being captured. An OPERATOR-supplied handle, NEVER a credential and never the
+    /// email — omitted (`None`) means the daemon auto-derives the label from the account
+    /// uuid, NEVER the email (#15/#134). `#[serde(default)]` so every other command omits it.
+    #[serde(default)]
+    label: Option<String>,
 }
 
 /// A parsed `swap` control request (issue #167): an operator-supplied target handle plus the
@@ -270,6 +304,63 @@ pub(crate) enum SwapRejection {
     SwapLockBusy,
     /// The swap engine aborted for another reason (a wrong-identity re-stash guard #211, an I/O
     /// error). ZERO writes.
+    Failed,
+}
+
+/// A parsed `capture` control request (issue #359): the operator's OPTIONAL label, and NOTHING
+/// else — never a credential. Handed from [`serve_control`] to the run loop (via
+/// [`ServeOutcome::Capture`] → [`ControlYield::Capture`]) so the daemon performs the WHOLE capture
+/// itself — reading the active credential + identity and stashing them under the single-writer swap
+/// lock (the #357 [`capture_locked`](crate::capture::capture_locked) primitive) — where `&mut Daemon`
+/// is available. The client never touches a credential (the panel-originates-no-seam invariant,
+/// REQ-MBR-C-005): it names only the account, and even that is optional — an omitted label
+/// auto-derives from the account uuid, NEVER the email (#15/#134).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptureCommand {
+    /// The operator's label for the account, or `None` to auto-derive it from the account uuid
+    /// (never the email — #15/#134).
+    pub(crate) label: Option<String>,
+}
+
+/// The redacted acknowledgement the daemon returns for a `capture` control command (issue #359) —
+/// the ONLY thing a `capture` client learns about the outcome. Non-secret by construction (issue
+/// #15): a machine `result` tag plus, for a landed capture, the non-secret roster LABEL and the
+/// running account COUNT — a capture ack NEVER carries a credential, an email, or an oauth blob.
+/// Internally tagged on `result`, mirroring [`SwapAck`], so the three cases stay one
+/// self-describing, forward-compatible field a client routes on. Derives `Serialize` (the daemon
+/// writes it) and `Deserialize` (a client reads it back).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub(crate) enum CaptureAck {
+    /// A NEW account was captured into the roster: its LABEL and the running account COUNT (issue
+    /// #35 — no fixed "of N" denominator). The daemon stashed both credential halves under the lock.
+    Captured { label: String, count: usize },
+    /// An already-rostered active account was REFRESHED in place (the issue-#359 idempotent-refresh
+    /// AC): its stash re-pointed to the current token and its roster row updated — NEVER a duplicate
+    /// row. Label + running count, exactly like [`Captured`](CaptureAck::Captured).
+    Refreshed { label: String, count: usize },
+    /// The daemon REFUSED with a redacted machine reason — ZERO roster writes.
+    Rejected { reason: CaptureRejection },
+}
+
+/// Why the daemon refused a `capture` command (issue #359) — a redacted, stable machine code (never
+/// a secret, never free-form), the capture counterpart of [`SwapRejection`]. Serialized kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CaptureRejection {
+    /// No active account to capture: not logged in to Claude Code (absent / unreadable
+    /// `~/.claude.json` identity), or the canonical credential is gone. Nothing was stashed.
+    NoActiveAccount,
+    /// The keychain is LOCKED — a SAFETY abort the capture makes when reading the active credential
+    /// (locked ≠ gone; retry when unlocked). ZERO writes.
+    KeychainLocked,
+    /// The single-writer swap lock (issue #64) stayed held the whole bounded wait — fail-closed,
+    /// ZERO work (no read, no stash, no roster write). The #357 primitive acquires the lock BEFORE
+    /// the identity read, so a contended refusal is a true no-op.
+    SwapLockBusy,
+    /// The capture aborted for another reason (an I/O error, or the post-stash roster save failed).
+    /// Stash-before-roster ordering (#6) means a save failure leaves an inert ORPHAN stash, never a
+    /// partial or duplicate roster row.
     Failed,
 }
 
@@ -378,6 +469,12 @@ pub(crate) enum ServeOutcome<RW> {
     /// handed back — NO reply written yet — for the caller (the run loop) to perform the swap and
     /// write the redacted ack from the real outcome.
     Swap(RW, SwapCommand),
+    /// An authenticated `capture` command was requested (issue #359); the connection is handed back
+    /// — NO reply written yet — for the caller (the run loop) to perform the capture (via the #357
+    /// `capture_locked` primitive) and write the redacted ack from the real outcome. Unlike `swap`,
+    /// a `capture` needs no `target`, so an authenticated request is ALWAYS well-formed (the label
+    /// is optional); the only inline rejection is the unauthorized peer.
+    Capture(RW, CaptureCommand),
 }
 
 /// Serve one control exchange: read one newline-delimited JSON request and either write one
@@ -410,10 +507,10 @@ where
             .read_line(&mut line)
             .await?;
         let trimmed = line.trim_end();
-        // `watch` (issue #165) and `swap` (issue #167) hand the connection OFF rather than write a
-        // one-shot reply here; every other command falls through to the pure `control_reply`. Parse
-        // once and branch. `into_inner` drops the (empty — these clients send only this one line)
-        // read buffer to yield a bare stream to hand back.
+        // `watch` (issue #165), `swap` (issue #167), and `capture` (issue #359) hand the connection
+        // OFF rather than write a one-shot reply here; every other command falls through to the pure
+        // `control_reply`. Parse once and branch. `into_inner` drops the (empty — these clients send
+        // only this one line) read buffer to yield a bare stream to hand back.
         match serde_json::from_str::<ControlRequest>(trimmed) {
             // A `watch` subscription (issue #165): a non-secret read stream (like `status`), so —
             // unlike `swap` below — it is NOT auth-gated; hand the connection to the streaming path.
@@ -446,6 +543,27 @@ where
                     }
                 };
             }
+            // A `capture` command (issue #359): STATE-AFFECTING, so authenticate FIRST (exactly like
+            // `swap` / `manual-swapped`). An unauthenticated peer gets `{"error":"unauthorized"}` and
+            // NO stream handoff — the capture never reaches the run loop, and a stranger learns
+            // nothing past the rejection AND causes ZERO work (no credential is ever read). Unlike
+            // `swap`, a `capture` needs no `target`: the label is OPTIONAL (an omitted one
+            // auto-derives from the account uuid, never the email — #15/#134), so an authenticated
+            // request is ALWAYS well-formed and hands the OPEN connection back so the run loop
+            // performs the capture (needs `&mut Daemon`) and writes the redacted ack from the REAL
+            // outcome — an outcome this pure serve cannot know.
+            Ok(request) if request.cmd == "capture" => {
+                if !peer_authenticated {
+                    write_line(&mut buffered, r#"{"error":"unauthorized"}"#).await?;
+                    return Ok(ServeOutcome::OneShot(None));
+                }
+                return Ok(ServeOutcome::Capture(
+                    buffered.into_inner(),
+                    CaptureCommand {
+                        label: request.label,
+                    },
+                ));
+            }
             _ => {}
         }
         let (reply, signal) = control_reply(trimmed, snapshot, peer_authenticated);
@@ -476,6 +594,9 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Swap(..) => {
                 panic!("expected a one-shot reply, got a swap handoff")
             }
+            ServeOutcome::Capture(..) => {
+                panic!("expected a one-shot reply, got a capture handoff")
+            }
         }
     }
 
@@ -486,6 +607,21 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Swap(stream, command) => (stream, command),
             ServeOutcome::OneShot(_) => panic!("expected a swap handoff, got a one-shot reply"),
             ServeOutcome::Watch(_) => panic!("expected a swap handoff, got a watch subscription"),
+            ServeOutcome::Capture(..) => panic!("expected a swap handoff, got a capture handoff"),
+        }
+    }
+
+    /// The handed-back stream + parsed command of a [`Capture`](ServeOutcome::Capture) outcome,
+    /// panicking on any other — for the issue-#359 capture-handoff tests, which always expect a
+    /// capture.
+    pub(crate) fn capture(self) -> (RW, CaptureCommand) {
+        match self {
+            ServeOutcome::Capture(stream, command) => (stream, command),
+            ServeOutcome::OneShot(_) => panic!("expected a capture handoff, got a one-shot reply"),
+            ServeOutcome::Watch(_) => {
+                panic!("expected a capture handoff, got a watch subscription")
+            }
+            ServeOutcome::Swap(..) => panic!("expected a capture handoff, got a swap handoff"),
         }
     }
 }
@@ -597,6 +733,24 @@ pub(crate) const SWAP_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// best-effort. Serializing a finite enum cannot realistically fail; a defensive fallback keeps
 /// the write total rather than dropping a completed swap's ack on an impossible encode error.
 pub(crate) async fn write_swap_ack<W>(mut stream: W, ack: &SwapAck) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(ack)
+        .unwrap_or_else(|_| r#"{"result":"rejected","reason":"failed"}"#.to_owned());
+    write_line(&mut stream, &line).await
+}
+
+/// Write a redacted [`CaptureAck`] as one newline-delimited JSON line to a `capture` client (issue
+/// #359) — the run loop's counterpart of `serve_control`'s one-shot reply, written AFTER the
+/// capture is performed (the ack must reflect the real outcome). The exact sibling of
+/// [`write_swap_ack`], sharing its [`SWAP_ACK_WRITE_TIMEOUT`] bound in the run loop. Non-secret by
+/// construction: the ack carries only a `result` tag plus a roster label + count (issue #15). Takes
+/// the stream BY VALUE so it is closed on return; a write failure (the client went away) propagates
+/// so the caller drops it best-effort. Serializing a finite enum cannot realistically fail; a
+/// defensive fallback keeps the write total rather than dropping a completed capture's ack on an
+/// impossible encode error.
+pub(crate) async fn write_capture_ack<W>(mut stream: W, ack: &CaptureAck) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {

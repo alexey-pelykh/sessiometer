@@ -100,6 +100,15 @@ enum Idle {
     /// cadence. Unlike the payload-less signals, this must be answered INLINE here (not spawned)
     /// because the swap needs the `!Send` daemon seams (ADR-0001).
     SwapRequested(UnixStream, SwapCommand),
+    /// An authenticated `capture` control command (#359) asked the daemon to capture the active
+    /// account into the roster. Carries the still-OPEN connection + the parsed request (moved out
+    /// of the [`ControlYield::Capture`] handoff), so the post-idle applies it where `&mut Daemon`
+    /// is available ([`Daemon::perform_socket_capture`]) — reading + stashing the credential under
+    /// the swap lock (the #357 primitive) and reconciling the in-memory roster — and writes the
+    /// redacted ack from the real outcome, then re-ticks so `status` reflects the new roster within
+    /// the poll cadence. Answered INLINE here (not spawned), exactly like `swap`, because the
+    /// capture needs the `!Send` daemon seams (ADR-0001).
+    CaptureRequested(UnixStream, CaptureCommand),
     /// The external-login watch (#140) saw the canonical credential change out-of-band
     /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
     /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
@@ -273,6 +282,14 @@ where
                     // answered inline in `serve_control`, so only an authenticated, well-formed
                     // request reaches here.
                     ControlYield::Swap(stream, command) => break Idle::SwapRequested(stream, command),
+                    // A `capture` (#359) breaks the idle to perform the capture (moving the open
+                    // stream + parsed request out of the handoff) where `&mut daemon` is available,
+                    // write the redacted ack, then re-tick. Like `swap`, the auth rejection was
+                    // already answered inline in `serve_control`, so only an authenticated request
+                    // reaches here (the label is optional, so there is no malformed-inline case).
+                    ControlYield::Capture(stream, command) => {
+                        break Idle::CaptureRequested(stream, command)
+                    }
                     ControlYield::Signal(None) => continue,
                 },
                 // The periodic isolated-refresh tick (issue #105), in the idle path off
@@ -567,6 +584,23 @@ where
                 }
                 let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_swap_ack(stream, &ack))
                     .await;
+            }
+            // Perform the authenticated `capture` control command (#359) where `&mut daemon` is
+            // available: read the active credential + identity and stash them through the
+            // single-writer swap lock (the #357 `capture_locked` primitive), reconcile the
+            // in-memory roster, emit the durable redacted `Event::Capture` (best-effort), then
+            // write the redacted ack back to the client — BEFORE looping back to re-tick so `status`
+            // reflects the new roster. The ack write is best-effort and time-boxed (the SAME
+            // `SWAP_ACK_WRITE_TIMEOUT` bound the swap ack uses): the ack carries nothing secret, so a
+            // disconnected / wedged client just drops it and can never stall the loop (issue #15).
+            Idle::CaptureRequested(stream, command) => {
+                let (ack, event) = daemon.perform_socket_capture(&command).await;
+                if let Some(event) = event {
+                    emit_best_effort(log, &event);
+                }
+                let _ =
+                    tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_capture_ack(stream, &ack))
+                        .await;
             }
             // The external-login watch (#140) detected an out-of-band canonical change: just
             // re-tick — the next `tick` reads the canonical and its `reconcile_canonical_change`
