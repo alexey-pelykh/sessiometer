@@ -330,7 +330,9 @@ fn outcome_label(report: &RefreshReport) -> &'static str {
         }
         RefreshOutcome::NoChange => "no change",
         RefreshOutcome::Dead => "dead — needs re-login",
-        RefreshOutcome::Error => "error",
+        // The one-shot `poke` label folds every error sub-cause to "error"; the non-secret
+        // `reason=` sub-class (issue #377) is a periodic-sweep EVENT field, not surfaced here.
+        RefreshOutcome::Error(_) => "error",
     }
 }
 
@@ -443,6 +445,7 @@ mod tests {
 
     use crate::claude_state::OauthAccount;
     use crate::keychain::{Credential, FakeCredentialStore};
+    use crate::refresh::RefreshErrorReason;
     use crate::stash::{FakeAccountStash, StashedAccount};
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -606,7 +609,10 @@ mod tests {
             "dead — needs re-login"
         );
         assert_eq!(
-            outcome_label(&report(RefreshOutcome::Error, false)),
+            outcome_label(&report(
+                RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
+                false
+            )),
             "error"
         );
     }
@@ -705,7 +711,13 @@ mod tests {
             "no change"
         );
         assert_eq!(
-            poke_outcome(&report(RefreshOutcome::Error, false), true),
+            poke_outcome(
+                &report(
+                    RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
+                    false
+                ),
+                true
+            ),
             "error"
         );
     }
