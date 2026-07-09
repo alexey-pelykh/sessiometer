@@ -33,22 +33,23 @@
 //! interactive step). All output names the account by its **label** only — never
 //! the email or token (issue #15 redaction).
 //!
-//! Capture reads the identity block and the token in two steps, so it assumes the
-//! active account does not change underneath it — i.e. the operator does not run
-//! `claude /login` *during* a capture. A concurrent re-login could pair one
-//! account's token with another's identity; per `build/version-compat.md` that
-//! mismatch only mis-displays (auth follows the token), but it would mis-key the
-//! roster entry. The capture-then-`/login` loop is sequential, so this does not
-//! arise in normal use; #6 should be aware of it when reasoning about staleness.
+//! Capture reads the identity block and the token in two steps, so those reads — and
+//! the stash that pairs them — run under the single-writer `swap.lock` (#357, via
+//! [`capture_locked`]): the daemon's autonomous timer-swap holds the SAME lock, so it can
+//! no longer land between the two reads and pair one account's token with another's
+//! identity (which would mis-key the roster entry — per `build/version-compat.md` the
+//! mismatch only mis-displays, auth following the token, but the roster row would be
+//! wrong). The one writer NOT serialized by that lock is an external `claude /login` (a
+//! separate process that never takes sessiometer's `flock`); the operator's
+//! capture-then-`/login` loop is sequential, so that does not arise in normal use — #6
+//! should be aware of it when reasoning about staleness.
 //!
 //! The decision logic ([`plan_capture`]) is a pure function over the roster, and
 //! the orchestration ([`run_capture`]) is generic over the stash seam, so both
 //! are unit-tested hermetically; [`capture`] only wires the real seams, persists,
 //! and prints.
 
-use crate::claude_state::{
-    read_oauth_account, read_oauth_account_from, write_oauth_account, OauthAccount,
-};
+use crate::claude_state::{read_oauth_account_from, write_oauth_account, OauthAccount};
 use crate::config::{
     Account, Config, LoginConfig, MigrationConfig, RefreshConfig, StatsConfig, Tunables,
 };
@@ -64,33 +65,42 @@ use std::time::Duration;
 
 /// Whether a `capture` added a new account or refreshed an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureOutcome {
+pub(crate) enum CaptureOutcome {
     Captured,
     Refreshed,
 }
 
 /// The result of planning + stashing a capture: the config to persist plus the
 /// facts the confirmation line needs.
-struct CaptureReport {
-    config: Config,
-    outcome: CaptureOutcome,
-    label: String,
-    count: usize,
+pub(crate) struct CaptureReport {
+    pub(crate) config: Config,
+    pub(crate) outcome: CaptureOutcome,
+    pub(crate) label: String,
+    pub(crate) count: usize,
 }
 
 /// Run the `capture` command: read the active credential + identity, stash them,
 /// update the roster, and print the confirmation.
+///
+/// The canonical read (identity + token) and the stash write run under the single-writer
+/// swap lock via [`capture_locked`], so a concurrent daemon swap cannot land between the two
+/// reads and pair one account's identity with another's token — the mis-keyed-roster race the
+/// module docs name (#357). The roster (`config.toml`) save stays OUTSIDE the lock — a swap
+/// never contends on `config.toml` — preserving stash-before-roster, exactly like
+/// [`reconcile_login`].
 pub(crate) async fn capture(label: Option<String>) -> Result<()> {
-    // Identity first (a cheap file read) so "not logged in" fails before we touch
-    // the keychain; then the active token.
-    let oauth = read_oauth_account()?;
-    let credential = RealCredentialStore::new().read().await?;
-
+    // Ensure the native-local support dir (0700) that houses `swap.lock` exists before
+    // acquiring the lock (mirrors `reconcile_login` / `use`, #64).
+    paths::ensure_private_dir(&paths::support_dir()?)?;
+    let swap_lock = paths::swap_lock()?;
+    let claude_json = paths::claude_json()?;
     let existing = load_existing()?;
-    let report = run_capture(
-        credential,
-        oauth,
+
+    let report = capture_locked(
+        Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
+        &RealCredentialStore::new(),
         &RealAccountStash::new(),
+        &claude_json,
         existing,
         label.as_deref(),
     )
@@ -105,6 +115,52 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
         confirmation(report.outcome, &report.label, report.count)
     );
     Ok(())
+}
+
+/// The capture core wrapped in the single-writer swap lock (issue #64): acquired BEFORE the
+/// identity read and held across the whole canonical critical section —
+///
+///   read-identity ([`read_oauth_account_from`]) → read-token ([`CredentialStore::read`]) →
+///   stash-write ([`run_capture`])
+///
+/// — so no concurrent daemon swap can interleave BETWEEN the two reads and pair one account's
+/// `~/.claude.json` identity with another account's keychain token (mis-keying the roster,
+/// #357). Mirrors [`run_login_locked`] / [`crate::swap::swap_locked`]: `lock` is
+/// `Some((path, max_wait))` in production and `None` on the hermetic single-process test path
+/// (no second writer to serialize against). A contended acquire fails closed
+/// ([`Error::SwapLockBusy`]) BEFORE any read, so a refusal is a true no-op (ZERO reads/writes).
+///
+/// The roster (`config.toml`) write is deliberately the CALLER's job, done AFTER this returns
+/// with the lock released: a swap contends only on the keychain + `~/.claude.json`, never on
+/// `config.toml`, and stash-before-roster means a crash after the locked stash but before the
+/// save leaves an inert orphan stash, never a roster row referencing an unstashed account.
+/// Generic over both keychain seams and taking the identity path as an argument, so the
+/// daemon-routed `cmd:capture` command (#359) can reuse this exact primitive with its own seams.
+pub(crate) async fn capture_locked<C, S>(
+    lock: Option<(&Path, Duration)>,
+    store: &C,
+    stash: &S,
+    claude_json: &Path,
+    existing: Option<Config>,
+    label: Option<&str>,
+) -> Result<CaptureReport>
+where
+    C: CredentialStore,
+    S: AccountStash,
+{
+    // Bind the guard so it outlives the whole critical section and drops on return (releasing
+    // the lock). Acquired BEFORE the identity read, so a contended refusal is a true no-op and
+    // the two reads are ONE atomic pair with respect to a concurrent swap.
+    let _guard = match lock {
+        Some((path, max_wait)) => Some(SwapLock::acquire(path, max_wait).await?),
+        None => None,
+    };
+    // Identity first (a cheap file read) so "not logged in" fails before we touch the
+    // keychain; then the active token. Both under the lock — no swap can land between them.
+    let oauth = read_oauth_account_from(claude_json)?;
+    let credential = store.read().await?;
+    // Stash under the lock (the roster save is the caller's, after the lock releases).
+    run_capture(credential, oauth, stash, existing, label).await
 }
 
 /// Run the `login` command (issue #135): drive the isolated interactive-login capture engine
@@ -1429,6 +1485,142 @@ mod tests {
         assert_eq!(report.label, "locked");
         assert_eq!(store.read().await.unwrap().expose(), b"tok");
         assert!(stash.contains("Sessiometer/u-lock"));
+    }
+
+    /// Write a `~/.claude.json` whose active `oauthAccount` names `uuid` — the identity seam
+    /// the capture path reads first (via [`read_oauth_account_from`]), off the real file.
+    fn claude_json_with(dir: &std::path::Path, uuid: &str) -> std::path::PathBuf {
+        let path = dir.join("claude.json");
+        std::fs::write(
+            &path,
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","displayName":"ignored"}}}}"#),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn capture_locked_reads_both_halves_and_stashes_through_an_uncontended_lock() {
+        // AC: `capture()` is refactored into a reusable `capture_locked` primitive that reads
+        // identity + token and stashes under the swap lock (#64). Here we prove the locked path
+        // is WIRED and, uncontended, behaves EXACTLY like a plain single-threaded capture — NO
+        // behavior change (#357 AC). The serialization guarantee itself is proven by the
+        // concurrency test below (and, for the swap writers, in swap.rs).
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(b"cap-token".to_vec()))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+        let claude_json = claude_json_with(dir.path(), "u-cap");
+
+        let report = capture_locked(
+            Some((&lock, SWAP_LOCK_MAX_WAIT)),
+            &store,
+            &stash,
+            &claude_json,
+            None,
+            Some("work"),
+        )
+        .await
+        .unwrap();
+
+        // Same outcome a plain capture would produce: a first capture appends one account…
+        assert_eq!(report.outcome, CaptureOutcome::Captured);
+        assert_eq!(report.label, "work");
+        assert_eq!(report.count, 1);
+        assert_eq!(report.config.roster[0].account_uuid, "u-cap");
+        // …with BOTH halves stashed together under its uuid-derived service.
+        let stashed = stash.read("Sessiometer/u-cap").await.unwrap();
+        assert_eq!(stashed.credential.expose(), b"cap-token");
+        assert_eq!(stashed.oauth_account.account_uuid(), "u-cap");
+    }
+
+    #[tokio::test]
+    async fn a_swap_between_the_two_capture_reads_cannot_mis_key_the_roster() {
+        // #357 regression: capture reads the active identity (`~/.claude.json`) and THEN the
+        // active token (keychain) as two steps. If a daemon timer-swap lands BETWEEN them, the
+        // token gets stashed under the WRONG account's identity (a mis-keyed roster row). The
+        // fix holds the swap lock across BOTH reads, so a concurrent swap serializes and capture
+        // always sees a CONSISTENT (identity, token) pair. Mirrors the swap-side
+        // `two_real_swap_writers_on_one_item_never_leave_a_split_pair`: a fake YIELDS to widen
+        // the exact window a mis-key would open, and the lock closes it (drop the lock and this
+        // test mis-keys).
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // The active account is a COUPLED (identity, token) pair a swap flips atomically:
+        // account A is (u-A, A-token); account B is (u-B, B-token). A cross pair
+        // (e.g. u-A + B-token) is exactly the mis-key this guards against.
+        type Slot = Rc<RefCell<Option<Credential>>>;
+
+        // Capture's token-read seam: yields FIRST, widening the window between capture's
+        // (already-done) identity read and this token read — where an unlocked swap would slip
+        // in. Reads the shared active-token slot; capture never writes the canonical token.
+        struct ProbeStore {
+            slot: Slot,
+        }
+        impl CredentialStore for ProbeStore {
+            async fn read(&self) -> Result<Credential> {
+                tokio::task::yield_now().await;
+                self.slot.borrow().clone().ok_or(Error::CredentialNotFound)
+            }
+            async fn write(&self, _credential: &Credential) -> Result<()> {
+                unreachable!("capture_locked never writes the canonical token")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("swap.lock");
+        // The active account starts as A: identity u-A in `~/.claude.json`, token A-token.
+        let claude_json = claude_json_with(dir.path(), "u-A");
+        let slot: Slot = Rc::new(RefCell::new(Some(Credential::new(b"A-token".to_vec()))));
+
+        let store = ProbeStore { slot: slot.clone() };
+        let stash = FakeAccountStash::empty();
+        let lw = (lock.as_path(), SWAP_LOCK_MAX_WAIT);
+
+        // The concurrent "swap": under the SAME swap lock, atomically flip the active pair from
+        // A to B (identity u-A → u-B, token A-token → B-token). Holding the lock ⇒ it runs
+        // WHOLLY before or WHOLLY after capture's critical section, never between the two reads.
+        let swap_json = claude_json.clone();
+        let swap_slot = slot.clone();
+        let contend_swap = async move {
+            let _guard = SwapLock::acquire(lw.0, lw.1).await.unwrap();
+            std::fs::write(
+                &swap_json,
+                br#"{"oauthAccount":{"accountUuid":"u-B","displayName":"ignored"}}"#,
+            )
+            .unwrap();
+            *swap_slot.borrow_mut() = Some(Credential::new(b"B-token".to_vec()));
+        };
+
+        // capture's first `SwapLock::acquire` is synchronous-and-uncontended, so `join!`
+        // deterministically lets capture take the lock before the swap is polled — the ONE
+        // ordering that opens the between-reads window. The mirror ordering (swap-first) has no
+        // mis-key window (capture would then read a consistent post-swap pair), so this single
+        // ordering is the discriminating case, not a coverage gap.
+        let (cap, ()) = tokio::join!(
+            capture_locked(Some(lw), &store, &stash, &claude_json, None, None),
+            contend_swap,
+        );
+        let report = cap.unwrap();
+
+        // Whichever account capture landed on, the stashed token must BELONG to the stashed
+        // identity — never a cross pair. A mis-key (u-A stashed with B-token) fails here.
+        let uuid = report.config.roster[0].account_uuid.clone();
+        let stashed = stash.read(&format!("Sessiometer/{uuid}")).await.unwrap();
+        let token = stashed.credential.expose().to_vec();
+        let consistent =
+            (uuid == "u-A" && token == b"A-token") || (uuid == "u-B" && token == b"B-token");
+        assert!(
+            consistent,
+            "mis-keyed roster: identity {uuid} was stashed with the other account's token \
+             — a swap interleaved between capture's identity read and token read",
+        );
+        assert_eq!(stashed.oauth_account.account_uuid(), uuid);
     }
 
     // Keep the production entry (and its production-only callees — the real seam

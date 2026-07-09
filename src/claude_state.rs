@@ -89,18 +89,14 @@ impl OauthAccount {
     }
 }
 
-/// Read `~/.claude.json` and extract the active account's `oauthAccount` block.
-pub(crate) fn read_oauth_account() -> Result<OauthAccount> {
-    read_oauth_account_from(&paths::claude_json()?)
-}
-
-/// [`read_oauth_account`] against an explicit path — the injectable seam, so the
-/// not-found / malformed / no-account branches are testable without touching the
-/// real `~/.claude.json`.
+/// Read `~/.claude.json` at an explicit `path` and extract the active account's
+/// `oauthAccount` block — the injectable seam, so the not-found / malformed /
+/// no-account branches are testable without touching the real `~/.claude.json`.
 ///
-/// Crate-visible because the daemon (#7) reads a configurable `~/.claude.json`
-/// path through this — both to identify the active account each cycle and to
-/// reconcile-on-start — so its tests can point it at a temp file.
+/// Crate-visible because both the `capture` path (under the swap lock, #357) and the
+/// daemon (#7) read a configurable `~/.claude.json` path through this — the daemon to
+/// identify the active account each cycle and to reconcile-on-start — so their tests can
+/// point it at a temp file.
 pub(crate) fn read_oauth_account_from(path: &Path) -> Result<OauthAccount> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
