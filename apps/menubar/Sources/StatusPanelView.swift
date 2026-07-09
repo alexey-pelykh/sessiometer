@@ -168,10 +168,10 @@ private struct RosterView: View {
                 AccountRowView(row: row, now: now)
             }
         }
-        // The design reference insets the roster 8px from the panel edge (`.accts` padding), so the
-        // active row's accent card aligns with the swap-callout card below (also inset 8) instead of
-        // bleeding edge-to-edge.
-        .padding(.horizontal, 8)
+        // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
+        // the active row's accent card aligns with the swap-callout card below (also inset 8) instead of
+        // bleeding edge-to-edge, plus 6px above / 2px below for breathing room under the divider.
+        .padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 2)
     }
 }
 
@@ -423,7 +423,8 @@ private struct UsageBar: View {
     private func fillWidth(_ full: CGFloat) -> CGFloat {
         let clamped = min(1, max(0, fraction))
         guard clamped > 0 else { return 0 }
-        return max(4, full * clamped)
+        // Mock `.m-fill { min-width: 5px }` — a live-but-tiny percent keeps a visible sliver.
+        return max(5, full * clamped)
     }
 }
 
@@ -710,11 +711,13 @@ private struct FooterView: View {
                     .font(.caption2)
                     .accessibilityHidden(true)
                 Text(text)
-                    .font(.caption)
+                    .font(.system(size: 11))
                     .monospacedDigit()
                 Spacer(minLength: 0)
             }
-            .foregroundStyle(stale ? Color.orange : Color.secondary)
+            // Mock `.pop-foot .fl2 { color: var(--text-3) }` — the snapshot-age line is tertiary; amber
+            // only when the reading should be distrusted (wedged poll loop / stale / disconnected).
+            .foregroundStyle(stale ? Color.orange : Color(nsColor: .tertiaryLabelColor))
             .padding(.horizontal, 14).padding(.top, 9).padding(.bottom, 11)
         }
         .padding(.top, 5)
