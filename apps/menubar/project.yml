@@ -56,6 +56,12 @@ targets:
       # real socket and no live daemon.
       - path: Sources/ControlCommandClient.swift
       - path: Sources/SwapAck.swift
+      # Capture affordance (#360): the redacted `capture`-ack decoder + the AppKit-free capture model
+      # (idle → pending → done → failed). Both are pure logic over the SAME WatchConnection seam, so the
+      # capture state machine is driven hermetically by the in-process fake connector — no socket, no live
+      # daemon — and the ack decoding is exercised against every wire variant, alongside SwapAck.
+      - path: Sources/CaptureAck.swift
+      - path: Sources/AccountCaptureModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT

@@ -13,7 +13,8 @@
 //     tagged;
 //   * each honest state shows its banner;
 //   * the footer renders `next_swap` (forward candidate), not history;
-//   * the empty-roster card copies `sessiometer capture`;
+//   * `captureCommand` is the exact `sessiometer capture` CLI subcommand (the equivalent terminal command;
+//     the in-app capture affordance is #360, tested in `AccountCaptureTests`);
 //   * every row is VoiceOver-navigable (one spoken label).
 //
 // The wire → row → panel integration cases decode the shared golden fixtures through `parseWatchFrame`
@@ -275,7 +276,7 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertNil(StatusPanelFormat.nextSwapFooter(nil))   // no active anchor → no footer
     }
 
-    // MARK: - captureCommand (issue #326 AC: onboarding copies the exact command)
+    // MARK: - captureCommand (the CLI-equivalent subcommand; in-app capture affordance is #360)
 
     func testCaptureCommandIsTheExactSubcommand() {
         XCTAssertEqual(StatusPanelFormat.captureCommand, "sessiometer capture")

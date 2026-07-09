@@ -26,10 +26,55 @@ import Foundation
 /// I/O, no clock (the caller passes `now`), so every output is a deterministic function of its inputs.
 enum StatusPanelFormat {
 
-    /// The onboarding command the empty-roster card offers to COPY to the clipboard — the app is a
-    /// pure client and NEVER runs it (design-menubar "copy-command, never a runner"). The first-run
-    /// operator pastes it into a terminal to capture their first account.
+    /// The `sessiometer capture` CLI subcommand — retained as the equivalent terminal command an operator
+    /// may prefer (and the parity anchor for `StatusPanelFormatTests`). As of #360 the panel's PRIMARY
+    /// capture path is the in-app "Capture active account" affordance (a real daemon-routed action over the
+    /// #358 transport), NOT a clipboard copy of this string — see the capture-affordance copy below.
     static let captureCommand = "sessiometer capture"
+
+    // MARK: - Capture affordance copy (issue #360 — the in-app capture states)
+
+    /// The pending label. Capture is now a REAL daemon-routed action (#360: command → daemon → redacted
+    /// ack), so a pending state is HONEST — unlike the superseded copy-command, which never ran and so had
+    /// no honest in-flight state (design-menubar's old "no fake spinner" scoped only the never-running
+    /// copy-command; a real action earns a real pending).
+    static let capturePendingText = "Capturing…"
+
+    /// The success confirmation — "Captured '<label>'" under the label the daemon actually ASSIGNED (the
+    /// UUID-derived handle when the operator left the field blank), echoed from the redacted ack so the
+    /// operator sees the real handle, never a fabricated one. Curly quotes match the panel's typography.
+    static func captureDoneText(label: String) -> String {
+        "Captured \u{2018}\(label)\u{2019}"
+    }
+
+    /// Human copy for a capture failure — the redacted machine verdict mapped to ONE operator-facing
+    /// sentence (never the raw kebab tag or transport jargon), actionable where there is an action. Pure:
+    /// a deterministic function of the non-secret `CaptureFailure`, unit-tested in isolation.
+    static func captureErrorText(_ failure: CaptureFailure) -> String {
+        switch failure {
+        case .rejected(let reason):
+            switch reason {
+            case .noActiveAccount: return "No active account — run claude /login, then capture."
+            case .keychainLocked:  return "Keychain is locked — unlock it, then try again."
+            case .swapLockBusy:    return "The daemon is busy — try again in a moment."
+            case .failed:          return "Capture failed — try again."
+            }
+        case .daemonError(let reason):
+            // The same-user local peer should never be unauthorized; surface it plainly if it ever happens.
+            return reason == "unauthorized" ? "Not authorized to capture." : "Capture failed — try again."
+        case .transport(let error):
+            switch error {
+            case .connectionRefused: return "The daemon isn’t running."
+            case .timedOut:          return "The daemon didn’t respond — try again."
+            case .closedBeforeAck:   return "The daemon closed the connection — try again."
+            case .encodeFailed, .io: return "Capture failed — try again."
+            }
+        case .undecodable:
+            return "Unexpected reply from the daemon."
+        case .unavailable:
+            return "The daemon socket is unreachable."
+        }
+    }
 
     // MARK: - Percentage cell (mirror `src/cli.rs` `pct`)
 

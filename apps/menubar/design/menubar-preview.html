@@ -31,8 +31,11 @@
       custom label the field defaults to the account UUID (e.g. a1b2c3…); the label is never the
       email (the roster stores no email — it lives only in the encrypted credential). No full email renders.
     - provider-neutral — monochrome monogram badge + plain text label, no brand colour/logo.
-    - capture AND `brew upgrade` are COPY-command buttons — the app never runs them; NO fake
-      spinner (daemon-starting uses a STATIC "forming" glyph, not an animated spinner).
+    - capture is a REAL in-app daemon-routed action (#360 — a button + optional label field that sends
+      the verb over the #358 control socket and renders an honest pending → done → error from the
+      redacted ack; no credential ever reaches the client). `brew upgrade` (version-skew) STAYS a
+      copy-command button — the app can't self-update. The only "no fake spinner" left is daemon-
+      starting's STATIC "forming" glyph: the app fakes no progress it isn't actually doing.
     - never render healthy on a degraded/dead daemon (#137); disconnected rows are dimmed + "stale",
       never frozen-as-live; crash-loop debounces the healthy-flash.
   Self-contained: inline CSS/SVG, system font stack only, no external deps - opens over file://.
@@ -251,6 +254,44 @@
   .add-hint{ min-width:0; font-size:11px; color:var(--text-2) }
   .add-hint code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10.5px; background:var(--code-bg); color:var(--text); padding:1px 5px; border-radius:4px }
   .add-hint .copied{ color:var(--ok); font-weight:600 }
+
+  /* ---- capture affordance (#360 — a REAL daemon-routed action, honest pending state) ---- */
+  .cap{ display:flex; flex-direction:column; gap:8px }
+  .cap-row{ display:flex; align-items:center; gap:8px }
+  .cap-field{
+    font:inherit; font-size:12px; color:var(--text); padding:5px 9px; border-radius:7px; min-width:0;
+    border:.5px solid var(--btn-border); background:var(--code-bg); outline:none;
+  }
+  .cap-row .cap-field{ flex:1 1 auto }
+  .cap-field::placeholder{ color:var(--text-3) }
+  .cap-btn{
+    flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; font:inherit; font-size:12px; font-weight:600;
+    padding:6px 12px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:default;
+    box-shadow:0 1px 2px rgba(0,0,0,.22); white-space:nowrap;
+  }
+  .cap-btn.bordered{ background:var(--btn-bg); color:var(--text); border:.5px solid var(--btn-border); box-shadow:none; font-weight:500 }
+  .cap-btn:active{ transform:translateY(.5px) }
+  .cap-btn[disabled]{ opacity:.55 }
+  .cap-status{ display:flex; align-items:center; gap:6px; min-height:15px; font-size:11px; color:var(--text-2) }
+  .cap-status:empty{ display:none }
+  .cap-status code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10px; background:var(--code-bg); padding:1px 4px; border-radius:4px }
+  .cap-status .spin{
+    width:11px; height:11px; border-radius:50%; border:1.7px solid currentColor; border-top-color:transparent;
+    animation:capspin .7s linear infinite; opacity:.9;
+  }
+  .cap-status.pending{ color:var(--accent) }
+  .cap-status.done{ color:var(--ok); font-weight:600 }
+  .cap-status.error{ color:var(--fault-fg) }
+  @keyframes capspin{ to{ transform:rotate(360deg) } }
+  .cap-onb{ align-items:flex-start; width:100%; margin-top:14px }
+  .cap-onb .cap-field{ width:100% }
+  .cap-onb .cap-btn{ align-self:flex-start }
+  .cap-note{ font-size:10.5px; color:var(--text-3); line-height:1.4; margin-top:2px; text-align:left }
+  .cap-note code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10px }
+  /* capture interaction-states reference card (pending / done / error — not a connection state) */
+  .cap-demo{ padding:13px 14px 16px; display:flex; flex-direction:column; gap:12px }
+  .cap-demo-row{ display:flex; align-items:flex-start; gap:10px }
+  .cap-demo-row .cds-k{ flex:0 0 56px; font-size:9.5px; font-weight:600; letter-spacing:.05em; text-transform:uppercase; color:var(--text-3); padding-top:1px }
 
   /* ---- footer ---- */
   .pop-foot{
@@ -511,12 +552,15 @@
               <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
               <button class="swap-btn">Swap</button>
             </div>
-            <div class="add-row">
-              <button class="add-btn" data-cmd="sessiometer capture" onclick="copyCmd(this)">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                <span class="add-label">Add account&hellip;</span>
-              </button>
-              <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code></span></span>
+            <div class="cap">
+              <div class="cap-row">
+                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
+                <button class="cap-btn bordered" onclick="capSim(this,'ok')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                  Capture active account
+                </button>
+              </div>
+              <div class="cap-status"></div>
             </div>
             <div class="pop-foot">
               <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
@@ -583,12 +627,15 @@
               <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
               <button class="swap-btn">Swap</button>
             </div>
-            <div class="add-row">
-              <button class="add-btn" data-cmd="sessiometer capture" onclick="copyCmd(this)">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                <span class="add-label">Add account&hellip;</span>
-              </button>
-              <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code></span></span>
+            <div class="cap">
+              <div class="cap-row">
+                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
+                <button class="cap-btn bordered" onclick="capSim(this,'ok')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                  Capture active account
+                </button>
+              </div>
+              <div class="cap-status"></div>
             </div>
             <div class="pop-foot">
               <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
@@ -985,12 +1032,15 @@
               <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
               <button class="swap-btn">Swap</button>
             </div>
-            <div class="add-row">
-              <button class="add-btn" data-cmd="sessiometer capture" onclick="copyCmd(this)">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                <span class="add-label">Add account&hellip;</span>
-              </button>
-              <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code></span></span>
+            <div class="cap">
+              <div class="cap-row">
+                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
+                <button class="cap-btn bordered" onclick="capSim(this,'ok')">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+                  Capture active account
+                </button>
+              </div>
+              <div class="cap-status"></div>
             </div>
             <div class="pop-foot">
               <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
@@ -1166,7 +1216,7 @@
                 </button>
                 <span class="add-hint"><span class="hint-default">copies <code>brew upgrade sessiometer</code> &middot; the app can&rsquo;t update itself</span></span>
               </div>
-              <div class="msg-hint">Refuses to render any % on schema/version skew (I-002). A copy-command button, not a runner &mdash; the same rule as capture (consistency).</div>
+              <div class="msg-hint">Refuses to render any % on schema/version skew (I-002). A copy-command button, not a runner &mdash; the app can&rsquo;t self-update (unlike capture, which the daemon now performs in-app, #360).</div>
             </div>
           </div>
         </div>
@@ -1197,14 +1247,16 @@
               <span class="msg-badge invite"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
               <div class="msg-title">No accounts yet</div>
               <div class="msg-sub">Add an account to get started. Sessiometer tracks usage across all of them.</div>
-              <div class="msg-cmd-wrap">
-                <button class="btn primary" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+              <div class="cap cap-onb">
+                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
+                <button class="cap-btn" onclick="capSim(this,'ok')">
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                  <span class="add-label">Add account&hellip;</span>
+                  Capture active account
                 </button>
-                <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code> &middot; paste in Terminal</span></span>
+                <div class="cap-status"></div>
+                <div class="cap-note">To add a different account, run <code>claude /login</code> first, then capture.</div>
               </div>
-              <div class="msg-hint">Calm base mark, distinct from &ldquo;disconnected.&rdquo; The button <b>copies</b> the command &mdash; the app never runs capture, so there is no fake &ldquo;capturing&rdquo; spinner.</div>
+              <div class="msg-hint">Calm base mark, distinct from &ldquo;disconnected.&rdquo; The button <b>captures</b> the active account via the daemon (#358&thinsp;/&thinsp;#360) &mdash; a real action, so its pending &rarr; done &rarr; error is honest, not a fake spinner. The captured row then arrives on its own via the live watch stream (the affordance never inserts it).</div>
             </div>
           </div>
         </div>
@@ -1227,14 +1279,38 @@
               <span class="msg-badge invite"><svg width="27" height="27" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
               <div class="msg-title">No accounts yet</div>
               <div class="msg-sub">Add an account to get started. Sessiometer tracks usage across all of them.</div>
-              <div class="msg-cmd-wrap">
-                <button class="btn primary" data-cmd="sessiometer capture" onclick="copyCmd(this)">
+              <div class="cap cap-onb">
+                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
+                <button class="cap-btn" onclick="capSim(this,'ok')">
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                  <span class="add-label">Add account&hellip;</span>
+                  Capture active account
                 </button>
-                <span class="add-hint"><span class="hint-default">copies <code>sessiometer capture</code> &middot; paste in Terminal</span></span>
+                <div class="cap-status"></div>
+                <div class="cap-note">To add a different account, run <code>claude /login</code> first, then capture.</div>
               </div>
-              <div class="msg-hint">Calm base mark, distinct from &ldquo;disconnected.&rdquo; The button <b>copies</b> the command &mdash; the app never runs capture, so there is no fake &ldquo;capturing&rdquo; spinner.</div>
+              <div class="msg-hint">Calm base mark, distinct from &ldquo;disconnected.&rdquo; The button <b>captures</b> the active account via the daemon (#358&thinsp;/&thinsp;#360) &mdash; a real action, so its pending &rarr; done &rarr; error is honest, not a fake spinner. The captured row then arrives on its own via the live watch stream (the affordance never inserts it).</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CAPTURE · INTERACTION STATES (the affordance's pending / done / error — NOT a 10th connection state) -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
+          Capture &middot; states
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Capture affordance &middot; states</span></span>
+            </div>
+            <div class="div"></div>
+            <div class="cap-demo">
+              <div class="cap-demo-row"><span class="cds-k">Pending</span><span class="cap-status pending"><span class="spin"></span>Capturing&hellip;</span></div>
+              <div class="cap-demo-row"><span class="cds-k">Done</span><span class="cap-status done">&#10003;&ensp;Captured &lsquo;Work&rsquo;</span></div>
+              <div class="cap-demo-row"><span class="cds-k">Error</span><span class="cap-status error">&#9888;&ensp;No active account &mdash; run <code>claude /login</code>, then capture.</span></div>
             </div>
           </div>
         </div>
@@ -1252,7 +1328,7 @@
       <li><b>Never healthy on a degraded daemon (#137).</b> <b>Disconnected</b> shows the last-known roster <i>dimmed + &ldquo;stale&rdquo;</i> with a broken-link badge and a <i>Reconnect</i> escape &mdash; never frozen-as-live; swaps paused. <b>Crash-looping</b> persists a <b>fault</b> shape and holds status until a fresh snapshot survives a stability window (the healthy-flash is debounced).</li>
       <li><b>Freshness is a spectrum.</b> <b>Stale-snapshot</b> is milder than disconnected &mdash; still connected, so the full roster renders live with only a subtle amber <code>stale&nbsp;6m</code> modifier in the header and an amber freshness line in the footer; the swap stays enabled (the daemon re-mints viability on swap).</li>
       <li><b>Blocked states are honest and non-intrusive.</b> <b>Keychain-locked</b> keeps the fresh roster but marks the active account with an amber lock, pauses the swap callout, and only <i>waits</i> &mdash; the app never prompts or auto-unlocks. <b>Version-skew</b> refuses to render any % and offers a copy-command instead.</li>
-      <li><b>Copy-command, never a runner.</b> <b>Add account</b> (<code>sessiometer capture</code>), first-run onboarding, and version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>) all copy to the clipboard for you to paste in Terminal. The app never runs them, and <b>daemon-starting</b> uses a <i>static</i> forming glyph &mdash; there is no fake &ldquo;capturing&rdquo; or &ldquo;starting&rdquo; spinner anywhere.</li>
+      <li><b>Capture is a real action; copy-command only where the app can&rsquo;t act.</b> <b>Add account</b> and <b>first-run onboarding</b> now <b>capture</b> the active account in-app (#360) &mdash; a button + optional label field that sends the verb over the #358 control socket and renders an honest <i>pending &rarr; done &rarr; error</i> from the redacted ack (no credential ever reaches the client). The captured row then arrives on its own via the live watch stream &mdash; the affordance never inserts it. To add a <i>different</i> account the operator runs <code>claude /login</code> first, then captures (capture snapshots the active account; it is not a picker). Only where the app genuinely can&rsquo;t act does it still copy a command: version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>). <b>daemon-starting</b> stays a <i>static</i> forming glyph &mdash; the app fakes no progress it isn&rsquo;t doing.</li>
       <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
       <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each provider gets the same monochrome monogram badge and a plain text label (no brand colour or logo). The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
@@ -1263,7 +1339,9 @@
 </div><!-- /wrap -->
 
 <script>
-  // Add-account / Copy-update = COPY the command. Never runs it; never a fake spinner.
+  // Copy-update (version-skew) COPIES the command — the app can't self-update, so there is nothing to run.
+  // Capture is different: it is a REAL daemon-routed action (#360), so capSim() below demonstrates its
+  // HONEST pending -> done / error (the "Capture states" card documents the three treatments statically).
   function copyCmd(btn){
     var cmd = btn.getAttribute('data-cmd') || '';
     var hint = btn.parentNode.querySelector('.add-hint');
@@ -1288,6 +1366,34 @@
       document.body.appendChild(ta); ta.select();
       document.execCommand('copy'); document.body.removeChild(ta);
     }catch(e){/* clipboard blocked over file:// — the command is visible for manual copy */}
+  }
+
+  // #360 capture affordance: simulate the redacted-ack round-trip the SwiftUI panel drives — button
+  // disabled + honest "Capturing…" spinner (pending), then "Captured '<label>'" (done, auto-resets to
+  // idle) or the human error copy. A blank field → the daemon-derived UUID handle (never the email). This
+  // is a browser demo of the HONEST states; the app itself sends the verb over the #358 socket and renders
+  // the daemon's real ack.
+  function capSim(btn, outcome){
+    var cap = btn.closest('.cap');
+    if(!cap) return;
+    var status = cap.querySelector('.cap-status');
+    var field = cap.querySelector('.cap-field');
+    var label = (field && field.value.trim()) || 'a1b2c3';   // blank → daemon-derived UUID handle
+    btn.disabled = true;
+    if(status){ status.className = 'cap-status pending'; status.innerHTML = '<span class="spin"></span>Capturing&hellip;'; }
+    setTimeout(function(){
+      if(outcome === 'error'){
+        if(status){ status.className = 'cap-status error'; status.innerHTML = '&#9888;&ensp;No active account &mdash; run <code>claude /login</code>, then capture.'; }
+        btn.disabled = false;
+      } else {
+        if(status){ status.className = 'cap-status done'; status.innerHTML = '&#10003;&ensp;Captured &lsquo;'+label+'&rsquo;'; }
+        setTimeout(function(){
+          if(status){ status.className = 'cap-status'; status.innerHTML = ''; }
+          if(field){ field.value = ''; }
+          btn.disabled = false;
+        }, 1800);
+      }
+    }, 900);
   }
 </script>
 </body>

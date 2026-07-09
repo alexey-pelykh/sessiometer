@@ -27,19 +27,28 @@ final class StatusItemController {
     /// The SwiftUI host, kept so `openPanel` can size the panel to the current content.
     private let hostingView: NSView
     private let store: WatchStatusStore
+    /// The in-app capture affordance's model (issue #360). Owned here so the outside-click dismiss can be
+    /// GATED on `captureModel.isBusy` (a mid-edit label / in-flight capture must not be lost), and so the
+    /// non-activating panel can be re-asserted key when the label field takes focus.
+    private let captureModel: AccountCaptureModel
     private var presentationTask: Task<Void, Never>?
     /// The UX gap between the menu bar and the panel's top edge.
     private let panelGap: CGFloat = 6
     /// The outside-click monitor installed WHILE the panel is open (see `openPanel`). `nil` when closed.
     private var dismissMonitor: Any?
 
-    init(store: WatchStatusStore) {
+    init(store: WatchStatusStore, captureClient: ControlCommandClient?) {
         self.store = store
+        let captureModel = AccountCaptureModel(client: captureClient)
+        self.captureModel = captureModel
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // #326's status panel reads the store via `@EnvironmentObject` (a thin view over the
-        // `src/cli.rs`-mirroring `StatusPanelFormat`), so inject it here rather than through an init.
-        let hosting = NSHostingView(rootView: StatusPanelView().environmentObject(store))
+        // `src/cli.rs`-mirroring `StatusPanelFormat`), so inject it here rather than through an init. The
+        // #360 capture affordance reads the `AccountCaptureModel` the same way — injected alongside.
+        let hosting = NSHostingView(rootView: StatusPanelView()
+            .environmentObject(store)
+            .environmentObject(captureModel))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         self.hostingView = hosting
 
@@ -66,6 +75,11 @@ final class StatusItemController {
         panel.hasShadow = true
         panel.contentView = effect
         self.panel = panel
+
+        // Re-assert the non-activating panel as key when the capture label field takes focus (issue #360):
+        // a `FloatingPanel` (hidesOnDeactivate=false) can lose key when focus moves, leaving the SwiftUI
+        // `TextField` unable to accept keystrokes. `[weak panel]` — the controller already retains it.
+        captureModel.panelKeyRequest = { [weak panel] in panel?.makeKey() }
 
         NSLayoutConstraint.activate([
             hosting.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
@@ -199,6 +213,10 @@ final class StatusItemController {
                window.frame.contains(NSEvent.mouseLocation) {
                 return
             }
+            // #360: don't dismiss while the operator is mid-edit or a capture is in flight — an accidental
+            // outside-click must not drop a typed-but-unsubmitted label or hide an in-flight capture. The
+            // Esc key (field `.onExitCommand`) and the status-item toggle remain the deliberate closers.
+            if self.captureModel.isBusy { return }
             self.closePanel()
         }
     }
