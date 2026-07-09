@@ -91,6 +91,25 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.healthGlyph(.dead), "🔴")
     }
 
+    // MARK: - healthSymbol (panel-native SF Symbol per state — distinct SHAPES, not color-alone)
+
+    func testHealthSymbolMapsEachStateToADistinctShape() {
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.healthy).name, "checkmark.circle.fill")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.unknown).name, "questionmark.circle")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.stale).name, "clock.badge.exclamationmark")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.atRisk).name, "exclamationmark.triangle.fill")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.dead).name, "xmark.octagon.fill")
+        // Tints are semantic roles (the view maps them to system colors); unknown stays neutral (#137).
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.healthy).tint, .green)
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.unknown).tint, .neutral)
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.dead).tint, .red)
+        // Every symbol name is DISTINCT → health is shape-encoded, not color-alone (WCAG 1.4.1 — the fix
+        // the shape-identical emoji ramp lacked).
+        let names = Set([CredentialHealth.healthy, .unknown, .stale, .atRisk, .dead]
+            .map { StatusPanelFormat.healthSymbol($0).name })
+        XCTAssertEqual(names.count, 5)
+    }
+
     // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
 
     func testAuthCellMirrorsHealthCell() {
@@ -181,24 +200,24 @@ final class StatusPanelFormatTests: XCTestCase {
     func testRowAccessibilityLabelSpeaksTheRow() {
         let active = StatusPanelFormat.rowAccessibilityLabel(
             label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
-            quarantined: false, sessionPct: 60, weeklyPct: 10, resetIn: "10m", isNextSwapTarget: false)
+            quarantined: false, sessionPct: 60, weeklyPct: 10, resetIn: "10m")
         XCTAssertEqual(active, "work, active, auth healthy, session 60%, weekly 10%, resets in 10m")
 
         let dead = StatusPanelFormat.rowAccessibilityLabel(
             label: "old", isActive: false, auth: .dead, recovering: false, enabled: true,
-            quarantined: true, sessionPct: nil, weeklyPct: nil, resetIn: "n/a", isNextSwapTarget: true)
-        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a, weekly n/a, resets in n/a, next swap target")
+            quarantined: true, sessionPct: nil, weeklyPct: nil, resetIn: "n/a")
+        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a, weekly n/a, resets in n/a")
 
         // A healthy pre-#119 legacy account speaks no auth verdict (empty phrase dropped).
         let legacy = StatusPanelFormat.rowAccessibilityLabel(
             label: "leg", isActive: false, auth: nil, recovering: false, enabled: true,
-            quarantined: false, sessionPct: 5, weeklyPct: 5, resetIn: "2h", isNextSwapTarget: false)
+            quarantined: false, sessionPct: 5, weeklyPct: 5, resetIn: "2h")
         XCTAssertEqual(legacy, "leg, session 5%, weekly 5%, resets in 2h")
 
         // A parked (disabled) account speaks the `parked` tag.
         let parked = StatusPanelFormat.rowAccessibilityLabel(
             label: "p", isActive: false, auth: .healthy, recovering: false, enabled: false,
-            quarantined: false, sessionPct: 1, weeklyPct: 1, resetIn: "1h", isNextSwapTarget: false)
+            quarantined: false, sessionPct: 1, weeklyPct: 1, resetIn: "1h")
         XCTAssertEqual(parked, "p, auth healthy, parked, session 1%, weekly 1%, resets in 1h")
     }
 

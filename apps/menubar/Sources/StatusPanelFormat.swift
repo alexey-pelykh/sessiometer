@@ -99,6 +99,27 @@ enum StatusPanelFormat {
         }
     }
 
+    /// The native SF Symbol + semantic tint for a health state — the PANEL's per-medium render of the
+    /// SAME `CredentialHealth` the CLI (and `healthGlyph`, the byte-parity mirror) shows as an emoji. R-2
+    /// was re-ratified (2026-07-09) as STATE-parity — the enum + `authSpoken` rendered per-medium — so
+    /// the panel draws a native symbol while the CLI keeps its emoji. DISTINCT SHAPES per state (checkmark
+    /// / question / clock / triangle / octagon), so health is legible WITHOUT color — the WCAG 1.4.1 fix
+    /// the shape-identical emoji ramp lacked. `unknown` stays neutral (the #137 "no false green").
+    static func healthSymbol(_ health: CredentialHealth) -> (name: String, tint: HealthTint) {
+        switch health {
+        case .healthy: return ("checkmark.circle.fill", .green)
+        case .unknown: return ("questionmark.circle", .neutral)
+        case .stale:   return ("clock.badge.exclamationmark", .yellow)
+        case .atRisk:  return ("exclamationmark.triangle.fill", .orange)
+        case .dead:    return ("xmark.octagon.fill", .red)
+        }
+    }
+
+    /// The semantic tint ROLE for a health symbol. This Foundation-only namespace cannot name a SwiftUI
+    /// `Color`, so it names the ROLE; the view maps it to a system semantic color (green/yellow/orange/
+    /// red, `.secondary` for neutral) — never `Color.accentColor` (the AUTH glyph is never app-tinted, #84).
+    enum HealthTint: Equatable { case green, yellow, orange, red, neutral }
+
     /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a DEAD
     /// account's actionable `claude /login` cue (softened to `recovering` for a healing quarantined
     /// account, issue #109), then the independent `disabled` rotation tag (#36). A pre-#119 daemon
@@ -233,8 +254,9 @@ enum StatusPanelFormat {
 
     /// One spoken, comma-separated sentence for a row's VoiceOver label, so the whole row reads as a
     /// single accessible element rather than a scatter of unlabeled glyphs. Speaks identity, the active
-    /// marker, the auth verdict + its cue, both usage percents, the reset-in, and the next-swap marker —
-    /// the same facts the row shows visually.
+    /// marker, the auth verdict + its cue, both usage percents, and the reset-in — the same facts the row
+    /// shows visually. Next-swap is NOT per-row (R-2 re-ratified 2026-07-09): it is a single-cardinality
+    /// fact spoken once by the footer, mirroring the CLI (which has no per-row next marker).
     static func rowAccessibilityLabel(
         label: String,
         isActive: Bool,
@@ -244,8 +266,7 @@ enum StatusPanelFormat {
         quarantined: Bool,
         sessionPct: UInt8?,
         weeklyPct: UInt8?,
-        resetIn: String,
-        isNextSwapTarget: Bool
+        resetIn: String
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
@@ -253,7 +274,6 @@ enum StatusPanelFormat {
         parts.append("session \(pct(sessionPct))")
         parts.append("weekly \(pct(weeklyPct))")
         parts.append("resets in \(resetIn)")
-        if isNextSwapTarget { parts.append("next swap target") }
         // Drop any empty auth phrase (a healthy pre-#119 legacy account speaks no auth verdict).
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }

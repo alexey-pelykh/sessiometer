@@ -140,13 +140,13 @@ private struct AccountRowView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                // Active marker: a filled accent dot for the active account, a hollow placeholder
-                // otherwise (mirrors the `status` table's `*` active marker), kept the same width so
-                // labels stay aligned.
-                Circle()
-                    .fill(row.isActive ? Color.accentColor : Color.clear)
-                    .overlay(Circle().stroke(Color.secondary.opacity(row.isActive ? 0 : 0.4), lineWidth: 1))
-                    .frame(width: 7, height: 7)
+                // Active marker: SHAPE-encoded, never color (R-2 "shape + 'ACTIVE', not color") — a
+                // filled inset circle for the active account, a hollow ring otherwise (mirrors the
+                // `status` table's `*`). The accent that used to fill this ALSO marked "→ next", so blue
+                // meant two things; it is freed. Idiom-consistent with the health SF Symbol beside it.
+                Image(systemName: row.isActive ? "circle.inset.filled" : "circle")
+                    .font(.caption)
+                    .foregroundStyle(row.isActive ? Color.primary : Color.secondary)
                     .accessibilityHidden(true)
 
                 Text(row.label)
@@ -154,6 +154,17 @@ private struct AccountRowView: View {
                     .fontWeight(row.isActive ? .semibold : .regular)
                     .lineLimit(1)
                     .truncationMode(.middle)
+
+                // The word-half of "shape + 'ACTIVE'": a quiet, accent-free tag on the active row that
+                // also carries the emphasis the active account earns (it is the one in use).
+                if row.isActive {
+                    Text("ACTIVE")
+                        .font(.caption2).fontWeight(.semibold)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4).padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.14)))
+                        .accessibilityHidden(true)
+                }
 
                 Spacer(minLength: 6)
 
@@ -169,17 +180,11 @@ private struct AccountRowView: View {
                 Text("·").foregroundStyle(.tertiary)
                 Text("resets in \(resetIn)")
                     .monospacedDigit()
-                if row.isNextSwapTarget {
-                    Spacer(minLength: 6)
-                    Text("→ next")
-                        .foregroundStyle(Color.accentColor)
-                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
-            // Keep the metrics on ONE line — never wrap. The next-swap row adds "→ next", which at the
-            // old width pushed "resets in …" onto a second line; the widened panel fits it, and this is
-            // the belt-and-suspenders guard so an unusually long value truncates rather than wraps.
+            // Keep the metrics on ONE line — never wrap; an unusually long value truncates rather than
+            // wraps. (Dynamic Type at large accessibility sizes still needs a look — tracked, task #8.)
             .lineLimit(1)
         }
         .accessibilityElement(children: .ignore)
@@ -191,7 +196,11 @@ private struct AccountRowView: View {
     private var authView: some View {
         if let auth = row.auth {
             HStack(spacing: 4) {
-                Text(StatusPanelFormat.healthGlyph(auth))
+                let symbol = StatusPanelFormat.healthSymbol(auth)
+                Image(systemName: symbol.name)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(healthColor(symbol.tint))
+                    .accessibilityHidden(true)
                 if let cue = StatusPanelFormat.authCue(auth: auth,
                                                        recovering: row.isRecovering,
                                                        enabled: row.isEnabled) {
@@ -216,6 +225,18 @@ private struct AccountRowView: View {
         auth == .dead && !row.isRecovering ? .red : .secondary
     }
 
+    /// Map the pure `HealthTint` role to a system semantic color — never `accentColor` (the AUTH glyph
+    /// is never app-tinted, #84); `.neutral` (unknown) is `.secondary`, the #137 "no false green".
+    private func healthColor(_ tint: StatusPanelFormat.HealthTint) -> Color {
+        switch tint {
+        case .green:   return .green
+        case .yellow:  return .yellow
+        case .orange:  return .orange
+        case .red:     return .red
+        case .neutral: return .secondary
+        }
+    }
+
     private var accessibilityLabel: String {
         StatusPanelFormat.rowAccessibilityLabel(
             label: row.label,
@@ -226,8 +247,7 @@ private struct AccountRowView: View {
             quarantined: row.isQuarantined,
             sessionPct: row.sessionPct,
             weeklyPct: row.weeklyPct,
-            resetIn: resetIn,
-            isNextSwapTarget: row.isNextSwapTarget)
+            resetIn: resetIn)
     }
 }
 
