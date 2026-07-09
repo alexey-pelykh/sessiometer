@@ -52,6 +52,7 @@ use crate::config::{Account, RefreshConfig};
 use crate::contract::{Clock, RefreshDelta, RefreshObservation, RefreshTicker, SweepOutcome};
 use crate::error::Result;
 use crate::observability::{Event, RefreshEventOutcome};
+use crate::paths;
 use crate::refresh::{self, RefreshOutcome, RefreshReport};
 use crate::stash::RealAccountStash;
 
@@ -67,21 +68,38 @@ pub(crate) trait RefreshEngine {
     async fn refresh(&self, account: &Account) -> Result<RefreshReport>;
 }
 
-/// The production [`RefreshEngine`]: the real keychain-backed stash plus the resolved
-/// `claude` binary, wired straight into the #102 engine entry points
+/// The production [`RefreshEngine`]: the real keychain-backed stash plus the
+/// `[refresh].claude_bin` override, wired straight into the #102 engine entry points
 /// ([`refresh::stored_expires_at`], [`refresh::refresh_account`]) — the same wiring `poke`'s
 /// `RealPokeEngine` uses.
+///
+/// Holds the OVERRIDE, not a resolved path (issue #375): the `claude` binary is resolved PER
+/// CYCLE at the spawn site via [`resolve_binary`](Self::resolve_binary), so a symlink / `$PATH`
+/// / version change AFTER the daemon started is picked up on the next cycle with no restart.
+/// Before #375 `cli` resolved once at startup and froze the `PathBuf` here, so any later change
+/// was invisible until a manual restart — and a frozen path that stopped working failed EVERY
+/// cycle (the periodic sweep #105 AND the #162 poll-refresh, which share this one engine).
 pub(crate) struct RealRefreshEngine {
     stash: RealAccountStash,
-    claude_binary: PathBuf,
+    claude_bin: Option<PathBuf>,
 }
 
 impl RealRefreshEngine {
-    pub(crate) fn new(stash: RealAccountStash, claude_binary: PathBuf) -> Self {
-        Self {
-            stash,
-            claude_binary,
-        }
+    pub(crate) fn new(stash: RealAccountStash, claude_bin: Option<PathBuf>) -> Self {
+        Self { stash, claude_bin }
+    }
+
+    /// Resolve the `claude` binary to spawn THIS cycle (issue #375). Reuses the UNCHANGED
+    /// resolution policy ([`paths::claude_binary_with_override`]: `[refresh].claude_bin` →
+    /// `$CLAUDE_BIN` → `$PATH`); only the TIMING moved from once-at-startup to per-cycle, and
+    /// WHICH binary is chosen is identical to before — no symlink canonicalization, no
+    /// prefer-the-"real"-binary, no validation that the target is the genuine CLI (a wrapper
+    /// symlink is spawned as-is). A resolution failure is returned as `Err` for the caller to
+    /// treat non-fatally: [`run_sweep`](RefreshTick::run_sweep) records an `error` refresh event
+    /// and the #162 poll path lets the 401 stand — both retry next cycle, and the tick is never
+    /// permanently disabled.
+    fn resolve_binary(&self) -> Result<PathBuf> {
+        paths::claude_binary_with_override(self.claude_bin.as_deref())
     }
 }
 
@@ -91,11 +109,14 @@ impl RefreshEngine for RealRefreshEngine {
     }
 
     async fn refresh(&self, account: &Account) -> Result<RefreshReport> {
+        // Resolve per cycle at the spawn site (issue #375), not from a frozen field — the `?` is
+        // the non-fatal path `run_sweep` (and the #162 poll) already handle fail-safe.
+        let claude_binary = self.resolve_binary()?;
         refresh::refresh_account(
             &self.stash,
             &account.stash(),
             &account.account_uuid,
-            self.claude_binary.clone(),
+            claude_binary,
         )
         .await
     }
@@ -104,12 +125,13 @@ impl RefreshEngine for RealRefreshEngine {
 /// The periodic refresh tick — the run loop's [`RefreshTicker`] seam (issue #105).
 ///
 /// Owns a copy of the roster (fixed for the daemon's life), the validated [`RefreshConfig`],
-/// the engine + clock seams, and the cadence anchor (`last_refresh`). `enabled` is the
-/// EFFECTIVE switch: `config.enabled` AND a successfully-resolved `claude` binary (a
-/// resolution failure disables the tick with a warning rather than failing the daemon — see
-/// [`crate::cli`]). When disabled the ticker is wholly inert: [`until_due`](Self::until_due)
-/// never resolves, so the tick adds no clock activity and the idle select behaves exactly as
-/// before #105.
+/// the engine + clock seams, and the cadence anchor (`last_refresh`). `enabled` mirrors the
+/// CONFIG `[refresh].enabled` (issue #375): the `claude` binary is resolved PER CYCLE at the
+/// engine's spawn site, so the tick is no longer gated on a successful startup resolution — a
+/// cycle-time resolution failure is non-fatal (recorded as an `error` refresh event, retried
+/// next cycle) and never disables the tick (see [`crate::cli`]). When disabled the ticker is
+/// wholly inert: [`until_due`](Self::until_due) never resolves, so the tick adds no clock
+/// activity and the idle select behaves exactly as before #105.
 pub(crate) struct RefreshTick<E, K> {
     roster: Vec<Account>,
     config: RefreshConfig,
@@ -129,7 +151,8 @@ pub(crate) struct RefreshTick<E, K> {
 }
 
 impl<E, K> RefreshTick<E, K> {
-    /// Build a tick. `enabled` is the effective switch (caller folds in binary resolution).
+    /// Build a tick. `enabled` mirrors the CONFIG `[refresh].enabled` switch (issue #375: the
+    /// engine resolves `claude` per cycle, so the caller no longer folds startup resolution in).
     pub(crate) fn new(
         roster: Vec<Account>,
         config: RefreshConfig,
@@ -600,6 +623,51 @@ mod tests {
                 now: Instant::now(),
             },
         )
+    }
+
+    // --- RealRefreshEngine per-cycle binary resolution (issue #375) ---------
+
+    #[test]
+    fn real_refresh_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
+        // Issue #375 regression, at the engine that backs BOTH the #105 periodic sweep and the
+        // #162 poll-refresh (it impls `RefreshEngine` and, through it, `PollRefresh`). The engine
+        // holds the `[refresh].claude_bin` OVERRIDE and resolves the spawn binary PER CYCLE, so a
+        // mid-run symlink re-point — a Claude Code auto-update, a version-dir swap — is picked up
+        // on the next cycle with no daemon restart. Built ONCE, resolved THREE times across two
+        // re-points: the frozen-at-startup design this fixes could only ever return its first
+        // result, so the Ok → Err → Ok sequence below is impossible under it.
+        let tmp = tempfile::tempdir().unwrap();
+        let version_a = tmp.path().join("claude-A");
+        let version_b = tmp.path().join("claude-B");
+        std::fs::write(&version_a, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&version_b, b"#!/bin/sh\n").unwrap();
+        // The `claude` symlink an updater re-points, configured as the override.
+        let link = tmp.path().join("claude");
+        std::os::unix::fs::symlink(&version_a, &link).unwrap();
+
+        // Built ONCE — exactly as the daemon builds it once at startup.
+        let engine = RealRefreshEngine::new(RealAccountStash::new(), Some(link.clone()));
+
+        // Cycle 1: link → A (exists) → Ok. The resolver returns the SYMLINK path UNCANONICALIZED
+        // (AC4 / issue constraint [C1]: a wrapper symlink is spawned as-is, never resolved to its
+        // target), so the fix changes only the timing of resolution, never which binary is chosen.
+        assert_eq!(engine.resolve_binary().unwrap(), link);
+
+        // A Claude Code auto-update removes the target the symlink pointed at (the "resolved
+        // version directory deleted by an updater" failure): the SAME engine now resolves to a
+        // NON-FATAL error on its next cycle (AC2), rather than reusing a stale frozen path.
+        std::fs::remove_file(&version_a).unwrap();
+        assert!(matches!(
+            engine.resolve_binary(),
+            Err(crate::error::Error::ClaudeBinaryNotFound)
+        ));
+
+        // …then the update re-points `claude` at the freshly installed binary — and the next cycle
+        // SELF-HEALS with no restart and no reconstruction of the engine (AC1, the whole point of
+        // #375). Under the frozen design this stays broken until a manual restart.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&version_b, &link).unwrap();
+        assert_eq!(engine.resolve_binary().unwrap(), link);
     }
 
     // --- is_near_expiry / account_listed (pure) -----------------------------
