@@ -31,6 +31,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var transport: WatchTransport?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        // Design-parity tooling (not a product path): `--render-panel <dir>` renders the panel to PNGs
+        // for diffing against the mock, then exits — never wires the status item. Runs here so the full
+        // AppKit environment (fonts, system colors) is up before `ImageRenderer` draws.
+        if let idx = CommandLine.arguments.firstIndex(of: "--render-panel"),
+           idx + 1 < CommandLine.arguments.count {
+            RenderPanelTool.run(outputDir: CommandLine.arguments[idx + 1])
+            exit(0)
+        }
+        #endif
+
         // The always-visible chrome: the status item consumes the store's glance stream.
         let store = WatchStatusStore()
         self.store = store
