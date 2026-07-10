@@ -56,6 +56,14 @@ which is the mock). Light shown here:
 - the **Swap** button is present-but-disabled — its click action is #169
 - no Status/Stats segmented control — Stats has no socket data path (spike #356)
 
+**Harness limitation — the capture field is NOT verified by the tool.** SwiftUI `ImageRenderer`
+cannot rasterize the AppKit-backed `TextField` in the #360 capture affordance (the operator-label
+input on the empty-roster / first-run onboarding + Add-account states): it draws a blank placeholder
+box, not the real field. So `--render-panel` faithfully captures every state's layout, color, and
+typography **except** that one label field — it needs a manual check against the mock in a real
+popover (open the panel → **Add account**, or first-run). Treat a blank/placeholder capture-field
+box in the PNGs as a known tool artifact, not a panel defect.
+
 ### Design vs. capture, screen by screen
 
 `build-comparison.py` assembles a single self-contained page that puts the mock's **live** `.pop`

@@ -558,7 +558,7 @@ private struct SwapCalloutCard: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .disabled(true)
-                .help("Swap-on-click wiring is tracked in #169")
+                .help("Switching accounts from the panel isn't available yet")
         }
         .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
         .background(
