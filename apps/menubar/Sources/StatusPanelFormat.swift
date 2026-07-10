@@ -279,12 +279,12 @@ enum StatusPanelFormat {
                           detail: "Connected to the daemon — no accounts configured.",
                           kind: .info)
         case .stale:
-            let base = "The daemon has gone quiet; showing the last-known reading"
+            let base = "Daemon quiet; showing last-known"
             return Banner(title: "Data may be stale",
                           detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .warning)
         case .disconnected:
-            let base = "Reconnecting; showing the last-known reading"
+            let base = "Reconnecting; showing last-known"
             return Banner(title: "Daemon not responding",
                           detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .error)

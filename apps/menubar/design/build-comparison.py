@@ -74,8 +74,9 @@ STATES = [
          note="The daemon speaks a wire contract this client can’t safely read → numbers refused, a plain "
               "honest message. The mock’s richer “brew upgrade” affordance is #169."),
     dict(title="6 · Empty roster / first run", theme="light", design=13, capture="panel-empty-roster-light.png",
-         note="Connected, zero accounts — an onboarding card distinct from daemon-down. The "
-              "<code>sessiometer capture</code> command is COPIED, never run (C-005)."),
+         note="Connected, zero accounts — an onboarding card distinct from daemon-down. First run "
+              "captures the active account <b>in-app</b> (operator-label field + button over the #358 "
+              "control socket, honest pending → done → error) — not a copied command (#360)."),
     dict(title="6 · Empty roster / first run (dark)", theme="dark", design=14, capture="panel-empty-roster-dark.png",
          note="Onboarding, dark appearance."),
 ]
