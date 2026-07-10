@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Menu-bar glyph: mark only, on transparent. Resting pose, monochrome.
+       Rendered as a template image (macOS tints it) for the resting state;
+       generate.sh derives colored status variants (needle rotates per state). -->
+  <g fill="none" stroke="#1D1D1F" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/>
+    <path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#1D1D1F" stroke-width="0.6"/>
+    <path d="M12 12 14.75 7.24" stroke-width="2.2"/>
+    <circle cx="12" cy="12" r="1.5" fill="#1D1D1F" stroke="none"/>
+  </g>
+</svg>

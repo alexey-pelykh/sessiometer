@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2c2b27"/>
+      <stop offset="1" stop-color="#1b1a17"/>
+    </linearGradient>
+  </defs>
+  <!-- warm-graphite instrument body -->
+  <rect width="1024" height="1024" rx="229" fill="url(#body)"/>
+  <rect x="1.5" y="1.5" width="1021" height="1021" rx="227.5" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="3"/>
+  <!-- Cycle Gauge mark, bone/ivory, resting signature pose -->
+  <g transform="translate(176,176) scale(28)" fill="none" stroke="#EDE8DF" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/>
+    <path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#EDE8DF" stroke-width="0.6"/>
+    <path d="M12 12 14.75 7.24" stroke-width="2.2"/>
+    <circle cx="12" cy="12" r="1.5" fill="#EDE8DF" stroke="none"/>
+  </g>
+</svg>
