@@ -87,20 +87,17 @@ const DEFAULT_MONITOR_401_N: u8 = 3;
 /// account is restored to the rotation (issue #42).
 const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
 
-/// Default seconds between periodic isolated-refresh ticks (issue #105). **Provisional**:
-/// the refresh-token TTL is unproven (#101 deliberately ran no real refresh), so this is
-/// NOT pinned to a specific `TTL/3` — it is a conservative one-hour default that keeps a
-/// parked token fresh across a wide range of plausible access-token lifetimes without
-/// churning refresh-token rotations, and doubles as the near-expiry SELECTION horizon (an
-/// account is due when its stored token would expire before the next tick — see
-/// [`RefreshConfig::cadence`]). Re-tune once the engine's own first-run telemetry
-/// (`expiresAt`-delta + RT-rotation, the #102 [`crate::refresh::RefreshReport`]) pins the
-/// server TTL; the #104 `poke` all-accounts horizon used the same one hour for the same reason.
+/// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
+/// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
+/// refresh — a sliding window, not a fixed cap), but the cadence is deliberately NOT pinned to a
+/// specific `TTL/3` — one hour keeps a parked token fresh well within its access-token TTL without
+/// churning refresh-token rotations, and doubles as the near-expiry SELECTION horizon (an account
+/// is due when its stored token would expire before the next tick — see [`RefreshConfig::cadence`]).
+/// The #104 `poke` all-accounts horizon uses the same one hour for the same reason.
 const DEFAULT_REFRESH_CADENCE_SECS: u64 = 3600;
-/// Default seconds the daemon must idle before a refresh sweep fires (issue #105).
-/// **Provisional** like the cadence: one minute lets the idle floor — anchored absolutely
-/// since #260, so it accumulates rather than resetting on each idle re-arm — elapse soon after
-/// start-up without waiting out a whole poll interval. Re-tune with the cadence.
+/// Default seconds the daemon must idle before a refresh sweep fires (issue #105). One minute lets
+/// the idle floor — anchored absolutely since #260, so it accumulates rather than resetting on each
+/// idle re-arm — elapse soon after start-up without waiting out a whole poll interval.
 const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
 /// Default seconds bounding ONE account's whole isolated-refresh cycle (issue #105). The
 /// engine's internal `claude -p` spawn budget is ~40 s (#102); ninety seconds leaves
@@ -330,10 +327,10 @@ fn default_poll_jitter() -> Jitter {
 /// The periodic isolated-refresh schedule (issue #105) — the in-daemon counterpart of the
 /// one-shot `poke` (#104), wiring the #102 refresh engine into the `run` loop's idle path.
 ///
-/// **Opt-in**: `enabled` defaults `false`, so a daemon refreshes nothing unless an operator
-/// turns it on. When on, between poll→usage→swap ticks the daemon keeps PARKED accounts'
-/// stored tokens fresh by letting Claude Code refresh them in an isolated `CLAUDE_CONFIG_DIR`
-/// (the engine's whole job), never touching the live session's canonical credential.
+/// **On by default**: `enabled` defaults `true`, so the daemon keeps PARKED accounts' stored
+/// tokens fresh unless an operator turns it OFF. Between poll→usage→swap ticks it lets Claude
+/// Code refresh them in an isolated `CLAUDE_CONFIG_DIR` (the engine's whole job), never touching
+/// the live session's canonical credential.
 ///
 /// The tick honors the engine's Caller contract: it refreshes parked accounts only (the
 /// active account and the imminent swap target are excluded; the swap lock the engine holds
@@ -341,9 +338,10 @@ fn default_poll_jitter() -> Jitter {
 /// dead-credential recovery path (#13/#42) absorbing a forfeited token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefreshConfig {
-    /// Whether the periodic refresh tick runs at all. **Off by default** (opt-in): the
-    /// refresh-token TTL is unproven (#101) and each refresh may rotate it, so an operator
-    /// turns this on deliberately.
+    /// Whether the periodic refresh tick runs at all. **On by default**: each refresh slides the
+    /// stored expiry forward, and any rotated refresh token is captured and re-stashed, so the
+    /// mechanism is self-sustaining. #101's TTL question is resolved (a sliding window, not a fixed
+    /// cap); an operator can still set `enabled = false` to turn it off deliberately.
     pub(crate) enabled: bool,
     /// The parked accounts the tick is allowed to refresh, each named by its `list` label OR
     /// `account_uuid` (the same resolution `poke` and `use` key on). **Empty = all** parked
@@ -356,13 +354,14 @@ pub(crate) struct RefreshConfig {
     /// account is *due* when its stored token would expire within one cadence of now — i.e.
     /// it would not survive until the next tick — so the cadence IS the configurable,
     /// TTL-aware threshold (#104 left the all-accounts horizon provisional for #105 to own).
-    /// **Provisional default** ([`DEFAULT_REFRESH_CADENCE_SECS`]) pending #101's TTL.
+    /// **Default** ([`DEFAULT_REFRESH_CADENCE_SECS`]): a conservative one-hour cadence that keeps a
+    /// parked token fresh well within its access-token TTL (#101 resolved — a sliding window).
     pub(crate) cadence_secs: u64,
     /// Seconds the daemon must idle before a refresh sweep fires (issue #105). Anchored
     /// absolutely since #260: the idle floor no longer restarts on every idle re-arm (the 15 s
     /// login-watch, a control read), so it accumulates across the idle gap instead of resetting
     /// off the poll→usage→swap seam — which bounds primarily the FIRST sweep after a (re)start,
-    /// after which steady-state sweeps fire on the cadence alone. **Provisional default**
+    /// after which steady-state sweeps fire on the cadence alone. **Default**
     /// ([`DEFAULT_REFRESH_IDLE_AFTER_SECS`]).
     pub(crate) idle_after_secs: u64,
     /// Seconds bounding ONE account's whole isolated-refresh cycle (issue #105); a cycle that
@@ -387,7 +386,7 @@ pub(crate) struct RefreshConfig {
 impl Default for RefreshConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             accounts: Vec::new(),
             cadence_secs: DEFAULT_REFRESH_CADENCE_SECS,
             idle_after_secs: DEFAULT_REFRESH_IDLE_AFTER_SECS,
@@ -602,7 +601,7 @@ pub(crate) struct Config {
     pub(crate) roster: Vec<Account>,
     /// Poll/swap tunables.
     pub(crate) tunables: Tunables,
-    /// The periodic isolated-refresh schedule (issue #105); opt-in, disabled by default.
+    /// The periodic isolated-refresh schedule (issue #105); on by default (#409).
     pub(crate) refresh: RefreshConfig,
     /// The one-shot `login` verb's settings (issue #135): capture timeout + optional `claude`
     /// binary override. Consumed by `crate::capture::login`, never by the daemon.
@@ -1372,17 +1371,19 @@ impl Config {
             render_jitter(&t.cooldown_strategy.jitter)
         ));
 
-        // The periodic isolated-refresh schedule (issue #105). Opt-in and OFF by default;
-        // the cadence/idle defaults are provisional pending the refresh-token TTL (#101).
+        // The periodic isolated-refresh schedule (issue #105). ON by default (#409): each refresh
+        // slides the stored expiry forward and re-stashes any rotated token, so it is self-sustaining
+        // (#101's TTL question is resolved — a sliding window, not a fixed cap).
         let r = &self.refresh;
         out.push_str("\n[refresh]\n");
         out.push_str(
             "# Periodically let Claude Code refresh PARKED accounts' stored tokens in an\n\
              # isolated config dir (the in-daemon counterpart of `poke`), off the\n\
              # poll/usage/swap seam — the live session's credential is never touched. The\n\
-             # active account and the imminent swap target are always excluded. OFF by\n\
-             # default (opt-in): each refresh may rotate the refresh token, whose durable\n\
-             # lifetime is not yet pinned.\n",
+             # active account and the imminent swap target are always excluded. ON by\n\
+             # default: each refresh slides the stored token's expiry forward and re-stashes\n\
+             # any rotated refresh token, so the schedule is self-sustaining. Set enabled\n\
+             # = false to turn it off.\n",
         );
         out.push_str(&format!("enabled = {}\n", r.enabled));
         out.push_str(
@@ -1393,12 +1394,12 @@ impl Config {
         out.push_str(
             "# Seconds between refresh ticks AND the near-expiry horizon (60..=86400): an\n\
              # account is refreshed when its stored token would expire within one cadence\n\
-             # (i.e. before the next tick). Provisional default pending the token TTL.\n",
+             # (i.e. before the next tick). A conservative one-hour default.\n",
         );
         out.push_str(&format!("cadence_secs = {}\n", r.cadence_secs));
         out.push_str(
             "# Seconds the daemon must idle before the first refresh sweep after start-up\n\
-             # (0..=3600); anchored absolutely (#260), then sweeps recur on cadence. Provisional.\n",
+             # (0..=3600); anchored absolutely (#260), then sweeps recur on cadence.\n",
         );
         out.push_str(&format!("idle_after_secs = {}\n", r.idle_after_secs));
         out.push_str(
@@ -1782,7 +1783,7 @@ fn default_monitor_recovery_m() -> i64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRefresh {
-    #[serde(default)]
+    #[serde(default = "default_refresh_enabled")]
     enabled: bool,
     #[serde(default)]
     accounts: Vec<String>,
@@ -1801,7 +1802,7 @@ struct RawRefresh {
 impl Default for RawRefresh {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_refresh_enabled(),
             accounts: Vec::new(),
             cadence_secs: default_refresh_cadence_secs(),
             idle_after_secs: default_refresh_idle_after_secs(),
@@ -1812,6 +1813,14 @@ impl Default for RawRefresh {
     }
 }
 
+/// The default for [`RawRefresh::enabled`] (issue #409): an absent `enabled` key — whether the
+/// whole `[refresh]` section is omitted (via [`RawRefresh::default`]) or only the key is (via this
+/// field default) — resolves to refresh ON, the self-sustaining sliding-window default. An operator
+/// opts OUT with an explicit `enabled = false`, which serde parses verbatim (a present key never
+/// takes this default).
+fn default_refresh_enabled() -> bool {
+    true
+}
 fn default_refresh_cadence_secs() -> i64 {
     DEFAULT_REFRESH_CADENCE_SECS as i64
 }
@@ -2364,10 +2373,10 @@ label = "personal"
 
     #[test]
     fn refresh_defaults_when_table_absent() {
-        // No [refresh] table → the opt-in feature is OFF with provisional defaults.
+        // No [refresh] table → the feature is ON by default (#409) with its standard defaults.
         let config = Config::parse(VALID).unwrap();
         assert_eq!(config.refresh, RefreshConfig::default());
-        assert!(!config.refresh.enabled);
+        assert!(config.refresh.enabled);
         assert!(config.refresh.accounts.is_empty());
         assert_eq!(config.refresh.cadence_secs, DEFAULT_REFRESH_CADENCE_SECS);
         assert_eq!(
@@ -2413,12 +2422,23 @@ label = "personal"
 
     #[test]
     fn refresh_missing_key_takes_its_default() {
-        // A partial [refresh] table fills only the named keys; the rest default.
-        let toml = format!("{VALID}\n[refresh]\nenabled = true\n");
+        // A partial [refresh] table fills only the named keys; the rest default — and an absent
+        // `enabled` key now takes the on-by-default (#409), not off.
+        let toml = format!("{VALID}\n[refresh]\ncadence_secs = 7200\n");
         let config = Config::parse(&toml).unwrap();
         assert!(config.refresh.enabled);
-        assert_eq!(config.refresh.cadence_secs, DEFAULT_REFRESH_CADENCE_SECS);
+        assert_eq!(config.refresh.cadence_secs, 7200);
         assert_eq!(config.refresh.timeout_secs, DEFAULT_REFRESH_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn refresh_explicit_false_still_disables() {
+        // Backward-compat (#409): an operator can still opt OUT — an explicit `enabled = false`
+        // parses to a disabled refresh even though the default is now on. A present key is never
+        // overridden by the on-by-default serde default.
+        let toml = format!("{VALID}\n[refresh]\nenabled = false\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(!config.refresh.enabled);
     }
 
     #[test]
@@ -2500,9 +2520,9 @@ label = "personal"
     }
 
     #[test]
-    fn rendered_default_refresh_is_off_with_commented_claude_bin() {
-        // The rendered default [refresh] block is disabled and leaves claude_bin commented
-        // (so a fresh `capture` writes an inert, self-documenting block) yet round-trips.
+    fn rendered_default_refresh_is_on_with_commented_claude_bin() {
+        // The rendered default [refresh] block is enabled (#409) and leaves claude_bin commented
+        // (so a fresh `capture` writes a self-documenting, on-by-default block) yet round-trips.
         let config = Config::parse(VALID).unwrap();
         let text = config.render();
         assert!(
@@ -2510,8 +2530,8 @@ label = "personal"
             "render must emit [refresh]: {text}"
         );
         assert!(
-            text.contains("enabled = false"),
-            "default refresh must render disabled: {text}"
+            text.contains("enabled = true"),
+            "default refresh must render enabled: {text}"
         );
         assert!(
             text.contains("# claude_bin ="),
