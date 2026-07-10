@@ -91,6 +91,25 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.healthGlyph(.dead), "🔴")
     }
 
+    // MARK: - healthSymbol (panel-native SF Symbol per state — distinct SHAPES, not color-alone)
+
+    func testHealthSymbolMapsEachStateToADistinctShape() {
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.healthy).name, "checkmark.circle.fill")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.unknown).name, "questionmark.circle")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.stale).name, "clock.badge.exclamationmark")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.atRisk).name, "exclamationmark.triangle.fill")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.dead).name, "xmark.octagon.fill")
+        // Tints are semantic roles (the view maps them to system colors); unknown stays neutral (#137).
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.healthy).tint, .green)
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.unknown).tint, .neutral)
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.dead).tint, .red)
+        // Every symbol name is DISTINCT → health is shape-encoded, not color-alone (WCAG 1.4.1 — the fix
+        // the shape-identical emoji ramp lacked).
+        let names = Set([CredentialHealth.healthy, .unknown, .stale, .atRisk, .dead]
+            .map { StatusPanelFormat.healthSymbol($0).name })
+        XCTAssertEqual(names.count, 5)
+    }
+
     // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
 
     func testAuthCellMirrorsHealthCell() {
@@ -161,6 +180,92 @@ final class StatusPanelFormatTests: XCTestCase {
         }
     }
 
+    // MARK: - snapshot age (council: the panel↔CLI parity render of the wire `generated_at`)
+
+    func testSnapshotAgeTextRendersUpdatedAgoOrNilWhenNoInstant() {
+        let now: Int64 = 1_000_000
+        // No generation instant (the wire's `0` sentinel for a never-generated snapshot) → no age line.
+        XCTAssertNil(StatusPanelFormat.snapshotAgeText(generatedAt: 0, now: now))
+        XCTAssertNil(StatusPanelFormat.snapshotAgeText(generatedAt: -5, now: now))
+        // A same-instant snapshot reads "just now"; older ones humanize with the reset-in vocabulary
+        // (the same `humanizeUntil` two-largest-unit format, so the panel↔CLI parity is inherited).
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now, now: now), "updated just now")
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now - 45, now: now), "updated <1m ago")
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now - 600, now: now), "updated 10m ago")
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now - 2 * 3600, now: now), "updated 2h ago")
+        // Client-ahead clock skew clamps to "just now" — never a negative age.
+        XCTAssertEqual(StatusPanelFormat.snapshotAgeText(generatedAt: now + 30, now: now), "updated just now")
+    }
+
+    func testSnapshotIsStaleBeyondMaxPollCadence() {
+        let now: Int64 = 1_000_000
+        // Absent freshness is unknown, not stale.
+        XCTAssertFalse(StatusPanelFormat.snapshotIsStale(generatedAt: 0, now: now))
+        // Within the max poll cadence (3600 s = POLL_SECS_HI) → fresh, even AT the boundary.
+        XCTAssertFalse(StatusPanelFormat.snapshotIsStale(generatedAt: now - 3600, now: now))
+        // One second past it → unambiguously stale (outlived any legitimate poll cadence).
+        XCTAssertTrue(StatusPanelFormat.snapshotIsStale(generatedAt: now - 3601, now: now))
+    }
+
+    func testBannerFoldsSnapshotAgeIntoRetainingStates() {
+        // The three RETAINING states (connected / stale / disconnected) surface the age in the detail…
+        XCTAssertEqual(
+            StatusPanelFormat.banner(for: .connected, accountCount: 3, ageText: "updated 12s ago").detail,
+            "3 accounts · updated 12s ago.")
+        XCTAssertTrue(
+            StatusPanelFormat.banner(for: .stale, accountCount: 2, ageText: "updated 4m ago")
+                .detail.contains("· updated 4m ago."))
+        XCTAssertTrue(
+            StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2, ageText: "updated 4m ago")
+                .detail.contains("· updated 4m ago."))
+        // …while transient / refused states never do (no retained reading to age).
+        for state in [ConnectionState.connecting, .emptyRoster, .unsupported] {
+            XCTAssertFalse(
+                StatusPanelFormat.banner(for: state, accountCount: 0, ageText: "updated 12s ago")
+                    .detail.contains("updated"),
+                "state \(state) must not fold in a snapshot age")
+        }
+        // A Live daemon whose data is stale escalates healthy → warning (the connected-but-stale cell).
+        XCTAssertEqual(
+            StatusPanelFormat.banner(for: .connected, accountCount: 3, ageText: "updated 2h ago", ageStale: true).kind,
+            .warning)
+        // A fresh Live daemon stays healthy.
+        XCTAssertEqual(
+            StatusPanelFormat.banner(for: .connected, accountCount: 3, ageText: "updated 12s ago", ageStale: false).kind,
+            .healthy)
+        // The no-age path reproduces the original detail exactly (existing callers unaffected).
+        XCTAssertEqual(StatusPanelFormat.banner(for: .connected, accountCount: 3).detail, "3 accounts.")
+    }
+
+    // MARK: - usage severity + swap-trigger (mirror `src/cli.rs` `util_severity` / `weekly_cell_severity`)
+
+    func testUtilSeverityBandsMirrorTheCli() {
+        // Bands: >= 90 Red, >= 75 Yellow, else Green (RED_UTIL_PCT / YELLOW_UTIL_PCT in src/cli.rs).
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(0), .green)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(74), .green)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(75), .yellow)   // Yellow boundary
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(89), .yellow)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(90), .red)      // Red boundary (≈ the swap trigger)
+        XCTAssertEqual(StatusPanelFormat.utilSeverity(100), .red)
+    }
+
+    func testSessionSeverityMapsPercentOrNil() {
+        XCTAssertEqual(StatusPanelFormat.sessionSeverity(20), .green)
+        XCTAssertEqual(StatusPanelFormat.sessionSeverity(92), .red)
+        XCTAssertNil(StatusPanelFormat.sessionSeverity(nil))          // failed poll → no color, not a fake green
+    }
+
+    func testWeeklySeverityRedWhenExhaustedRegardlessOfPercent() {
+        // A weekly-EXHAUSTED account is Red whatever its rounded percent (the week-blocked verdict).
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 3, weeklyExhausted: true), .red)
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 100, weeklyExhausted: true), .red)
+        // Not exhausted → the raw bands.
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 10, weeklyExhausted: false), .green)
+        XCTAssertEqual(StatusPanelFormat.weeklySeverity(weeklyPct: 80, weeklyExhausted: false), .yellow)
+        // Failed poll → nil even when flagged exhausted (no present reading to color, mirrors the CLI).
+        XCTAssertNil(StatusPanelFormat.weeklySeverity(weeklyPct: nil, weeklyExhausted: true))
+    }
+
     // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
 
     func testNextSwapFooterWording() {
@@ -181,25 +286,25 @@ final class StatusPanelFormatTests: XCTestCase {
     func testRowAccessibilityLabelSpeaksTheRow() {
         let active = StatusPanelFormat.rowAccessibilityLabel(
             label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
-            quarantined: false, sessionPct: 60, weeklyPct: 10, resetIn: "10m", isNextSwapTarget: false)
-        XCTAssertEqual(active, "work, active, auth healthy, session 60%, weekly 10%, resets in 10m")
+            quarantined: false, sessionPct: 60, weeklyPct: 10, sessionReset: "10m", weeklyReset: "5d")
+        XCTAssertEqual(active, "work, active, auth healthy, session 60% resets in 10m, weekly 10% resets in 5d")
 
         let dead = StatusPanelFormat.rowAccessibilityLabel(
             label: "old", isActive: false, auth: .dead, recovering: false, enabled: true,
-            quarantined: true, sessionPct: nil, weeklyPct: nil, resetIn: "n/a", isNextSwapTarget: true)
-        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a, weekly n/a, resets in n/a, next swap target")
+            quarantined: true, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a")
+        XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a resets in n/a, weekly n/a resets in n/a")
 
         // A healthy pre-#119 legacy account speaks no auth verdict (empty phrase dropped).
         let legacy = StatusPanelFormat.rowAccessibilityLabel(
             label: "leg", isActive: false, auth: nil, recovering: false, enabled: true,
-            quarantined: false, sessionPct: 5, weeklyPct: 5, resetIn: "2h", isNextSwapTarget: false)
-        XCTAssertEqual(legacy, "leg, session 5%, weekly 5%, resets in 2h")
+            quarantined: false, sessionPct: 5, weeklyPct: 5, sessionReset: "2h", weeklyReset: "6d")
+        XCTAssertEqual(legacy, "leg, session 5% resets in 2h, weekly 5% resets in 6d")
 
         // A parked (disabled) account speaks the `parked` tag.
         let parked = StatusPanelFormat.rowAccessibilityLabel(
             label: "p", isActive: false, auth: .healthy, recovering: false, enabled: false,
-            quarantined: false, sessionPct: 1, weeklyPct: 1, resetIn: "1h", isNextSwapTarget: false)
-        XCTAssertEqual(parked, "p, auth healthy, parked, session 1%, weekly 1%, resets in 1h")
+            quarantined: false, sessionPct: 1, weeklyPct: 1, sessionReset: "1h", weeklyReset: "3d")
+        XCTAssertEqual(parked, "p, auth healthy, parked, session 1% resets in 1h, weekly 1% resets in 3d")
     }
 
     // MARK: - Integration: wire → AccountRow → panel format (recovering distinct from dead)
@@ -256,6 +361,74 @@ final class StatusPanelFormatTests: XCTestCase {
         let other = try XCTUnwrap(rows.first { $0.label == "work" })
         XCTAssertFalse(other.isNextSwapTarget)
         XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal")), "Next swap → personal")
+    }
+
+    // MARK: - Header subtitle (issue #355 — design-reference parity)
+
+    func testHeaderSubtitleSpeaksTheHonestStatePerConnection() {
+        // Connected: identity — "N accounts · {active} active".
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .connected, accountCount: 3,
+                                             activeLabel: "work", ageStale: false),
+            "3 accounts · work active")
+        // Singular account, no active anchor → just the count (correct pluralization).
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .connected, accountCount: 1,
+                                             activeLabel: nil, ageStale: false),
+            "1 account")
+        // Connected but the snapshot has outlived any poll cadence → "· stale", never a false "fresh".
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .connected, accountCount: 3,
+                                             activeLabel: "work", ageStale: true),
+            "3 accounts · work active · stale")
+        // The gone-quiet `.stale` connection is always marked stale, regardless of age.
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .stale, accountCount: 2,
+                                             activeLabel: "work", ageStale: false),
+            "2 accounts · work active · stale")
+        // Dropped connection → last-known, never "active" (honest-state discipline in the header).
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .disconnected(reason: "EOF"), accountCount: 3,
+                                             activeLabel: "work", ageStale: false),
+            "3 accounts · last-known")
+        // Absent / transitional states speak their status, not a roster count.
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .connecting, accountCount: 0,
+                                                        activeLabel: nil, ageStale: false),
+                       "Connecting to the daemon…")
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .emptyRoster, accountCount: 0,
+                                                        activeLabel: nil, ageStale: false),
+                       "Welcome")
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .unsupported, accountCount: 3,
+                                                        activeLabel: "work", ageStale: false),
+                       "Version mismatch")
+    }
+
+    // MARK: - Swap callout (issue #355 — design-reference parity)
+
+    func testSwapCalloutTargetIsPresentOnlyForAViableForwardCandidate() {
+        XCTAssertEqual(StatusPanelFormat.swapCalloutTarget(.target(to: "personal")), "personal")
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.noViableTarget))
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.awaitingData))
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(nil))
+    }
+
+    func testSwapCalloutReasonIsFactualAndNeverInventsLowest() {
+        // Genuinely lowest-weekly target → the full reference-style reason with its weekly %.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: 18, isLowestWeekly: true),
+            "lowest weekly · 18% · most headroom")
+        // Not the lowest → just the factual weekly %, no "most headroom" claim it can't support.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: 71, isLowestWeekly: false),
+            "weekly 71%")
+        // Weekly unknown (failed poll) but lowest → headroom without a fabricated %.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: nil, isLowestWeekly: true),
+            "most headroom")
+        // Weekly unknown and not lowest → the neutral fallback.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: nil, isLowestWeekly: false),
+            "next candidate")
     }
 
     // MARK: - Helpers

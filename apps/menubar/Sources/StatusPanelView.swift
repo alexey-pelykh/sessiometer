@@ -35,37 +35,85 @@ struct StatusPanelView: View {
         TimelineView(.periodic(from: .now, by: Self.clockTick)) { context in
             content(now: Int64(context.date.timeIntervalSince1970))
         }
-        .frame(width: 320, alignment: .leading)
+        .frame(width: 380, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
+        // An OPAQUE, appearance-adaptive backing so the panel reads at full contrast regardless of what
+        // is behind it. The `.popover` vibrancy (StatusItemController) blended with the desktop/terminal
+        // behind the panel — dropping every label + metric onto a SHIFTING mid-tone — so text contrast
+        // was at the mercy of the wallpaper. A solid `windowBackgroundColor` (clipped to the panel's
+        // rounded corners by the host effect view) gives a stable, high-contrast card in light OR dark.
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     @ViewBuilder
     private func content(now: Int64) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // The banner is the live honest-state indicator — always full strength.
-            BannerView(banner: StatusPanelFormat.banner(for: store.connectionState,
-                                                        accountCount: store.rows.count))
+        // The snapshot's freshness, re-derived against the client's own clock on each `TimelineView`
+        // tick so a resting panel's "updated Ns ago" keeps advancing (and a wedged-but-heartbeating
+        // daemon's growing age is visible without a manual refresh). `nil` generatedAt → no age.
+        let ageText = store.generatedAt.flatMap {
+            StatusPanelFormat.snapshotAgeText(generatedAt: $0, now: now)
+        }
+        let ageStale = store.generatedAt.map {
+            StatusPanelFormat.snapshotIsStale(generatedAt: $0, now: now)
+        } ?? false
+        let state = store.connectionState
+        let activeLabel = store.rows.first(where: \.isActive)?.label
+        let subtitle = StatusPanelFormat.headerSubtitle(state: state,
+                                                        accountCount: store.rows.count,
+                                                        activeLabel: activeLabel,
+                                                        ageStale: ageStale)
 
-            if case .emptyRoster = store.connectionState {
-                // A live onboarding state, not stale data — full strength, distinct from daemon-down.
+        // The design reference's chrome (`apps/menubar/design/menubar-preview.html`): an app-identity
+        // header, a hairline divider, the state's body, and a snapshot-age footer. Sections own their
+        // insets (no uniform padding) so the header/roster/callout/footer spacing matches the reference.
+        // Honest-state is carried by the header sub-line (never a false "active" on a degraded daemon)
+        // plus, on a dropped connection, an explicit strip over a dimmed last-known roster.
+        VStack(alignment: .leading, spacing: 0) {
+            PanelHeader(subtitle: subtitle)
+
+            switch state {
+            case .emptyRoster:
+                // A live onboarding state, not stale data — distinct from daemon-down.
+                Divider().padding(.horizontal, 14)
                 OnboardingCard()
-            } else {
-                // The RETAINED reading (roster + its `next_swap` footer): shown LIVE only on
-                // `.connected`, DIMMED as one on every degraded/absent state so last-known data is
-                // never mistaken for live (the never-healthy-when-dead discipline). `.unsupported`
-                // clears both (numbers refused), so this block renders nothing but the banner.
-                VStack(alignment: .leading, spacing: 14) {
-                    if !store.rows.isEmpty {
-                        RosterView(rows: store.rows, now: now)
-                    }
-                    if let footer = StatusPanelFormat.nextSwapFooter(store.nextSwap) {
-                        FooterView(text: footer)
-                    }
+                    .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+
+            case .connecting, .unsupported:
+                // No retained reading — a plain honest message (the reference's centered message card
+                // for these states, with its distinct per-state glyph, is #169).
+                Divider().padding(.horizontal, 14)
+                BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
+                    .padding(.horizontal, 14).padding(.vertical, 14)
+
+            case .disconnected:
+                // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
+                // frozen-as-live (#137). No swap callout / add-account (swaps are paused while dropped).
+                HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
+                                                             ageText: ageText, ageStale: ageStale))
+                if !store.rows.isEmpty {
+                    RosterView(rows: store.rows, now: now).opacity(0.55)
                 }
-                .opacity(store.connectionState.isHealthy ? 1 : 0.55)
+
+            case .connected, .stale:
+                // Live (or connected-but-stale — the roster stays full-strength, the header/footer carry
+                // the "stale" mark). The full design reference: roster, swap-callout hero, add-account.
+                Divider().padding(.horizontal, 14)
+                if !store.rows.isEmpty {
+                    RosterView(rows: store.rows, now: now)
+                }
+                if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
+                    SwapCalloutCard(target: target, rows: store.rows)
+                }
+                AddAccountRow()
+            }
+
+            if let ageText {
+                // Freshness reads amber whenever the numbers should be distrusted — a wedged-but-
+                // heartbeating poll loop (ageStale) OR any non-live connection (stale / disconnected)
+                // showing a last-known reading — never a frozen-as-fresh green (#137).
+                FooterView(text: ageText, stale: ageStale || !state.isHealthy)
             }
         }
-        .padding(16)
     }
 }
 
@@ -115,69 +163,93 @@ private struct RosterView: View {
     let now: Int64
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 2) {
             ForEach(rows) { row in
                 AccountRowView(row: row, now: now)
             }
         }
+        // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
+        // the active row's accent card aligns with the swap-callout card below (also inset 8) instead of
+        // bleeding edge-to-edge, plus 6px above / 2px below for breathing room under the divider.
+        .padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 2)
     }
 }
 
-/// One account row: the active marker + label + auth glyph/cue on the top line, then the usage
-/// percents, the single reset-in, and the next-swap marker on a quieter second line. The whole row is
-/// one VoiceOver element.
+/// One account row, built to the design reference (`apps/menubar/design/menubar-preview.html`). BOTH
+/// reset windows show — R-2 parity with the `status` CLI, which prints both — never collapsed to one.
+/// The whole row is a single VoiceOver element.
 private struct AccountRowView: View {
     let row: AccountRow
     let now: Int64
 
-    private var resetIn: String {
-        StatusPanelFormat.resetIn(weeklyExhausted: row.weeklyExhausted,
-                                  sessionResetsAt: row.sessionResetsAt,
-                                  weeklyResetsAt: row.weeklyResetsAt,
-                                  now: now)
+    /// Each window's reset-in against the client's own clock — both shown, never collapsed to one pick.
+    private var sessionReset: String {
+        StatusPanelFormat.resetCell(row.sessionResetsAt, now: now)
+    }
+    private var weeklyReset: String {
+        StatusPanelFormat.resetCell(row.weeklyResetsAt, now: now)
+    }
+
+    private var sessionSeverity: StatusPanelFormat.UsageSeverity? {
+        StatusPanelFormat.sessionSeverity(row.sessionPct)
+    }
+    private var weeklySeverity: StatusPanelFormat.UsageSeverity? {
+        StatusPanelFormat.weeklySeverity(weeklyPct: row.weeklyPct, weeklyExhausted: row.weeklyExhausted)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                // Active marker: a filled accent dot for the active account, a hollow placeholder
-                // otherwise (mirrors the `status` table's `*` active marker), kept the same width so
-                // labels stay aligned.
-                Circle()
-                    .fill(row.isActive ? Color.accentColor : Color.clear)
-                    .overlay(Circle().stroke(Color.secondary.opacity(row.isActive ? 0 : 0.4), lineWidth: 1))
-                    .frame(width: 7, height: 7)
-                    .accessibilityHidden(true)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                StatusDot(isActive: row.isActive)
+                MonogramBadge(label: row.label)
 
                 Text(row.label)
                     .font(.body)
-                    .fontWeight(row.isActive ? .semibold : .regular)
+                    .fontWeight(.semibold)
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
 
                 Spacer(minLength: 6)
+
+                if row.isActive {
+                    // The design reference's accent "ACTIVE" tag — one of the row's THREE active cues
+                    // (leading filled dot + this tag + accent-tint row), so active never rides on color
+                    // alone (R-2 / WCAG 1.4.1).
+                    Text("ACTIVE")
+                        .font(.system(size: 9, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(.tint)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .overlay(RoundedRectangle(cornerRadius: 4)
+                            .strokeBorder(Color.accentColor.opacity(0.42), lineWidth: 0.5))
+                        .accessibilityHidden(true)
+                }
 
                 authView
             }
 
-            HStack(spacing: 8) {
-                Text("session \(StatusPanelFormat.pct(row.sessionPct))")
-                    .monospacedDigit()
-                Text("·").foregroundStyle(.tertiary)
-                Text("weekly \(StatusPanelFormat.pct(row.weeklyPct))")
-                    .monospacedDigit()
-                Text("·").foregroundStyle(.tertiary)
-                Text("resets in \(resetIn)")
-                    .monospacedDigit()
-                if row.isNextSwapTarget {
-                    Spacer(minLength: 6)
-                    Text("→ next")
-                        .foregroundStyle(Color.accentColor)
-                }
+            VStack(spacing: 6) {
+                UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
+                           reset: sessionReset)
+                UsageMeter(label: "Weekly", pct: row.weeklyPct, severity: weeklySeverity,
+                           reset: weeklyReset)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
+        .padding(.horizontal, 8)
+        .padding(.top, 9)
+        .padding(.bottom, 10)
+        // Active emphasis follows the design reference: an accent-tint fill + ring. Active is redundantly
+        // encoded — the filled leading dot (shape) + the "ACTIVE" tag carry it too — so color is never the
+        // SOLE signal (WCAG 1.4.1 / R-2 state-parity holds; the accent here is a redundant cue, and the
+        // now-dropped per-row next badge means accent is no longer overloaded).
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9)
+                        .strokeBorder(Color.accentColor.opacity(row.isActive ? 0.28 : 0), lineWidth: 0.5)
+                )
+        )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
     }
@@ -187,7 +259,11 @@ private struct AccountRowView: View {
     private var authView: some View {
         if let auth = row.auth {
             HStack(spacing: 4) {
-                Text(StatusPanelFormat.healthGlyph(auth))
+                let symbol = StatusPanelFormat.healthSymbol(auth)
+                Image(systemName: symbol.name)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(healthColor(symbol.tint))
+                    .accessibilityHidden(true)
                 if let cue = StatusPanelFormat.authCue(auth: auth,
                                                        recovering: row.isRecovering,
                                                        enabled: row.isEnabled) {
@@ -212,6 +288,18 @@ private struct AccountRowView: View {
         auth == .dead && !row.isRecovering ? .red : .secondary
     }
 
+    /// Map the pure `HealthTint` role to a system semantic color — never `accentColor` (the AUTH glyph
+    /// is never app-tinted, #84); `.neutral` (unknown) is `.secondary`, the #137 "no false green".
+    private func healthColor(_ tint: StatusPanelFormat.HealthTint) -> Color {
+        switch tint {
+        case .green:   return .green
+        case .yellow:  return .yellow
+        case .orange:  return .orange
+        case .red:     return .red
+        case .neutral: return .secondary
+        }
+    }
+
     private var accessibilityLabel: String {
         StatusPanelFormat.rowAccessibilityLabel(
             label: row.label,
@@ -222,8 +310,333 @@ private struct AccountRowView: View {
             quarantined: row.isQuarantined,
             sessionPct: row.sessionPct,
             weeklyPct: row.weeklyPct,
-            resetIn: resetIn,
-            isNextSwapTarget: row.isNextSwapTarget)
+            sessionReset: sessionReset,
+            weeklyReset: weeklyReset)
+    }
+}
+
+// MARK: - Row building blocks (per the design reference)
+
+/// The account's monogram — provider-neutral by construction (issue #15: the label's initial, never a
+/// brand mark or color). Accessibility-hidden; the row's VoiceOver label already speaks the identity.
+private struct MonogramBadge: View {
+    let label: String
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(Color.secondary.opacity(0.16))
+            .frame(width: 30, height: 30)
+            .overlay(
+                Text(initial)
+                    .font(.system(size: 13, weight: .bold))
+                    .tracking(0.4)
+                    .foregroundStyle(.secondary)
+            )
+            .accessibilityHidden(true)
+    }
+
+    /// The first character of the operator label, uppercased — `?` for an empty/whitespace label.
+    private var initial: String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first else { return "?" }
+        return String(first).uppercased()
+    }
+}
+
+/// One usage window's meter. Both percents render at a uniform weight — the design reference (and the
+/// `status` CLI) carry severity in COLOR, not weight; the fixed column widths + monospaced digits keep
+/// Session and Weekly aligned.
+private struct UsageMeter: View {
+    let label: String
+    let pct: UInt8?
+    let severity: StatusPanelFormat.UsageSeverity?
+    let reset: String
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Text(label.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 52, alignment: .leading)
+
+            UsageBar(fraction: fraction, color: barColor)
+
+            Text(StatusPanelFormat.pct(pct))
+                .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                .foregroundStyle(pctColor)
+                .frame(width: 40, alignment: .trailing)
+
+            Text(reset)
+                .font(.system(size: 11)).monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 52, alignment: .trailing)
+                .lineLimit(1)
+        }
+    }
+
+    private var fraction: Double {
+        pct.map { Double($0) / 100.0 } ?? 0
+    }
+
+    /// Bar fill = the green/amber/red usage band; a failed poll (`nil`) is muted, never a false green (#137).
+    private var barColor: Color {
+        switch severity {
+        case .red:    return .red
+        case .yellow: return .orange
+        case .green:  return .green
+        case .none:   return Color.secondary.opacity(0.45)
+        }
+    }
+
+    /// The percent TEXT carries its severity band in color, matching the `status` CLI (which colors green
+    /// percents green too — `Severity::Green => "32"`) and the design reference: green healthy, ≥75% amber
+    /// (orange reads better than yellow), ≥90%/exhausted red. A failed poll (`n/a`) stays neutral — no
+    /// false green (#137).
+    private var pctColor: Color {
+        switch severity {
+        case .red:    return .red
+        case .yellow: return .orange
+        case .green:  return .green
+        case .none:   return .primary
+        }
+    }
+}
+
+/// A capsule fill proportional to `fraction` (0…1), with a minimum sliver so a live-but-tiny percent
+/// never reads as empty; a zero/failed reading shows a bare track. The number carries the real value.
+private struct UsageBar: View {
+    let fraction: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.20))
+                Capsule().fill(color)
+                    .frame(width: fillWidth(geo.size.width))
+            }
+        }
+        .frame(height: 6)
+        .accessibilityHidden(true)
+    }
+
+    private func fillWidth(_ full: CGFloat) -> CGFloat {
+        let clamped = min(1, max(0, fraction))
+        guard clamped > 0 else { return 0 }
+        // Mock `.m-fill { min-width: 5px }` — a live-but-tiny percent keeps a visible sliver.
+        return max(5, full * clamped)
+    }
+}
+
+// MARK: - Header + callouts (per the design reference)
+
+/// The app-identity header — a neutral gauge glyph, the product name, and the honest identity sub-line
+/// (`StatusPanelFormat.headerSubtitle`). Always present; the SUB-LINE — never the glyph — carries the
+/// connection state, so a degraded daemon reads "last-known" / "· stale", never a false "active".
+/// Provider-neutral (issue #15): a generic gauge, no brand mark or color.
+private struct PanelHeader: View {
+    let subtitle: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 7)
+                .fill(Color.secondary.opacity(0.16))
+                .frame(width: 27, height: 27)
+                .overlay(
+                    Image(systemName: "gauge.medium")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                )
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Sessiometer")
+                    .font(.system(size: 13.5, weight: .semibold))
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 11)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Sessiometer. \(subtitle)")
+    }
+}
+
+/// The leading status dot — the design reference's per-row marker: a filled accent disc for the active
+/// (being-consumed) account, a hollow ring otherwise. FILL-vs-RING is a SHAPE difference, so active is
+/// legible without color (WCAG 1.4.1); the accent is a redundant cue and the row's "ACTIVE" tag +
+/// VoiceOver label state it in words.
+private struct StatusDot: View {
+    let isActive: Bool
+
+    var body: some View {
+        Circle()
+            .fill(isActive ? Color.accentColor : Color.clear)
+            .overlay(
+                Circle().strokeBorder(Color.secondary.opacity(0.55), lineWidth: isActive ? 0 : 1.5)
+            )
+            .frame(width: 8, height: 8)
+            // The design reference rings the active disc with a soft accent halo (`box-shadow 0 0 0 3px`) —
+            // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue.
+            .background {
+                if isActive {
+                    Circle().fill(Color.accentColor.opacity(0.20)).frame(width: 14, height: 14)
+                }
+            }
+            .accessibilityHidden(true)
+    }
+}
+
+/// The honest strip shown over a dimmed last-known roster on a DROPPED connection — the design
+/// reference's disconnected bar. States the degradation loudly (tinted, titled) so the retained numbers
+/// below are never mistaken for live (#137). Richer per-state strips (keychain-locked "paused", a
+/// Reconnect action) are #169.
+private struct HonestStrip: View {
+    let banner: StatusPanelFormat.Banner
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "bolt.horizontal.circle")
+                .font(.caption)
+                .accessibilityHidden(true)
+            Text(banner.title)
+                .font(.system(size: 11.5, weight: .semibold))
+            Text(banner.detail)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(stripTint)
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(stripTint.opacity(0.12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(banner.title). \(banner.detail)")
+    }
+
+    private var stripTint: Color {
+        switch banner.kind {
+        case .healthy: return .green
+        case .info:    return .secondary
+        case .warning: return .orange
+        case .error:   return .red
+        }
+    }
+}
+
+/// The swap-callout hero — the design reference's primary action: the daemon's `next_swap` target, a
+/// client-derived "why" line, and the Swap button. Accent-tinted (the panel's ONE accent action). The
+/// button's on-click WIRING is #169 (the daemon swap command #167 already exists); until then it is
+/// present-but-DISABLED — honest that the affordance is not yet live, never a dead-click.
+private struct SwapCalloutCard: View {
+    let target: String
+    let rows: [AccountRow]
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.left.arrow.right")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                (Text("Next swap → ") + Text(target).fontWeight(.semibold))
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(reason)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 6)
+            Button("Swap") {}
+                .font(.system(size: 12, weight: .semibold))
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(true)
+                .help("Swap-on-click wiring is tracked in #169")
+        }
+        .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(Color.accentColor.opacity(0.10))
+                .overlay(RoundedRectangle(cornerRadius: 9)
+                    .strokeBorder(Color.accentColor.opacity(0.20), lineWidth: 0.5))
+        )
+        .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Next swap to \(target). \(reason). Swap action pending.")
+    }
+
+    /// The client-derived "why" line — the wire carries only the target label (#15), so the reason is
+    /// computed here: the target's weekly headroom, flagged "lowest weekly" ONLY when it truly has the
+    /// least weekly usage among the viable (non-active, enabled) swap candidates.
+    private var reason: String {
+        let targetRow = rows.first { $0.label == target }
+        let candidates = rows.filter { !$0.isActive && $0.isEnabled }
+        let knownWeekly = candidates.compactMap(\.weeklyPct)
+        let isLowest = targetRow?.weeklyPct.map { tw in knownWeekly.allSatisfy { tw <= $0 } } ?? false
+        return StatusPanelFormat.swapCalloutReason(targetWeeklyPct: targetRow?.weeklyPct,
+                                                   isLowestWeekly: isLowest)
+    }
+}
+
+/// The always-on "Add account…" row — the design reference's populated-roster affordance. COPIES
+/// `sessiometer capture` to the clipboard (the app never runs it — C-005: no roster/credential mutation
+/// from the client); the same copy-command as the empty-roster onboarding, always available.
+private struct AddAccountRow: View {
+    @State private var copied = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: copy) {
+                Label(copied ? "Copied" : "Add account…",
+                      systemImage: copied ? "checkmark" : "rectangle.badge.plus")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityLabel(copied ? "Copied the capture command"
+                                       : "Add account — copies the capture command")
+            if copied {
+                Text("Copied — paste in Terminal")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.green)
+                    .lineLimit(1)
+            } else {
+                // The design reference renders the copy-command as a monospaced chip, not plain prose.
+                HStack(spacing: 4) {
+                    Text("copies")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(StatusPanelFormat.captureCommand)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.14)))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12).padding(.top, 5).padding(.bottom, 3)
+    }
+
+    /// Copy the capture command — a pure AppKit pasteboard write, no execution (pure client). Brief
+    /// "Copied" confirmation, mirroring the onboarding card.
+    private func copy() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(StatusPanelFormat.captureCommand, forType: .string)
+        copied = true
+        Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            copied = false
+        }
     }
 }
 
@@ -282,22 +695,33 @@ private struct OnboardingCard: View {
 
 // MARK: - Footer
 
-/// The `next_swap` footer (issue #326): the forward swap candidate, or absent when there is no active
-/// anchor. Not swap history (that needs a new daemon source — deferred).
+/// The snapshot-age footer (issue #355 / #164 `generated_at`) — the design reference's freshness line,
+/// "updated Ns ago". `next_swap` is NOT here (it lives in the swap-callout hero; a dropped daemon shows
+/// no card, so the two never collide). Amber when the reading should be distrusted (a wedged poll loop,
+/// or a stale/disconnected connection), never frozen-as-fresh (#137).
 private struct FooterView: View {
     let text: String
+    let stale: Bool
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.caption2)
-                .accessibilityHidden(true)
-            Text(text)
-                .font(.caption)
-            Spacer(minLength: 0)
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 5) {
+                Image(systemName: "clock")
+                    .font(.caption2)
+                    .accessibilityHidden(true)
+                Text(text)
+                    .font(.system(size: 11))
+                    .monospacedDigit()
+                Spacer(minLength: 0)
+            }
+            // Mock `.pop-foot .fl2 { color: var(--text-3) }` — the snapshot-age line is tertiary; amber
+            // only when the reading should be distrusted (wedged poll loop / stale / disconnected).
+            .foregroundStyle(stale ? Color.orange : Color(nsColor: .tertiaryLabelColor))
+            .padding(.horizontal, 14).padding(.top, 9).padding(.bottom, 11)
         }
-        .foregroundStyle(.secondary)
+        .padding(.top, 5)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(text)
+        .accessibilityLabel(stale ? "\(text), stale" : text)
     }
 }

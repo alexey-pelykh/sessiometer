@@ -99,6 +99,27 @@ enum StatusPanelFormat {
         }
     }
 
+    /// The native SF Symbol + semantic tint for a health state — the PANEL's per-medium render of the
+    /// SAME `CredentialHealth` the CLI (and `healthGlyph`, the byte-parity mirror) shows as an emoji. R-2
+    /// was re-ratified (2026-07-09) as STATE-parity — the enum + `authSpoken` rendered per-medium — so
+    /// the panel draws a native symbol while the CLI keeps its emoji. DISTINCT SHAPES per state (checkmark
+    /// / question / clock / triangle / octagon), so health is legible WITHOUT color — the WCAG 1.4.1 fix
+    /// the shape-identical emoji ramp lacked. `unknown` stays neutral (the #137 "no false green").
+    static func healthSymbol(_ health: CredentialHealth) -> (name: String, tint: HealthTint) {
+        switch health {
+        case .healthy: return ("checkmark.circle.fill", .green)
+        case .unknown: return ("questionmark.circle", .neutral)
+        case .stale:   return ("clock.badge.exclamationmark", .yellow)
+        case .atRisk:  return ("exclamationmark.triangle.fill", .orange)
+        case .dead:    return ("xmark.octagon.fill", .red)
+        }
+    }
+
+    /// The semantic tint ROLE for a health symbol. This Foundation-only namespace cannot name a SwiftUI
+    /// `Color`, so it names the ROLE; the view maps it to a system semantic color (green/yellow/orange/
+    /// red, `.secondary` for neutral) — never `Color.accentColor` (the AUTH glyph is never app-tinted, #84).
+    enum HealthTint: Equatable { case green, yellow, orange, red, neutral }
+
     /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a DEAD
     /// account's actionable `claude /login` cue (softened to `recovering` for a healing quarantined
     /// account, issue #109), then the independent `disabled` rotation tag (#36). A pre-#119 daemon
@@ -185,7 +206,18 @@ enum StatusPanelFormat {
     /// Pure — the same state always yields the same banner. The `disconnected` reason is deliberately
     /// NOT surfaced verbatim (it is transport jargon, e.g. "connection closed (EOF)"); the banner is a
     /// plain operator-facing sentence.
-    static func banner(for state: ConnectionState, accountCount: Int) -> Banner {
+    ///
+    /// `ageText` (from `snapshotAgeText`) folds the snapshot's freshness into the detail for the three
+    /// states that RETAIN a reading (connected / stale / disconnected) — so a persistent "Live" never
+    /// silently implies the numbers are fresh (the council's "don't let Live imply fresh"). It is
+    /// deliberately omitted for `connecting` (no snapshot yet), `emptyRoster` (no reading to age), and
+    /// `unsupported` (numbers refused — the banner shows no freshness). `ageStale` (from
+    /// `snapshotIsStale`) escalates a Live-but-stale daemon (transport up, data outlived any poll
+    /// cadence) from `.healthy` to `.warning` — the connected-but-stale cell of the matrix.
+    static func banner(for state: ConnectionState,
+                       accountCount: Int,
+                       ageText: String? = nil,
+                       ageStale: Bool = false) -> Banner {
         switch state {
         case .connecting:
             return Banner(title: "Connecting…",
@@ -193,26 +225,96 @@ enum StatusPanelFormat {
                           kind: .info)
         case .connected:
             let plural = accountCount == 1 ? "" : "s"
+            let base = "\(accountCount) account\(plural)"
             return Banner(title: "Live",
-                          detail: "\(accountCount) account\(plural).",
-                          kind: .healthy)
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
+                          kind: ageStale ? .warning : .healthy)
         case .emptyRoster:
             return Banner(title: "No accounts yet",
                           detail: "Connected to the daemon — no accounts configured.",
                           kind: .info)
         case .stale:
+            let base = "The daemon has gone quiet; showing the last-known reading"
             return Banner(title: "Data may be stale",
-                          detail: "The daemon has gone quiet; showing the last-known reading.",
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .warning)
         case .disconnected:
+            let base = "Reconnecting; showing the last-known reading"
             return Banner(title: "Daemon not responding",
-                          detail: "Reconnecting; showing the last-known reading.",
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .error)
         case .unsupported:
             return Banner(title: "Update required",
                           detail: "The daemon speaks a newer version this app can't read.",
                           kind: .error)
         }
+    }
+
+    // MARK: - Snapshot age (issue #326 / council — the CLI's parity render of the wire `generated_at`)
+
+    /// The age (in seconds) past which a snapshot's data is UNAMBIGUOUSLY stale — the maximum possible
+    /// poll cadence (`POLL_SECS_HI` = 3600 in `src/daemon.rs`). A snapshot older than this has outlived
+    /// even the slowest legitimate poll interval, so it cannot be dismissed as "just a long cadence."
+    /// Deliberately conservative: it NEVER false-alarms a healthy-but-slow daemon (the client does not
+    /// know the configured cadence, so a lower bar would cry wolf), and the transport-liveness watchdog
+    /// (#344, 32 s) already catches a DROPPED connection far sooner. This is the backstop for the one
+    /// gap the watchdog misses — a daemon that keeps HEARTBEATING while its poll loop is wedged (frames
+    /// still arrive, so the connection reads live, but `generated_at` stops advancing). Mirrors the Rust
+    /// `STALE_AGE_SECS` (`src/cli.rs`); the two thresholds move together.
+    static let staleAgeSecs: Int64 = 3600
+
+    /// "updated Ns ago" for a snapshot's freshness, or `nil` when there is no generation instant
+    /// (`generatedAt <= 0` — the wire's `0` sentinel for an all-defaults / never-generated snapshot).
+    /// The age is `now - generatedAt` against the client's OWN clock, humanized with the SAME
+    /// two-largest-unit `humanizeUntil` the reset-in uses (so the vocabulary matches and the panel↔CLI
+    /// parity is inherited from that already-byte-mirrored humanizer). Clamped at 0 for a benign
+    /// client-ahead clock skew. This is the field the wire contract itself earmarks for exactly this UX
+    /// (`snapshot.rs`: "a client compares it against its own clock and greys out once the gap grows").
+    static func snapshotAgeText(generatedAt: Int64, now: Int64) -> String? {
+        guard generatedAt > 0 else { return nil }
+        let age = max(0, now - generatedAt)
+        return age == 0 ? "updated just now" : "updated \(humanizeUntil(age)) ago"
+    }
+
+    /// Whether a snapshot is unambiguously stale — older than `staleAgeSecs`. `false` for a snapshot
+    /// with no generation instant (`generatedAt <= 0`): absent freshness is NOT stale (it is unknown).
+    /// Drives the connected-but-stale banner escalation (a `Live` daemon whose data has outlived any
+    /// poll cadence is flagged `.warning`).
+    static func snapshotIsStale(generatedAt: Int64, now: Int64) -> Bool {
+        generatedAt > 0 && (now - generatedAt) > staleAgeSecs
+    }
+
+    // MARK: - Usage severity + swap-trigger (mirror `src/cli.rs` `util_severity` / `weekly_cell_severity`)
+
+    /// One utilization urgency band. Mirrors the subset of `src/cli.rs` `Severity` the per-cell
+    /// utilization overlay uses — the reset-proximity `Dim` and the account-aggregate's reset-soon
+    /// downgrade are CLI-table concerns (the `ACCOUNT` cell), NOT the per-metric panel color, so the
+    /// panel mirror is the three utilization bands only.
+    enum UsageSeverity: Equatable { case green, yellow, red }
+
+    /// The urgency band for a utilization percent — the panel's mirror of `src/cli.rs` `util_severity`:
+    /// `>= 90` Red (at/near the ~95% session swap-away trigger, #41), `>= 75` Yellow (worth watching),
+    /// else Green. One shared "how full is too full" definition (issue #84), so the panel's per-metric
+    /// threshold color keys off the SAME bands as the CLI's per-cell overlay for the same reading.
+    static func utilSeverity(_ pct: UInt8) -> UsageSeverity {
+        if pct >= 90 { return .red }
+        if pct >= 75 { return .yellow }
+        return .green
+    }
+
+    /// The SESSION metric's severity — the raw `utilSeverity` of its percent, or `nil` when the poll
+    /// failed (the `n/a` text carries the truth; an uncolored metric is not a false "healthy"). Mirrors
+    /// the CLI's `session_severity` (`account.session_pct.map(util_severity)`).
+    static func sessionSeverity(_ sessionPct: UInt8?) -> UsageSeverity? {
+        sessionPct.map(utilSeverity)
+    }
+
+    /// The WEEKLY metric's severity — `utilSeverity` of its percent, EXCEPT a weekly-EXHAUSTED account
+    /// (the daemon's blocked-for-the-week verdict, #11/#37) reads Red whatever the rounded percent — a
+    /// week-blocked account is never painted "healthy", even under a lowered `weekly_trigger`. `nil`
+    /// when the weekly poll failed. Mirrors the CLI's `weekly_cell_severity`.
+    static func weeklySeverity(weeklyPct: UInt8?, weeklyExhausted: Bool) -> UsageSeverity? {
+        weeklyPct.map { weeklyExhausted ? .red : utilSeverity($0) }
     }
 
     // MARK: - `next_swap` footer (issue #326 AC — renders the FORWARD candidate, not swap history)
@@ -229,12 +331,56 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Header identity + swap callout (issue #355 — design-reference parity)
+
+    /// The header's identity sub-line — the design reference's `app-sub` ("N accounts · {active}
+    /// active"). Honest per connection state: a degraded roster reads "last-known" and a Live-but-wedged
+    /// or gone-quiet snapshot appends "· stale", so the always-present identity line NEVER implies the
+    /// numbers are live/fresh (the never-healthy-on-degraded discipline, carried into the header).
+    static func headerSubtitle(state: ConnectionState,
+                               accountCount: Int,
+                               activeLabel: String?,
+                               ageStale: Bool) -> String {
+        let plural = accountCount == 1 ? "" : "s"
+        let count = "\(accountCount) account\(plural)"
+        switch state {
+        case .connecting:   return "Connecting to the daemon…"
+        case .emptyRoster:  return "Welcome"
+        case .unsupported:  return "Version mismatch"
+        case .disconnected: return "\(count) · last-known"
+        case .connected, .stale:
+            let base = activeLabel.map { "\(count) · \($0) active" } ?? count
+            let isStale: Bool = { if case .stale = state { return true } else { return ageStale } }()
+            return isStale ? "\(base) · stale" : base
+        }
+    }
+
+    /// The swap-callout target label (the design reference's hero card), or `nil` when there is no
+    /// forward candidate — the card is then absent (same single-cardinality as `nextSwapFooter`; a
+    /// `noViableTarget` / `awaitingData` / absent anchor shows no card).
+    static func swapCalloutTarget(_ nextSwap: NextSwap?) -> String? {
+        if case .target(let to) = nextSwap { return to }
+        return nil
+    }
+
+    /// The swap-callout's muted "why" line — a CLIENT-derived description of the target row, because
+    /// the wire's `next_swap` carries only the label, never a reason (#15). Facts only: the target's
+    /// weekly headroom, flagged "lowest weekly" ONLY when it genuinely has the least weekly usage among
+    /// the viable swap candidates (computed by the caller) — never an invented rationale.
+    static func swapCalloutReason(targetWeeklyPct: UInt8?, isLowestWeekly: Bool) -> String {
+        guard let weekly = targetWeeklyPct else {
+            return isLowestWeekly ? "most headroom" : "next candidate"
+        }
+        return isLowestWeekly ? "lowest weekly · \(pct(weekly)) · most headroom" : "weekly \(pct(weekly))"
+    }
+
     // MARK: - Row VoiceOver label (issue #326 AC — VoiceOver-navigable rows)
 
     /// One spoken, comma-separated sentence for a row's VoiceOver label, so the whole row reads as a
     /// single accessible element rather than a scatter of unlabeled glyphs. Speaks identity, the active
-    /// marker, the auth verdict + its cue, both usage percents, the reset-in, and the next-swap marker —
-    /// the same facts the row shows visually.
+    /// marker, the auth verdict + its cue, both usage percents each with its own reset-in — the same facts
+    /// the row shows visually. Next-swap is NOT per-row (R-2 re-ratified 2026-07-09): it is a single-cardinality
+    /// fact spoken once by the footer, mirroring the CLI (which has no per-row next marker).
     static func rowAccessibilityLabel(
         label: String,
         isActive: Bool,
@@ -244,16 +390,15 @@ enum StatusPanelFormat {
         quarantined: Bool,
         sessionPct: UInt8?,
         weeklyPct: UInt8?,
-        resetIn: String,
-        isNextSwapTarget: Bool
+        sessionReset: String,
+        weeklyReset: String
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
         parts.append(authSpoken(auth: auth, recovering: recovering, enabled: enabled, quarantined: quarantined))
-        parts.append("session \(pct(sessionPct))")
-        parts.append("weekly \(pct(weeklyPct))")
-        parts.append("resets in \(resetIn)")
-        if isNextSwapTarget { parts.append("next swap target") }
+        // Both windows, each with its reset — matching the row's two meters and the CLI's two columns.
+        parts.append("session \(pct(sessionPct)) resets in \(sessionReset)")
+        parts.append("weekly \(pct(weeklyPct)) resets in \(weeklyReset)")
         // Drop any empty auth phrase (a healthy pre-#119 legacy account speaks no auth verdict).
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }

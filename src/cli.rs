@@ -1092,9 +1092,16 @@ async fn status(json: bool, no_color: bool, verbose: bool) -> Result<()> {
         }
         StatusView::Render(versioned) => {
             let color = should_colorize(no_color);
-            // One `now` for both the table's "resets in" and the verbose expiry block, so
-            // the two never read against different clocks within a single render.
+            // One `now` for the freshness header, the table's "resets in", AND the verbose expiry
+            // block, so they never read against different clocks within a single render.
             let now = now_epoch();
+            // The snapshot-freshness header (council / #164 `generated_at`): "updated Ns ago" above
+            // the table so a reader never assumes the numbers are fresh when the daemon has wedged.
+            // Omitted for an empty roster (nothing to age) and a never-generated snapshot, mirroring
+            // the panel (which omits the age for its connecting / empty / unsupported banners).
+            if !versioned.status.accounts.is_empty() {
+                print!("{}", render_snapshot_age(versioned.generated_at, now));
+            }
             print!(
                 "{}",
                 render_status(&versioned.status, now, terminal_cols(), color)
@@ -1415,6 +1422,35 @@ pub(crate) fn render_status(
         out.push_str(REFRESH_DISABLED_ADVISORY);
     }
     out
+}
+
+/// The age (in seconds) past which a snapshot's data is UNAMBIGUOUSLY stale — the maximum possible
+/// poll cadence (`POLL_SECS_HI` = 3600 in `src/daemon.rs`). A snapshot older than this has outlived
+/// even the slowest legitimate poll interval, so it cannot be dismissed as "just a long cadence." A
+/// deliberately conservative bound: the CLI does not know the configured cadence, so a lower bar would
+/// cry wolf on a healthy-but-slow daemon. Mirrors the panel's `staleAgeSecs` (`StatusPanelFormat.swift`).
+const STALE_AGE_SECS: i64 = 3600;
+
+/// The snapshot-freshness header line (council / issue #164 `generated_at`): `updated Ns ago` above
+/// the table, the CLI's parity render of the panel banner's age — surfaced so a `status` reader never
+/// assumes the numbers are current when the daemon's poll loop has wedged (`generated_at` stops
+/// advancing while the control socket keeps answering the held snapshot). Empty when there is no
+/// generation instant (`generated_at <= 0`, the wire's all-defaults sentinel). A snapshot older than
+/// [`STALE_AGE_SECS`] gets a trailing ` (stale)` marker — the age NUMBER already conveys staleness, so
+/// this is plain text, not the color-gated #73 severity overlay. Mirrors the panel's `snapshotAgeText`
+/// + `snapshotIsStale`; the age humanizes with the SAME [`humanize_until`] the reset-in uses.
+fn render_snapshot_age(generated_at: i64, now: i64) -> String {
+    if generated_at <= 0 {
+        return String::new();
+    }
+    let age = (now - generated_at).max(0);
+    let humanized = if age == 0 {
+        "just now".to_owned()
+    } else {
+        format!("{} ago", humanize_until(age))
+    };
+    let stale = if age > STALE_AGE_SECS { " (stale)" } else { "" };
+    format!("updated {humanized}{stale}\n")
 }
 
 /// The issue-#138 signal: ≥1 NON-ACTIVE account carries a non-healthy / unverified credential
@@ -5081,6 +5117,40 @@ spare  22222222-2222\n\
         assert_eq!(humanize_until(2 * 3_600 + 30 * 60), "2h30m");
         assert_eq!(humanize_until(3 * 86_400 + 4 * 3_600), "3d4h");
         assert_eq!(humanize_until(3 * 86_400), "3d"); // trailing zero unit dropped
+    }
+
+    #[test]
+    fn render_snapshot_age_reads_updated_ago_or_empty_without_an_instant() {
+        let now = 1_000_000;
+        // No generation instant (the wire's 0 sentinel) → no header line at all.
+        assert_eq!(render_snapshot_age(0, now), "");
+        assert_eq!(render_snapshot_age(-5, now), "");
+        // Same instant → "just now"; older → the two-largest-unit humanization (panel parity).
+        assert_eq!(render_snapshot_age(now, now), "updated just now\n");
+        assert_eq!(render_snapshot_age(now - 600, now), "updated 10m ago\n");
+        // Client-ahead clock skew clamps to "just now" — never a negative age.
+        assert_eq!(render_snapshot_age(now + 30, now), "updated just now\n");
+    }
+
+    #[test]
+    fn render_snapshot_age_marks_stale_beyond_the_max_poll_cadence() {
+        let now = 1_000_000;
+        // AT the boundary (== the max poll cadence) → fresh, no marker.
+        assert_eq!(
+            render_snapshot_age(now - STALE_AGE_SECS, now),
+            "updated 1h ago\n"
+        );
+        // One second past it → the ` (stale)` marker, even though the humanized age is unchanged:
+        // the threshold is the exact second, not the humanized unit.
+        assert_eq!(
+            render_snapshot_age(now - STALE_AGE_SECS - 1, now),
+            "updated 1h ago (stale)\n"
+        );
+        // A comfortably-stale snapshot.
+        assert_eq!(
+            render_snapshot_age(now - 2 * 3_600, now),
+            "updated 2h ago (stale)\n"
+        );
     }
 
     #[test]

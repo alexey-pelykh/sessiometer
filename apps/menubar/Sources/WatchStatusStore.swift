@@ -180,3 +180,21 @@ final class WatchStatusStore: ObservableObject {
         }
     }
 }
+
+#if DEBUG
+extension WatchStatusStore {
+    /// Tooling / preview only (`--render-panel`, SwiftUI previews): a store pinned to a fixed derived
+    /// state WITHOUT the transport, so `StatusPanelView` can be rendered offscreen (`ImageRenderer`) for
+    /// design-parity review against the mock. NOT a production path — the real state is machine-derived
+    /// from the wire, never set directly. Same-file so it can set the `private(set)` projection.
+    static func preview(state: ConnectionState, rows: [AccountRow],
+                        nextSwap: NextSwap?, generatedAt: Int64?) -> WatchStatusStore {
+        let store = WatchStatusStore()
+        store.connectionState = state
+        store.rows = rows
+        store.nextSwap = nextSwap
+        store.generatedAt = generatedAt
+        return store
+    }
+}
+#endif
