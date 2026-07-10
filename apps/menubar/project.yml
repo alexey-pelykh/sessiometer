@@ -66,6 +66,12 @@ targets:
       # daemon — and the ack decoding is exercised against every wire variant, alongside SwapAck.
       - path: Sources/CaptureAck.swift
       - path: Sources/AccountCaptureModel.swift
+      # Swap affordance (#169): the AppKit-free swap model (idle → pending → done → failed) over the SAME
+      # WatchConnection seam, so the swap-on-click phase machine — including the sibling-disable window and
+      # the bounded-ack recovery a lost reply lands in — is driven hermetically by the in-process fake
+      # connector. No socket, no live daemon, and so never a real credential swap in a test run. `SwapAck`
+      # is already compiled above as the decoder this model routes on.
+      - path: Sources/AccountSwapModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT

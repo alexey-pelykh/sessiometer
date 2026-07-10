@@ -10,11 +10,18 @@
 // Honest-state discipline (the crown-jewel invariant, ADR-0003 UI analogue): a banner ALWAYS states
 // the connection status, the roster renders LIVE only on `.connected` and DIMMED-but-retained on every
 // degraded/absent state (never frozen-as-live), the empty-roster state shows an onboarding card
-// distinct from daemon-down, and a breaking-schema daemon refuses its numbers. The one command the panel
-// DOES run is the in-app capture affordance (issue #360): the onboarding card + add-account row send a
-// `capture` verb over the #358 control socket and render its redacted ack (pending → done → error) — the
-// app still originates no credential and never inserts the captured row itself (that arrives via the
-// `watch` snapshot). Version-skew alone stays a `brew upgrade` copy-command (the app can't self-update).
+// distinct from daemon-down, and a breaking-schema daemon refuses its numbers. The commands the panel
+// DOES run are the in-app capture affordance (issue #360) and the swap affordance (issue #169): both
+// send a verb over the #358 control socket and render its redacted ack (pending → done → error) — the
+// app still originates no credential, never inserts the captured row itself, and never mutates the
+// active account itself (both arrive via the `watch` snapshot). Version-skew alone stays a
+// `brew upgrade` copy-command (the app can't self-update).
+//
+// Two swap verbs, read differently (issue #169, Von Restorff): the footer **Swap** button is the
+// panel's ONE accent/primary action — the daemon's own recommendation, sent WYSIWYG as the displayed
+// `next_swap` target. A per-row manual switch is a quiet, neutral-weight, hover-revealed affordance —
+// the operator choosing an arbitrary target. Both send the SAME `swap` command; the daemon re-validates
+// every target from its own state, so the client never sends a viability hint.
 //
 // Provider-neutral by construction: the wire carries only the operator-chosen `label` (never an email
 // — issue #15) and no provider field, so a row is plain text with no brand color or logo. Every row is
@@ -37,6 +44,21 @@ fileprivate extension Color {
     }
 }
 
+/// The panel's fixed layout constants — thin references to the source-of-truth in `StatusPanelFormat`
+/// (the testable layer that also owns the width gate). The panel is FIXED-width by construction
+/// (`.frame(width:)` below), so a roster row's available width is a DERIVED CONSTANT, not something to
+/// measure. `StatusPanelFormat.rowFitsSwitchAffordance` gates the manual-switch affordance on it (issue
+/// #169's "gate the affordance on available row width"). If the panel ever becomes resizable or gains a
+/// compact mode, feed a MEASURED width into that same gate — the gate itself does not change.
+private enum PanelMetrics {
+    /// The panel's fixed content width.
+    static let width = CGFloat(StatusPanelFormat.panelContentWidth)
+    /// The roster's horizontal inset (`RosterView`), which the rows sit inside.
+    static let rosterInset = CGFloat(StatusPanelFormat.rosterHorizontalInset)
+    /// The width available to one roster row.
+    static var rowWidth: Double { StatusPanelFormat.defaultRowWidth }
+}
+
 /// The root panel. Observes the store and re-derives the reset-in against the client's own wall clock
 /// on a periodic `TimelineView` tick (issue #326: "computed against the client's own clock"), so a
 /// resting popover keeps its "resets in" honest without a manual refresh.
@@ -51,7 +73,7 @@ struct StatusPanelView: View {
         TimelineView(.periodic(from: .now, by: Self.clockTick)) { context in
             content(now: Int64(context.date.timeIntervalSince1970))
         }
-        .frame(width: 380, alignment: .leading)
+        .frame(width: PanelMetrics.width, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         // A translucent `.regularMaterial` scrim over the host's `.popover` vibrancy (StatusItemController):
         // the desktop blur reads through (matching the design reference's `backdrop-filter` translucency)
@@ -103,24 +125,29 @@ struct StatusPanelView: View {
 
             case .disconnected:
                 // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
-                // frozen-as-live (#137). No swap callout / add-account (swaps are paused while dropped).
+                // frozen-as-live (#137). No swap callout / add-account (swaps are paused while dropped),
+                // and the roster rows are NOT switchable: a retained last-known row is not a live target,
+                // and a click over a dead socket would be a dead click (#169's honest-affordance rule).
                 HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
                                                              ageText: ageText, ageStale: ageStale))
                 if !store.rows.isEmpty {
-                    RosterView(rows: store.rows, now: now).opacity(0.55)
+                    RosterView(rows: store.rows, now: now, switchable: false).opacity(0.55)
                 }
 
             case .connected, .stale:
                 // Live (or connected-but-stale — the roster stays full-strength, the header/footer carry
                 // the "stale" mark). The full design reference: roster, swap-callout hero, add-account.
+                // The roster is switchable exactly where the swap-callout card renders, so the panel's two
+                // swap paths (per-row manual, footer recommendation) are live and dead together (#169).
                 Divider().padding(.horizontal, 14)
                 if !store.rows.isEmpty {
-                    RosterView(rows: store.rows, now: now)
+                    RosterView(rows: store.rows, now: now, switchable: true)
                 }
                 if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
                     SwapCalloutCard(target: target,
                                     reason: StatusPanelFormat.swapCalloutReason(store.nextSwap))
                 }
+                SwapStatusLine()
                 AddAccountRow()
             }
 
@@ -174,30 +201,95 @@ private struct BannerView: View {
 // MARK: - Roster
 
 /// The per-account roster. Its live-vs-retained dimming is applied by the parent (so the `next_swap`
-/// footer dims in lock-step) — this view just lays the rows out.
+/// footer dims in lock-step) — this view just lays the rows out and decides, per row, whether it is a
+/// manual-switch target (issue #169).
 private struct RosterView: View {
     let rows: [AccountRow]
     let now: Int64
+    /// Whether rows offer the manual-switch affordance at all. `false` on a dropped connection, where a
+    /// retained last-known row is not a live target.
+    let switchable: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(rows) { row in
-                AccountRowView(row: row, now: now)
+                // On a dropped connection every row is `notATarget` (non-interactive); otherwise the pure
+                // `rowSwitchState` verdict decides (active → plain row, non-viable → disabled-with-reason,
+                // else the switch affordance). The active-row-stays-plain and parked-still-switchable
+                // rules live in that pure, unit-tested function — never re-decided here.
+                let state: StatusPanelFormat.RowSwitchState = switchable
+                    ? StatusPanelFormat.rowSwitchState(isActive: row.isActive,
+                                                       isQuarantined: row.isQuarantined,
+                                                       weeklyExhausted: row.weeklyExhausted,
+                                                       isEnabled: row.isEnabled)
+                    : .notATarget
+                AccountRowView(row: row, now: now, switchState: state)
             }
         }
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
         // the active row's accent card aligns with the swap-callout card below (also inset 8) instead of
         // bleeding edge-to-edge, plus 6px above / 2px below for breathing room under the divider.
-        .padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 2)
+        .padding(.horizontal, PanelMetrics.rosterInset).padding(.top, 6).padding(.bottom, 2)
+    }
+}
+
+/// The per-row manual-switch button style (issue #169): a QUIET, neutral affordance — deliberately NOT
+/// the accent/primary treatment the footer **Swap** button wears. Von Restorff: the accent action is
+/// what the daemon SUGGESTS; the quiet ones are the operator CHOOSING. A subtle wash on hover (a live
+/// row only) and a slightly deeper one while pressed; a blocked row never washes, so it can never read
+/// as pressable.
+private struct RowSwitchButtonStyle: ButtonStyle {
+    let hovering: Bool
+    let live: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            // MIS-CLICK GUARD (issue #169 falsifier b) — resolved deliberately, not by accident. The
+            // checklist item forbids "an INVISIBLE whole-row click"; the watch-out phrases it as "not a
+            // whole-row HOT-ZONE". Both are honored by REVEAL, not by shrinking the hit target:
+            //   * At rest the row is pure data — no wash, no glyph, no `pointingHand`: it does not read as
+            //     pressable, so the invisible-click hazard the checklist names cannot occur.
+            //   * The hit rect is the whole row (per the explicit "implement the row as a Button"
+            //     instruction + Fitts's law — an 18 pt glyph-only target would be a worse, error-prone
+            //     mechanism), but it is ARMED only once hover has revealed the glyph + wash + cursor, so
+            //     the operator always SEES the row is live before a press can land.
+            //   * Residual accidental-press risk is bounded by three things the daemon and model already
+            //     enforce: the daemon re-validates every target (a stray press can't do something unsafe),
+            //     a swap is reversible (undo = switch back), and a sibling swap is `.disabled()` mid-flight.
+            // Net: cheaper than a confirm dialog, honest at rest. The real-popover press feel is a #380
+            // manual-check item.
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .background(
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(Color.secondary.opacity(wash(pressed: configuration.isPressed)))
+            )
+    }
+
+    private func wash(pressed: Bool) -> Double {
+        guard live, hovering else { return 0 }
+        return pressed ? 0.16 : 0.08
     }
 }
 
 /// One account row, built to the design reference (`apps/menubar/design/menubar-preview.html`). BOTH
 /// reset windows show — R-2 parity with the `status` CLI, which prints both — never collapsed to one.
 /// The whole row is a single VoiceOver element.
+///
+/// A non-active row is ALSO the manual-switch affordance (issue #169): a `Button` whose trailing swap
+/// glyph is revealed on hover. The resting row stays pure data.
 private struct AccountRowView: View {
     let row: AccountRow
     let now: Int64
+    /// The row's manual-switch verdict (issue #169). `.notATarget` — the ACTIVE row, or any row on a
+    /// dropped connection — stays a plain, non-interactive display row.
+    let switchState: StatusPanelFormat.RowSwitchState
+
+    @EnvironmentObject private var swap: AccountSwapModel
+    @State private var isHovering = false
+    /// Whether this row currently owns a pushed `pointingHand` cursor — tracked so a push is always
+    /// balanced by exactly one pop, even when the row stops being live WHILE the pointer is inside it
+    /// (a sibling swap starting mid-hover would otherwise strand the cursor).
+    @State private var cursorPushed = false
 
     /// Each window's reset-in against the client's own clock — both shown, never collapsed to one pick.
     private var sessionReset: String {
@@ -214,7 +306,101 @@ private struct AccountRowView: View {
         StatusPanelFormat.weeklySeverity(weeklyPct: row.weeklyPct, weeklyExhausted: row.weeklyExhausted)
     }
 
+    // MARK: - Switch state (issue #169)
+
+    /// The wire-visible reason this row cannot be switched to, if any.
+    private var blockReason: StatusPanelFormat.SwitchBlock? {
+        if case .blocked(let block) = switchState { return block }
+        return nil
+    }
+
+    /// Whether the row is offered as a switch target AT ALL. `.notATarget` (active row / dropped
+    /// connection) never is; otherwise it is, GATED on the row's available width — too narrow to host the
+    /// affordance ⇒ not interactive, rather than an invisible whole-row hot-zone. The panel is
+    /// fixed-width, so the width is a derived constant (`PanelMetrics`), not a measurement.
+    private var offersSwitch: Bool {
+        switchState != .notATarget
+            && StatusPanelFormat.rowFitsSwitchAffordance(rowWidth: PanelMetrics.rowWidth)
+    }
+
+    /// This row's own swap is in flight.
+    private var isSwitching: Bool { swap.phase.pendingTarget == row.label }
+
+    /// Whether a click on this row would actually do something.
+    private var isLiveSwitch: Bool {
+        offersSwitch && blockReason == nil && !swap.phase.isPending
+    }
+
     var body: some View {
+        Group {
+            if offersSwitch {
+                // ROW-ACTION CARDINALITY (issue #169 watch-out — decide the count BEFORE the mechanism):
+                // a viable row carries exactly ONE action today (switch), so wrapping the whole row in a
+                // `Button` is sound, and it earns the VoiceOver button trait, native `.disabled()`, and
+                // hover styling for free. If a row ever gains a SECOND action (an enable-toggle, a
+                // remove), this wrap MUST be undone — nested interactive children inside a `Button` do
+                // not receive their own events. Hoist the secondary control into a trailing accessory or
+                // a context menu and shrink the button to the identity region.
+                Button(action: submit) { rowContent }
+                    .buttonStyle(RowSwitchButtonStyle(hovering: isHovering, live: isLiveSwitch))
+                    .disabled(blockReason != nil || swap.phase.isPending)
+                    .help(hoverText)
+                    // The button trait + `dimmed` come from `Button` + `.disabled()`; the label carries
+                    // the row's facts and, when blocked, WHY it is dimmed (a trait alone never says why).
+                    .accessibilityLabel(StatusPanelFormat.rowSwitchAccessibilityLabel(
+                        base: accessibilityLabel, block: blockReason))
+                    .accessibilityHint(blockReason == nil
+                                       ? StatusPanelFormat.switchHelpText(label: row.label) : "")
+            } else {
+                rowContent
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(accessibilityLabel)
+            }
+        }
+        .onHover { hovering in
+            isHovering = hovering
+            syncCursor()
+        }
+        // Resync the cursor whenever the row's live-ness can change WITHOUT a hover event, so a lingering
+        // `pointingHand` never contradicts the row's real state: a sibling swap starting/finishing
+        // (`swap.phase`), or a fresh snapshot flipping this row's viability or making it the new active
+        // account (`switchState`) while the pointer rests on it.
+        .onChange(of: swap.phase) { _ in syncCursor() }
+        .onChange(of: switchState) { _ in syncCursor() }
+        .onDisappear { setCursor(pushed: false) }
+    }
+
+    /// Submit a manual switch to THIS row's account. The clicked row's target goes on the wire verbatim;
+    /// the daemon re-validates it (`swap_command_verdict`) and may still refuse — a `cooldown`, say, which
+    /// never rides the wire and so cannot be pre-empted here. That refusal renders in `SwapStatusLine`.
+    private func submit() {
+        Task { await swap.swap(to: row.label) }
+    }
+
+    /// The hover tooltip: the block reason for a non-viable row, otherwise the switch invitation.
+    private var hoverText: String {
+        blockReason.map(StatusPanelFormat.switchBlockedText)
+            ?? StatusPanelFormat.switchHelpText(label: row.label)
+    }
+
+    /// Push / pop the `pointingHand` cursor to match whether a click here would do anything.
+    private func syncCursor() {
+        setCursor(pushed: isHovering && isLiveSwitch)
+    }
+
+    private func setCursor(pushed: Bool) {
+        guard pushed != cursorPushed else { return }
+        if pushed {
+            NSCursor.pointingHand.push()
+        } else {
+            NSCursor.pop()
+        }
+        cursorPushed = pushed
+    }
+
+    /// The row's visual content — identical whether or not it is wrapped in a `Button`, so the two
+    /// branches cannot drift.
+    private var rowContent: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
                 StatusDot(isActive: row.isActive)
@@ -243,6 +429,7 @@ private struct AccountRowView: View {
                 }
 
                 authView
+                switchSlot
             }
 
             VStack(spacing: 6) {
@@ -264,8 +451,39 @@ private struct AccountRowView: View {
             RoundedRectangle(cornerRadius: 9)
                 .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
         )
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// The trailing manual-switch slot (issue #169) — HOVER-REVEALED, never a resting affordance.
+    ///
+    /// The slot's WIDTH is laid out on every roster row, always, even where the glyph is invisible or the
+    /// row is not switchable at all. Two things fall out of that, both load-bearing:
+    ///   * revealing the glyph on hover can never REFLOW the row, so the label's truncation is identical
+    ///     hovered and at rest — the affordance can never truncate the label into something uninformative
+    ///     (the issue's row-width watch-out); and
+    ///   * the auth column stays aligned across active and non-active rows.
+    /// The why-text itself never truncates: it is a native `.help` tooltip, not an inline label.
+    ///
+    /// This hover-reveal is itself the mis-click guard — the full rationale lives on `RowSwitchButtonStyle`.
+    @ViewBuilder
+    private var switchSlot: some View {
+        Group {
+            if isSwitching {
+                ProgressView().controlSize(.small)
+            } else if offersSwitch, isHovering {
+                // A blocked row reveals a DISTINCT glyph (`nosign`), not a dimmer swap arrow: "you cannot
+                // switch here" is a different fact from "switch here", and shape carries it without color.
+                Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
+                    .font(.system(size: 11, weight: .semibold))
+                    // Neutral / secondary-text weight — never `.tint`. The accent belongs to the footer
+                    // Swap button alone (Von Restorff: one accent action per panel).
+                    .foregroundStyle(.secondary)
+                    .opacity(blockReason == nil ? 1 : 0.55)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: CGFloat(StatusPanelFormat.switchAffordanceSlotWidth), alignment: .trailing)
+        .accessibilityHidden(true)
     }
 
     /// The auth glyph (modern path) or the legacy tag text (pre-#119), plus the DEAD/`disabled` cue.
@@ -541,10 +759,13 @@ private struct HonestStrip: View {
 }
 
 /// The swap-callout hero — the design reference's primary action: the daemon's `next_swap` target, the
-/// daemon's OWN "why" line (issue #393 — carried on the wire, no longer client-derived), and the Swap
-/// button. Accent-tinted (the panel's ONE accent action). The button's on-click WIRING is #169 (the
-/// daemon swap command #167 already exists); until then it is present-but-DISABLED — honest that the
-/// affordance is not yet live, never a dead-click.
+/// daemon's OWN "why" line (issue #393 — carried on the wire, no longer client-derived), and the live
+/// Swap button. Accent-tinted: this is the panel's ONE accent action, the daemon's RECOMMENDATION
+/// (Von Restorff — the quiet per-row switches are the operator choosing instead).
+///
+/// WYSIWYG (issue #169): the button sends the `target` this card DISPLAYS — never a client re-pick, and
+/// never a targetless "swap to whatever you'd choose" verb. It is the same `swap` command a per-row
+/// switch sends; the daemon re-validates it either way.
 private struct SwapCalloutCard: View {
     let target: String
     /// The daemon's selection rationale for `target`, already rendered from the wire
@@ -552,12 +773,20 @@ private struct SwapCalloutCard: View {
     /// which case the card shows just the target label.
     let reason: String?
 
+    @EnvironmentObject private var swap: AccountSwapModel
+
+    /// The in-flight swap is this card's own target (as opposed to a per-row switch elsewhere).
+    private var isSwitchingToTarget: Bool { swap.phase.pendingTarget == target }
+
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "arrow.left.arrow.right")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.tint)
                 .accessibilityHidden(true)
+            // The card's TEXT is one combined VoiceOver element; the button below is a SEPARATE one.
+            // (Combining the whole card, as this did while the button was dead, would now swallow a live
+            // control and leave it unreachable.)
             VStack(alignment: .leading, spacing: 1) {
                 (Text("Next swap → ") + Text(target).fontWeight(.semibold))
                     .font(.system(size: 12))
@@ -571,13 +800,31 @@ private struct SwapCalloutCard: View {
                         .truncationMode(.tail)
                 }
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityText)
+
             Spacer(minLength: 6)
-            Button("Swap") {}
-                .font(.system(size: 12, weight: .semibold))
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(true)
-                .help("Switching accounts from the panel isn't available yet")
+
+            Button(action: { Task { await swap.swap(to: target) } }) {
+                if isSwitchingToTarget {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.small)
+                        Text(StatusPanelFormat.swapPendingText)
+                    }
+                } else {
+                    Text("Swap")
+                }
+            }
+            .font(.system(size: 12, weight: .semibold))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            // Any in-flight swap disables this button too — the footer and the rows are siblings on the
+            // one `swap` verb, and the daemon holds a single-writer lock behind it.
+            .disabled(swap.phase.isPending)
+            .help(StatusPanelFormat.switchHelpText(label: target))
+            .accessibilityLabel(isSwitchingToTarget
+                                ? "Switching to \(target)"
+                                : StatusPanelFormat.switchHelpText(label: target))
         }
         .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
         .background(
@@ -587,18 +834,50 @@ private struct SwapCalloutCard: View {
                     .strokeBorder(Color.accentColor.opacity(0.20), lineWidth: 0.5))
         )
         .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityText)
     }
 
-    /// The spoken label: identity + the daemon's reason (when present) + the pending-action note.
-    /// Omits the reason clause for a pre-#393 daemon (`reason == nil`), so VoiceOver never speaks a
-    /// dangling ". ." where the "why" line is absent.
+    /// The spoken label for the card's text: identity + the daemon's reason (when present). Omits the
+    /// reason clause for a pre-#393 daemon (`reason == nil`), so VoiceOver never speaks a dangling ". ."
+    /// where the "why" line is absent. The Swap button speaks for itself.
     private var accessibilityText: String {
         if let reason {
-            return "Next swap to \(target). \(reason). Swap action pending."
+            return "Next swap to \(target). \(reason)."
         }
-        return "Next swap to \(target). Swap action pending."
+        return "Next swap to \(target)."
+    }
+}
+
+/// The settled swap's inline outcome (issue #169) — one line beneath the swap-callout card, shared by
+/// BOTH swap paths (the footer recommendation and a per-row manual switch), because the daemon holds a
+/// single-writer swap lock: at most one swap is ever in flight, so at most one outcome needs a home.
+///
+/// PENDING renders nothing here — it is shown ON the clicked row / the footer button, where the operator
+/// is already looking; a second spinner would be noise. `done` clears itself after a short beat; a
+/// `failed` persists until the next swap attempt, so an error the operator has not read cannot vanish.
+private struct SwapStatusLine: View {
+    @EnvironmentObject private var swap: AccountSwapModel
+
+    var body: some View {
+        switch swap.phase {
+        case .idle, .pending:
+            EmptyView()
+        case .done(let success):
+            line(StatusPanelFormat.swapDoneText(success),
+                 symbol: "checkmark.circle.fill", tint: .green)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .failed(let failure):
+            line(StatusPanelFormat.swapErrorText(failure),
+                 symbol: "exclamationmark.triangle.fill", tint: .red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func line(_ text: String, symbol: String, tint: Color) -> some View {
+        Label(text, systemImage: symbol)
+            .font(.system(size: 11))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 12).padding(.vertical, 2)
     }
 }
 

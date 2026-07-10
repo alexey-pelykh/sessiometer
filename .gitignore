@@ -106,3 +106,8 @@ target/
 *.pdb
 
 # Note: Cargo.lock is intentionally committed (sessiometer is a binary crate).
+
+# Xcode derived data for apps/menubar when `xcodebuild -derivedDataPath .build/xcode` is run from the
+# REPO ROOT (as the menubar build command documents). `apps/menubar/.gitignore` only covers that path
+# relative to its own directory, so a root-level build needs its own entry.
+.build/

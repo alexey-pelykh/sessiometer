@@ -31,24 +31,34 @@ final class StatusItemController {
     /// GATED on `captureModel.isBusy` (a mid-edit label / in-flight capture must not be lost), and so the
     /// non-activating panel can be re-asserted key when the label field takes focus.
     private let captureModel: AccountCaptureModel
+    /// The swap affordance's model (issue #169). Owned here for the same reason as `captureModel`: the
+    /// outside-click dismiss is GATED on `swapModel.isBusy`, so an in-flight swap — a real write against
+    /// the operator's active account — cannot be hidden by a stray click before its outcome is seen.
+    private let swapModel: AccountSwapModel
     private var presentationTask: Task<Void, Never>?
     /// The UX gap between the menu bar and the panel's top edge.
     private let panelGap: CGFloat = 6
     /// The outside-click monitor installed WHILE the panel is open (see `openPanel`). `nil` when closed.
     private var dismissMonitor: Any?
 
-    init(store: WatchStatusStore, captureClient: ControlCommandClient?) {
+    init(store: WatchStatusStore,
+         captureClient: ControlCommandClient?,
+         swapClient: ControlCommandClient?) {
         self.store = store
         let captureModel = AccountCaptureModel(client: captureClient)
         self.captureModel = captureModel
+        let swapModel = AccountSwapModel(client: swapClient)
+        self.swapModel = swapModel
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // #326's status panel reads the store via `@EnvironmentObject` (a thin view over the
         // `src/cli.rs`-mirroring `StatusPanelFormat`), so inject it here rather than through an init. The
-        // #360 capture affordance reads the `AccountCaptureModel` the same way — injected alongside.
+        // #360 capture affordance reads the `AccountCaptureModel` the same way, and the #169 swap
+        // affordance the `AccountSwapModel` — all injected alongside.
         let hosting = NSHostingView(rootView: StatusPanelView()
             .environmentObject(store)
-            .environmentObject(captureModel))
+            .environmentObject(captureModel)
+            .environmentObject(swapModel))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         self.hostingView = hosting
 
@@ -214,9 +224,11 @@ final class StatusItemController {
                 return
             }
             // #360: don't dismiss while the operator is mid-edit or a capture is in flight — an accidental
-            // outside-click must not drop a typed-but-unsubmitted label or hide an in-flight capture. The
+            // outside-click must not drop a typed-but-unsubmitted label or hide an in-flight capture. #169
+            // extends the same retain to an in-flight SWAP, which writes the active account: its outcome
+            // (committed, or refused with a reason) must not be hidden before the operator reads it. The
             // Esc key (field `.onExitCommand`) and the status-item toggle remain the deliberate closers.
-            if self.captureModel.isBusy { return }
+            if self.captureModel.isBusy || self.swapModel.isBusy { return }
             self.closePanel()
         }
     }
