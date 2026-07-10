@@ -409,10 +409,10 @@ enum StatusPanelFormat {
     /// — NOT swap history (a true last-swap needs a new daemon source; issue #326 note).
     static func nextSwapFooter(_ nextSwap: NextSwap?) -> String? {
         switch nextSwap {
-        case .target(let to): return "Next swap → \(to)"
-        case .noViableTarget: return "No viable target"
-        case .awaitingData:   return "Awaiting data"
-        case nil:             return nil
+        case .target(let to, _): return "Next swap → \(to)"
+        case .noViableTarget:    return "No viable target"
+        case .awaitingData:      return "Awaiting data"
+        case nil:                return nil
         }
     }
 
@@ -444,19 +444,27 @@ enum StatusPanelFormat {
     /// forward candidate — the card is then absent (same single-cardinality as `nextSwapFooter`; a
     /// `noViableTarget` / `awaitingData` / absent anchor shows no card).
     static func swapCalloutTarget(_ nextSwap: NextSwap?) -> String? {
-        if case .target(let to) = nextSwap { return to }
+        if case .target(let to, _) = nextSwap { return to }
         return nil
     }
 
-    /// The swap-callout's muted "why" line — a CLIENT-derived description of the target row, because
-    /// the wire's `next_swap` carries only the label, never a reason (#15). Facts only: the target's
-    /// weekly headroom, flagged "lowest weekly" ONLY when it genuinely has the least weekly usage among
-    /// the viable swap candidates (computed by the caller) — never an invented rationale.
-    static func swapCalloutReason(targetWeeklyPct: UInt8?, isLowestWeekly: Bool) -> String {
-        guard let weekly = targetWeeklyPct else {
-            return isLowestWeekly ? "most headroom" : "next candidate"
+    /// The swap-callout's muted "why" line — the daemon's OWN selection reason (issue #393),
+    /// rendered from the wire `NextSwap.target` discriminant. This REPLACES the former client-side
+    /// derivation, which asserted "lowest weekly · most headroom" — a rationale on the SUPERSEDED
+    /// selection axis (`pick_target` chooses by soonest weekly reset, #37, not headroom), and one
+    /// the client could not honestly re-derive anyway (the daemon-only session trigger / floor never
+    /// ride the wire). `nil` when the candidate is not a `target`, OR when a pre-#393 daemon carried
+    /// a target with no reason — the card then shows just the label (strictly more honest than the
+    /// old superseded-rule story). Each medium renders the shared discriminant its own way
+    /// (state-parity): this concise phrase for the panel, a parenthetical for `sessiometer status`.
+    static func swapCalloutReason(_ nextSwap: NextSwap?) -> String? {
+        guard case .target(_, let reason) = nextSwap else { return nil }
+        switch reason {
+        case .soonestReset:  return "weekly resets soonest"
+        case .onlyCandidate: return "only viable target"
+        case .rosterOrder:   return "first eligible · no reset times known"
+        case nil:            return nil
         }
-        return isLowestWeekly ? "lowest weekly · \(pct(weekly)) · most headroom" : "weekly \(pct(weekly))"
     }
 
     // MARK: - Row VoiceOver label (issue #326 AC — VoiceOver-navigable rows)

@@ -164,7 +164,7 @@ struct AccountRow: Identifiable, Equatable, Sendable {
     /// against the snapshot's `next_swap` candidate.
     static func rows(from status: VersionedStatus) -> [AccountRow] {
         let targetLabel: String?
-        if case .target(let to) = status.nextSwap { targetLabel = to } else { targetLabel = nil }
+        if case .target(let to, _) = status.nextSwap { targetLabel = to } else { targetLabel = nil }
         return status.accounts.map { account in
             AccountRow(
                 label: account.label,

@@ -53,7 +53,7 @@ final class HonestStateMachineTests: XCTestCase {
         let m = machine([.connected, .line(Fixtures.snapshotRichTarget)])
         XCTAssertEqual(m.connectionState, .connected)
         XCTAssertEqual(m.rows.count, 2)
-        XCTAssertEqual(m.nextSwap, .target(to: "personal"))
+        XCTAssertEqual(m.nextSwap, .target(to: "personal", reason: .onlyCandidate))
         XCTAssertEqual(m.refreshEnabled, true)
 
         let work = try XCTUnwrap(m.rows.first { $0.label == "work" })

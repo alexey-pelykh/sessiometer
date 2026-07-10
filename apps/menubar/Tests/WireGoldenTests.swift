@@ -73,4 +73,20 @@ final class WireGoldenTests: XCTestCase {
                 + "and update the Swift mirror (Sources/WireModel.swift) + this fixture in lockstep"
         )
     }
+
+    /// The `next_swap` = target frame carrying the #393 structured reason: the Swift
+    /// `snapshotNextSwap` fixture must be byte-identical to the Rust-emitted
+    /// `wire_golden_snapshot_next_swap_frame` golden — this is what puts the `NextSwap.target`
+    /// `reason` field under the cross-language byte-drift guard (the basic golden's `next_swap` is
+    /// null, so it never exercises the reason encoder/mirror).
+    func testNextSwapReasonFixtureMatchesRustGolden() throws {
+        XCTAssertEqual(
+            Fixtures.snapshotNextSwap,
+            try golden("wire-snapshot-next-swap.json"),
+            "snapshotNextSwap drifted from the Rust wire golden — the daemon's next_swap reason wire "
+                + "type changed; regenerate the golden (cargo test -- --ignored "
+                + "emit_wire_golden_fixtures) and update the Swift mirror (Sources/WireModel.swift) + "
+                + "this fixture in lockstep"
+        )
+    }
 }

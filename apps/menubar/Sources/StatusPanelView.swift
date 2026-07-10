@@ -118,7 +118,8 @@ struct StatusPanelView: View {
                     RosterView(rows: store.rows, now: now)
                 }
                 if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
-                    SwapCalloutCard(target: target, rows: store.rows)
+                    SwapCalloutCard(target: target,
+                                    reason: StatusPanelFormat.swapCalloutReason(store.nextSwap))
                 }
                 AddAccountRow()
             }
@@ -539,13 +540,17 @@ private struct HonestStrip: View {
     }
 }
 
-/// The swap-callout hero — the design reference's primary action: the daemon's `next_swap` target, a
-/// client-derived "why" line, and the Swap button. Accent-tinted (the panel's ONE accent action). The
-/// button's on-click WIRING is #169 (the daemon swap command #167 already exists); until then it is
-/// present-but-DISABLED — honest that the affordance is not yet live, never a dead-click.
+/// The swap-callout hero — the design reference's primary action: the daemon's `next_swap` target, the
+/// daemon's OWN "why" line (issue #393 — carried on the wire, no longer client-derived), and the Swap
+/// button. Accent-tinted (the panel's ONE accent action). The button's on-click WIRING is #169 (the
+/// daemon swap command #167 already exists); until then it is present-but-DISABLED — honest that the
+/// affordance is not yet live, never a dead-click.
 private struct SwapCalloutCard: View {
     let target: String
-    let rows: [AccountRow]
+    /// The daemon's selection rationale for `target`, already rendered from the wire
+    /// `NextSwap.target` reason (issue #393); `nil` for a pre-#393 daemon that sent no reason, in
+    /// which case the card shows just the target label.
+    let reason: String?
 
     var body: some View {
         HStack(spacing: 10) {
@@ -558,11 +563,13 @@ private struct SwapCalloutCard: View {
                     .font(.system(size: 12))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                Text(reason)
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                if let reason {
+                    Text(reason)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             }
             Spacer(minLength: 6)
             Button("Swap") {}
@@ -581,19 +588,17 @@ private struct SwapCalloutCard: View {
         )
         .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Next swap to \(target). \(reason). Swap action pending.")
+        .accessibilityLabel(accessibilityText)
     }
 
-    /// The client-derived "why" line — the wire carries only the target label (#15), so the reason is
-    /// computed here: the target's weekly headroom, flagged "lowest weekly" ONLY when it truly has the
-    /// least weekly usage among the viable (non-active, enabled) swap candidates.
-    private var reason: String {
-        let targetRow = rows.first { $0.label == target }
-        let candidates = rows.filter { !$0.isActive && $0.isEnabled }
-        let knownWeekly = candidates.compactMap(\.weeklyPct)
-        let isLowest = targetRow?.weeklyPct.map { tw in knownWeekly.allSatisfy { tw <= $0 } } ?? false
-        return StatusPanelFormat.swapCalloutReason(targetWeeklyPct: targetRow?.weeklyPct,
-                                                   isLowestWeekly: isLowest)
+    /// The spoken label: identity + the daemon's reason (when present) + the pending-action note.
+    /// Omits the reason clause for a pre-#393 daemon (`reason == nil`), so VoiceOver never speaks a
+    /// dangling ". ." where the "why" line is absent.
+    private var accessibilityText: String {
+        if let reason {
+            return "Next swap to \(target). \(reason). Swap action pending."
+        }
+        return "Next swap to \(target). Swap action pending."
     }
 }
 

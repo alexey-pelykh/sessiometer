@@ -304,7 +304,7 @@ final class StatusPanelFormatTests: XCTestCase {
     // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
 
     func testNextSwapFooterWording() {
-        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal")), "Next swap → personal")
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal", reason: .onlyCandidate)), "Next swap → personal")
         XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.noViableTarget), "No viable target")
         XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.awaitingData), "Awaiting data")
         XCTAssertNil(StatusPanelFormat.nextSwapFooter(nil))   // no active anchor → no footer
@@ -395,7 +395,7 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertTrue(target.isNextSwapTarget)
         let other = try XCTUnwrap(rows.first { $0.label == "work" })
         XCTAssertFalse(other.isNextSwapTarget)
-        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal")), "Next swap → personal")
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal", reason: .onlyCandidate)), "Next swap → personal")
     }
 
     // MARK: - Header subtitle (issue #355 — design-reference parity)
@@ -441,29 +441,37 @@ final class StatusPanelFormatTests: XCTestCase {
     // MARK: - Swap callout (issue #355 — design-reference parity)
 
     func testSwapCalloutTargetIsPresentOnlyForAViableForwardCandidate() {
-        XCTAssertEqual(StatusPanelFormat.swapCalloutTarget(.target(to: "personal")), "personal")
+        XCTAssertEqual(StatusPanelFormat.swapCalloutTarget(.target(to: "personal", reason: .onlyCandidate)), "personal")
         XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.noViableTarget))
         XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.awaitingData))
         XCTAssertNil(StatusPanelFormat.swapCalloutTarget(nil))
     }
 
-    func testSwapCalloutReasonIsFactualAndNeverInventsLowest() {
-        // Genuinely lowest-weekly target → the full reference-style reason with its weekly %.
+    func testSwapCalloutReasonRendersTheDaemonSelectionAxis() {
+        // #393: the "why" line is now the daemon's OWN reason read off the wire — the #37
+        // soonest-reset axis, the sole-candidate default, or the no-tiebreak roster-order fallback —
+        // each rendered concisely (state-parity with the CLI's parenthetical). It is NO LONGER a
+        // client-derived "lowest weekly · most headroom" claim, which asserted a rationale on the
+        // SUPERSEDED selection axis.
         XCTAssertEqual(
-            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: 18, isLowestWeekly: true),
-            "lowest weekly · 18% · most headroom")
-        // Not the lowest → just the factual weekly %, no "most headroom" claim it can't support.
+            StatusPanelFormat.swapCalloutReason(
+                .target(to: "spare", reason: .soonestReset(resetsAt: 1_893_800_000))),
+            "weekly resets soonest")
         XCTAssertEqual(
-            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: 71, isLowestWeekly: false),
-            "weekly 71%")
-        // Weekly unknown (failed poll) but lowest → headroom without a fabricated %.
+            StatusPanelFormat.swapCalloutReason(.target(to: "spare", reason: .onlyCandidate)),
+            "only viable target")
+        // ≥2 accounts qualified but none reported a reset → the card must NOT say "only viable
+        // target"; the others were viable too. It names the axis that actually decided.
         XCTAssertEqual(
-            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: nil, isLowestWeekly: true),
-            "most headroom")
-        // Weekly unknown and not lowest → the neutral fallback.
-        XCTAssertEqual(
-            StatusPanelFormat.swapCalloutReason(targetWeeklyPct: nil, isLowestWeekly: false),
-            "next candidate")
+            StatusPanelFormat.swapCalloutReason(.target(to: "spare", reason: .rosterOrder)),
+            "first eligible · no reset times known")
+        // A pre-#393 daemon sent a target with no reason → no "why" line (the card shows just the
+        // label — strictly more honest than the old superseded-rule story).
+        XCTAssertNil(StatusPanelFormat.swapCalloutReason(.target(to: "spare", reason: nil)))
+        // A non-target candidate (or no anchor) has no reason to render.
+        XCTAssertNil(StatusPanelFormat.swapCalloutReason(.noViableTarget))
+        XCTAssertNil(StatusPanelFormat.swapCalloutReason(.awaitingData))
+        XCTAssertNil(StatusPanelFormat.swapCalloutReason(nil))
     }
 
     // MARK: - Helpers

@@ -59,9 +59,11 @@ enum RenderPanelTool {
         // show a banner / onboarding card. Ages chosen so the footer reads live / stale as intended.
         let fixtures = [
             Fixture(name: "healthy", state: .connected, rows: rows,
-                    nextSwap: .target(to: "Scratch"), generatedAt: now - 12),
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 12),
             Fixture(name: "stale", state: .stale, rows: rows,
-                    nextSwap: .target(to: "Scratch"), generatedAt: now - 5400),
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 5400),
             Fixture(name: "disconnected", state: .disconnected(reason: "the daemon is not responding"),
                     rows: rows, nextSwap: nil, generatedAt: now - 240),
             Fixture(name: "connecting", state: .connecting, rows: [], nextSwap: nil, generatedAt: nil),
