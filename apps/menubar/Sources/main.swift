@@ -45,7 +45,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The always-visible chrome: the status item consumes the store's glance stream.
         let store = WatchStatusStore()
         self.store = store
-        let controller = StatusItemController(store: store)
+
+        // The in-app capture affordance's write path (issue #360): the short-lived control-command client
+        // over the SAME daemon control socket the watch transport uses. Built via `.production()` (the
+        // ADR-0011 non-sandbox tripwire); a resolve failure (sandboxed / home unresolved) degrades to a nil
+        // client so a capture attempt surfaces an honest "unreachable" rather than a dead button — and in
+        // that case the watch transport ALSO fails, so the panel shows disconnected and never renders the
+        // affordance anyway.
+        let captureClient: ControlCommandClient?
+        switch ControlCommandClient.production() {
+        case .success(let client):
+            captureClient = client
+        case .failure(let error):
+            appLog.error("capture client unavailable: \(String(describing: error), privacy: .public)")
+            captureClient = nil
+        }
+
+        let controller = StatusItemController(store: store, captureClient: captureClient)
         controller.start()
         statusItemController = controller
 

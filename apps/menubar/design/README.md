@@ -2,7 +2,8 @@
 
 The canonical **visual** build-reference for the SwiftUI menubar panel (see #168 / #169).
 `menubar-preview.html` is a single self-contained mock of **all 9 launch-or-attach states**
-(light + dark) in the intended native macOS language.
+(light + dark) in the intended native macOS language, plus a **capture-affordance interaction-states**
+reference card (pending / done / error) for the in-app "Capture active account" action (#360).
 
 ![All 9 menubar states, light + dark](renders/all-states.png)
 
@@ -20,7 +21,7 @@ blacks out the vibrancy). Run from this directory:
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --hide-scrollbars --force-device-scale-factor=1.5 \
-  --window-size=1200,7600 --screenshot=renders/all-states.png \
+  --window-size=1200,8200 --screenshot=renders/all-states.png \
   menubar-preview.html
 ```
 
@@ -96,7 +97,10 @@ healthy on a degraded daemon.
 - **Identity** — each row leads with the account's operator-chosen **label** (never the email;
   defaults to the account UUID when unset), provider on a quieter secondary line.
 - **Provider-neutral** — a monochrome monogram badge + plain-text label, no brand color or logo.
-- **Copy-command, never a runner** — `sessiometer capture` / `brew upgrade sessiometer` buttons copy the command to the
-  clipboard; the app never runs them, and there is **no fake spinner** (daemon-starting shows a
-  static "forming" glyph).
+- **Capture is a real action; copy-command only where the app can't act** — first-run onboarding and
+  **Add account** capture the active account in-app (#360), sending the verb over the #358 control socket
+  and rendering an honest pending → done → error (redacted ack; no credential ever reaches the client);
+  the captured row arrives on its own via the live `watch` stream (the affordance never inserts it).
+  Version-skew still offers a `brew upgrade sessiometer` **copy-command** (the app can't self-update), and
+  daemon-starting shows a static "forming" glyph — the app fakes no progress it isn't doing.
 - **Honest state** — disconnected rows are dimmed + "stale", never frozen-as-live.

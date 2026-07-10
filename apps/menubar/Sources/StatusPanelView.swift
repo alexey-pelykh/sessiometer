@@ -10,9 +10,11 @@
 // Honest-state discipline (the crown-jewel invariant, ADR-0003 UI analogue): a banner ALWAYS states
 // the connection status, the roster renders LIVE only on `.connected` and DIMMED-but-retained on every
 // degraded/absent state (never frozen-as-live), the empty-roster state shows an onboarding card
-// distinct from daemon-down, and a breaking-schema daemon refuses its numbers. The panel never runs a
-// command — the onboarding card COPIES `sessiometer capture` to the clipboard (design-menubar
-// "copy-command, never a runner").
+// distinct from daemon-down, and a breaking-schema daemon refuses its numbers. The one command the panel
+// DOES run is the in-app capture affordance (issue #360): the onboarding card + add-account row send a
+// `capture` verb over the #358 control socket and render its redacted ack (pending → done → error) — the
+// app still originates no credential and never inserts the captured row itself (that arrives via the
+// `watch` snapshot). Version-skew alone stays a `brew upgrade` copy-command (the app can't self-update).
 //
 // Provider-neutral by construction: the wire carries only the operator-chosen `label` (never an email
 // — issue #15) and no provider field, so a row is plain text with no brand color or logo. Every row is
@@ -37,12 +39,12 @@ struct StatusPanelView: View {
         }
         .frame(width: 380, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
-        // An OPAQUE, appearance-adaptive backing so the panel reads at full contrast regardless of what
-        // is behind it. The `.popover` vibrancy (StatusItemController) blended with the desktop/terminal
-        // behind the panel — dropping every label + metric onto a SHIFTING mid-tone — so text contrast
-        // was at the mercy of the wallpaper. A solid `windowBackgroundColor` (clipped to the panel's
-        // rounded corners by the host effect view) gives a stable, high-contrast card in light OR dark.
-        .background(Color(nsColor: .windowBackgroundColor))
+        // A translucent `.regularMaterial` scrim over the host's `.popover` vibrancy (StatusItemController):
+        // the desktop blur reads through (matching the design reference's `backdrop-filter` translucency)
+        // while the material's built-in frosting keeps every label + metric legible against a busy wallpaper
+        // — the contrast guarantee we previously bought only by going fully opaque, which defeated the
+        // vibrancy. Restores #390 (I5); the scrim is what makes the restore safe (ratified: vibrancy+scrim).
+        .background(.regularMaterial)
     }
 
     @ViewBuilder
@@ -238,17 +240,14 @@ private struct AccountRowView: View {
         .padding(.horizontal, 8)
         .padding(.top, 9)
         .padding(.bottom, 10)
-        // Active emphasis follows the design reference: an accent-tint fill + ring. Active is redundantly
-        // encoded — the filled leading dot (shape) + the "ACTIVE" tag carry it too — so color is never the
-        // SOLE signal (WCAG 1.4.1 / R-2 state-parity holds; the accent here is a redundant cue, and the
-        // now-dropped per-row next badge means accent is no longer overloaded).
+        // Active emphasis follows the design reference: an accent-tint fill ONLY. The accent ring was
+        // dropped (#387 M5, ratified) to cut active over-signaling — active stays redundantly encoded by
+        // the filled leading dot (shape) + the "ACTIVE" tag + the tint, so color is never the SOLE signal
+        // (WCAG 1.4.1 / R-2 state-parity holds). The mock's active-ring is dropped in lockstep
+        // (menubar-preview.html `.acct.active` / `.stat.active`).
         .background(
             RoundedRectangle(cornerRadius: 9)
                 .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9)
-                        .strokeBorder(Color.accentColor.opacity(row.isActive ? 0.28 : 0), lineWidth: 0.5)
-                )
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
@@ -586,110 +585,170 @@ private struct SwapCalloutCard: View {
     }
 }
 
-/// The always-on "Add account…" row — the design reference's populated-roster affordance. COPIES
-/// `sessiometer capture` to the clipboard (the app never runs it — C-005: no roster/credential mutation
-/// from the client); the same copy-command as the empty-roster onboarding, always available.
-private struct AddAccountRow: View {
-    @State private var copied = false
+/// The in-app capture affordance (issue #360) — a "Capture active account" button + an inline operator-
+/// label field, SHARED by the populated add-account row and the empty-roster onboarding card. It sends
+/// `{"cmd":"capture","label":…}` over the #358 control-command transport (via `AccountCaptureModel`) and
+/// renders the redacted ack's idle → pending → done → error phase. It NEVER inserts the captured row —
+/// that arrives on its own via the `watch` snapshot (issue #360 AC); on success the affordance just
+/// returns to idle. The client still originates NO credential (C-005 held): a verb + non-secret label out,
+/// a redacted ack back.
+///
+/// Capture snapshots the account currently logged into Claude Code — it is NOT an account picker. To add a
+/// DIFFERENT account the operator runs `claude /login` first, then captures (the honest scope boundary,
+/// surfaced as the onboarding secondary hint). An already-active-and-rostered account is an idempotent
+/// refresh.
+private struct CaptureAffordance: View {
+    /// Onboarding uses the prominent, stacked treatment (the first-run hero); the populated add-row uses
+    /// the compact inline one.
+    enum Style { case onboarding, addRow }
+    let style: Style
+
+    @EnvironmentObject private var capture: AccountCaptureModel
+    @State private var label = ""
+    @FocusState private var fieldFocused: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button(action: copy) {
-                Label(copied ? "Copied" : "Add account…",
-                      systemImage: copied ? "checkmark" : "rectangle.badge.plus")
-                    .font(.system(size: 12))
+        Group {
+            switch style {
+            case .onboarding: onboarding
+            case .addRow:     addRow
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .accessibilityLabel(copied ? "Copied the capture command"
-                                       : "Add account — copies the capture command")
-            if copied {
-                Text("Copied — paste in Terminal")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.green)
-                    .lineLimit(1)
-            } else {
-                // The design reference renders the copy-command as a monospaced chip, not plain prose.
-                HStack(spacing: 4) {
-                    Text("copies")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    Text(StatusPanelFormat.captureCommand)
-                        .font(.system(size: 10.5, design: .monospaced))
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.14)))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+        }
+        // Bridge the field's focus to the model — the panel-retain predicate (`isBusy`) gates the outside-
+        // click dismiss on it, and focusing re-asserts the panel key so keystrokes land (issue #360).
+        .onChange(of: fieldFocused) { focused in capture.setEditing(focused) }
+        // Esc cancels: resign focus + clear back to idle so an outside click can dismiss again (Return
+        // submits via the field's `.onSubmit`).
+        .onExitCommand {
+            fieldFocused = false
+            capture.cancelEditing()
+        }
+        // A completed capture consumed its label; blank the field so the next capture starts clean.
+        .onChange(of: capture.phase) { phase in
+            if case .done = phase { label = "" }
+        }
+    }
+
+    /// The label field — the placeholder invites an OPTIONAL label; blank → the daemon derives the handle
+    /// from the account UUID (never the email). Disabled while a capture is in flight.
+    private var field: some View {
+        TextField("e.g. Work, Personal", text: $label)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12))
+            .focused($fieldFocused)
+            .onSubmit(submit)
+            .disabled(capture.phase.isPending)
+            .accessibilityLabel("Account label, optional")
+    }
+
+    /// The "Capture active account" button — the primary action; disabled and spinner-labelled while
+    /// pending (a real pending state is honest now that capture is a real daemon-routed action).
+    private func button(prominent: Bool) -> some View {
+        Button(action: submit) {
+            if capture.phase.isPending {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text(StatusPanelFormat.capturePendingText)
                 }
+            } else {
+                Label("Capture active account", systemImage: "rectangle.badge.plus")
             }
-            Spacer(minLength: 0)
+        }
+        .font(.system(size: 12, weight: prominent ? .semibold : .regular))
+        .controlSize(.small)
+        .disabled(capture.phase.isPending)
+        .accessibilityLabel(capture.phase.isPending ? "Capturing the active account"
+                                                     : "Capture the active account")
+    }
+
+    /// The done / error status line — rendered from the PURE `StatusPanelFormat` copy, never a string the
+    /// view invents. Pending is shown on the button itself; idle has no status.
+    @ViewBuilder
+    private var status: some View {
+        switch capture.phase {
+        case .idle, .pending:
+            EmptyView()
+        case .done(let doneLabel):
+            Label(StatusPanelFormat.captureDoneText(label: doneLabel), systemImage: "checkmark.circle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.green)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        case .failed(let failure):
+            Label(StatusPanelFormat.captureErrorText(failure), systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The prominent, stacked treatment for the first-run onboarding card.
+    private var onboarding: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            field
+            HStack(spacing: 8) {
+                button(prominent: true).buttonStyle(.borderedProminent)
+                Spacer(minLength: 0)
+            }
+            status
+            Text("To add a different account, run claude /login first, then capture.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The compact inline treatment beneath the populated roster.
+    private var addRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                field
+                button(prominent: false).buttonStyle(.bordered)
+            }
+            status
         }
         .padding(.horizontal, 12).padding(.top, 5).padding(.bottom, 3)
     }
 
-    /// Copy the capture command — a pure AppKit pasteboard write, no execution (pure client). Brief
-    /// "Copied" confirmation, mirroring the onboarding card.
-    private func copy() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(StatusPanelFormat.captureCommand, forType: .string)
-        copied = true
-        Task {
-            try? await Task.sleep(for: .seconds(1.6))
-            copied = false
-        }
+    /// Submit a capture of the currently-active account under the field's label (blank → the daemon derives
+    /// the handle). The model owns the pending → done / failed transitions.
+    private func submit() {
+        let text = label
+        Task { await capture.capture(rawLabel: text) }
+    }
+}
+
+/// The always-on "Add account" row (issue #360) — the populated-roster capture affordance: the same
+/// "Capture active account" button + label field as the onboarding card, always available beneath the
+/// roster. Replaces the pre-#360 copy-command; the captured row arrives via the `watch` snapshot.
+private struct AddAccountRow: View {
+    var body: some View {
+        CaptureAffordance(style: .addRow)
     }
 }
 
 // MARK: - Empty-roster onboarding
 
-/// The first-run onboarding card (issue #326 AC): visually distinct from daemon-down, it explains the
-/// empty roster and offers the `sessiometer capture` command to COPY — the app never runs it.
+/// The first-run onboarding card (issue #326 / #360): visually distinct from daemon-down, it explains the
+/// empty roster and offers the in-app capture affordance — a "Capture active account" button + label field
+/// that sends the capture command over the #358 transport and renders pending → done → error. The captured
+/// row then arrives on its own via the `watch` snapshot (the app still originates no credential — a verb +
+/// label out, a redacted ack back).
 private struct OnboardingCard: View {
-    @State private var copied = false
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 9) {
             Text("Capture your first account")
                 .font(.subheadline.weight(.semibold))
-            Text("Run this in a terminal to add an account, then the daemon starts tracking it here.")
+            Text("Capture the account you’re signed into — the daemon adds it to the roster and starts tracking it here.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 8) {
-                Text(StatusPanelFormat.captureCommand)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 8)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
-                    .accessibilityLabel("command \(StatusPanelFormat.captureCommand)")
-
-                Spacer(minLength: 0)
-
-                Button(action: copy) {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .labelStyle(.titleAndIcon)
-                        .font(.caption)
-                }
-                .accessibilityLabel(copied ? "Copied the capture command" : "Copy the capture command")
-            }
+            CaptureAffordance(style: .onboarding)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
-    }
-
-    /// Copy the command to the clipboard — a pure AppKit pasteboard write, no execution (the app is a
-    /// pure client). Shows a brief "Copied" confirmation.
-    private func copy() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(StatusPanelFormat.captureCommand, forType: .string)
-        copied = true
-        Task {
-            try? await Task.sleep(for: .seconds(1.6))
-            copied = false
-        }
     }
 }
 
