@@ -241,12 +241,19 @@ impl KeepWarmTrigger {
 /// (which renders it) both import it.
 ///
 /// Non-secret by construction: a bare classification, never a token, an expiry, or an
-/// email — the same #15 discipline as [`RefreshEventOutcome`]. The four SEVERITY variants
-/// are ordered `Healthy` < `Stale` < `AtRisk` < `Dead`, matching the issue's green →
+/// email — the same #15 discipline as [`RefreshEventOutcome`]. The SEVERITY variants are
+/// ordered `Healthy` < `Stale` < `AtRisk` < `Degraded` < `Dead`, matching the issue's green →
 /// yellow → orange → red ladder; `Unknown` (issue #137) is OFF that severity axis — a
 /// non-active account with NO positive-liveness evidence (never successfully polled, no
 /// refresh telemetry, no refresh-sourced expiry), reported honestly rather than as a false
 /// 🟢. It sits just above `Healthy` in declaration order, the "unverified" caution.
+///
+/// `Degraded` (issue #427) splits the old `Dead` catch-all in two: a bare `quarantined`
+/// (the #42 access-token 401-streak) is NON-TERMINAL — the *access* token was rejected, but
+/// a usage-endpoint 401 says nothing about the *refresh* token (a resource server never sees
+/// it), so `poke` / a daemon restart revive the account. It is `Degraded`, not `Dead`; only a
+/// PROVEN refresh-token death (a sweep-refresh that actually returned `Dead`, the #261 /
+/// `CredentialUnrecoverable` cue) justifies the terminal 🔴 `Dead` / "claude /login".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CredentialHealth {
@@ -268,8 +275,17 @@ pub(crate) enum CredentialHealth {
     /// prevents staleness/death is struggling, so the account trends toward dead even
     /// while its token may still work for now. 🟠
     AtRisk,
-    /// The credential is DEAD — quarantined (the #42 401-streak verdict) OR its refresh
-    /// token was cleared in place — and needs an operator `claude /login`. 🔴
+    /// The stored ACCESS token was rejected and the account 401-streaked into quarantine (the
+    /// #42 verdict), so it is out of rotation right now — but this is NON-TERMINAL (issue
+    /// #427): a usage-endpoint 401 never sees the refresh token, so the refresh token is
+    /// (very likely) still valid and `poke` / a restart revive the account. Needs a REFRESH,
+    /// not a re-login. Renders 🟠 with a needs-refresh cue, distinct from the terminal 🔴
+    /// `Dead`. Only escalates to `Dead` once a refresh actually returns `Dead`.
+    Degraded,
+    /// The credential is PROVABLY DEAD — a sweep-refresh returned `Dead` (the #261 /
+    /// `CredentialUnrecoverable` cue: the refresh token itself was rejected) — and genuinely
+    /// needs an operator `claude /login`. 🔴 Reserved for this proven case; a bare quarantine
+    /// (an access-token 401-streak) is `Degraded`, not `Dead` (issue #427).
     Dead,
 }
 
@@ -282,6 +298,7 @@ impl CredentialHealth {
             CredentialHealth::Unknown => "unknown",
             CredentialHealth::Stale => "stale",
             CredentialHealth::AtRisk => "at_risk",
+            CredentialHealth::Degraded => "degraded",
             CredentialHealth::Dead => "dead",
         }
     }
@@ -2136,14 +2153,15 @@ mod tests {
 
     #[test]
     fn credential_health_line_carries_the_handle_and_state_token() {
-        // Issue #119: the health-transition event is the handle + a bare 4-state token —
-        // never a token, an expiry, or an email. Each rollup state renders its `snake_case`
-        // token, matching the `--json` wire serialization of `CredentialHealth`.
+        // Issue #119 (+ #427 `degraded`): the health-transition event is the handle + a bare
+        // rollup token — never a token, an expiry, or an email. Each rollup state renders its
+        // `snake_case` token, matching the `--json` wire serialization of `CredentialHealth`.
         for (state, token) in [
             (CredentialHealth::Healthy, "healthy"),
             (CredentialHealth::Unknown, "unknown"),
             (CredentialHealth::Stale, "stale"),
             (CredentialHealth::AtRisk, "at_risk"),
+            (CredentialHealth::Degraded, "degraded"),
             (CredentialHealth::Dead, "dead"),
         ] {
             let line = Event::CredentialHealth {

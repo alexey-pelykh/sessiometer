@@ -2160,10 +2160,11 @@ struct StatusRow {
     weekly: String,
     /// Compact time until the WEEKLY window resets, or `n/a` (issue #94).
     weekly_reset: String,
-    /// The AUTH cell (issue #119): the daemon's 4-state credential rollup as ONE glyph
-    /// (🟢 healthy · 🟡 stale · 🟠 at-risk · 🔴 dead), with the `claude /login` cue appended
-    /// for a dead account — softened to `recovering` for a healing quarantined one (#109) —
-    /// and a trailing `disabled` for a parked account (#36, orthogonal to credential health).
+    /// The AUTH cell (issue #119, #427): the daemon's credential rollup as ONE glyph
+    /// (🟢 healthy · ⚪ unknown · 🟡 stale · 🟠 at-risk · 🟠 degraded · 🔴 dead), with the
+    /// `claude /login` cue appended for a PROVEN-dead account and the needs-refresh cue for a
+    /// `degraded` (quarantined-but-refreshable) one — each softened to `recovering` for a healing
+    /// account (#109) — and a trailing `disabled` for a parked account (#36, orthogonal).
     /// Falls back to the legacy comma-joined tags (`disabled`, `needs re-login` / `recovering`)
     /// when the daemon sent no rollup (a pre-#119 daemon, `health == None`). Empty only for a
     /// pre-#119 daemon with no tags.
@@ -2211,31 +2212,52 @@ impl StatusRow {
     }
 }
 
-/// The `status` AUTH cell for one account (issue #119): the daemon's 4-state credential
+/// The needs-REFRESH cue for a `Degraded` (bare-quarantine) credential (issue #427): the honest
+/// counterpart to `Dead`'s `claude /login`. Leads with the immediate remedy (`poke`); enabling
+/// `[refresh]` — the durable fix — is carried holistically by [`REFRESH_DISABLED_ADVISORY`], and
+/// a genuine refresh-token death still escalates to 🔴 `claude /login`. Deliberately NOT
+/// "re-login" — that is precisely the over-reaction the honest verdict prevents.
+const DEGRADED_CUE: &str = "degraded — run 'sessiometer poke'";
+
+/// The `status` AUTH cell for one account (issue #119, extended by #427): the daemon's credential
 /// rollup as ONE glyph plus the minimal cue an operator needs to act, with the `disabled`
 /// rotation tag (#36) — orthogonal to credential health — appended.
 ///
-/// `health == Some(verdict)` (a current daemon) renders the glyph; a DEAD account carries
-/// the actionable `claude /login` cue (AC-1), softened to `recovering` for a healing
-/// quarantined account so the operator neither re-logs-in needlessly nor swaps away from a
-/// recovering — often healthier — account (#109). `health == None` (a pre-#119 daemon that
-/// sent no rollup) falls back to the legacy comma-joined tags, so an old daemon's `status`
-/// is unchanged rather than mis-reading a defaulted glyph over a dead account.
+/// `health == Some(verdict)` (a current daemon) renders the glyph; a PROVEN-`Dead` account carries
+/// the `claude /login` cue and a `Degraded` (quarantined-but-refreshable) account the needs-refresh
+/// [`DEGRADED_CUE`] (AC-1: a refreshable account NEVER reads "claude /login"), each softened to
+/// `recovering` for a healing account so the operator neither acts needlessly nor swaps away from a
+/// recovering — often healthier — account (#109). `health == None` (a pre-#119 daemon that sent no
+/// rollup) falls back to the legacy comma-joined tags, so an old daemon's `status` is unchanged
+/// rather than mis-reading a defaulted glyph over a dead account.
 fn health_cell(account: &AccountStatusLine) -> String {
     let Some(health) = account.health else {
         return legacy_health_tags(account);
     };
     let mut cell = health_glyph(health).to_owned();
-    if health == CredentialHealth::Dead {
-        // A healing account (#109) reads `recovering`, not the `claude /login` command, so
-        // the operator holds rather than re-authing or swapping away; a genuinely dead one
-        // gets the exact command to run.
-        cell.push(' ');
-        cell.push_str(if account.recovering {
-            "recovering"
-        } else {
-            "claude /login"
-        });
+    // The actionable cue an operator needs, keyed off the honest verdict (issue #427): a PROVEN
+    // `Dead` credential needs a re-login (`claude /login`); a `Degraded` one (a bare quarantine)
+    // needs only a REFRESH — distinct advice, so the false "claude /login" never fires for a
+    // still-refreshable account. Either state softens to `recovering` for a healing account
+    // (#109) so the operator holds rather than acting or swapping away.
+    match health {
+        CredentialHealth::Dead => {
+            cell.push(' ');
+            cell.push_str(if account.recovering {
+                "recovering"
+            } else {
+                "claude /login"
+            });
+        }
+        CredentialHealth::Degraded => {
+            cell.push(' ');
+            cell.push_str(if account.recovering {
+                "recovering"
+            } else {
+                DEGRADED_CUE
+            });
+        }
+        _ => {}
     }
     // `disabled` (rotation #36) is independent of credential health — a parked account can
     // be perfectly healthy — so it trails the glyph rather than replacing it.
@@ -2257,6 +2279,13 @@ fn health_glyph(health: CredentialHealth) -> &'static str {
         CredentialHealth::Unknown => "⚪",
         CredentialHealth::Stale => "🟡",
         CredentialHealth::AtRisk => "🟠",
+        // #427: a quarantined-but-refreshable credential is a NON-TERMINAL warning — it shares
+        // the warm 🟠 band with `AtRisk` (both "act soon, recoverable"), reserving 🔴 for a
+        // PROVEN refresh-token death that truly needs `claude /login`. The two orange states are
+        // told apart by the actionable TEXT cue in `health_cell` (needs-refresh vs no cue), and
+        // the operator's load-bearing distinction — 🟠 poke-to-refresh vs 🔴 re-login — is the
+        // one carried by color.
+        CredentialHealth::Degraded => "🟠",
         CredentialHealth::Dead => "🔴",
     }
 }
@@ -4099,9 +4128,9 @@ spare  22222222-2222\n\
 
     #[test]
     fn health_cell_projects_each_rollup_state_to_a_glyph_with_an_actionable_cue() {
-        use CredentialHealth::{AtRisk, Dead, Healthy, Stale, Unknown};
-        // `health == Some(verdict)`: the daemon's 4-state rollup renders as ONE self-coloring
-        // glyph, plus the minimal cue an operator needs to act.
+        use CredentialHealth::{AtRisk, Dead, Degraded, Healthy, Stale, Unknown};
+        // `health == Some(verdict)`: the daemon's rollup renders as ONE self-coloring glyph,
+        // plus the minimal cue an operator needs to act.
         let cell = |health, quarantined, recovering, enabled| {
             health_cell(&AccountStatusLine {
                 health,
@@ -4113,12 +4142,22 @@ spare  22222222-2222\n\
         };
         assert_eq!(cell(Some(Healthy), false, false, true), "🟢");
         // #137: no positive-liveness evidence renders a neutral ⚪ — distinct from a false 🟢,
-        // and carries NO cue (only `Dead` prompts `claude /login`).
+        // and carries NO cue (only `Dead` / `Degraded` prompt an action).
         assert_eq!(cell(Some(Unknown), false, false, true), "⚪");
         assert_eq!(cell(Some(Stale), false, false, true), "🟡");
         assert_eq!(cell(Some(AtRisk), false, false, true), "🟠");
+        // #427: a DEGRADED (quarantined-but-refreshable) credential is 🟠 with a needs-REFRESH
+        // cue — NEVER the 🔴 "claude /login" of a proven death. This is the honesty fix: the cue
+        // points at `poke`, distinguishing needs-refresh from needs-re-login.
+        assert_eq!(
+            cell(Some(Degraded), true, false, true),
+            "🟠 degraded — run 'sessiometer poke'"
+        );
+        // A HEALING degraded account reads `recovering` — the operator holds while it heals (#109).
+        assert_eq!(cell(Some(Degraded), true, true, true), "🟠 recovering");
         // A DEAD credential carries the exact recovery command (AC-1) — visibly distinct from
-        // a usage-exhausted but credential-healthy account, which carries no such cue.
+        // a usage-exhausted but credential-healthy account, which carries no such cue. Reserved
+        // for PROVEN refresh-token death (#427).
         assert_eq!(cell(Some(Dead), true, false, true), "🔴 claude /login");
         // A HEALING quarantined account reads `recovering`, NOT the command — so the operator
         // holds rather than re-authing or swapping away from an often-healthier account (#109).
@@ -4126,6 +4165,10 @@ spare  22222222-2222\n\
         // The rotation `disabled` tag (#36) is orthogonal to credential health — a parked
         // account can be perfectly healthy — so it TRAILS the glyph rather than replacing it.
         assert_eq!(cell(Some(Healthy), false, false, false), "🟢 disabled");
+        assert_eq!(
+            cell(Some(Degraded), true, false, false),
+            "🟠 degraded — run 'sessiometer poke' disabled"
+        );
         assert_eq!(
             cell(Some(Dead), true, false, false),
             "🔴 claude /login disabled"
@@ -4215,10 +4258,11 @@ spare  22222222-2222\n\
 
     #[test]
     fn render_status_renders_every_rollup_state_including_unknown_under_auth() {
-        // #143 + #137: the AUTH column renders each of the four states AND the neutral ⚪
-        // Unknown (#137) as its self-coloring glyph, so `status` tells "unverified" apart
-        // from a genuine 🟢 at a glance — and the DEAD account keeps its `claude /login` cue.
-        use CredentialHealth::{AtRisk, Dead, Healthy, Stale, Unknown};
+        // #143 + #137 + #427: the AUTH column renders each rollup state as its self-coloring
+        // glyph — the neutral ⚪ Unknown (#137) told apart from a genuine 🟢, the 🟠 `Degraded`
+        // (quarantined-but-refreshable) with a needs-refresh cue and NEVER "claude /login", and
+        // the 🔴 PROVEN-`Dead` account keeping its re-login cue.
+        use CredentialHealth::{AtRisk, Dead, Degraded, Healthy, Stale, Unknown};
         let line = |label, health| AccountStatusLine {
             health: Some(health),
             ..status_line(label, false, Some(10), Some(20))
@@ -4232,6 +4276,13 @@ spare  22222222-2222\n\
                 line("staleacct", Stale),
                 line("atriskacct", AtRisk),
                 {
+                    // A quarantined-but-refreshable account: 🟠 Degraded, needs a refresh.
+                    let mut degraded = line("degradedacct", Degraded);
+                    degraded.quarantined = true;
+                    degraded
+                },
+                {
+                    // A PROVEN-dead account (a refresh returned Dead): 🔴, needs a re-login.
                     let mut dead = line("deadacct", Dead);
                     dead.quarantined = true;
                     dead
@@ -4245,6 +4296,15 @@ spare  22222222-2222\n\
         assert!(row("unknownacct").contains("⚪"), "{}", row("unknownacct"));
         assert!(row("staleacct").contains("🟡"), "{}", row("staleacct"));
         assert!(row("atriskacct").contains("🟠"), "{}", row("atriskacct"));
+        // AC-1: the degraded account is 🟠 with a needs-refresh cue, and NEVER "claude /login".
+        assert!(
+            row("degradedacct").contains("🟠")
+                && row("degradedacct").contains("sessiometer poke")
+                && !row("degradedacct").contains("claude /login"),
+            "the degraded state is 🟠 needs-refresh, never the re-login cue: {}",
+            row("degradedacct")
+        );
+        // AC-2: 🔴 / "claude /login" appears ONLY for the proven-dead account.
         assert!(
             row("deadacct").contains("🔴") && row("deadacct").contains("claude /login"),
             "the dead state keeps its glyph and re-login cue: {}",
@@ -4940,10 +5000,12 @@ spare  22222222-2222\n\
 
     #[test]
     fn render_status_advisory_fires_for_every_non_healthy_nonactive_rollup() {
-        // AC-1 breadth: each of ⚪ Unknown / 🟡 Stale / 🟠 AtRisk / 🔴 Dead on a NON-ACTIVE
-        // account arms the advisory (all are "unhealthy/unverified"); only 🟢 Healthy does not.
-        use CredentialHealth::{AtRisk, Dead, Healthy, Stale, Unknown};
-        for health in [Unknown, Stale, AtRisk, Dead] {
+        // AC-1 breadth: each of ⚪ Unknown / 🟡 Stale / 🟠 AtRisk / 🟠 Degraded / 🔴 Dead on a
+        // NON-ACTIVE account arms the advisory (all are "unhealthy/unverified"); only 🟢 Healthy
+        // does not. A degraded account is exactly the refresh-off case the advisory points at
+        // ("run 'sessiometer poke' or enable [refresh]") — issue #427.
+        use CredentialHealth::{AtRisk, Dead, Degraded, Healthy, Stale, Unknown};
+        for health in [Unknown, Stale, AtRisk, Degraded, Dead] {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
                 refresh_enabled: Some(false),

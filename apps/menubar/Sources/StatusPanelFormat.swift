@@ -310,16 +310,27 @@ enum StatusPanelFormat {
 
     // MARK: - AUTH cell (mirror `src/cli.rs` `health_glyph` / `health_cell` / `legacy_health_tags`)
 
-    /// The emoji glyph for a 4+1-state credential rollup — self-coloring content, not an overlay —
-    /// mirroring `src/cli.rs` `health_glyph` (issue #119; the neutral `⚪` for `unknown` is the anti-#137
+    /// The needs-REFRESH cue for a `degraded` (bare-quarantine) credential — byte-identical to the
+    /// CLI's `DEGRADED_CUE` (`src/cli.rs`, issue #427): the honest counterpart to `dead`'s
+    /// `claude /login`. Deliberately NOT "re-login" — a quarantined-but-refreshable account needs a
+    /// `poke`, not a re-authentication (the false-🔴 the honest verdict prevents).
+    static let degradedCue = "degraded — run 'sessiometer poke'"
+
+    /// The emoji glyph for a credential rollup — self-coloring content, not an overlay — mirroring
+    /// `src/cli.rs` `health_glyph` (issue #119, #427; the neutral `⚪` for `unknown` is the anti-#137
     /// "no false green" verdict).
     static func healthGlyph(_ health: CredentialHealth) -> String {
         switch health {
-        case .healthy: return "🟢"
-        case .unknown: return "⚪"
-        case .stale:   return "🟡"
-        case .atRisk:  return "🟠"
-        case .dead:    return "🔴"
+        case .healthy:  return "🟢"
+        case .unknown:  return "⚪"
+        case .stale:    return "🟡"
+        case .atRisk:   return "🟠"
+        // #427: a quarantined-but-refreshable credential shares the warm 🟠 band with `atRisk`
+        // (both "act soon, recoverable"), reserving 🔴 for a PROVEN refresh-token death. The two
+        // are told apart by the needs-refresh cue (`authCue`) and, in the panel, by DISTINCT
+        // SHAPES (`healthSymbol`); the load-bearing 🟠-poke vs 🔴-re-login split is carried by color.
+        case .degraded: return "🟠"
+        case .dead:     return "🔴"
         }
     }
 
@@ -331,11 +342,15 @@ enum StatusPanelFormat {
     /// the shape-identical emoji ramp lacked. `unknown` stays neutral (the #137 "no false green").
     static func healthSymbol(_ health: CredentialHealth) -> (name: String, tint: HealthTint) {
         switch health {
-        case .healthy: return ("checkmark.circle.fill", .green)
-        case .unknown: return ("questionmark.circle", .neutral)
-        case .stale:   return ("clock.badge.exclamationmark", .yellow)
-        case .atRisk:  return ("exclamationmark.triangle.fill", .orange)
-        case .dead:    return ("xmark.octagon.fill", .red)
+        case .healthy:  return ("checkmark.circle.fill", .green)
+        case .unknown:  return ("questionmark.circle", .neutral)
+        case .stale:    return ("clock.badge.exclamationmark", .yellow)
+        case .atRisk:   return ("exclamationmark.triangle.fill", .orange)
+        // #427: DISTINCT shape from `atRisk` (a refresh-arrow vs a warning-triangle) so a
+        // quarantined-but-refreshable credential is legible WITHOUT color — WCAG 1.4.1 — while
+        // sharing the `.orange` warm-warning tint, honest that it is recoverable, not the red death.
+        case .degraded: return ("arrow.clockwise.circle.fill", .orange)
+        case .dead:     return ("xmark.octagon.fill", .red)
         }
     }
 
@@ -371,9 +386,10 @@ enum StatusPanelFormat {
         }
     }
 
-    /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a DEAD
-    /// account's actionable `claude /login` cue (softened to `recovering` for a healing quarantined
-    /// account, issue #109), then the independent `disabled` rotation tag (#36). A pre-#119 daemon
+    /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a
+    /// PROVEN-DEAD account's `claude /login` cue and a `degraded` (quarantined-but-refreshable) one's
+    /// needs-refresh `degradedCue` (issue #427) — each softened to `recovering` for a healing account
+    /// (issue #109) — then the independent `disabled` rotation tag (#36). A pre-#119 daemon
     /// (`auth == nil`) falls back to the legacy comma-joined tags. Kept as the parity anchor for the
     /// tests and the row's VoiceOver label; the VIEW draws the glyph and cue as separate elements via
     /// `healthGlyph` + `authCue`.
@@ -387,8 +403,8 @@ enum StatusPanelFormat {
             return legacyHealthTags(enabled: enabled, quarantined: quarantined, recovering: recovering)
         }
         var cell = healthGlyph(health)
-        if health == .dead {
-            cell += " " + (recovering ? "recovering" : "claude /login")
+        if let cue = authActionCue(auth: health, recovering: recovering) {
+            cell += " " + cue
         }
         if !enabled {
             cell += " disabled"
@@ -396,19 +412,31 @@ enum StatusPanelFormat {
         return cell
     }
 
-    /// The trailing AUTH cue WITHOUT the glyph — the DEAD account's `claude /login` / `recovering`
-    /// action plus a trailing `disabled`, or `nil` when there is no cue — for the modern (`auth != nil`)
-    /// path where the view renders the glyph as its own element. The legacy (`auth == nil`) path uses
-    /// `legacyHealthTags` as plain text instead.
+    /// The trailing AUTH cue WITHOUT the glyph — the action a `dead` (`claude /login`) or `degraded`
+    /// (needs-refresh) account needs, softened to `recovering` while healing (#109), plus a trailing
+    /// `disabled` — or `nil` when there is no cue. For the modern (`auth != nil`) path where the view
+    /// renders the glyph as its own element; the legacy (`auth == nil`) path uses `legacyHealthTags`.
     static func authCue(auth: CredentialHealth?, recovering: Bool, enabled: Bool) -> String? {
         var parts: [String] = []
-        if auth == .dead {
-            parts.append(recovering ? "recovering" : "claude /login")
+        if let auth, let cue = authActionCue(auth: auth, recovering: recovering) {
+            parts.append(cue)
         }
         if !enabled {
             parts.append("disabled")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
+    /// The per-verdict action word (issue #427) shared by `authCell` / `authCue` / `authSpoken` so the
+    /// three never drift: a PROVEN-`dead` credential needs `claude /login`; a `degraded`
+    /// (quarantined-but-refreshable) one needs a refresh (`degradedCue`); either softens to
+    /// `recovering` while healing (#109). Every other state carries no action cue (`nil`).
+    private static func authActionCue(auth: CredentialHealth, recovering: Bool) -> String? {
+        switch auth {
+        case .dead:     return recovering ? "recovering" : "claude /login"
+        case .degraded: return recovering ? "recovering" : degradedCue
+        default:        return nil
+        }
     }
 
     /// The pre-#119 AUTH text for an account whose daemon sent no rollup (`auth == nil`), mirroring
@@ -691,6 +719,8 @@ enum StatusPanelFormat {
             case .unknown: phrase = "auth unknown"
             case .stale:   phrase = "auth stale"
             case .atRisk:  phrase = "auth at risk"
+            // #427: spoken needs-refresh, distinct from `dead`'s needs-re-login.
+            case .degraded: phrase = recovering ? "recovering" : "credential degraded, run sessiometer poke to refresh"
             case .dead:    phrase = recovering ? "recovering" : "credential dead, run claude /login"
             }
         } else {

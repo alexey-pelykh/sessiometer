@@ -165,7 +165,8 @@ record per line:
 ACCOUNT  SESSION% RESET  WEEKLY% RESET  AUTH
 * work   97%      12m    40%     5d     🟢
   spare  10%      2h     20%     3d     🟢
-  dead   n/a      n/a    n/a     n/a    🔴 claude /login
+  idle   n/a      n/a    n/a     n/a    🟠 degraded — run 'sessiometer poke'
+  gone   n/a      n/a    n/a     n/a    🔴 claude /login
 
 next swap: spare
 ```
@@ -187,10 +188,15 @@ next swap: spare
 - A trailing **`AUTH`** column reports each account's **credential-auth state** as one
   self-coloring glyph — **🟢** healthy (a positive liveness signal), **🟡** stale (the
   access token has expired but the refresh token still recovers it), **🟠** at-risk (the
-  auto-refresh safety-net is failing), **🔴** dead (needs re-login — recover with
-  [`sessiometer login`](#logging-in--re-authenticating)), **⚪** unknown (no
-  liveness signal yet — unverified, not a false 🟢, issue #137). A **🔴** dead credential
-  trails the actionable **`claude /login`** cue, softened to `recovering` while a dead
+  auto-refresh safety-net is failing), **🟠** degraded (the access token was rejected and
+  the account quarantined out of rotation, but its **refresh token is still good** — it
+  needs a *refresh*, not a re-login; issue #427), **🔴** dead (a refresh **proved** the
+  refresh token itself is dead — the one state that genuinely needs re-login, recover with
+  [`sessiometer login`](#logging-in--re-authenticating)), **⚪** unknown (no liveness signal
+  yet — unverified, not a false 🟢, issue #137). A **🟠** degraded credential trails a
+  **needs-refresh** cue (`run 'sessiometer poke'`, or enable
+  [`[refresh]`](#refreshing-parked-credentials-automatically)); only a **🔴** dead credential
+  trails the re-login **`claude /login`** cue — each softened to `recovering` while the
   credential is answering again and climbing back toward health (issue #109); a parked
   account trails `disabled` (issue #36, orthogonal to credential health). The header
   reports **auth** standing, not a vague "health" (rate-limit health lives in the `%`
@@ -200,7 +206,7 @@ The **`next swap:`** footer names the account the daemon would rotate to next �
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`
 when no other account is a sound swap destination — every one is weekly-exhausted,
 session-saturated (over its swap-away session trigger), over the opt-in swap-target
-session floor, or quarantined and needs a re-login — and
+session floor, or quarantined (out of rotation until it recovers) — and
 `none (awaiting usage data)` right after the daemon starts, before it has polled the
 other accounts. It is **forward-looking** and recomputed every cycle, so —
 unlike a remembered "last swap" — it survives a daemon restart and always shows where
@@ -387,7 +393,7 @@ sessiometer use spare --force
 
 By default `use` runs a **pre-swap gate** and refuses — with a specific reason
 and **without writing anything** — when the target is not a sound destination:
-its weekly window is exhausted, it is quarantined and needs a re-login, or a swap
+its weekly window is exhausted, it is quarantined (out of rotation), or a swap
 cooldown is still active. Switching to the account that is **already active** is a
 no-op success. Each refusal exits with its own status code, so a script can tell
 them apart.
@@ -471,10 +477,11 @@ fresh credential under the swap lock **only** when you re-authenticate the accou
 that is already active (re-auth in place), or when no account is active yet
 (bootstrap). Logging in a **different** account while one is active adds or revives
 it **without** touching the active slot — the live session keeps working. If that
-account was **quarantined** (🔴 `dead` / `needs re-login`), the re-login also **clears
-the quarantine at once** — `login` signals the running daemon to return it to the
-rotation the moment the fresh credential lands, instead of waiting on the daemon's
-slower periodic recovery sweep. There is still no swap; the active account stays live.
+account was **quarantined** (🟠 `degraded`, or 🔴 `dead` if a refresh proved it
+unrecoverable), the re-login also **clears the quarantine at once** — `login` signals
+the running daemon to return it to the rotation the moment the fresh credential lands,
+instead of waiting on the daemon's slower periodic recovery sweep. There is still no
+swap; the active account stays live.
 Switch to it with [`sessiometer use`](#switching-the-active-account) when you're ready:
 
 ```sh

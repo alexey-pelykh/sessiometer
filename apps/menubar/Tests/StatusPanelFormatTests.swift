@@ -89,6 +89,9 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.healthGlyph(.unknown), "⚪")
         XCTAssertEqual(StatusPanelFormat.healthGlyph(.stale), "🟡")
         XCTAssertEqual(StatusPanelFormat.healthGlyph(.atRisk), "🟠")
+        // #427: a quarantined-but-refreshable credential shares the warm 🟠 band with atRisk,
+        // reserving 🔴 for a PROVEN refresh-token death (told apart by the needs-refresh cue).
+        XCTAssertEqual(StatusPanelFormat.healthGlyph(.degraded), "🟠")
         XCTAssertEqual(StatusPanelFormat.healthGlyph(.dead), "🔴")
     }
 
@@ -99,16 +102,20 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.unknown).name, "questionmark.circle")
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.stale).name, "clock.badge.exclamationmark")
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.atRisk).name, "exclamationmark.triangle.fill")
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.degraded).name, "arrow.clockwise.circle.fill")
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.dead).name, "xmark.octagon.fill")
         // Tints are semantic roles (the view maps them to system colors); unknown stays neutral (#137).
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.healthy).tint, .green)
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.unknown).tint, .neutral)
+        // #427: degraded shares atRisk's warm .orange tint but a DISTINCT shape (refresh-arrow) — a
+        // recoverable warning, not the red death; the shape carries the distinction, not the color.
+        XCTAssertEqual(StatusPanelFormat.healthSymbol(.degraded).tint, .orange)
         XCTAssertEqual(StatusPanelFormat.healthSymbol(.dead).tint, .red)
         // Every symbol name is DISTINCT → health is shape-encoded, not color-alone (WCAG 1.4.1 — the fix
-        // the shape-identical emoji ramp lacked).
-        let names = Set([CredentialHealth.healthy, .unknown, .stale, .atRisk, .dead]
+        // the shape-identical emoji ramp lacked). Degraded and atRisk share 🟠 yet stay distinct SHAPES.
+        let names = Set([CredentialHealth.healthy, .unknown, .stale, .atRisk, .degraded, .dead]
             .map { StatusPanelFormat.healthSymbol($0).name })
-        XCTAssertEqual(names.count, 5)
+        XCTAssertEqual(names.count, 6)
     }
 
     // MARK: - Tint tokens (#388 — role → contrast-safe asset-catalog token; the load-bearing warning fix)
@@ -153,10 +160,15 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(cell(.unknown), "⚪")
         XCTAssertEqual(cell(.stale), "🟡")
         XCTAssertEqual(cell(.atRisk), "🟠")
+        // #427: a DEGRADED (quarantined-but-refreshable) credential is 🟠 with a needs-REFRESH cue,
+        // NEVER the 🔴 "claude /login" of a proven death — byte-parity with `src/cli.rs` `health_cell`.
+        XCTAssertEqual(cell(.degraded), "🟠 degraded — run 'sessiometer poke'")
+        XCTAssertEqual(cell(.degraded, recovering: true), "🟠 recovering")
         XCTAssertEqual(cell(.dead), "🔴 claude /login")
         XCTAssertEqual(cell(.dead, recovering: true), "🔴 recovering")
         // `disabled` (rotation #36) trails the glyph, independent of credential health.
         XCTAssertEqual(cell(.healthy, enabled: false), "🟢 disabled")
+        XCTAssertEqual(cell(.degraded, enabled: false), "🟠 degraded — run 'sessiometer poke' disabled")
         XCTAssertEqual(cell(.dead, enabled: false), "🔴 claude /login disabled")
         XCTAssertEqual(cell(.dead, recovering: true, enabled: false), "🔴 recovering disabled")
     }
@@ -175,9 +187,14 @@ final class StatusPanelFormatTests: XCTestCase {
     func testAuthCueSplitsTheTrailingCueFromTheGlyph() {
         XCTAssertNil(StatusPanelFormat.authCue(auth: .healthy, recovering: false, enabled: true))
         XCTAssertNil(StatusPanelFormat.authCue(auth: .stale, recovering: false, enabled: true))
+        XCTAssertNil(StatusPanelFormat.authCue(auth: .atRisk, recovering: false, enabled: true))
+        // #427: the degraded cue is needs-refresh, softened to `recovering` while healing (#109).
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .degraded, recovering: false, enabled: true), "degraded — run 'sessiometer poke'")
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .degraded, recovering: true, enabled: true), "recovering")
         XCTAssertEqual(StatusPanelFormat.authCue(auth: .dead, recovering: false, enabled: true), "claude /login")
         XCTAssertEqual(StatusPanelFormat.authCue(auth: .dead, recovering: true, enabled: true), "recovering")
         XCTAssertEqual(StatusPanelFormat.authCue(auth: .healthy, recovering: false, enabled: false), "disabled")
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: .degraded, recovering: false, enabled: false), "degraded — run 'sessiometer poke' disabled")
         XCTAssertEqual(StatusPanelFormat.authCue(auth: .dead, recovering: false, enabled: false), "claude /login disabled")
     }
 
@@ -328,6 +345,12 @@ final class StatusPanelFormatTests: XCTestCase {
             label: "old", isActive: false, auth: .dead, recovering: false, enabled: true,
             quarantined: true, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a")
         XCTAssertEqual(dead, "old, credential dead, run claude /login, session n/a resets in n/a, weekly n/a resets in n/a")
+
+        // #427: a degraded (quarantined-but-refreshable) account speaks needs-REFRESH, never re-login.
+        let degraded = StatusPanelFormat.rowAccessibilityLabel(
+            label: "parked", isActive: false, auth: .degraded, recovering: false, enabled: true,
+            quarantined: true, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a")
+        XCTAssertEqual(degraded, "parked, credential degraded, run sessiometer poke to refresh, session n/a resets in n/a, weekly n/a resets in n/a")
 
         // A healthy pre-#119 legacy account speaks no auth verdict (empty phrase dropped).
         let legacy = StatusPanelFormat.rowAccessibilityLabel(

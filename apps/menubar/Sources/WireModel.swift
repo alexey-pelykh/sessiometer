@@ -74,11 +74,17 @@ enum WireContract {
 /// renamed the wire key). Serialized `snake_case`; a value the client does not recognise is a
 /// decode error (mirrors serde's unknown-variant rejection), but `auth` is optional so an
 /// absent / null key is tolerated (`None`).
+///
+/// `degraded` (issue #427) is the NON-TERMINAL split of the old `dead` catch-all: a bare
+/// quarantine (an access-token 401-streak) needs a REFRESH, not a re-login, so it renders 🟠
+/// with a needs-refresh cue — the terminal 🔴 `dead` is reserved for a PROVEN refresh-token
+/// death. The status client and menubar must AGREE on this (single source of truth, #169).
 enum CredentialHealth: String, Decodable, Equatable {
     case healthy
     case unknown
     case stale
     case atRisk = "at_risk"
+    case degraded
     case dead
 }
 

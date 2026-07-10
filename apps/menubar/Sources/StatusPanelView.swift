@@ -543,11 +543,16 @@ private struct AccountRowView: View {
     }
 
     private func cueColor(for auth: CredentialHealth) -> Color {
-        // The DEAD cue sits in the same row as the DEAD glyph, so it takes the SAME contrast-safe red
-        // (#388 `--ut-r`) — a system `.red` beside the token-tinted glyph would read as two different reds.
-        auth == .dead && !row.isRecovering
-            ? .panel(StatusPanelFormat.healthTint(.red))
-            : .secondary
+        // Each cue sits in the same row as its glyph, so it takes the SAME contrast-safe tint (#388) —
+        // a system color beside the token-tinted glyph would read as two different shades. A healing
+        // account's `recovering` cue stays neutral (it is holding, not acting). #427: the 🟠 degraded
+        // cue is orange (`--ut-o`), the 🔴 dead cue red (`--ut-r`).
+        guard !row.isRecovering else { return .secondary }
+        switch auth {
+        case .dead:     return .panel(StatusPanelFormat.healthTint(.red))
+        case .degraded: return .panel(StatusPanelFormat.healthTint(.orange))
+        default:        return .secondary
+        }
     }
 
     /// Map the pure `HealthTint` role to its contrast-safe panel tint (#388) — never `accentColor` (the
