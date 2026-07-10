@@ -22,9 +22,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy};
 use crate::daemon::{
-    run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, RealClock,
-    RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl,
-    VersionedStatus, STATUS_SCHEMA_VERSION,
+    run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap,
+    NextSwapReason, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion,
+    StatusResponse, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -1802,7 +1802,19 @@ pub(crate) fn render_status(
     // active account to anchor a swap from, or (via `#[serde(default)]`) a pre-#88 daemon
     // that omits the field — and renders a bare `none` either way.
     match &response.next_swap {
-        Some(NextSwap::Target { to }) => out.push_str(&format!("next swap: {to}\n")),
+        // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
+        // so the CLI operator sees WHY this account — the identical "why this target?" the panel
+        // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
+        // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
+        Some(NextSwap::Target { to, reason }) => {
+            let why = match reason {
+                Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+                Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
+                Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
+                None => "",
+            };
+            out.push_str(&format!("next swap: {to}{why}\n"));
+        }
         Some(NextSwap::NoViableTarget) => out.push_str("next swap: none (no viable target)\n"),
         Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
         None => out.push_str("next swap: none\n"),
@@ -3506,7 +3518,6 @@ mod tests {
             tunables: Tunables {
                 poll_secs: 60,
                 cooldown_secs: 60,
-                session_floor: None,
                 session_trigger: 95,
                 monitor_401_n: 3,
                 // `list` reads no timing strategies; default jitter is a fine
@@ -4300,6 +4311,7 @@ spare  22222222-2222\n\
             ],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: None,
             }),
         };
         // Header labels are wider than their data, so the header sizes the columns
@@ -4335,6 +4347,7 @@ spare  22222222-2222\n\
             )],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: None,
             }),
         };
         for color in [false, true] {
@@ -4584,9 +4597,40 @@ spare  22222222-2222\n\
                 .unwrap()
                 .to_owned()
         };
+        // The daemon's own selection rationale (issue #393) renders as a parenthetical: the #37
+        // soonest-reset axis, the sole-candidate default, or the no-tiebreak roster-order fallback.
+        // The `resets_at` value is not shown (the per-account "resets in" already carries the
+        // clock) — only WHICH axis chose it.
         assert_eq!(
             footer(Some(NextSwap::Target {
-                to: "spare".to_owned()
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::SoonestReset {
+                    resets_at: NOW + 3600
+                }),
+            })),
+            "next swap: spare (weekly resets soonest)"
+        );
+        assert_eq!(
+            footer(Some(NextSwap::Target {
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::OnlyCandidate),
+            })),
+            "next swap: spare (only viable target)"
+        );
+        // ≥2 viable but no reset times to compare → the footer must NOT claim "only viable target".
+        assert_eq!(
+            footer(Some(NextSwap::Target {
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::RosterOrder),
+            })),
+            "next swap: spare (first eligible; no reset times known)"
+        );
+        // A pre-#393 daemon carries a target with no reason (`None`) → the bare label, the honest
+        // fallback (strictly more honest than the superseded "most headroom" story it replaced).
+        assert_eq!(
+            footer(Some(NextSwap::Target {
+                to: "spare".to_owned(),
+                reason: None,
             })),
             "next swap: spare"
         );
@@ -4613,6 +4657,7 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: None,
             }),
         };
         let colored = render_status(&response, NOW, None, true);
@@ -4841,6 +4886,7 @@ spare  22222222-2222\n\
             )],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: None,
             }),
         };
         let out = render_status(&response, NOW, None, false);
@@ -5186,6 +5232,7 @@ spare  22222222-2222\n\
             ],
             next_swap: Some(NextSwap::Target {
                 to: "calm".to_owned(),
+                reason: None,
             }),
         };
         let plain = render_status(&response, NOW, None, false);
@@ -5521,6 +5568,7 @@ spare  22222222-2222\n\
             )],
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: None,
             }),
         };
         let out = render_status(&response, NOW, None, true);
@@ -5820,6 +5868,9 @@ spare  22222222-2222\n\
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: Some(NextSwap::Target {
                     to: "spare".to_owned(),
+                    reason: Some(NextSwapReason::SoonestReset {
+                        resets_at: 1_782_781_200,
+                    }),
                 }),
             },
         })
@@ -5849,11 +5900,16 @@ spare  22222222-2222\n\
         assert_eq!(parsed.status.accounts.len(), 1);
         assert_eq!(parsed.status.accounts[0].label, "work");
         assert_eq!(parsed.status.accounts[0].session_pct, Some(50));
-        // The next-swap candidate round-trips intact (#88).
+        // The next-swap candidate — label AND the #393 structured reason — round-trips intact
+        // (#88 + #393): the daemon-authoritative rationale survives serialization, so a client
+        // reads the SoonestReset epoch off the wire rather than re-deriving any selection heuristic.
         assert_eq!(
             parsed.status.next_swap,
             Some(NextSwap::Target {
-                to: "spare".to_owned()
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::SoonestReset {
+                    resets_at: 1_782_781_200,
+                }),
             })
         );
     }

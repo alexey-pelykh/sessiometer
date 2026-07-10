@@ -32,6 +32,15 @@ thiserror = "2.0.18"
 # is preserved; the rest are the async primitives the daemon has always needed.
 tokio = { version = "1.52.3", features = ["rt", "macros", "time", "process", "io-util", "net", "signal", "sync"] }
 toml = "1.1.2"
+# The TOML string/key escaper, used by `Config::render` (issue #403, ADR-0005). `toml`
+# ALREADY depends on it (`toml` -> `toml_writer`, same 1.1.1, `default-features = false`
+# + `alloc`), so naming it here adds a direct edge to a crate that is already compiled —
+# ZERO new crates, vendors, or code enter the graph, and the minimal-dependency posture
+# holds. It replaces a hand-rolled `basic_string`; unlike the crate's other hand-rolled
+# primitives (curl transport, SHA-256, hex), TOML escaping is a spec'd grammar whose
+# reference implementation ships in a crate we already build. The emitter itself stays
+# hand-written (ADR-0005) — only the escaping is delegated.
+toml_writer = { version = "1.1.1", default-features = false, features = ["alloc"] }
 # The canonical UAX #11 display-width table (issue #176), replacing a hand-rolled
 # wcwidth approximation that guessed the whole emoji block as uniformly width-2 and
 # ignored ZWJ sequences, regional-indicator flags, skin-tone modifiers, and variation

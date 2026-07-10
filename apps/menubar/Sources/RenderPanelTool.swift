@@ -59,9 +59,11 @@ enum RenderPanelTool {
         // show a banner / onboarding card. Ages chosen so the footer reads live / stale as intended.
         let fixtures = [
             Fixture(name: "healthy", state: .connected, rows: rows,
-                    nextSwap: .target(to: "Scratch"), generatedAt: now - 12),
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 12),
             Fixture(name: "stale", state: .stale, rows: rows,
-                    nextSwap: .target(to: "Scratch"), generatedAt: now - 5400),
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 5400),
             Fixture(name: "disconnected", state: .disconnected(reason: "the daemon is not responding"),
                     rows: rows, nextSwap: nil, generatedAt: now - 240),
             Fixture(name: "connecting", state: .connecting, rows: [], nextSwap: nil, generatedAt: nil),
@@ -75,14 +77,18 @@ enum RenderPanelTool {
             for scheme in [ColorScheme.light, .dark] {
                 let theme = scheme == .light ? "light" : "dark"
                 let name = "panel-\(fixture.name)-\(theme).png"
-                // The panel's capture affordance (#360) reads an `AccountCaptureModel` from the environment;
-                // inject a nil-client preview instance so the populated-roster capture bar (and the onboarding
-                // card) render idle instead of trapping on a missing environment object. A nil client renders
-                // the idle field/button and never touches a socket — the label field itself stays a known
-                // ImageRenderer blank (see design/README.md). (Absent since #360/#372 added the dependency.)
+                // The panel's capture affordance (#360) reads an `AccountCaptureModel` from the environment,
+                // and its swap affordance (#169) an `AccountSwapModel`; inject nil-client preview instances so
+                // the populated-roster capture bar (and the onboarding card) render idle instead of trapping on
+                // a missing environment object. A nil client renders the idle field/button and never touches a
+                // socket — the label field itself stays a known ImageRenderer blank (see design/README.md).
+                // (Absent since #360/#372 added the dependency.) The swap model renders at `.idle`, so the
+                // fixtures capture the RESTING row (no hover, no pending) — the hover-revealed switch glyph is
+                // not reachable from `ImageRenderer` and stays a manual-check surface (#380).
                 let view = StatusPanelView()
                     .environmentObject(store)
                     .environmentObject(AccountCaptureModel(client: nil))
+                    .environmentObject(AccountSwapModel(client: nil))
                     .environment(\.colorScheme, scheme)
                 let renderer = ImageRenderer(content: view)
                 renderer.scale = 2

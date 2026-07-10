@@ -40,35 +40,54 @@ enum Fixtures {
     /// the canonical frame the Rust `parse_watch_frame` test decodes. One account, session 60,
     /// weekly 10, all-default flags, `auth` = the default `healthy`, `next_swap` null.
     static let snapshotBasic = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
-    /// `next_swap` = target, two accounts. Exercises `auth` at_risk + unknown, `refresh_health`
+    /// The basic frame but with `next_swap` = target carrying the #393 structured reason
+    /// (`soonest_reset` + its `resets_at` epoch) — byte-identical to the Rust
+    /// `wire-snapshot-next-swap.json` golden (`WireGoldenTests`), so the reason field is under the
+    /// cross-language byte-drift guard (#340). The basic golden's `next_swap` is null, so without
+    /// this the `NextSwap.target` `reason` would have NO byte coverage.
+    static let snapshotNextSwap = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":false,"systemic_refresh_failure":null}
+    """#
+
+    /// `next_swap` = target with the #393 `roster_order` reason: ≥2 accounts qualified but none
+    /// reported a weekly reset, so no soonest-reset tiebreak existed and the earliest roster index
+    /// won. Hand-built to the contract (the byte-pinned golden above carries `soonest_reset`) — it
+    /// pins that the client accepts the tag the daemon emits, since an unknown `kind` is a HARD
+    /// decode error and one golden cannot cover every variant.
+    static let snapshotRosterOrderTarget = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"roster_order"}},"refresh_enabled":false,"systemic_refresh_failure":null}
+    """#
+
+    /// `next_swap` = target with the #393 `only_candidate` reason (personal is the lone viable
+    /// spare — work is active), two accounts. Exercises `auth` at_risk + unknown, `refresh_health`
     /// present + null, `session_pct`/resets/expires present + null, `refresh_enabled` true.
     static let snapshotRichTarget = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":1893460000,"weekly_resets_at":1893800000,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":true,"consecutive_failures":0},"auth":"at_risk"},{"label":"personal","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"unknown"}],"next_swap":{"state":"target","to":"personal"},"refresh_enabled":true,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":1893460000,"weekly_resets_at":1893800000,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":true,"consecutive_failures":0},"auth":"at_risk"},{"label":"personal","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"unknown"}],"next_swap":{"state":"target","to":"personal","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
     /// `next_swap` = no_viable_target; a weekly-exhausted, stale account with a failure streak.
     static let snapshotNoViable = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":1893456100,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":95,"weekly_pct":100,"session_resets_at":1893460500,"weekly_resets_at":1893800500,"weekly_exhausted":true,"access_expires_at":1893470500,"refresh_health":{"last_ok":false,"rotated":false,"consecutive_failures":2},"auth":"stale"}],"next_swap":{"state":"no_viable_target"},"refresh_enabled":true,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":1893456100,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":95,"weekly_pct":100,"session_resets_at":1893460500,"weekly_resets_at":1893800500,"weekly_exhausted":true,"access_expires_at":1893470500,"refresh_health":{"last_ok":false,"rotated":false,"consecutive_failures":2},"auth":"stale"}],"next_swap":{"state":"no_viable_target"},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
     /// `next_swap` = awaiting_data; a quarantined dead account with no usage.
     static let snapshotAwaitingDead = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":1893456200,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":1893456200,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// A schema-supported snapshot with ZERO accounts — the real first-run / empty-roster frame the
     /// daemon emits before any account is captured (B-014). Supported major, so it is a DISTINCT
     /// "connected but empty" state, NOT the pre-freeze / unsupported empty snapshots below.
     static let snapshotEmptyRoster = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":100,"accounts":[],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":100,"accounts":[],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// `encode_heartbeat_frame(42)` — the canonical beat the Rust test decodes.
     static let heartbeatBasic = #"""
-    {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":1}}
+    {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":2}}
     """#
 
     // ---- Backward/forward-compat frames (hand-built to the same contract) -------------------
@@ -106,6 +125,14 @@ enum Fixtures {
     /// account level. Unknown keys are ignored; major 1 stays supported.
     static let snapshotUnknownAdditiveFields = #"""
     {"type":"snapshot","schema_version":{"major":1,"minor":5},"generated_at":9,"future_top":123,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"future_field":"x"}],"next_swap":null,"refresh_enabled":false}
+    """#
+
+    /// A pre-#393 daemon (minor 1): `next_swap` = target WITHOUT the `reason` key. The reason field
+    /// was additive in 1.2, so an older daemon emits a bare target — it must decode to
+    /// `reason: nil` (the `decodeIfPresent` forward-compat path), NOT a decode error. This freezes
+    /// the additive contract that makes `NextSwap.target` render-safe against an older daemon.
+    static let snapshotTargetNoReason = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare"},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     // ---- Malformed / rejected bodies --------------------------------------------------------

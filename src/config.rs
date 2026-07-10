@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use toml_writer::{ToTomlValue, TomlStringBuilder};
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -71,6 +72,11 @@ pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
 const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
 /// Default `session_trigger` percent.
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
+/// Default `session_floor` percent (issue #398): the default-on swap-target
+/// reserve — only swap TO an account whose session usage is below this. Sits
+/// below `session_trigger` so a swapped-to target keeps runway before the next
+/// poll; supersedes #10's opt-in (an absent key now means this, not "off").
+const DEFAULT_SESSION_FLOOR: u8 = 80;
 /// Default `weekly_trigger` percent — separate from and higher than
 /// `session_trigger` (issue #41): the weekly window is the longer, harder limit,
 /// so the active account is allowed closer to full on it before a swap-away.
@@ -229,13 +235,17 @@ pub(crate) struct Tunables {
     /// cooldown logic (#10 / #11).
     #[allow(dead_code)]
     pub(crate) cooldown_secs: u64,
-    /// Opt-in swap-target session guard (#10): when `Some(pct)`, only swap *to* an
-    /// account whose session usage is below `pct` percent (`0..=session_trigger`);
-    /// `None` (the default) disables the guard, so target choice rests on the
-    /// soonest-reset selection alone (issue #37) — the configuration under which the
-    /// post-swap cooldown alone bounds oscillation. OFF by default: operators opt
-    /// in, and a sensible enabled value mirrors `session_trigger`.
-    pub(crate) session_floor: Option<u8>,
+    /// Default-on swap-target session reserve (issue #398): only swap *to* an
+    /// account whose session usage is below this percent (`0..=session_trigger`),
+    /// so a freshly-swapped target keeps runway before the next poll. Always
+    /// valued — an absent key means [`DEFAULT_SESSION_FLOOR`], not "off" (this
+    /// supersedes #10's opt-in `Option`). To loosen it, raise toward
+    /// `session_trigger` (equal is inert); the always-on session gate
+    /// (`session < session_trigger`, [`crate::daemon`]) still prevents oscillation
+    /// independently. The name reads backwards — higher is MORE permissive (a
+    /// ceiling on the target's usage, not a minimum); a rename is tracked
+    /// separately.
+    pub(crate) session_floor: u8,
     /// Swap *away* from the active account at or above this session percent
     /// (`50..=99`).
     pub(crate) session_trigger: u8,
@@ -283,7 +293,7 @@ impl Default for Tunables {
         Self {
             poll_secs: DEFAULT_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
-            session_floor: None,
+            session_floor: DEFAULT_SESSION_FLOOR,
             session_trigger: DEFAULT_SESSION_TRIGGER,
             weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
             monitor_401_n: DEFAULT_MONITOR_401_N,
@@ -718,12 +728,12 @@ impl Config {
         // session (an unusual but valid operator choice), so both are configurable
         // independently (AC #3).
         range("weekly_trigger", t.weekly_trigger, 50, 99)?;
-        // session_floor is opt-in (#10): absent → None (the guard is off). When
+        // session_floor is default-on (#398): absent → DEFAULT_SESSION_FLOOR. When
         // present, its lower bound is 0 and its upper bound is session_trigger (a
         // higher floor could never admit a target), the latter a distinct
         // cross-field error.
         let session_floor = match t.session_floor {
-            None => None,
+            None => DEFAULT_SESSION_FLOOR,
             Some(floor) => {
                 if floor < 0 {
                     return Err(Error::ConfigInvalid(format!(
@@ -737,7 +747,7 @@ impl Config {
                         trigger: t.session_trigger,
                     });
                 }
-                Some(floor as u8)
+                floor as u8
             }
         };
         range("poll_secs", t.poll_secs, 5, 3600)?;
@@ -978,13 +988,10 @@ impl Config {
         out.push_str(
             "# Only swap TO an account whose session usage is below this percent\n\
              # (0..=session_trigger): a candidate must be at most this full to receive the\n\
-             # active session. This is NOT the level that triggers a swap. OFF by default\n\
-             # (opt-in, #10): uncomment to enable; a sensible value mirrors session_trigger.\n",
+             # active session. This is NOT the level that triggers a swap. Default-on\n\
+             # (#398): to loosen, raise toward session_trigger (equal is inert).\n",
         );
-        match t.session_floor {
-            Some(floor) => out.push_str(&format!("session_floor = {floor}\n")),
-            None => out.push_str(&format!("# session_floor = {}\n", t.session_trigger)),
-        }
+        out.push_str(&format!("session_floor = {}\n", t.session_floor));
         out.push_str(
             "# Swap AWAY from the active account at or above this session percent (50..=99).\n",
         );
@@ -1292,7 +1299,6 @@ fn render_jitter(jitter: &Jitter) -> String {
 /// `["work", "spare"]` (issue #105 `[refresh].accounts`). Each element goes through
 /// [`basic_string`], so labels/uuids needing escapes round-trip; an empty list renders
 /// `[]`.
-#[allow(dead_code)]
 fn render_str_array(items: &[String]) -> String {
     let mut out = String::from("[");
     for (i, item) in items.iter().enumerate() {
@@ -1309,32 +1315,19 @@ fn render_str_array(items: &[String]) -> String {
 /// by [`Config::render`] for roster fields, which (unlike the integer tunables)
 /// may contain characters needing escaping.
 ///
-/// Hand-rolled on purpose, not delegated to a TOML crate: the emitter it serves is
-/// hand-written by design (see [`Config::render`]; issue #181, ADR-0005). Kept
-/// minimal and pinned by `basic_string_escapes_specials`.
-#[allow(dead_code)]
+/// Delegated to `toml_writer` (issue #403, refining ADR-0005). The *emitter* stays
+/// hand-written — it interleaves doc-comments a serializer would drop — but the
+/// escaping itself is a spec'd grammar (`basic-unescaped`), and `toml_writer` is the
+/// reference implementation, already compiled as a dependency of `toml`. It supersedes a
+/// hand-rolled `match` that had to re-derive which C0 controls take `\uXXXX` and that
+/// non-ASCII stays literal.
+///
+/// `as_basic()` always quotes with `"` (never a literal `'…'` string), which keeps the
+/// output shape identical to the hand-rolled emitter's. Pinned by
+/// `basic_string_escapes_specials` and `rendered_strings_round_trip_through_the_parser`,
+/// both written against the old implementation and re-run unchanged against this one.
 fn basic_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            // Remaining C0 controls and DEL must be escaped; everything else
-            // (including non-ASCII) is valid literally in a basic string.
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    TomlStringBuilder::new(s).as_basic().to_toml_value()
 }
 
 /// Permissive deserialization target: every key optional (documented default),
@@ -1392,7 +1385,8 @@ struct RawTunables {
     poll_secs: i64,
     #[serde(default = "default_cooldown_secs")]
     cooldown_secs: i64,
-    /// Opt-in (#10): absent → `None` (the session-floor guard is off by default).
+    /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_SESSION_FLOOR`
+    /// in [`Config::validate`] (the raw layer keeps `Option` to detect absence).
     #[serde(default)]
     session_floor: Option<i64>,
     #[serde(default = "default_session_trigger")]
@@ -1665,7 +1659,7 @@ label = "personal"
             Tunables {
                 poll_secs: 30,
                 cooldown_secs: 45,
-                session_floor: Some(70),
+                session_floor: 70,
                 session_trigger: 90,
                 weekly_trigger: 97,
                 monitor_401_n: 5,
@@ -1698,8 +1692,8 @@ label = "personal"
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
         assert_eq!(config.tunables.session_trigger, 95);
-        // #10: the session-floor guard is OFF by default (opt-in).
-        assert_eq!(config.tunables.session_floor, None);
+        // #398: the session-floor reserve is default-on at 80.
+        assert_eq!(config.tunables.session_floor, DEFAULT_SESSION_FLOOR);
     }
 
     #[test]
@@ -1798,27 +1792,28 @@ label = "personal"
     }
 
     #[test]
-    fn session_floor_is_off_by_default_and_opt_in() {
-        // #10: an absent session_floor leaves the guard OFF (None), even when other
-        // tunables are set…
-        let off = Config::parse(&with_tunables("session_trigger = 95")).unwrap();
-        assert_eq!(off.tunables.session_floor, None);
-        // …and a present value opts in at that percent.
-        let on = Config::parse(&with_tunables("session_floor = 90\nsession_trigger = 95")).unwrap();
-        assert_eq!(on.tunables.session_floor, Some(90));
+    fn session_floor_defaults_to_80_when_absent() {
+        // #398: an absent session_floor takes the default-on reserve (80), even when
+        // other tunables are set…
+        let absent = Config::parse(&with_tunables("session_trigger = 95")).unwrap();
+        assert_eq!(absent.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+        // …and a present value overrides it at that percent.
+        let set =
+            Config::parse(&with_tunables("session_floor = 90\nsession_trigger = 95")).unwrap();
+        assert_eq!(set.tunables.session_floor, 90);
     }
 
     #[test]
-    fn rendered_default_config_documents_session_floor_as_off() {
-        // With the floor off, render emits a commented-out opt-in line (suggesting
-        // the trigger value) and round-trips back to None — never a live assignment.
+    fn rendered_default_config_documents_session_floor_as_a_live_value() {
+        // #398: render emits a LIVE session_floor line (default-on) that round-trips
+        // back to the same value — never a commented-out opt-in.
         let mut config = Config::parse(VALID).unwrap();
-        config.tunables.session_floor = None;
+        config.tunables.session_floor = DEFAULT_SESSION_FLOOR;
         let text = config.render();
-        assert!(text.contains("OFF by default"), "got {text}");
-        assert!(text.contains("# session_floor ="), "got {text}");
+        assert!(text.contains("session_floor = 80"), "got {text}");
+        assert!(!text.contains("# session_floor ="), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
-        assert_eq!(reparsed.tunables.session_floor, None);
+        assert_eq!(reparsed.tunables.session_floor, DEFAULT_SESSION_FLOOR);
     }
 
     #[test]
@@ -1900,7 +1895,7 @@ label = "personal"
         let config = Config::parse("[tunables]\npoll_secs = 120\nsession_floor = 80\n").unwrap();
         assert!(config.roster.is_empty());
         assert_eq!(config.tunables.poll_secs, 120);
-        assert_eq!(config.tunables.session_floor, Some(80));
+        assert_eq!(config.tunables.session_floor, 80);
     }
 
     #[test]
@@ -2508,12 +2503,72 @@ label = "personal"
         assert!((config.swap_threshold() - 0.90).abs() < 1e-9);
     }
 
+    /// Pins the full escape surface of [`basic_string`], not just the common cases.
+    ///
+    /// Written to characterize the hand-rolled emitter BEFORE #403 delegated it to
+    /// `toml_writer`, then re-run unchanged against the delegated one: an identical
+    /// pass across every escape class is the empirical evidence that the swap is
+    /// behavior-preserving. Do not thin it out — each arm below is a distinct branch
+    /// of the TOML `basic-unescaped` grammar.
     #[test]
     fn basic_string_escapes_specials() {
         assert_eq!(basic_string("plain"), "\"plain\"");
         assert_eq!(basic_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert_eq!(basic_string("tab\tnl\n"), "\"tab\\tnl\\n\"");
         assert_eq!(basic_string("\u{0}"), "\"\\u0000\"");
+
+        // The named escapes TOML defines, each on its own.
+        assert_eq!(basic_string("\u{08}"), "\"\\b\"");
+        assert_eq!(basic_string("\u{0c}"), "\"\\f\"");
+        assert_eq!(basic_string("\r"), "\"\\r\"");
+
+        // Remaining C0 controls and DEL take the \uXXXX form, upper-case hex.
+        assert_eq!(basic_string("\u{1}"), "\"\\u0001\"");
+        assert_eq!(basic_string("\u{1f}"), "\"\\u001F\"");
+        assert_eq!(basic_string("\u{7f}"), "\"\\u007F\"");
+
+        // Non-ASCII is valid literally in a basic string — never escaped. This is the
+        // arm an operator's label most plausibly exercises (issue #176 wide glyphs).
+        assert_eq!(basic_string("café"), "\"café\"");
+        assert_eq!(basic_string("работа"), "\"работа\"");
+        assert_eq!(basic_string("🟢 work"), "\"🟢 work\"");
+
+        // Space and `'` stay literal; only `"` and `\` are structural.
+        assert_eq!(basic_string("a b 'c'"), "\"a b 'c'\"");
+
+        // Empty renders as an empty basic string, not a bare pair of nothing.
+        assert_eq!(basic_string(""), "\"\"");
+    }
+
+    /// Every string [`Config::render`] emits must survive a render → parse round-trip.
+    /// Guards the #403 delegation at the level that actually matters: the emitted file
+    /// re-parses to the same values, for the whole escape surface at once.
+    ///
+    /// The empty string is deliberately absent: `""` escapes fine (pinned above) but
+    /// `validate` rejects an empty `label` outright, which is a roster invariant, not an
+    /// escaping property.
+    #[test]
+    fn rendered_strings_round_trip_through_the_parser() {
+        for label in [
+            "plain",
+            "a\"b\\c",
+            "tab\there",
+            "nl\nhere",
+            "cr\rhere",
+            "\u{08}\u{0c}",
+            "\u{0}\u{1f}\u{7f}",
+            "café ☕",
+            "🟢 work",
+        ] {
+            let rendered = basic_string(label);
+            let toml = format!("[[account]]\naccount_uuid = \"u\"\nlabel = {rendered}\n");
+            let config = Config::parse(&toml)
+                .unwrap_or_else(|e| panic!("{label:?} rendered as {rendered} must parse: {e}"));
+            assert_eq!(
+                config.roster[0].label, label,
+                "{label:?} must survive render -> parse unchanged"
+            );
+        }
     }
 
     #[test]

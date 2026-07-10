@@ -336,7 +336,7 @@ per-tick decision and any back-off, plus the daemon's start (with the effective
 config), its stop, and the moment it **leaves** the all-exhausted state:
 
 ```text
-ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 session_floor=off session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
+ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 session_floor=80 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
 ts=2026-06-30T00:00:00Z diag=poll account=work outcome=rate_limited
 ts=2026-06-30T00:00:00Z diag=tick decision=skip_active_unavailable backoff_secs=120
 ts=2026-06-30T00:00:30Z diag=poll account=work outcome=live
@@ -609,7 +609,7 @@ The primary hand-editable block — the poll cadence and the swap thresholds.
 | `cooldown_secs` | Seconds to wait after a swap before another is allowed — the swap-pacing floor. Tunable **above** a non-zero minimum but never down to zero, so rapid-fire account flapping can't be configured on. | `5..=3600` | `60` |
 | `session_trigger` | Swap **away** from the active account at or above this session-usage percent. | `50..=99` | `95` |
 | `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
-| `session_floor` | Opt-in guard: only swap **to** an account whose session usage is below this percent. Off unless set. | `0..=session_trigger` | off |
+| `session_floor` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent, so the target keeps runway. Despite the name it is a **ceiling on the target**, not a minimum — *raising* it toward `session_trigger` is what **loosens** it (equal is inert), and `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_trigger`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_trigger` | `80` |
 | `monitor_401_n` | Consecutive non-scope `401`s before an account is treated as dead and quarantined. | `1..=20` | `3` |
 | `monitor_recovery_m` | Consecutive recovery-probe successes before a quarantined account whose own token recovers (without a re-login) is returned to the rotation. | `1..=20` | `2` |
 
@@ -689,6 +689,13 @@ A `PATH` argument is written atomically (a same-directory temp, then `rename(2)`
 mode `0600`; with no `PATH` the artifact goes to standard output. Cross-machine
 credential portability on macOS is verified (build spike #145), so an exported artifact
 restores on another Mac.
+
+An artifact embeds the config **text**, so a tunable that was absent when the artifact
+was written is absent on import, and takes **today's** default — not the default that
+was in force at export time. This is the same absent-key rule the config file follows
+everywhere. It is worth knowing for artifacts exported before `session_floor` became a
+default-on `80` (issue #398): they import with the reserve **on**, where the original
+machine ran with it off.
 
 ## Privacy: no telemetry
 
