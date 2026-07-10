@@ -933,8 +933,15 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // `3` (issue #7), without disturbing the running daemon.
     let _lock = InstanceLock::acquire(&paths::daemon_lock()?)?;
 
-    // Load the real config (roster + tunables); a malformed or absent config is
-    // fatal, never silently replaced by defaults (issue #3).
+    // Load the real config (roster + tunables). A malformed or absent config FILE
+    // is fatal — never silently replaced wholesale by defaults (issue #3). That
+    // guarantee is per-FILE, NOT per-section: in an existing file, an absent
+    // `[section]` or key silently takes its documented default (every `RawConfig`
+    // field is `#[serde(default)]`) — correct and designed, but invisible, so
+    // deleting a section quietly shifts effective values. #401 (`config show
+    // --origin`) will surface effective-vs-on-disk; a non-roster edit reaches a
+    // running daemon only on restart (#400, no hot-reload — roster is the live
+    // exception, #139).
     let config = Config::load()?;
     // The daemon needs at least one account to rotate across. This is the daemon's
     // precondition (enforced here, at the consumer), NOT a parse-time rule —
