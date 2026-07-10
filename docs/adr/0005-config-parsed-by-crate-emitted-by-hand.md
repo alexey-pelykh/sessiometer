@@ -108,9 +108,10 @@ Framed as the issue's options (a) / (b) / (c).
 
 ### Negative / trade-offs
 
-- **`basic_string` is maintained by hand** against the TOML basic-string escape rules.
+- ~~**`basic_string` is maintained by hand** against the TOML basic-string escape rules.
   Bounded: TOML 1.0 is stable and `basic_string_escapes_specials` pins the behaviour; a
-  spec change would be a visible, test-caught edit.
+  spec change would be a visible, test-caught edit.~~ **Retired** by issue #403 — the
+  escaping is delegated to `toml_writer`; see the Update note below.
 - **Two write paths coexist by design** (`toml` in, hand-rolled out). Mitigated by the
   render→parse round-trip tests, which assert the hand-written output is re-readable by
   the `toml` parser on every change.
@@ -130,12 +131,32 @@ future refinement, not part of this decision: the current escaper is verified co
 and test-pinned, and promoting a transitive dep to a direct one plus re-baselining the
 exact-bytes round-trip tests is churn without a correctness gain today.
 
+> **Update (2026-07-10, issue #403).** This refinement **was subsequently adopted**.
+> `basic_string` now delegates to `toml_writer::TomlStringBuilder::…as_basic()`;
+> `toml_writer` is named directly in `Cargo.toml` and `Cargo.lock` gained a single
+> dependency *edge* — no new `[[package]]`, so the zero-new-crate cost held exactly.
+> The anticipated re-baselining did not materialize: the escape surface was pinned
+> against the hand-rolled implementation first, then the identical tests passed unchanged
+> against the delegated one — the two emitters are byte-for-byte equivalent.
+>
+> **The decision recorded above is unchanged**: the *emitter* stays hand-written
+> (`push_str`, interleaved comments, selective omission); only the *escaper* moved. This
+> ADR keeps status `Accepted`, and is not superseded — a trade-off it listed (`basic_string`
+> is maintained by hand) is simply retired. Two illustrations in the Context above are now
+> historical: `session_floor` no longer renders as a commented-out OFF-state line (it is a
+> default-on live value since issue #398 — see **ADR-0013**), and `[refresh]`'s `enabled`
+> has always rendered live. `claude_bin`'s commented example still stands.
+
 ## Related
 
 - Issue #181 (this decision); issue #3 N2 (self-documenting config); issue #148
   (`export` reuses `render`); issue #70 (derived `stash`, never persisted).
+- Issue #403 (the optional escaper refinement above, subsequently **adopted** — see the
+  Update note); issue #398 / ADR-0013 (`session_floor` is default-on, so the
+  commented-out OFF-state illustration in the Context is historical).
 - ADR-0004 / ADR-0002: the same minimal-dependency posture that weighs against adopting
   `toml_edit`.
 - Code: `src/config.rs` — `Config::parse`, `RawConfig`, `Config::render`,
-  `basic_string` and its `basic_string_escapes_specials` test; `Cargo.toml` dependency
-  rationale; `Cargo.lock` (`toml`, no `toml_edit`).
+  `basic_string` (now a `toml_writer` delegation) and its `basic_string_escapes_specials`
+  + `rendered_strings_round_trip_through_the_parser` tests; `Cargo.toml` dependency
+  rationale; `Cargo.lock` (`toml`, `toml_writer`, no `toml_edit`).
