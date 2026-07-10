@@ -84,6 +84,10 @@ enum Command {
     /// `service install|uninstall|start|stop|restart|status` — manage the background
     /// launchd LaunchAgent and its lifecycle.
     Service { action: ServiceAction },
+    /// `daemon status` — report the daemon *process*: its liveness and management mode
+    /// (issue #396). The process-lifecycle counterpart to the persistence-oriented
+    /// `service` noun. Read-only — nothing is started, stopped, or signalled.
+    Daemon { action: DaemonAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
         json: bool,
@@ -148,6 +152,16 @@ enum ServiceAction {
     Status,
 }
 
+/// The `daemon` sub-action (issue #396). The 0.1.0 leaf ships only `status` — the read-only
+/// liveness + management-mode report; the lifecycle restructure (#397) extends this scaffold
+/// with `stop`/`restart`. A plain data enum, like [`ServiceAction`] — the parser resolves the
+/// sub-verb so `execute` just dispatches.
+#[derive(Debug, PartialEq)]
+enum DaemonAction {
+    /// `daemon status` — report whether a daemon is running, and how it is managed.
+    Status,
+}
+
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
 /// subcommand's own usage. Doubles as the subcommand identity in a [`Error::CliUsage`]
 /// hint, so a rejected flag points at the exact `--help` to run.
@@ -158,6 +172,7 @@ enum HelpTopic {
     Login,
     Run,
     Service,
+    Daemon,
     Status,
     List,
     Use,
@@ -179,6 +194,7 @@ impl HelpTopic {
             HelpTopic::Login => "sessiometer login --help",
             HelpTopic::Run => "sessiometer run --help",
             HelpTopic::Service => "sessiometer service --help",
+            HelpTopic::Daemon => "sessiometer daemon --help",
             HelpTopic::Status => "sessiometer status --help",
             HelpTopic::List => "sessiometer list --help",
             HelpTopic::Use => "sessiometer use --help",
@@ -202,6 +218,7 @@ impl HelpTopic {
             HelpTopic::Login => LOGIN_USAGE,
             HelpTopic::Run => RUN_USAGE,
             HelpTopic::Service => SERVICE_USAGE,
+            HelpTopic::Daemon => DAEMON_USAGE,
             HelpTopic::Status => STATUS_USAGE,
             HelpTopic::List => LIST_USAGE,
             HelpTopic::Use => USE_USAGE,
@@ -325,6 +342,38 @@ fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
     match action {
         Some(action) => Ok(Command::Service { action }),
         None => Ok(Command::Help(HelpTopic::Service)),
+    }
+}
+
+/// Parse `daemon <status>` (issue #396): the process-lifecycle noun. The 0.1.0 leaf accepts
+/// only `status`; the first positional is the sub-action, `-h`/`--help` short-circuits to help,
+/// an unknown flag or action is a strict-usage error, and bare `daemon` (no action) prints the
+/// daemon help. Mirrors [`parse_service`] so the lifecycle restructure (#397) grows the action
+/// set without reshaping the parser.
+fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut action = None;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Daemon)),
+            Value(value) if action.is_none() => {
+                let name = value.to_string_lossy();
+                action = Some(match name.as_ref() {
+                    "status" => DaemonAction::Status,
+                    other => {
+                        return Err(Error::CliUsage {
+                            message: format!("unknown daemon action `{other}`"),
+                            usage_hint: HelpTopic::Daemon.hint(),
+                        })
+                    }
+                });
+            }
+            Value(_) => {} // extra positional ignored, matching the other parsers
+            other => return Err(unexpected(other, HelpTopic::Daemon)),
+        }
+    }
+    match action {
+        Some(action) => Ok(Command::Daemon { action }),
+        None => Ok(Command::Help(HelpTopic::Daemon)),
     }
 }
 
@@ -518,6 +567,7 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         "login" => parse_positional(parser, HelpTopic::Login, |label| Command::Login { label }),
         "run" => parse_run(parser),
         "service" => parse_service(parser),
+        "daemon" => parse_daemon(parser),
         "status" => parse_status(parser),
         "list" => parse_list(parser),
         "use" => parse_use(parser),
@@ -566,6 +616,9 @@ async fn execute(command: Command) -> Result<()> {
             ServiceAction::Stop => crate::service::stop().await,
             ServiceAction::Restart => crate::service::restart().await,
             ServiceAction::Status => crate::service::status().await,
+        },
+        Command::Daemon { action } => match action {
+            DaemonAction::Status => daemon_status().await,
         },
         Command::Status {
             json,
@@ -630,6 +683,7 @@ COMMANDS:
     login [<label>]      Log in to an account (claude /login) in isolation and land it in the rotation, keeping the active account
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
     service <install|uninstall|start|stop|restart|status>  Manage the background launchd LaunchAgent (install/uninstall) and drive its lifecycle (start/stop/restart/status)
+    daemon <status>      Report the running daemon process: alive? managed (launchd) / unmanaged (foreground run) / not running
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -710,6 +764,21 @@ The agent invokes the lock-guarded `sessiometer run`, so the background agent an
 foreground `run` can never both drive the swap loop: whichever starts second refuses
 with a clear message and exits 3, performing no swap. This single-owner guard is a
 safety guard — nothing bypasses it.
+";
+
+const DAEMON_USAGE: &str = "sessiometer daemon — inspect the running daemon process: its liveness and how it is managed
+
+USAGE:
+    sessiometer daemon <status>
+
+    status      report whether a daemon is running, and whether it is managed (launchd) or unmanaged (a foreground / detached `sessiometer run`)
+    -h, --help  print this help
+
+`daemon` is the process-lifecycle counterpart to `service` (which owns the launchd
+registration). `daemon status` is READ-ONLY — it starts, stops, and signals nothing. It
+asks the control socket first (a responsive daemon answers), then falls back to the
+single-instance lock, so a daemon that is alive but not yet answering (starting up) is
+reported honestly rather than as not running. Exits 0 whenever it can determine state.
 ";
 
 const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
@@ -1207,6 +1276,100 @@ fn render_schema_mismatch(wire: SchemaVersion, supported: SchemaVersion) -> Stri
          `sessiometer status --json` still emits the raw snapshot.\n",
         wire.major, wire.minor, supported.major, supported.minor,
     )
+}
+
+/// How long `daemon status` waits for the control socket to answer before falling back to the
+/// single-instance lock (issue #396). A local daemon answers `status` off an in-memory
+/// snapshot near-instantly, so this is generous headroom — not a latency budget. It exists
+/// only so a mid-startup daemon (socket bound but not yet accepting) or a wedged one does not
+/// hang the report; on timeout the lock fallback still tells alive-but-unresponsive from
+/// not-running.
+const DAEMON_STATUS_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The daemon *process* liveness, as `daemon status` projects it (issue #396) from two
+/// read-only probes: the control socket (primary) and the single-instance lock (fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonLiveness {
+    /// The control socket answered a `status` request — a live, responsive daemon.
+    Responsive,
+    /// The socket did not answer, but the single-instance lock is held — a live daemon not
+    /// answering yet (starting up, or wedged). Reported honestly, NOT as "not running".
+    AliveUnresponsive,
+    /// Neither the socket answers nor the lock is held — no daemon is running.
+    NotRunning,
+}
+
+/// Report the daemon *process* — is it alive, and how is it managed (issue #396)? The
+/// process-lifecycle counterpart to `service status`, which speaks only to the launchd
+/// registration and exits non-zero when none is installed (even beside a healthy daemon).
+/// This is READ-ONLY — it starts, stops, and signals nothing: a socket `status` query, a
+/// non-blocking lock probe, and a `plist.exists()` check.
+///
+/// Liveness is socket-primary, lock-fallback: a responsive socket ⇒ running; otherwise a held
+/// single-instance lock ⇒ alive-but-unresponsive (the honest startup / wedged case); otherwise
+/// not running. Management mode is the same `plist.exists()` signal the `service` verbs gate on
+/// ([`crate::service::is_managed`]) — managed (launchd) vs unmanaged (a foreground / detached
+/// `run`). Prints one report line to stdout and returns `Ok` (exit `0`) whenever it can
+/// determine state.
+async fn daemon_status() -> Result<()> {
+    let liveness = if probe_socket_responsive(&paths::control_socket()?).await {
+        DaemonLiveness::Responsive
+    } else if InstanceLock::is_held(&paths::daemon_lock()?)? {
+        DaemonLiveness::AliveUnresponsive
+    } else {
+        DaemonLiveness::NotRunning
+    };
+    // Management mode is only meaningful for a running daemon; the renderer ignores it in the
+    // not-running case. A pure `plist.exists()` filesystem read — no launchctl, no process.
+    let managed = crate::service::is_managed()?;
+    print!("{}", render_daemon_status(liveness, managed));
+    Ok(())
+}
+
+/// Probe whether the daemon's control socket answers a `status` request within
+/// [`DAEMON_STATUS_SOCKET_TIMEOUT`] (issue #396). Read-only: it opens a client connection and
+/// sends the EXISTING `status` verb (no new wire verb — issue note), then waits for any reply.
+/// `true` only if the daemon answered; a missing/refused socket, a bounded timeout (socket
+/// bound but not accepting yet, or wedged), or a read error all read as "not responsive",
+/// leaving the lock fallback to tell alive-but-unresponsive from not-running. Dropping the
+/// timed-out future closes only this client connection — the daemon is neither signalled nor
+/// disturbed.
+async fn probe_socket_responsive(path: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(DAEMON_STATUS_SOCKET_TIMEOUT, query_status(path)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// The report `daemon status` prints for a [`DaemonLiveness`] × management-mode pair (issue
+/// #396). Pure (no I/O) so the state→text mapping is unit-tested without a socket, lock, or
+/// plist. `managed` is read only for a running daemon (managed = launchd LaunchAgent installed;
+/// unmanaged = a foreground / detached `sessiometer run`); the not-running report carries no
+/// management mode. Trailing newline included.
+fn render_daemon_status(liveness: DaemonLiveness, managed: bool) -> String {
+    match liveness {
+        DaemonLiveness::Responsive => format!(
+            "sessiometer: daemon is running and responsive{}\n",
+            management_suffix(managed),
+        ),
+        DaemonLiveness::AliveUnresponsive => format!(
+            "sessiometer: daemon is running but not answering the control socket yet — \
+             starting up or busy{}\n",
+            management_suffix(managed),
+        ),
+        DaemonLiveness::NotRunning => "sessiometer: daemon is not running.\n".to_owned(),
+    }
+}
+
+/// The management-mode tail shared by the two running-daemon reports (issue #396): managed
+/// (launchd LaunchAgent) vs unmanaged (a foreground / detached `sessiometer run`). Carries the
+/// trailing period so each base report reads as one sentence.
+fn management_suffix(managed: bool) -> &'static str {
+    if managed {
+        " (managed by launchd)."
+    } else {
+        " (unmanaged: a foreground or detached `sessiometer run`)."
+    }
 }
 
 /// Render a [`StatusResponse`] as the text `status` prints: an aligned table with a
@@ -6197,6 +6360,126 @@ spare  22222222-2222\n\
         let err = parse_argv(&["service", "install", "--force"]).unwrap_err();
         assert!(matches!(err, Error::CliUsage { .. }));
         assert!(err.to_string().contains("--force"), "got: {err}");
+    }
+
+    #[test]
+    fn daemon_status_parses_to_its_action() {
+        // Issue #396: the 0.1.0 leaf's sole sub-verb routes to its action, so `execute`
+        // dispatches it to `daemon_status`.
+        assert_eq!(
+            parse_argv(&["daemon", "status"]).unwrap(),
+            Command::Daemon {
+                action: DaemonAction::Status
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_help_and_bare_daemon_print_help_never_an_action() {
+        // `daemon --help` and a bare `daemon` (no sub-action) both resolve to HELP — a pure
+        // `Help`, so neither can fall through to an action.
+        assert_eq!(
+            parse_argv(&["daemon", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Daemon)
+        );
+        assert_eq!(
+            parse_argv(&["daemon"]).unwrap(),
+            Command::Help(HelpTopic::Daemon)
+        );
+    }
+
+    #[test]
+    fn daemon_rejects_an_unknown_action_instead_of_defaulting() {
+        // A typo'd sub-action (`statu`) errors, naming the bad action and pointing at
+        // `daemon --help` — it never silently falls through to `status`.
+        match parse_argv(&["daemon", "statu"]).unwrap_err() {
+            Error::CliUsage {
+                message,
+                usage_hint,
+            } => {
+                assert!(message.contains("statu"), "names the bad action: {message}");
+                assert_eq!(usage_hint, "sessiometer daemon --help");
+            }
+            other => panic!("expected a CliUsage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_status_rejects_an_unknown_flag() {
+        // `daemon status --nope` is a strict-usage error (issue #175 posture), pointing at the
+        // daemon help — not a silently-dropped flag.
+        let err = parse_argv(&["daemon", "status", "--nope"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("--nope"), "got: {err}");
+    }
+
+    #[test]
+    fn daemon_status_report_distinguishes_liveness_and_management_mode() {
+        // Issue #396 AC-2 + AC-3: the five states each render an honest, distinct report —
+        // responsive vs alive-but-unresponsive vs not-running, crossed with managed vs
+        // unmanaged for the two running states.
+        let responsive_managed = render_daemon_status(DaemonLiveness::Responsive, true);
+        assert!(
+            responsive_managed.contains("running and responsive"),
+            "{responsive_managed}"
+        );
+        assert!(
+            responsive_managed.contains("managed by launchd"),
+            "{responsive_managed}"
+        );
+
+        let responsive_unmanaged = render_daemon_status(DaemonLiveness::Responsive, false);
+        assert!(
+            responsive_unmanaged.contains("running and responsive"),
+            "{responsive_unmanaged}"
+        );
+        assert!(
+            responsive_unmanaged.contains("unmanaged"),
+            "{responsive_unmanaged}"
+        );
+
+        // AC-3 (the headline honesty case): alive-but-unresponsive is reported as RUNNING, NOT
+        // as "not running", with the management mode still surfaced.
+        let starting_managed = render_daemon_status(DaemonLiveness::AliveUnresponsive, true);
+        assert!(
+            starting_managed.contains("running but not answering"),
+            "{starting_managed}"
+        );
+        assert!(
+            !starting_managed.contains("not running"),
+            "alive-but-unresponsive must not read as not-running: {starting_managed}"
+        );
+        assert!(
+            starting_managed.contains("managed by launchd"),
+            "{starting_managed}"
+        );
+
+        let starting_unmanaged = render_daemon_status(DaemonLiveness::AliveUnresponsive, false);
+        assert!(
+            starting_unmanaged.contains("running but not answering"),
+            "{starting_unmanaged}"
+        );
+        assert!(
+            starting_unmanaged.contains("unmanaged"),
+            "{starting_unmanaged}"
+        );
+
+        // Not-running is unambiguous and carries no management mode (the `managed` flag is
+        // inert), so both plist states render identically.
+        assert_eq!(
+            render_daemon_status(DaemonLiveness::NotRunning, true),
+            "sessiometer: daemon is not running.\n"
+        );
+        assert_eq!(
+            render_daemon_status(DaemonLiveness::NotRunning, false),
+            render_daemon_status(DaemonLiveness::NotRunning, true),
+        );
+
+        // Every report is a single trailing-newline-terminated line (a clean report to stdout).
+        for report in [responsive_managed, starting_managed] {
+            assert!(report.ends_with('\n'), "trailing newline: {report:?}");
+            assert_eq!(report.matches('\n').count(), 1, "one line only: {report:?}");
+        }
     }
 
     #[test]

@@ -763,6 +763,54 @@ impl InstanceLock {
             Err(Error::Io(err))
         }
     }
+
+    /// Probe whether the single-instance lock at `path` is currently held by a LIVE daemon,
+    /// WITHOUT disturbing it (issue #396) — the lock-fallback half of the `daemon status`
+    /// liveness projection (socket-primary, lock-fallback). A non-blocking
+    /// `flock(LOCK_EX|LOCK_NB)` over a fresh read-only open (a separate open file description,
+    /// so it contends with the daemon's held lock exactly as a second `run` would):
+    /// - `EWOULDBLOCK` ⇒ another process holds it — a daemon is alive even if its control
+    ///   socket is not answering yet (the honest startup / wedged case; NOT "not running").
+    /// - a successful acquire ⇒ no live holder; the lock is released the instant `file` drops
+    ///   at the end of this scope — nothing is started, stopped, or signalled.
+    /// - an absent lock file ⇒ the daemon has never created it ⇒ not running.
+    ///
+    /// Read-only by construction (the `daemon status` AC: no process is started/stopped/
+    /// signalled). Kept beside [`Self::acquire`] so the raw `flock` FFI stays localized
+    /// (ADR-0004).
+    ///
+    /// Note the one inherent tradeoff: probing a FREE lock necessarily acquires it for the
+    /// ~microseconds until `file` drops — `flock` has no test-without-acquire mode, so this
+    /// acquire-then-release is the canonical liveness-probe shape. It is benign here because
+    /// the caller runs this ONLY as the socket-primary fallback (a real startup already holds
+    /// the lock, so the probe fails to acquire and never contends); the sole residual race is
+    /// a `run` whose own `acquire` lands in that microsecond window and self-refuses (exit 3),
+    /// which is vanishingly unlikely and self-correcting on retry.
+    pub(crate) fn is_held(path: &Path) -> Result<bool> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = match OpenOptions::new().read(true).open(path) {
+            Ok(file) => file,
+            // No lock file at all ⇒ the daemon has never created it ⇒ not held.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(Error::Io(err)),
+        };
+        // SAFETY: as in `acquire` — a valid open fd (owned by `file`, which outlives the
+        // call) plus the two flag constants; `flock` has no other preconditions.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // Acquired ⇒ no live holder; `file` drops at the end of this scope, releasing the
+            // lock at once.
+            return Ok(false);
+        }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK (== EAGAIN): another instance holds the lock — a live daemon.
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(true)
+        } else {
+            Err(Error::Io(err))
+        }
+    }
 }
 
 /// Current wall-clock as epoch SECONDS, the unit the #119 credential rollup and wire use
@@ -10503,6 +10551,38 @@ mod tests {
         drop(lock);
         let _reacquired =
             InstanceLock::acquire(&path).expect("the lock is free after the first is dropped");
+    }
+
+    #[test]
+    fn instance_lock_is_held_probe_reports_absent_held_and_freed() {
+        // Issue #396: the read-only lock-fallback probe behind `daemon status`. It must never
+        // disturb a live holder (non-blocking flock over a separate open), and it distinguishes
+        // three states: absent lock file, held-by-a-live-daemon, and present-but-free.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+
+        // Absent lock file ⇒ the daemon has never created it ⇒ not held (⇒ "not running").
+        assert!(!InstanceLock::is_held(&path).expect("an absent lock probes cleanly as not-held"));
+
+        // A held single-instance lock ⇒ the probe (a SEPARATE open + non-blocking flock, as a
+        // `daemon status` in another process would do) sees it held — without disturbing the
+        // holder, which is still live below.
+        let lock = InstanceLock::acquire(&path).expect("acquire the single-instance lock");
+        assert!(InstanceLock::is_held(&path).expect("a held lock probes as held"));
+        // The probe did not steal the lock: a second real acquisition is still refused.
+        assert!(matches!(
+            InstanceLock::acquire(&path),
+            Err(Error::AlreadyRunning)
+        ));
+
+        // Released (holder dropped) ⇒ present-but-free ⇒ not held. The file now EXISTS
+        // (acquire created it), so this is the stale-lock-file path — distinct from the
+        // absent path above, and the probe's own acquire+release leaves nothing signalled.
+        drop(lock);
+        assert!(
+            !InstanceLock::is_held(&path).expect("a released lock probes as not-held"),
+            "a present-but-unlocked file must read as not-held (stale lock file)",
+        );
     }
 
     // --- run loop ----------------------------------------------------------
