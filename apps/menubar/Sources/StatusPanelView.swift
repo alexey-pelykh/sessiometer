@@ -23,6 +23,20 @@
 import AppKit
 import SwiftUI
 
+fileprivate extension Color {
+    /// Resolve a Foundation-only `StatusPanelFormat.PanelTint` to a concrete `Color` (#388): an
+    /// asset-catalog color set (theme-adaptive Any/Dark + Increased-Contrast) from the app's main bundle,
+    /// or a system semantic color. This is the ONE SwiftUI-side seam; the role→token table stays in
+    /// `StatusPanelFormat` (Foundation-only, unit-tested), which cannot name a `Color` itself.
+    static func panel(_ tint: StatusPanelFormat.PanelTint) -> Color {
+        switch tint {
+        case .asset(let name): return Color(name, bundle: .main)
+        case .secondary:       return .secondary
+        case .primary:         return .primary
+        }
+    }
+}
+
 /// The root panel. Observes the store and re-derives the reset-in against the client's own wall clock
 /// on a periodic `TimelineView` tick (issue #326: "computed against the client's own clock"), so a
 /// resting popover keeps its "resets in" honest without a manual refresh.
@@ -284,19 +298,18 @@ private struct AccountRowView: View {
     }
 
     private func cueColor(for auth: CredentialHealth) -> Color {
-        auth == .dead && !row.isRecovering ? .red : .secondary
+        // The DEAD cue sits in the same row as the DEAD glyph, so it takes the SAME contrast-safe red
+        // (#388 `--ut-r`) — a system `.red` beside the token-tinted glyph would read as two different reds.
+        auth == .dead && !row.isRecovering
+            ? .panel(StatusPanelFormat.healthTint(.red))
+            : .secondary
     }
 
-    /// Map the pure `HealthTint` role to a system semantic color — never `accentColor` (the AUTH glyph
-    /// is never app-tinted, #84); `.neutral` (unknown) is `.secondary`, the #137 "no false green".
+    /// Map the pure `HealthTint` role to its contrast-safe panel tint (#388) — never `accentColor` (the
+    /// AUTH glyph is never app-tinted, #84); `.neutral` (unknown) stays `.secondary`, the #137 "no false
+    /// green". The role→token table lives in `StatusPanelFormat.healthTint` (Foundation-only, unit-tested).
     private func healthColor(_ tint: StatusPanelFormat.HealthTint) -> Color {
-        switch tint {
-        case .green:   return .green
-        case .yellow:  return .yellow
-        case .orange:  return .orange
-        case .red:     return .red
-        case .neutral: return .secondary
-        }
+        .panel(StatusPanelFormat.healthTint(tint))
     }
 
     private var accessibilityLabel: String {
@@ -378,6 +391,9 @@ private struct UsageMeter: View {
     }
 
     /// Bar fill = the green/amber/red usage band; a failed poll (`nil`) is muted, never a false green (#137).
+    /// The FILL deliberately keeps the system-bright colors (≈ the mock's `--u-*` fill family): a bar is a
+    /// non-text fill (WCAG 3:1), so — unlike the small `pctColor` TEXT, which took the darker `--ut-*` tokens
+    /// in #388 — it does NOT need the contrast-safe tint (leaving it here is intentional, not an oversight).
     private var barColor: Color {
         switch severity {
         case .red:    return .red
@@ -388,16 +404,12 @@ private struct UsageMeter: View {
     }
 
     /// The percent TEXT carries its severity band in color, matching the `status` CLI (which colors green
-    /// percents green too — `Severity::Green => "32"`) and the design reference: green healthy, ≥75% amber
-    /// (orange reads better than yellow), ≥90%/exhausted red. A failed poll (`n/a`) stays neutral — no
-    /// false green (#137).
+    /// percents green too — `Severity::Green => "32"`) and the design reference: green healthy, ≥75% amber,
+    /// ≥90%/exhausted red. As small text it takes the contrast-safe `--ut-*` TEXT tints (#388) — a family
+    /// apart from the bar's brighter `--u-*` fill (`barColor`, unchanged). A failed poll (`n/a`) stays
+    /// neutral — no false green (#137).
     private var pctColor: Color {
-        switch severity {
-        case .red:    return .red
-        case .yellow: return .orange
-        case .green:  return .green
-        case .none:   return .primary
-        }
+        .panel(StatusPanelFormat.usageTextTint(severity))
     }
 }
 
@@ -774,9 +786,11 @@ private struct FooterView: View {
                     .monospacedDigit()
                 Spacer(minLength: 0)
             }
-            // Mock `.pop-foot .fl2 { color: var(--text-3) }` — the snapshot-age line is tertiary; amber
-            // only when the reading should be distrusted (wedged poll loop / stale / disconnected).
-            .foregroundStyle(stale ? Color.orange : Color(nsColor: .tertiaryLabelColor))
+            // Mock `.pop-foot .fl2 { color: var(--text-3) }` — the snapshot-age line is tertiary; the mock's
+            // `.fl2.stale { color: var(--ut-a) }` turns it amber only when the reading should be distrusted
+            // (wedged poll loop / stale / disconnected). That amber is the SAME contrast-safe `--ut-a` token
+            // as the stale auth glyph (#388) — small text on the vibrancy, so never raw system orange (< 4.5:1).
+            .foregroundStyle(stale ? .panel(StatusPanelFormat.healthTint(.yellow)) : Color(nsColor: .tertiaryLabelColor))
             .padding(.horizontal, 14).padding(.top, 9).padding(.bottom, 11)
         }
         .padding(.top, 5)

@@ -92,11 +92,21 @@ each to its native equivalent rather than copying the CSS literally:
 | Mock (HTML/CSS)              | Native (SwiftUI / AppKit)                    |
 |------------------------------|----------------------------------------------|
 | `backdrop-filter` vibrancy   | `NSVisualEffectView` material                |
-| hex colors                   | system semantic `Color` / `NSColor`          |
+| hex colors                   | system semantic `Color` / `NSColor` — **except** the health / warning tints (see below) |
 | tabular numerals             | `.monospacedDigit()`                          |
 | health glyph (drawn SVG)     | SF Symbol **template** image (shape, not color) |
 
-The hex values and pixel metrics are **directional**, not targets.
+The hex values and pixel metrics are **directional**, not targets — with one exception.
+
+**Exception — the health / warning tints are exact tokens (#388).** The system semantic warm colors
+(`.yellow` / `.orange` / `.red`) fail WCAG non-text/text contrast on the translucent vibrancy (system
+yellow ≈ 1.2:1 there), so the in-panel auth-glyph tint (`healthColor`), its dead cue, and the meter
+`%`-text (`pctColor`) resolve to **asset-catalog color sets** — `HealthOK` / `UtilGreen` / `UtilAmber`
+/ `UtilOrange` / `UtilRed`, mirroring the mock's `--ok` / `--ut-*` families with Any/Dark **plus
+Increased-Contrast** variants. For these, the mock hex values ARE the targets, not directional. The
+meter **bar fill** (`barColor`) stays on the bright system colors (≈ the mock's `--u-*` fill family): a
+bar is a non-text fill (3:1), so it needs no darker tint. The menu-bar status-item glyph is unaffected —
+it is a monochrome **template** image (shape-encoded, `StatusGauge`), never health-tinted.
 
 ## The 9 states
 
