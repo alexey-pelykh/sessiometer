@@ -31,6 +31,10 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Info.plist
+        # Pin the app's global accent to the brand-blue asset (#391): `Color.accentColor` / `.tint` then
+        # resolve to `Assets.xcassets/AccentColor` (#007aff light / #0a84ff dark) instead of the user's
+        # macOS system accent, so a non-blue system accent can't drift the panel hue off the design mock.
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
   # Wire-decoder (#322) + socket-transport (#323) + status-store (#324) unit tests. A STANDALONE
   # logic-test bundle: no TEST_HOST, so it never launches the app — it compiles the pure production
   # sources directly alongside the tests (NOT the whole Sources dir: main.swift is the app's
