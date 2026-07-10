@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use toml_writer::{ToTomlValue, TomlStringBuilder};
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -1298,7 +1299,6 @@ fn render_jitter(jitter: &Jitter) -> String {
 /// `["work", "spare"]` (issue #105 `[refresh].accounts`). Each element goes through
 /// [`basic_string`], so labels/uuids needing escapes round-trip; an empty list renders
 /// `[]`.
-#[allow(dead_code)]
 fn render_str_array(items: &[String]) -> String {
     let mut out = String::from("[");
     for (i, item) in items.iter().enumerate() {
@@ -1315,32 +1315,19 @@ fn render_str_array(items: &[String]) -> String {
 /// by [`Config::render`] for roster fields, which (unlike the integer tunables)
 /// may contain characters needing escaping.
 ///
-/// Hand-rolled on purpose, not delegated to a TOML crate: the emitter it serves is
-/// hand-written by design (see [`Config::render`]; issue #181, ADR-0005). Kept
-/// minimal and pinned by `basic_string_escapes_specials`.
-#[allow(dead_code)]
+/// Delegated to `toml_writer` (issue #403, refining ADR-0005). The *emitter* stays
+/// hand-written — it interleaves doc-comments a serializer would drop — but the
+/// escaping itself is a spec'd grammar (`basic-unescaped`), and `toml_writer` is the
+/// reference implementation, already compiled as a dependency of `toml`. It supersedes a
+/// hand-rolled `match` that had to re-derive which C0 controls take `\uXXXX` and that
+/// non-ASCII stays literal.
+///
+/// `as_basic()` always quotes with `"` (never a literal `'…'` string), which keeps the
+/// output shape identical to the hand-rolled emitter's. Pinned by
+/// `basic_string_escapes_specials` and `rendered_strings_round_trip_through_the_parser`,
+/// both written against the old implementation and re-run unchanged against this one.
 fn basic_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            // Remaining C0 controls and DEL must be escaped; everything else
-            // (including non-ASCII) is valid literally in a basic string.
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+    TomlStringBuilder::new(s).as_basic().to_toml_value()
 }
 
 /// Permissive deserialization target: every key optional (documented default),
@@ -2516,12 +2503,72 @@ label = "personal"
         assert!((config.swap_threshold() - 0.90).abs() < 1e-9);
     }
 
+    /// Pins the full escape surface of [`basic_string`], not just the common cases.
+    ///
+    /// Written to characterize the hand-rolled emitter BEFORE #403 delegated it to
+    /// `toml_writer`, then re-run unchanged against the delegated one: an identical
+    /// pass across every escape class is the empirical evidence that the swap is
+    /// behavior-preserving. Do not thin it out — each arm below is a distinct branch
+    /// of the TOML `basic-unescaped` grammar.
     #[test]
     fn basic_string_escapes_specials() {
         assert_eq!(basic_string("plain"), "\"plain\"");
         assert_eq!(basic_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert_eq!(basic_string("tab\tnl\n"), "\"tab\\tnl\\n\"");
         assert_eq!(basic_string("\u{0}"), "\"\\u0000\"");
+
+        // The named escapes TOML defines, each on its own.
+        assert_eq!(basic_string("\u{08}"), "\"\\b\"");
+        assert_eq!(basic_string("\u{0c}"), "\"\\f\"");
+        assert_eq!(basic_string("\r"), "\"\\r\"");
+
+        // Remaining C0 controls and DEL take the \uXXXX form, upper-case hex.
+        assert_eq!(basic_string("\u{1}"), "\"\\u0001\"");
+        assert_eq!(basic_string("\u{1f}"), "\"\\u001F\"");
+        assert_eq!(basic_string("\u{7f}"), "\"\\u007F\"");
+
+        // Non-ASCII is valid literally in a basic string — never escaped. This is the
+        // arm an operator's label most plausibly exercises (issue #176 wide glyphs).
+        assert_eq!(basic_string("café"), "\"café\"");
+        assert_eq!(basic_string("работа"), "\"работа\"");
+        assert_eq!(basic_string("🟢 work"), "\"🟢 work\"");
+
+        // Space and `'` stay literal; only `"` and `\` are structural.
+        assert_eq!(basic_string("a b 'c'"), "\"a b 'c'\"");
+
+        // Empty renders as an empty basic string, not a bare pair of nothing.
+        assert_eq!(basic_string(""), "\"\"");
+    }
+
+    /// Every string [`Config::render`] emits must survive a render → parse round-trip.
+    /// Guards the #403 delegation at the level that actually matters: the emitted file
+    /// re-parses to the same values, for the whole escape surface at once.
+    ///
+    /// The empty string is deliberately absent: `""` escapes fine (pinned above) but
+    /// `validate` rejects an empty `label` outright, which is a roster invariant, not an
+    /// escaping property.
+    #[test]
+    fn rendered_strings_round_trip_through_the_parser() {
+        for label in [
+            "plain",
+            "a\"b\\c",
+            "tab\there",
+            "nl\nhere",
+            "cr\rhere",
+            "\u{08}\u{0c}",
+            "\u{0}\u{1f}\u{7f}",
+            "café ☕",
+            "🟢 work",
+        ] {
+            let rendered = basic_string(label);
+            let toml = format!("[[account]]\naccount_uuid = \"u\"\nlabel = {rendered}\n");
+            let config = Config::parse(&toml)
+                .unwrap_or_else(|e| panic!("{label:?} rendered as {rendered} must parse: {e}"));
+            assert_eq!(
+                config.roster[0].label, label,
+                "{label:?} must survive render -> parse unchanged"
+            );
+        }
     }
 
     #[test]

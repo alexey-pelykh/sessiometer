@@ -405,6 +405,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_writer",
  "unicode-width",
  "zeroize",
 ]
