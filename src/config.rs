@@ -728,12 +728,17 @@ impl Config {
         // session (an unusual but valid operator choice), so both are configurable
         // independently (AC #3).
         range("weekly_trigger", t.weekly_trigger, 50, 99)?;
-        // session_floor is default-on (#398): absent → DEFAULT_SESSION_FLOOR. When
-        // present, its lower bound is 0 and its upper bound is session_trigger (a
-        // higher floor could never admit a target), the latter a distinct
-        // cross-field error.
+        // session_floor is default-on (#398): absent → DEFAULT_SESSION_FLOOR, clamped
+        // down to session_trigger so the default honors the SAME
+        // `session_floor <= session_trigger` invariant the present-value arm enforces
+        // (#417 — without the clamp a `session_trigger < 80` config loads with an
+        // unchecked floor of 80 and then bricks after a render→parse round-trip, since
+        // #398 renders the default as a live line; `floor == trigger` is inert per
+        // ADR-0013). When present, its lower bound is 0 and its upper bound is
+        // session_trigger (a higher floor could never admit a target), the latter a
+        // distinct cross-field error.
         let session_floor = match t.session_floor {
-            None => DEFAULT_SESSION_FLOOR,
+            None => DEFAULT_SESSION_FLOOR.min(t.session_trigger as u8),
             Some(floor) => {
                 if floor < 0 {
                     return Err(Error::ConfigInvalid(format!(
@@ -1814,6 +1819,34 @@ label = "personal"
         assert!(!text.contains("# session_floor ="), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
         assert_eq!(reparsed.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+    }
+
+    #[test]
+    fn absent_floor_default_clamps_to_trigger_below_80_and_survives_round_trip() {
+        // #417 (regression from #398): with session_trigger < 80 and NO session_floor
+        // key, the absent-key default (80) MUST clamp down to session_trigger — honoring
+        // the same session_floor <= session_trigger invariant the present-value arm
+        // already enforces (ADR-0013 Decision 1). Without the clamp the first load
+        // silently yields floor = 80 (> trigger — the cross-field check is skipped on the
+        // absent-key arm), render() then emits it as a LIVE line (#398), and the SECOND
+        // parse rejects the config with ConfigFloorAboveTrigger — bricking a valid config
+        // after any save/export round-trip (enable/disable/remove account, capture
+        // write-back, export→import). The existing round-trip test above only covers the
+        // default trigger = 95 (where 80 < 95), so it never reached this corner.
+        let toml = with_tunables("session_trigger = 70"); // no session_floor key
+        let config = Config::parse(&toml).unwrap();
+        // The default is clamped to the trigger — the maximally-permissive inert value
+        // (ADR-0013: floor == trigger admits exactly what the always-on gate admits),
+        // never left at 80.
+        assert_eq!(config.tunables.session_floor, 70);
+        assert!(config.tunables.session_floor <= config.tunables.session_trigger);
+
+        // …and it survives a render → parse round-trip: the exact path that bricked.
+        let text = config.render();
+        assert!(text.contains("session_floor = 70"), "got {text}");
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.tunables.session_floor, 70);
+        assert_eq!(reparsed.tunables.session_trigger, 70);
     }
 
     #[test]

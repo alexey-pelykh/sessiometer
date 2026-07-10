@@ -5568,6 +5568,50 @@ mod tests {
         assert_eq!(soonest_weekly_reset(&none), None);
     }
 
+    #[test]
+    fn all_exhausted_relief_names_the_soonest_session_reset_among_blocked_spares() {
+        // #417 secondary: on the session-wide branch, the relief hint keys off the
+        // SOONEST session reset among weekly-viable-but-session-blocked spares
+        // (`session_relief.is_none_or(|(_, best)| at < best)`, ADR-0013 Decision 4). The
+        // existing session-branch coverage uses `session_resets_at: None` (only the
+        // fallback-naming arm fires), so an inverted comparison (`at > best`) or a wrong
+        // index would ship green. Here TWO spares qualify with DISTINCT session resets and
+        // the later-indexed one resets sooner, so a correct comparison must override the
+        // first-seen fallback.
+        let session_ceiling = 0.80_f64;
+        let weekly_trigger = 0.95_f64;
+        let readings = vec![
+            // idx 0: the exhausted active account — skipped (active == 0).
+            Some(Usage {
+                session: 0.99,
+                weekly: 0.99,
+                weekly_resets_at: Some(500),
+                session_resets_at: Some(500),
+            }),
+            // idx 1: weekly-viable, session-blocked; first seen → the naming fallback.
+            Some(Usage {
+                session: 0.90,
+                weekly: 0.10,
+                weekly_resets_at: None,
+                session_resets_at: Some(300),
+            }),
+            // idx 2: weekly-viable, session-blocked; resets SOONEST → the winner.
+            Some(Usage {
+                session: 0.85,
+                weekly: 0.20,
+                weekly_resets_at: None,
+                session_resets_at: Some(150),
+            }),
+        ];
+        let enabled = vec![true, true, true];
+        let (cause, hold_idx, resets_at) =
+            all_exhausted_relief(0, &readings, &enabled, session_ceiling, weekly_trigger);
+        assert_eq!(cause, SwapReason::Session);
+        // idx 2 (soonest, 150) wins over idx 1 (first-seen fallback, 300).
+        assert_eq!(hold_idx, 2);
+        assert_eq!(resets_at, Some(150));
+    }
+
     // --- tick: decision + swap --------------------------------------------
 
     #[tokio::test]
