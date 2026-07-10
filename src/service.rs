@@ -264,6 +264,15 @@ fn ensure_managed(plist: &Path) -> Result<()> {
     }
 }
 
+/// Whether a managed LaunchAgent is installed for this binary — the same pure
+/// `plist.exists()` signal [`ensure_managed`] gates the lifecycle verbs on (issue #376),
+/// re-exposed (issue #396) so `daemon status` can project the management mode: managed
+/// (launchd LaunchAgent installed) vs unmanaged (a foreground / detached `sessiometer run`).
+/// Read-only — a single file-existence check, nothing loaded or signalled.
+pub(crate) fn is_managed() -> Result<bool> {
+    Ok(agent_plist()?.exists())
+}
+
 /// Whether the agent is currently loaded into the per-user launchd domain (issue #376).
 /// `launchctl print <target>` exits `0` for a service in the domain and non-zero
 /// ("Could not find service") for one whose plist is on disk but is booted out. Its
