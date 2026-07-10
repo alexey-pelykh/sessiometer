@@ -595,9 +595,12 @@ outcome, and whether the refresh token rotated), never a token or email.
 **roster** — the `[[account]]` entries — is managed for you by `capture`, `login`,
 `remove`, and `disable`/`enable`; don't hand-edit it. The tuning blocks below **are**
 safe to hand-edit: every key is optional and falls back to the default shown, an
-out-of-range value is rejected at load with a message naming the key, and a running
-daemon reloads the file on change (no restart). The generated file also carries an
-inline comment on every key, so your own `config.toml` doubles as a reference.
+out-of-range value is rejected at load with a message naming the key, and a hand-edited
+change takes effect on the next daemon restart (`sessiometer daemon restart`) — the tuning
+blocks are read once at start-up and frozen for the process lifetime, so a running daemon
+does not pick them up live (unlike the managed roster, which hot-reloads). The generated
+file also carries an inline comment on every key, so your own `config.toml` doubles as a
+reference.
 
 ### `[tunables]`
 
