@@ -8454,7 +8454,7 @@ mod tests {
     // --- credential-health rollup (issue #119) -----------------------------
 
     #[test]
-    fn credential_health_rolls_up_the_four_states_by_severity() {
+    fn credential_health_rolls_up_the_states_by_severity() {
         use RefreshEventOutcome::{Error, NoChange, Refreshed};
         const NOW: i64 = 1_782_777_600;
 
@@ -8490,13 +8490,16 @@ mod tests {
             CredentialHealth::AtRisk
         );
 
-        // Dead — quarantined (the #42 401-streak verdict)…
+        // Degraded — a bare quarantine (the #42 access-token 401-streak) is NON-TERMINAL
+        // (issue #427): the refresh token is unproven, so `poke` / a restart revive it. It is
+        // 🟠, NOT the terminal 🔴 `Dead` — the honesty fix that stops the false "claude /login".
         assert_eq!(
             credential_health(true, None, 0, None, false, NOW),
-            CredentialHealth::Dead
+            CredentialHealth::Degraded
         );
-        // …or the refresh token was cleared in place (a refresh-detected death), surfaced
-        // as 🔴 too rather than hidden — this is a DISPLAY rollup, it never quarantines.
+        // Dead — reserved for PROVEN refresh-token death: a sweep-refresh actually returned
+        // `Dead` (#261). Surfaced as 🔴 rather than hidden — this is a DISPLAY rollup, it never
+        // quarantines. This is the ONLY 🔴 case (issue #427).
         assert_eq!(
             credential_health(
                 false,
@@ -8508,15 +8511,23 @@ mod tests {
             ),
             CredentialHealth::Dead
         );
+        // Proven death WINS over a co-occurring quarantine: a quarantined account whose refresh
+        // ALSO returned `Dead` is genuinely dead (needs re-login), so it reads 🔴 `Dead`, not
+        // 🟠 `Degraded` — `Dead` is checked before `quarantined` (issue #427).
+        assert_eq!(
+            credential_health(true, Some(RefreshEventOutcome::Dead), 0, None, false, NOW),
+            CredentialHealth::Dead
+        );
 
-        // Severity ladder (Dead > AtRisk > Stale > Healthy): a quarantined account whose
-        // token is ALSO expired and whose refresh is ALSO failing still reads Dead; an
-        // at-risk account whose token is ALSO expired reads AtRisk, not Stale. A fresh
-        // reading NEVER masks a negative signal — even `has_fresh_reading = true` stays
-        // Dead / AtRisk here.
+        // Severity ladder (Dead > Degraded > AtRisk > Stale > Healthy): a quarantined account
+        // whose token is ALSO expired and whose refresh is ALSO merely FAILING (an `Error`
+        // streak, not a proven `Dead`) reads 🟠 `Degraded` — the quarantine outranks the
+        // at-risk streak, and without a proven refresh death it is NOT terminal (issue #427).
+        // An at-risk account whose token is ALSO expired reads AtRisk, not Stale. A fresh
+        // reading NEVER masks a negative signal — even `has_fresh_reading = true` holds here.
         assert_eq!(
             credential_health(true, Some(Error), 3, Some(NOW - 10), true, NOW),
-            CredentialHealth::Dead
+            CredentialHealth::Degraded
         );
         assert_eq!(
             credential_health(false, Some(Error), 2, Some(NOW - 10), true, NOW),
@@ -8564,10 +8575,55 @@ mod tests {
             CredentialHealth::Stale
         );
 
-        // A negative signal always overrides missing evidence — quarantine ⇒ Dead, not
-        // Unknown, even with no other input.
+        // A negative signal always overrides missing evidence — a bare quarantine ⇒ Degraded
+        // (issue #427: NON-TERMINAL, needs a refresh not a re-login), never Unknown, even with
+        // no other input.
         assert_eq!(
             credential_health(true, None, 0, None, false, NOW),
+            CredentialHealth::Degraded
+        );
+    }
+
+    #[test]
+    fn credential_health_reserves_dead_for_proven_refresh_death_not_a_bare_quarantine() {
+        // Issue #427 regression: locks the honesty trajectory 🟢 → 🟠 degraded → 🔴-only-on-proof
+        // so a parked account that merely 401-streaked into quarantine can never again render the
+        // terminal 🔴 / "claude /login" while its refresh token is still good.
+        const NOW: i64 = 1_782_777_600;
+
+        // Healthy — a positive-liveness signal (a fresh reading), refresh path untouched.
+        assert_eq!(
+            credential_health(false, None, 0, None, true, NOW),
+            CredentialHealth::Healthy
+        );
+
+        // Degraded (NOT Dead) — the access token 401-streaked into quarantine, but no refresh has
+        // returned `Dead`, so the refresh token is unproven and `poke` / a restart revive it. This
+        // is the exact false-🔴 the issue fixes: a bare quarantine is 🟠 needs-refresh, never
+        // 🔴 needs-re-login — regardless of whether the refresh net is merely failing (`Error`),
+        // idle (`None`), or last succeeded (`NoChange`), and regardless of a stale/fresh clock.
+        for refresh in [
+            None,
+            Some(RefreshEventOutcome::Error),
+            Some(RefreshEventOutcome::NoChange),
+            Some(RefreshEventOutcome::Refreshed),
+        ] {
+            assert_eq!(
+                credential_health(true, refresh, 0, None, false, NOW),
+                CredentialHealth::Degraded,
+                "a bare quarantine (refresh={refresh:?}) is degraded, never dead"
+            );
+        }
+
+        // Dead — ONLY once a sweep-refresh actually returns `Dead` (#261 / `CredentialUnrecoverable`):
+        // the refresh token itself was rejected, so a re-login is genuinely required. Holds whether
+        // or not the account is also quarantined — proven death is checked first and wins.
+        assert_eq!(
+            credential_health(false, Some(RefreshEventOutcome::Dead), 0, None, false, NOW),
+            CredentialHealth::Dead
+        );
+        assert_eq!(
+            credential_health(true, Some(RefreshEventOutcome::Dead), 0, None, false, NOW),
             CredentialHealth::Dead
         );
     }
@@ -8961,13 +9017,15 @@ mod tests {
         );
 
         // A genuine change emits EXACTLY ONE redacted event (AC-3) — the handle and the new
-        // state — and only for the account that changed.
-        daemon.state.health[0].quarantined = true; // → Dead
+        // state — and only for the account that changed. A bare quarantine (an access-token
+        // 401-streak) transitions to Degraded, NOT Dead (issue #427): the event log carries the
+        // honest non-terminal verdict too, so a `grep` never cries a false death.
+        daemon.state.health[0].quarantined = true; // → Degraded
         assert_eq!(
             daemon.note_health_transitions(NOW),
             vec![Event::CredentialHealth {
                 account: "work".to_owned(),
-                state: CredentialHealth::Dead,
+                state: CredentialHealth::Degraded,
             }]
         );
 
@@ -8975,7 +9033,7 @@ mod tests {
         assert!(daemon.note_health_transitions(NOW).is_empty());
 
         // Un-quarantine WITHOUT any new evidence ⇒ back to Unknown, NOT a false Healthy
-        // (#137): clearing the dead flag does not prove the credential is alive.
+        // (#137): clearing the quarantine flag does not prove the credential is alive.
         daemon.state.health[0].quarantined = false; // → Unknown (still no liveness signal)
         assert_eq!(
             daemon.note_health_transitions(NOW),
@@ -15635,10 +15693,12 @@ mod tests {
             harvest_channels(&outcome, &mut corpus);
         }
 
-        // Scenario 4 — the dead-credential lifecycle (#42): a single 401 on the
-        // active account (threshold 1) declares it DEAD and triggers an emergency
-        // swap in one tick, so `credential_dead`, `emergency_swap`, AND the durable
-        // `quarantined` status (snapshot + wire + text) are all harvested at once.
+        // Scenario 4 — the quarantine lifecycle (#42): a single 401 on the active
+        // account (threshold 1) quarantines it — the #42 `credential_dead` EDGE, which is
+        // NON-terminal (issue #427: an access-token 401-streak needs a refresh, not a
+        // re-login) — and triggers an emergency swap in one tick, so `credential_dead`,
+        // `emergency_swap`, AND the durable `quarantined` status (snapshot + wire + the
+        // 🟠 degraded rollup text, #427) are all harvested at once.
         {
             let poller = FakeRosterPoller::new()
                 .unauthorized(A.0) // active → 401 → dead at threshold 1
@@ -15946,14 +16006,15 @@ mod tests {
             "UDS channel: quarantine status missing"
         );
         assert!(
-            // The status-TEXT rendering of a dead credential (#119): the 🔴 rollup glyph
-            // plus the actionable `claude /login` cue (AC-1) now stand in for the pre-rollup
-            // `needs re-login` tag. Unique to the text channel — the wire carries the verdict
-            // as the `"auth":"dead"` enum (issue #143 renamed the key `health` → `auth`), not
-            // this operator-facing command — so it proves the status-text channel contributed
-            // (a non-vacuous #15 gate).
-            corpus.contains("🔴 claude /login"),
-            "status-text channel: dead-credential cue missing"
+            // The status-TEXT rendering of a quarantined credential (#119, #427): a bare
+            // 401-streak quarantine is the NON-TERMINAL 🟠 `Degraded` rollup glyph plus the
+            // needs-refresh cue — NOT the terminal 🔴 `claude /login`, which #427 reserves for
+            // a PROVEN refresh-token death. Unique to the text channel — the wire carries the
+            // verdict as the `"auth":"degraded"` enum (issue #143 renamed the key `health` →
+            // `auth`), not this operator-facing command — so it proves the status-text channel
+            // contributed (a non-vacuous #15 gate).
+            corpus.contains("🟠 degraded — run 'sessiometer poke'"),
+            "status-text channel: degraded-credential cue missing"
         );
         assert!(
             corpus.contains(r#""session_pct":97"#),

@@ -420,10 +420,16 @@ pub(crate) fn to_pct(fraction: f64) -> u8 {
 ///
 /// A SEVERITY ladder (most-severe wins), matching the issue's 🟢→🟡→🟠→🔴 ordering, plus a
 /// distinct ⚪ `Unknown` for the no-evidence case (#137):
-/// - **Dead** — `quarantined` (the #42 401-streak verdict) OR the last refresh outcome was
-///   `Dead` (the refresh token was cleared in place). Both genuinely need `claude /login`;
-///   surfacing a refresh-detected death as 🔴 too is more honest than hiding it (this is a
-///   DISPLAY rollup — it never flips the quarantine machinery).
+/// - **Dead** — the last refresh outcome was `Dead`: a sweep-refresh actually rejected the
+///   REFRESH token (the #261 / `CredentialUnrecoverable` cue). This is PROVEN death and the
+///   ONLY 🔴 / `claude /login` case (issue #427). A DISPLAY rollup — it never flips the
+///   quarantine machinery; surfacing a refresh-detected death is more honest than hiding it.
+/// - **Degraded** — `quarantined` (the #42 access-token 401-streak verdict) but NOT proven
+///   dead (issue #427). A usage-endpoint 401 rejects the ACCESS token and says nothing about
+///   the REFRESH token (a resource server never sees it), so the account is out of rotation
+///   right now yet `poke` / a restart revive it — it needs a REFRESH, not a re-login. 🟠
+///   NON-TERMINAL; checked AFTER proven `Dead` so a quarantined account whose refresh has
+///   ALSO returned `Dead` still reads the terminal 🔴.
 /// - **AtRisk** — the refresh safety-net is failing (`consecutive_refresh_failures > 0`):
 ///   a streak of `Error` cycles means the mechanism that prevents staleness/death is
 ///   struggling, so the account trends toward dead even while its token may still work.
@@ -453,8 +459,16 @@ pub(crate) fn credential_health(
     has_fresh_reading: bool,
     now_secs: i64,
 ) -> CredentialHealth {
-    if quarantined || last_refresh_outcome == Some(RefreshEventOutcome::Dead) {
+    if last_refresh_outcome == Some(RefreshEventOutcome::Dead) {
+        // PROVEN death: a refresh actually rejected the REFRESH token (#261). The only 🔴
+        // `claude /login` case — checked FIRST so it wins over a co-occurring quarantine.
         CredentialHealth::Dead
+    } else if quarantined {
+        // The ACCESS token 401-streaked into quarantine (#42) but the refresh token is
+        // unproven — NON-TERMINAL (issue #427): needs a REFRESH (`poke` / restart), not a
+        // re-login. Ranks above `AtRisk`: the account is out of rotation NOW, not merely
+        // trending, so a quarantine wins even alongside a refresh-failure streak.
+        CredentialHealth::Degraded
     } else if consecutive_refresh_failures > 0 {
         CredentialHealth::AtRisk
     } else if access_expires_at.is_some_and(|expires_at| expires_at <= now_secs) {

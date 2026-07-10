@@ -78,6 +78,14 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":1893456200,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
+    /// A quarantined-but-refreshable account carrying the NON-TERMINAL `"auth":"degraded"` verdict
+    /// (issue #427): the wire's new rollup token the daemon emits for a bare access-token 401-streak.
+    /// The client MUST decode it (a value it cannot read is a hard decode error — a menubar that
+    /// rejected `degraded` would blank on exactly the account this fix exists to render honestly).
+    static let snapshotDegraded = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":2},"generated_at":1893456300,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"degraded"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
+    """#
+
     /// A schema-supported snapshot with ZERO accounts — the real first-run / empty-roster frame the
     /// daemon emits before any account is captured (B-014). Supported major, so it is a DISTINCT
     /// "connected but empty" state, NOT the pre-freeze / unsupported empty snapshots below.

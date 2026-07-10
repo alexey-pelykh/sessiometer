@@ -123,6 +123,18 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(a.auth, .dead)
     }
 
+    // AC (#427): the NON-TERMINAL `"auth":"degraded"` verdict decodes — the menubar reads the new
+    // rollup token a daemon emits for a quarantined-but-refreshable account rather than hard-erroring
+    // on an unrecognized value. This is the wire half of CLI↔menubar agreement (single source of truth).
+    func testDecodesDegraded() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotDegraded) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        let a = v.accounts[0]
+        XCTAssertTrue(a.quarantined)
+        XCTAssertEqual(a.auth, .degraded)
+    }
+
     // AC: "`auth` → CredentialHealth including `null`".
     func testAuthNullIsTolerated() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotAuthNull) else {
