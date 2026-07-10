@@ -51,18 +51,23 @@ which is the mock). Light shown here:
 **Expected reconciliations** — the built panel intentionally differs from the mock in these spots:
 
 - no provider secondary line — the wire carries no `provider` field yet (#173)
-- the footer reads "updated <1m ago" and resets read as durations ("3d") — the panel mirrors the
-  `status` CLI (R-2 state-parity), not the mock's illustrative "snapshot 12s old" / "Sun"
+- the footer reads "updated <1m ago" — the panel mirrors the `status` CLI (R-2 state-parity), not
+  the mock's illustrative "snapshot 12s old". Resets no longer diverge: the mock now uses the CLI's
+  compact duration form too ("2h14m" / "3d"), not a day-name (#387)
 - the **Swap** button is present-but-disabled — its click action is #169
 - no Status/Stats segmented control — Stats has no socket data path (spike #356)
+- the panel still renders the capture bar on a **populated** roster; the mock now specs capture on
+  **empty-roster / first-run only**, with Add account moved off-panel. The panel-side relocation is
+  #394 — until it lands, a capture bar in `panel-healthy-*.png` is expected, not a defect
 
 **Harness limitation — the capture field is NOT verified by the tool.** SwiftUI `ImageRenderer`
 cannot rasterize the AppKit-backed `TextField` in the #360 capture affordance (the operator-label
-input on the empty-roster / first-run onboarding + Add-account states): it draws a blank placeholder
-box, not the real field. So `--render-panel` faithfully captures every state's layout, color, and
-typography **except** that one label field — it needs a manual check against the mock in a real
-popover (open the panel → **Add account**, or first-run). Treat a blank/placeholder capture-field
-box in the PNGs as a known tool artifact, not a panel defect.
+input on the empty-roster / first-run onboarding state — and, until #394 relocates it, the panel's
+Add-account bar): it draws a blank placeholder box, not the real field. So `--render-panel`
+faithfully captures every state's layout, color, and typography **except** that one label field — it
+needs a manual check against the mock in a real popover (first run — or the panel's Add-account bar,
+which the mock no longer specs). Treat a blank/placeholder capture-field box in the PNGs as a known
+tool artifact, not a panel defect.
 
 ### Design vs. capture, screen by screen
 
@@ -105,10 +110,11 @@ healthy on a degraded daemon.
 - **Identity** — each row leads with the account's operator-chosen **label** (never the email;
   defaults to the account UUID when unset), provider on a quieter secondary line.
 - **Provider-neutral** — a monochrome monogram badge + plain-text label, no brand color or logo.
-- **Capture is a real action; copy-command only where the app can't act** — first-run onboarding and
-  **Add account** capture the active account in-app (#360), sending the verb over the #358 control socket
+- **Capture is a real action; copy-command only where the app can't act** — first-run / empty-roster
+  onboarding captures the active account in-app (#360), sending the verb over the #358 control socket
   and rendering an honest pending → done → error (redacted ack; no credential ever reaches the client);
-  the captured row arrives on its own via the live `watch` stream (the affordance never inserts it).
+  the captured row arrives on its own via the live `watch` stream (the affordance never inserts it). It's
+  an onboarding affordance: a populated panel carries no capture bar, so adding an account lives off-panel.
   Version-skew still offers a `brew upgrade sessiometer` **copy-command** (the app can't self-update), and
   daemon-starting shows a static "forming" glyph — the app fakes no progress it isn't doing.
 - **Honest state** — disconnected rows are dimmed + "stale", never frozen-as-live.
