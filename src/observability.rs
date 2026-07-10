@@ -86,6 +86,31 @@ impl SwapReason {
     }
 }
 
+/// The throttle CLASS that armed a per-account poll back-off — the `class=` of an
+/// [`Event::UsageBackoff`] (issue #399). A closed enum, secret-free BY CONSTRUCTION (#15):
+/// it separates a rate-limit (`429`) from a generic transient (`5xx` / network), so the
+/// DURABLE log makes the #399 "usage-endpoint 429 count" queryable (`grep class=rate_limited`).
+/// The durable-event mirror of the stderr-only [`PollClass::RateLimited`] / [`PollClass::Transient`]
+/// distinction the diagnostic channel carries — narrowed to the two outcomes that actually arm a
+/// back-off, so an invalid class (a `live` / `unauthorized` reading) is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackoffClass {
+    /// HTTP 429 — the usage endpoint rate-limited the poll (the per-Anthropic-org throttle).
+    RateLimited,
+    /// A `5xx` / network / unreadable transient — no liveness signal, backs off the same way.
+    Transient,
+}
+
+impl BackoffClass {
+    /// The `class=` token.
+    fn as_str(self) -> &'static str {
+        match self {
+            BackoffClass::RateLimited => "rate_limited",
+            BackoffClass::Transient => "transient",
+        }
+    }
+}
+
 /// How the periodic isolated-refresh tick classified one cycle — the `outcome=` of an
 /// [`Event::Refresh`] (issue #106).
 ///
@@ -674,6 +699,51 @@ pub(crate) enum Event {
         overwritten: u32,
         failed: u32,
     },
+    /// A per-account usage poll ARMED (or widened) its rate-limit / transient back-off window
+    /// (issue #399): the durable complement of the stderr-only `diag=tick backoff_secs=…
+    /// retry_after_secs=…` line, so a back-off episode is diagnosable from
+    /// `~/Library/Logs/sessiometer/sessiometer.log` alone. `class` distinguishes a `429`
+    /// (rate-limit) from a `5xx` / network transient — what makes the "429 count" queryable;
+    /// `consecutive` is the account's per-account back-off streak (#293, the exponential-widening
+    /// driver, the same running-count idiom [`Event::Monitor401`] carries); `retry_after_secs` is
+    /// the RAW server-advised `Retry-After` when the response supplied one, BEFORE the
+    /// [`crate::daemon`] `POLL_BACKOFF_CAP` clamp (#294/#295); and `backoff_secs` is the resulting
+    /// armed window (the effective wait). Emitted on EACH throttled poll, not just the first, so
+    /// the durable log shows the window WIDEN across the episode — the residual-late-swap signal
+    /// (#363/#368/#369) that a single first-throttle line would hide. `account` is the account
+    /// UUID — a non-PII identifier secret-free BY CONSTRUCTION, never the operator `label` (which
+    /// is free-form and PII-capable); the same uuid handle [`Event::UncapturedLogin`] carries (#15).
+    UsageBackoff {
+        account: String,
+        class: BackoffClass,
+        consecutive: u32,
+        retry_after_secs: Option<u64>,
+        backoff_secs: u64,
+    },
+    /// A per-account back-off window CLEARED (issue #399): after an armed window, the account
+    /// polled a NON-throttling outcome (a success / 401 / 403), so its streak + window reset and it
+    /// re-polls on the normal cadence. The edge-triggered EXIT partner of [`Event::UsageBackoff`]'s
+    /// ENTER, so a back-off episode's SPAN is bracketed in the durable log. Emitted ONLY when a
+    /// window was actually armed — a plain clean poll (no prior back-off) stays silent, mirroring
+    /// [`Event::UsageRollup`]'s no-op silence. `account` is the account UUID — never the operator
+    /// `label` (#15), matching [`Event::UsageBackoff`].
+    UsageBackoffCleared { account: String },
+    /// The per-account usage VELOCITY between the last two readings (issue #399): the SIGNED change
+    /// in each rounded-percent dimension since the account's previous reading (`to_pct(next) -
+    /// to_pct(prev)`), so the durable log carries how fast each account is climbing — the
+    /// measurement the gated adaptive-trigger follow-up (#368) is waiting on. Emitted only when the
+    /// account measurably MOVED (a non-zero delta in either dimension), so a flat idle account
+    /// stays silent (again mirroring [`Event::UsageRollup`]); never emitted across a poll gap (a
+    /// throttle / failure clears the prior reading), so a delta always spans two real consecutive
+    /// readings. `session_delta_pct` / `weekly_delta_pct` are POSITIVE when usage is rising and
+    /// NEGATIVE when a window reset dropped it. `account` is the account UUID (#15); both deltas are
+    /// bare signed percents (a difference of two `0..=100` values, so within `-100..=100`), never a
+    /// token.
+    UsageVelocity {
+        account: String,
+        session_delta_pct: i16,
+        weekly_delta_pct: i16,
+    },
 }
 
 impl Event {
@@ -937,6 +1007,44 @@ impl Event {
                 format!(
                     "ts={ts} event=import accounts={accounts} outcome={outcome} \
                      imported={imported} skipped={skipped} overwritten={overwritten} failed={failed}"
+                )
+            }
+            Event::UsageBackoff {
+                account,
+                class,
+                consecutive,
+                retry_after_secs,
+                backoff_secs,
+            } => {
+                // `acct=` carries the account UUID (never the free-form `label`, #15) — the same key
+                // the usage-family `usage_gap` and the uuid-carrying `uncaptured_login` use.
+                // `backoff_secs` (the armed window) is always present; `retry_after_secs` trails
+                // OPTIONALLY — an empty value after `=` would split the key=val grammar (mirrors
+                // `all_exhausted`'s optional `resets_at`) — present iff the server advised a
+                // `Retry-After`, absent for a self-capped exponential. Field ORDER mirrors the
+                // sibling `diag=tick` line (`backoff_secs` then `retry_after_secs`).
+                let class = class.as_str();
+                let retry_after = match retry_after_secs {
+                    Some(secs) => format!(" retry_after_secs={secs}"),
+                    None => String::new(),
+                };
+                format!(
+                    "ts={ts} event=usage_backoff acct={account} class={class} consecutive={consecutive} backoff_secs={backoff_secs}{retry_after}"
+                )
+            }
+            Event::UsageBackoffCleared { account } => {
+                format!("ts={ts} event=usage_backoff_cleared acct={account}")
+            }
+            Event::UsageVelocity {
+                account,
+                session_delta_pct,
+                weekly_delta_pct,
+            } => {
+                // Both deltas are bare SIGNED percents (a difference of two `0..=100` values), so a
+                // `-` sign can prefix the number — a `key=val` token existing parsers read as-is.
+                // `acct=` is the UUID (#15), matching the sibling `usage_backoff` line.
+                format!(
+                    "ts={ts} event=usage_velocity acct={account} session_delta_pct={session_delta_pct} weekly_delta_pct={weekly_delta_pct}"
                 )
             }
         }
@@ -2371,6 +2479,141 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             // No per-account identity field: the events are aggregate-only.
             assert!(!line.contains("account="), "no account handle: {line}");
             assert!(!line.contains("acct="), "no account handle: {line}");
+        }
+    }
+
+    // --- Event::UsageBackoff / UsageBackoffCleared / UsageVelocity (durable #399 signals) ---
+
+    #[test]
+    fn usage_backoff_line_carries_the_uuid_class_streak_and_window() {
+        // The durable ENTER line (#399): the account UUID (not a label), the throttle class, the
+        // running back-off streak, and the armed window — the previously stderr-only 429 signal
+        // made durable. No server `Retry-After` here, so the optional trailing field is ABSENT.
+        let line = Event::UsageBackoff {
+            account: "u-A".to_owned(),
+            class: BackoffClass::RateLimited,
+            consecutive: 3,
+            retry_after_secs: None,
+            backoff_secs: 480,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=usage_backoff acct=u-A class=rate_limited consecutive=3 backoff_secs=480")
+        );
+    }
+
+    #[test]
+    fn usage_backoff_line_appends_the_raw_retry_after_when_present() {
+        // A server-advised `Retry-After` (the #295 source label, RAW/pre-cap) trails the line AFTER
+        // `backoff_secs`, mirroring the sibling `diag=tick` field order — so the pathological-value
+        // case (`backoff_secs=3600 retry_after_secs=86400`, the #294 clamp) stays visible durably.
+        let line = Event::UsageBackoff {
+            account: "u-A".to_owned(),
+            class: BackoffClass::RateLimited,
+            consecutive: 6,
+            retry_after_secs: Some(86_400),
+            backoff_secs: 3600,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=usage_backoff acct=u-A class=rate_limited consecutive=6 backoff_secs=3600 retry_after_secs=86400")
+        );
+    }
+
+    #[test]
+    fn usage_backoff_line_distinguishes_a_transient_from_a_rate_limit() {
+        // The `class=` token is what makes the #399 "429 count" queryable: a `5xx` / network
+        // transient renders `transient`, a `429` renders `rate_limited` — so `grep class=rate_limited`
+        // counts genuine rate-limits, not every back-off.
+        let transient = Event::UsageBackoff {
+            account: "u-B".to_owned(),
+            class: BackoffClass::Transient,
+            consecutive: 1,
+            retry_after_secs: None,
+            backoff_secs: 120,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            transient,
+            format!(
+                "{TS0} event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=120"
+            )
+        );
+    }
+
+    #[test]
+    fn usage_backoff_cleared_line_carries_the_uuid() {
+        // The edge-triggered EXIT partner: just the account UUID — the window's span is bracketed
+        // by pairing this with the last ENTER line.
+        let line = Event::UsageBackoffCleared {
+            account: "u-A".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=usage_backoff_cleared acct=u-A"));
+    }
+
+    #[test]
+    fn usage_velocity_line_carries_signed_percent_deltas() {
+        // A climbing account: both deltas POSITIVE (the #368 adaptive-trigger measurement).
+        let climbing = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: 7,
+            weekly_delta_pct: 2,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            climbing,
+            format!("{TS0} event=usage_velocity acct=u-A session_delta_pct=7 weekly_delta_pct=2")
+        );
+
+        // A window reset dropped the reading: a NEGATIVE session delta renders with its `-` sign,
+        // a `key=val` token existing parsers read as-is.
+        let reset = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: -92,
+            weekly_delta_pct: 0,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            reset,
+            format!("{TS0} event=usage_velocity acct=u-A session_delta_pct=-92 weekly_delta_pct=0")
+        );
+    }
+
+    #[test]
+    fn the_durable_399_lines_carry_no_pii() {
+        // The #15 guarantee for the #399 signals: every field is a UUID / closed-enum token /
+        // number — never an email, token, or the free-form operator `label`. The identity is
+        // `acct=<uuid>`, secret-free BY CONSTRUCTION.
+        let lines = [
+            Event::UsageBackoff {
+                account: "u-A".to_owned(),
+                class: BackoffClass::RateLimited,
+                consecutive: 2,
+                retry_after_secs: Some(300),
+                backoff_secs: 300,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::UsageBackoffCleared {
+                account: "u-A".to_owned(),
+            }
+            .to_log_line(at_epoch(0)),
+            Event::UsageVelocity {
+                account: "u-A".to_owned(),
+                session_delta_pct: -5,
+                weekly_delta_pct: 1,
+            }
+            .to_log_line(at_epoch(0)),
+        ];
+        for line in &lines {
+            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(!line.contains("token"), "no token may appear: {line}");
+            assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
+            assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
+            // The identity is the uuid handle only — never the free-form `label=` field.
+            assert!(!line.contains("label="), "no operator label: {line}");
         }
     }
 
