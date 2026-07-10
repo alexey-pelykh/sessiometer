@@ -3243,7 +3243,6 @@ mod tests {
             tunables: Tunables {
                 poll_secs: 60,
                 cooldown_secs: 60,
-                session_floor: None,
                 session_trigger: 95,
                 monitor_401_n: 3,
                 // `list` reads no timing strategies; default jitter is a fine
