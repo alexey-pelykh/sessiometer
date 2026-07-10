@@ -1379,7 +1379,7 @@ pub(crate) enum Diagnostic {
     Start {
         accounts: usize,
         poll_secs: u64,
-        session_floor: u8,
+        target_max_usage: u8,
         session_trigger: u8,
         weekly_trigger: u8,
         monitor_401_n: u8,
@@ -1430,17 +1430,17 @@ impl Diagnostic {
             Diagnostic::Start {
                 accounts,
                 poll_secs,
-                session_floor,
+                target_max_usage,
                 session_trigger,
                 weekly_trigger,
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
-                // session_floor (#398) is always-valued — render its percent directly,
+                // target_max_usage (#398) is always-valued — render its percent directly,
                 // like the other counts/percentages (no `off` sentinel to carry).
                 format!(
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
-                     session_floor={session_floor} session_trigger={session_trigger} \
+                     target_max_usage={target_max_usage} session_trigger={session_trigger} \
                      weekly_trigger={weekly_trigger} monitor_401_n={monitor_401_n} \
                      monitor_recovery_m={monitor_recovery_m}"
                 )
@@ -2715,12 +2715,12 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn start_line_renders_the_effective_config_summary() {
-        // session_floor (#398, always-valued) renders as its percent, like the rest —
+        // target_max_usage (#398, always-valued) renders as its percent, like the rest —
         // counts and percentages only, no handle.
         let line = Diagnostic::Start {
             accounts: 3,
             poll_secs: 30,
-            session_floor: 70,
+            target_max_usage: 70,
             session_trigger: 90,
             weekly_trigger: 98,
             monitor_401_n: 5,
@@ -2730,7 +2730,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         assert_eq!(
             line,
             format!(
-                "{TS0} diag=start accounts=3 poll_secs=30 session_floor=70 \
+                "{TS0} diag=start accounts=3 poll_secs=30 target_max_usage=70 \
                  session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4"
             )
         );
@@ -2861,7 +2861,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             Diagnostic::Start {
                 accounts: 2,
                 poll_secs: 30,
-                session_floor: 70,
+                target_max_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 98,
                 monitor_401_n: 5,

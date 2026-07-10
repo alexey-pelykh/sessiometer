@@ -17,6 +17,12 @@ default-on reserve of 80, dropped on the emergency swap path) and **supersedes i
 this ADR records a **shipped** behavior change, now enforced in `src/daemon.rs` and
 `src/config.rs`.
 
+> **Update (#415):** the rename this ADR defers (§ Context, § Consequences) has since
+> landed — `session_floor` is now **`target_max_usage`** (it reads as a ceiling on the
+> target's usage, not a floor). The historical prose below is preserved as-written and
+> refers to the field by its then-current name; `session_floor` still parses as a
+> deprecated alias, so existing `config.toml` files keep loading.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active, rotating across a roster

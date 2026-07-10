@@ -205,8 +205,8 @@ next swap: spare
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. It reads `none (no viable target)`
 when no other account is a sound swap destination — every one is weekly-exhausted,
-session-saturated (over its swap-away session trigger), over the opt-in swap-target
-session floor, or quarantined (out of rotation until it recovers) — and
+session-saturated (over its swap-away session trigger), over the swap-target
+`target_max_usage` reserve, or quarantined (out of rotation until it recovers) — and
 `none (awaiting usage data)` right after the daemon starts, before it has polled the
 other accounts. It is **forward-looking** and recomputed every cycle, so —
 unlike a remembered "last swap" — it survives a daemon restart and always shows where
@@ -350,7 +350,7 @@ per-tick decision and any back-off, plus the daemon's start (with the effective
 config), its stop, and the moment it **leaves** the all-exhausted state:
 
 ```text
-ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 session_floor=80 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
+ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 target_max_usage=80 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
 ts=2026-06-30T00:00:00Z diag=poll account=work outcome=rate_limited
 ts=2026-06-30T00:00:00Z diag=tick decision=skip_active_unavailable backoff_secs=120
 ts=2026-06-30T00:00:30Z diag=poll account=work outcome=live
@@ -630,7 +630,7 @@ The primary hand-editable block — the poll cadence and the swap thresholds.
 | `cooldown_secs` | Seconds to wait after a swap before another is allowed — the swap-pacing floor. Tunable **above** a non-zero minimum but never down to zero, so rapid-fire account flapping can't be configured on. | `5..=3600` | `60` |
 | `session_trigger` | Swap **away** from the active account at or above this session-usage percent. | `50..=99` | `95` |
 | `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
-| `session_floor` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent, so the target keeps runway. Despite the name it is a **ceiling on the target**, not a minimum — *raising* it toward `session_trigger` is what **loosens** it (equal is inert), and `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_trigger`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_trigger` | `80` |
+| `target_max_usage` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent — the most-full a target may be to receive the active session, so it keeps runway. *Raising* it toward `session_trigger` admits busier targets (equal is inert); `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_trigger`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_trigger` | `80` |
 | `monitor_401_n` | Consecutive non-scope `401`s before an account is treated as dead and quarantined. | `1..=20` | `3` |
 | `monitor_recovery_m` | Consecutive recovery-probe successes before a quarantined account whose own token recovers (without a re-login) is returned to the rotation. | `1..=20` | `2` |
 
@@ -696,7 +696,7 @@ $ sessiometer config validate
 `config validate` parses and validates the file **without running** — the same checks the
 daemon applies at load. It reports the documented error classes and exits non-zero on any
 of them, so it drops into a pre-flight check: a typo'd/unknown key (e.g. `poll_secss`), an
-out-of-range value (`poll_secs must be in 5..=3600`), or `session_floor > session_trigger`.
+out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_usage > session_trigger`.
 
 ```console
 $ sessiometer config show --origin
@@ -760,7 +760,7 @@ restores on another Mac.
 An artifact embeds the config **text**, so a tunable that was absent when the artifact
 was written is absent on import, and takes **today's** default — not the default that
 was in force at export time. This is the same absent-key rule the config file follows
-everywhere. It is worth knowing for artifacts exported before `session_floor` became a
+everywhere. It is worth knowing for artifacts exported before `target_max_usage` became a
 default-on `80` (issue #398): they import with the reserve **on**, where the original
 machine ran with it off.
 
