@@ -136,8 +136,8 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, NextSwap, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
-    STATUS_SCHEMA_VERSION,
+    AccountStatusLine, NextSwap, NextSwapReason, SchemaVersion, StatusResponse, StatusSnapshot,
+    VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -3370,7 +3370,7 @@ where
     fn next_swap(&self, active: Option<usize>, readings: &[Option<Usage>]) -> Option<NextSwap> {
         let active_idx = active?;
         let enabled = self.enabled_mask();
-        if let Some(target) = pick_target(
+        if let Some((target, reason)) = pick_target_with_reason(
             active_idx,
             readings,
             &enabled,
@@ -3378,8 +3378,12 @@ where
             self.session_trigger_base,
             self.weekly_trigger_base,
         ) {
+            // Carry the daemon's own selection rationale (issue #393) alongside the label, so the
+            // panel + `sessiometer status` render the reason the daemon actually used rather than a
+            // client-re-derived (and, on the superseded "most headroom" axis, wrong) one.
             return Some(NextSwap::Target {
                 to: self.roster[target].label.clone(),
+                reason: Some(reason),
             });
         }
         // No viable target. Distinguish the post-restart "no readings yet" case (some
@@ -4002,7 +4006,39 @@ fn pick_target(
     session_trigger: f64,
     weekly_trigger: f64,
 ) -> Option<usize> {
-    readings
+    // The index-only projection for the callers that need no rationale (the swap decision, the
+    // refresh exclusions). [`pick_target_with_reason`] is the single source of selection truth;
+    // this drops the reason so those call sites (and their tests) stay unchanged.
+    pick_target_with_reason(
+        active,
+        readings,
+        enabled,
+        floor,
+        session_trigger,
+        weekly_trigger,
+    )
+    .map(|(i, _)| i)
+}
+
+/// Like [`pick_target`], but also returns WHY the winner was chosen ([`NextSwapReason`], issue
+/// #393) — the rationale [`Daemon::next_swap`] carries on the wire so the panel + `sessiometer
+/// status` render the ONE reason the daemon actually used. Selection is IDENTICAL to
+/// [`pick_target`] (same viability filters, same #37 soonest-weekly-reset `min_by_key`); this
+/// variant merely RETAINS the sort axis instead of discarding it. Kept as the shared core (rather
+/// than re-deriving the reason in `next_swap`) so the filter set can never drift between the
+/// selection and its stated reason.
+fn pick_target_with_reason(
+    active: usize,
+    readings: &[Option<Usage>],
+    enabled: &[bool],
+    floor: Option<f64>,
+    session_trigger: f64,
+    weekly_trigger: f64,
+) -> Option<(usize, NextSwapReason)> {
+    // The viable set — the same exclusions `pick_target` applies (issue #11/#36/#37, the
+    // always-on session anti-thrash gate, the opt-in `floor`), collected so its CARDINALITY can
+    // distinguish a genuine soonest-reset win from a sole-candidate default.
+    let viable: Vec<(usize, Usage)> = readings
         .iter()
         .enumerate()
         .filter(|&(i, _)| i != active)
@@ -4015,16 +4051,36 @@ fn pick_target(
         // `floor` below, which tightens this ceiling further when the caller passes it.
         .filter(|&(_, usage)| usage.session < session_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
-        // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
-        // unknown one (`false` < `true`), then by the reset epoch ascending;
-        // `min_by_key` keeps the first of equal keys, so an exact tie — or an
-        // all-unknown field — falls to the earliest roster index, matching
-        // [`soonest_weekly_reset`]'s tie-break (#11).
-        .min_by_key(|&(_, usage)| match usage.weekly_resets_at {
-            Some(resets_at) => (false, resets_at),
-            None => (true, i64::MAX),
-        })
-        .map(|(i, _)| i)
+        .collect();
+    let candidate_count = viable.len();
+    // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
+    // unknown one (`false` < `true`), then by the reset epoch ascending;
+    // `min_by_key` keeps the first of equal keys, so an exact tie — or an
+    // all-unknown field — falls to the earliest roster index, matching
+    // [`soonest_weekly_reset`]'s tie-break (#11).
+    let (idx, usage) =
+        viable
+            .into_iter()
+            .min_by_key(|&(_, usage)| match usage.weekly_resets_at {
+                Some(resets_at) => (false, resets_at),
+                None => (true, i64::MAX),
+            })?;
+    // The reason names the axis that ACTUALLY discriminated the winner — never a rule the daemon
+    // did not apply (that inversion is the #393 bug itself). Three genuinely distinct states.
+    let reason = if candidate_count < 2 {
+        // Sole viable target: there was nothing to compare it against, so no axis decided.
+        NextSwapReason::OnlyCandidate
+    } else if let Some(resets_at) = usage.weekly_resets_at {
+        // ≥2 viable and the winner holds the soonest KNOWN reset — issue #37's axis, carried as
+        // the very `min_by_key` key that selected it (previously computed, then discarded).
+        NextSwapReason::SoonestReset { resets_at }
+    } else {
+        // ≥2 viable, and the winner reported NO reset — a `Some` would have sorted ahead of it, so
+        // NONE did. No reset-time tiebreak existed; the earliest roster index won. Reporting
+        // `OnlyCandidate` here would assert "only viable target" while other targets were viable.
+        NextSwapReason::RosterOrder
+    };
+    Some((idx, reason))
 }
 
 /// The roster index (and its epoch) of the account whose WEEKLY window resets
@@ -4988,6 +5044,97 @@ mod tests {
         assert_eq!(
             pick_target(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn pick_target_with_reason_reports_soonest_reset_when_two_or_more_qualify() {
+        // The #393 rationale for the #37 axis: with ≥2 viable candidates the winner carries
+        // `SoonestReset` holding its OWN weekly-reset epoch — the `min_by_key` key `pick_target`
+        // formerly computed then discarded before serialization. Index 1 (reset 200) beats the
+        // more-headroom index 2 (reset 500), and its reason is the reset it won on.
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: Some(100),
+                session_resets_at: None,
+            }), // index 0 = active (excluded)
+            Some(Usage {
+                session: 0.50,
+                weekly: 0.60,
+                weekly_resets_at: Some(200),
+                session_resets_at: None,
+            }), // winner — soonest reset among viable
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.20,
+                weekly_resets_at: Some(500),
+                session_resets_at: None,
+            }), // more headroom, but later reset
+        ];
+        assert_eq!(
+            pick_target_with_reason(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            Some((1, NextSwapReason::SoonestReset { resets_at: 200 })),
+        );
+    }
+
+    #[test]
+    fn pick_target_with_reason_reports_only_candidate_for_a_lone_viable_target() {
+        // A SOLE qualifying account — index 0 active, index 1 unavailable — so no reset-time
+        // comparison applied: the reason is `OnlyCandidate` even though the winner has a known
+        // reset, because there was nothing to be "soonest" among.
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: Some(100),
+                session_resets_at: None,
+            }), // index 0 = active (excluded)
+            None, // unavailable
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.30,
+                weekly_resets_at: Some(400),
+                session_resets_at: None,
+            }), // the only viable candidate
+        ];
+        assert_eq!(
+            pick_target_with_reason(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            Some((2, NextSwapReason::OnlyCandidate)),
+        );
+    }
+
+    #[test]
+    fn pick_target_with_reason_reports_roster_order_when_no_candidate_knows_its_reset() {
+        // The degenerate case: ≥2 viable candidates but NONE reported a weekly reset, so the
+        // winner fell to roster order (`min_by_key`'s unknown-last tie-break) — there is no epoch
+        // to carry, so the reason is neither a hollow `SoonestReset` NOR `OnlyCandidate` (index 2
+        // was equally viable; claiming "only viable target" would be the #393 bug again). It is
+        // `RosterOrder`: the axis that actually decided.
+        let readings = vec![
+            Some(Usage {
+                session: 0.97,
+                weekly: 0.10,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }), // index 0 = active (excluded)
+            Some(Usage {
+                session: 0.10,
+                weekly: 0.20,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }), // winner by roster order (no reset to compare)
+            Some(Usage {
+                session: 0.20,
+                weekly: 0.30,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }),
+        ];
+        assert_eq!(
+            pick_target_with_reason(0, &readings, &all_on(&readings), Some(0.80), SESS, WK),
+            Some((1, NextSwapReason::RosterOrder)),
         );
     }
 
@@ -7899,9 +8046,10 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            // A viable candidate rides the wire as a label (#88).
+            // A viable candidate rides the wire as a label + the daemon's #393 selection reason (#88).
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: Some(NextSwapReason::OnlyCandidate),
             }),
         };
         let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
@@ -9013,6 +9161,24 @@ mod tests {
         encode_heartbeat_frame(42)
     }
 
+    /// A snapshot frame whose `next_swap` carries the #393 structured reason — the basic golden's
+    /// `next_swap` is `null`, so the [`NextSwap::Target`] `reason` field (the whole point of #393)
+    /// had NO byte-drift coverage. This freezes the `{"state":"target","to":…,"reason":{"kind":
+    /// "soonest_reset","resets_at":…}}` shape, so the cross-language guard now fails if the Rust
+    /// reason encoder and the Swift mirror ever diverge. Built as the basic frame with an overridden
+    /// `next_swap`, so it differs from `wire_golden_snapshot_frame` in exactly that one field.
+    /// Mirrored by Swift `Fixtures.snapshotNextSwap`.
+    fn wire_golden_snapshot_next_swap_frame() -> String {
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.next_swap = Some(NextSwap::Target {
+            to: "spare".to_owned(),
+            reason: Some(NextSwapReason::SoonestReset {
+                resets_at: 1_893_800_000,
+            }),
+        });
+        encode_snapshot_frame(&versioned_status_response(&snapshot))
+    }
+
     /// One-time emitter for the committed wire goldens. `#[ignore]` — NOT part of the suite; it
     /// WRITES the bytes the pin test and the Swift fixtures consume. Run it ONLY alongside a
     /// deliberate wire-contract change:
@@ -9034,6 +9200,11 @@ mod tests {
             wire_golden_heartbeat_frame(),
         )
         .expect("write wire-heartbeat golden");
+        std::fs::write(
+            dir.join("wire-snapshot-next-swap.json"),
+            wire_golden_snapshot_next_swap_frame(),
+        )
+        .expect("write wire-snapshot-next-swap golden");
     }
 
     /// The committed snapshot-frame golden — the exact bytes Swift `Fixtures.snapshotBasic` is
@@ -9049,6 +9220,13 @@ mod tests {
     const WIRE_HEARTBEAT_GOLDEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/build/fixtures/wire-heartbeat-basic.json"
+    ));
+
+    /// The committed next-swap-reason snapshot golden (issue #393) — the exact bytes Swift
+    /// `Fixtures.snapshotNextSwap` is pinned to.
+    const WIRE_SNAPSHOT_NEXT_SWAP_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-snapshot-next-swap.json"
     ));
 
     #[test]
@@ -9074,6 +9252,13 @@ mod tests {
             "the committed wire-heartbeat golden drifted from encode_heartbeat_frame — re-run \
              `cargo test -- --ignored emit_wire_golden_fixtures`, then update the Swift mirror \
              (apps/menubar) so its fixtures stay byte-identical"
+        );
+        assert_eq!(
+            wire_golden_snapshot_next_swap_frame(),
+            WIRE_SNAPSHOT_NEXT_SWAP_GOLDEN,
+            "the committed wire-snapshot-next-swap golden drifted from the next_swap reason encoder \
+             (issue #393) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, then update \
+             the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
         );
     }
 
@@ -10122,10 +10307,14 @@ mod tests {
 
     #[test]
     fn status_response_projects_the_next_swap_candidate_and_drops_last_swap() {
-        // A viable candidate projects as a label (#88), never a token/email (#15).
+        // A viable candidate projects as a label plus the daemon's #393 selection reason (#88),
+        // never a token/email (#15).
         let target = StatusSnapshot {
             next_swap: Some(NextSwap::Target {
                 to: "spare".to_owned(),
+                reason: Some(NextSwapReason::SoonestReset {
+                    resets_at: 1_782_800_000,
+                }),
             }),
             ..Default::default()
         };
@@ -10133,6 +10322,12 @@ mod tests {
         assert!(json.contains("\"next_swap\":"), "got {json}");
         assert!(json.contains("\"state\":\"target\""), "got {json}");
         assert!(json.contains("\"to\":\"spare\""), "got {json}");
+        // #393: the structured reason nests under `reason`, internally tagged on `kind`, carrying
+        // the `min_by_key` epoch `pick_target` used to formerly compute and discard.
+        assert!(
+            json.contains("\"reason\":{\"kind\":\"soonest_reset\",\"resets_at\":1782800000}"),
+            "got {json}"
+        );
         // #15: a label only — never an email or token sigil.
         assert!(!json.contains('@'));
         assert!(!json.to_lowercase().contains("token"));
@@ -10192,7 +10387,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":1}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":2}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -10244,6 +10439,58 @@ mod tests {
         assert_eq!(bare.accounts[0].label, "work");
         assert!(bare.accounts[0].active);
         assert_eq!(bare.next_swap, Some(NextSwap::NoViableTarget));
+    }
+
+    #[test]
+    fn a_pre_393_target_without_a_reason_decodes_as_none() {
+        // Forward-compat (#393): `reason` is an ADDITIVE field (schema 1.2), so a pre-#393 daemon
+        // emits a bare `target` with no `reason` key. `#[serde(default)]` must read that as `None`
+        // — never a deserialize error — which is the contract the Swift client's `decodeIfPresent`
+        // path mirrors (`WireDecoderTests.testPreReasonTargetDecodesWithNilReason`). An explicit
+        // `null` decodes the same way, and a `None` round-trips back out as `"reason":null`
+        // (this wire carries no `skip_serializing_if`, per the codebase convention).
+        let expected = NextSwap::Target {
+            to: "spare".to_owned(),
+            reason: None,
+        };
+
+        let absent: NextSwap = serde_json::from_str(r#"{"state":"target","to":"spare"}"#).unwrap();
+        assert_eq!(absent, expected, "an absent `reason` key decodes as None");
+
+        let explicit_null: NextSwap =
+            serde_json::from_str(r#"{"state":"target","to":"spare","reason":null}"#).unwrap();
+        assert_eq!(explicit_null, expected, "an explicit null decodes as None");
+
+        assert_eq!(
+            serde_json::to_string(&expected).unwrap(),
+            r#"{"state":"target","to":"spare","reason":null}"#
+        );
+    }
+
+    #[test]
+    fn every_next_swap_reason_variant_round_trips_its_wire_tag() {
+        // The `kind` tags are a CROSS-LANGUAGE contract: `WireModel.swift` matches these exact
+        // strings and treats an unknown tag as a hard decode error, so a tag rename here silently
+        // breaks the panel. Pin all three shapes (only `soonest_reset` carries a payload).
+        for (reason, wire) in [
+            (
+                NextSwapReason::SoonestReset {
+                    resets_at: 1_782_800_000,
+                },
+                r#"{"kind":"soonest_reset","resets_at":1782800000}"#,
+            ),
+            (
+                NextSwapReason::OnlyCandidate,
+                r#"{"kind":"only_candidate"}"#,
+            ),
+            (NextSwapReason::RosterOrder, r#"{"kind":"roster_order"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<NextSwapReason>(wire).unwrap(),
+                reason
+            );
+        }
     }
 
     #[test]
@@ -10503,16 +10750,20 @@ mod tests {
             })
         };
 
-        // Viable target → the choice mapped to a label. spare and backup are both under
-        // the floor and weekly-viable; with no known reset the tie falls to the earliest
-        // roster index (spare), mirroring `pick_target`.
+        // Viable target → the choice mapped to a label plus its #393 reason. spare and backup are
+        // both under the floor and weekly-viable; with no known reset the tie falls to the earliest
+        // roster index (spare). Because TWO targets were viable and no reset-time comparison could
+        // discriminate them, the reason is `RosterOrder` — neither a fabricated `SoonestReset` with
+        // no epoch to carry, nor `OnlyCandidate`, which would tell the operator "only viable
+        // target" while backup was equally viable.
         assert_eq!(
             daemon.next_swap(
                 Some(0),
                 &[usage(0.97, 0.40), usage(0.10, 0.10), usage(0.20, 0.10)]
             ),
             Some(NextSwap::Target {
-                to: "spare".to_owned()
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::RosterOrder),
             }),
         );
 

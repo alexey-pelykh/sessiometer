@@ -139,8 +139,10 @@ pub(crate) struct SchemaVersion {
 /// status snapshot settled by #137–#143. Bump MAJOR on any breaking field change, MINOR on an
 /// additive one (see [`SchemaVersion`]). `1.1` ADDED the daemon-level
 /// [`StatusResponse::systemic_refresh_failure`] indicator (issue #378) — an optional field an
-/// older client tolerates by ignoring.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 1 };
+/// older client tolerates by ignoring. `1.2` ADDED the [`NextSwap::Target`] `reason`
+/// ([`NextSwapReason`], issue #393) — the daemon's own selection rationale, likewise optional and
+/// tolerated-by-ignoring.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 2 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -293,8 +295,19 @@ pub(crate) struct AccountStatusLine {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub(crate) enum NextSwap {
-    /// A viable target exists — [`pick_target`]'s choice, by roster label.
-    Target { to: String },
+    /// A viable target exists — [`pick_target`]'s choice, by roster label, plus the daemon's own
+    /// `reason` for choosing it ([`NextSwapReason`], issue #393). The reason is DAEMON-AUTHORITATIVE:
+    /// a client cannot re-derive it (the session trigger / floor `pick_target` consumes are
+    /// daemon-only, never on the wire), so it is carried here rather than guessed client-side. An
+    /// ADDITIVE `Option` field (`#[serde(default)]`, the #164 minor-bump convention): a current
+    /// daemon always sends `Some`, but a pre-#393 daemon omits it → `None`, which a renderer shows
+    /// as a bare target label with no rationale (mirroring the `health` / `refresh_enabled`
+    /// pre-freeze-compat posture).
+    Target {
+        to: String,
+        #[serde(default)]
+        reason: Option<NextSwapReason>,
+    },
     /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
     /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
     /// *live* (enabled, non-quarantined) other account has already been polled and none
@@ -309,6 +322,37 @@ pub(crate) enum NextSwap {
     /// checks `status`; a quarantined account's masked-away reading does NOT count here
     /// (its data needs a re-login, not a poll).
     AwaitingData,
+}
+
+/// WHY [`pick_target`] chose the [`NextSwap::Target`] it did (issue #393) — the daemon's own
+/// selection rationale, carried on the wire so BOTH the panel footer and `sessiometer status`
+/// render the ONE reason the daemon actually used, each in its own idiom (R-2 STATE-parity: a
+/// structured discriminant, not a pre-formatted string that would force identical wording on both
+/// media). Distinct from [`crate::observability::SwapReason`], which records why a swap FIRED
+/// (session / weekly / manual / forced); this records why a particular TARGET won selection.
+///
+/// The variants track [`pick_target`]'s ACTUAL axis (issue #37 — soonest weekly reset among
+/// viable accounts), NOT the superseded "most headroom" rule the client used to assert. Internally
+/// tagged on `kind` (NOT `reason`, which is the carrying field name on [`NextSwap::Target`], nor
+/// `state`, [`NextSwap`]'s own tag), so the nested wire shape is unambiguous:
+/// `{"state":"target","to":"…","reason":{"kind":"soonest_reset","resets_at":…}}`. Non-secret — a
+/// discriminant plus one epoch timestamp, never a token or email (issue #15).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum NextSwapReason {
+    /// Two or more accounts qualified and this one's WEEKLY window resets SOONEST — the live #37
+    /// selection axis. `resets_at` is the winner's weekly-reset epoch (the `min_by_key` key
+    /// `pick_target` sorts on, previously computed then discarded before serialization).
+    SoonestReset { resets_at: i64 },
+    /// Exactly ONE account qualified, so nothing discriminated the winner — it is the sole viable
+    /// target. Carries no epoch: its weekly reset, known or not, decided nothing.
+    OnlyCandidate,
+    /// Two or more accounts qualified but NONE reported a weekly reset, so no soonest-reset
+    /// tiebreak existed and selection fell to the earliest roster index (`min_by_key` keeps the
+    /// first of equal keys). Deliberately DISTINCT from [`Self::OnlyCandidate`]: several targets
+    /// were viable here, so a renderer must never claim this one was the only one — that would be
+    /// the very false-rationale bug #393 exists to remove. Carries no epoch because none exists.
+    RosterOrder,
 }
 
 /// Project a [`StatusSnapshot`] into the wire [`StatusResponse`]. Sourced solely

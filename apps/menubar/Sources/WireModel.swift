@@ -48,10 +48,11 @@ struct SchemaVersion: Decodable, Equatable {
 }
 
 /// The frozen-contract compatibility gate (`src/daemon/snapshot.rs`
-/// `STATUS_SCHEMA_VERSION` = `{1, 0}`, `parse_watch_frame`'s "the client gates on `major`
+/// `STATUS_SCHEMA_VERSION`, `parse_watch_frame`'s "the client gates on `major`
 /// before rendering"). Decoding NEVER fails on a major mismatch — the frame still decodes so
 /// the client can read `generated_at` and degrade gracefully; the gate is a SEPARATE
-/// render-time check.
+/// render-time check. The MINOR is deliberately not restated here — it moves on every additive
+/// bump, and `supportedSchemaMajor` below is the only version this gate reads.
 enum WireContract {
     /// The status-snapshot contract MAJOR this client speaks. Mirrors
     /// `STATUS_SCHEMA_VERSION.major` in `src/daemon/snapshot.rs`; bump in lockstep when the
@@ -98,19 +99,67 @@ struct RefreshHealth: Decodable, Equatable {
     }
 }
 
+/// WHY the daemon chose the `target` it did (`src/daemon/snapshot.rs` `NextSwapReason`, issue
+/// #393) — its OWN selection rationale, carried so the client renders the reason the daemon
+/// actually used rather than re-deriving a (superseded, wrong) one. Internally tagged on `kind`
+/// (`snake_case`), so a value is one of three shapes:
+///   * `{"kind":"soonest_reset","resets_at":<epoch>}` — ≥2 accounts qualified and this one's
+///     weekly window resets soonest (the live #37 axis); `resetsAt` is that epoch.
+///   * `{"kind":"only_candidate"}` — exactly one account qualified; nothing discriminated it.
+///   * `{"kind":"roster_order"}` — ≥2 qualified but none reported a weekly reset, so no tiebreak
+///     existed and the earliest roster index won. NEVER render this as "only viable target":
+///     other targets were viable, and that false claim is the bug #393 removes.
+///
+/// An UNKNOWN `kind` is a decode error, mirroring serde's internally-tagged enum. Mirrors the
+/// daemon's variant set; render each medium's own way, never a pre-formatted string (state-parity).
+enum NextSwapReason: Equatable {
+    case soonestReset(resetsAt: Int64)
+    case onlyCandidate
+    case rosterOrder
+}
+
+extension NextSwapReason: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case resetsAt = "resets_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(String.self, forKey: .kind)
+        switch kind {
+        case "soonest_reset":
+            self = .soonestReset(resetsAt: try container.decode(Int64.self, forKey: .resetsAt))
+        case "only_candidate":
+            self = .onlyCandidate
+        case "roster_order":
+            self = .rosterOrder
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind,
+                in: container,
+                debugDescription:
+                    "unknown next_swap reason '\(kind)' — an incompatible wire contract"
+            )
+        }
+    }
+}
+
 /// The next swap candidate (`src/daemon/snapshot.rs` `NextSwap`): who the daemon would rotate
 /// the active session to, or why there is no candidate. Internally tagged on `state`
 /// (`snake_case`), so a value is one of three shapes:
-///   * `{"state":"target","to":"<label>"}`
+///   * `{"state":"target","to":"<label>","reason":<NextSwapReason>}`
 ///   * `{"state":"no_viable_target"}`
 ///   * `{"state":"awaiting_data"}`
 ///
 /// An UNKNOWN `state` is a decode error — faithfully mirroring serde's internally-tagged enum,
 /// which rejects a variant it does not know (verified against the daemon: `unknown variant …`).
 /// The whole `next_swap` key is optional (`null` when there is no active anchor), handled at
-/// `VersionedStatus`.
+/// `VersionedStatus`. The target's `reason` (issue #393) is ADDITIVE and optional — a current
+/// daemon always sends it, but a pre-#393 daemon omits it → `nil`, tolerated via `decodeIfPresent`
+/// (the same additive-minor forward-compat the whole contract rests on).
 enum NextSwap: Equatable {
-    case target(to: String)
+    case target(to: String, reason: NextSwapReason?)
     case noViableTarget
     case awaitingData
 }
@@ -119,6 +168,7 @@ extension NextSwap: Decodable {
     private enum CodingKeys: String, CodingKey {
         case state
         case to
+        case reason
     }
 
     init(from decoder: Decoder) throws {
@@ -126,7 +176,10 @@ extension NextSwap: Decodable {
         let state = try container.decode(String.self, forKey: .state)
         switch state {
         case "target":
-            self = .target(to: try container.decode(String.self, forKey: .to))
+            self = .target(
+                to: try container.decode(String.self, forKey: .to),
+                reason: try container.decodeIfPresent(NextSwapReason.self, forKey: .reason)
+            )
         case "no_viable_target":
             self = .noViableTarget
         case "awaiting_data":

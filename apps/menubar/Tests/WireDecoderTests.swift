@@ -15,7 +15,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 1))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 2))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
@@ -42,8 +42,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 1)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 1))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 2)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 2))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -54,7 +54,8 @@ final class WireDecoderTests: XCTestCase {
             return XCTFail("expected a snapshot frame")
         }
         XCTAssertEqual(v.generatedAt, 1_893_456_000)
-        XCTAssertEqual(v.nextSwap, .target(to: "personal"))
+        // The target carries the #393 reason: personal is the lone viable spare → `only_candidate`.
+        XCTAssertEqual(v.nextSwap, .target(to: "personal", reason: .onlyCandidate))
         XCTAssertEqual(v.refreshEnabled, true)
         XCTAssertEqual(v.accounts.count, 2)
 
@@ -72,6 +73,30 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertNil(personal.sessionPct)
         XCTAssertNil(personal.refreshHealth, "refresh_health null is tolerated → nil")
         XCTAssertEqual(personal.auth, .unknown)
+    }
+
+    // AC (#393): the target's structured reason decodes — `soonest_reset` carries its `resets_at`
+    // epoch straight off the wire, so the client renders the daemon's rationale rather than
+    // re-deriving any selection heuristic. Byte-pinned to the Rust golden (WireGoldenTests).
+    func testDecodesNextSwapTargetWithSoonestResetReason() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotNextSwap) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(
+            v.nextSwap,
+            .target(to: "spare", reason: .soonestReset(resetsAt: 1_893_800_000))
+        )
+    }
+
+    // AC (#393): the `roster_order` reason decodes — ≥2 accounts qualified, none reported a weekly
+    // reset, so the earliest roster index won. The client must accept every tag the daemon emits
+    // (an unknown `kind` is a hard decode error), and must never render this as "only viable
+    // target" — other targets were viable.
+    func testDecodesNextSwapTargetWithRosterOrderReason() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotRosterOrderTarget) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: .rosterOrder))
     }
 
     // AC: "All three `next_swap` states …" — `no_viable_target`. + `auth` stale, failure streak.
@@ -132,6 +157,18 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 5))
         XCTAssertTrue(v.isSchemaSupported, "a minor bump stays supported")
         XCTAssertEqual(v.accounts[0].label, "work")
+    }
+
+    // AC (#393 forward-compat): a pre-#393 daemon's `target` has no `reason` key → decodes to
+    // `reason: nil` (the additive `decodeIfPresent` path), never a decode error. This is the
+    // contract that lets the client render an older daemon's next-swap without the rationale line.
+    func testPreReasonTargetDecodesWithNilReason() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotTargetNoReason) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 1))
+        XCTAssertTrue(v.isSchemaSupported, "a pre-#393 minor stays supported")
+        XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: nil))
     }
 
     // AC: "Unknown `type` → ignored (returns an 'unknown' frame, NOT an error)".
