@@ -196,7 +196,16 @@ pub(crate) struct Account {
     /// Stable per-account identifier (the Claude `account_uuid`); the sole roster
     /// key, and the basis for the derived [`stash`](Account::stash) name.
     pub(crate) account_uuid: String,
-    /// Human-readable label shown by `list` / `status`.
+    /// Human-readable label shown by `list` / `status`, and the operator-facing
+    /// HANDLE written **verbatim** into the daemon's durable event log — e.g. the
+    /// `event=swap` line's `from=` / `to=` (see [`crate::observability`], the sole
+    /// place an event becomes a log line). Those diagnostics are secret-free BY
+    /// CONSTRUCTION — closed enums, rounded percents, config ints, timestamps
+    /// (issue #15) — so that guarantee extends to the label ONLY while the operator
+    /// keeps it a **non-PII nickname** (`work`, `spare`), never an email or username
+    /// (issue #404). Non-empty is the sole invariant [`validate`](Config::validate)
+    /// enforces on it; PII-freedom is deliberately left to the operator — no
+    /// email-shaped rejection, which would be a behavior change out of scope for #404.
     pub(crate) label: String,
     /// Whether this account participates in the rotation (issue #36). A disabled
     /// account stays in the roster (its keychain stash is untouched), but the

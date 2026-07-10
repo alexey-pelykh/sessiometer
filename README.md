@@ -324,6 +324,14 @@ token or email (issue #15):
 - **The diagnostic channel** — per-cycle DETAIL for debugging a live `run`, on
   **stderr**, **off by default**.
 
+The event log — and the `-v` diagnostic channel — identify accounts by their
+**`label`**, written **verbatim** as the account handle (e.g. `event=swap from=…
+to=…`, `diag=poll account=…`). It is the one operator-chosen, free-form field on
+the durable surface, so keep every label a **non-PII nickname** (`work`, `spare`),
+never an email or username: the secret-free-by-construction guarantee (issue #15)
+extends to the label only while it stays PII-free. Labels are set at
+[`sessiometer login <label>`](#logging-in--re-authenticating).
+
 Pass `-v` (or `--verbose`) to opt into the diagnostic channel:
 
 ```sh
@@ -477,6 +485,9 @@ sessiometer login spare
 The optional `<label>` names a **new** account — omit it and the label is
 auto-derived from the account's `account_uuid` (exactly as `capture`); a re-login of
 an already-rostered account keeps its existing label unless you pass a new one.
+Pick a **non-PII nickname** (`work`, `spare`), never an email or username — the
+label is written verbatim into the daemon's durable
+[event log](#watching-the-daemon-diagnostics) (issue #15).
 `login` needs a real terminal and the `claude` binary on your `PATH` (or
 `$CLAUDE_BIN`); tune its timeout in the [`[login]`](#login) block. On success it
 prints one redacted line — `Onboarded` (new) or `Revived` (existing); an unfinished
