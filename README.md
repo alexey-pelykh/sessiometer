@@ -532,7 +532,7 @@ account's `list` label, never a token. It needs the `claude` binary on your `PAT
 
 `poke` is the manual trigger; the daemon can also run that same refresh **on a
 cadence** so a spare is always ready to swap to without a stale-token round-trip.
-The periodic tick is **off by default** (opt-in) and runs entirely in the daemon's
+The periodic tick is **on by default** and runs entirely in the daemon's
 **idle path** — between polls, off the poll → usage → swap seam — so it never
 competes with the work that keeps the active session alive. Each refresh happens in
 an isolated `CLAUDE_CONFIG_DIR` (exactly as `poke`), so the live
@@ -543,11 +543,11 @@ active account is instead kept warm **in place**, see
 that overruns its timeout) is non-fatal: it is logged, redacted, and the daemon
 returns to polling.
 
-Turn it on and tune it in the `[refresh]` table of `config.toml`:
+Tune it (or turn it off) in the `[refresh]` table of `config.toml`:
 
 ```toml
 [refresh]
-enabled = true            # opt-in; false (the default) leaves the tick wholly inert
+enabled = true            # on by default; set false to leave the tick wholly inert
 accounts = []             # parked accounts by `list` label or account-uuid; [] = all near-expiry
 cadence_secs = 3600       # seconds between ticks AND the near-expiry horizon (60..=86400)
 idle_after_secs = 60      # idle seconds (no poll/swap) required before a refresh fires (0..=3600)

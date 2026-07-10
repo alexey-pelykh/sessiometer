@@ -542,7 +542,9 @@ pub(crate) enum Event {
     /// The periodic isolated-refresh tick (#105) ran one cycle for the PARKED `account`
     /// (issue #106): `outcome` is the non-secret classification, and `expires_before` /
     /// `expires_after` are the stored token's `expiresAt` (epoch milliseconds) before and
-    /// after the cycle — each `None` only when the stored expiry was unreadable. `account`
+    /// after the cycle — each `None` only when the stored expiry was unreadable; when BOTH
+    /// are present, [`to_log_line`](Event::to_log_line) also renders their difference as a
+    /// `window_secs=` field (issue #409 — the sliding-window slide, in whole seconds). `account`
     /// is the HANDLE (operator label), never a token or email; the expiry is a plain
     /// timestamp. A cycle that refreshes a quarantined account back to life additionally
     /// drives a separate [`Event::CredentialRestored`] (the restore, applied daemon-side).
@@ -893,8 +895,23 @@ impl Event {
                     Some(secs) => format!(" backoff_secs={secs}"),
                     None => String::new(),
                 };
+                // `window_secs=` (issue #409): the stored expiry's forward SLIDE this cycle,
+                // `expires_after − expires_before` in whole seconds — the sliding-window-vs-cap
+                // signal (the engine's [`crate::refresh::RefreshReport`] `expires_at_delta_secs`)
+                // made durable on the line, so an operator reads the granted-lifetime extension
+                // WITHOUT deriving it from the two timestamps by hand. Rendered only when BOTH
+                // expiries are readable (else the slide is undefined); an additive TRAILING field
+                // (like `reason=`/`backoff_secs=`) so a partial line is byte-for-byte unchanged and
+                // every existing `key=val` parser is unaffected. A bare integer derived from two
+                // non-secret timestamps already on the line — the #15 single-surface guarantee holds.
+                let window = match (expires_before, expires_after) {
+                    (Some(before_ms), Some(after_ms)) => {
+                        format!(" window_secs={}", (after_ms - before_ms) / 1000)
+                    }
+                    _ => String::new(),
+                };
                 format!(
-                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}{reason}{backoff}"
+                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}{reason}{backoff}{window}"
                 )
             }
             Event::PollRefresh {
@@ -1800,8 +1817,9 @@ mod tests {
 
     #[test]
     fn refresh_line_carries_handle_outcome_and_optional_expiries() {
-        // A successful refresh: handle + outcome token + the before/after expiry rendered
-        // to RFC 3339 (epoch ms → whole-second UTC), so the slide forward is visible.
+        // A successful refresh: handle + outcome token + the before/after expiry rendered to
+        // RFC 3339 (epoch ms → whole-second UTC), plus the explicit `window_secs=` slide (#409 —
+        // the +1h forward move, `expires_after − expires_before` in whole seconds).
         let refreshed = Event::Refresh {
             account: "spare".to_owned(),
             outcome: RefreshEventOutcome::Refreshed,
@@ -1817,7 +1835,7 @@ mod tests {
             format!(
                 "{TS0} event=refresh account=spare outcome=refreshed \
                  expires_before=2026-06-30T00:00:00Z expires_after=2026-06-30T01:00:00Z \
-                 rotated=true"
+                 rotated=true window_secs=3600"
             )
         );
         assert!(!refreshed.contains("reason="), "got: {refreshed}");
@@ -1842,6 +1860,64 @@ mod tests {
         );
         assert!(!unknown.contains("expires_"), "got: {unknown}");
         assert!(!unknown.contains("reason="), "got: {unknown}");
+    }
+
+    #[test]
+    fn refresh_line_carries_the_window_secs_slide() {
+        // Issue #409: the stored expiry's forward slide is first-class as an additive TRAILING
+        // `window_secs=` field — `expires_after − expires_before` in whole seconds — so the
+        // sliding-window-vs-cap signal is monitorable without deriving it from the two timestamps
+        // by hand. It is the EXPIRY difference, independent of the line's own `ts`.
+
+        // A +2h slide (7200 s). The non-zero line `ts` proves the field is
+        // `expires_after − expires_before`, NOT `expires_after − ts`.
+        let slid = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Refreshed,
+            expires_before: Some(1_782_777_600_000),
+            expires_after: Some(1_782_784_800_000), // +7200 s
+            refresh_token_rotated: false,
+            reason: None,
+            backoff_secs: None,
+        }
+        .to_log_line(at_epoch(1_000));
+        assert!(
+            slid.ends_with(" window_secs=7200"),
+            "the slide trails the line: {slid}"
+        );
+
+        // No slide (before == after — a held expiry, e.g. `no_change`): `window_secs=0`.
+        let held = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::NoChange,
+            expires_before: Some(1_782_777_600_000),
+            expires_after: Some(1_782_777_600_000),
+            refresh_token_rotated: false,
+            reason: None,
+            backoff_secs: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            held.contains(" window_secs=0"),
+            "a held expiry renders a zero slide: {held}"
+        );
+
+        // An unreadable expiry: the slide is undefined, so `window_secs=` is OMITTED entirely
+        // (never an empty value that would split the key=val grammar), exactly like `expires_*`.
+        let unknown = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Refreshed,
+            expires_before: None,
+            expires_after: Some(1_782_784_800_000),
+            refresh_token_rotated: false,
+            reason: None,
+            backoff_secs: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            !unknown.contains("window_secs="),
+            "a missing expiry omits the slide: {unknown}"
+        );
     }
 
     #[test]
