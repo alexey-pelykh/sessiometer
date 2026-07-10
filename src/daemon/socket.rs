@@ -10,6 +10,12 @@
 //!   - `manual-swapped` (#64) / `roster-reload` (#139) / `restored` (#275) — state-affecting
 //!     fire-and-forget signals, honored ONLY for an authenticated same-user peer (an unauthenticated
 //!     one gets `{"error":"unauthorized"}` and produces NO signal).
+//!   - `shutdown` (#397) — a state-affecting STOP for an UNMANAGED daemon (the `daemon stop`
+//!     control path, for a foreground / detached `sessiometer run`). Like the signals above it is
+//!     honored ONLY for an authenticated same-user peer; it drives the daemon's existing graceful
+//!     [`Idle::Shutdown`](mod@super::run_loop) exit (an in-flight swap completes first — shutdown is
+//!     observed only BETWEEN ticks). A MANAGED launchd agent is stopped with `launchctl bootout`
+//!     instead, so its `KeepAlive` does not respawn it.
 //!   - `swap` (#167) — a state-affecting command the daemon performs ITSELF (needs `&mut Daemon`),
 //!     re-validating the target against its own roster and returning a REDACTED ack from the real
 //!     outcome (`{"cmd":"swap","target":"<label|uuid>","force":<bool>}`).
@@ -75,6 +81,15 @@ pub(crate) enum ControlSignal {
     /// the sweep (which is starved, #260), so this is the RELIABLE on-demand
     /// un-quarantine path for a re-logged-in parked account.
     Restored(String),
+    /// An authenticated same-user peer asked the daemon to STOP (issue #397) — the `daemon
+    /// stop` control path for an UNMANAGED daemon (a foreground / detached `sessiometer run`;
+    /// a MANAGED launchd agent is stopped with `launchctl bootout` instead, so its `KeepAlive`
+    /// does not respawn it). The run loop breaks its idle to the SAME graceful
+    /// [`Idle::Shutdown`](mod@super::run_loop) exit a SIGINT / SIGTERM drives, so an in-flight swap
+    /// completes before exit (shutdown is observed only BETWEEN ticks, never mid-swap). Like the
+    /// other state-affecting signals it is payload-less and honored ONLY for an authenticated
+    /// same-user peer; the `{"ok":true}` ack is flushed to the client BEFORE the loop exits.
+    ShutdownRequested,
 }
 
 /// What serving one control connection yielded to the run loop. Most commands are fire-and-forget
@@ -434,6 +449,23 @@ pub(crate) fn control_reply(
                 (r#"{"error":"unauthorized"}"#.to_owned(), None)
             }
         }
+        // `shutdown` (issue #397) STOPS an unmanaged daemon — the `daemon stop` control path for a
+        // foreground / detached `sessiometer run`. State-affecting (it ends the process), so — like
+        // `manual-swapped` / `roster-reload` / `restored` — it is honored ONLY for an authenticated
+        // same-user peer; an unauthenticated one gets an error and produces NO signal (a stranger
+        // can never stop the daemon). Fail-closed on the auth verdict, identical to the sibling
+        // signals. The `{"ok":true}` ack is written by `serve_control` BEFORE this signal reaches
+        // the run loop, so the client learns the stop was accepted before the daemon exits.
+        Ok(request) if request.cmd == "shutdown" => {
+            if peer_authenticated {
+                (
+                    r#"{"ok":true}"#.to_owned(),
+                    Some(ControlSignal::ShutdownRequested),
+                )
+            } else {
+                (r#"{"error":"unauthorized"}"#.to_owned(), None)
+            }
+        }
         Ok(_) => (r#"{"error":"unknown command"}"#.to_owned(), None),
         Err(_) => (r#"{"error":"malformed request"}"#.to_owned(), None),
     }
@@ -567,9 +599,18 @@ where
             _ => {}
         }
         let (reply, signal) = control_reply(trimmed, snapshot, peer_authenticated);
-        buffered.write_all(reply.as_bytes()).await?;
-        buffered.write_all(b"\n").await?;
-        buffered.flush().await?;
+        // Delivering the ack is BEST-EFFORT: the request is already read, authenticated, and its
+        // effect decided. A peer that hung up first (a client that gave up waiting, or was
+        // interrupted) makes this write fail with `EPIPE` — and propagating that would discard
+        // `signal` at [`UnixControl::serve`]'s `Err(_) => Signal(None)` arm, silently cancelling an
+        // action the operator authenticated. A `shutdown` the daemon accepted must still happen.
+        let ack = async {
+            buffered.write_all(reply.as_bytes()).await?;
+            buffered.write_all(b"\n").await?;
+            buffered.flush().await
+        }
+        .await;
+        let _ = ack;
         Ok::<_, Error>(ServeOutcome::OneShot(signal))
     };
     // A peer that stalls mid-line must not hold the exchange open: time-box it and

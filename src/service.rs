@@ -2,8 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 //! The background service: install/uninstall `sessiometer run` as a per-user
-//! launchd **LaunchAgent** (issue #166), plus the lifecycle verbs
-//! start/stop/restart/status over that installed agent (issue #376).
+//! launchd **LaunchAgent** (issue #166), the `service status` "is-a-managed-service-
+//! installed?" report, and the MANAGED-daemon lifecycle primitives ([`stop_managed`],
+//! [`kickstart_managed`], [`bootstrap_managed`]) that the `daemon stop` / `daemon restart`
+//! verbs call once [`agent_supervision`] reports what launchd is doing about the agent (issue #397).
+//!
+//! The #397 noun split re-homed *process lifecycle* from `service` to `daemon`:
+//! `service` now owns only *persistence* (install / uninstall / status — "is auto-start
+//! at login enabled?"), while `daemon` owns the *running process* (status / stop /
+//! restart). The launchctl mechanics for the managed case still live here — they act on
+//! the LaunchAgent this module installs — but they are now invoked by the `daemon` verbs
+//! (issue #376's standalone `service start`/`stop`/`restart` are removed, pre-0.1.0, no
+//! deprecation cycle). The UNMANAGED case (a foreground / detached `sessiometer run`) is
+//! handled by `daemon` itself over the control socket, not here.
 //!
 //! A LaunchAgent (not a system-wide LaunchDaemon) because the swap loop needs the
 //! user's **login keychain**, which only exists inside the per-user GUI session.
@@ -133,34 +144,49 @@ pub(crate) async fn uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Restart the installed LaunchAgent (issue #376): the headline recovery verb for a
-/// stuck/stale daemon (#375) or an applied config change. `kickstart -k` kills the
-/// running agent and relaunches it atomically — a bare kill would just be respawned by
-/// `KeepAlive`, so `-k` is what makes "restart" mean restart. If the agent is installed
-/// but currently booted out (a prior `service stop`), there is nothing to kickstart, so
-/// it is bootstrapped instead — a `restart` always ends with the agent running, matching
-/// `systemctl restart` on a stopped unit. No managed service (no plist) ⇒ the
-/// [`Error::NoManagedService`] guidance, never a raw launchctl error.
-pub(crate) async fn restart() -> Result<()> {
-    let plist = agent_plist()?;
-    ensure_managed(&plist)?;
-    let target = service_target(AGENT_LABEL);
-    if is_loaded(&target).await? {
-        launchctl(&["kickstart", "-k", &target]).await?;
-    } else {
-        launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
-    }
-    eprintln!("sessiometer: background service restarted ({AGENT_LABEL}).");
+/// Restart a LOADED managed daemon (issue #397's `daemon restart`, supervised branch; re-homed
+/// from issue #376's `service restart`): the headline recovery verb for a stuck/stale daemon
+/// (#375) or an applied config change. `kickstart -k` kills the running agent and relaunches
+/// it atomically — a bare kill would just be respawned by `KeepAlive`, so `-k` is what makes
+/// "restart" mean restart.
+///
+/// PRECONDITION: the agent's job is in the domain ([`AgentSupervision::Supervising`] or
+/// [`AgentSupervision::RegisteredIdle`] with nothing else running). The caller ([`crate::cli`]'s
+/// `daemon restart`) dispatches on exactly that, so this never re-probes it. `kickstart` starts a
+/// registered job that is not currently running, so it covers both. The never-registered case is
+/// [`bootstrap_managed`]; a daemon launchd does not supervise is the caller's
+/// [`Error::UnmanagedDaemonNoRestart`] branch, never this one.
+pub(crate) async fn kickstart_managed() -> Result<()> {
+    launchctl(&["kickstart", "-k", &service_target(AGENT_LABEL)]).await?;
+    eprintln!("sessiometer: daemon restarted ({AGENT_LABEL}, managed by launchd).");
     Ok(())
 }
 
-/// Report whether the installed LaunchAgent is loaded/running (issue #376). The state
-/// report is command data, so it prints to STDOUT (like `status`/`list`/`export`), while
-/// the operational verbs write to stderr. A `launchctl print` that succeeds means the
-/// agent is in the per-user domain (loaded); a failure means the plist is on disk but the
-/// agent is booted out (a prior `service stop`, or not yet loaded this session). Either
-/// is a successful *report* (exit `0`); only a missing plist is the non-zero
-/// [`Error::NoManagedService`] guidance case.
+/// Load an installed-but-booted-out agent into the per-user domain (issue #397): the branch
+/// `daemon restart` takes when a managed service is registered, currently stopped (a prior
+/// `daemon stop`), and nothing else is running. `restart` on a stopped unit simply starts it —
+/// matching `systemctl restart` — which is also how a stopped managed daemon comes back without
+/// a login cycle, the role a standalone `daemon start` verb would otherwise fill.
+///
+/// PRECONDITION: a plist is installed ([`is_managed`]), the agent is NOT loaded, and no
+/// unmanaged daemon is running. Bootstrapping over a live foreground `run` would hand launchd a
+/// process that loses the single-instance lock, exits `3`, and is respawned by `KeepAlive` into
+/// a throttled crash loop — so the caller refuses that state rather than reaching this.
+pub(crate) async fn bootstrap_managed() -> Result<()> {
+    let plist = agent_plist()?;
+    launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
+    eprintln!("sessiometer: daemon started ({AGENT_LABEL}, managed by launchd).");
+    Ok(())
+}
+
+/// Report whether the installed LaunchAgent is loaded/running (issues #376, #397) — the
+/// PERSISTENCE question ("is a managed service installed / enabled at login?"); the running-
+/// process question is `daemon status`. The state report is command data, so it prints to
+/// STDOUT (like `status`/`list`/`export`), while the operational verbs write to stderr. A
+/// `launchctl print` that succeeds means the agent is in the per-user domain (loaded); a
+/// failure means the plist is on disk but the agent is booted out (a prior `daemon stop`, or
+/// not yet loaded this session). Either is a successful *report* (exit `0`); only a missing
+/// plist is the non-zero [`Error::NoManagedService`] guidance case.
 pub(crate) async fn status() -> Result<()> {
     let plist = agent_plist()?;
     ensure_managed(&plist)?;
@@ -183,49 +209,40 @@ pub(crate) async fn status() -> Result<()> {
     } else {
         println!(
             "sessiometer: background service {AGENT_LABEL} is installed but not loaded — \
-             start it with `sessiometer service start`."
+             `sessiometer daemon restart` loads it now (or it starts at next login)."
         );
     }
     Ok(())
 }
 
-/// Start (load) the installed LaunchAgent (issue #376): bootstrap the on-disk plist into
-/// the per-user domain, where `RunAtLoad` starts it. Idempotent — an already-loaded agent
-/// reports "already running" rather than letting `bootstrap` fail with a confusing
-/// "service already loaded". No managed service (no plist) ⇒ [`Error::NoManagedService`].
-pub(crate) async fn start() -> Result<()> {
-    let plist = agent_plist()?;
-    ensure_managed(&plist)?;
-    let target = service_target(AGENT_LABEL);
-    if is_loaded(&target).await? {
-        eprintln!("sessiometer: background service {AGENT_LABEL} is already running.");
-        return Ok(());
-    }
-    launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
-    eprintln!("sessiometer: background service started ({AGENT_LABEL}).");
+/// Stop a MANAGED daemon (issue #397's `daemon stop`, managed branch; re-homed from issue
+/// #376's `service stop`): boot the installed agent out of the per-user domain, which stops
+/// the process AND suppresses the `KeepAlive` respawn (a control-socket shutdown would just be
+/// respawned — that is why the managed case must `bootout`, not signal the process). This stops
+/// it for the CURRENT login session; `RunAtLoad` brings it back at the next login
+/// (`sessiometer service uninstall` removes it for good).
+///
+/// PRECONDITION: launchd is supervising the daemon ([`AgentSupervision::Supervising`]), so booting
+/// the agent out stops the running daemon itself. The caller ([`crate::cli`]'s `daemon stop`)
+/// dispatches on exactly that. For a merely-[`AgentSupervision::RegisteredIdle`] job the bootout is
+/// still REQUIRED — it disarms the `KeepAlive` respawn — but is NOT the whole stop, so the caller
+/// uses the quiet [`bootout_agent`] there and narrates the compound stop itself.
+pub(crate) async fn stop_managed() -> Result<()> {
+    bootout_agent().await?;
+    eprintln!(
+        "sessiometer: daemon stopped ({AGENT_LABEL}, managed by launchd). It returns at next \
+         login; `sessiometer service uninstall` removes it for good."
+    );
     Ok(())
 }
 
-/// Stop (unload) the installed LaunchAgent (issue #376): boot it out of the per-user
-/// domain, which stops the process and suppresses the `KeepAlive` respawn. Idempotent —
-/// an already-stopped agent reports "already stopped" rather than a confusing `bootout`
-/// error. This stops it for the CURRENT login session; `RunAtLoad` brings it back at the
-/// next login (`sessiometer service uninstall` removes it for good). No managed service
-/// (no plist) ⇒ [`Error::NoManagedService`].
-pub(crate) async fn stop() -> Result<()> {
-    let plist = agent_plist()?;
-    ensure_managed(&plist)?;
-    let target = service_target(AGENT_LABEL);
-    if !is_loaded(&target).await? {
-        eprintln!("sessiometer: background service {AGENT_LABEL} is already stopped.");
-        return Ok(());
-    }
-    launchctl(&["bootout", &target]).await?;
-    eprintln!(
-        "sessiometer: background service stopped ({AGENT_LABEL}). It returns at next login; \
-         `sessiometer service uninstall` removes it for good."
-    );
-    Ok(())
+/// Boot the agent out of the per-user domain WITHOUT printing — the bare launchctl primitive under
+/// [`stop_managed`]. `daemon stop` uses this directly for the [`AgentSupervision::RegisteredIdle`]
+/// case, where the bootout only disarms `KeepAlive` and the real stop is a control-socket shutdown;
+/// emitting `stop_managed`'s "daemon stopped, managed by launchd" there would contradict the
+/// unmanaged-shutdown line that follows. The caller owns the message for that compound path.
+pub(crate) async fn bootout_agent() -> Result<()> {
+    launchctl(&["bootout", &service_target(AGENT_LABEL)]).await
 }
 
 /// The launchd domain target for a per-user LaunchAgent: `gui/<uid>`.
@@ -264,31 +281,74 @@ fn ensure_managed(plist: &Path) -> Result<()> {
     }
 }
 
-/// Whether a managed LaunchAgent is installed for this binary — the same pure
-/// `plist.exists()` signal [`ensure_managed`] gates the lifecycle verbs on (issue #376),
-/// re-exposed (issue #396) so `daemon status` can project the management mode: managed
-/// (launchd LaunchAgent installed) vs unmanaged (a foreground / detached `sessiometer run`).
-/// Read-only — a single file-existence check, nothing loaded or signalled.
+/// Whether a managed LaunchAgent is INSTALLED for this binary — the pure `plist.exists()`
+/// registration signal [`ensure_managed`] gates the `service` verbs on (issue #376). Read-only —
+/// a single file-existence check, nothing loaded or signalled.
+///
+/// This answers the PERSISTENCE question ("is a service registered to start at login?"). It does
+/// NOT answer "is the running daemon the managed one" — a plist can sit on disk while the agent
+/// is booted out and a foreground `sessiometer run` owns the process. The `daemon` process verbs
+/// must dispatch on [`agent_supervision`] instead (issue #397).
 pub(crate) fn is_managed() -> Result<bool> {
     Ok(agent_plist()?.exists())
 }
 
-/// Whether the agent is currently loaded into the per-user launchd domain (issue #376).
-/// `launchctl print <target>` exits `0` for a service in the domain and non-zero
-/// ("Could not find service") for one whose plist is on disk but is booted out. Its
-/// (voluminous) output is discarded — only the exit status is the signal — so the probe
-/// stays silent. A spawn failure propagates as [`Error::Io`]; a non-zero exit is simply
-/// "not loaded", never an error. Lets the lifecycle verbs stay idempotent and correct
-/// (e.g. `restart` on a stopped agent must bootstrap, not `kickstart` a missing service).
-async fn is_loaded(target: &str) -> Result<bool> {
-    let status = Command::new(LAUNCHCTL)
-        .args(["print", target])
+/// What launchd is actually doing about the agent right now — the signal the `daemon` process
+/// verbs dispatch on (issue #397). Three states, because the two obvious ones are not enough:
+/// a job can sit REGISTERED in the domain with no running process behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentSupervision {
+    /// No job in the per-user domain. A plist may still be on disk (a prior `daemon stop` boots
+    /// the agent out but leaves it registered for next login) — so this is NOT [`is_managed`].
+    Unregistered,
+    /// The job is in the domain, but launchd has no running process for it: it was bootstrapped
+    /// while a foreground `run` already held the single-instance lock (so the agent's own `run`
+    /// exits `3` and `KeepAlive` throttles it into a crash loop), or it is simply between
+    /// respawns. Whatever daemon is running here, launchd is NOT supervising it.
+    RegisteredIdle,
+    /// The job is in the domain WITH a running process — launchd is supervising the daemon, and
+    /// since that process holds the single-instance lock no foreground `run` can coexist.
+    Supervising,
+}
+
+/// Probe launchd for the agent's [`AgentSupervision`] (issue #397). Read-only: `launchctl print`
+/// is a query, and nothing is started, stopped, or signalled.
+///
+/// Exit status alone is NOT enough. `launchctl print <target>` exits `0` for any job in the
+/// domain — including one whose process is dead and being respawn-throttled — and non-zero
+/// ("Could not find service") only when the job is absent. Dispatching the `daemon` verbs on the
+/// exit status would therefore `bootout` an agent that supervises nothing (reporting a stop that
+/// did not happen) or `kickstart` one whose `run` immediately loses the lock to a live foreground
+/// daemon. So the dump is parsed for whether launchd currently has a process, via [`job_is_running`].
+pub(crate) async fn agent_supervision() -> Result<AgentSupervision> {
+    let output = Command::new(LAUNCHCTL)
+        .args(["print", &service_target(AGENT_LABEL)])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .output()
         .await?;
-    Ok(status.success())
+    if !output.status.success() {
+        return Ok(AgentSupervision::Unregistered);
+    }
+    if job_is_running(&String::from_utf8_lossy(&output.stdout)) {
+        Ok(AgentSupervision::Supervising)
+    } else {
+        Ok(AgentSupervision::RegisteredIdle)
+    }
+}
+
+/// Whether a `launchctl print` dump shows launchd holding a live process for the job. Pure, so the
+/// parse is unit-tested against captured dumps rather than a live domain.
+///
+/// Two independent markers, either of which is sufficient: the `state = running` line, and a `pid =`
+/// line (launchd prints a PID only while the process lives). Requiring only one of the two keeps a
+/// future `launchctl` output tweak from silently flipping the answer. If BOTH ever disappear this
+/// degrades to "not running", which is the SAFE direction: `daemon restart` then refuses rather than
+/// bootstrapping a second daemon into a `KeepAlive` crash loop.
+fn job_is_running(dump: &str) -> bool {
+    dump.lines()
+        .map(str::trim)
+        .any(|line| line == "state = running" || line.starts_with("pid = "))
 }
 
 /// Remove a LaunchAgent plist by path, tolerating absence (`NotFound` = success). The
@@ -532,14 +592,81 @@ mod tests {
         remove_plist_file(&legacy).expect("removing an absent legacy plist is a tolerated no-op");
     }
 
+    /// A `launchctl print` dump for a job launchd is RUNNING, trimmed to the shape the parser
+    /// reads. Both markers present, plus the nested `state = active` endpoint lines that must NOT
+    /// be mistaken for the job's own state. Captured from a live per-user domain.
+    const DUMP_RUNNING: &str = "\
+org.sessiometer.agent = {
+\tstate = running
+\tprogram = /usr/local/bin/sessiometer
+\tpid = 1406
+\tendpoints = {
+\t\t\"listener\" = {
+\t\t\tstate = active
+\t\t}
+\t}
+}";
+
+    /// A dump for a job that is REGISTERED in the domain but has no running process — `launchctl
+    /// print` still exits `0` for this. Note the nested `state = active` endpoint lines: a naive
+    /// `contains("state = running")`-style parse on a substring, or one that read any `state =`
+    /// line, would get this wrong.
+    const DUMP_REGISTERED_IDLE: &str = "\
+org.sessiometer.agent = {
+\tstate = not running
+\tprogram = /usr/local/bin/sessiometer
+\tlast exit code = 3
+\tendpoints = {
+\t\t\"listener\" = {
+\t\t\tstate = active
+\t\t}
+\t}
+}";
+
+    #[test]
+    fn job_is_running_reads_launchd_state_not_mere_domain_membership() {
+        // Issue #397: `launchctl print` exits 0 for BOTH of these, so the exit status alone cannot
+        // tell "launchd is supervising the daemon" from "launchd registered a job that keeps
+        // dying". Dispatching `daemon stop` / `daemon restart` on the exit status would bootout an
+        // agent that supervises nothing, or kickstart one whose `run` loses the single-instance
+        // lock to a live foreground daemon and crash-loops under `KeepAlive`.
+        assert!(job_is_running(DUMP_RUNNING));
+        assert!(!job_is_running(DUMP_REGISTERED_IDLE));
+    }
+
+    #[test]
+    fn job_is_running_accepts_either_marker_and_ignores_nested_endpoint_state() {
+        // Either marker alone suffices, so one `launchctl` output tweak cannot silently flip the
+        // answer. `state = not running` must never match the `state = running` marker by prefix,
+        // and a nested `state = active` must never be read as the job's own state.
+        assert!(job_is_running("\tstate = running"), "state marker alone");
+        assert!(job_is_running("\tpid = 42"), "pid marker alone");
+        assert!(
+            !job_is_running("\tstate = not running"),
+            "not a prefix match"
+        );
+        assert!(
+            !job_is_running("\t\tstate = active"),
+            "nested endpoint state"
+        );
+        assert!(!job_is_running("\tlast exit code = 3"), "no marker");
+        assert!(!job_is_running(""), "empty dump");
+        // Degrading to "not running" when BOTH markers vanish is the SAFE direction: `daemon
+        // restart` refuses rather than bootstrapping a second daemon into a crash loop.
+        assert!(!job_is_running(
+            "org.sessiometer.agent = {\n\tprogram = /x\n}"
+        ));
+    }
+
     #[test]
     fn ensure_managed_gates_the_lifecycle_verbs_on_an_installed_agent() {
-        // Issue #376 AC: a lifecycle verb (start/stop/restart/status) with NO installed
-        // agent must not silently no-op nor emit a raw launchctl error. `ensure_managed`
-        // is the file-seam gate that turns an absent plist into the guidance
-        // `NoManagedService` (a non-zero exit), and lets a present plist through to the
-        // launchctl call. Exercised hermetically against a temp dir — the launchctl calls
-        // themselves need a live GUI login domain (like the `bootout` half elsewhere).
+        // Issue #376 + #397: `service status` (the sole `service` verb still gating on the
+        // plist after the #397 split re-homed stop/restart to `daemon`) with NO installed agent
+        // must not silently no-op nor emit a raw launchctl error. `ensure_managed` is the
+        // file-seam gate that turns an absent plist into the guidance `NoManagedService` (a
+        // non-zero exit), and lets a present plist through to the launchctl call. Exercised
+        // hermetically against a temp dir — the launchctl calls themselves need a live GUI
+        // login domain (like the `bootout` half elsewhere).
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join(format!("{AGENT_LABEL}.plist"));
 

@@ -75,7 +75,10 @@ fn emit_best_effort(log: &mut EventLog, event: &Event) {
 /// scoped to [`idle_until_next_tick`] and dropped on its return, before the run loop applies a
 /// `ManualSwapped` adoption, which needs its own `&mut Daemon`.
 enum Idle {
-    /// SIGINT / SIGTERM observed — exit the loop cleanly.
+    /// SIGINT / SIGTERM observed — OR an authenticated `shutdown` control command (#397, the
+    /// `daemon stop` path for an unmanaged daemon) — exit the loop cleanly. Both drive the same
+    /// graceful exit: a swap inside `tick` always ran to completion first (shutdown is observed
+    /// only BETWEEN ticks), so there is never a half-swap.
     Shutdown,
     /// The poll interval (or the #13 locked-keychain back-off wait) elapsed — re-tick.
     /// The #76 rate-limit back-off is per-account now (#293) and never a whole-loop wait.
@@ -282,6 +285,13 @@ where
                     // account (moving the uuid payload out of the signal), then re-tick;
                     // a `status` read (None) just continues serving until the wait elapses.
                     ControlYield::Signal(Some(ControlSignal::Restored(uuid))) => break Idle::Restored(uuid),
+                    // A `shutdown` (#397) — the `daemon stop` control path for an UNMANAGED
+                    // daemon — breaks the idle to the SAME `Idle::Shutdown` a SIGINT / SIGTERM
+                    // drives, so the graceful exit (and its "swap completes before exit" property,
+                    // shutdown observed only between ticks) is shared, not re-implemented. The
+                    // `{"ok":true}` ack was already flushed to the client in `serve_control`, and
+                    // only an authenticated peer reaches here (a stranger was refused inline).
+                    ControlYield::Signal(Some(ControlSignal::ShutdownRequested)) => break Idle::Shutdown,
                     // A `swap` (#167) breaks the idle to perform the swap (moving the open stream +
                     // parsed request out of the handoff) where `&mut daemon` is available, write the
                     // redacted ack, then re-tick. The auth + malformed rejections were already

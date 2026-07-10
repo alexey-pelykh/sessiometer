@@ -78,26 +78,67 @@ inside the per-user session. The agent is `RunAtLoad` + `KeepAlive`, so it start
 login and is brought back up if it ever exits. Its stdout/stderr land in
 `~/Library/Logs/sessiometer/daemon.out.log` and `daemon.err.log`.
 
-Once it is installed, manage its lifecycle without touching `launchctl` by hand:
+### Two nouns: `service` (persistence) and `daemon` (process)
+
+The lifecycle surface is split by concern — the same way systemd separates
+`enable`/`disable` from `start`/`stop`:
+
+| Noun | Concern | Verbs |
+|------|---------|-------|
+| `service` | **Persistence** — does the daemon auto-start at login? | `install`, `uninstall`, `status` |
+| `daemon` | **Process** — the running daemon itself | `status`, `stop`, `restart` |
+
+`service status` answers *"is a managed service installed?"*; `daemon status` answers
+*"is a daemon running, and how is it managed?"*. You never *start* a daemon with the
+`daemon` noun — you start one with `service install` (managed) or `sessiometer run`
+(unmanaged) — which is why there is no `daemon start`.
+
+### The three daemon states
+
+| State | What it means | `daemon status` reports |
+|-------|---------------|-------------------------|
+| **Managed** | installed via `service install`; launchd starts it at login and keeps it up | running (managed by launchd) |
+| **Foreground `run`** (unmanaged) | started by `sessiometer run`, in a terminal or detached; nothing supervises it | running (unmanaged) |
+| **Stopped** | no daemon is running — none was started, or it was stopped | not running |
 
 ```sh
+# Which state am I in?
+sessiometer daemon status
+
+# Stop the running daemon (either state; a no-op if none is running):
+sessiometer daemon stop
+
 # Restart it — the recovery verb after a stuck/stale daemon or a config change:
-sessiometer service restart
-
-# Is it loaded/running?
-sessiometer service status
-
-# Stop it now / start it again (stop lasts until next login; `uninstall` removes it for good):
-sessiometer service stop
-sessiometer service start
+sessiometer daemon restart
 ```
 
-`restart` is `launchctl kickstart -k` (kill + relaunch in one step — a bare kill would
-just be respawned by `KeepAlive`). `stop` boots the agent out of your login session and
-`start` loads it back in; `status` reports whether it is loaded. If you never ran
-`service install` — i.e. you start the daemon in the foreground with `sessiometer run` —
-these verbs print clear guidance and exit non-zero rather than silently doing nothing (to
-restart a foreground `run`, Ctrl-C it and run it again).
+`daemon stop` reaches both running states, but by different means, because the means are
+what make "stopped" stick. A **managed** daemon is booted out of your login session
+(`launchctl bootout`), which also stops `KeepAlive` from respawning it — it returns at
+next login, and `service uninstall` removes it for good. An **unmanaged** daemon is asked
+to shut down gracefully over its control socket, so an in-flight swap always completes
+before it exits. Either way the post-condition is the same: not running. No lifecycle path
+ever discovers a PID in order to signal it.
+
+"Managed" here means **launchd is supervising the daemon right now** — not merely that a
+service is installed. The two differ after a `daemon stop`, which boots the agent out but
+leaves it registered: a `sessiometer run` started in that window is unmanaged, even though
+`service status` still reports an installed service. The `daemon` verbs follow the running
+process, so they treat it as exactly what it is.
+
+`daemon restart` works only on a **managed** daemon, because restart means *kill and
+relaunch* (`launchctl kickstart -k`, atomic — a bare kill would just be respawned by
+`KeepAlive`), and only launchd supervises the daemon well enough to relaunch it. A
+foreground `sessiometer run` has no supervisor, so `daemon restart` is a clear, actionable
+error rather than a half-restart: install a managed service (`sessiometer service install`)
+for a supervised daemon with restart, or `sessiometer daemon stop` it and start a new
+`sessiometer run`. On an installed service that is currently stopped, with nothing else
+running, `daemon restart` simply starts it — no login cycle needed.
+
+> **Recovering a wedged daemon.** The managed path never needs the daemon to be
+> responsive: `daemon stop` and `daemon restart` both go through launchd. The unmanaged
+> path talks to the daemon's control socket, so it needs a daemon that still answers —
+> there is no clean automated recovery for a wedged foreground `run`.
 
 **One owner at a time — a safety guard.** Whatever launchd starts is the ordinary
 lock-guarded `sessiometer run`: it takes a single-owner lock on the roster before it
@@ -111,8 +152,8 @@ sessiometer: another sessiometer daemon is already running (the single-instance 
 and exits `3`, performing **no** swap. This guard is deliberate and has **no**
 `--force`-style bypass: two processes rewriting the active credential on the same
 roster would fight over which account is canonical. If you want to run in the
-foreground temporarily, `sessiometer service uninstall` first (or stop the agent),
-then `sessiometer run`.
+foreground temporarily, `sessiometer service uninstall` first (or `sessiometer daemon
+stop` to stop it just for this login session), then `sessiometer run`.
 
 ## Checking status
 
@@ -747,9 +788,9 @@ To remove `sessiometer` completely and hand credential custody back to plain
 Claude Code:
 
 1. **Stop the daemon.** If you installed the background LaunchAgent, remove it with
-   `sessiometer service uninstall` (this unloads it and deletes its plist). Also quit
-   any running foreground `sessiometer run` (Ctrl-C in its terminal, or kill the
-   process). After that, nothing runs in the background.
+   `sessiometer service uninstall` (this unloads it and deletes its plist). Also stop
+   any running foreground `sessiometer run` with `sessiometer daemon stop` (or Ctrl-C
+   in its terminal). After that, nothing runs in the background.
 
 2. **Erase the per-account stashes.** The cleanest way is to `remove` each captured
    account, which deletes its `Sessiometer/<account_uuid>` keychain stash:
