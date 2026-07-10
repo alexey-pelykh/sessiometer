@@ -69,12 +69,17 @@
 //! session gate (a session-saturated account is never a swap target, mirroring the
 //! weekly-exhaustion exclusion); the post-swap cooldown (#10) additionally PACES swaps
 //! — a re-swap is refused until the per-cycle jittered cooldown has elapsed — and the
-//! swap-target session floor is an opt-in reserve on top (off by default). When EVERY
-//! account is weekly-exhausted there is no viable target
-//! ([`TickAction::NoViableTarget`], #11): the loop enters the all-exhausted
-//! terminal state — it HOLDS (no swap, so no thrash) and emits a single
-//! edge-triggered `all_exhausted` event naming the least-bad account (the soonest
-//! weekly `resets_at`), which now fills the event log's `resets_at=` field.
+//! swap-target session floor (#398) is a default-on reserve on top: a PROACTIVE swap
+//! only lands on an account whose session usage is *below* the floor, so the target
+//! keeps runway. The floor is a hard filter on that path — if nothing sits below it,
+//! holding is the correct answer. An EMERGENCY swap (the active credential is dead or
+//! quarantined) drops the floor entirely: any live account beats a dead one, and
+//! honouring the floor there would strand the daemon on the corpse. When no target
+//! survives the filters there is no viable target ([`TickAction::NoViableTarget`],
+//! #11): the loop enters the all-exhausted terminal state — it HOLDS (no swap, so no
+//! thrash) and emits a single edge-triggered `all_exhausted` event naming the
+//! least-bad account, its `cause=` (session-blocked vs weekly-exhausted) and, when
+//! known, the `resets_at=` of the relief that unblocks it.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -1239,13 +1244,15 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// so the "next swap" candidate never flickers with per-cycle session-trigger
     /// jitter; the live swap path (`decide_action`) uses the per-cycle drawn trigger.
     session_trigger_base: f64,
-    /// Opt-in swap-target session guard (#10): `Some(fraction)` only swaps TO an
-    /// account whose session usage is below it (`session_floor / 100`); `None` (the
-    /// default) disables the guard, leaving target choice to the soonest-reset rule
-    /// (issue #37) constrained by the always-on session gate (`session < session_trigger`)
-    /// — which is what prevents session-saturated oscillation; the floor is a STRICTER
-    /// reserve layered on top.
-    session_floor: Option<f64>,
+    /// Default-on swap-target session reserve (issue #398) as a fraction
+    /// (`session_floor / 100`), always valued. The PROACTIVE swap path passes it as
+    /// `Some(..)` to [`pick_target`] — only swap TO an account whose session usage is
+    /// below it — layering a STRICTER reserve on the always-on session gate
+    /// (`session < session_trigger`, which prevents oscillation on its own). The
+    /// EMERGENCY path ([`Self::emergency_swap`]) passes `None` instead: when the active
+    /// credential is DEAD, liveness beats the reserve. Supersedes #10's opt-in `None`
+    /// default — the config floor is now always set.
+    session_floor: f64,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
@@ -1387,7 +1394,7 @@ where
             // off (issue #72), NOT the per-cycle jittered swap-decision draw.
             weekly_trigger_base: f64::from(tunables.weekly_trigger) / 100.0,
             session_trigger_base: f64::from(tunables.session_trigger) / 100.0,
-            session_floor: tunables.session_floor.map(|floor| f64::from(floor) / 100.0),
+            session_floor: f64::from(tunables.session_floor) / 100.0,
             cooldown_strategy: tunables.cooldown_strategy,
             // The un-jittered cooldown window the socket `swap` command gates a manual
             // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
@@ -2705,30 +2712,34 @@ where
             active_idx,
             readings,
             &self.enabled_mask(),
-            self.session_floor,
+            Some(self.session_floor),
             session_trigger,
             weekly_trigger,
         ) else {
             // No viable target — every other account is weekly-exhausted, session-
-            // saturated (over the always-on session gate), or over the opt-in floor.
+            // saturated (over the always-on session gate), or over the default-on floor.
             // The all-exhausted TERMINAL state (issue #11): HOLD, do NOT swap (swapping
             // among exhausted accounts only thrashes), and emit ONE edge-triggered
-            // signal naming the least-bad account by soonest weekly reset, so the
-            // operator knows when relief arrives. (For the session-saturated case relief
-            // actually arrives at the sooner SESSION reset; keying the hint off session
-            // when the block is session-wide is a follow-up — the minimal gate keeps the
-            // existing weekly-reset hint.) The active account is left exactly as is.
-            // The signal is edge-triggered: emit only on ENTERING the state, so the
-            // payload is computed once per episode, not every poll while it holds.
+            // signal naming the least-bad account and WHY relief is blocked
+            // (`cause=session|weekly`), so the operator knows when relief arrives. When
+            // the block is session-wide (a weekly-viable account held out only by
+            // session), relief arrives at the sooner SESSION reset and the hint keys off
+            // it (issue #398, the acknowledged follow-up); otherwise it is the weekly
+            // reset (#11). The active account is left exactly as is. The signal is
+            // edge-triggered: emit only on ENTERING the state, so the payload is computed
+            // once per episode, not every poll while it holds.
             if !self.state.signaled_all_exhausted {
-                let (hold_idx, resets_at) = match soonest_weekly_reset(readings) {
-                    Some((idx, at)) => (idx, Some(at)),
-                    // No account reported a parseable weekly reset: fall back to the
-                    // active account, timestamp omitted (forward-compatible).
-                    None => (active_idx, None),
-                };
+                let session_ceiling = session_trigger.min(self.session_floor);
+                let (cause, hold_idx, resets_at) = all_exhausted_relief(
+                    active_idx,
+                    readings,
+                    &self.enabled_mask(),
+                    session_ceiling,
+                    weekly_trigger,
+                );
                 events.push(Event::AllExhausted {
                     hold: self.roster[hold_idx].label.clone(),
+                    cause,
                     resets_at,
                 });
                 self.state.signaled_all_exhausted = true;
@@ -3302,15 +3313,17 @@ where
             active_idx,
             readings,
             &self.enabled_mask(),
-            self.session_floor,
-            // No always-on session gate on the emergency path: the active credential is
-            // DEAD, so liveness beats optimality — escape to a live account even if it is
-            // over the session trigger. (An opt-in `session_floor`, passed just above, is
-            // still honored: a configured reserve is not breached even in the emergency;
-            // with the default floor OFF, any live account qualifies.) This cannot
-            // ping-pong: the dead active is quarantined (never a viable target), and once
-            // a session-fresh target exists the normal path's session gate moves off the
+            // Drop the session-floor reserve on the emergency path (issue #398): the
+            // active credential is DEAD, so liveness beats the reserve — escape to ANY
+            // live account even if it is over the floor. Without this, a default-on floor
+            // (#398) plus every live account at/above it would strand the daemon on the
+            // dead active (`ActiveDeadNoTarget`) — a self-DoS. The dead active is
+            // quarantined (never a viable target), so this cannot ping-pong; once a
+            // session-fresh target exists the normal path's session gate moves off any
             // saturated account cleanly.
+            None,
+            // Also bypass the always-on session gate here (same liveness rationale):
+            // escape even to an account over the session trigger.
             f64::INFINITY,
             weekly_trigger,
         ) else {
@@ -3361,7 +3374,7 @@ where
             active_idx,
             readings,
             &enabled,
-            self.session_floor,
+            Some(self.session_floor),
             self.session_trigger_base,
             self.weekly_trigger_base,
         ) {
@@ -3433,7 +3446,7 @@ where
                 active,
                 &readings,
                 &enabled,
-                self.session_floor,
+                Some(self.session_floor),
                 self.session_trigger_base,
                 self.weekly_trigger_base,
             ) {
@@ -3974,9 +3987,10 @@ fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
 /// exactly such a target, producing an indefinite session ping-pong between the two
 /// soonest-reset accounts. The `session < session_trigger` filter closes that: the
 /// acquire predicate is now at least as strict as the negation of the release
-/// predicate on BOTH dimensions. It is always-on, distinct from the opt-in `floor`
-/// (#10) — a STRICTER reserve layered on top (effective ceiling
-/// `min(session_trigger, floor)`). The disabled exclusion (#36): a parked account
+/// predicate on BOTH dimensions. It is unconditional, distinct from `floor` — a
+/// STRICTER reserve layered on top (effective ceiling `min(session_trigger, floor)`)
+/// which the PROACTIVE caller passes (default 80, #398) and the EMERGENCY caller
+/// drops (`None`) so a dead active always escapes. The disabled exclusion (#36): a parked account
 /// is never a destination even with ample headroom, and — being excluded here
 /// rather than relying on its (skipped) poll — it can never hold the daemon out of
 /// the #11 terminal state.
@@ -3998,7 +4012,7 @@ fn pick_target(
         // Always-on session anti-thrash gate: exclude a target at/above the session
         // trigger — it would immediately re-trip [`swap::decide`]'s session dimension
         // and thrash (the exact mirror of the weekly filter above). Distinct from the
-        // opt-in `floor` below, which tightens this ceiling further when set.
+        // `floor` below, which tightens this ceiling further when the caller passes it.
         .filter(|&(_, usage)| usage.session < session_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
@@ -4028,6 +4042,57 @@ fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
         }
     }
     soonest
+}
+
+/// Classify why [`pick_target`] found no viable target, for the `all_exhausted`
+/// relief hint (issue #398): `(cause, hold_idx, resets_at)`.
+///
+/// A candidate that is weekly-VIABLE (`weekly < weekly_trigger`) but session-blocked
+/// (`session >= session_ceiling`, the ceiling being `min(session_trigger, floor)`) is
+/// held out ONLY by session — it returns at its SESSION reset, sooner than any weekly
+/// reset. If any such candidate exists the block is session-wide: report
+/// [`SwapReason::Session`] and key the hint off the soonest such session reset (naming
+/// that account). Otherwise every candidate is weekly-exhausted: report
+/// [`SwapReason::Weekly`] and fall back to the soonest weekly reset (the #11 default).
+/// `resets_at` is `None` when the relevant window has no parseable reset (the
+/// forward-compatible "hold, timestamp omitted" case).
+fn all_exhausted_relief(
+    active: usize,
+    readings: &[Option<Usage>],
+    enabled: &[bool],
+    session_ceiling: f64,
+    weekly_trigger: f64,
+) -> (SwapReason, usize, Option<i64>) {
+    // Soonest SESSION reset among weekly-viable-but-session-blocked candidates, plus a
+    // naming fallback (the first such account) for when none reports a parseable reset.
+    let mut session_relief: Option<(usize, i64)> = None;
+    let mut session_blocked: Option<usize> = None;
+    for (i, reading) in readings.iter().enumerate() {
+        if i == active || !enabled[i] {
+            continue;
+        }
+        let Some(usage) = reading else { continue };
+        if usage.weekly < weekly_trigger && usage.session >= session_ceiling {
+            session_blocked.get_or_insert(i);
+            if let Some(at) = usage.session_resets_at {
+                if session_relief.is_none_or(|(_, best)| at < best) {
+                    session_relief = Some((i, at));
+                }
+            }
+        }
+    }
+    if let Some(fallback) = session_blocked {
+        // Session-wide: a weekly-viable account is held out only by session.
+        return match session_relief {
+            Some((idx, at)) => (SwapReason::Session, idx, Some(at)),
+            None => (SwapReason::Session, fallback, None),
+        };
+    }
+    // Weekly-wide: every candidate is weekly-exhausted (the #11 default).
+    match soonest_weekly_reset(readings) {
+        Some((idx, at)) => (SwapReason::Weekly, idx, Some(at)),
+        None => (SwapReason::Weekly, active, None),
+    }
 }
 
 /// The daemon's own re-validation verdict for a socket `swap` command (issue #167) — the pure
@@ -4746,9 +4811,9 @@ mod tests {
         Tunables {
             poll_secs: 60,
             cooldown_secs: cooldown,
-            // Most daemon tests opt the floor IN (the pre-#10 behavior they were
-            // written against); `tunables_floor_off` covers the new default.
-            session_floor: Some(floor),
+            // Most daemon tests set an explicit floor; `tunables_floor_off` sets it
+            // inert (== trigger) for the tests that pin the always-on gate instead.
+            session_floor: floor,
             session_trigger: trigger,
             weekly_trigger: WEEKLY_TRIGGER,
             monitor_401_n: 3,
@@ -4762,13 +4827,14 @@ mod tests {
         }
     }
 
-    /// Tunables with the session-floor guard OFF — the #10 default. The floor is
-    /// the only field that differs from [`tunables`], so the rest is reused.
+    /// Tunables with the session-floor reserve INERT — set to `session_trigger`, so
+    /// `pick_target`'s floor filter never tightens beyond the always-on session gate
+    /// (config allows `session_floor == session_trigger`). Post-#398 the floor is
+    /// always-valued, so "no extra tightening" is expressed this way rather than the
+    /// removed opt-out; behaviorally identical to the old `None` for target selection.
+    /// The tests that use it pin the always-on gate / weekly behavior, not the reserve.
     fn tunables_floor_off(trigger: u8, cooldown: u64) -> Tunables {
-        Tunables {
-            session_floor: None,
-            ..tunables(trigger, 0, cooldown)
-        }
+        tunables(trigger, trigger, cooldown)
     }
 
     fn cred(blob: &[u8]) -> Credential {
@@ -6890,14 +6956,16 @@ mod tests {
         let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::NoViableTarget);
-        // The floor-driven no-viable-target path emits one all_exhausted event.
-        // No reading carried a weekly reset here, so #11 falls back to the active
-        // handle with `resets_at` omitted (the soonest-reset path is covered by the
-        // all-weekly-exhausted test below).
+        // Floor-driven exhaustion: B is weekly-viable but over the session floor, so
+        // the block is session-wide (#398) — cause=session, naming B ("spare", the
+        // account relief comes from at its session reset). The poller reports no
+        // session reset, so `resets_at` is omitted (the soonest-reset path is covered
+        // by the all-weekly-exhausted test below).
         assert_eq!(
             outcome.events,
             vec![Event::AllExhausted {
-                hold: "work".to_owned(),
+                hold: "spare".to_owned(),
+                cause: SwapReason::Session,
                 resets_at: None,
             }],
         );
@@ -6937,8 +7005,8 @@ mod tests {
             .ok_resets("u-A", 0.50, 0.99, A_RESET)
             .ok_resets("u-B", 0.50, 0.99, B_RESET)
             .ok_resets("u-C", 0.50, 0.99, C_RESET);
-        // Floor OFF (the #10 default); weekly_trigger 98 via the tunables helper, so
-        // the swap-away fires on the weekly dimension and every target is excluded.
+        // Floor inert (== trigger via tunables_floor_off); weekly_trigger 98, so the
+        // swap-away fires on the weekly dimension and every target is excluded.
         let tun = tunables_floor_off(95, 0);
 
         let mut daemon: FakeDaemon = Daemon::new(
@@ -6959,6 +7027,7 @@ mod tests {
             first.events,
             vec![Event::AllExhausted {
                 hold: "spare".to_owned(),
+                cause: SwapReason::Weekly,
                 resets_at: Some(B_RESET),
             }],
         );
@@ -13824,6 +13893,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emergency_swap_escapes_a_dead_active_ignoring_the_floor() {
+        // #398 atomicity: the emergency path drops the session-floor reserve. A
+        // confirmed-dead ACTIVE account must escape to the ONLY live target even when
+        // that target sits OVER the default-on floor (0.80) — liveness beats the
+        // reserve. Without the floor-drop (emergency passes `None`, not the configured
+        // floor), a default-on floor plus an over-floor live spare would strand the
+        // daemon on the dead credential (`ActiveDeadNoTarget`) — a self-DoS. This test
+        // gates shipping the default-on flip together with the emergency floor-drop.
+        let mut daemon = lifecycle_daemon_with(FakeRosterPoller::new(), tunables(95, 80, 0)).await;
+        let at = daemon.clock.now();
+        daemon.state.active = Some(0);
+        daemon.state.health[0].quarantined = true;
+
+        // Dead active has no reading; the spare polled live but is OVER the floor
+        // (0.85 ≥ 0.80) — the PROACTIVE path would exclude it, the emergency path must
+        // not. It is weekly-viable (0.10) and below the session trigger (0.85 < 0.95),
+        // so ONLY the floor could have blocked it.
+        let readings = vec![
+            None,
+            Some(Usage {
+                session: 0.85,
+                weekly: 0.10,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }),
+        ];
+        let mut events = Vec::new();
+        let action = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+
+        assert_eq!(
+            action,
+            TickAction::EmergencySwapped { from: 0, to: 1 },
+            "the dead active must escape to the over-floor live spare (floor dropped on emergency)"
+        );
+        assert_eq!(
+            events,
+            vec![Event::EmergencySwap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            }]
+        );
+        assert_eq!(daemon.state.active, Some(1));
+    }
+
+    #[tokio::test]
     async fn a_recovering_active_account_is_held_never_swapped_away() {
         // Thrash-safety / protect-recovery: a quarantined ACTIVE account that is
         // polling live again is the operator's re-login recovering it. Hold — never
@@ -14717,7 +14833,7 @@ mod tests {
             &Diagnostic::Start {
                 accounts: 3,
                 poll_secs: 30,
-                session_floor: Some(70),
+                session_floor: 70,
                 session_trigger: 90,
                 weekly_trigger: 98,
                 monitor_401_n: 5,

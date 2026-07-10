@@ -433,13 +433,17 @@ pub(crate) enum Event {
     ReStash { account: String },
     /// The active account is over a trigger but no other account is a viable swap
     /// target — the all-exhausted terminal state (issue #11). `hold` is the
-    /// least-bad account the daemon holds on: the one whose weekly window resets
-    /// soonest. `resets_at` is that account's weekly reset as epoch seconds,
+    /// least-bad account the daemon holds on. `cause` (issue #398) is WHY relief is
+    /// blocked: [`SwapReason::Session`] when a weekly-viable account is held out only
+    /// by session (relief at the sooner SESSION reset) or [`SwapReason::Weekly`] when
+    /// every candidate is weekly-exhausted (relief at the weekly reset); `hold` and
+    /// `resets_at` name that cause's reset. `resets_at` is that reset as epoch seconds,
     /// rendered to RFC 3339 by [`Event::to_log_line`] and present whenever the API
-    /// supplied a parseable timestamp; `None` (the field is omitted) when no
-    /// account reported one, keeping the line forward-compatible.
+    /// supplied a parseable timestamp; `None` (the field is omitted) when no account
+    /// reported one, keeping the line forward-compatible.
     AllExhausted {
         hold: String,
+        cause: SwapReason,
         resets_at: Option<i64>,
     },
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
@@ -698,13 +702,21 @@ impl Event {
             Event::ReStash { account } => {
                 format!("ts={ts} event=restash account={account}")
             }
-            Event::AllExhausted { hold, resets_at } => match resets_at {
-                Some(secs) => {
-                    let resets_at = rfc3339(system_time_from_epoch(*secs));
-                    format!("ts={ts} event=all_exhausted hold={hold} resets_at={resets_at}")
-                }
-                None => format!("ts={ts} event=all_exhausted hold={hold}"),
-            },
+            Event::AllExhausted {
+                hold,
+                cause,
+                resets_at,
+            } => {
+                // `cause` (#398) is a required field after `hold`; `resets_at` trails
+                // optionally (an empty value would split the key=val grammar), mirroring
+                // the swap line's optional `late=`.
+                let cause = cause.as_str();
+                let resets = match resets_at {
+                    Some(secs) => format!(" resets_at={}", rfc3339(system_time_from_epoch(*secs))),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=all_exhausted hold={hold} cause={cause}{resets}")
+            }
             Event::Monitor401 {
                 account,
                 consecutive,
@@ -1205,7 +1217,7 @@ pub(crate) enum Diagnostic {
     Start {
         accounts: usize,
         poll_secs: u64,
-        session_floor: Option<u8>,
+        session_floor: u8,
         session_trigger: u8,
         weekly_trigger: u8,
         monitor_401_n: u8,
@@ -1262,13 +1274,8 @@ impl Diagnostic {
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
-                // session_floor is opt-in (#10): render the disabled state as an
-                // explicit `off` sentinel rather than omitting the key, so the
-                // summary always STATES whether the swap-target session guard is on.
-                let session_floor = match session_floor {
-                    Some(floor) => floor.to_string(),
-                    None => "off".to_owned(),
-                };
+                // session_floor (#398) is always-valued — render its percent directly,
+                // like the other counts/percentages (no `off` sentinel to carry).
                 format!(
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
                      session_floor={session_floor} session_trigger={session_trigger} \
@@ -1457,27 +1464,35 @@ mod tests {
     }
 
     #[test]
-    fn all_exhausted_renders_resets_at_when_known_and_omits_it_otherwise() {
-        // No reset reported (#11 fallback) → the field is simply absent and the
-        // line stays well-formed.
+    fn all_exhausted_renders_cause_and_resets_at_when_known_and_omits_reset_otherwise() {
+        // No reset reported (#11 fallback) → resets_at is simply absent and the line
+        // stays well-formed; cause (#398) is always present.
         let absent = Event::AllExhausted {
             hold: "work".to_owned(),
+            cause: SwapReason::Weekly,
             resets_at: None,
         }
         .to_log_line(at_epoch(0));
-        assert_eq!(absent, format!("{TS0} event=all_exhausted hold=work"));
+        assert_eq!(
+            absent,
+            format!("{TS0} event=all_exhausted hold=work cause=weekly")
+        );
         assert!(!absent.contains("resets_at"), "got: {absent}");
 
         // A known reset (epoch seconds, #11) is rendered to RFC 3339 by the same
-        // single formatter — 1_782_777_600 is 2026-06-30T00:00:00Z.
+        // single formatter — 1_782_777_600 is 2026-06-30T00:00:00Z. A session-wide
+        // block (#398) reports cause=session and keys off the SESSION reset.
         let present = Event::AllExhausted {
             hold: "work".to_owned(),
+            cause: SwapReason::Session,
             resets_at: Some(1_782_777_600),
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             present,
-            format!("{TS0} event=all_exhausted hold=work resets_at=2026-06-30T00:00:00Z")
+            format!(
+                "{TS0} event=all_exhausted hold=work cause=session resets_at=2026-06-30T00:00:00Z"
+            )
         );
     }
 
@@ -1872,6 +1887,7 @@ mod tests {
             },
             Event::AllExhausted {
                 hold: "work".to_owned(),
+                cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
             },
             Event::ReStash {
@@ -2277,11 +2293,12 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn start_line_renders_the_effective_config_summary() {
-        // session_floor present → its percent; the rest are counts/percentages.
-        let on = Diagnostic::Start {
+        // session_floor (#398, always-valued) renders as its percent, like the rest —
+        // counts and percentages only, no handle.
+        let line = Diagnostic::Start {
             accounts: 3,
             poll_secs: 30,
-            session_floor: Some(70),
+            session_floor: 70,
             session_trigger: 90,
             weekly_trigger: 98,
             monitor_401_n: 5,
@@ -2289,26 +2306,12 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
-            on,
+            line,
             format!(
                 "{TS0} diag=start accounts=3 poll_secs=30 session_floor=70 \
                  session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4"
             )
         );
-
-        // session_floor absent → the explicit `off` sentinel (the guard is disabled,
-        // #10), never an empty value that would split the key=val grammar.
-        let off = Diagnostic::Start {
-            accounts: 1,
-            poll_secs: 60,
-            session_floor: None,
-            session_trigger: 80,
-            weekly_trigger: 95,
-            monitor_401_n: 3,
-            monitor_recovery_m: 2,
-        }
-        .to_log_line(at_epoch(0));
-        assert!(off.contains("session_floor=off"), "got: {off}");
     }
 
     #[test]
@@ -2436,7 +2439,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             Diagnostic::Start {
                 accounts: 2,
                 poll_secs: 30,
-                session_floor: Some(70),
+                session_floor: 70,
                 session_trigger: 90,
                 weekly_trigger: 98,
                 monitor_401_n: 5,

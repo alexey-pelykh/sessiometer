@@ -969,8 +969,8 @@ mod tests {
         let existing = Config {
             roster: vec![],
             tunables: Tunables {
-                poll_secs: 120,          // a non-default the operator set
-                session_floor: Some(80), // opt-in guard the operator enabled
+                poll_secs: 120,    // a non-default the operator set
+                session_floor: 70, // a non-default reserve (default 80) the operator set
                 ..Tunables::default()
             },
             refresh: RefreshConfig::default(),
@@ -992,9 +992,9 @@ mod tests {
         assert_eq!(report.outcome, CaptureOutcome::Captured);
         assert_eq!(report.config.roster.len(), 1);
         // The operator's tunables survive the bootstrap (NOT reset to defaults:
-        // poll_secs default is 300, session_floor default is None).
+        // poll_secs default is 300, session_floor default is 80 — #398).
         assert_eq!(report.config.tunables.poll_secs, 120);
-        assert_eq!(report.config.tunables.session_floor, Some(80));
+        assert_eq!(report.config.tunables.session_floor, 70);
     }
 
     #[tokio::test]
@@ -1106,7 +1106,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\nsession_floor = 80\n",
+            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\nsession_floor = 70\n",
         )
         .unwrap();
 
@@ -1117,9 +1117,9 @@ mod tests {
             "a file with no [[account]] loads with an empty roster"
         );
         // The operator's tunables survive the load — NOT reset to defaults (default
-        // poll_secs is 300, default session_floor is None).
+        // poll_secs is 300, default session_floor is 80 — #398).
         assert_eq!(config.tunables.poll_secs, 120);
-        assert_eq!(config.tunables.session_floor, Some(80));
+        assert_eq!(config.tunables.session_floor, 70);
     }
 
     #[test]
