@@ -49,6 +49,13 @@ targets:
       - path: Sources/SocketPathResolver.swift
       - path: Sources/WatchConnection.swift
       - path: Sources/WatchTransport.swift
+      # Control-command transport (#358): the short-lived client→daemon write path + its redacted-ack
+      # decoder. Compiled here (both are pure logic over the WatchConnection seam — no AppKit) so the
+      # one-shot exchange (bounded timeout, connection-refused, closed-before-ack) is driven by the
+      # same in-process fake connector as WatchTransport, and SwapAck decoding is exercised, with no
+      # real socket and no live daemon.
+      - path: Sources/ControlCommandClient.swift
+      - path: Sources/SwapAck.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
