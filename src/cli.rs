@@ -36,6 +36,7 @@ use crate::observability::{
 use crate::paths;
 use crate::refresh;
 use crate::refresh_tick::{RealRefreshEngine, RefreshTick};
+use crate::service::AgentSupervision;
 use crate::sha256::sha256_hex;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
@@ -81,12 +82,12 @@ enum Command {
     Login { label: Option<String> },
     /// `run [-v|--verbose]` — the foreground poll+swap daemon.
     Run { verbose: bool },
-    /// `service install|uninstall|start|stop|restart|status` — manage the background
-    /// launchd LaunchAgent and its lifecycle.
+    /// `service install|uninstall|status` — the PERSISTENCE noun (issue #397): manage the
+    /// background launchd LaunchAgent (install/uninstall) and report whether one is installed.
     Service { action: ServiceAction },
-    /// `daemon status` — report the daemon *process*: its liveness and management mode
-    /// (issue #396). The process-lifecycle counterpart to the persistence-oriented
-    /// `service` noun. Read-only — nothing is started, stopped, or signalled.
+    /// `daemon status|stop|restart` — the daemon *process* (issues #396, #397): its liveness
+    /// and management mode (`status`, read-only), plus stopping / restarting it (`stop` /
+    /// `restart`). The process-lifecycle counterpart to the persistence-oriented `service` noun.
     Daemon { action: DaemonAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
@@ -132,34 +133,39 @@ enum Command {
     Help(HelpTopic),
 }
 
-/// The `service` sub-action (issues #166, #376): install/uninstall the background
-/// LaunchAgent, or drive its lifecycle (start/stop/restart/status) over the installed
-/// agent. A plain data enum, like [`Command`] — the parser resolves the sub-verb so
-/// `execute` just dispatches.
+/// The `service` sub-action (issues #166, #376, #397): the PERSISTENCE noun —
+/// install/uninstall the background LaunchAgent and report whether one is installed. The
+/// #397 split re-homed process lifecycle (stop/restart) to the `daemon` noun, so the pre-0.1.0
+/// `start`/`stop`/`restart` sub-verbs are removed (no deprecation cycle). A plain data enum,
+/// like [`Command`] — the parser resolves the sub-verb so `execute` just dispatches.
 #[derive(Debug, PartialEq)]
 enum ServiceAction {
     /// `service install` — write + load the LaunchAgent so `run` starts at login.
     Install,
     /// `service uninstall` — unload + remove the LaunchAgent.
     Uninstall,
-    /// `service start` — load the installed agent into the per-user launchd domain.
-    Start,
-    /// `service stop` — boot the installed agent out of the domain (stops it now).
-    Stop,
-    /// `service restart` — `kickstart -k` the installed agent (kill + relaunch).
-    Restart,
-    /// `service status` — report whether the installed agent is loaded/running.
+    /// `service status` — is a managed service installed / enabled at login? (the "is-enabled"
+    /// question; the running-process question is [`DaemonAction::Status`]).
     Status,
 }
 
-/// The `daemon` sub-action (issue #396). The 0.1.0 leaf ships only `status` — the read-only
-/// liveness + management-mode report; the lifecycle restructure (#397) extends this scaffold
-/// with `stop`/`restart`. A plain data enum, like [`ServiceAction`] — the parser resolves the
-/// sub-verb so `execute` just dispatches.
+/// The `daemon` sub-action (issue #396 scaffold, extended by #397): the PROCESS-lifecycle
+/// noun — counterpart to the persistence-oriented [`ServiceAction`]. `status` reports the
+/// running process (read-only, #396); `stop`/`restart` (#397) act on it. A plain data enum —
+/// the parser resolves the sub-verb so `execute` just dispatches. There is deliberately NO
+/// standalone `start`: a daemon is started by `service install` (managed) or `sessiometer run`
+/// (unmanaged), so a `daemon start` would error on an unmanaged setup and be redundant with
+/// `service install` on a managed one.
 #[derive(Debug, PartialEq)]
 enum DaemonAction {
     /// `daemon status` — report whether a daemon is running, and how it is managed.
     Status,
+    /// `daemon stop` — stop the running daemon now. Managed → `launchctl bootout`; unmanaged →
+    /// a same-user-gated `{"cmd":"shutdown"}` control request. Post-condition: not running.
+    Stop,
+    /// `daemon restart` — restart the running daemon. Managed → `launchctl kickstart -k`;
+    /// unmanaged → a clear error (nothing supervises a bare `run` to respawn it).
+    Restart,
 }
 
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
@@ -309,10 +315,11 @@ fn parse_run(parser: &mut lexopt::Parser) -> Result<Command> {
     Ok(Command::Run { verbose })
 }
 
-/// Parse `service <install|uninstall|start|stop|restart|status>` (issues #166, #376): the
-/// first positional is the sub-action, `-h`/`--help` short-circuits to help, an unknown flag
-/// is rejected, and an unrecognized action is a strict-usage error. Bare `service` (no
-/// action) prints the service help.
+/// Parse `service <install|uninstall|status>` (issues #166, #376, #397): the first positional
+/// is the sub-action, `-h`/`--help` short-circuits to help, an unknown flag is rejected, and an
+/// unrecognized action is a strict-usage error. Bare `service` (no action) prints the service
+/// help. The #397 split removed `start`/`stop`/`restart` — they now fall into the unknown-action
+/// arm (a strict error pointing at `service --help`), never a silent no-op.
 fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut action = None;
     while let Some(arg) = parser.next()? {
@@ -323,9 +330,6 @@ fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
                 action = Some(match name.as_ref() {
                     "install" => ServiceAction::Install,
                     "uninstall" => ServiceAction::Uninstall,
-                    "start" => ServiceAction::Start,
-                    "stop" => ServiceAction::Stop,
-                    "restart" => ServiceAction::Restart,
                     "status" => ServiceAction::Status,
                     other => {
                         return Err(Error::CliUsage {
@@ -345,11 +349,11 @@ fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
     }
 }
 
-/// Parse `daemon <status>` (issue #396): the process-lifecycle noun. The 0.1.0 leaf accepts
-/// only `status`; the first positional is the sub-action, `-h`/`--help` short-circuits to help,
-/// an unknown flag or action is a strict-usage error, and bare `daemon` (no action) prints the
-/// daemon help. Mirrors [`parse_service`] so the lifecycle restructure (#397) grows the action
-/// set without reshaping the parser.
+/// Parse `daemon <status|stop|restart>` (issues #396, #397): the process-lifecycle noun. The
+/// first positional is the sub-action, `-h`/`--help` short-circuits to help, an unknown flag or
+/// action is a strict-usage error, and bare `daemon` (no action) prints the daemon help. Mirrors
+/// [`parse_service`]; #397 grew the action set (`stop`/`restart`) without reshaping the parser.
+/// There is deliberately no `start` — it falls into the unknown-action arm (see [`DaemonAction`]).
 fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut action = None;
     while let Some(arg) = parser.next()? {
@@ -359,6 +363,8 @@ fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
                 let name = value.to_string_lossy();
                 action = Some(match name.as_ref() {
                     "status" => DaemonAction::Status,
+                    "stop" => DaemonAction::Stop,
+                    "restart" => DaemonAction::Restart,
                     other => {
                         return Err(Error::CliUsage {
                             message: format!("unknown daemon action `{other}`"),
@@ -612,13 +618,12 @@ async fn execute(command: Command) -> Result<()> {
         Command::Service { action } => match action {
             ServiceAction::Install => crate::service::install().await,
             ServiceAction::Uninstall => crate::service::uninstall().await,
-            ServiceAction::Start => crate::service::start().await,
-            ServiceAction::Stop => crate::service::stop().await,
-            ServiceAction::Restart => crate::service::restart().await,
             ServiceAction::Status => crate::service::status().await,
         },
         Command::Daemon { action } => match action {
             DaemonAction::Status => daemon_status().await,
+            DaemonAction::Stop => daemon_stop().await,
+            DaemonAction::Restart => daemon_restart().await,
         },
         Command::Status {
             json,
@@ -682,8 +687,8 @@ COMMANDS:
     capture [<label>]    Stash the active account into the rotation
     login [<label>]      Log in to an account (claude /login) in isolation and land it in the rotation, keeping the active account
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
-    service <install|uninstall|start|stop|restart|status>  Manage the background launchd LaunchAgent (install/uninstall) and drive its lifecycle (start/stop/restart/status)
-    daemon <status>      Report the running daemon process: alive? managed (launchd) / unmanaged (foreground run) / not running
+    service <install|uninstall|status>  Persistence: install/uninstall the background launchd LaunchAgent, and report whether one is installed (auto-start at login)
+    daemon <status|stop|restart>  Process lifecycle: report the running daemon (status), stop it, or restart it
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -743,22 +748,20 @@ USAGE:
     -h, --help     print this help
 ";
 
-const SERVICE_USAGE: &str = "sessiometer service — run the daemon in the background via a launchd LaunchAgent, and manage its lifecycle
+const SERVICE_USAGE: &str = "sessiometer service — install the daemon as a background launchd LaunchAgent so it auto-starts at login (persistence)
 
 USAGE:
-    sessiometer service <install|uninstall|start|stop|restart|status>
+    sessiometer service <install|uninstall|status>
 
     install     write + load a per-user LaunchAgent that runs `sessiometer run` at login and keeps it up across the session
-    uninstall   unload + remove that LaunchAgent
-    start       load the installed agent into the launchd domain (start it now)
-    stop        boot the installed agent out of the domain (stop it now; it returns at next login — `uninstall` removes it for good)
-    restart     kickstart -k the installed agent (kill + relaunch) — the recovery verb for a stuck/stale daemon or an applied config change
-    status      report whether the installed agent is loaded/running
+    uninstall   unload + remove that LaunchAgent (stops it now, and it won't return at next login)
+    status      is a managed service installed / enabled at login? (the persistence question)
     -h, --help  print this help
 
-start/stop/restart/status act on an agent installed by `service install`. Run against a
-foreground `sessiometer run` (no LaunchAgent installed), they print clear guidance and exit
-non-zero rather than silently doing nothing.
+`service` owns PERSISTENCE — whether the daemon auto-starts at login — not the running
+process. To act on the process itself (stop it, restart it) or ask whether one is running,
+use `daemon` (`sessiometer daemon status|stop|restart`): `service status` answers \"is a
+managed service installed?\", while `daemon status` answers \"is a daemon running?\".
 
 The agent invokes the lock-guarded `sessiometer run`, so the background agent and a
 foreground `run` can never both drive the swap loop: whichever starts second refuses
@@ -766,19 +769,37 @@ with a clear message and exits 3, performing no swap. This single-owner guard is
 safety guard — nothing bypasses it.
 ";
 
-const DAEMON_USAGE: &str = "sessiometer daemon — inspect the running daemon process: its liveness and how it is managed
+const DAEMON_USAGE: &str = "sessiometer daemon — the running daemon process: report it, stop it, restart it (process lifecycle)
 
 USAGE:
-    sessiometer daemon <status>
+    sessiometer daemon <status|stop|restart>
 
     status      report whether a daemon is running, and whether it is managed (launchd) or unmanaged (a foreground / detached `sessiometer run`)
+    stop        stop the running daemon now — managed: launchctl bootout; unmanaged: a graceful control-socket shutdown (an in-flight swap completes first)
+    restart     restart a managed daemon (launchctl kickstart -k); an unmanaged daemon has no restart (see below)
     -h, --help  print this help
 
 `daemon` is the process-lifecycle counterpart to `service` (which owns the launchd
-registration). `daemon status` is READ-ONLY — it starts, stops, and signals nothing. It
-asks the control socket first (a responsive daemon answers), then falls back to the
-single-instance lock, so a daemon that is alive but not yet answering (starting up) is
-reported honestly rather than as not running. Exits 0 whenever it can determine state.
+registration / auto-start persistence). `status` is READ-ONLY — it starts, stops, and
+signals nothing; it asks the control socket first (a responsive daemon answers), then falls
+back to the single-instance lock, so a daemon alive but not yet answering (starting up) is
+reported honestly rather than as not running. If one is running, it also asks launchd whether
+that process is the one it supervises.
+
+A MANAGED daemon is one launchd is supervising right now, so it can be stopped (booted out of
+the domain, which also suppresses the auto-respawn) and restarted (killed and relaunched in one
+step). An UNMANAGED daemon (a foreground / detached `sessiometer run`) has no supervisor:
+`daemon stop` still stops it (it shuts down gracefully over the control socket), but there is
+nothing to relaunch it, so `daemon restart` is a clear error — install a managed service
+(`service install`) for a supervised daemon with restart, or stop it and start a new
+`sessiometer run`.
+
+Managed means supervised, not merely registered: `daemon stop` leaves the service installed, so
+a `sessiometer run` started afterwards is unmanaged even while `service status` still reports an
+installed service. These verbs follow the running process.
+
+You do not start a daemon with `daemon`: one is started by `service install` (managed, at
+login) or `sessiometer run` (unmanaged, foreground) — which is why there is no `daemon start`.
 ";
 
 const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
@@ -977,9 +998,12 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     .with_systemic_failure_n(config.refresh.systemic_failure_n);
     let mut shutdown = RealShutdown::new()?;
 
+    // Name the followable stop first (issue #397): a DETACHED `run` has no controlling terminal
+    // to Ctrl-C, so `daemon stop` — which reaches it over the control socket — is the guidance
+    // that always works. Ctrl-C / SIGTERM stay listed for the terminal-attached case.
     eprintln!(
         "sessiometer: daemon started (polling about every {}s, jittered); \
-         Ctrl-C or SIGTERM to stop",
+         stop it with `sessiometer daemon stop`, Ctrl-C, or SIGTERM",
         config.tunables.poll_secs,
     );
 
@@ -1286,6 +1310,24 @@ fn render_schema_mismatch(wire: SchemaVersion, supported: SchemaVersion) -> Stri
 /// not-running.
 const DAEMON_STATUS_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long `daemon stop` waits for the daemon to acknowledge a `{"cmd":"shutdown"}` request
+/// (issue #397). Much larger than [`DAEMON_STATUS_SOCKET_TIMEOUT`], and NOT a latency budget: the
+/// daemon accepts control connections only *between* ticks, and a tick can span a per-account poll
+/// (`curl --max-time 30`) or — when refresh is enabled (opt-in) — a sweep that walks the parked
+/// roster SEQUENTIALLY, each account bounded by `RefreshConfig::timeout()` (default 90s). So the
+/// true worst case scales with the roster and can exceed this 60s on a busy refresh cycle; the
+/// value trades a bounded wait against out-waiting the *common* poll-length window rather than
+/// pretending to cover every configuration.
+///
+/// That residual is deliberately SAFE, not merely tolerated. A daemon busier than this still
+/// RECEIVES the request — it is queued in the socket buffer — and the daemon's control handler
+/// honours it even if the ack can no longer be delivered. So an over-budget cycle produces an honest
+/// "did not acknowledge" (exit `1`) while the stop still happens on the next between-ticks gap: a
+/// false FAILURE the operator can retry, NEVER a stop that silently did not happen, and NEVER a
+/// success that silently did. A `status` probe that misses the window has a lock fallback and still
+/// answers; a `stop` has none, which is why it waits far longer than `status`.
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The daemon *process* liveness, as `daemon status` projects it (issue #396) from two
 /// read-only probes: the control socket (primary) and the single-instance lock (fallback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1299,31 +1341,252 @@ enum DaemonLiveness {
     NotRunning,
 }
 
-/// Report the daemon *process* — is it alive, and how is it managed (issue #396)? The
+/// Probe the daemon *process* liveness (issues #396, #397), socket-primary and lock-fallback: a
+/// responsive control socket ⇒ running; otherwise a held single-instance lock ⇒ alive-but-
+/// unresponsive (the honest startup / wedged case); otherwise not running. Both probes are
+/// READ-ONLY — nothing is started, stopped, or signalled. Shared by `daemon status` (which
+/// reports it) and `daemon restart` (which refuses to bootstrap over a running daemon).
+async fn daemon_liveness() -> Result<DaemonLiveness> {
+    if probe_socket_responsive(&paths::control_socket()?).await {
+        Ok(DaemonLiveness::Responsive)
+    } else if InstanceLock::is_held(&paths::daemon_lock()?)? {
+        Ok(DaemonLiveness::AliveUnresponsive)
+    } else {
+        Ok(DaemonLiveness::NotRunning)
+    }
+}
+
+/// Report the daemon *process* — is it alive, and is launchd supervising it (issue #396)? The
 /// process-lifecycle counterpart to `service status`, which speaks only to the launchd
 /// registration and exits non-zero when none is installed (even beside a healthy daemon).
 /// This is READ-ONLY — it starts, stops, and signals nothing: a socket `status` query, a
-/// non-blocking lock probe, and a `plist.exists()` check.
+/// non-blocking lock probe, and a `launchctl print` probe.
 ///
-/// Liveness is socket-primary, lock-fallback: a responsive socket ⇒ running; otherwise a held
-/// single-instance lock ⇒ alive-but-unresponsive (the honest startup / wedged case); otherwise
-/// not running. Management mode is the same `plist.exists()` signal the `service` verbs gate on
-/// ([`crate::service::is_managed`]) — managed (launchd) vs unmanaged (a foreground / detached
-/// `run`). Prints one report line to stdout and returns `Ok` (exit `0`) whenever it can
-/// determine state.
+/// Liveness comes from [`daemon_liveness`]. Management mode is *supervision*
+/// ([`AgentSupervision::Supervising`]) — NOT plist existence, and not mere registration either. A
+/// booted-out agent leaves its plist on disk, and a registered-but-idle job leaves its label in the
+/// domain; in both states a foreground `run` can own the process, so either weaker signal would
+/// mislabel it "managed by launchd" (issue #397). Prints one report line to stdout and returns `Ok`
+/// (exit `0`) whenever it can determine state.
 async fn daemon_status() -> Result<()> {
-    let liveness = if probe_socket_responsive(&paths::control_socket()?).await {
-        DaemonLiveness::Responsive
-    } else if InstanceLock::is_held(&paths::daemon_lock()?)? {
-        DaemonLiveness::AliveUnresponsive
-    } else {
-        DaemonLiveness::NotRunning
+    let liveness = daemon_liveness().await?;
+    // Management mode is only meaningful for a running daemon — the renderer ignores it otherwise —
+    // so skip the `launchctl` probe entirely when nothing is running. That keeps the not-running
+    // report from depending on a subprocess that could fail, and spares a spawn.
+    let managed = match liveness {
+        DaemonLiveness::NotRunning => false,
+        DaemonLiveness::Responsive | DaemonLiveness::AliveUnresponsive => {
+            crate::service::agent_supervision().await? == AgentSupervision::Supervising
+        }
     };
-    // Management mode is only meaningful for a running daemon; the renderer ignores it in the
-    // not-running case. A pure `plist.exists()` filesystem read — no launchctl, no process.
-    let managed = crate::service::is_managed()?;
     print!("{}", render_daemon_status(liveness, managed));
     Ok(())
+}
+
+/// How `daemon stop` reaches its "not running" post-condition (issue #397). Dispatch turns on what
+/// launchd is doing about the agent ([`AgentSupervision`]) — never on `plist.exists()`
+/// ([`crate::service::is_managed`]), which is registration, and never on mere domain membership,
+/// which is not supervision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopPlan {
+    /// launchd is supervising the daemon ⇒ `launchctl bootout` alone. REQUIRED, not merely
+    /// sufficient: the agent is `KeepAlive`, so a socket shutdown would just be respawned. Only
+    /// leaving the domain makes "stopped" stick, and the process it stops IS the running daemon.
+    BootOut,
+    /// The job is in the domain but launchd runs no process for it, so a foreground `run` may own
+    /// the daemon ⇒ do BOTH, in order. The bootout is what stops `KeepAlive` from respawning a
+    /// replacement the instant the real daemon exits; the socket shutdown is what actually stops
+    /// that daemon. Either alone leaves a daemon running.
+    BootOutThenSocketShutdown,
+    /// No job in the domain ⇒ nothing supervises anything: a same-user-gated `{"cmd":"shutdown"}`
+    /// control request, driving the daemon's graceful exit (an in-flight swap completes first).
+    /// Nothing listening ⇒ the post-condition already holds.
+    SocketShutdown,
+}
+
+/// Pure dispatch for `daemon stop` — see [`StopPlan`] for why all three cases exist.
+fn plan_stop(agent: AgentSupervision) -> StopPlan {
+    match agent {
+        AgentSupervision::Supervising => StopPlan::BootOut,
+        AgentSupervision::RegisteredIdle => StopPlan::BootOutThenSocketShutdown,
+        AgentSupervision::Unregistered => StopPlan::SocketShutdown,
+    }
+}
+
+/// How `daemon restart` acts on each reachable daemon state (issue #397). Restart is the one verb
+/// that cannot be made to work universally: only launchd can kill-and-relaunch, so a daemon it does
+/// not supervise gets a clear error instead of a half-restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartPlan {
+    /// launchd owns the daemon (or owns an idle job with nothing else running) ⇒ `kickstart -k`,
+    /// the atomic kill+relaunch. `kickstart` also STARTS a registered job that is not running.
+    Kickstart,
+    /// Registered nowhere, plist on disk, nothing running ⇒ `launchctl bootstrap`: load it now.
+    Bootstrap,
+    /// A daemon is running that launchd does not supervise ⇒ [`Error::UnmanagedDaemonNoRestart`].
+    RefuseUnmanaged,
+    /// Nothing running and no service registered ⇒ [`Error::NoManagedService`].
+    RefuseNoService,
+}
+
+/// Pure dispatch for `daemon restart` (issue #397), exhaustively unit-tested.
+///
+/// [`AgentSupervision::Supervising`] settles it: that process holds the single-instance lock, so no
+/// foreground daemon can coexist and a kickstart restarts the daemon the operator meant. Otherwise a
+/// RUNNING daemon is one launchd does not supervise, and must be refused — kickstarting or
+/// bootstrapping beside it hands launchd a `run` that loses the lock, exits `3`, and is respawned
+/// into a throttled crash loop. Only with nothing running does registration mean "bring it up".
+fn plan_restart(
+    agent: AgentSupervision,
+    daemon_running: bool,
+    service_installed: bool,
+) -> RestartPlan {
+    match agent {
+        AgentSupervision::Supervising => RestartPlan::Kickstart,
+        AgentSupervision::RegisteredIdle if daemon_running => RestartPlan::RefuseUnmanaged,
+        AgentSupervision::RegisteredIdle => RestartPlan::Kickstart,
+        AgentSupervision::Unregistered if daemon_running => RestartPlan::RefuseUnmanaged,
+        AgentSupervision::Unregistered if service_installed => RestartPlan::Bootstrap,
+        AgentSupervision::Unregistered => RestartPlan::RefuseNoService,
+    }
+}
+
+/// Stop the running daemon now (issue #397's `daemon stop`), reaching a uniform "not running"
+/// post-condition in every state — see [`StopPlan`] for the dispatch and why supervision, not
+/// registration, decides it.
+///
+/// NEVER discovers a PID to signal: there is no pidfile, the single-instance `flock` carries no
+/// holder PID, and `kill(2)` is PID-reuse-racy.
+async fn daemon_stop() -> Result<()> {
+    match plan_stop(crate::service::agent_supervision().await?) {
+        // launchd supervises the daemon: booting the agent out IS the stop, and it disarms the
+        // `KeepAlive` respawn in the same step.
+        StopPlan::BootOut => crate::service::stop_managed().await,
+        // The registered agent is idle while a foreground `run` may own the daemon. Bootout FIRST,
+        // to disarm `KeepAlive` so it cannot respawn a replacement, THEN stop the running daemon
+        // over the socket. Neither half alone is the whole story, so narrate the compound stop with
+        // one coherent message rather than stacking two primitive ones.
+        StopPlan::BootOutThenSocketShutdown => {
+            crate::service::bootout_agent().await?;
+            socket_shutdown(
+                "sessiometer: daemon stop requested. The registered launchd agent was idle (booted \
+                 out so it cannot respawn); the running `sessiometer run` exits gracefully after \
+                 any in-flight swap completes.",
+                "sessiometer: daemon is not running — the idle launchd agent has been booted out so \
+                 it cannot respawn.",
+            )
+            .await
+        }
+        // Nothing in the launchd domain: ask whatever is running to stop itself.
+        StopPlan::SocketShutdown => {
+            socket_shutdown(
+                "sessiometer: daemon stop requested (unmanaged `sessiometer run`). It exits \
+                 gracefully after any in-flight swap completes.",
+                "sessiometer: daemon is not running (nothing to stop).",
+            )
+            .await
+        }
+    }
+}
+
+/// Send a graceful `{"cmd":"shutdown"}` to the daemon over the control socket and report the outcome
+/// (issue #397). Shared by `daemon stop`'s two socket-driven branches, which differ only in wording.
+///
+/// A missing / refused socket means no daemon is running — the stop post-condition already holds, so
+/// that maps to an idempotent success (`on_not_running`), never the `DaemonNotRunning` error a
+/// `status` client would raise. Any other failure (timeout, an unexpected reply) propagates.
+async fn socket_shutdown(on_ok: &str, on_not_running: &str) -> Result<()> {
+    match request_shutdown(&paths::control_socket()?).await {
+        Ok(()) => {
+            eprintln!("{on_ok}");
+            Ok(())
+        }
+        Err(Error::DaemonNotRunning) => {
+            eprintln!("{on_not_running}");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Restart the running daemon (issue #397's `daemon restart`) — see [`RestartPlan`] for the four
+/// reachable outcomes. Only launchd can kill-and-relaunch, so a daemon it does not supervise gets a
+/// clear, actionable error rather than a half-restart.
+async fn daemon_restart() -> Result<()> {
+    let agent = crate::service::agent_supervision().await?;
+    // Probe only what can still change the decision: a supervising agent settles it (see
+    // `plan_restart`), and liveness settles the unsupervised case before registration is consulted.
+    let supervising = agent == AgentSupervision::Supervising;
+    let daemon_running = !supervising && daemon_liveness().await? != DaemonLiveness::NotRunning;
+    let service_installed =
+        agent == AgentSupervision::Unregistered && !daemon_running && crate::service::is_managed()?;
+    match plan_restart(agent, daemon_running, service_installed) {
+        RestartPlan::Kickstart => crate::service::kickstart_managed().await,
+        RestartPlan::Bootstrap => crate::service::bootstrap_managed().await,
+        RestartPlan::RefuseUnmanaged => Err(Error::UnmanagedDaemonNoRestart),
+        RestartPlan::RefuseNoService => Err(Error::NoManagedService),
+    }
+}
+
+/// Ask a running UNMANAGED daemon to stop over its control socket (issue #397): connect, send the
+/// same-user-gated `{"cmd":"shutdown"}` verb, and read the one-line ack. Returns `Ok(())` once the
+/// daemon acknowledged (`{"ok":true}`) — the daemon then drives its existing graceful shutdown (an
+/// in-flight swap completes before exit). A connect failure that means "no daemon" — the socket is
+/// absent, or present but refusing — maps to [`Error::DaemonNotRunning`] (the caller, `daemon_stop`,
+/// treats that as an idempotent "already not running"). Any other reply than the `{"ok":true}` ack
+/// (an `{"error":…}` from the same-user peer gate — which should not happen for our own uid — or an
+/// unexpected line) surfaces as an I/O error carrying the reply, never a false success.
+///
+/// The request carries NO credential and NO payload — a pure stop signal, gated same-user on the
+/// daemon side ([`crate::daemon::peer_is_same_user`]). Time-boxed by [`DAEMON_SHUTDOWN_TIMEOUT`] —
+/// generous, because a busy daemon serves the socket only between ticks — so a wedged daemon that
+/// binds the socket but never answers cannot hang `daemon stop` forever.
+async fn request_shutdown(path: &Path) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let stream = match UnixStream::connect(path).await {
+        Ok(stream) => stream,
+        // No socket file, or a stale one with no listener → no live daemon.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(Error::DaemonNotRunning);
+        }
+        Err(err) => return Err(Error::Io(err)),
+    };
+
+    // The same newline-delimited JSON the daemon's `serve_control` speaks: write one request
+    // line, read one reply line. The whole exchange is time-boxed so a socket-bound-but-wedged
+    // daemon cannot hang the verb.
+    let mut buffered = tokio::io::BufReader::new(stream);
+    let exchange = async {
+        buffered.write_all(b"{\"cmd\":\"shutdown\"}\n").await?;
+        buffered.flush().await?;
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        Ok::<String, Error>(line.trim_end().to_owned())
+    };
+    let reply = match tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, exchange).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon did not acknowledge the shutdown request",
+            )))
+        }
+    };
+    // The daemon acks a same-user shutdown with `{"ok":true}`; an `{"error":…}` (the peer gate
+    // refusing) or anything unexpected is NOT a success — never report a stop that did not happen.
+    if reply.contains(r#""ok":true"#) {
+        Ok(())
+    } else {
+        Err(Error::Io(std::io::Error::other(format!(
+            "daemon refused the shutdown request: {reply}"
+        ))))
+    }
 }
 
 /// Probe whether the daemon's control socket answers a `status` request within
@@ -1343,9 +1606,9 @@ async fn probe_socket_responsive(path: &Path) -> bool {
 
 /// The report `daemon status` prints for a [`DaemonLiveness`] × management-mode pair (issue
 /// #396). Pure (no I/O) so the state→text mapping is unit-tested without a socket, lock, or
-/// plist. `managed` is read only for a running daemon (managed = launchd LaunchAgent installed;
-/// unmanaged = a foreground / detached `sessiometer run`); the not-running report carries no
-/// management mode. Trailing newline included.
+/// plist. `managed` is read only for a running daemon (managed = launchd is supervising it, i.e.
+/// the agent is loaded — NOT merely that a plist is installed; unmanaged = a foreground / detached
+/// `sessiometer run`); the not-running report carries no management mode. Trailing newline included.
 fn render_daemon_status(liveness: DaemonLiveness, managed: bool) -> String {
     match liveness {
         DaemonLiveness::Responsive => format!(
@@ -5387,6 +5650,159 @@ spare  22222222-2222\n\
         );
     }
 
+    #[test]
+    fn plan_stop_covers_every_supervision_state() {
+        use AgentSupervision::{RegisteredIdle, Supervising, Unregistered};
+
+        // launchd owns the process: bootout stops the daemon AND suppresses the `KeepAlive`
+        // respawn. It is the daemon, so nothing else needs stopping.
+        assert_eq!(plan_stop(Supervising), StopPlan::BootOut);
+
+        // The regression state (issue #397 review): the job sits in the domain with NO process
+        // behind it — `launchctl print` still exits 0 — while a foreground `run` owns the lock and
+        // the socket. Bootout alone would report a stop that did not happen; a socket shutdown alone
+        // would be undone the instant `KeepAlive` respawned the agent. Both, in order.
+        assert_eq!(
+            plan_stop(RegisteredIdle),
+            StopPlan::BootOutThenSocketShutdown
+        );
+
+        // No job in the domain — even with a plist on disk from a prior `daemon stop`. Nothing
+        // supervises anything, so ask the daemon itself. `plan_stop` cannot see `plist.exists()`;
+        // that is the point of its signature, not an omission.
+        assert_eq!(plan_stop(Unregistered), StopPlan::SocketShutdown);
+    }
+
+    #[test]
+    fn plan_restart_covers_every_supervision_state() {
+        use AgentSupervision::{RegisteredIdle, Supervising, Unregistered};
+
+        // Supervising settles it: that process holds the single-instance lock, so no foreground
+        // daemon can coexist and the other two signals cannot change the answer.
+        for daemon_running in [true, false] {
+            for service_installed in [true, false] {
+                assert_eq!(
+                    plan_restart(Supervising, daemon_running, service_installed),
+                    RestartPlan::Kickstart,
+                    "supervising ⇒ kickstart (running={daemon_running}, installed={service_installed})"
+                );
+            }
+        }
+
+        // Registered but idle: whatever is running, launchd is not supervising it. Kickstarting
+        // would hand launchd a `run` that loses the lock, exits 3, and crash-loops under KeepAlive.
+        assert_eq!(
+            plan_restart(RegisteredIdle, true, true),
+            RestartPlan::RefuseUnmanaged
+        );
+        assert_eq!(
+            plan_restart(RegisteredIdle, true, false),
+            RestartPlan::RefuseUnmanaged
+        );
+        // Registered, idle, and nothing running: `kickstart` starts a job that is not running, so
+        // no bootstrap is needed and none of the crash-loop hazard applies.
+        assert_eq!(
+            plan_restart(RegisteredIdle, false, true),
+            RestartPlan::Kickstart
+        );
+        assert_eq!(
+            plan_restart(RegisteredIdle, false, false),
+            RestartPlan::Kickstart
+        );
+
+        // Unregistered with a daemon alive ⇒ a foreground `run`, whatever the plist says.
+        assert_eq!(
+            plan_restart(Unregistered, true, true),
+            RestartPlan::RefuseUnmanaged
+        );
+        assert_eq!(
+            plan_restart(Unregistered, true, false),
+            RestartPlan::RefuseUnmanaged
+        );
+        // Nothing running: a plist on disk is loaded; with no plist there is nothing to restart and
+        // nothing to supervise, so `restart` routes to `service install`.
+        assert_eq!(
+            plan_restart(Unregistered, false, true),
+            RestartPlan::Bootstrap
+        );
+        assert_eq!(
+            plan_restart(Unregistered, false, false),
+            RestartPlan::RefuseNoService
+        );
+    }
+
+    #[tokio::test]
+    async fn request_shutdown_is_daemon_not_running_when_no_socket_is_bound() {
+        // Issue #397: `daemon stop` (unmanaged) over an absent socket means no unmanaged daemon is
+        // running. `request_shutdown` maps the connect failure to `DaemonNotRunning`, which the
+        // caller (`daemon_stop`) treats as an idempotent "already not running" — a `stop` no-op,
+        // never a hard failure. The same friendly remap `query_status` makes.
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock"); // never bound
+        let err = request_shutdown(&socket)
+            .await
+            .expect_err("no daemon → error");
+        assert!(matches!(err, Error::DaemonNotRunning), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn request_shutdown_sends_the_shutdown_verb_and_accepts_the_ok_ack() {
+        // Issue #397: the client sends exactly one newline-delimited `{"cmd":"shutdown"}` request —
+        // the wire contract the daemon's #397 `control_reply` handler parses into
+        // `ShutdownRequested` — and returns Ok once the daemon acks `{"ok":true}`. This is the CLI
+        // half of the `daemon stop` unmanaged path; the daemon then drives its graceful shutdown.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        // Server: accept one connection, assert the exact request line, ack once.
+        let server = async {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut buffered = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            buffered.read_line(&mut request).await.unwrap();
+            assert_eq!(request.trim_end(), r#"{"cmd":"shutdown"}"#);
+            buffered.write_all(br#"{"ok":true}"#).await.unwrap();
+            buffered.write_all(b"\n").await.unwrap();
+            buffered.flush().await.unwrap();
+        };
+
+        let (_, result) = tokio::join!(server, request_shutdown(&path));
+        result.expect("an `{\"ok\":true}` ack is a successful stop request");
+    }
+
+    #[tokio::test]
+    async fn request_shutdown_does_not_report_success_on_an_unauthorized_refusal() {
+        // Issue #397: the daemon same-user-gates `shutdown` and fail-closes an unauthorized peer
+        // with `{"error":"unauthorized"}`. That is NOT a stop — `request_shutdown` must surface it
+        // as an error, never a false success that would let `daemon stop` claim a stop that did not
+        // happen. (Our own uid always authenticates in practice; this proves the negative path.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let server = async {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut buffered = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            buffered.read_line(&mut request).await.unwrap();
+            buffered
+                .write_all(br#"{"error":"unauthorized"}"#)
+                .await
+                .unwrap();
+            buffered.write_all(b"\n").await.unwrap();
+            buffered.flush().await.unwrap();
+        };
+
+        let (_, result) = tokio::join!(server, request_shutdown(&path));
+        assert!(
+            result.is_err(),
+            "an unauthorized refusal must not read as a successful stop",
+        );
+    }
+
     #[tokio::test]
     async fn query_status_round_trips_over_a_real_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -6301,21 +6717,32 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn service_lifecycle_verbs_parse_to_their_actions() {
-        // Issue #376: the four lifecycle sub-verbs route to their actions, alongside the
-        // existing install/uninstall — so `execute` just dispatches each to its
-        // `crate::service::*` handler.
-        for (verb, expected) in [
-            ("start", ServiceAction::Start),
-            ("stop", ServiceAction::Stop),
-            ("restart", ServiceAction::Restart),
-            ("status", ServiceAction::Status),
-        ] {
-            assert_eq!(
-                parse_argv(&["service", verb]).unwrap(),
-                Command::Service { action: expected },
-                "`service {verb}` parses to its action",
-            );
+    fn service_status_parses_but_the_removed_lifecycle_verbs_are_rejected() {
+        // Issue #397: `service` keeps only the PERSISTENCE verbs — `status` still parses (the
+        // "is-a-managed-service-installed?" question), while the pre-0.1.0 `start`/`stop`/`restart`
+        // are REMOVED (process lifecycle moved to `daemon`). The removed verbs must now be
+        // strict-usage errors pointing at `service --help`, never a silent no-op nor a stale action.
+        assert_eq!(
+            parse_argv(&["service", "status"]).unwrap(),
+            Command::Service {
+                action: ServiceAction::Status
+            },
+            "`service status` still parses to its action",
+        );
+        for verb in ["start", "stop", "restart"] {
+            match parse_argv(&["service", verb]).unwrap_err() {
+                Error::CliUsage {
+                    message,
+                    usage_hint,
+                } => {
+                    assert!(
+                        message.contains(verb),
+                        "names the removed action `{verb}`: {message}",
+                    );
+                    assert_eq!(usage_hint, "sessiometer service --help");
+                }
+                other => panic!("`service {verb}` must be a CliUsage error now, got {other:?}"),
+            }
         }
     }
 
@@ -6363,15 +6790,39 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn daemon_status_parses_to_its_action() {
-        // Issue #396: the 0.1.0 leaf's sole sub-verb routes to its action, so `execute`
-        // dispatches it to `daemon_status`.
-        assert_eq!(
-            parse_argv(&["daemon", "status"]).unwrap(),
-            Command::Daemon {
-                action: DaemonAction::Status
+    fn daemon_lifecycle_verbs_parse_to_their_actions() {
+        // Issues #396 + #397: the process-lifecycle noun routes `status` (#396) plus the
+        // #397-added `stop` / `restart` to their actions, so `execute` dispatches each to
+        // `daemon_status` / `daemon_stop` / `daemon_restart`.
+        for (verb, expected) in [
+            ("status", DaemonAction::Status),
+            ("stop", DaemonAction::Stop),
+            ("restart", DaemonAction::Restart),
+        ] {
+            assert_eq!(
+                parse_argv(&["daemon", verb]).unwrap(),
+                Command::Daemon { action: expected },
+                "`daemon {verb}` parses to its action",
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_start_is_rejected_because_there_is_no_such_verb() {
+        // Issue #397 (recorded verb-set decision): there is deliberately NO `daemon start` — a
+        // daemon is started by `service install` (managed) or `sessiometer run` (unmanaged). So
+        // `daemon start` is a strict-usage error naming the bad action and pointing at `daemon
+        // --help`, never a silent fall-through.
+        match parse_argv(&["daemon", "start"]).unwrap_err() {
+            Error::CliUsage {
+                message,
+                usage_hint,
+            } => {
+                assert!(message.contains("start"), "names the bad action: {message}");
+                assert_eq!(usage_hint, "sessiometer daemon --help");
             }
-        );
+            other => panic!("expected a CliUsage error, got {other:?}"),
+        }
     }
 
     #[test]

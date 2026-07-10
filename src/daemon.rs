@@ -4669,6 +4669,33 @@ mod tests {
         }
     }
 
+    /// A control seam that yields `ShutdownRequested` exactly once (issue #397), then never
+    /// resolves — so the run loop takes its graceful `Idle::Shutdown` exit on the FIRST idle,
+    /// exactly as an authenticated `{"cmd":"shutdown"}` control command (the `daemon stop` path
+    /// for an unmanaged daemon) would. The stop analog of [`OnceRosterReload`]: drives the live
+    /// `Signal(ShutdownRequested) => break Idle::Shutdown` wiring that `NoControl` never does.
+    struct OnceShutdown {
+        fired: Cell<bool>,
+    }
+
+    impl OnceShutdown {
+        fn new() -> Self {
+            Self {
+                fired: Cell::new(false),
+            }
+        }
+    }
+
+    impl Control for OnceShutdown {
+        async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
+            if self.fired.replace(true) {
+                std::future::pending().await
+            } else {
+                ControlYield::Signal(Some(ControlSignal::ShutdownRequested))
+            }
+        }
+    }
+
     /// A [`Control`] that hands back a single `swap` command (issue #167) on its first serve — the
     /// run-loop counterpart of [`OnceRestored`], carrying a REAL socket end so a test can read the
     /// redacted ack the loop writes back. Pends forever after, so the loop then idles on the tick
@@ -8610,6 +8637,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_control_writes_the_ok_ack_and_yields_the_shutdown_signal() {
+        // Issue #397: an authenticated same-user `shutdown` — the `daemon stop` control path for an
+        // unmanaged daemon — is answered with `{"ok":true}` over the stream AND yields the
+        // `ShutdownRequested` signal the run loop turns into a graceful `Idle::Shutdown`. The ack is
+        // flushed HERE, before the signal ever reaches the run loop, so the client learns the stop
+        // was accepted before the daemon goes away.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"shutdown\"}\n").await.unwrap();
+        let signal = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .one_shot();
+        assert_eq!(
+            signal,
+            Some(ControlSignal::ShutdownRequested),
+            "an authenticated shutdown yields the graceful-stop signal",
+        );
+
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert_eq!(
+            reply.trim_end(),
+            r#"{"ok":true}"#,
+            "the ok ack is written before the daemon exits: {reply:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_honours_a_shutdown_whose_peer_hung_up_before_the_ack() {
+        // Issue #397: the daemon accepts control connections only BETWEEN ticks, so a `daemon stop`
+        // against a busy daemon can time out and close before the daemon ever reads the request.
+        // When the daemon then answers, the ack write fails with `EPIPE`. Delivering the ack is
+        // best-effort — the request was already read and authenticated, so the shutdown MUST still
+        // take effect. Propagating the write error instead would discard the signal at
+        // `UnixControl::serve`'s `Err(_) => Signal(None)` arm: the operator's `daemon stop` would
+        // exit 1 AND the daemon would keep running.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"shutdown\"}\n").await.unwrap();
+        drop(client); // the client gave up waiting and hung up: the ack write will now fail
+
+        let signal = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .expect("a failed ack must not fail the exchange")
+            .one_shot();
+        assert_eq!(
+            signal,
+            Some(ControlSignal::ShutdownRequested),
+            "an authenticated shutdown survives an undeliverable ack",
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_refuses_a_shutdown_from_an_unauthenticated_peer() {
+        // Issue #397: `shutdown` is state-affecting (it ends the process), so an UNauthenticated
+        // peer is fail-closed with `{"error":"unauthorized"}` and produces NO signal — a stranger
+        // can never stop the daemon (the same same-user gate `manual-swapped` #64 / `roster-reload`
+        // #139 / `restored` #275 sit behind). Auth is the ONLY gate on this verb, so this is the
+        // whole guard: the socket-layer half here, the real `getpeereid` euid comparison that
+        // computes the bool in `serve_control_rejects_a_foreign_uid_peer` / `is_same_user`.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"shutdown\"}\n").await.unwrap();
+        let signal = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap()
+            .one_shot();
+        assert!(
+            signal.is_none(),
+            "an unauthorized shutdown produces no signal — the daemon keeps running",
+        );
+
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.contains("unauthorized"), "fail-closed: {reply:?}");
+    }
+
+    #[tokio::test]
     async fn serve_control_bounds_an_oversized_request_line() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // Issue #64: the receive path must be BOUNDED. A peer that streams a line
@@ -11295,6 +11404,31 @@ mod tests {
         assert_eq!(signal, None);
     }
 
+    #[test]
+    fn control_reply_shutdown_authenticated_signals_a_graceful_stop() {
+        // Issue #397: an authenticated same-user peer's `shutdown` — the `daemon stop` control
+        // path for an UNMANAGED daemon — acks `{"ok":true}` and yields the `ShutdownRequested`
+        // signal the run loop turns into a graceful `Idle::Shutdown` (so an in-flight swap
+        // completes before exit). The pure request→(reply, signal) mapping, mirroring the
+        // `roster-reload` #139 gate.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"shutdown"}"#, &snap, true);
+        assert_eq!(reply, r#"{"ok":true}"#);
+        assert_eq!(signal, Some(ControlSignal::ShutdownRequested));
+    }
+
+    #[test]
+    fn control_reply_shutdown_unauthenticated_is_refused_with_no_signal() {
+        // Issue #397 (AC): `shutdown` is state-affecting — it ends the process — so an
+        // UNauthenticated peer is refused with `{"error":"unauthorized"}` and produces NO signal:
+        // a stranger can never stop the daemon (parity with the `manual-swapped` #64 /
+        // `roster-reload` #139 / `restored` #275 same-user gate). Fail-closed on the auth verdict.
+        let snap = StatusSnapshot::default();
+        let (reply, signal) = control_reply(r#"{"cmd":"shutdown"}"#, &snap, false);
+        assert_eq!(reply, r#"{"error":"unauthorized"}"#);
+        assert_eq!(signal, None);
+    }
+
     #[tokio::test]
     async fn notify_restored_sends_the_uuid_command_and_reads_the_ack() {
         // Issue #276: the client-side `restored` notify writes exactly one newline-delimited
@@ -11549,6 +11683,72 @@ mod tests {
             daemon.state.active,
             Some(0),
             "work stays active; restoring the parked spare never activates it"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_shutdown_control_command_exits_the_loop_gracefully() {
+        // Issue #397 (AC): the run loop's idle select must route an authenticated `shutdown`
+        // control signal — the `daemon stop` path for an UNMANAGED daemon — into the SAME graceful
+        // `Idle::Shutdown` exit a SIGINT / SIGTERM drives. `OnceShutdown` fires `ShutdownRequested`
+        // on the first idle, and `FakeShutdown::after(100)` guarantees the SIGINT/SIGTERM seam never
+        // fires here — so the ONLY thing that can end this loop is the control signal. A regression
+        // turning that arm into a `continue` (or dropping it) would spin the idle forever rather
+        // than pass.
+        //
+        // The AC's "an in-flight swap completes before exit" half is a property of the SHARED
+        // `Idle::Shutdown` exit, not of the trigger: a swap always runs to completion inside `tick`
+        // (shutdown is observed only BETWEEN ticks), as `run_loop_completes_a_swap_before_a_
+        // concurrent_shutdown` proves for the signal path. The socket verb funnels into that
+        // identical exit, so it inherits the no-half-swap guarantee by construction.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Holds-only readings — no swap perturbs the idle path; the shutdown signal drives the exit.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // after(100): the SIGINT/SIGTERM seam never resolves within this test, so a passing run
+        // proves the CONTROL signal — not a signal — ended the loop.
+        let mut shutdown = FakeShutdown::after(100);
+        let control = OnceShutdown::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .expect("an authenticated shutdown control command exits the loop cleanly (Ok)");
+
+        // Exactly one warm-up tick ran, then the first idle delivered `ShutdownRequested` and broke
+        // to `Idle::Shutdown` — the graceful exit, with the tick already complete.
+        assert_eq!(
+            daemon.state.ticks, 1,
+            "one tick, then the control-driven graceful exit",
         );
     }
 

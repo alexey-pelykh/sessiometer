@@ -303,18 +303,40 @@ pub(crate) enum Error {
     #[error("launchctl failed: {0}")]
     LaunchctlFailed(String),
 
-    /// A `service` lifecycle verb (`start`/`stop`/`restart`/`status`, issue #376)
-    /// was invoked while NO LaunchAgent is installed — the daemon is being run in
-    /// the foreground via `sessiometer run`, so there is no managed service for
-    /// launchctl to act on. Surfaced as clear guidance (never a silent no-op, never
-    /// a raw/confusing launchctl "Could not find service") with a generic failure
-    /// exit `1` (via the `_` arm of [`Error::exit_code`]). Secret-free — names only
-    /// non-secret commands.
+    /// No LaunchAgent is installed, and the verb needs one. Two callers, both with nothing
+    /// managed to act on: `service status` (issue #376; the surviving `service` lifecycle verb
+    /// after the #397 noun split), and `daemon restart` (issue #397) when no daemon is running
+    /// either — nothing to restart, and no service to bring up.
+    ///
+    /// Surfaced as clear, FOLLOWABLE guidance: never a silent no-op, never a raw/confusing
+    /// launchctl "Could not find service", and — since #397 — never the un-followable "Ctrl-C and
+    /// re-run it" (a detached `run` has no controlling terminal to Ctrl-C). It routes to `service
+    /// install` to enable a managed service, and names `run` / `daemon status` / `daemon stop` for
+    /// the foreground case. The wording stays neutral about whether a daemon is *currently* running,
+    /// because the two callers disagree on that. Generic failure exit `1` (via the `_` arm of
+    /// [`Error::exit_code`]). Secret-free — names only non-secret commands.
     #[error(
-        "no managed service — install one with `sessiometer service install`, or if \
-         you're running `sessiometer run` in the foreground, Ctrl-C and re-run it"
+        "no managed service installed — `sessiometer service install` enables auto-start at \
+         login. Without one, a daemon runs only in the foreground: start it with `sessiometer \
+         run`, inspect it with `sessiometer daemon status`, or stop it with `sessiometer daemon \
+         stop`."
     )]
     NoManagedService,
+
+    /// `daemon restart` (issue #397) was invoked against an UNMANAGED daemon — a foreground
+    /// / detached `sessiometer run`. Nothing supervises a bare `run` to respawn it, so there
+    /// is no clean automated restart (unlike a managed launchd agent, which `kickstart -k`
+    /// kills and relaunches in one step). Surfaced as clear, FOLLOWABLE guidance — install a
+    /// managed service for a supervised daemon with restart, or stop the current one and
+    /// start a new `run` — never a raw error or a silent no-op. Generic failure exit `1`
+    /// (via the `_` arm of [`Error::exit_code`]). Secret-free — names only non-secret commands.
+    #[error(
+        "can't restart an unmanaged daemon — nothing supervises a foreground `sessiometer \
+         run` to respawn it. Install a managed service with `sessiometer service install` \
+         for a supervised daemon with restart, or stop this one with `sessiometer daemon \
+         stop` and start a new `sessiometer run`."
+    )]
+    UnmanagedDaemonNoRestart,
 
     // --- Manual account selection (`sessiometer use`, issue #63) -------------
     //
@@ -672,6 +694,9 @@ mod tests {
         // generic failure — non-zero so the verb is never a silent no-op, but it does
         // not touch the swap/lock taxonomy (2–7).
         assert_eq!(Error::NoManagedService.exit_code(), 1);
+        // `daemon restart` against an unmanaged daemon (issue #397) is a generic failure —
+        // non-zero so the verb is never a silent no-op, outside the swap/lock taxonomy (2–7).
+        assert_eq!(Error::UnmanagedDaemonNoRestart.exit_code(), 1);
         // A strict-usage rejection (issue #175) is a generic failure, matching the
         // sibling `UnknownCommand` — both are "you asked for something that isn't a
         // thing", distinct from a runtime failure.
@@ -691,10 +716,11 @@ mod tests {
 
     #[test]
     fn no_managed_service_guides_the_operator_instead_of_a_raw_launchctl_error() {
-        // Issue #376 AC: a lifecycle verb with no installed agent yields a CLEAR
-        // guidance message — it must name the recovery path (`service install`) and
-        // acknowledge the foreground `run` workflow — not a bare/confusing launchctl
-        // "Could not find service".
+        // Issue #376 + #397 AC: `service status` with no installed agent yields CLEAR,
+        // FOLLOWABLE guidance — it names the enable path (`service install`) and routes an
+        // unmanaged (`sessiometer run`) daemon to the `daemon` lifecycle verbs — never a
+        // bare/confusing launchctl "Could not find service", and never the un-followable
+        // "Ctrl-C and re-run it" a detached `run` cannot obey (the #397 guidance fix).
         let message = Error::NoManagedService.to_string();
         assert!(
             message.contains("no managed service"),
@@ -702,11 +728,37 @@ mod tests {
         );
         assert!(
             message.contains("sessiometer service install"),
-            "points at the install recovery path: {message}",
+            "points at the install/enable recovery path: {message}",
         );
         assert!(
-            message.contains("sessiometer run"),
-            "acknowledges the foreground workflow: {message}",
+            message.contains("sessiometer daemon status")
+                && message.contains("sessiometer daemon stop"),
+            "routes an unmanaged daemon to the `daemon` lifecycle verbs: {message}",
+        );
+        assert!(
+            !message.to_lowercase().contains("ctrl-c"),
+            "drops the un-followable Ctrl-C advice (#397 guidance fix): {message}",
+        );
+    }
+
+    #[test]
+    fn unmanaged_daemon_no_restart_guides_the_operator_with_a_followable_action() {
+        // Issue #397 AC: `daemon restart` against an unmanaged (foreground `run`) daemon
+        // returns a CLEAR, ACTIONABLE error — it explains nothing supervises a bare `run` to
+        // respawn it and points at `service install` for a managed daemon with restart (and at
+        // `daemon stop` + a fresh `run` as the manual path) — never a raw launchctl error.
+        let message = Error::UnmanagedDaemonNoRestart.to_string();
+        assert!(
+            message.contains("unmanaged daemon"),
+            "names the condition: {message}",
+        );
+        assert!(
+            message.contains("sessiometer service install"),
+            "points at the managed-service recovery path: {message}",
+        );
+        assert!(
+            message.contains("sessiometer daemon stop"),
+            "offers the manual stop-and-rerun path: {message}",
         );
     }
 
