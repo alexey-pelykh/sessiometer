@@ -104,8 +104,8 @@ use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
 use crate::observability::{
-    CaptureEventOutcome, CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog, Event,
-    EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome, SwapReason,
+    BackoffClass, CaptureEventOutcome, CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog,
+    Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome, SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
@@ -1776,8 +1776,27 @@ where
             });
             // Fold the outcome into account `i`'s OWN back-off (issue #293): a `429` / `5xx`
             // advances its per-account streak and arms its back-off window; any other
-            // outcome clears both. The returned widened wait rides the diagnostic tick line.
-            this_tick_backoff = self.note_account_backoff(i, &result);
+            // outcome clears both. The returned widened wait rides the diagnostic tick line;
+            // the durable back-off ENTER / EXIT events (issue #399) ride `events`.
+            this_tick_backoff = self.note_account_backoff(i, &result, &mut events);
+            // Durable per-account usage VELOCITY (issue #399): the signed percent delta between
+            // this reading and the account's previous one, so the durable log carries how fast each
+            // account is climbing (the gated #368 adaptive-trigger measurement). Both readings must
+            // be present — the account's FIRST reading, or a reading after a throttle / failure
+            // (which clears the slot below to `None`), has nothing to diff — and the account must
+            // have measurably MOVED (a non-zero rounded delta in either dimension), mirroring
+            // `usage_rollup`'s no-op silence so a flat idle account stays quiet on the always-on log.
+            if let (Some(prev), Ok(next)) = (self.state.last_readings[i].as_ref(), result.as_ref())
+            {
+                let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
+                if session_delta_pct != 0 || weekly_delta_pct != 0 {
+                    events.push(Event::UsageVelocity {
+                        account: self.roster[i].account_uuid.clone(),
+                        session_delta_pct,
+                        weekly_delta_pct,
+                    });
+                }
+            }
             self.state.last_readings[i] = result.ok();
             // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
             // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
@@ -3800,11 +3819,30 @@ where
     /// `429` is per-Anthropic-org (independent buckets), and under a genuine endpoint outage
     /// every account fails its OWN poll and arms its OWN window anyway — so one per-account
     /// path is the simplest correct design and needs no separate global case.
-    fn note_account_backoff(&mut self, i: usize, result: &Result<Usage>) -> Option<TickBackoff> {
+    fn note_account_backoff(
+        &mut self,
+        i: usize,
+        result: &Result<Usage>,
+        events: &mut Vec<Event>,
+    ) -> Option<TickBackoff> {
+        // The account UUID is the durable identity for the #399 events (never the free-form,
+        // PII-capable `label`, #15). Cloned up front so the borrow does not tangle with the
+        // `&mut self.state.health[i]` below.
+        let account_uuid = self.roster[i].account_uuid.clone();
         let Some(signal) = backoff_signal(result) else {
             let health = &mut self.state.health[i];
+            // Edge-triggered EXIT (issue #399): a non-throttling poll (success / 401 / 403) that
+            // CLEARED an actually-armed window emits a durable `usage_backoff_cleared`, bracketing
+            // the episode's span. A plain clean poll with no armed window stays silent (mirroring
+            // `usage_rollup`'s no-op silence), so the exit is a true edge, not a per-clean-poll line.
+            let was_backing_off = health.poll_backoff_until.is_some();
             health.poll_backoff_streak = 0;
             health.poll_backoff_until = None;
+            if was_backing_off {
+                events.push(Event::UsageBackoffCleared {
+                    account: account_uuid,
+                });
+            }
             return None;
         };
         let streak = self.state.health[i].poll_backoff_streak.saturating_add(1);
@@ -3827,6 +3865,20 @@ where
         // instant cannot overflow — the value is bounded at the source (issue #294), which
         // supersedes #293's `checked_add` guard against an unbounded `Retry-After`.
         self.state.health[i].poll_backoff_until = Some(self.clock.now() + wait);
+        // Durable ENTER (issue #399): make the previously stderr-only 429 / back-off signal durable
+        // — the account UUID, the throttle class (`429` vs transient), the running streak, the RAW
+        // server `Retry-After` (pre-cap #295), and the effective armed window. Emitted on EACH
+        // throttled poll (the streak climbs, the window widens), so the durable log shows the
+        // WIDENING across the episode — the residual-late-swap signal a single first-throttle line
+        // would hide. So a back-off on the ACTIVE account (which blinds the very account being
+        // consumed) is diagnosable from `sessiometer.log` alone, without the stderr channel.
+        events.push(Event::UsageBackoff {
+            account: account_uuid,
+            class: signal.class,
+            consecutive: streak,
+            retry_after_secs: signal.retry_after.map(|ra| ra.as_secs()),
+            backoff_secs: wait.as_secs(),
+        });
         // Carry the RAW server `Retry-After` (pre-cap) alongside the effective `wait` so the
         // diagnostic tick line can LABEL the wait's source (issue #295): a `Some` marks a
         // server-advised floor, a `None` marks the self-capped exponential. Pre-cap keeps a
@@ -3914,9 +3966,11 @@ fn diag_poll_class(result: &Result<Usage>) -> PollClass {
 }
 
 /// A poll outcome that asks the loop to back off (issue #76): a `429`
-/// (rate-limited) or a `5xx` / network transient. Carries the server-advised
-/// `Retry-After` the response supplied, if any.
+/// (rate-limited) or a `5xx` / network transient. Carries the throttle `class` (issue
+/// #399, so the durable back-off event can tell a `429` from a transient) and the
+/// server-advised `Retry-After` the response supplied, if any.
 struct BackoffSignal {
+    class: BackoffClass,
     retry_after: Option<Duration>,
 }
 
@@ -3944,12 +3998,31 @@ struct TickBackoff {
 /// `Transient`) AND asks the loop to slow down (here).
 fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
     match result {
-        Err(Error::UsageRateLimited { retry_after, .. })
-        | Err(Error::UsageTransient { retry_after, .. }) => Some(BackoffSignal {
+        // The `class` (issue #399) distinguishes the two back-off outcomes so the durable
+        // `usage_backoff` event can carry which one armed the window — a `429` is the
+        // rate-limit the "429 count" acceptance counts, a `5xx` / network the transient.
+        Err(Error::UsageRateLimited { retry_after, .. }) => Some(BackoffSignal {
+            class: BackoffClass::RateLimited,
+            retry_after: *retry_after,
+        }),
+        Err(Error::UsageTransient { retry_after, .. }) => Some(BackoffSignal {
+            class: BackoffClass::Transient,
             retry_after: *retry_after,
         }),
         _ => None,
     }
+}
+
+/// The per-account usage VELOCITY between two consecutive readings (issue #399): the signed
+/// change in each dimension as a rounded percent, `to_pct(next) - to_pct(prev)`. Reuses
+/// [`to_pct`] so the delta agrees with the percents the swap line (`session_pct`) and `status`
+/// show for the same reading; a difference of two `0..=100` percents lands in `-100..=100`, well
+/// inside `i16`. Positive ⇒ usage climbing; negative ⇒ a window reset dropped the reading. Pure,
+/// so the quantization is unit-tested without a daemon.
+fn usage_velocity(prev: &Usage, next: &Usage) -> (i16, i16) {
+    let session = i16::from(to_pct(next.session)) - i16::from(to_pct(prev.session));
+    let weekly = i16::from(to_pct(next.weekly)) - i16::from(to_pct(prev.weekly));
+    (session, weekly)
 }
 
 /// Pick the viable swap target whose weekly window resets SOONEST (issue #37):
@@ -6507,6 +6580,241 @@ mod tests {
         // A later 429 restarts at the base 120 s (not 240 s), proving the streak was reset.
         daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
         assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+    }
+
+    // --- durable per-account 429 / back-off / velocity observability (issue #399) ---
+
+    #[test]
+    fn usage_velocity_computes_signed_rounded_percent_deltas() {
+        // The pure quantization (issue #399): `to_pct(next) - to_pct(prev)`, so a velocity agrees
+        // with the percents `status` / the swap line show, and a difference of two `0..=100`
+        // percents is a signed value in `-100..=100`.
+        let r = |session: f64, weekly: f64| Usage {
+            session,
+            weekly,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+        // Climbing: both dimensions POSITIVE.
+        assert_eq!(usage_velocity(&r(0.10, 0.20), &r(0.17, 0.22)), (7, 2));
+        // A window reset dropped the reading: NEGATIVE session delta.
+        assert_eq!(usage_velocity(&r(0.95, 0.40), &r(0.03, 0.40)), (-92, 0));
+        // Flat: zero in both dimensions (the no-op the emitter stays silent on).
+        assert_eq!(usage_velocity(&r(0.50, 0.50), &r(0.50, 0.50)), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_emits_a_durable_backoff_event() {
+        // AC (issue #399): the previously stderr-only 429 back-off is now DURABLE. A 429 poll emits
+        // a `usage_backoff` event carrying the account UUID (not a label), class=rate_limited, the
+        // streak, and the armed window — so a back-off episode is diagnosable from the event log
+        // alone. No server `Retry-After` was scripted, so `retry_after_secs` is `None`.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        let first = daemon.tick().await;
+        assert!(
+            first.events.contains(&Event::UsageBackoff {
+                account: "u-A".to_owned(),
+                class: BackoffClass::RateLimited,
+                consecutive: 1,
+                retry_after_secs: None,
+                backoff_secs: 120,
+            }),
+            "the 429 must emit a durable usage_backoff ENTER: {:?}",
+            first.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_durable_backoff_event_carries_the_raw_retry_after() {
+        // The durable event carries the RAW server `Retry-After` (pre-cap #294/#295), so the
+        // flagship pathological case stays diagnosable from the log alone: a full day of
+        // `Retry-After` clamped to the 1 h window renders `backoff_secs=3600 retry_after_secs=86400`.
+        let (_dir, mut daemon) = rate_limit_daemon(
+            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(86_400))),
+        )
+        .await;
+        let first = daemon.tick().await;
+        assert!(first.events.contains(&Event::UsageBackoff {
+            account: "u-A".to_owned(),
+            class: BackoffClass::RateLimited,
+            consecutive: 1,
+            retry_after_secs: Some(86_400),
+            backoff_secs: POLL_BACKOFF_CAP.as_secs(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_transient_emits_a_transient_class_backoff_event() {
+        // A `5xx` / network transient arms the same back-off, but the durable event records
+        // class=transient — so `grep class=rate_limited` counts genuine 429s (the #399 "429 count"),
+        // not every back-off.
+        let (_dir, mut daemon) = rate_limit_daemon(FakeRosterPoller::new().failing("u-A")).await;
+        let first = daemon.tick().await;
+        assert!(first.events.contains(&Event::UsageBackoff {
+            account: "u-A".to_owned(),
+            class: BackoffClass::Transient,
+            consecutive: 1,
+            retry_after_secs: None,
+            backoff_secs: 120,
+        }));
+    }
+
+    #[tokio::test]
+    async fn consecutive_rate_limits_widen_the_durable_backoff_window() {
+        // Each throttled re-poll emits a fresh durable ENTER with the climbing streak and the
+        // widened window (120 → 240 → 480). This WIDENING is the residual-late-swap signal (#363's
+        // ~1674 s active-account gap) that a single first-throttle line would hide — the reason the
+        // event is emitted on EVERY throttle, not just the first.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let outcome = daemon.tick().await;
+            for e in &outcome.events {
+                if let Event::UsageBackoff {
+                    consecutive,
+                    backoff_secs,
+                    ..
+                } = e
+                {
+                    seen.push((*consecutive, *backoff_secs));
+                }
+            }
+            // Step past the just-armed window so the next tick re-polls (not skips) A.
+            if let Some(secs) = tick_backoff_secs(&outcome) {
+                daemon.clock.advance(Duration::from_secs(secs));
+            }
+        }
+        assert_eq!(seen, vec![(1, 120), (2, 240), (3, 480)]);
+    }
+
+    #[tokio::test]
+    async fn a_recovering_poll_emits_a_durable_backoff_cleared_event() {
+        // AC (issue #399): the window's EXIT is durable too — a non-throttling poll that CLEARS an
+        // armed window emits `usage_backoff_cleared`, bracketing the episode's span. A 403 here
+        // (like a 401 or a clean read) is the non-throttling clear.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        daemon.tick().await; // arm the window
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.poller = FakeRosterPoller::new().scope_missing("u-A");
+        let cleared = daemon.tick().await;
+        assert!(
+            cleared.events.contains(&Event::UsageBackoffCleared {
+                account: "u-A".to_owned(),
+            }),
+            "clearing an armed window must emit a durable EXIT: {:?}",
+            cleared.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_poll_without_a_prior_backoff_emits_no_cleared_event() {
+        // The EXIT is a TRUE edge: a clean poll with no armed window emits NO `usage_backoff_cleared`
+        // (mirroring `usage_rollup`'s no-op silence), so the always-on event log is not spammed with
+        // a per-clean-poll line.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
+        let clean = daemon.tick().await;
+        assert!(
+            !clean
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::UsageBackoffCleared { .. })),
+            "a clean poll with no prior back-off must be silent: {:?}",
+            clean.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_velocity_is_emitted_on_the_second_reading() {
+        // AC (issue #399): velocity is queryable from the durable log. The FIRST reading has no
+        // prior to diff (silent); the SECOND emits a `usage_velocity` with the signed percent delta
+        // — here session climbed 10% → 17% (=+7) while weekly held at 20% (=0).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
+        let first = daemon.tick().await;
+        assert!(
+            !first
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::UsageVelocity { .. })),
+            "the first reading has no prior to diff: {:?}",
+            first.events,
+        );
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.17, 0.20);
+        let second = daemon.tick().await;
+        assert!(
+            second.events.contains(&Event::UsageVelocity {
+                account: "u-A".to_owned(),
+                session_delta_pct: 7,
+                weekly_delta_pct: 0,
+            }),
+            "the second reading must emit its velocity: {:?}",
+            second.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_velocity_is_silent_when_the_reading_is_flat() {
+        // A flat reading (no measurable change) emits no `usage_velocity` — the no-op silence that
+        // keeps an idle account quiet on the always-on event log (mirroring `usage_rollup`).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
+        daemon.tick().await; // seed the prior reading
+        let flat = daemon.tick().await; // an identical reading → zero delta
+        assert!(
+            !flat
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::UsageVelocity { .. })),
+            "a flat reading must emit no velocity: {:?}",
+            flat.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_velocity_is_negative_when_a_window_resets() {
+        // A window reset drops the reading, so the delta is NEGATIVE (session 90% → 5% = -85) — the
+        // durable log distinguishes a reset from a climb by sign, the signal #368 consumes.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.90, 0.30)).await;
+        daemon.tick().await; // seed a prior reading at 90% session
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.05, 0.30);
+        let reset = daemon.tick().await;
+        assert!(reset.events.contains(&Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: -85,
+            weekly_delta_pct: 0,
+        }));
+    }
+
+    #[tokio::test]
+    async fn usage_velocity_does_not_span_a_throttle_gap() {
+        // A velocity always spans two CONSECUTIVE real readings. A throttle clears the prior reading
+        // (its `Err` result sets `last_readings` to `None`), so the recovering clean poll has
+        // nothing to diff — no spurious velocity across an unknown-duration gap.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.90, 0.30)).await;
+        daemon.tick().await; // seed a prior reading at 90% session
+
+        // A 429 wipes the prior reading and arms a window.
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await;
+        daemon.clock.advance(Duration::from_secs(120));
+
+        // The recovering clean poll has no prior to diff → no velocity.
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.05, 0.31);
+        let post_gap = daemon.tick().await;
+        assert!(
+            !post_gap
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::UsageVelocity { .. })),
+            "a velocity must not span a throttle gap: {:?}",
+            post_gap.events,
+        );
     }
 
     #[tokio::test]
