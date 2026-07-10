@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The background service: install/uninstall `sessiometer run` as a per-user
-//! launchd **LaunchAgent** (issue #166).
+//! launchd **LaunchAgent** (issue #166), plus the lifecycle verbs
+//! start/stop/restart/status over that installed agent (issue #376).
 //!
 //! A LaunchAgent (not a system-wide LaunchDaemon) because the swap loop needs the
 //! user's **login keychain**, which only exists inside the per-user GUI session.
@@ -86,7 +87,7 @@ pub(crate) async fn install() -> Result<()> {
     // absent WITHOUT narrowing its permissions (unlike our private state dirs).
     let agents_dir = paths::launch_agents_dir()?;
     std::fs::create_dir_all(&agents_dir)?;
-    let plist = agents_dir.join(format!("{AGENT_LABEL}.plist"));
+    let plist = agent_plist()?;
     write_plist(&plist, &contents)?;
 
     // Best-effort pre-clean so a re-install is idempotent (tolerate "not loaded"),
@@ -120,7 +121,7 @@ pub(crate) async fn uninstall() -> Result<()> {
     // Tolerate "not loaded" so the unload half is idempotent.
     let _ = launchctl(&["bootout", &service_target(AGENT_LABEL)]).await;
 
-    let plist = paths::launch_agents_dir()?.join(format!("{AGENT_LABEL}.plist"));
+    let plist = agent_plist()?;
     remove_plist_file(&plist)?;
 
     // Migration (#329): also retire any leftover pre-rename agent + plist, so a user who
@@ -129,6 +130,101 @@ pub(crate) async fn uninstall() -> Result<()> {
     remove_legacy_agent().await?;
 
     eprintln!("sessiometer: background service uninstalled ({AGENT_LABEL}).");
+    Ok(())
+}
+
+/// Restart the installed LaunchAgent (issue #376): the headline recovery verb for a
+/// stuck/stale daemon (#375) or an applied config change. `kickstart -k` kills the
+/// running agent and relaunches it atomically — a bare kill would just be respawned by
+/// `KeepAlive`, so `-k` is what makes "restart" mean restart. If the agent is installed
+/// but currently booted out (a prior `service stop`), there is nothing to kickstart, so
+/// it is bootstrapped instead — a `restart` always ends with the agent running, matching
+/// `systemctl restart` on a stopped unit. No managed service (no plist) ⇒ the
+/// [`Error::NoManagedService`] guidance, never a raw launchctl error.
+pub(crate) async fn restart() -> Result<()> {
+    let plist = agent_plist()?;
+    ensure_managed(&plist)?;
+    let target = service_target(AGENT_LABEL);
+    if is_loaded(&target).await? {
+        launchctl(&["kickstart", "-k", &target]).await?;
+    } else {
+        launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
+    }
+    eprintln!("sessiometer: background service restarted ({AGENT_LABEL}).");
+    Ok(())
+}
+
+/// Report whether the installed LaunchAgent is loaded/running (issue #376). The state
+/// report is command data, so it prints to STDOUT (like `status`/`list`/`export`), while
+/// the operational verbs write to stderr. A `launchctl print` that succeeds means the
+/// agent is in the per-user domain (loaded); a failure means the plist is on disk but the
+/// agent is booted out (a prior `service stop`, or not yet loaded this session). Either
+/// is a successful *report* (exit `0`); only a missing plist is the non-zero
+/// [`Error::NoManagedService`] guidance case.
+pub(crate) async fn status() -> Result<()> {
+    let plist = agent_plist()?;
+    ensure_managed(&plist)?;
+    let target = service_target(AGENT_LABEL);
+    let output = Command::new(LAUNCHCTL)
+        .args(["print", &target])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    if output.status.success() {
+        // Loaded. launchctl's `print` dump carries a `state = running|…` line; surface
+        // just that (not the whole multi-hundred-line dump) as the concise report.
+        let dump = String::from_utf8_lossy(&output.stdout);
+        let state = dump
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("state = "))
+            .unwrap_or("loaded");
+        println!("sessiometer: background service {AGENT_LABEL} is loaded (state: {state}).");
+    } else {
+        println!(
+            "sessiometer: background service {AGENT_LABEL} is installed but not loaded — \
+             start it with `sessiometer service start`."
+        );
+    }
+    Ok(())
+}
+
+/// Start (load) the installed LaunchAgent (issue #376): bootstrap the on-disk plist into
+/// the per-user domain, where `RunAtLoad` starts it. Idempotent — an already-loaded agent
+/// reports "already running" rather than letting `bootstrap` fail with a confusing
+/// "service already loaded". No managed service (no plist) ⇒ [`Error::NoManagedService`].
+pub(crate) async fn start() -> Result<()> {
+    let plist = agent_plist()?;
+    ensure_managed(&plist)?;
+    let target = service_target(AGENT_LABEL);
+    if is_loaded(&target).await? {
+        eprintln!("sessiometer: background service {AGENT_LABEL} is already running.");
+        return Ok(());
+    }
+    launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
+    eprintln!("sessiometer: background service started ({AGENT_LABEL}).");
+    Ok(())
+}
+
+/// Stop (unload) the installed LaunchAgent (issue #376): boot it out of the per-user
+/// domain, which stops the process and suppresses the `KeepAlive` respawn. Idempotent —
+/// an already-stopped agent reports "already stopped" rather than a confusing `bootout`
+/// error. This stops it for the CURRENT login session; `RunAtLoad` brings it back at the
+/// next login (`sessiometer service uninstall` removes it for good). No managed service
+/// (no plist) ⇒ [`Error::NoManagedService`].
+pub(crate) async fn stop() -> Result<()> {
+    let plist = agent_plist()?;
+    ensure_managed(&plist)?;
+    let target = service_target(AGENT_LABEL);
+    if !is_loaded(&target).await? {
+        eprintln!("sessiometer: background service {AGENT_LABEL} is already stopped.");
+        return Ok(());
+    }
+    launchctl(&["bootout", &target]).await?;
+    eprintln!(
+        "sessiometer: background service stopped ({AGENT_LABEL}). It returns at next login; \
+         `sessiometer service uninstall` removes it for good."
+    );
     Ok(())
 }
 
@@ -143,6 +239,47 @@ fn domain_target() -> String {
 /// the #329 migration cleans up.
 fn service_target(label: &str) -> String {
     format!("gui/{}/{label}", paths::current_uid())
+}
+
+/// This agent's LaunchAgent plist path: `~/Library/LaunchAgents/<label>.plist`. The
+/// single source for the on-disk plist location — `install` writes it, `uninstall`
+/// removes it, and the lifecycle verbs (issue #376) probe it to tell a managed service
+/// from a foreground `run`.
+fn agent_plist() -> Result<PathBuf> {
+    Ok(paths::launch_agents_dir()?.join(format!("{AGENT_LABEL}.plist")))
+}
+
+/// Guard the lifecycle verbs (issue #376) against the no-managed-service case: if the
+/// agent's plist is absent, the daemon was never installed as a LaunchAgent (it is being
+/// run in the foreground via `sessiometer run`), so there is nothing for launchctl to
+/// act on. Returns the guidance [`Error::NoManagedService`] (non-zero exit) rather than
+/// letting a raw launchctl "Could not find service" confuse the operator. A pure
+/// file-existence check, factored — like [`remove_plist_file`] — so it is exercised
+/// hermetically against a temp dir (the launchctl calls need a live GUI login domain).
+fn ensure_managed(plist: &Path) -> Result<()> {
+    if plist.exists() {
+        Ok(())
+    } else {
+        Err(Error::NoManagedService)
+    }
+}
+
+/// Whether the agent is currently loaded into the per-user launchd domain (issue #376).
+/// `launchctl print <target>` exits `0` for a service in the domain and non-zero
+/// ("Could not find service") for one whose plist is on disk but is booted out. Its
+/// (voluminous) output is discarded — only the exit status is the signal — so the probe
+/// stays silent. A spawn failure propagates as [`Error::Io`]; a non-zero exit is simply
+/// "not loaded", never an error. Lets the lifecycle verbs stay idempotent and correct
+/// (e.g. `restart` on a stopped agent must bootstrap, not `kickstart` a missing service).
+async fn is_loaded(target: &str) -> Result<bool> {
+    let status = Command::new(LAUNCHCTL)
+        .args(["print", target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await?;
+    Ok(status.success())
 }
 
 /// Remove a LaunchAgent plist by path, tolerating absence (`NotFound` = success). The
@@ -384,6 +521,28 @@ mod tests {
         // … and cleaning up again with nothing there is a no-op, not an error — the
         // unreleased common case, and what keeps install/uninstall idempotent.
         remove_plist_file(&legacy).expect("removing an absent legacy plist is a tolerated no-op");
+    }
+
+    #[test]
+    fn ensure_managed_gates_the_lifecycle_verbs_on_an_installed_agent() {
+        // Issue #376 AC: a lifecycle verb (start/stop/restart/status) with NO installed
+        // agent must not silently no-op nor emit a raw launchctl error. `ensure_managed`
+        // is the file-seam gate that turns an absent plist into the guidance
+        // `NoManagedService` (a non-zero exit), and lets a present plist through to the
+        // launchctl call. Exercised hermetically against a temp dir — the launchctl calls
+        // themselves need a live GUI login domain (like the `bootout` half elsewhere).
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join(format!("{AGENT_LABEL}.plist"));
+
+        // No plist on disk (the foreground-`run` case) ⇒ the guidance error, not a no-op.
+        match ensure_managed(&plist) {
+            Err(Error::NoManagedService) => {}
+            other => panic!("an absent plist must yield NoManagedService, got {other:?}"),
+        }
+
+        // An installed agent (plist present) passes the gate, so the verb proceeds.
+        std::fs::write(&plist, "irrelevant").unwrap();
+        ensure_managed(&plist).expect("a present plist means a managed service is installed");
     }
 
     #[test]

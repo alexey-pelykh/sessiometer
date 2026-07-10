@@ -81,7 +81,8 @@ enum Command {
     Login { label: Option<String> },
     /// `run [-v|--verbose]` — the foreground poll+swap daemon.
     Run { verbose: bool },
-    /// `service install|uninstall` — manage the background launchd LaunchAgent.
+    /// `service install|uninstall|start|stop|restart|status` — manage the background
+    /// launchd LaunchAgent and its lifecycle.
     Service { action: ServiceAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
@@ -127,15 +128,24 @@ enum Command {
     Help(HelpTopic),
 }
 
-/// The `service` sub-action (issue #166): install/start the background LaunchAgent,
-/// or uninstall/stop it. A plain data enum, like [`Command`] — the parser resolves
-/// the sub-verb so `execute` just dispatches.
+/// The `service` sub-action (issues #166, #376): install/uninstall the background
+/// LaunchAgent, or drive its lifecycle (start/stop/restart/status) over the installed
+/// agent. A plain data enum, like [`Command`] — the parser resolves the sub-verb so
+/// `execute` just dispatches.
 #[derive(Debug, PartialEq)]
 enum ServiceAction {
     /// `service install` — write + load the LaunchAgent so `run` starts at login.
     Install,
     /// `service uninstall` — unload + remove the LaunchAgent.
     Uninstall,
+    /// `service start` — load the installed agent into the per-user launchd domain.
+    Start,
+    /// `service stop` — boot the installed agent out of the domain (stops it now).
+    Stop,
+    /// `service restart` — `kickstart -k` the installed agent (kill + relaunch).
+    Restart,
+    /// `service status` — report whether the installed agent is loaded/running.
+    Status,
 }
 
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
@@ -282,9 +292,10 @@ fn parse_run(parser: &mut lexopt::Parser) -> Result<Command> {
     Ok(Command::Run { verbose })
 }
 
-/// Parse `service <install|uninstall>` (issue #166): the first positional is the sub-action,
-/// `-h`/`--help` short-circuits to help, an unknown flag is rejected, and an unrecognized
-/// action is a strict-usage error. Bare `service` (no action) prints the service help.
+/// Parse `service <install|uninstall|start|stop|restart|status>` (issues #166, #376): the
+/// first positional is the sub-action, `-h`/`--help` short-circuits to help, an unknown flag
+/// is rejected, and an unrecognized action is a strict-usage error. Bare `service` (no
+/// action) prints the service help.
 fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut action = None;
     while let Some(arg) = parser.next()? {
@@ -295,6 +306,10 @@ fn parse_service(parser: &mut lexopt::Parser) -> Result<Command> {
                 action = Some(match name.as_ref() {
                     "install" => ServiceAction::Install,
                     "uninstall" => ServiceAction::Uninstall,
+                    "start" => ServiceAction::Start,
+                    "stop" => ServiceAction::Stop,
+                    "restart" => ServiceAction::Restart,
+                    "status" => ServiceAction::Status,
                     other => {
                         return Err(Error::CliUsage {
                             message: format!("unknown service action `{other}`"),
@@ -547,6 +562,10 @@ async fn execute(command: Command) -> Result<()> {
         Command::Service { action } => match action {
             ServiceAction::Install => crate::service::install().await,
             ServiceAction::Uninstall => crate::service::uninstall().await,
+            ServiceAction::Start => crate::service::start().await,
+            ServiceAction::Stop => crate::service::stop().await,
+            ServiceAction::Restart => crate::service::restart().await,
+            ServiceAction::Status => crate::service::status().await,
         },
         Command::Status {
             json,
@@ -610,7 +629,7 @@ COMMANDS:
     capture [<label>]    Stash the active account into the rotation
     login [<label>]      Log in to an account (claude /login) in isolation and land it in the rotation, keeping the active account
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
-    service install|uninstall  Run the daemon in the background via a launchd LaunchAgent (persists across the login session)
+    service <install|uninstall|start|stop|restart|status>  Manage the background launchd LaunchAgent (install/uninstall) and drive its lifecycle (start/stop/restart/status)
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -670,14 +689,22 @@ USAGE:
     -h, --help     print this help
 ";
 
-const SERVICE_USAGE: &str = "sessiometer service — run the daemon in the background via a launchd LaunchAgent
+const SERVICE_USAGE: &str = "sessiometer service — run the daemon in the background via a launchd LaunchAgent, and manage its lifecycle
 
 USAGE:
-    sessiometer service <install|uninstall>
+    sessiometer service <install|uninstall|start|stop|restart|status>
 
     install     write + load a per-user LaunchAgent that runs `sessiometer run` at login and keeps it up across the session
     uninstall   unload + remove that LaunchAgent
+    start       load the installed agent into the launchd domain (start it now)
+    stop        boot the installed agent out of the domain (stop it now; it returns at next login — `uninstall` removes it for good)
+    restart     kickstart -k the installed agent (kill + relaunch) — the recovery verb for a stuck/stale daemon or an applied config change
+    status      report whether the installed agent is loaded/running
     -h, --help  print this help
+
+start/stop/restart/status act on an agent installed by `service install`. Run against a
+foreground `sessiometer run` (no LaunchAgent installed), they print clear guidance and exit
+non-zero rather than silently doing nothing.
 
 The agent invokes the lock-guarded `sessiometer run`, so the background agent and a
 foreground `run` can never both drive the swap loop: whichever starts second refuses
@@ -6038,6 +6065,25 @@ spare  22222222-2222\n\
                 action: ServiceAction::Uninstall
             }
         );
+    }
+
+    #[test]
+    fn service_lifecycle_verbs_parse_to_their_actions() {
+        // Issue #376: the four lifecycle sub-verbs route to their actions, alongside the
+        // existing install/uninstall — so `execute` just dispatches each to its
+        // `crate::service::*` handler.
+        for (verb, expected) in [
+            ("start", ServiceAction::Start),
+            ("stop", ServiceAction::Stop),
+            ("restart", ServiceAction::Restart),
+            ("status", ServiceAction::Status),
+        ] {
+            assert_eq!(
+                parse_argv(&["service", verb]).unwrap(),
+                Command::Service { action: expected },
+                "`service {verb}` parses to its action",
+            );
+        }
     }
 
     #[test]

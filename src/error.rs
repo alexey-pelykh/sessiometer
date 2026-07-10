@@ -294,7 +294,7 @@ pub(crate) enum Error {
     #[error("daemon not running — start it with `sessiometer run`")]
     DaemonNotRunning,
 
-    // --- Background service (`sessiometer service`, issue #166) ---------------
+    // --- Background service (`sessiometer service`, issues #166, #376) --------
     /// A `launchctl` invocation (`bootstrap` / `bootout`) while installing or
     /// uninstalling the LaunchAgent exited non-zero. The wrapped detail is the
     /// launchctl subcommand, its exit code, and its stderr — all non-secret (a
@@ -302,6 +302,19 @@ pub(crate) enum Error {
     /// A generic failure exit `1` (via the `_` arm of [`Error::exit_code`]).
     #[error("launchctl failed: {0}")]
     LaunchctlFailed(String),
+
+    /// A `service` lifecycle verb (`start`/`stop`/`restart`/`status`, issue #376)
+    /// was invoked while NO LaunchAgent is installed — the daemon is being run in
+    /// the foreground via `sessiometer run`, so there is no managed service for
+    /// launchctl to act on. Surfaced as clear guidance (never a silent no-op, never
+    /// a raw/confusing launchctl "Could not find service") with a generic failure
+    /// exit `1` (via the `_` arm of [`Error::exit_code`]). Secret-free — names only
+    /// non-secret commands.
+    #[error(
+        "no managed service — install one with `sessiometer service install`, or if \
+         you're running `sessiometer run` in the foreground, Ctrl-C and re-run it"
+    )]
+    NoManagedService,
 
     // --- Manual account selection (`sessiometer use`, issue #63) -------------
     //
@@ -655,6 +668,10 @@ mod tests {
         // A launchctl install/uninstall failure (issue #166) is a generic failure —
         // it does not touch the swap/lock taxonomy (2–7).
         assert_eq!(Error::LaunchctlFailed("boom".to_owned()).exit_code(), 1);
+        // A lifecycle verb run with no LaunchAgent installed (issue #376) is a
+        // generic failure — non-zero so the verb is never a silent no-op, but it does
+        // not touch the swap/lock taxonomy (2–7).
+        assert_eq!(Error::NoManagedService.exit_code(), 1);
         // A strict-usage rejection (issue #175) is a generic failure, matching the
         // sibling `UnknownCommand` — both are "you asked for something that isn't a
         // thing", distinct from a runtime failure.
@@ -669,6 +686,27 @@ mod tests {
         assert_eq!(
             Error::UnknownCommand("frobnicate".to_owned()).exit_code(),
             1
+        );
+    }
+
+    #[test]
+    fn no_managed_service_guides_the_operator_instead_of_a_raw_launchctl_error() {
+        // Issue #376 AC: a lifecycle verb with no installed agent yields a CLEAR
+        // guidance message — it must name the recovery path (`service install`) and
+        // acknowledge the foreground `run` workflow — not a bare/confusing launchctl
+        // "Could not find service".
+        let message = Error::NoManagedService.to_string();
+        assert!(
+            message.contains("no managed service"),
+            "leads with the diagnosis: {message}",
+        );
+        assert!(
+            message.contains("sessiometer service install"),
+            "points at the install recovery path: {message}",
+        );
+        assert!(
+            message.contains("sessiometer run"),
+            "acknowledges the foreground workflow: {message}",
         );
     }
 

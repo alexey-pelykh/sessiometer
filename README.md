@@ -78,6 +78,27 @@ inside the per-user session. The agent is `RunAtLoad` + `KeepAlive`, so it start
 login and is brought back up if it ever exits. Its stdout/stderr land in
 `~/Library/Logs/sessiometer/daemon.out.log` and `daemon.err.log`.
 
+Once it is installed, manage its lifecycle without touching `launchctl` by hand:
+
+```sh
+# Restart it — the recovery verb after a stuck/stale daemon or a config change:
+sessiometer service restart
+
+# Is it loaded/running?
+sessiometer service status
+
+# Stop it now / start it again (stop lasts until next login; `uninstall` removes it for good):
+sessiometer service stop
+sessiometer service start
+```
+
+`restart` is `launchctl kickstart -k` (kill + relaunch in one step — a bare kill would
+just be respawned by `KeepAlive`). `stop` boots the agent out of your login session and
+`start` loads it back in; `status` reports whether it is loaded. If you never ran
+`service install` — i.e. you start the daemon in the foreground with `sessiometer run` —
+these verbs print clear guidance and exit non-zero rather than silently doing nothing (to
+restart a foreground `run`, Ctrl-C it and run it again).
+
 **One owner at a time — a safety guard.** Whatever launchd starts is the ordinary
 lock-guarded `sessiometer run`: it takes a single-owner lock on the roster before it
 polls or swaps. So the background agent and a foreground `sessiometer run` can never
