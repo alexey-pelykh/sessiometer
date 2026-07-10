@@ -653,6 +653,52 @@ Settings for `sessiometer login`, the interactive re-auth verb.
 `[stats]` and `[migration]` are hand-editable too; their keys, ranges, and defaults
 are documented by the inline comments in the generated `config.toml`.
 
+### Inspecting the config (`config path` / `validate` / `show`)
+
+Because the tuning blocks are read once at start-up and frozen for the process lifetime
+(and the daemon only ever echoes its effective config once, to stderr), there is
+otherwise no way to see what a running daemon actually loaded — a hand-deleted `[tunables]`
+block, for instance, silently falls back to defaults with nothing to show for it. Three
+**read-only** `config` verbs make it observable (none of them writes the file, touches the
+daemon, or changes any state):
+
+```console
+$ sessiometer config path
+/Users/you/Library/Application Support/sessiometer/config.toml
+```
+
+`config path` prints the resolved `config.toml` location (honouring `$XDG_CONFIG_HOME`),
+so you always edit — or `cat` — the exact file the daemon reads.
+
+```console
+$ sessiometer config validate
+/Users/you/Library/Application Support/sessiometer/config.toml is valid (2 accounts)
+```
+
+`config validate` parses and validates the file **without running** — the same checks the
+daemon applies at load. It reports the documented error classes and exits non-zero on any
+of them, so it drops into a pre-flight check: a typo'd/unknown key (e.g. `poll_secss`), an
+out-of-range value (`poll_secs must be in 5..=3600`), or `session_floor > session_trigger`.
+
+```console
+$ sessiometer config show --origin
+# effective configuration
+# /Users/you/Library/Application Support/sessiometer/config.toml
+
+[tunables]  (absent — all defaults)
+  poll_secs          = 300  default
+  session_trigger    = 95   default
+  …
+[refresh]
+  enabled            = true  from-file
+  …
+```
+
+`config show` prints the **effective** config — every value the daemon would use, defaults
+filled in. With `--origin`, each value is tagged `from-file` or `default`, and a whole
+absent `[section]` is flagged, so a silently-defaulted block (the drift above) is visible
+at a glance rather than buried in start-up stderr.
+
 ## Exporting state (offline)
 
 `sessiometer export` serializes your local state — the roster and tunables plus each

@@ -20,7 +20,7 @@ use tokio::net::{UnixListener, UnixStream};
 use unicode_width::UnicodeWidthStr;
 
 use crate::claude_state::OauthAccount;
-use crate::config::{Account, Config, ConflictPolicy};
+use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
     run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap,
     NextSwapReason, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion,
@@ -89,6 +89,10 @@ enum Command {
     /// and management mode (`status`, read-only), plus stopping / restarting it (`stop` /
     /// `restart`). The process-lifecycle counterpart to the persistence-oriented `service` noun.
     Daemon { action: DaemonAction },
+    /// `config path|validate|show [--origin]` — READ-ONLY config diagnostics (issue #401):
+    /// resolve the `config.toml` path, parse+validate it without running, or print the effective
+    /// config with each value tagged `default` vs `from-file`. Never mutates the file or the daemon.
+    Config { action: ConfigAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
         json: bool,
@@ -168,6 +172,23 @@ enum DaemonAction {
     Restart,
 }
 
+/// The `config` sub-action (issue #401): READ-ONLY config diagnostics. `path` prints the
+/// resolved `config.toml` location, `validate` parses + validates it WITHOUT running (the same
+/// seam the daemon loads through), and `show` prints the effective config — with `--origin`,
+/// each value tagged `default` vs `from-file` so a silently-defaulted absent section is visible.
+/// None of the three mutates the file or the daemon. A plain data enum, like [`ServiceAction`] /
+/// [`DaemonAction`] — the parser resolves the sub-verb (and the `--origin` flag) so `execute`
+/// just dispatches.
+#[derive(Debug, PartialEq)]
+enum ConfigAction {
+    /// `config path` — print the resolved `config.toml` path (honours `$XDG_CONFIG_HOME`).
+    Path,
+    /// `config validate` — parse + validate without running; report the first error class.
+    Validate,
+    /// `config show [--origin]` — print the effective config; `--origin` tags each value's provenance.
+    Show { origin: bool },
+}
+
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
 /// subcommand's own usage. Doubles as the subcommand identity in a [`Error::CliUsage`]
 /// hint, so a rejected flag points at the exact `--help` to run.
@@ -179,6 +200,7 @@ enum HelpTopic {
     Run,
     Service,
     Daemon,
+    Config,
     Status,
     List,
     Use,
@@ -201,6 +223,7 @@ impl HelpTopic {
             HelpTopic::Run => "sessiometer run --help",
             HelpTopic::Service => "sessiometer service --help",
             HelpTopic::Daemon => "sessiometer daemon --help",
+            HelpTopic::Config => "sessiometer config --help",
             HelpTopic::Status => "sessiometer status --help",
             HelpTopic::List => "sessiometer list --help",
             HelpTopic::Use => "sessiometer use --help",
@@ -225,6 +248,7 @@ impl HelpTopic {
             HelpTopic::Run => RUN_USAGE,
             HelpTopic::Service => SERVICE_USAGE,
             HelpTopic::Daemon => DAEMON_USAGE,
+            HelpTopic::Config => CONFIG_USAGE,
             HelpTopic::Status => STATUS_USAGE,
             HelpTopic::List => LIST_USAGE,
             HelpTopic::Use => USE_USAGE,
@@ -381,6 +405,52 @@ fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
         Some(action) => Ok(Command::Daemon { action }),
         None => Ok(Command::Help(HelpTopic::Daemon)),
     }
+}
+
+/// Parse `config <path|validate|show> [--origin]` (issue #401): the READ-ONLY config
+/// diagnostics noun. The first positional is the sub-action; the order-independent `--origin`
+/// flag applies to `show` (tag each value default-vs-file). `-h`/`--help` short-circuits, an
+/// unknown flag or action is a strict-usage error, and bare `config` prints the config help.
+/// Mirrors [`parse_service`] / [`parse_daemon`]; the `--origin` flag is the only shape
+/// difference, and it is REJECTED on `path`/`validate` (where it is meaningless) rather than
+/// silently accepted — the same strict-usage stance as an unknown flag (issue #175).
+fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut action_name = None;
+    let mut origin = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Config)),
+            Long("origin") => origin = true,
+            Value(value) if action_name.is_none() => {
+                action_name = Some(value.to_string_lossy().into_owned());
+            }
+            Value(_) => {} // extra positional ignored, matching the other parsers
+            other => return Err(unexpected(other, HelpTopic::Config)),
+        }
+    }
+    let Some(name) = action_name else {
+        // Bare `config` (no action) prints the config help — never a side effect.
+        return Ok(Command::Help(HelpTopic::Config));
+    };
+    let action = match name.as_str() {
+        "path" => ConfigAction::Path,
+        "validate" => ConfigAction::Validate,
+        "show" => ConfigAction::Show { origin },
+        other => {
+            return Err(Error::CliUsage {
+                message: format!("unknown config action `{other}`"),
+                usage_hint: HelpTopic::Config.hint(),
+            })
+        }
+    };
+    // `--origin` only means something for `show`; on `path`/`validate` it is a usage error.
+    if origin && !matches!(action, ConfigAction::Show { .. }) {
+        return Err(Error::CliUsage {
+            message: "`--origin` applies only to `config show`".to_string(),
+            usage_hint: HelpTopic::Config.hint(),
+        });
+    }
+    Ok(Command::Config { action })
 }
 
 /// Parse `status [--json] [--no-color] [-v|--verbose]` (issues #72/#73/#143) — all flags
@@ -574,6 +644,7 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         "run" => parse_run(parser),
         "service" => parse_service(parser),
         "daemon" => parse_daemon(parser),
+        "config" => parse_config(parser),
         "status" => parse_status(parser),
         "list" => parse_list(parser),
         "use" => parse_use(parser),
@@ -624,6 +695,11 @@ async fn execute(command: Command) -> Result<()> {
             DaemonAction::Status => daemon_status().await,
             DaemonAction::Stop => daemon_stop().await,
             DaemonAction::Restart => daemon_restart().await,
+        },
+        Command::Config { action } => match action {
+            ConfigAction::Path => config_path(),
+            ConfigAction::Validate => config_validate(),
+            ConfigAction::Show { origin } => config_show(origin),
         },
         Command::Status {
             json,
@@ -689,6 +765,7 @@ COMMANDS:
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
     service <install|uninstall|status>  Persistence: install/uninstall the background launchd LaunchAgent, and report whether one is installed (auto-start at login)
     daemon <status|stop|restart>  Process lifecycle: report the running daemon (status), stop it, or restart it
+    config <path|validate|show>  Read-only config diagnostics: resolve the config.toml path, validate it, or show the effective config (show --origin tags default vs from-file)
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -800,6 +877,23 @@ installed service. These verbs follow the running process.
 
 You do not start a daemon with `daemon`: one is started by `service install` (managed, at
 login) or `sessiometer run` (unmanaged, foreground) — which is why there is no `daemon start`.
+";
+
+const CONFIG_USAGE: &str = "sessiometer config — read-only config diagnostics: resolve, validate, and inspect config.toml
+
+USAGE:
+    sessiometer config <path|validate|show> [--origin]
+
+    path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
+    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and session_floor > session_trigger
+    show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
+    --origin    (with show) tag each value's provenance, so a silently-defaulted absent section is visible
+    -h, --help  print this help
+
+All three are READ-ONLY: they never write config.toml, start/stop a daemon, or change any state. `config
+show --origin` surfaces effective-vs-on-disk drift — e.g. a hand-deleted [tunables] block shows every
+tunable as `default`, the very drift that once went unnoticed because the effective config is only ever
+emitted once to stderr at start-up.
 ";
 
 const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
@@ -1609,6 +1703,120 @@ async fn probe_socket_responsive(path: &Path) -> bool {
         tokio::time::timeout(DAEMON_STATUS_SOCKET_TIMEOUT, query_status(path)).await,
         Ok(Ok(_))
     )
+}
+
+/// `config path` (issue #401): print the resolved `config.toml` path — the SAME
+/// [`paths::config_file`] the daemon and every verb load through, so it names the real
+/// location (honouring `$XDG_CONFIG_HOME`, else the native support dir) rather than a
+/// re-derived guess. Read-only.
+fn config_path() -> Result<()> {
+    println!("{}", paths::config_file()?.display());
+    Ok(())
+}
+
+/// `config validate` (issue #401): parse + validate `config.toml` WITHOUT running, routing
+/// through the SAME [`Config::load_path`] seam the daemon loads through — so a typo'd/unknown
+/// key (`deny_unknown_fields` → [`Error::ConfigParse`]), an out-of-range value
+/// ([`Error::ConfigInvalid`]), or `session_floor > session_trigger`
+/// ([`Error::ConfigFloorAboveTrigger`]) surfaces here with the identical message the daemon
+/// would fail on, and a clean file reports valid. Read-only: it loads and validates, nothing
+/// more. A validation failure propagates as the loader's error, so it exits non-zero (usable
+/// in a pre-flight check) — `main` prints it and maps the exit code.
+fn config_validate() -> Result<()> {
+    let path = paths::config_file()?;
+    let config = Config::load_path(&path)?;
+    let count = config.roster.len();
+    let plural = if count == 1 { "" } else { "s" };
+    println!("{} is valid ({count} account{plural})", path.display());
+    Ok(())
+}
+
+/// `config show [--origin]` (issue #401): print the effective config the daemon WOULD load
+/// (defaults filled in). With `--origin`, each value trails a `default` / `from-file` tag and
+/// an absent `[section]` is flagged — surfacing the effective-vs-on-disk drift that motivated
+/// #401 (a hand-deleted `[tunables]` block reads as all-`default`). Read-only: it loads and
+/// formats, never writes. An invalid file surfaces the same error as `config validate`.
+fn config_show(origin: bool) -> Result<()> {
+    let path = paths::config_file()?;
+    let report = Config::load_with_origin(&path)?;
+    print!("{}", render_config_origin(&path, &report, origin));
+    Ok(())
+}
+
+/// Render the effective-config view for `config show [--origin]` (issue #401). With `origin`,
+/// each value trails a `default` / `from-file` tag and an absent `[section]` is flagged, so
+/// silently-defaulted drift is visible; without it, the same values print untagged. Columns are
+/// aligned per section (by Unicode-scalar count, matching Rust's fill semantics); pure — no I/O,
+/// no colour — so the state→text mapping is unit-tested without touching a real config path.
+fn render_config_origin(path: &Path, report: &OriginReport, origin: bool) -> String {
+    let mut out = String::new();
+    out.push_str("# effective configuration\n");
+    out.push_str(&format!("# {}\n", path.display()));
+
+    for section in &report.sections {
+        out.push('\n');
+        if origin && !section.present {
+            out.push_str(&format!("{}  (absent — all defaults)\n", section.header));
+        } else {
+            out.push_str(section.header);
+            out.push('\n');
+        }
+        let key_w = section
+            .entries
+            .iter()
+            .map(|e| e.key.chars().count())
+            .max()
+            .unwrap_or(0);
+        // The value column is padded only in --origin mode, to align the trailing tag;
+        // without a tag there is nothing to align to, so the scan is skipped.
+        let val_w = if origin {
+            section
+                .entries
+                .iter()
+                .map(|e| e.value.chars().count())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        for e in &section.entries {
+            if origin {
+                let tag = match e.origin {
+                    Origin::Default => "default",
+                    Origin::FromFile => "from-file",
+                };
+                out.push_str(&format!(
+                    "  {key:<key_w$} = {value:<val_w$}  {tag}\n",
+                    key = e.key,
+                    value = e.value,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {key:<key_w$} = {value}\n",
+                    key = e.key,
+                    value = e.value
+                ));
+            }
+        }
+    }
+
+    // The roster is `list`'s detailed job; here it is a one-line effective summary.
+    out.push('\n');
+    let count = report.roster_count;
+    let plural = if count == 1 { "" } else { "s" };
+    if origin {
+        let roster_origin = if report.roster_present {
+            "from-file"
+        } else {
+            "default"
+        };
+        out.push_str(&format!(
+            "[[account]]  ({count} account{plural}, {roster_origin})\n"
+        ));
+    } else {
+        out.push_str(&format!("[[account]]  ({count} account{plural})\n"));
+    }
+    out
 }
 
 /// The report `daemon status` prints for a [`DaemonLiveness`] × management-mode pair (issue
@@ -6916,6 +7124,182 @@ spare  22222222-2222\n\
             }
             other => panic!("expected a CliUsage error, got {other:?}"),
         }
+    }
+
+    // --- config diagnostics verbs (issue #401) -----------------------------
+
+    #[test]
+    fn config_verbs_parse_to_their_actions() {
+        // #401: the three READ-ONLY config diagnostics verbs route to their actions.
+        assert_eq!(
+            parse_argv(&["config", "path"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Path
+            }
+        );
+        assert_eq!(
+            parse_argv(&["config", "validate"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Validate
+            }
+        );
+        assert_eq!(
+            parse_argv(&["config", "show"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Show { origin: false }
+            }
+        );
+    }
+
+    #[test]
+    fn config_show_origin_flag_sets_origin_order_independently() {
+        // `--origin` applies to `show`, before OR after the verb (flag order-independent).
+        assert_eq!(
+            parse_argv(&["config", "show", "--origin"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Show { origin: true }
+            }
+        );
+        assert_eq!(
+            parse_argv(&["config", "--origin", "show"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Show { origin: true }
+            }
+        );
+    }
+
+    #[test]
+    fn config_origin_flag_is_rejected_on_path_and_validate() {
+        // `--origin` means nothing for `path`/`validate` — a strict-usage error naming the
+        // flag and pointing at `config --help`, never a silent accept.
+        for verb in ["path", "validate"] {
+            match parse_argv(&["config", verb, "--origin"]).unwrap_err() {
+                Error::CliUsage {
+                    message,
+                    usage_hint,
+                } => {
+                    assert!(message.contains("--origin"), "names the flag: {message}");
+                    assert_eq!(usage_hint, "sessiometer config --help");
+                }
+                other => panic!("`config {verb} --origin` must be a CliUsage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn config_help_and_bare_config_print_help_never_an_action() {
+        // `config --help` and a bare `config` both resolve to HELP — pure `Help`, so neither
+        // can read a config or touch state as a side effect (all three verbs are read-only
+        // anyway, but bare-noun-is-help stays consistent with `service` / `daemon`).
+        assert_eq!(
+            parse_argv(&["config", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Config)
+        );
+        assert_eq!(
+            parse_argv(&["config"]).unwrap(),
+            Command::Help(HelpTopic::Config)
+        );
+    }
+
+    #[test]
+    fn config_rejects_an_unknown_action() {
+        // A typo'd sub-action (`shwo`) errors, naming the bad action and pointing at
+        // `config --help` — never a silent fall-through.
+        match parse_argv(&["config", "shwo"]).unwrap_err() {
+            Error::CliUsage {
+                message,
+                usage_hint,
+            } => {
+                assert!(message.contains("shwo"), "names the bad action: {message}");
+                assert_eq!(usage_hint, "sessiometer config --help");
+            }
+            other => panic!("expected a CliUsage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_rejects_an_unknown_flag() {
+        let err = parse_argv(&["config", "show", "--verbose"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("--verbose"), "got: {err}");
+    }
+
+    #[test]
+    fn render_config_origin_tags_values_and_flags_absent_sections() {
+        // #401 formatting: with --origin each value trails its provenance tag and an absent
+        // `[section]` is flagged; the roster summary carries its own origin.
+        use crate::config::{OriginEntry, OriginSection};
+        let report = OriginReport {
+            sections: vec![OriginSection {
+                header: "[tunables]",
+                present: false,
+                entries: vec![
+                    OriginEntry {
+                        key: "poll_secs",
+                        value: "300".to_string(),
+                        origin: Origin::Default,
+                    },
+                    OriginEntry {
+                        key: "session_trigger",
+                        value: "90".to_string(),
+                        origin: Origin::FromFile,
+                    },
+                ],
+            }],
+            roster_count: 2,
+            roster_present: true,
+        };
+        let path = Path::new("/x/config.toml");
+
+        let tagged = render_config_origin(path, &report, true);
+        assert!(
+            tagged.contains("# /x/config.toml"),
+            "names the path: {tagged}"
+        );
+        assert!(
+            tagged.contains("[tunables]") && tagged.contains("absent"),
+            "flags the absent section: {tagged}",
+        );
+        assert!(
+            tagged.contains("default"),
+            "tags the defaulted value: {tagged}"
+        );
+        assert!(
+            tagged.contains("from-file"),
+            "tags the file value: {tagged}"
+        );
+        assert!(
+            tagged.contains("2 accounts") && tagged.contains("from-file"),
+            "summarizes the roster with its origin: {tagged}",
+        );
+
+        // Without --origin: values only — no tags, no absent-flag.
+        let plain = render_config_origin(path, &report, false);
+        assert!(
+            !plain.contains("from-file"),
+            "no tags without --origin: {plain}"
+        );
+        assert!(
+            !plain.contains("absent"),
+            "no absent-flag without --origin: {plain}"
+        );
+        assert!(
+            plain.contains("session_trigger = 90"),
+            "still prints the value: {plain}",
+        );
+    }
+
+    #[test]
+    fn render_config_origin_pluralizes_a_single_account() {
+        // The roster summary reads "1 account" (singular) for a lone account.
+        let report = OriginReport {
+            sections: vec![],
+            roster_count: 1,
+            roster_present: true,
+        };
+        let out = render_config_origin(Path::new("/x/config.toml"), &report, true);
+        assert!(out.contains("1 account,"), "singular roster: {out}");
+        assert!(!out.contains("1 accounts"), "no plural for one: {out}");
     }
 
     #[test]
