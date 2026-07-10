@@ -69,12 +69,17 @@
 //! session gate (a session-saturated account is never a swap target, mirroring the
 //! weekly-exhaustion exclusion); the post-swap cooldown (#10) additionally PACES swaps
 //! — a re-swap is refused until the per-cycle jittered cooldown has elapsed — and the
-//! swap-target session floor is an opt-in reserve on top (off by default). When EVERY
-//! account is weekly-exhausted there is no viable target
-//! ([`TickAction::NoViableTarget`], #11): the loop enters the all-exhausted
-//! terminal state — it HOLDS (no swap, so no thrash) and emits a single
-//! edge-triggered `all_exhausted` event naming the least-bad account (the soonest
-//! weekly `resets_at`), which now fills the event log's `resets_at=` field.
+//! swap-target session floor (#398) is a default-on reserve on top: a PROACTIVE swap
+//! only lands on an account whose session usage is *below* the floor, so the target
+//! keeps runway. The floor is a hard filter on that path — if nothing sits below it,
+//! holding is the correct answer. An EMERGENCY swap (the active credential is dead or
+//! quarantined) drops the floor entirely: any live account beats a dead one, and
+//! honouring the floor there would strand the daemon on the corpse. When no target
+//! survives the filters there is no viable target ([`TickAction::NoViableTarget`],
+//! #11): the loop enters the all-exhausted terminal state — it HOLDS (no swap, so no
+//! thrash) and emits a single edge-triggered `all_exhausted` event naming the
+//! least-bad account, its `cause=` (session-blocked vs weekly-exhausted) and, when
+//! known, the `resets_at=` of the relief that unblocks it.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -3982,9 +3987,10 @@ fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
 /// exactly such a target, producing an indefinite session ping-pong between the two
 /// soonest-reset accounts. The `session < session_trigger` filter closes that: the
 /// acquire predicate is now at least as strict as the negation of the release
-/// predicate on BOTH dimensions. It is always-on, distinct from the opt-in `floor`
-/// (#10) — a STRICTER reserve layered on top (effective ceiling
-/// `min(session_trigger, floor)`). The disabled exclusion (#36): a parked account
+/// predicate on BOTH dimensions. It is unconditional, distinct from `floor` — a
+/// STRICTER reserve layered on top (effective ceiling `min(session_trigger, floor)`)
+/// which the PROACTIVE caller passes (default 80, #398) and the EMERGENCY caller
+/// drops (`None`) so a dead active always escapes. The disabled exclusion (#36): a parked account
 /// is never a destination even with ample headroom, and — being excluded here
 /// rather than relying on its (skipped) poll — it can never hold the daemon out of
 /// the #11 terminal state.
@@ -4006,7 +4012,7 @@ fn pick_target(
         // Always-on session anti-thrash gate: exclude a target at/above the session
         // trigger — it would immediately re-trip [`swap::decide`]'s session dimension
         // and thrash (the exact mirror of the weekly filter above). Distinct from the
-        // opt-in `floor` below, which tightens this ceiling further when set.
+        // `floor` below, which tightens this ceiling further when the caller passes it.
         .filter(|&(_, usage)| usage.session < session_trigger)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
