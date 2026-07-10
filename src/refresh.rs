@@ -1755,7 +1755,7 @@ mod tests {
         // event log. Scan the EXACT production builder's rendered line — a hand-rolled replica
         // would silently miss a future secret-bearing field added to `refresh_event`. `before`
         // is a non-secret stored timestamp the daemon supplies; its value is immaterial here.
-        let line = crate::refresh_tick::refresh_event("work", Some(NOW_MS), &report)
+        let line = crate::refresh_tick::refresh_event("work", Some(NOW_MS), &report, None)
             .to_log_line(UNIX_EPOCH);
         assert!(
             line.contains("event=refresh"),
@@ -1765,7 +1765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_error_refresh_event_with_a_reason_leaks_no_secret() {
+    async fn an_error_refresh_event_with_a_reason_and_backoff_leaks_no_secret() {
         // Issue #377: the error `reason=` sub-class is a FIXED enum token, never dynamic error
         // text — so a FAILING cycle over the real-secret fixture must still leave the emitted
         // event line clean. The #106 "an unexercised channel is unmetered" discipline: the
@@ -1773,6 +1773,10 @@ mod tests {
         // `reason=` branch. Metering the error path is the durable guard the "NO dynamic error
         // text" AC leans on — a future regression that folded an error `Display` into `reason`
         // would trip here on the exact production builder's output.
+        //
+        // Issue #408: a production error cycle also arms a back-off, so the SAME line carries a
+        // `backoff_secs=<n>` field — render it here (a bare `u64`, structurally secret-free) so
+        // the `Some` branch is metered over the real secret too, not just the `None` render.
         let secrets = crate::redaction::meter::Secrets::meter_fixture();
         let stash = seeded_stash(secrets.blob(), "u-1").await;
         let keychain = FakeIsolatedKeychain::empty();
@@ -1785,12 +1789,17 @@ mod tests {
             RefreshOutcome::Error(RefreshErrorReason::SpawnFailed)
         );
 
-        // The EXACT production builder's error line, over the real-secret cycle.
-        let line = crate::refresh_tick::refresh_event("work", Some(NOW_MS), &report)
+        // The EXACT production builder's error line, over the real-secret cycle, WITH the armed
+        // back-off surfaced (as an erroring sweep does in production).
+        let line = crate::refresh_tick::refresh_event("work", Some(NOW_MS), &report, Some(120))
             .to_log_line(UNIX_EPOCH);
         assert!(
             line.contains("reason=spawn_failed"),
             "the error line carries the #377 reason: {line}"
+        );
+        assert!(
+            line.contains("backoff_secs=120"),
+            "the error line carries the #408 back-off: {line}"
         );
         crate::redaction::meter::assert_clean(&line, &secrets);
     }

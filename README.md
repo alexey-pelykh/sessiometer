@@ -857,6 +857,16 @@ long-running rotation hits:
   cadence also carries normal jitter so concurrent accounts decorrelate, and on
   start-up the daemon waits a small jittered delay before its first poll so repeated
   restarts don't synchronise a burst of requests.
+- **Sustained refresh failures back off per-account.** A parked-credential refresh
+  that keeps erroring — a broken `claude` binary, a dead network — is **not** retried
+  at the idle floor forever. The daemon widens **that account's** refresh spacing on
+  each consecutive error (an exponential back-off from the idle floor to the same
+  ~1 h ceiling), skipping the account **whole** while it backs off — no `claude -p`
+  spawn, no keychain read — so a persistent failure can no longer storm the machine
+  with a refresh every idle floor. The streak is **per-account** and **clears on the
+  first clean refresh**, and every other account keeps refreshing on its normal
+  cadence. The armed wait is surfaced as `backoff_secs=<n>` on the account's
+  `event=refresh` error line.
 - **Re-authentication is picked up automatically.** If you `claude /login` an
   account again (refreshing its token, or switching the active account), the
   daemon detects the changed canonical credential and **re-stashes** the affected

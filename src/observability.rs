@@ -524,6 +524,16 @@ pub(crate) enum Event {
         /// class — in both cases NO `reason=` is rendered. A [`RefreshEventReason`] is a fixed
         /// enum token, never dynamic error text, so it cannot carry a secret onto the line.
         reason: Option<RefreshEventReason>,
+        /// The per-account refresh back-off armed by THIS `outcome=error` cycle (issue #408),
+        /// in seconds — the window before this account's next sweep-refresh is permitted. `Some`
+        /// ONLY on an `error` outcome that advanced the account's back-off streak (the periodic
+        /// #105 sweep; the widening mirror of the poll path's `backoff_secs` on `diag=tick`);
+        /// `None` on every non-error outcome (which CLEARS the streak) and on the poll-path
+        /// refresh (#162, which does not sweep-throttle). Rendered as an additive TRAILING
+        /// `backoff_secs=` field after `reason=`, so a non-throttled refresh line is byte-for-byte
+        /// unchanged and every existing `key=val` parser is unaffected. A bare integer, never a
+        /// token or handle — the #15 single-surface guarantee holds.
+        backoff_secs: Option<u64>,
     },
     /// The `#162` poll-path refresh-then-retry fired for the PARKED `account` (issue #255): on
     /// the FIRST usage-401 of a streak episode the daemon ran ONE isolated refresh (the #102
@@ -748,6 +758,7 @@ impl Event {
                 expires_after,
                 refresh_token_rotated,
                 reason,
+                backoff_secs,
             } => {
                 let outcome = outcome.as_str();
                 // Each expiry is omitted when unreadable (an empty value after `=` would
@@ -786,8 +797,17 @@ impl Event {
                     Some(reason) => format!(" reason={}", reason.as_str()),
                     None => String::new(),
                 };
+                // `backoff_secs=` (issue #408) trails the WHOLE line — after the optional
+                // `reason=` — mirroring the swap line's optional trailing `late=` and the tick
+                // line's `backoff_secs=`. Present ONLY on an error that armed a per-account
+                // back-off; omitted otherwise, so a non-throttled refresh line is byte-for-byte
+                // unchanged and every existing `key=val` parser is unaffected.
+                let backoff = match backoff_secs {
+                    Some(secs) => format!(" backoff_secs={secs}"),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}{reason}"
+                    "ts={ts} event=refresh account={account} outcome={outcome}{before}{after} rotated={refresh_token_rotated}{reason}{backoff}"
                 )
             }
             Event::PollRefresh {
@@ -1663,7 +1683,8 @@ mod tests {
             expires_before: Some(1_782_777_600_000),
             expires_after: Some(1_782_781_200_000), // +1h
             refresh_token_rotated: true,
-            reason: None, // a success carries no error reason (#377)
+            reason: None,       // a success carries no error reason (#377)
+            backoff_secs: None, // a success carries no back-off (#408)
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -1687,6 +1708,7 @@ mod tests {
             expires_after: None,
             refresh_token_rotated: false,
             reason: None,
+            backoff_secs: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -1719,6 +1741,7 @@ mod tests {
                 expires_after: None,
                 refresh_token_rotated: false,
                 reason: Some(reason),
+                backoff_secs: None,
             }
             .to_log_line(at_epoch(0));
             assert_eq!(
@@ -1728,6 +1751,66 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn refresh_error_line_carries_the_trailing_backoff_secs() {
+        // Issue #408: the per-account back-off an error armed rides an additive TRAILING
+        // `backoff_secs=` field, AFTER the optional `reason=` (mirroring the tick line's
+        // `backoff_secs=` and the swap line's `late=`), so it is observable without disturbing any
+        // existing `key=val` parser. Three cases pin the field's placement and its omission.
+
+        // With BOTH a reason and a back-off: `backoff_secs=` trails `reason=`.
+        let timed_out = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Error,
+            expires_before: None,
+            expires_after: None,
+            refresh_token_rotated: false,
+            reason: Some(RefreshEventReason::Timeout),
+            backoff_secs: Some(240),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            timed_out,
+            format!("{TS0} event=refresh account=spare outcome=error rotated=false reason=timeout backoff_secs=240")
+        );
+
+        // A hard `Err` (no reason) that armed a back-off: `backoff_secs=` rides directly after
+        // `rotated=`, with no `reason=` between.
+        let hard = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Error,
+            expires_before: None,
+            expires_after: None,
+            refresh_token_rotated: false,
+            reason: None,
+            backoff_secs: Some(120),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            hard,
+            format!(
+                "{TS0} event=refresh account=spare outcome=error rotated=false backoff_secs=120"
+            )
+        );
+
+        // A successful refresh (no back-off): the field is OMITTED entirely — the line is
+        // byte-for-byte the pre-#408 shape.
+        let ok = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Refreshed,
+            expires_before: None,
+            expires_after: None,
+            refresh_token_rotated: false,
+            reason: None,
+            backoff_secs: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            !ok.contains("backoff_secs="),
+            "a success omits backoff_secs: {ok}"
+        );
     }
 
     #[test]
@@ -1865,6 +1948,7 @@ mod tests {
                 expires_after: None,
                 refresh_token_rotated: false,
                 reason: None, // outcome-token render only — the #377 reason has its own test
+                backoff_secs: None, // and no back-off — the #408 field has its own test
             }
             .to_log_line(at_epoch(0));
             assert_eq!(
@@ -1918,6 +2002,7 @@ mod tests {
                 expires_after: Some(1_782_781_200_000),
                 refresh_token_rotated: true,
                 reason: None,
+                backoff_secs: None,
             },
             Event::CredentialHealth {
                 account: "work".to_owned(),
