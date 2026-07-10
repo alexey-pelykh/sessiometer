@@ -12527,6 +12527,7 @@ mod tests {
                 expires_after: Some(1_003_600),
                 refresh_token_rotated: false,
                 reason: None,
+                backoff_secs: None,
             }],
             restored: vec!["u-B".to_owned()],
             observations: Vec::new(),
@@ -15351,6 +15352,7 @@ mod tests {
                 expires_after: Some(1_782_784_800_000),
                 refresh_token_rotated: true, // the #279 field joins the #15 all-channels corpus
                 reason: None,
+                backoff_secs: None,
             }
             .to_log_line(std::time::UNIX_EPOCH + Duration::from_secs(1_782_777_600)),
         );

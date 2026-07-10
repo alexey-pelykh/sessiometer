@@ -262,6 +262,28 @@ mod tests {
     }
 
     #[test]
+    fn a_fully_backed_off_sweep_reads_as_no_signal_and_cannot_mask_a_systemic_failure() {
+        // #408 × #378 reachable-state composition: once the refresh error back-off arms on every
+        // eligible account, the next sweep SKIPS them all and yields ZERO refresh observations
+        // (`refresh_tick` asserts that emptiness at its own seam). Feeding that empty set through
+        // the SAME `classify` → `note` path the daemon's run loop uses must read as `NoSignal` and
+        // leave an active systemic episode UNTOUCHED — the throttle may DELAY a re-probe but must
+        // never fabricate a recovery that hides a genuine mechanism outage from #378.
+        let mut detector = SystemicRefreshHealth::default();
+        for _ in 0..3 {
+            detector.note(all_error(2), 3); // mechanism down → episode active at N=3
+        }
+        assert_eq!(detector.status(), Some(3));
+        // A fully-backed-off sweep classifies exactly like the empty observation set it produces.
+        let backed_off = SweepHealth::classify(std::iter::empty());
+        assert_eq!(backed_off, SweepHealth::NoSignal);
+        assert_eq!(detector.note(backed_off, 3), None);
+        // Still active, count intact — detection survives the back-off; only a real `Working` sweep
+        // (the mechanism demonstrably recovered) clears it.
+        assert_eq!(detector.status(), Some(3));
+    }
+
+    #[test]
     fn a_second_episode_re_fires_after_a_recovery() {
         let mut detector = SystemicRefreshHealth::default();
         for _ in 0..3 {

@@ -56,6 +56,63 @@ use crate::paths;
 use crate::refresh::{self, RefreshErrorReason, RefreshOutcome, RefreshReport};
 use crate::stash::RealAccountStash;
 
+/// Floor on the base spacing the per-account refresh error back-off widens from (issue #408). The
+/// base is the sweep's own idle floor (`idle_after_secs`) — the interval a recovery-prompted failing
+/// sweep abuses (~1/min at the 60 s default) — so the ramp starts at the interval it is throttling,
+/// exactly as the poll back-off bases on the poll interval (`src/daemon.rs`). Applied as
+/// `idle_after().max(THIS)` because `idle_after_secs` is a tunable that may be `0` (a valid "sweep as
+/// soon as idle" config); an unfloored `0` base would collapse the whole back-off to zero at
+/// precisely the worst config. 60 s is the `idle_after_secs` DEFAULT, so the common case is unchanged.
+const REFRESH_BACKOFF_MIN_BASE: Duration = Duration::from_secs(60);
+/// Largest exponent applied to the refresh error back-off (issue #408), mirroring the poll path's
+/// `POLL_BACKOFF_MAX_SHIFT` (#76): the wait is `base × 2^min(streak, this)`. Clamping the exponent
+/// keeps the shift finite (no `1 << streak` overflow); [`REFRESH_BACKOFF_CAP`] is the real ceiling.
+/// `6` (×64) is past the cap for any base ≤ the cap, so it is a safety bound, not the operative
+/// limit.
+const REFRESH_BACKOFF_MAX_SHIFT: u32 = 6;
+/// Ceiling on the per-account refresh error back-off (issue #408), mirroring `POLL_BACKOFF_CAP`
+/// (#76): under sustained failure the effective refresh spacing grows exponentially but settles
+/// here — one `claude -p` spawn per hour instead of the ~1/min spawn storm. Numerically the refresh
+/// cadence default (`DEFAULT_REFRESH_CADENCE_SECS`), the natural "at most one attempt per cadence"
+/// ceiling. Unlike the poll back-off there is NO server-advised `Retry-After` to honour — a refresh
+/// is a `claude -p` subprocess spawn, not an HTTP request — so this cap has no server minimum.
+const REFRESH_BACKOFF_CAP: Duration = Duration::from_secs(3600);
+
+/// One account's refresh error back-off ledger entry (issue #408): the consecutive-`outcome=error`
+/// streak and the monotonic instant before which this account's next sweep-refresh is suppressed.
+/// The per-account, tick-owned mirror of the poll path's `AccountHealth::poll_backoff_streak` +
+/// `poll_backoff_until` (ADR-0009) — housed on [`RefreshTick`] (not `AccountHealth`) because the
+/// #105 sweep owns its refresh-timing state on its OWN clock, decoupled from the daemon (see
+/// `src/daemon/run_loop.rs` "the tick owns its own roster copy + clock"). Every non-error refresh
+/// CLEARS the entry (edge-triggered, like the poll path), so an entry exists only while backing off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RefreshBackoff {
+    /// Consecutive `outcome=error` refresh cycles for this account (1-based: the first error is 1).
+    streak: u32,
+    /// The monotonic instant before which the sweep SKIPS this account (no `claude -p`, no keychain
+    /// read). Armed as `now + `[`refresh_backoff_delay`]`(streak, base)` on each error.
+    until: Instant,
+}
+
+/// The refresh error back-off wait for a consecutive-error `streak` and a `base` spacing (issue
+/// #408): `base × 2^min(streak, `[`REFRESH_BACKOFF_MAX_SHIFT`]`)`, clamped to
+/// [`REFRESH_BACKOFF_CAP`]. The widening mirror of the poll path's `note_account_backoff`
+/// (`src/daemon.rs`) — the first error already earns 2× the base, sustained failure settles at the
+/// cap. A pure function of `(streak, base)`, so the exponential + cap is unit-tested without a clock.
+///
+/// The cap is raised to `max(CAP, base)` so that for ANY `base` the back-off can never be SHORTER
+/// than the base itself — an inversion where a failing account would retry FASTER than a healthy
+/// sweep. In production this is defense-in-depth, not a live path: config bounds `idle_after_secs`
+/// to `≤ 3600 s` (= [`REFRESH_BACKOFF_CAP`]), so `base ≤ CAP` and the raise is always a no-op —
+/// keeping the pure fn correct for any `base` future-proofs it against a later config-cap increase
+/// silently reintroducing the inversion. `checked_mul` guards the (already shift-clamped) multiply,
+/// falling back to the cap.
+fn refresh_backoff_delay(streak: u32, base: Duration) -> Duration {
+    let shift = streak.min(REFRESH_BACKOFF_MAX_SHIFT);
+    let cap = REFRESH_BACKOFF_CAP.max(base);
+    base.checked_mul(1u32 << shift).unwrap_or(cap).min(cap)
+}
+
 /// The per-account isolated-refresh operations [`RefreshTick`] drives, injected as a seam so
 /// the whole selection → refresh flow runs hermetically against an in-memory fake in tests —
 /// exactly as `poke`'s `PokeEngine` and `use`'s swap seams. The production implementation is
@@ -148,6 +205,16 @@ pub(crate) struct RefreshTick<E, K> {
     /// so a `until_due` future the run loop RE-CREATES every idle iteration sees a SHRINKING
     /// delay rather than a fresh full floor — the fix for the 15s-login-watch starvation.
     idle_anchor: Option<Instant>,
+    /// Per-account refresh error back-off (issue #408), positional to [`roster`](Self::roster):
+    /// `refresh_backoff[i]` is `Some` while account `i` is throttled after consecutive
+    /// `outcome=error` cycles, `None` otherwise. Sized to the roster ONCE at construction and never
+    /// resized — the tick's roster is fixed for the daemon's life (`adopt_roster_reload` rewrites
+    /// only the DAEMON's roster, a pre-existing #139 limitation), so the positional map stays
+    /// aligned with no pruning. Read in [`run_sweep`](Self::run_sweep) to SKIP a backing-off account
+    /// before any spawn; the widen/clear deltas it emits are applied in [`sweep`](RefreshTicker::sweep),
+    /// so `run_sweep` stays `&self` (the same deferral the restores/observations use). The
+    /// tick-owned mirror of the poll path's per-`AccountHealth` back-off (ADR-0009).
+    refresh_backoff: Vec<Option<RefreshBackoff>>,
 }
 
 impl<E, K> RefreshTick<E, K> {
@@ -160,6 +227,8 @@ impl<E, K> RefreshTick<E, K> {
         engine: E,
         clock: K,
     ) -> Self {
+        // Sized to the roster ONCE — the tick's roster is fixed for the daemon's life (issue #408).
+        let refresh_backoff = vec![None; roster.len()];
         Self {
             roster,
             config,
@@ -168,6 +237,7 @@ impl<E, K> RefreshTick<E, K> {
             clock,
             last_refresh: None,
             idle_anchor: None,
+            refresh_backoff,
         }
     }
 
@@ -249,18 +319,27 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
     /// is reported in [`SweepOutcome::restored`] for the daemon to un-quarantine. `now_ms`
     /// is the wall clock for the near-expiry horizon. Per-account errors and timeouts are
     /// non-fatal — recorded as an `error` refresh event and stepped past.
+    ///
+    /// Issue #408: an account inside its per-account refresh error back-off window is SKIPPED
+    /// entirely — the widening-on-sustained-failure mirror of the poll path (ADR-0009). Kept `&self`
+    /// (no clock write) by RETURNING the back-off widen/clear deltas as `(index, new state)` pairs
+    /// alongside the [`SweepOutcome`]; [`sweep`](RefreshTicker::sweep) applies them, the same
+    /// post-run deferral `last_refresh` / the restores use.
     async fn run_sweep(
         &self,
         excluded: &[String],
         quarantined: &[String],
         now_ms: i64,
-    ) -> SweepOutcome {
+    ) -> (SweepOutcome, Vec<(usize, Option<RefreshBackoff>)>) {
         // The near-expiry horizon = one cadence: refresh anything that would not survive to
         // the next tick. `* 1000` → ms (the unit CC's `expiresAt` uses).
         let horizon_ms = (self.config.cadence_secs as i64).saturating_mul(1000);
         let allowlist = !self.config.accounts.is_empty();
         let mut outcome = SweepOutcome::default();
-        for account in &self.roster {
+        // Per-account back-off ledger deltas (issue #408): `(index, Some)` to arm/widen, `(index,
+        // None)` to clear. Applied by `sweep` after this returns, so `run_sweep` stays `&self`.
+        let mut backoff_updates: Vec<(usize, Option<RefreshBackoff>)> = Vec::new();
+        for (i, account) in self.roster.iter().enumerate() {
             // Parked only: the daemon excludes the active account + imminent swap target.
             if excluded.iter().any(|uuid| uuid == &account.account_uuid) {
                 continue;
@@ -268,6 +347,18 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // Allowlist (empty = all parked accounts).
             if allowlist && !self.account_listed(account) {
                 continue;
+            }
+            // Issue #408: SKIP an account still inside its refresh error back-off window — no
+            // `claude -p` spawn AND no `stored_expires_at` keychain read (a `security` subprocess,
+            // ADR-0002), so a throttled account costs nothing on each wake. Placed HERE, ahead of
+            // the keychain read below AND the quarantine bypass, so the RESTORE re-probe is
+            // throttled too — that recovery path re-probing at the idle floor is the actual storm
+            // (#408). No event, no observation, exactly like the exclusion skip above. Mirrors the
+            // poll path dropping a backing-off index before the poll body (ADR-0009).
+            if let Some(backoff) = self.refresh_backoff[i] {
+                if self.clock.now() < backoff.until {
+                    continue;
+                }
             }
             let is_quarantined = quarantined.iter().any(|uuid| uuid == &account.account_uuid);
             // The stored expiry BEFORE the cycle: the event's `expires_before` AND the
@@ -298,43 +389,74 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // a hard engine `Err` (`Ok(Err)`) has no secret-free sub-class → no `reason=`.
             // Computed before the match consumes `cycle`.
             let timeout_reason = cycle.is_err().then_some(RefreshEventReason::Timeout);
-            let (event, observation) = match cycle {
-                Ok(Ok(report)) => {
-                    // RESTORE a quarantined account ONLY when THIS cycle persisted the fresh
-                    // token (`Refreshed` AND `re_stashed`): then the canonical demonstrably
-                    // holds a token we know is good. On a CAS-discarded refresh (`Refreshed`
-                    // but not `re_stashed`) a concurrent swap/login changed the stash and is
-                    // authoritative — it OWNS the un-quarantine (the #42 poll once it polls
-                    // active, or #107's re-login), so we do not second-guess its credential.
-                    if is_quarantined
-                        && report.outcome == RefreshOutcome::Refreshed
-                        && report.re_stashed
-                    {
-                        outcome.restored.push(account.account_uuid.clone());
-                    }
-                    let observation = RefreshObservation {
+            // Classify ONCE — drives the event, the #119 observation, AND the #408 back-off fold.
+            // A completed cycle keeps its report (for the expiry slide + rotation); a hard `Err` /
+            // timeout has no report and is an `Error` outcome with the expiry held at the before.
+            let (event_outcome, report) = match cycle {
+                Ok(Ok(report)) => (refresh_event_outcome(&report), Some(report)),
+                Ok(Err(_)) | Err(_) => (RefreshEventOutcome::Error, None),
+            };
+            // RESTORE a quarantined account ONLY when THIS cycle persisted the fresh token
+            // (`Refreshed` AND `re_stashed`): then the canonical demonstrably holds a token we know
+            // is good. On a CAS-discarded refresh (`Refreshed` but not `re_stashed`) a concurrent
+            // swap/login changed the stash and is authoritative — it OWNS the un-quarantine (the #42
+            // poll once it polls active, or #107's re-login), so we do not second-guess its credential.
+            if is_quarantined
+                && report
+                    .as_ref()
+                    .is_some_and(|r| r.outcome == RefreshOutcome::Refreshed && r.re_stashed)
+            {
+                outcome.restored.push(account.account_uuid.clone());
+            }
+            // Fold the per-account back-off ledger (issue #408). An `Error` advances the streak and
+            // arms a widening window (surfaced as `backoff_secs=` on the event); ANY other outcome
+            // CLEARS it — edge-triggered, mirroring the poll path's `note_account_backoff`. The
+            // widen/clear is emitted as a delta and applied by `sweep`, so this stays `&self`.
+            let backoff_secs = if event_outcome == RefreshEventOutcome::Error {
+                let streak = self.refresh_backoff[i]
+                    .map_or(0, |b| b.streak)
+                    .saturating_add(1);
+                // Base = the sweep's own idle floor (the interval a failing sweep abuses), floored
+                // so a `0` `idle_after_secs` cannot collapse the back-off to nothing (#408).
+                let base = self.config.idle_after().max(REFRESH_BACKOFF_MIN_BASE);
+                let wait = refresh_backoff_delay(streak, base);
+                // `wait` is already bounded by `REFRESH_BACKOFF_CAP`, so this `checked_add` is a
+                // belt-and-suspenders guard on the monotonic instant (unreachable for a real clock);
+                // if it ever overflowed, fall back to `now` — an immediate re-attempt next cycle,
+                // never a panic (adding anything to an overflowed instant would panic too).
+                let now = self.clock.now();
+                let until = now.checked_add(wait).unwrap_or(now);
+                backoff_updates.push((i, Some(RefreshBackoff { streak, until })));
+                Some(wait.as_secs())
+            } else {
+                // Clear only when there is a live window — never churn the ledger with no-op writes.
+                if self.refresh_backoff[i].is_some() {
+                    backoff_updates.push((i, None));
+                }
+                None
+            };
+            let (event, observation) = match report {
+                Some(report) => (
+                    refresh_event(&account.label, before_ms, &report, backoff_secs),
+                    RefreshObservation {
                         account_uuid: account.account_uuid.clone(),
                         // The post-cycle stored expiry (the event's `expires_after`): a
                         // re-stashed refresh slid it forward; every other terminal state
                         // left the stash — and so the expiry — unchanged.
                         expires_at_ms: expires_after(before_ms, &report),
                         refresh: Some(RefreshDelta {
-                            outcome: refresh_event_outcome(&report),
+                            outcome: event_outcome,
                             token_rotated: report.refresh_token_rotated,
                         }),
-                    };
-                    (
-                        refresh_event(&account.label, before_ms, &report),
-                        observation,
-                    )
-                }
+                    },
+                ),
                 // Secret-free: a hard `Err` (`Ok(Err)`) or a timeout (`Err`) is an `error`
                 // outcome. The engine's error Display is NOT folded into the structured event —
                 // only the class, plus the `timeout` reason when the bound fired (#377); a hard
                 // `Err` carries no secret-free reason. The stash is untouched, so the rollup sees
                 // a refresh failure (→ at-risk) with the expiry held at the before, never a slide.
-                Ok(Err(_)) | Err(_) => (
-                    error_refresh_event(&account.label, before_ms, timeout_reason),
+                None => (
+                    error_refresh_event(&account.label, before_ms, timeout_reason, backoff_secs),
                     RefreshObservation {
                         account_uuid: account.account_uuid.clone(),
                         expires_at_ms: before_ms,
@@ -348,7 +470,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             outcome.events.push(event);
             outcome.observations.push(observation);
         }
-        outcome
+        (outcome, backoff_updates)
     }
 }
 
@@ -362,6 +484,19 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
         // one the sweep WOULD refresh for the #106 restore — the only kind worth prompting for
         // (issue #280). Kept in lockstep with `run_sweep` so a quarantined account outside the
         // allowlist, or an excluded dead active/target, never raises a prompt the sweep no-ops.
+        //
+        // DELIBERATELY back-off-UNAWARE (issue #408): a quarantined account inside its refresh
+        // back-off window still returns `true` here, even though `run_sweep` will SKIP it. This is
+        // not the #280 lockstep leaking — it is load-bearing. `recovery_pending` gates the WAKE
+        // CADENCE (it drops the cadence term in `until_due`, keeping the tick waking at the tight
+        // idle floor); the back-off `until` widens SUB-cadence (60→120→…→3600 s), so the tick must
+        // keep waking at the idle floor to re-check `until` and honour each step. Make this
+        // back-off-aware (return `false` while backing off, or push the wake out to `until`) and the
+        // wake cadence jumps to the full refresh cadence — the exponential's first several steps go
+        // inert. The skip inside `run_sweep` already makes these wakes SPAWN-free (no `claude -p`,
+        // no keychain read), so the cost of keeping them is a bare timer + roster scan. Do NOT
+        // "fix" this divergence — it is what keeps the sub-cadence back-off honoured without the
+        // ~1/min spawn storm.
         let allowlist = !self.config.accounts.is_empty();
         self.roster.iter().any(|account| {
             quarantined.iter().any(|uuid| uuid == &account.account_uuid)
@@ -391,7 +526,14 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
         if !self.enabled {
             return SweepOutcome::default();
         }
-        let outcome = self.run_sweep(excluded, quarantined, now_ms()).await;
+        let (outcome, backoff_updates) = self.run_sweep(excluded, quarantined, now_ms()).await;
+        // Apply the per-account back-off ledger deltas `run_sweep` emitted (issue #408): arm/widen
+        // (`Some`) on an `outcome=error`, clear (`None`) on any recovery. Deferred to here — after
+        // the `&self` sweep returns — the same post-run write pattern `last_refresh` uses, so the
+        // sweep itself needs no `&mut self`. Indices are positional to the roster, fixed for life.
+        for (i, state) in backoff_updates {
+            self.refresh_backoff[i] = state;
+        }
         // Anchor the cadence from the END of the sweep, so a long sweep does not let the
         // next one start early.
         self.last_refresh = Some(self.clock.now());
@@ -421,7 +563,18 @@ fn is_near_expiry(expires_at_ms: Option<i64>, now_ms: i64, horizon_ms: i64) -> b
 /// `pub(crate)` so the engine's redaction-METER test ([`crate::refresh`]) can scan THIS
 /// exact production builder's output over a real-secret cycle — a hand-rolled replica would
 /// silently miss a future secret-bearing field added here (issue #106 deliverable 3).
-pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &RefreshReport) -> Event {
+///
+/// `backoff_secs` (issue #408) is the per-account refresh back-off THIS cycle armed, in seconds,
+/// or `None` — passed by the caller ([`RefreshTick::run_sweep`]), which owns the back-off state.
+/// A completed cycle that classified `Error` advances the streak (so `Some`); every non-error
+/// outcome clears it (`None`). Threaded through here rather than derived, so the sweep is the one
+/// place the back-off ledger is folded.
+pub(crate) fn refresh_event(
+    label: &str,
+    before_ms: Option<i64>,
+    report: &RefreshReport,
+    backoff_secs: Option<u64>,
+) -> Event {
     Event::Refresh {
         account: label.to_owned(),
         outcome: refresh_event_outcome(report),
@@ -432,6 +585,8 @@ pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &Refres
         // The non-secret error sub-class (issue #377): `Some` iff the completed cycle
         // classified `Error`, mapped from the engine's `RefreshErrorReason`; `None` otherwise.
         reason: refresh_event_reason(report),
+        // The per-account back-off this cycle armed (issue #408); `Some` only on an `Error`.
+        backoff_secs,
     }
 }
 
@@ -444,10 +599,15 @@ pub(crate) fn refresh_event(label: &str, before_ms: Option<i64>, report: &Refres
 /// whole-cycle timeout bound fired, `None` for a hard engine `Err` (a locked keychain, a
 /// contended lock, an FS error, an unresolved binary) — that carries no secret-free class, so
 /// it renders a bare `outcome=error`.
+///
+/// `backoff_secs` (issue #408) is the per-account refresh back-off THIS error armed, in seconds
+/// — always an error path here, so it is `Some` whenever the sweep advanced the streak. Passed by
+/// [`RefreshTick::run_sweep`], the owner of the back-off ledger.
 fn error_refresh_event(
     label: &str,
     before_ms: Option<i64>,
     reason: Option<RefreshEventReason>,
+    backoff_secs: Option<u64>,
 ) -> Event {
     Event::Refresh {
         account: label.to_owned(),
@@ -458,6 +618,8 @@ fn error_refresh_event(
         // engine `Err` / whole-cycle timeout renders `rotated=false`.
         refresh_token_rotated: false,
         reason,
+        // The per-account back-off this error armed (issue #408).
+        backoff_secs,
     }
 }
 
@@ -602,11 +764,19 @@ mod tests {
     }
 
     /// In-memory [`RefreshEngine`]: canned per-account expiries + refresh results, plus a
-    /// record of which accounts (in order) actually had `refresh` called.
+    /// record of which accounts (in order) actually had `refresh` called AND which had their
+    /// stored expiry READ (`expiry_reads`, issue #408) — the latter is the `security` keychain
+    /// subprocess (ADR-0002) the back-off skip must avoid, not just the `claude -p` spawn.
     struct FakeEngine {
         expiries: HashMap<String, Option<i64>>,
         results: HashMap<String, FakeRefresh>,
+        /// Per-account SEQUENCE of results consumed front-to-back (issue #408): lets one account
+        /// return DIFFERENT outcomes across sweeps on the SAME tick (error → success → error), so
+        /// the back-off streak's arm/clear across sweeps is testable. Falls back to `results` (then
+        /// the `NoChange` default) once a script is exhausted.
+        scripts: RefCell<HashMap<String, Vec<FakeRefresh>>>,
         refreshed: RefCell<Vec<String>>,
+        expiry_reads: RefCell<Vec<String>>,
     }
 
     impl FakeEngine {
@@ -614,7 +784,9 @@ mod tests {
             Self {
                 expiries: HashMap::new(),
                 results: HashMap::new(),
+                scripts: RefCell::new(HashMap::new()),
                 refreshed: RefCell::new(Vec::new()),
+                expiry_reads: RefCell::new(Vec::new()),
             }
         }
         fn with_expiry(mut self, uuid: &str, expires_at: Option<i64>) -> Self {
@@ -625,21 +797,43 @@ mod tests {
             self.results.insert(uuid.to_owned(), result);
             self
         }
+        /// Canned SEQUENCE of results for one account, consumed one per `refresh` call (issue #408).
+        fn with_script(self, uuid: &str, results: Vec<FakeRefresh>) -> Self {
+            self.scripts.borrow_mut().insert(uuid.to_owned(), results);
+            self
+        }
         fn refreshed(&self) -> Vec<String> {
             self.refreshed.borrow().clone()
+        }
+        /// The accounts whose stored expiry was READ this run — a proxy for the keychain
+        /// subprocess the #408 back-off skip must avoid (issue #408).
+        fn expiry_reads(&self) -> Vec<String> {
+            self.expiry_reads.borrow().clone()
         }
     }
 
     impl RefreshEngine for FakeEngine {
         async fn stored_expires_at(&self, account: &Account) -> Option<i64> {
+            self.expiry_reads
+                .borrow_mut()
+                .push(account.account_uuid.clone());
             self.expiries.get(&account.account_uuid).copied().flatten()
         }
         async fn refresh(&self, account: &Account) -> Result<RefreshReport> {
             self.refreshed
                 .borrow_mut()
                 .push(account.account_uuid.clone());
-            match self.results.get(&account.account_uuid) {
-                Some(FakeRefresh::Report(r)) => Ok(*r),
+            // Pick the result — a scripted step (if any remain), else the fixed per-account result,
+            // else the `NoChange` default — and DROP the `scripts` borrow before any `await`.
+            let scripted = self
+                .scripts
+                .borrow_mut()
+                .get_mut(&account.account_uuid)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.remove(0));
+            let fake = scripted.or_else(|| self.results.get(&account.account_uuid).copied());
+            match fake {
+                Some(FakeRefresh::Report(r)) => Ok(r),
                 Some(FakeRefresh::HardError) => Err(crate::error::Error::SwapLockBusy),
                 Some(FakeRefresh::Hang) => {
                     tokio::time::sleep(Duration::from_secs(10_000)).await;
@@ -1131,7 +1325,8 @@ mod tests {
                 expires_before: Some(soon),
                 expires_after: Some(soon + 7_200_000), // before + 7200 s in ms
                 refresh_token_rotated: true,           // sourced from the report above (#279)
-                reason: None, // a successful refresh carries no reason (#377)
+                reason: None,       // a successful refresh carries no reason (#377)
+                backoff_secs: None, // a success clears any back-off (#408)
             }]
         );
         assert!(
@@ -1169,6 +1364,7 @@ mod tests {
                 expires_after: Some(soon), // unchanged — the CAS discarded the fresh token
                 refresh_token_rotated: false, // this cycle's report did not rotate
                 reason: None,              // not an error outcome — no reason (#377)
+                backoff_secs: None, // RefreshedNotReStashed is not an error — no back-off (#408)
             }]
         );
     }
@@ -1197,6 +1393,9 @@ mod tests {
                 // A hard `Err` has no report to source a rotation from → `false` (#279).
                 refresh_token_rotated: false,
                 reason: None, // hard `Err`: no secret-free sub-class → no `reason=` (#377)
+                // This FIRST error arms the #408 per-account back-off: streak 1, base = idle_after
+                // (60 s) × 2^1 = 120 s (below the 3600 s cap), surfaced on the error event.
+                backoff_secs: Some(120),
             }]
         );
     }
@@ -1226,6 +1425,8 @@ mod tests {
                 expires_after: Some(soon),
                 refresh_token_rotated: false,
                 reason: Some(RefreshEventReason::Timeout), // the whole-cycle bound fired (#377)
+                // A timeout is an `error` too → the #408 back-off arms: streak 1 × 60 s base = 120 s.
+                backoff_secs: Some(120),
             }]
         );
     }
@@ -1418,5 +1619,249 @@ mod tests {
         );
         assert!(outcome.restored.is_empty());
         assert!(outcome.events.is_empty());
+    }
+
+    // --- per-account refresh error back-off (issue #408) --------------------
+
+    /// The `backoff_secs` on the ONE refresh event a single-account sweep produced. Panics if the
+    /// sweep did not produce exactly one `Event::Refresh` — a backing-off (skipped) account emits
+    /// none, so this doubles as an "it was attempted" assertion.
+    fn backoff_secs_of(outcome: &SweepOutcome) -> Option<u64> {
+        match outcome.events.as_slice() {
+            [Event::Refresh { backoff_secs, .. }] => *backoff_secs,
+            other => panic!("expected exactly one refresh event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_backoff_delay_widens_exponentially_and_caps() {
+        // base = 60 s (the default idle floor): each consecutive error doubles the wait until the
+        // 3600 s cap — the poll path's `interval × 2^min(streak, MAX_SHIFT)` shape (#76), minus
+        // any `Retry-After` (a `claude -p` spawn has no server signal). Streak is 1-based.
+        let base = Duration::from_secs(60);
+        assert_eq!(refresh_backoff_delay(1, base), Duration::from_secs(120));
+        assert_eq!(refresh_backoff_delay(2, base), Duration::from_secs(240));
+        assert_eq!(refresh_backoff_delay(3, base), Duration::from_secs(480));
+        assert_eq!(refresh_backoff_delay(4, base), Duration::from_secs(960));
+        assert_eq!(refresh_backoff_delay(5, base), Duration::from_secs(1920));
+        // 60 × 2^6 = 3840 > 3600 → clamped to the cap.
+        assert_eq!(refresh_backoff_delay(6, base), Duration::from_secs(3600));
+        // The exponent is clamped at MAX_SHIFT (6), so a runaway streak never overflows `1 << n`
+        // and never climbs past the cap.
+        assert_eq!(refresh_backoff_delay(7, base), Duration::from_secs(3600));
+        assert_eq!(refresh_backoff_delay(1000, base), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn refresh_backoff_delay_never_caps_below_the_base() {
+        // Contract of the PURE helper for any `base`, including one WIDER than the cap: it must not
+        // invert the back-off SHORTER than the base — the effective cap is raised to `max(CAP, base)`.
+        // base = 7200 s (> 3600): streak 1 would be 14400 s, clamped to the base (7200), never down to
+        // 3600. (Config bounds `idle_after_secs` ≤ 3600, so this `base` is beyond the production range
+        // — the test exercises the fn's defense-in-depth, per its doc, not a reachable config.)
+        let base = Duration::from_secs(7200);
+        assert_eq!(refresh_backoff_delay(1, base), Duration::from_secs(7200));
+        assert_eq!(refresh_backoff_delay(6, base), Duration::from_secs(7200));
+    }
+
+    #[tokio::test]
+    async fn a_backing_off_account_is_skipped_with_no_spawn_and_no_keychain_read() {
+        // The core #408 guarantee: an account inside its back-off window costs NOTHING on the next
+        // wake — no `claude -p` spawn AND no `stored_expires_at` keychain read (a `security`
+        // subprocess, ADR-0002) — because the skip sits ahead of BOTH. FixedClock never advances,
+        // so the second sweep is squarely inside the window armed by the first.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::HardError);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        // Sweep 1: attempted → error → arms streak 1 (base 60 × 2^1 = 120 s).
+        let o1 = t.sweep(&[], &[]).await;
+        assert_eq!(backoff_secs_of(&o1), Some(120));
+        assert_eq!(
+            t.engine.refreshed(),
+            vec!["u-A"],
+            "the first sweep spawns once"
+        );
+        assert_eq!(
+            t.engine.expiry_reads(),
+            vec!["u-A"],
+            "and reads the expiry once"
+        );
+        // Sweep 2 at the SAME instant: inside the window → fully skipped.
+        let o2 = t.sweep(&[], &[]).await;
+        assert!(o2.events.is_empty(), "a backing-off account emits no event");
+        assert!(
+            o2.observations.is_empty(),
+            "a backing-off account records no observation"
+        );
+        assert_eq!(
+            t.engine.refreshed(),
+            vec!["u-A"],
+            "no SECOND claude -p spawn while backing off"
+        );
+        assert_eq!(
+            t.engine.expiry_reads(),
+            vec!["u-A"],
+            "no SECOND keychain read while backing off — the skip is ahead of the read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_backoff_window_elapses_then_the_account_is_reattempted() {
+        // Once the window passes, the account is attempted again — the back-off DELAYS retries, it
+        // does not silence them forever. On the virtual clock: arm 120 s, advance past it, re-sweep.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::HardError);
+        let mut t = RefreshTick::new(roster, cfg(3600, 60, &[]), true, engine, TokioClock);
+        assert_eq!(backoff_secs_of(&t.sweep(&[], &[]).await), Some(120)); // streak 1
+        assert!(
+            t.sweep(&[], &[]).await.events.is_empty(),
+            "still inside the 120 s window → skipped"
+        );
+        tokio::time::advance(Duration::from_secs(121)).await;
+        // Window elapsed → attempted again, and since it errors again the streak WIDENS to 2 (240).
+        assert_eq!(backoff_secs_of(&t.sweep(&[], &[]).await), Some(240));
+        assert_eq!(
+            t.engine.refreshed(),
+            vec!["u-A", "u-A"],
+            "two real attempts"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_backoff_widens_across_sustained_errors_and_settles_at_the_cap() {
+        // The end-to-end AC: a sustained refresh failure backs off exponentially to the CAP instead
+        // of retrying ~1/min. Drive one error per window, advancing just past each armed wait.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::HardError);
+        let mut t = RefreshTick::new(roster, cfg(3600, 60, &[]), true, engine, TokioClock);
+        // 60 × 2^streak: 120, 240, 480, 960, 1920, then the 3600 cap (3840 clamped) and steady.
+        for (streak, secs) in [120u64, 240, 480, 960, 1920, 3600, 3600]
+            .into_iter()
+            .enumerate()
+        {
+            let o = t.sweep(&[], &[]).await;
+            assert_eq!(
+                backoff_secs_of(&o),
+                Some(secs),
+                "streak {} arms a {secs} s back-off",
+                streak + 1
+            );
+            assert!(
+                t.sweep(&[], &[]).await.events.is_empty(),
+                "skipped inside the streak-{} window",
+                streak + 1
+            );
+            tokio::time::advance(Duration::from_secs(secs + 1)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_refresh_clears_the_error_backoff_streak() {
+        // Edge-triggered clear (like the poll path): the FIRST success resets the streak, so a LATER
+        // error starts over at streak 1 (120 s), not a carried-over streak 2 (240 s). Scripted
+        // error → success → error on one account across three sweeps.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_script(
+                "u-A",
+                vec![
+                    FakeRefresh::HardError,
+                    FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                    FakeRefresh::HardError,
+                ],
+            );
+        let mut t = RefreshTick::new(roster, cfg(3600, 60, &[]), true, engine, TokioClock);
+        // Error → streak 1 (120 s).
+        assert_eq!(backoff_secs_of(&t.sweep(&[], &[]).await), Some(120));
+        tokio::time::advance(Duration::from_secs(121)).await;
+        // Success → clears the streak (a refresh event carrying NO back-off).
+        assert_eq!(backoff_secs_of(&t.sweep(&[], &[]).await), None);
+        // A fresh error at the SAME instant starts at streak 1 again — proving the clear. Were the
+        // streak NOT reset, this would be streak 2 (240 s).
+        assert_eq!(backoff_secs_of(&t.sweep(&[], &[]).await), Some(120));
+    }
+
+    #[tokio::test]
+    async fn refresh_backoff_is_scoped_per_account() {
+        // One account's back-off never throttles another's: `u-A` errors and backs off; `u-B`
+        // (healthy, near-expiry) keeps refreshing on the same sweep. Positional ledger, no bleed.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("a", "u-A"), acct("b", "u-B")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_expiry("u-B", Some(soon))
+            .with_result("u-A", FakeRefresh::HardError)
+            .with_result(
+                "u-B",
+                FakeRefresh::Report(report(RefreshOutcome::NoChange, false)),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        // Sweep 1: both attempted — `u-A` errors (arms back-off), `u-B` is fine.
+        let o1 = t.sweep(&[], &[]).await;
+        assert_eq!(
+            o1.events.len(),
+            2,
+            "both accounts refreshed on the first sweep"
+        );
+        assert_eq!(t.engine.refreshed(), vec!["u-A", "u-B"]);
+        // Sweep 2 (same FixedClock instant): `u-A` is skipped, but `u-B` still refreshes.
+        let o2 = t.sweep(&[], &[]).await;
+        assert!(
+            matches!(o2.events.as_slice(), [Event::Refresh { account, .. }] if account == "b"),
+            "only u-B refreshes on the second sweep; u-A is backing off — got {:?}",
+            o2.events
+        );
+        assert_eq!(
+            t.engine.refreshed(),
+            vec!["u-A", "u-B", "u-B"],
+            "u-A spawned once (then backed off); u-B spawned both sweeps"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backing_off_quarantined_account_skips_its_restore_reprobe() {
+        // The ACTUAL incident shape (#408): a quarantined account's #106 restore RE-PROBE re-spawns
+        // `claude -p` at the recovery idle floor. The back-off skip sits AHEAD of the quarantine
+        // bypass, so a failing restore re-probe backs off too — the storm's real source is bounded.
+        let now_ms = now_ms();
+        let far = now_ms + 30 * 24 * 3_600_000; // far from expiry — reached only via the quarantine bypass
+        let roster = vec![acct("dead", "u-Q")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-Q", Some(far))
+            .with_result("u-Q", FakeRefresh::HardError);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        // Sweep 1: the restore re-probe is attempted → errors → arms the back-off.
+        let o1 = t.sweep(&[], &["u-Q".to_owned()]).await;
+        assert_eq!(backoff_secs_of(&o1), Some(120));
+        assert_eq!(t.engine.refreshed(), vec!["u-Q"]);
+        // Sweep 2 (same instant): the quarantined account is SKIPPED despite the quarantine bypass —
+        // no re-probe spawn, no restore attempt.
+        let o2 = t.sweep(&[], &["u-Q".to_owned()]).await;
+        assert!(
+            o2.events.is_empty(),
+            "the backing-off restore re-probe is skipped"
+        );
+        assert!(o2.restored.is_empty());
+        assert_eq!(
+            t.engine.refreshed(),
+            vec!["u-Q"],
+            "no SECOND restore re-probe spawn while backing off"
+        );
     }
 }

@@ -26,6 +26,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0011](0011-menubar-transport-raw-posix-af-unix.md) | menubar↔daemon transport — raw POSIX AF_UNIX from Swift (not Network.framework) | Accepted |
 | [0012](0012-active-reobservation-via-schedule-interleave.md) | Active-account re-observation via schedule interleave, not a lower `poll_secs` | Accepted |
 | [0013](0013-session-floor-default-on-reserve-emergency-exempt.md) | `session_floor` is a default-on swap-target reserve, exempt on the emergency path | Accepted |
+| [0014](0014-refresh-error-backoff-is-tick-owned.md) | Refresh error back-off is tick-owned, not on `AccountHealth` | Accepted |
 
 ## Conventions
 
