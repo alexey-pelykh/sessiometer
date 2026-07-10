@@ -969,8 +969,8 @@ mod tests {
         let existing = Config {
             roster: vec![],
             tunables: Tunables {
-                poll_secs: 120,    // a non-default the operator set
-                session_floor: 70, // a non-default reserve (default 80) the operator set
+                poll_secs: 120,       // a non-default the operator set
+                target_max_usage: 70, // a non-default reserve (default 80) the operator set
                 ..Tunables::default()
             },
             refresh: RefreshConfig::default(),
@@ -992,9 +992,9 @@ mod tests {
         assert_eq!(report.outcome, CaptureOutcome::Captured);
         assert_eq!(report.config.roster.len(), 1);
         // The operator's tunables survive the bootstrap (NOT reset to defaults:
-        // poll_secs default is 300, session_floor default is 80 — #398).
+        // poll_secs default is 300, target_max_usage default is 80 — #398).
         assert_eq!(report.config.tunables.poll_secs, 120);
-        assert_eq!(report.config.tunables.session_floor, 70);
+        assert_eq!(report.config.tunables.target_max_usage, 70);
     }
 
     #[tokio::test]
@@ -1106,7 +1106,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\nsession_floor = 70\n",
+            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\ntarget_max_usage = 70\n",
         )
         .unwrap();
 
@@ -1117,9 +1117,29 @@ mod tests {
             "a file with no [[account]] loads with an empty roster"
         );
         // The operator's tunables survive the load — NOT reset to defaults (default
-        // poll_secs is 300, default session_floor is 80 — #398).
+        // poll_secs is 300, default target_max_usage is 80 — #398).
         assert_eq!(config.tunables.poll_secs, 120);
-        assert_eq!(config.tunables.session_floor, 70);
+        assert_eq!(config.tunables.target_max_usage, 70);
+    }
+
+    #[test]
+    fn load_existing_from_reads_the_deprecated_session_floor_key() {
+        // #415: an existing on-disk config.toml written with the pre-rename `session_floor`
+        // key must still load through the real load_existing → load_path seam, mapping onto
+        // `target_max_usage` via the serde deprecation alias. Guards the schema migration
+        // (ADR-0006) at the actual file boundary, not just an in-memory parse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\nsession_floor = 70\n",
+        )
+        .unwrap();
+
+        let loaded = load_existing_from(&path).unwrap();
+        let config = loaded.expect("a tunables-only file that EXISTS is Some, not None");
+        // The deprecated key maps onto the new field — the operator's reserve survives.
+        assert_eq!(config.tunables.target_max_usage, 70);
     }
 
     #[test]

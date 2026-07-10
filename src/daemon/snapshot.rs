@@ -312,7 +312,7 @@ pub(crate) enum NextSwap {
     /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
     /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
     /// *live* (enabled, non-quarantined) other account has already been polled and none
-    /// qualifies (weekly-exhausted, or over the opt-in session floor) — even while other
+    /// qualifies (weekly-exhausted, or over the `target_max_usage` reserve) — even while other
     /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
     /// there is no live other account at all (every other disabled #36 or quarantined #42,
     /// its reading masked away by `decision_readings`, or there is simply no other account).

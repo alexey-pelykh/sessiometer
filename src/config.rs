@@ -72,11 +72,11 @@ pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
 const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
 /// Default `session_trigger` percent.
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
-/// Default `session_floor` percent (issue #398): the default-on swap-target
+/// Default `target_max_usage` percent (issue #398): the default-on swap-target
 /// reserve — only swap TO an account whose session usage is below this. Sits
 /// below `session_trigger` so a swapped-to target keeps runway before the next
 /// poll; supersedes #10's opt-in (an absent key now means this, not "off").
-const DEFAULT_SESSION_FLOOR: u8 = 80;
+const DEFAULT_TARGET_MAX_USAGE: u8 = 80;
 /// Default `weekly_trigger` percent — separate from and higher than
 /// `session_trigger` (issue #41): the weekly window is the longer, harder limit,
 /// so the active account is allowed closer to full on it before a swap-away.
@@ -241,18 +241,16 @@ pub(crate) struct Tunables {
     /// cooldown logic (#10 / #11).
     #[allow(dead_code)]
     pub(crate) cooldown_secs: u64,
-    /// Default-on swap-target session reserve (issue #398): only swap *to* an
-    /// account whose session usage is below this percent (`1..=session_trigger`; an
-    /// explicit `0` admits no target and is rejected), so a freshly-swapped target
-    /// keeps runway before the next poll. Always
-    /// valued — an absent key means [`DEFAULT_SESSION_FLOOR`], not "off" (this
-    /// supersedes #10's opt-in `Option`). To loosen it, raise toward
-    /// `session_trigger` (equal is inert); the always-on session gate
+    /// Default-on swap-target reserve (issue #398): the most-full an account may be
+    /// to receive the active session — only swap *to* an account whose session usage
+    /// is below this percent (`1..=session_trigger`; an explicit `0` admits no target
+    /// and is rejected), so a freshly-swapped target keeps runway before the next
+    /// poll. Always valued — an absent key means [`DEFAULT_TARGET_MAX_USAGE`], not
+    /// "off" (this supersedes #10's opt-in `Option`). Raise it toward `session_trigger`
+    /// to admit busier targets (equal is inert); the always-on session gate
     /// (`session < session_trigger`, [`crate::daemon`]) still prevents oscillation
-    /// independently. The name reads backwards — higher is MORE permissive (a
-    /// ceiling on the target's usage, not a minimum); a rename is tracked
-    /// separately.
-    pub(crate) session_floor: u8,
+    /// independently.
+    pub(crate) target_max_usage: u8,
     /// Swap *away* from the active account at or above this session percent
     /// (`50..=99`).
     pub(crate) session_trigger: u8,
@@ -300,7 +298,7 @@ impl Default for Tunables {
         Self {
             poll_secs: DEFAULT_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
-            session_floor: DEFAULT_SESSION_FLOOR,
+            target_max_usage: DEFAULT_TARGET_MAX_USAGE,
             session_trigger: DEFAULT_SESSION_TRIGGER,
             weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
             monitor_401_n: DEFAULT_MONITOR_401_N,
@@ -675,7 +673,7 @@ impl Config {
     ///
     /// Returns [`Error::ConfigNotFound`] if the file is absent (the daemon has
     /// nothing to run until `capture` writes one), [`Error::ConfigParse`] /
-    /// [`Error::ConfigInvalid`] / [`Error::ConfigFloorAboveTrigger`] for a file
+    /// [`Error::ConfigInvalid`] / [`Error::ConfigTargetMaxAboveTrigger`] for a file
     /// that exists but is malformed. Never silently substitutes defaults for a
     /// malformed file. A well-formed file with an *empty* roster loads
     /// successfully (tunables preserved) — the "at least one account" rule is the
@@ -721,7 +719,7 @@ impl Config {
     /// read maps [`Error::ConfigNotFound`] / [`Error::Io`] just as
     /// [`load_path`](Config::load_path) does, and the SAME [`parse`](Config::parse) →
     /// [`validate`](Config::validate) seam maps [`Error::ConfigParse`] /
-    /// [`Error::ConfigInvalid`] / [`Error::ConfigFloorAboveTrigger`]. It then re-reads
+    /// [`Error::ConfigInvalid`] / [`Error::ConfigTargetMaxAboveTrigger`]. It then re-reads
     /// the raw text into a permissive [`toml::Table`] PURELY to detect key presence,
     /// which the typed `#[serde(default)]` layer cannot report.
     pub(crate) fn load_with_origin(path: &Path) -> Result<OriginReport> {
@@ -785,9 +783,9 @@ impl Config {
                     present("tunables", "cooldown_secs"),
                 ),
                 entry(
-                    "session_floor",
-                    t.session_floor.to_string(),
-                    present("tunables", "session_floor"),
+                    "target_max_usage",
+                    t.target_max_usage.to_string(),
+                    present("tunables", "target_max_usage"),
                 ),
                 entry(
                     "session_trigger",
@@ -1027,7 +1025,7 @@ impl Config {
 
     /// Stage two: bounds-check every tunable and the roster, producing the typed
     /// `Config`. Each rejection names the offending field; the cross-field rule
-    /// (`session_floor <= session_trigger`) gets its own distinct error.
+    /// (`target_max_usage <= session_trigger`) gets its own distinct error.
     fn validate(raw: RawConfig) -> Result<Self> {
         let t = raw.tunables;
 
@@ -1037,47 +1035,46 @@ impl Config {
         // session (an unusual but valid operator choice), so both are configurable
         // independently (AC #3).
         range("weekly_trigger", t.weekly_trigger, 50, 99)?;
-        // session_floor is default-on (#398): absent → DEFAULT_SESSION_FLOOR, clamped
+        // target_max_usage is default-on (#398): absent → DEFAULT_TARGET_MAX_USAGE, clamped
         // down to session_trigger so the default honors the SAME
-        // `session_floor <= session_trigger` invariant the present-value arm enforces
+        // `target_max_usage <= session_trigger` invariant the present-value arm enforces
         // (#417 — without the clamp a `session_trigger < 80` config loads with an
-        // unchecked floor of 80 and then bricks after a render→parse round-trip, since
-        // #398 renders the default as a live line; `floor == trigger` is inert per
+        // unchecked reserve of 80 and then bricks after a render→parse round-trip, since
+        // #398 renders the default as a live line; an equal reserve is inert per
         // ADR-0013). When present, its lower bound is 1 (an explicit 0 admits no
         // target, silently disabling proactive swapping) and its upper bound is
-        // session_trigger (a higher floor could never admit a target), the latter a
+        // session_trigger (a higher reserve could never admit a target), the latter a
         // distinct cross-field error.
-        let session_floor = match t.session_floor {
-            None => DEFAULT_SESSION_FLOOR.min(t.session_trigger as u8),
-            Some(floor) => {
-                if floor == 0 {
-                    // The swap predicate is `usage.session < floor`, so a floor of 0
+        let target_max_usage = match t.target_max_usage {
+            None => DEFAULT_TARGET_MAX_USAGE.min(t.session_trigger as u8),
+            Some(value) => {
+                if value == 0 {
+                    // The swap predicate is `usage.session < target_max_usage`, so 0
                     // admits NO account and silently disables proactive swapping (the
-                    // daemon just holds). Because the name reads backwards (higher is
-                    // MORE permissive), 0 is the natural wrong guess for "no
-                    // restriction" — reject it with the remedy spelled out, rather than
-                    // let a live, hand-editable line brick swapping in silence.
+                    // daemon just holds). 0 is the natural wrong guess for "no
+                    // restriction" — its exact opposite (#414) — so reject it with the
+                    // remedy spelled out, rather than let a live, hand-editable line
+                    // brick swapping in silence.
                     return Err(Error::ConfigInvalid(format!(
-                        "session_floor = 0 admits no swap target and silently disables \
-                         proactive swapping; it must be in 1..={}. To make the floor \
-                         more permissive, raise it toward session_trigger (higher admits \
-                         more targets), not lower it.",
+                        "target_max_usage = 0 admits no swap target and silently disables \
+                         proactive swapping; it must be in 1..={}. Raise it toward \
+                         session_trigger to admit more targets.",
                         t.session_trigger
                     )));
                 }
-                if floor < 0 {
+                if value < 0 {
                     return Err(Error::ConfigInvalid(format!(
-                        "session_floor must be in 1..={}, got {floor}",
+                        "target_max_usage must be in 1..={}, got {value}",
                         t.session_trigger
                     )));
                 }
-                if floor > t.session_trigger {
-                    return Err(Error::ConfigFloorAboveTrigger {
-                        floor,
+                if value > t.session_trigger {
+                    return Err(Error::ConfigTargetMaxAboveTrigger {
+                        target_max_usage: value,
                         trigger: t.session_trigger,
                     });
                 }
-                floor as u8
+                value as u8
             }
         };
         range("poll_secs", t.poll_secs, 5, 3600)?;
@@ -1109,7 +1106,7 @@ impl Config {
         let tunables = Tunables {
             poll_secs: t.poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
-            session_floor,
+            target_max_usage,
             session_trigger: t.session_trigger as u8,
             weekly_trigger: t.weekly_trigger as u8,
             monitor_401_n: t.monitor_401_n as u8,
@@ -1316,13 +1313,12 @@ impl Config {
         ));
         out.push_str(&format!("cooldown_secs = {}\n", t.cooldown_secs));
         out.push_str(
-            "# Only swap TO an account whose session usage is below this percent\n\
-             # (1..=session_trigger): a candidate must be at most this full to receive the\n\
-             # active session. This is NOT the level that triggers a swap. Default-on\n\
-             # (#398): to loosen, raise toward session_trigger (equal is inert). 0 is\n\
-             # rejected — it admits no target and would disable proactive swapping.\n",
+            "# The most-full an account may be to receive the active session: only swap\n\
+             # TO an account whose session usage is below this percent (1..=session_trigger).\n\
+             # This is NOT the level that triggers a swap. Default-on (#398); 0 is rejected\n\
+             # — it admits no target and would disable proactive swapping.\n",
         );
-        out.push_str(&format!("session_floor = {}\n", t.session_floor));
+        out.push_str(&format!("target_max_usage = {}\n", t.target_max_usage));
         out.push_str(
             "# Swap AWAY from the active account at or above this session percent (50..=99).\n",
         );
@@ -1729,10 +1725,15 @@ struct RawTunables {
     poll_secs: i64,
     #[serde(default = "default_cooldown_secs")]
     cooldown_secs: i64,
-    /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_SESSION_FLOOR`
+    /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_TARGET_MAX_USAGE`
     /// in [`Config::validate`] (the raw layer keeps `Option` to detect absence).
-    #[serde(default)]
-    session_floor: Option<i64>,
+    /// Accepts the pre-#415 key `session_floor` as a deprecation alias (ADR-0006): an
+    /// existing `config.toml` written with `session_floor = N` still parses to this
+    /// field, and `save` re-emits it under the new key. Both keys present in one file →
+    /// serde's duplicate-field parse error, so an operator mid-migration gets no silent
+    /// winner.
+    #[serde(default, alias = "session_floor")]
+    target_max_usage: Option<i64>,
     #[serde(default = "default_session_trigger")]
     session_trigger: i64,
     #[serde(default = "default_weekly_trigger")]
@@ -1748,7 +1749,7 @@ impl Default for RawTunables {
         Self {
             poll_secs: default_poll_secs(),
             cooldown_secs: default_cooldown_secs(),
-            session_floor: None,
+            target_max_usage: None,
             session_trigger: default_session_trigger(),
             weekly_trigger: default_weekly_trigger(),
             monitor_401_n: default_monitor_401_n(),
@@ -1976,7 +1977,7 @@ mod tests {
 [tunables]
 poll_secs = 30
 cooldown_secs = 45
-session_floor = 70
+target_max_usage = 70
 session_trigger = 90
 weekly_trigger = 97
 monitor_401_n = 5
@@ -2011,7 +2012,7 @@ label = "personal"
             Tunables {
                 poll_secs: 30,
                 cooldown_secs: 45,
-                session_floor: 70,
+                target_max_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 97,
                 monitor_401_n: 5,
@@ -2044,8 +2045,8 @@ label = "personal"
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
         assert_eq!(config.tunables.session_trigger, 95);
-        // #398: the session-floor reserve is default-on at 80.
-        assert_eq!(config.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+        // #398: the target_max_usage reserve is default-on at 80.
+        assert_eq!(config.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
     }
 
     #[test]
@@ -2093,7 +2094,7 @@ label = "personal"
     #[test]
     fn session_and_weekly_triggers_are_independently_configurable() {
         // AC #3: the two triggers are set independently — there is NO cross-field
-        // rule, so weekly may even sit BELOW session (unlike session_floor, which
+        // rule, so weekly may even sit BELOW session (unlike target_max_usage, which
         // is capped at session_trigger).
         let t = Config::parse(&with_tunables("session_trigger = 90\nweekly_trigger = 99"))
             .unwrap()
@@ -2103,7 +2104,7 @@ label = "personal"
         assert_eq!(t.trigger_strategy.base, 90.0);
         assert_eq!(t.weekly_trigger_strategy.base, 99.0);
 
-        // weekly BELOW session is accepted (no floor-style cross-field constraint).
+        // weekly BELOW session is accepted (no target_max_usage-style cross-field constraint).
         let inverted = Config::parse(&with_tunables("session_trigger = 95\nweekly_trigger = 60"))
             .unwrap()
             .tunables;
@@ -2126,104 +2127,159 @@ label = "personal"
     }
 
     #[test]
-    fn rejects_floor_above_trigger_with_a_distinct_error() {
-        let toml = with_tunables("session_floor = 95\nsession_trigger = 90");
+    fn rejects_target_max_above_trigger_with_a_distinct_error() {
+        let toml = with_tunables("target_max_usage = 95\nsession_trigger = 90");
         assert!(matches!(
             Config::parse(&toml),
-            Err(Error::ConfigFloorAboveTrigger {
-                floor: 95,
+            Err(Error::ConfigTargetMaxAboveTrigger {
+                target_max_usage: 95,
                 trigger: 90
             })
         ));
     }
 
     #[test]
-    fn rejects_negative_floor() {
-        let toml = with_tunables("session_floor = -1");
+    fn rejects_negative_target_max() {
+        let toml = with_tunables("target_max_usage = -1");
         assert!(matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))));
     }
 
     #[test]
-    fn rejects_zero_floor_naming_the_consequence() {
-        // #414: session_floor = 0 makes the swap predicate `usage.session < 0` admit no
+    fn rejects_zero_target_max_naming_the_consequence() {
+        // #414: target_max_usage = 0 makes the swap predicate `usage.session < 0` admit no
         // account, so proactive swapping is silently disabled and the daemon just holds.
-        // Since #398 made session_floor a live, hand-editable line, 0 is the natural
-        // (wrong) guess for "no restriction" — the exact opposite. validate must reject it
-        // with a message that names the consequence AND points at the remedy (raise the
-        // floor toward session_trigger, since the name reads backwards).
-        let toml = with_tunables("session_floor = 0\nsession_trigger = 90");
+        // Since #398 made target_max_usage a live, hand-editable line, 0 is the natural
+        // (wrong) guess for "no restriction" — its exact opposite. validate must reject it
+        // with a message that names the consequence AND points at the remedy (raise it
+        // toward session_trigger to admit more targets).
+        let toml = with_tunables("target_max_usage = 0\nsession_trigger = 90");
         match Config::parse(&toml) {
             Err(Error::ConfigInvalid(msg)) => assert!(
                 msg.contains("disables proactive swapping") && msg.contains("session_trigger"),
                 "rejection must name the consequence and the remedy, got: {msg}"
             ),
-            Ok(_) => panic!("session_floor = 0 must be rejected, not accepted"),
-            Err(e) => panic!("session_floor = 0 must be ConfigInvalid, got: {e}"),
+            Ok(_) => panic!("target_max_usage = 0 must be rejected, not accepted"),
+            Err(e) => panic!("target_max_usage = 0 must be ConfigInvalid, got: {e}"),
         }
 
-        // The reject is precisely 0, not "any low floor": 1 is the valid lower edge and
+        // The reject is precisely 0, not "any low value": 1 is the valid lower edge and
         // still parses (inert-but-valid — admits only accounts at 0% session).
-        let one = Config::parse(&with_tunables("session_floor = 1\nsession_trigger = 90"))
-            .expect("session_floor = 1 is the valid lower bound and must parse");
-        assert_eq!(one.tunables.session_floor, 1);
+        let one = Config::parse(&with_tunables("target_max_usage = 1\nsession_trigger = 90"))
+            .expect("target_max_usage = 1 is the valid lower bound and must parse");
+        assert_eq!(one.tunables.target_max_usage, 1);
 
         // …and the absent-key default path (#417 clamp) is untouched by the reject: an
-        // absent session_floor still yields the default-on reserve, never 0.
+        // absent target_max_usage still yields the default-on reserve, never 0.
         let absent = Config::parse(&with_tunables("session_trigger = 90")).unwrap();
-        assert_eq!(absent.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+        assert_eq!(absent.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
     }
 
     #[test]
-    fn session_floor_defaults_to_80_when_absent() {
-        // #398: an absent session_floor takes the default-on reserve (80), even when
+    fn target_max_usage_defaults_to_80_when_absent() {
+        // #398: an absent target_max_usage takes the default-on reserve (80), even when
         // other tunables are set…
         let absent = Config::parse(&with_tunables("session_trigger = 95")).unwrap();
-        assert_eq!(absent.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+        assert_eq!(absent.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
         // …and a present value overrides it at that percent.
-        let set =
-            Config::parse(&with_tunables("session_floor = 90\nsession_trigger = 95")).unwrap();
-        assert_eq!(set.tunables.session_floor, 90);
+        let set = Config::parse(&with_tunables(
+            "target_max_usage = 90\nsession_trigger = 95",
+        ))
+        .unwrap();
+        assert_eq!(set.tunables.target_max_usage, 90);
     }
 
     #[test]
-    fn rendered_default_config_documents_session_floor_as_a_live_value() {
-        // #398: render emits a LIVE session_floor line (default-on) that round-trips
+    fn rendered_default_config_documents_target_max_usage_as_a_live_value() {
+        // #398: render emits a LIVE target_max_usage line (default-on) that round-trips
         // back to the same value — never a commented-out opt-in.
         let mut config = Config::parse(VALID).unwrap();
-        config.tunables.session_floor = DEFAULT_SESSION_FLOOR;
+        config.tunables.target_max_usage = DEFAULT_TARGET_MAX_USAGE;
         let text = config.render();
-        assert!(text.contains("session_floor = 80"), "got {text}");
-        assert!(!text.contains("# session_floor ="), "got {text}");
+        assert!(text.contains("target_max_usage = 80"), "got {text}");
+        assert!(!text.contains("# target_max_usage ="), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
-        assert_eq!(reparsed.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+        assert_eq!(reparsed.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
     }
 
     #[test]
-    fn absent_floor_default_clamps_to_trigger_below_80_and_survives_round_trip() {
-        // #417 (regression from #398): with session_trigger < 80 and NO session_floor
+    fn absent_target_max_default_clamps_to_trigger_below_80_and_survives_round_trip() {
+        // #417 (regression from #398): with session_trigger < 80 and NO target_max_usage
         // key, the absent-key default (80) MUST clamp down to session_trigger — honoring
-        // the same session_floor <= session_trigger invariant the present-value arm
+        // the same target_max_usage <= session_trigger invariant the present-value arm
         // already enforces (ADR-0013 Decision 1). Without the clamp the first load
-        // silently yields floor = 80 (> trigger — the cross-field check is skipped on the
-        // absent-key arm), render() then emits it as a LIVE line (#398), and the SECOND
-        // parse rejects the config with ConfigFloorAboveTrigger — bricking a valid config
+        // silently yields a reserve of 80 (> trigger — the cross-field check is skipped on
+        // the absent-key arm), render() then emits it as a LIVE line (#398), and the SECOND
+        // parse rejects the config with ConfigTargetMaxAboveTrigger — bricking a valid config
         // after any save/export round-trip (enable/disable/remove account, capture
         // write-back, export→import). The existing round-trip test above only covers the
         // default trigger = 95 (where 80 < 95), so it never reached this corner.
-        let toml = with_tunables("session_trigger = 70"); // no session_floor key
+        let toml = with_tunables("session_trigger = 70"); // no target_max_usage key
         let config = Config::parse(&toml).unwrap();
         // The default is clamped to the trigger — the maximally-permissive inert value
-        // (ADR-0013: floor == trigger admits exactly what the always-on gate admits),
+        // (ADR-0013: an equal reserve admits exactly what the always-on gate admits),
         // never left at 80.
-        assert_eq!(config.tunables.session_floor, 70);
-        assert!(config.tunables.session_floor <= config.tunables.session_trigger);
+        assert_eq!(config.tunables.target_max_usage, 70);
+        assert!(config.tunables.target_max_usage <= config.tunables.session_trigger);
 
         // …and it survives a render → parse round-trip: the exact path that bricked.
         let text = config.render();
-        assert!(text.contains("session_floor = 70"), "got {text}");
+        assert!(text.contains("target_max_usage = 70"), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
-        assert_eq!(reparsed.tunables.session_floor, 70);
+        assert_eq!(reparsed.tunables.target_max_usage, 70);
         assert_eq!(reparsed.tunables.session_trigger, 70);
+    }
+
+    #[test]
+    fn deprecated_session_floor_alias_parses_and_renders_as_target_max_usage() {
+        // #415: `session_floor` was renamed to `target_max_usage` (the old name read
+        // backwards — it is a CEILING on the target's usage, not a minimum). The key is a
+        // persisted, operator-visible line in every existing config.toml, so the rename is
+        // a schema migration (ADR-0006), not a sed: the deprecated key MUST still parse for
+        // a deprecation window, mapping onto the new field.
+
+        // The OLD key still loads and maps onto the new field…
+        let old = Config::parse(&with_tunables("session_floor = 70\nsession_trigger = 90"))
+            .expect("a config written with the deprecated `session_floor` key must still parse");
+        assert_eq!(old.tunables.target_max_usage, 70);
+
+        // …the NEW key loads to the same value…
+        let new = Config::parse(&with_tunables(
+            "target_max_usage = 70\nsession_trigger = 90",
+        ))
+        .expect("the new `target_max_usage` key parses");
+        assert_eq!(new.tunables.target_max_usage, 70);
+
+        // …and a deprecated-key file is REWRITTEN to the new key on render (the one-way key
+        // rewrite, mirroring the #70 stash drop): the emitted file carries
+        // `target_max_usage`, never the old `session_floor`.
+        let rendered = old.render();
+        assert!(
+            rendered.contains("target_max_usage = 70"),
+            "render must emit the new key: {rendered}"
+        );
+        assert!(
+            !rendered.contains("session_floor"),
+            "render must NOT emit the deprecated key: {rendered}"
+        );
+
+        // Export → import round-trip survives the deprecated-key input: parsing the render
+        // of an old-key file yields the same value under the new field.
+        let reimported = Config::parse(&rendered).expect("the rendered new-key file re-imports");
+        assert_eq!(reimported.tunables.target_max_usage, 70);
+    }
+
+    #[test]
+    fn both_target_max_usage_and_deprecated_alias_present_is_a_parse_error() {
+        // #415: mid-migration an operator might leave BOTH the deprecated `session_floor`
+        // and the new `target_max_usage` in one file. serde's alias maps both onto the same
+        // field, so a file carrying both is a duplicate-field parse error rather than a
+        // silent winner — the operator is told to pick one (the issue's precedence choice).
+        let toml = with_tunables("session_floor = 70\ntarget_max_usage = 80\nsession_trigger = 90");
+        assert!(
+            matches!(Config::parse(&toml), Err(Error::ConfigParse(_))),
+            "both keys present must be a ConfigParse error, got: {:?}",
+            Config::parse(&toml)
+        );
     }
 
     #[test]
@@ -2302,10 +2358,10 @@ label = "personal"
         // file must PARSE (empty roster) and PRESERVE the operator's tunables, so
         // `capture` can load it to add the first account. The "at least one account"
         // rule is the daemon's `require_roster` precondition, not a parse rejection.
-        let config = Config::parse("[tunables]\npoll_secs = 120\nsession_floor = 80\n").unwrap();
+        let config = Config::parse("[tunables]\npoll_secs = 120\ntarget_max_usage = 80\n").unwrap();
         assert!(config.roster.is_empty());
         assert_eq!(config.tunables.poll_secs, 120);
-        assert_eq!(config.tunables.session_floor, 80);
+        assert_eq!(config.tunables.target_max_usage, 80);
     }
 
     #[test]
@@ -2887,12 +2943,12 @@ label = "personal"
     fn rendered_config_documents_the_tunables() {
         let text = Config::parse(VALID).unwrap().render();
         // AC #5: the written file carries the inline tunable docs, in particular
-        // the session_floor "only swap TO an account below this %" semantics.
-        assert!(text.contains("# Only swap TO an account"));
+        // the target_max_usage "most-full a target may be to receive the session" semantics.
+        assert!(text.contains("The most-full an account may be to receive"));
         for key in [
             "poll_secs",
             "cooldown_secs",
-            "session_floor",
+            "target_max_usage",
             "session_trigger",
             "weekly_trigger",
             "monitor_401_n",
@@ -2994,12 +3050,12 @@ label = "personal"
 
     #[test]
     fn accepts_inclusive_bounds() {
-        // Each bound's edge is valid: trigger 50/99, floor 1 (the non-zero lower bound;
+        // Each bound's edge is valid: trigger 50/99, target_max_usage 1 (the non-zero lower bound;
         // 0 admits no target) and floor == trigger, poll 5/3600, cooldown 5/3600 (5 =
         // the non-zero floor, #272), monitor 1/20.
         for fragment in [
-            "session_trigger = 50\nsession_floor = 1",
-            "session_trigger = 99\nsession_floor = 99", // floor == trigger is allowed
+            "session_trigger = 50\ntarget_max_usage = 1",
+            "session_trigger = 99\ntarget_max_usage = 99", // target_max_usage == trigger is allowed
             "weekly_trigger = 50",
             "weekly_trigger = 99",
             "poll_secs = 5",
@@ -3065,7 +3121,7 @@ label = "personal"
         assert_eq!(by_key("session_trigger").value, "90");
         // Every OTHER tunable in the present section is still a compiled-in default.
         assert_eq!(by_key("poll_secs").origin, Origin::Default);
-        assert_eq!(by_key("session_floor").origin, Origin::Default);
+        assert_eq!(by_key("target_max_usage").origin, Origin::Default);
         assert_eq!(by_key("monitor_401_n").origin, Origin::Default);
 
         // Every optional section is absent → not present, all values Default.
@@ -3225,7 +3281,7 @@ label = \"work\"
     /// writes for a full config MUST also appear in `origin_report`. Without this, a tunable
     /// added to `render` but forgotten in `origin_report` would be silently DROPPED from
     /// `config show` — the drift most likely as the schema grows (jitter #38, refresh #105,
-    /// stats #161, migration #150, session_floor #398). Asserts `live ⊆ reported`.
+    /// stats #161, migration #150, target_max_usage #398). Asserts `live ⊆ reported`.
     #[test]
     fn origin_report_reports_every_key_render_writes() {
         let config = Config::parse(VALID).unwrap();

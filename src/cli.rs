@@ -885,7 +885,7 @@ USAGE:
     sessiometer config <path|validate|show> [--origin]
 
     path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
-    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and session_floor > session_trigger
+    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_usage > session_trigger
     show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
     --origin    (with show) tag each value's provenance, so a silently-defaulted absent section is visible
     -h, --help  print this help
@@ -1119,7 +1119,7 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     diag.emit(&Diagnostic::Start {
         accounts: config.roster.len(),
         poll_secs: config.tunables.poll_secs,
-        session_floor: config.tunables.session_floor,
+        target_max_usage: config.tunables.target_max_usage,
         session_trigger: config.tunables.session_trigger,
         weekly_trigger: config.tunables.weekly_trigger,
         monitor_401_n: config.tunables.monitor_401_n,
@@ -1728,8 +1728,8 @@ fn config_path() -> Result<()> {
 /// `config validate` (issue #401): parse + validate `config.toml` WITHOUT running, routing
 /// through the SAME [`Config::load_path`] seam the daemon loads through — so a typo'd/unknown
 /// key (`deny_unknown_fields` → [`Error::ConfigParse`]), an out-of-range value
-/// ([`Error::ConfigInvalid`]), or `session_floor > session_trigger`
-/// ([`Error::ConfigFloorAboveTrigger`]) surfaces here with the identical message the daemon
+/// ([`Error::ConfigInvalid`]), or `target_max_usage > session_trigger`
+/// ([`Error::ConfigTargetMaxAboveTrigger`]) surfaces here with the identical message the daemon
 /// would fail on, and a clean file reports valid. Read-only: it loads and validates, nothing
 /// more. A validation failure propagates as the loader's error, so it exits non-zero (usable
 /// in a pre-flight check) — `main` prints it and maps the exit code.

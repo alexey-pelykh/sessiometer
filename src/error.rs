@@ -157,13 +157,13 @@ pub(crate) enum Error {
     #[error("invalid config: {0}")]
     ConfigInvalid(String),
 
-    /// The cross-field rule failed: `session_floor` exceeds `session_trigger`
-    /// (no account could ever become a swap target, since the floor a candidate
+    /// The cross-field rule failed: `target_max_usage` exceeds `session_trigger`
+    /// (no account could ever become a swap target, since the ceiling a candidate
     /// must sit below is itself above the trigger). A distinct variant from
     /// [`Error::ConfigInvalid`] so this case can be matched specifically
     /// (issue #3).
-    #[error("invalid config: session_floor ({floor}) must not exceed session_trigger ({trigger})")]
-    ConfigFloorAboveTrigger { floor: i64, trigger: i64 },
+    #[error("invalid config: target_max_usage ({target_max_usage}) must not exceed session_trigger ({trigger})")]
+    ConfigTargetMaxAboveTrigger { target_max_usage: i64, trigger: i64 },
 
     /// Claude Code's state file (`~/.claude.json`) does not exist — Claude Code
     /// has not run / no account is logged in, so there is nothing to capture.

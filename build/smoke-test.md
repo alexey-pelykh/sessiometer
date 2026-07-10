@@ -50,7 +50,7 @@ Config lives at `~/Library/Application Support/sessiometer/config.toml` (or
 poll_secs       = 5     # poll briskly so the run is quick (min 5)
 session_trigger = 50    # the minimum: a half-used session already trips a swap-away
 cooldown_secs   = 60    # a window long enough to watch the no-oscillation hold
-# leave session_floor commented out (the #10 default: cooldown alone bounds oscillation)
+# leave target_max_usage commented out (the #10 default: cooldown alone bounds oscillation)
 ```
 
 Restore your normal values when finished (Step 9).
