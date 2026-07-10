@@ -39,12 +39,12 @@ struct StatusPanelView: View {
         }
         .frame(width: 380, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
-        // An OPAQUE, appearance-adaptive backing so the panel reads at full contrast regardless of what
-        // is behind it. The `.popover` vibrancy (StatusItemController) blended with the desktop/terminal
-        // behind the panel — dropping every label + metric onto a SHIFTING mid-tone — so text contrast
-        // was at the mercy of the wallpaper. A solid `windowBackgroundColor` (clipped to the panel's
-        // rounded corners by the host effect view) gives a stable, high-contrast card in light OR dark.
-        .background(Color(nsColor: .windowBackgroundColor))
+        // A translucent `.regularMaterial` scrim over the host's `.popover` vibrancy (StatusItemController):
+        // the desktop blur reads through (matching the design reference's `backdrop-filter` translucency)
+        // while the material's built-in frosting keeps every label + metric legible against a busy wallpaper
+        // — the contrast guarantee we previously bought only by going fully opaque, which defeated the
+        // vibrancy. Restores #390 (I5); the scrim is what makes the restore safe (ratified: vibrancy+scrim).
+        .background(.regularMaterial)
     }
 
     @ViewBuilder
@@ -240,17 +240,14 @@ private struct AccountRowView: View {
         .padding(.horizontal, 8)
         .padding(.top, 9)
         .padding(.bottom, 10)
-        // Active emphasis follows the design reference: an accent-tint fill + ring. Active is redundantly
-        // encoded — the filled leading dot (shape) + the "ACTIVE" tag carry it too — so color is never the
-        // SOLE signal (WCAG 1.4.1 / R-2 state-parity holds; the accent here is a redundant cue, and the
-        // now-dropped per-row next badge means accent is no longer overloaded).
+        // Active emphasis follows the design reference: an accent-tint fill ONLY. The accent ring was
+        // dropped (#387 M5, ratified) to cut active over-signaling — active stays redundantly encoded by
+        // the filled leading dot (shape) + the "ACTIVE" tag + the tint, so color is never the SOLE signal
+        // (WCAG 1.4.1 / R-2 state-parity holds). The mock's active-ring is dropped in lockstep
+        // (menubar-preview.html `.acct.active` / `.stat.active`).
         .background(
             RoundedRectangle(cornerRadius: 9)
                 .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9)
-                        .strokeBorder(Color.accentColor.opacity(row.isActive ? 0.28 : 0), lineWidth: 0.5)
-                )
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)

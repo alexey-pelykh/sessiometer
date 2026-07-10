@@ -146,7 +146,7 @@
     --pop-bg:rgba(247,247,250,.72); --pop-border:rgba(0,0,0,.13); --pop-hl:rgba(255,255,255,.75);
     --text:#1d1d1f; --text-2:rgba(60,60,67,.62); --text-3:rgba(60,60,67,.4);
     --divider:rgba(0,0,0,.08); --card-bg:rgba(120,120,128,.08);
-    --active-bg:rgba(0,122,255,.08); --active-ring:rgba(0,122,255,.28);
+    --active-bg:rgba(0,122,255,.08);
     --accent:#007aff; --accent-halo:rgba(0,122,255,.2); --accent-ring:rgba(0,122,255,.42);
     --accent-tint:rgba(0,122,255,.10); --accent-tint-border:rgba(0,122,255,.2);
     --badge-bg:rgba(120,120,128,.16); --track:rgba(120,120,128,.22);
@@ -163,7 +163,7 @@
     --pop-bg:rgba(38,38,43,.64); --pop-border:rgba(255,255,255,.12); --pop-hl:rgba(255,255,255,.09);
     --text:#f5f5f7; --text-2:rgba(235,235,245,.6); --text-3:rgba(235,235,245,.36);
     --divider:rgba(255,255,255,.09); --card-bg:rgba(255,255,255,.05);
-    --active-bg:rgba(10,132,255,.15); --active-ring:rgba(10,132,255,.42);
+    --active-bg:rgba(10,132,255,.15);
     --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3); --accent-ring:rgba(10,132,255,.5);
     --accent-tint:rgba(10,132,255,.16); --accent-tint-border:rgba(10,132,255,.3);
     --badge-bg:rgba(255,255,255,.10); --track:rgba(255,255,255,.14);
@@ -195,7 +195,7 @@
   /* ---- account cards (Status) ---- */
   .accts{ padding:6px 8px 2px; display:flex; flex-direction:column; gap:2px }
   .acct{ padding:9px 8px 10px; border-radius:9px }
-  .acct.active{ background:var(--active-bg); box-shadow:inset 0 0 0 .5px var(--active-ring) }
+  .acct.active{ background:var(--active-bg) } /* accent-tint fill only; ring dropped (#387 M5) */
 
   .acct-id{ display:flex; align-items:center; gap:9px }
   .dot{ flex:0 0 8px; width:8px; height:8px; border-radius:50% }
@@ -308,7 +308,7 @@
    * ============================================================= */
   .stats{ padding:6px 8px 2px; display:flex; flex-direction:column; gap:2px }
   .stat{ padding:10px 8px; border-radius:9px }
-  .stat.active{ background:var(--active-bg); box-shadow:inset 0 0 0 .5px var(--active-ring) }
+  .stat.active{ background:var(--active-bg) } /* accent-tint fill only; ring dropped (#387 M5) */
   .stat-head{ display:flex; align-items:center; gap:9px }
   .s-meta{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column }
   .s-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
