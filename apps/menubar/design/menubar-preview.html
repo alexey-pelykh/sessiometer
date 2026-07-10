@@ -13,7 +13,7 @@
 
   VISUAL LANGUAGE: 380px native popover, vibrancy
   (backdrop-filter blur+saturate over a wallpaper), SF-symbol-style drawn glyphs, tabular
-  numerals, usage meters (session + weekly bars; green<70 / amber70-90 / red>=90),
+  numerals, usage meters (session + weekly bars; green<75 / amber75-89 / red>=90),
   drawn SVG area+line sparklines (Stats), label-primary two-line identity (Work/Personal/Scratch
   monogram badge + provider secondary line), light + dark, no-wrap-by-construction.
 
@@ -144,17 +144,19 @@
 
   .pop.theme-light{
     --pop-bg:rgba(247,247,250,.72); --pop-border:rgba(0,0,0,.13); --pop-hl:rgba(255,255,255,.75);
-    --text:#1d1d1f; --text-2:rgba(60,60,67,.62); --text-3:rgba(60,60,67,.4);
+    /* --text-2 carries load-bearing secondary text (freshness age, reset countdowns): .72 clears
+       WCAG AA 4.5:1 (4.53:1 over #f5f5f7); the prior .62 ran 3.50:1. --text-3 stays decorative. */
+    --text:#1d1d1f; --text-2:rgba(60,60,67,.72); --text-3:rgba(60,60,67,.4);
     --divider:rgba(0,0,0,.08); --card-bg:rgba(120,120,128,.08);
     --active-bg:rgba(0,122,255,.08);
-    --accent:#007aff; --accent-halo:rgba(0,122,255,.2); --accent-ring:rgba(0,122,255,.42);
+    --accent:#007aff; --accent-halo:rgba(0,122,255,.2);
     --accent-tint:rgba(0,122,255,.10); --accent-tint-border:rgba(0,122,255,.2);
     --badge-bg:rgba(120,120,128,.16); --track:rgba(120,120,128,.22);
     --seg-bg:rgba(120,120,128,.12); --seg-border:rgba(0,0,0,.05); --seg-on:#ffffff;
     --btn-bg:rgba(255,255,255,.72); --btn-border:rgba(0,0,0,.14); --code-bg:rgba(120,120,128,.15);
     --ok:#2ba24a; --spark:rgba(60,60,67,.55);
     --u-g:#34c759; --u-a:#ff9f0a; --u-r:#ff3b30;
-    --ut-g:#268a3f; --ut-a:#976300; --ut-r:#c8261d;
+    --ut-g:#268a3f; --ut-a:#976300; --ut-o:#b4550c; --ut-r:#c8261d;
     --sig-under-bg:rgba(0,122,255,.12);  --sig-under-fg:#2668bd;
     --sig-bal-bg:rgba(30,150,105,.13);   --sig-bal-fg:#1c8a5f;
     --sig-sat-bg:rgba(178,120,20,.15);   --sig-sat-fg:#966611;
@@ -164,14 +166,14 @@
     --text:#f5f5f7; --text-2:rgba(235,235,245,.6); --text-3:rgba(235,235,245,.36);
     --divider:rgba(255,255,255,.09); --card-bg:rgba(255,255,255,.05);
     --active-bg:rgba(10,132,255,.15);
-    --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3); --accent-ring:rgba(10,132,255,.5);
+    --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3);
     --accent-tint:rgba(10,132,255,.16); --accent-tint-border:rgba(10,132,255,.3);
     --badge-bg:rgba(255,255,255,.10); --track:rgba(255,255,255,.14);
     --seg-bg:rgba(255,255,255,.08); --seg-border:rgba(255,255,255,.06); --seg-on:rgba(255,255,255,.18);
     --btn-bg:rgba(255,255,255,.10); --btn-border:rgba(255,255,255,.16); --code-bg:rgba(255,255,255,.10);
     --ok:#30d158; --spark:rgba(235,235,245,.5);
     --u-g:#30d158; --u-a:#ff9f0a; --u-r:#ff453a;
-    --ut-g:#4fd873; --ut-a:#ffb340; --ut-r:#ff6961;
+    --ut-g:#4fd873; --ut-a:#ffb340; --ut-o:#ff8f3c; --ut-r:#ff6961;
     --sig-under-bg:rgba(64,140,230,.20); --sig-under-fg:#82b3ed;
     --sig-bal-bg:rgba(50,180,130,.18);   --sig-bal-fg:#60cfa1;
     --sig-sat-bg:rgba(210,160,80,.20);   --sig-sat-fg:#e0b268;
@@ -210,9 +212,16 @@
   .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-trail{ flex:0 0 auto; display:flex; align-items:center; gap:8px; margin-left:6px }
+  /* native macOS tag: a calm NEUTRAL capsule matching the monogram .badge family — not an accent
+     pill. The accent DOT already carries the active colour cue, and #387 M5 drops the active ring to
+     reduce active over-signalling, so a second accent element here would re-inflate it; a same-hue
+     accent-on-accent-tint pill also sank the label to ~3:1. Sentence-case, no hairline outline / no
+     letter-spaced uppercase (both read as a web badge). The TEXT stays — with the filled dot it is
+     the WCAG 1.4.1 colour-is-not-the-only-cue redundancy for "active" (label ~3.9:1 light / ~3.8:1
+     dark on the capsule, clearing 1.4.11 with margin). */
   .tag{
-    font-size:9px; font-weight:700; letter-spacing:.07em; text-transform:uppercase;
-    color:var(--accent); border:.5px solid var(--accent-ring); padding:1px 5px; border-radius:4px;
+    font-size:10px; font-weight:600; letter-spacing:0;
+    color:var(--text-2); background:var(--badge-bg); padding:1.5px 7px; border-radius:5px;
   }
   .health{ display:inline-flex; color:var(--ok) }
 
@@ -244,32 +253,24 @@
     background:var(--accent); color:#fff; cursor:default; box-shadow:0 1px 2px rgba(0,0,0,.22);
   }
 
-  /* ---- add account (copy-command) ---- */
-  .add-row{ display:flex; align-items:center; gap:10px; padding:5px 12px 3px }
-  .add-btn{
-    flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; font:inherit; font-size:12px; font-weight:500;
-    padding:6px 11px; border-radius:8px; border:.5px solid var(--btn-border); background:var(--btn-bg); color:var(--text); cursor:default;
-  }
-  .add-btn:active{ transform:translateY(.5px) }
+  /* ---- copy-command hint (version-skew only — the one place the app genuinely can't act) ---- */
   .add-hint{ min-width:0; font-size:11px; color:var(--text-2) }
   .add-hint code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10.5px; background:var(--code-bg); color:var(--text); padding:1px 5px; border-radius:4px }
   .add-hint .copied{ color:var(--ok); font-weight:600 }
 
-  /* ---- capture affordance (#360 — a REAL daemon-routed action, honest pending state) ---- */
+  /* ---- capture affordance (#360 — a REAL daemon-routed action, honest pending state) ----
+     Inline on EMPTY-ROSTER / first-run only (.cap-onb); a populated panel carries no capture bar. */
   .cap{ display:flex; flex-direction:column; gap:8px }
-  .cap-row{ display:flex; align-items:center; gap:8px }
   .cap-field{
     font:inherit; font-size:12px; color:var(--text); padding:5px 9px; border-radius:7px; min-width:0;
     border:.5px solid var(--btn-border); background:var(--code-bg); outline:none;
   }
-  .cap-row .cap-field{ flex:1 1 auto }
   .cap-field::placeholder{ color:var(--text-3) }
   .cap-btn{
     flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; font:inherit; font-size:12px; font-weight:600;
     padding:6px 12px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:default;
     box-shadow:0 1px 2px rgba(0,0,0,.22); white-space:nowrap;
   }
-  .cap-btn.bordered{ background:var(--btn-bg); color:var(--text); border:.5px solid var(--btn-border); box-shadow:none; font-weight:500 }
   .cap-btn:active{ transform:translateY(.5px) }
   .cap-btn[disabled]{ opacity:.55 }
   .cap-status{ display:flex; align-items:center; gap:6px; min-height:15px; font-size:11px; color:var(--text-2) }
@@ -425,8 +426,17 @@
   .accts.dim .acct{ opacity:.5 }
   .accts.dim .acct.active{ box-shadow:inset 0 0 0 .5px var(--divider) }
 
-  /* row-health variants */
-  .acct .health.locked{ color:var(--ut-a) }
+  /* row-health variants — the health-glyph tint family, ordered by warmth to mirror the CLI's
+     severity ladder (healthy 🟢 < stale 🟡 < at-risk 🟠 < dead 🔴, src/observability.rs).
+     Shape carries WCAG 1.4.1; the tint is a second channel and must itself clear 1.4.11 (3:1).
+       healthy  → --ok    (green check)
+       stale    → --ut-a  (amber; the header/footer freshness marks below)
+       at-risk  → --ut-o  (orange; #b4550c ≈ 4.5:1 light, #ff8f3c ≈ 6.1:1 dark)
+       unknown  → --text-3 (muted — never a false green, #137)
+     A locked keychain means the refresh path is broken while the token may still work: that is
+     AT-RISK, not stale — so the padlock takes --ut-o and amber stays the stale mark. Keeping the
+     two distinct preserves severity-by-warmth and 🟡/🟠 parity with the CLI. */
+  .acct .health.locked{ color:var(--ut-o) }
   .acct .health.muted{ color:var(--text-3) }
 
   /* paused swap callout (keychain-locked) */
@@ -517,7 +527,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
                 </div>
               </div>
               <!-- codex -->
@@ -529,8 +539,8 @@
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
-                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
                 </div>
               </div>
               <!-- gemini -->
@@ -543,7 +553,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
                 </div>
               </div>
             </div>
@@ -551,16 +561,6 @@
               <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
               <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
               <button class="swap-btn">Swap</button>
-            </div>
-            <div class="cap">
-              <div class="cap-row">
-                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
-                <button class="cap-btn bordered" onclick="capSim(this,'ok')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                  Capture active account
-                </button>
-              </div>
-              <div class="cap-status"></div>
             </div>
             <div class="pop-foot">
               <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
@@ -594,7 +594,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -605,8 +605,8 @@
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
-                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -618,7 +618,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
                 </div>
               </div>
             </div>
@@ -626,16 +626,6 @@
               <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
               <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
               <button class="swap-btn">Swap</button>
-            </div>
-            <div class="cap">
-              <div class="cap-row">
-                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
-                <button class="cap-btn bordered" onclick="capSim(this,'ok')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                  Capture active account
-                </button>
-              </div>
-              <div class="cap-status"></div>
             </div>
             <div class="pop-foot">
               <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
@@ -939,7 +929,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -950,8 +940,8 @@
                   <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
                 <div class="meters">
-                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -963,7 +953,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
                 </div>
               </div>
             </div>
@@ -999,7 +989,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -1010,8 +1000,8 @@
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
-                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -1023,7 +1013,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
                 </div>
               </div>
             </div>
@@ -1031,16 +1021,6 @@
               <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
               <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">lowest weekly &middot; 18% &middot; most headroom</div></span>
               <button class="swap-btn">Swap</button>
-            </div>
-            <div class="cap">
-              <div class="cap-row">
-                <input class="cap-field" type="text" placeholder="e.g. Work, Personal" aria-label="Account label, optional">
-                <button class="cap-btn bordered" onclick="capSim(this,'ok')">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/></svg>
-                  Capture active account
-                </button>
-              </div>
-              <div class="cap-status"></div>
             </div>
             <div class="pop-foot">
               <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
@@ -1084,7 +1064,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -1095,8 +1075,8 @@
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
-                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -1108,7 +1088,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
                 </div>
               </div>
             </div>
@@ -1151,7 +1131,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -1162,8 +1142,8 @@
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
-                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h02m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:71%"></span></span><span class="m-pct a">71%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
                 </div>
               </div>
               <div class="acct">
@@ -1175,7 +1155,7 @@
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
-                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">Sun</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
                 </div>
               </div>
             </div>
@@ -1324,15 +1304,15 @@
     <h2>Design notes &mdash; the 9-state map in the native macOS language</h2>
     <ul>
       <li><b>One surface, nine states, one language.</b> Every state is a render of the same 380&nbsp;px vibrancy popover &mdash; healthy rosters and degraded messages share the frosted material, hairline dividers, SF-symbol-style glyphs and tabular numerals. Each state is a <b>distinct icon-shape + panel message + affordance</b> (the 9-state map); the caption glyph above each card is that state&rsquo;s <b>menubar</b> shape.</li>
-      <li><b>Healthy = the <code>status</code> render.</b> Status and Stats share one language: label-primary two-line identity (<code>Work</code> / <code>Personal</code> / <code>Scratch</code> + monogram badge, provider below), session &amp; weekly usage meters (green&nbsp;&lt;70 / amber&nbsp;70&ndash;90 / red&nbsp;&ge;90), the smart <b>swap</b> hero callout, and drawn SVG sparklines with the neutral symmetric SIGNAL band.</li>
+      <li><b>Healthy = the <code>status</code> render.</b> Status and Stats share one language: label-primary two-line identity (<code>Work</code> / <code>Personal</code> / <code>Scratch</code> + monogram badge, provider below), session &amp; weekly usage meters on the <code>status</code> CLI&rsquo;s own bands (green&nbsp;&lt;75 / amber&nbsp;75&ndash;89 / red&nbsp;&ge;90) with resets in its compact duration form (<code>2h14m</code>, <code>3d</code>), the smart <b>swap</b> hero callout, and drawn SVG sparklines with the neutral symmetric SIGNAL band. Every percent carries its band in colour &mdash; a healthy one included &mdash; exactly as the CLI paints it.</li>
       <li><b>Never healthy on a degraded daemon (#137).</b> <b>Disconnected</b> shows the last-known roster <i>dimmed + &ldquo;stale&rdquo;</i> with a broken-link badge and a <i>Reconnect</i> escape &mdash; never frozen-as-live; swaps paused. <b>Crash-looping</b> persists a <b>fault</b> shape and holds status until a fresh snapshot survives a stability window (the healthy-flash is debounced).</li>
       <li><b>Freshness is a spectrum.</b> <b>Stale-snapshot</b> is milder than disconnected &mdash; still connected, so the full roster renders live with only a subtle amber <code>stale&nbsp;6m</code> modifier in the header and an amber freshness line in the footer; the swap stays enabled (the daemon re-mints viability on swap).</li>
-      <li><b>Blocked states are honest and non-intrusive.</b> <b>Keychain-locked</b> keeps the fresh roster but marks the active account with an amber lock, pauses the swap callout, and only <i>waits</i> &mdash; the app never prompts or auto-unlocks. <b>Version-skew</b> refuses to render any % and offers a copy-command instead.</li>
-      <li><b>Capture is a real action; copy-command only where the app can&rsquo;t act.</b> <b>Add account</b> and <b>first-run onboarding</b> now <b>capture</b> the active account in-app (#360) &mdash; a button + optional label field that sends the verb over the #358 control socket and renders an honest <i>pending &rarr; done &rarr; error</i> from the redacted ack (no credential ever reaches the client). The captured row then arrives on its own via the live watch stream &mdash; the affordance never inserts it. To add a <i>different</i> account the operator runs <code>claude /login</code> first, then captures (capture snapshots the active account; it is not a picker). Only where the app genuinely can&rsquo;t act does it still copy a command: version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>). <b>daemon-starting</b> stays a <i>static</i> forming glyph &mdash; the app fakes no progress it isn&rsquo;t doing.</li>
+      <li><b>Blocked states are honest and non-intrusive.</b> <b>Keychain-locked</b> keeps the fresh roster but marks the active account with an <i>orange at-risk</i> lock &mdash; the refresh path is broken while the token may still work, so it outranks a mere amber <i>stale</i> mark (🟡&nbsp;&lt;&nbsp;🟠, the CLI&rsquo;s ladder) &mdash; pauses the swap callout, and only <i>waits</i>: the app never prompts or auto-unlocks. <b>Version-skew</b> refuses to render any % and offers a copy-command instead.</li>
+      <li><b>Capture is a real action; copy-command only where the app can&rsquo;t act.</b> <b>First-run / empty-roster onboarding</b> <b>captures</b> the active account in-app (#360) &mdash; a button + optional label field that sends the verb over the #358 control socket and renders an honest <i>pending &rarr; done &rarr; error</i> from the redacted ack (no credential ever reaches the client). It is an <i>onboarding</i> affordance: a populated panel carries no capture bar, so the steady state stays a read-only glance and adding an account lives off-panel. The captured row then arrives on its own via the live watch stream &mdash; the affordance never inserts it. To add a <i>different</i> account the operator runs <code>claude /login</code> first, then captures (capture snapshots the active account; it is not a picker). Only where the app genuinely can&rsquo;t act does it still copy a command: version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>). <b>daemon-starting</b> stays a <i>static</i> forming glyph &mdash; the app fakes no progress it isn&rsquo;t doing.</li>
       <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
       <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each provider gets the same monochrome monogram badge and a plain text label (no brand colour or logo). The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
-      <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges, the amber lock and stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>
+      <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges, the orange at-risk lock and the amber stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>
     </ul>
   </section>
 

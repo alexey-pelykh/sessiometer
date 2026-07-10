@@ -56,8 +56,11 @@ STATES = [
               "each name (no <code>provider</code> wire field yet — #173), the “Last swap …” footer "
               "(dropped from the wire → event log, #88), and an enabled blue Swap button (its action is "
               "#169, so the panel ships it disabled — never a dead-click). The panel’s “updated &lt;1m "
-              "ago” footer and duration resets (“3d”) mirror the <code>status</code> CLI (R-2), not the "
-              "mock’s illustrative “snapshot 12s old” / “Sun”."),
+              "ago” footer mirrors the <code>status</code> CLI (R-2), not the mock’s illustrative "
+              "“snapshot 12s old”; resets no longer diverge either — the mock now uses the CLI’s "
+              "duration form too (“2h14m” / “3d”), and its usage meters carry the CLI’s 75/90 bands. "
+              "Conversely the panel still renders a capture bar here: the mock now specs capture on "
+              "first-run only, with Add account off-panel (#394 relocates it)."),
     dict(title="1 · Healthy — Status (dark)", theme="dark", design=1, capture="panel-healthy-dark.png",
          note="Same state, dark appearance — system semantic colours, not the mock’s hex."),
     dict(title="2 · Connecting / daemon-starting", theme="light", design=4, capture="panel-connecting-light.png",
