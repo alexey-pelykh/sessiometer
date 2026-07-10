@@ -607,6 +607,60 @@ pub(crate) struct Config {
     pub(crate) migration: MigrationConfig,
 }
 
+/// Whether an effective config value came from `config.toml` or a compiled-in
+/// default — the provenance `config show --origin` surfaces (issue #401). An
+/// absent key (or a whole absent `[section]`) reads as [`Origin::Default`], so the
+/// silently-defaulted drift that motivated #401 — an externally-deleted
+/// `[tunables]` block — becomes visible instead of masquerading as intentional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The key (or its whole `[section]`) is absent from the file; the daemon
+    /// silently substituted the compiled-in default.
+    Default,
+    /// The key is present in the file.
+    FromFile,
+}
+
+/// One effective config value tagged with where it came from (issue #401). `value`
+/// is pre-rendered exactly as it reads in `config.toml` — through the SAME
+/// `basic_string` / `render_str_array` / `render_jitter` helpers as
+/// [`Config::render`] — so the view and the file speak one syntax.
+#[derive(Debug)]
+pub(crate) struct OriginEntry {
+    /// The TOML key name (e.g. `poll_secs`).
+    pub(crate) key: &'static str,
+    /// The effective value, pre-rendered as TOML.
+    pub(crate) value: String,
+    /// File-set or compiled-in default.
+    pub(crate) origin: Origin,
+}
+
+/// One `[section]` of the origin report: its TOML header, whether that section
+/// header was present in the file at all, and its keyed entries (issue #401).
+#[derive(Debug)]
+pub(crate) struct OriginSection {
+    /// The section header exactly as it reads in the file, e.g. `[tunables]`.
+    pub(crate) header: &'static str,
+    /// Was the `[section]` header present in the file? A `false` here with every
+    /// entry [`Origin::Default`] is the deleted-block signal #401 exists to show.
+    pub(crate) present: bool,
+    /// The section's keyed values, in `render` order.
+    pub(crate) entries: Vec<OriginEntry>,
+}
+
+/// The effective config — sectioned and origin-tagged — plus a roster summary, the
+/// read-only view `config show [--origin]` renders (issue #401). Produced by
+/// [`Config::load_with_origin`]; consumed by the CLI, which only formats it.
+#[derive(Debug)]
+pub(crate) struct OriginReport {
+    /// The tunable/optional-table blocks, in `render` order.
+    pub(crate) sections: Vec<OriginSection>,
+    /// How many accounts the effective roster holds.
+    pub(crate) roster_count: usize,
+    /// Was any `[[account]]` present in the file?
+    pub(crate) roster_present: bool,
+}
+
 impl Config {
     /// Load and validate `config.toml` from its standard path.
     ///
@@ -648,6 +702,252 @@ impl Config {
     /// identical invariants (unique non-empty `account_uuid`, tunable ranges).
     pub(crate) fn from_toml_str(text: &str) -> Result<Self> {
         Self::parse(text)
+    }
+
+    /// Load the effective config AND classify every value's origin (file vs default),
+    /// for the read-only `config show [--origin]` diagnostics verb (issue #401).
+    ///
+    /// Purely additive — it changes nothing about how the daemon loads or defaults
+    /// config, and every error class matches [`load`](Config::load) exactly: the file
+    /// read maps [`Error::ConfigNotFound`] / [`Error::Io`] just as
+    /// [`load_path`](Config::load_path) does, and the SAME [`parse`](Config::parse) →
+    /// [`validate`](Config::validate) seam maps [`Error::ConfigParse`] /
+    /// [`Error::ConfigInvalid`] / [`Error::ConfigFloorAboveTrigger`]. It then re-reads
+    /// the raw text into a permissive [`toml::Table`] PURELY to detect key presence,
+    /// which the typed `#[serde(default)]` layer cannot report.
+    pub(crate) fn load_with_origin(path: &Path) -> Result<OriginReport> {
+        // Deliberately mirrors `load_path`'s read (absent → `ConfigNotFound`, other →
+        // `Io`) rather than calling it — the raw text is needed twice (typed parse +
+        // presence table), and this keeps the change additive to the daemon's load path.
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(Error::ConfigNotFound {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(err) => return Err(Error::Io(err)),
+        };
+        // The effective, validated config (defaults filled). Any parse/validate error
+        // surfaces here first, byte-identically to what `load_path` would return.
+        let config = Self::parse(&text)?;
+        // A second, permissive parse into a raw table — key presence only. `parse`
+        // above already accepted `text` under `deny_unknown_fields`, so this re-parse
+        // of the same input cannot fail; map defensively regardless.
+        let raw: toml::Table =
+            toml::from_str(&text).map_err(|err| Error::ConfigParse(err.to_string()))?;
+        Ok(config.origin_report(&raw))
+    }
+
+    /// Build the origin report from the effective config (`self`) and the raw TOML
+    /// `table` (the presence source). Mirrors [`render`](Config::render)'s field walk —
+    /// same sections, same order, same value formatting — but emits `(key, value,
+    /// origin)` triples instead of persisted TOML. The schema's single source of truth
+    /// stays with the structs here; the CLI only formats what this returns.
+    fn origin_report(&self, table: &toml::Table) -> OriginReport {
+        // Is `[section].key` present in the raw file? An absent section (or key) →
+        // the value the effective config carries is a compiled-in default.
+        let present = |section: &str, key: &str| -> Origin {
+            match table
+                .get(section)
+                .and_then(toml::Value::as_table)
+                .map(|t| t.contains_key(key))
+            {
+                Some(true) => Origin::FromFile,
+                _ => Origin::Default,
+            }
+        };
+        let entry =
+            |key: &'static str, value: String, origin: Origin| OriginEntry { key, value, origin };
+
+        let t = &self.tunables;
+        let tunables = OriginSection {
+            header: "[tunables]",
+            present: table.contains_key("tunables"),
+            entries: vec![
+                entry(
+                    "poll_secs",
+                    t.poll_secs.to_string(),
+                    present("tunables", "poll_secs"),
+                ),
+                entry(
+                    "cooldown_secs",
+                    t.cooldown_secs.to_string(),
+                    present("tunables", "cooldown_secs"),
+                ),
+                entry(
+                    "session_floor",
+                    t.session_floor.to_string(),
+                    present("tunables", "session_floor"),
+                ),
+                entry(
+                    "session_trigger",
+                    t.session_trigger.to_string(),
+                    present("tunables", "session_trigger"),
+                ),
+                entry(
+                    "weekly_trigger",
+                    t.weekly_trigger.to_string(),
+                    present("tunables", "weekly_trigger"),
+                ),
+                entry(
+                    "monitor_401_n",
+                    t.monitor_401_n.to_string(),
+                    present("tunables", "monitor_401_n"),
+                ),
+                entry(
+                    "monitor_recovery_m",
+                    t.monitor_recovery_m.to_string(),
+                    present("tunables", "monitor_recovery_m"),
+                ),
+            ],
+        };
+
+        let jitter = OriginSection {
+            header: "[jitter]",
+            present: table.contains_key("jitter"),
+            entries: vec![
+                entry(
+                    "poll",
+                    render_jitter(&t.poll_strategy.jitter),
+                    present("jitter", "poll"),
+                ),
+                entry(
+                    "trigger",
+                    render_jitter(&t.trigger_strategy.jitter),
+                    present("jitter", "trigger"),
+                ),
+                entry(
+                    "weekly_trigger",
+                    render_jitter(&t.weekly_trigger_strategy.jitter),
+                    present("jitter", "weekly_trigger"),
+                ),
+                entry(
+                    "cooldown",
+                    render_jitter(&t.cooldown_strategy.jitter),
+                    present("jitter", "cooldown"),
+                ),
+            ],
+        };
+
+        let r = &self.refresh;
+        let refresh = OriginSection {
+            header: "[refresh]",
+            present: table.contains_key("refresh"),
+            entries: vec![
+                entry(
+                    "enabled",
+                    r.enabled.to_string(),
+                    present("refresh", "enabled"),
+                ),
+                entry(
+                    "accounts",
+                    render_str_array(&r.accounts),
+                    present("refresh", "accounts"),
+                ),
+                entry(
+                    "cadence_secs",
+                    r.cadence_secs.to_string(),
+                    present("refresh", "cadence_secs"),
+                ),
+                entry(
+                    "idle_after_secs",
+                    r.idle_after_secs.to_string(),
+                    present("refresh", "idle_after_secs"),
+                ),
+                entry(
+                    "timeout_secs",
+                    r.timeout_secs.to_string(),
+                    present("refresh", "timeout_secs"),
+                ),
+                entry(
+                    "systemic_failure_n",
+                    r.systemic_failure_n.to_string(),
+                    present("refresh", "systemic_failure_n"),
+                ),
+                entry(
+                    "claude_bin",
+                    render_optional_bin(&r.claude_bin),
+                    present("refresh", "claude_bin"),
+                ),
+            ],
+        };
+
+        let l = &self.login;
+        let login = OriginSection {
+            header: "[login]",
+            present: table.contains_key("login"),
+            entries: vec![
+                entry(
+                    "timeout_secs",
+                    l.timeout_secs.to_string(),
+                    present("login", "timeout_secs"),
+                ),
+                entry(
+                    "claude_bin",
+                    render_optional_bin(&l.claude_bin),
+                    present("login", "claude_bin"),
+                ),
+            ],
+        };
+
+        let s = &self.stats;
+        let stats = OriginSection {
+            header: "[stats]",
+            present: table.contains_key("stats"),
+            entries: vec![
+                entry(
+                    "raw_retention_secs",
+                    s.raw_retention_secs.to_string(),
+                    present("stats", "raw_retention_secs"),
+                ),
+                entry(
+                    "hourly_retention_secs",
+                    s.hourly_retention_secs.to_string(),
+                    present("stats", "hourly_retention_secs"),
+                ),
+                entry(
+                    "daily_retention_secs",
+                    s.daily_retention_secs.to_string(),
+                    present("stats", "daily_retention_secs"),
+                ),
+                entry(
+                    "default_period",
+                    basic_string(&s.default_period),
+                    present("stats", "default_period"),
+                ),
+            ],
+        };
+
+        let mi = &self.migration;
+        let migration = OriginSection {
+            header: "[migration]",
+            present: table.contains_key("migration"),
+            entries: vec![
+                entry(
+                    "kdf_memory_kib",
+                    mi.kdf_memory_kib.to_string(),
+                    present("migration", "kdf_memory_kib"),
+                ),
+                entry(
+                    "kdf_iterations",
+                    mi.kdf_iterations.to_string(),
+                    present("migration", "kdf_iterations"),
+                ),
+                entry(
+                    "conflict_policy",
+                    basic_string(mi.conflict_policy.as_str()),
+                    present("migration", "conflict_policy"),
+                ),
+            ],
+        };
+
+        OriginReport {
+            sections: vec![tunables, jitter, refresh, login, stats, migration],
+            roster_count: self.roster.len(),
+            // The roster is the `[[account]]` array-of-tables (RawConfig's `account`).
+            roster_present: table.contains_key("account"),
+        }
     }
 
     /// Persist this config to the canonical `config.toml` (`0600`, parent `0700`), with the
@@ -1297,6 +1597,17 @@ fn render_jitter(jitter: &Jitter) -> String {
         Jitter::None => "{ kind = \"none\" }".to_string(),
         Jitter::Uniform { spread } => format!("{{ kind = \"uniform\", spread = {spread:?} }}"),
         Jitter::Normal { stddev } => format!("{{ kind = \"normal\", stddev = {stddev:?} }}"),
+    }
+}
+
+/// Render an optional `claude_bin` override for the `config show` origin view
+/// (issue #401): the quoted path when set, or a `(unset)` sentinel when it defers
+/// to `$CLAUDE_BIN` / `$PATH`. Diagnostic-only — this view never round-trips to a
+/// file, so an absent override reads as a clear sentinel rather than a blank.
+fn render_optional_bin(bin: &Option<PathBuf>) -> String {
+    match bin {
+        Some(path) => basic_string(&path.to_string_lossy()),
+        None => "(unset)".to_string(),
     }
 }
 
@@ -2648,6 +2959,220 @@ label = "personal"
             Config::load_path(&path),
             Err(Error::ConfigParse(_))
         ));
+    }
+
+    // --- config show --origin (issue #401) ---------------------------------
+
+    /// The provenance test #401 exists for: a file that sets ONLY `session_trigger`
+    /// must show that one key `FromFile` and EVERY other tunable — plus every absent
+    /// optional section — `Default`, so a silently-defaulted (absent) block is visible.
+    #[test]
+    fn origin_report_tags_absent_keys_default_and_present_keys_from_file() {
+        let text = "[tunables]\nsession_trigger = 90\n";
+        let config = Config::from_toml_str(text).expect("a lone session_trigger is valid");
+        let table: toml::Table = toml::from_str(text).expect("valid TOML");
+        let report = config.origin_report(&table);
+
+        let tunables = &report.sections[0];
+        assert_eq!(tunables.header, "[tunables]");
+        assert!(tunables.present, "[tunables] is present");
+        let by_key = |k: &str| {
+            tunables
+                .entries
+                .iter()
+                .find(|e| e.key == k)
+                .unwrap_or_else(|| panic!("no `{k}` entry"))
+        };
+        assert_eq!(by_key("session_trigger").origin, Origin::FromFile);
+        assert_eq!(by_key("session_trigger").value, "90");
+        // Every OTHER tunable in the present section is still a compiled-in default.
+        assert_eq!(by_key("poll_secs").origin, Origin::Default);
+        assert_eq!(by_key("session_floor").origin, Origin::Default);
+        assert_eq!(by_key("monitor_401_n").origin, Origin::Default);
+
+        // Every optional section is absent → not present, all values Default.
+        for header in ["[jitter]", "[refresh]", "[login]", "[stats]", "[migration]"] {
+            let section = report
+                .sections
+                .iter()
+                .find(|s| s.header == header)
+                .unwrap_or_else(|| panic!("no `{header}` section"));
+            assert!(!section.present, "{header} is absent");
+            assert!(
+                section.entries.iter().all(|e| e.origin == Origin::Default),
+                "{header} keys are all Default when the section is absent",
+            );
+        }
+        assert_eq!(report.roster_count, 0);
+        assert!(!report.roster_present, "no [[account]] in the file");
+    }
+
+    /// Keys and sections PRESENT in the file read `FromFile`; a key omitted from an
+    /// otherwise-present section still reads `Default`; a populated roster is counted
+    /// and flagged present.
+    #[test]
+    fn origin_report_marks_present_sections_keys_and_roster_from_file() {
+        let text = "\
+[tunables]
+poll_secs = 45
+
+[refresh]
+enabled = true
+
+[[account]]
+account_uuid = \"11111111-1111\"
+label = \"work\"
+";
+        let config = Config::from_toml_str(text).expect("valid config");
+        let table: toml::Table = toml::from_str(text).expect("valid TOML");
+        let report = config.origin_report(&table);
+
+        let tunables = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[tunables]")
+            .unwrap();
+        let poll = tunables
+            .entries
+            .iter()
+            .find(|e| e.key == "poll_secs")
+            .unwrap();
+        assert_eq!(poll.origin, Origin::FromFile);
+        assert_eq!(poll.value, "45");
+        // Present section, absent key → still Default.
+        let cooldown = tunables
+            .entries
+            .iter()
+            .find(|e| e.key == "cooldown_secs")
+            .unwrap();
+        assert_eq!(cooldown.origin, Origin::Default);
+
+        let refresh = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[refresh]")
+            .unwrap();
+        assert!(refresh.present);
+        let enabled = refresh.entries.iter().find(|e| e.key == "enabled").unwrap();
+        assert_eq!(enabled.origin, Origin::FromFile);
+        assert_eq!(enabled.value, "true");
+
+        assert_eq!(report.roster_count, 1);
+        assert!(report.roster_present);
+    }
+
+    /// `load_with_origin` funnels through the SAME parse→validate seam as `load`, so a
+    /// bad value fails identically (never a silent default) and an absent file is
+    /// `ConfigNotFound` — the read-only diagnostics verb inherits the daemon's contract.
+    #[test]
+    fn load_with_origin_surfaces_the_same_errors_as_load_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, "[tunables]\npoll_secs = 1\n").unwrap();
+        let err = Config::load_with_origin(&path).expect_err("poll_secs=1 is out of range");
+        assert!(matches!(err, Error::ConfigInvalid(_)), "got {err:?}");
+
+        let missing = dir.path().join("nope.toml");
+        assert!(matches!(
+            Config::load_with_origin(&missing),
+            Err(Error::ConfigNotFound { .. })
+        ));
+    }
+
+    /// End-to-end through disk. A rendered config reports every value `FromFile`
+    /// (render writes every key live), so the ONLY way a tunable reads `Default` is a
+    /// genuinely absent key — which is exactly why the drift #401 surfaces is real.
+    #[test]
+    fn load_with_origin_reports_a_rendered_config_all_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let rendered = Config::parse(VALID).unwrap().render();
+        std::fs::write(&path, &rendered).unwrap();
+
+        let report = Config::load_with_origin(&path).unwrap();
+        for section in &report.sections {
+            // `claude_bin` is the one key `render` leaves COMMENTED when unset, so it
+            // is legitimately absent (`Default`); every other rendered key is live.
+            for entry in &section.entries {
+                if entry.key == "claude_bin" {
+                    continue;
+                }
+                assert_eq!(
+                    entry.origin,
+                    Origin::FromFile,
+                    "rendered {}.{} should read FromFile",
+                    section.header,
+                    entry.key,
+                );
+            }
+        }
+    }
+
+    /// The externally-deleted-block scenario #401 names verbatim: a config that OMITS
+    /// `[tunables]` entirely (but is otherwise valid) loads fine, and every tunable
+    /// reads `Default` with the section flagged absent — the drift made visible.
+    #[test]
+    fn load_with_origin_surfaces_a_missing_tunables_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[refresh]\nenabled = true\n\n[[account]]\naccount_uuid = \"11111111-1111\"\nlabel = \"work\"\n",
+        )
+        .unwrap();
+
+        let report = Config::load_with_origin(&path).unwrap();
+        let tunables = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[tunables]")
+            .unwrap();
+        assert!(!tunables.present, "[tunables] is absent from the file");
+        assert!(
+            tunables.entries.iter().all(|e| e.origin == Origin::Default),
+            "a missing [tunables] block reads as all-Default — the #401 drift signal",
+        );
+        // The present [refresh].enabled still reads FromFile — absence is per-section.
+        let refresh = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[refresh]")
+            .unwrap();
+        assert!(refresh.present);
+    }
+
+    /// #401 drift guard, the complement of `..._all_from_file` above: every key `render`
+    /// writes for a full config MUST also appear in `origin_report`. Without this, a tunable
+    /// added to `render` but forgotten in `origin_report` would be silently DROPPED from
+    /// `config show` — the drift most likely as the schema grows (jitter #38, refresh #105,
+    /// stats #161, migration #150, session_floor #398). Asserts `live ⊆ reported`.
+    #[test]
+    fn origin_report_reports_every_key_render_writes() {
+        let config = Config::parse(VALID).unwrap();
+        let table: toml::Table = toml::from_str(&config.render()).unwrap();
+        let report = config.origin_report(&table);
+        for (name, live) in &table {
+            // The `[[account]]` roster is summarized, not key-listed — skip the array.
+            let Some(live) = live.as_table() else {
+                continue;
+            };
+            let want = format!("[{name}]");
+            let section = report
+                .sections
+                .iter()
+                .find(|s| s.header == want.as_str())
+                .unwrap_or_else(|| panic!("render writes {want} but origin_report has no section"));
+            let reported: std::collections::BTreeSet<&str> =
+                section.entries.iter().map(|e| e.key).collect();
+            for key in live.keys() {
+                assert!(
+                    reported.contains(key.as_str()),
+                    "render writes {name}.{key} but origin_report omits it — config show would drop it",
+                );
+            }
+        }
     }
 
     /// AC #3 + #4 end-to-end: a config written the way `capture` will write it
