@@ -54,7 +54,10 @@ which is the mock). Light shown here:
 - the footer reads "updated <1m ago" — the panel mirrors the `status` CLI (R-2 state-parity), not
   the mock's illustrative "snapshot 12s old". Resets no longer diverge: the mock now uses the CLI's
   compact duration form too ("2h14m" / "3d"), not a day-name (#387)
-- the **Swap** button is present-but-disabled — its click action is #169
+- the **Swap** button is LIVE as of #169 (it sends the displayed `next_swap` target over the daemon's
+  `swap` command). Each non-active roster row is also a quiet, hover-revealed manual switch — an
+  affordance the mock does not spec, so the #169 body is its reference; at rest the row keeps a
+  trailing action slot for it, which is why the auth glyph sits ~27 pt further left than in the mock
 - no Status/Stats segmented control — Stats has no socket data path (spike #356)
 - the panel still renders the capture bar on a **populated** roster; the mock now specs capture on
   **empty-roster / first-run only**, with Add account moved off-panel. The panel-side relocation is
@@ -68,6 +71,12 @@ faithfully captures every state's layout, color, and typography **except** that 
 needs a manual check against the mock in a real popover (first run — or the panel's Add-account bar,
 which the mock no longer specs). Treat a blank/placeholder capture-field box in the PNGs as a known
 tool artifact, not a panel defect.
+
+**Harness limitation — HOVER states are NOT captured.** `ImageRenderer` draws one resting frame, so
+the #169 per-row manual switch (its revealed `arrow.left.arrow.right` glyph, the `nosign` on a
+non-viable row, the row wash, the `pointingHand` cursor) and the in-flight `Switching…` spinner never
+appear in these PNGs — the rows correctly render at rest. Those states, like the real-popover swap
+round-trip, are a manual operator check (#380).
 
 ### Design vs. capture, screen by screen
 

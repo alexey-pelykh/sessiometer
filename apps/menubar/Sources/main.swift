@@ -61,7 +61,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             captureClient = nil
         }
 
-        let controller = StatusItemController(store: store, captureClient: captureClient)
+        // The swap affordance's write path (issue #169): the SAME short-lived control-command transport,
+        // but with its OWN, larger budget — exactly the per-call-site timeout `ControlCommandClient`
+        // earmarks for this exchange. A `swap` ack is written only AFTER the swap runs, and the swap may
+        // wait on the cross-process single-writer lock for up to `SWAP_LOCK_MAX_WAIT` (10 s, `src/swap.rs`)
+        // before failing closed. The capture default (2 s) would therefore time out a swap that is merely
+        // QUEUED and about to succeed — reporting a false failure for a write that then commits. 15 s
+        // clears the lock's own bound with headroom for the keychain read/write beneath it. The bound is
+        // what makes a lost ack recover instead of sticking the spinner (issue #169).
+        let swapClient: ControlCommandClient?
+        switch ControlCommandClient.production(timeout: .seconds(15)) {
+        case .success(let client):
+            swapClient = client
+        case .failure(let error):
+            appLog.error("swap client unavailable: \(String(describing: error), privacy: .public)")
+            swapClient = nil
+        }
+
+        let controller = StatusItemController(store: store,
+                                              captureClient: captureClient,
+                                              swapClient: swapClient)
         controller.start()
         statusItemController = controller
 

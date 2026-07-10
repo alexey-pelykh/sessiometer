@@ -76,6 +76,185 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Manual switch affordance (issue #169 — the per-row swap-on-click)
+
+    /// Why a roster row cannot be manually switched to. These are exactly the CLIENT-VISIBLE subset of
+    /// the daemon's OWN non-`force` policy gates (`swap_command_verdict`, `src/daemon.rs`), in the
+    /// daemon's own order — so a row the panel disables is a row the daemon would refuse.
+    ///
+    /// The daemon's THIRD gate, `cooldown`, is deliberately absent: the post-swap cooldown is in-memory
+    /// daemon state and never rides the wire, so the client cannot know it. A row the panel shows as
+    /// viable can therefore still come back `rejected(.cooldown)` — that refusal is rendered inline
+    /// (`swapErrorText`). This asymmetry is the honest design: the panel disables ONLY what the wire
+    /// proves, and never sends a viability hint (the daemon re-validates every target regardless).
+    ///
+    /// `enabled` is NOT a gate: `swap_command_verdict` does not read it. A parked account (issue #36) is
+    /// out of the AUTO rotation, not un-switchable — the CLI's `use <account>` reaches it too.
+    enum SwitchBlock: Equatable {
+        /// The credential is dead (issue #42) — the daemon refuses without `force`.
+        case quarantined
+        /// The weekly window is exhausted (issue #11/#37) — the daemon refuses without `force`.
+        case weeklyExhausted
+    }
+
+    /// The wire-visible block on manually switching to a row, or `nil` when the row is viable as far as
+    /// the wire can say. Mirrors `swap_command_verdict`'s gate ORDER (quarantined before weekly), so the
+    /// reason the panel shows is the reason the daemon would give.
+    static func switchBlock(quarantined: Bool, weeklyExhausted: Bool) -> SwitchBlock? {
+        if quarantined { return .quarantined }
+        if weeklyExhausted { return .weeklyExhausted }
+        return nil
+    }
+
+    /// A roster row's manual-switch state (issue #169), as a pure verdict the panel's `RosterView` maps to
+    /// its affordance:
+    ///   * `notATarget` — the ACTIVE row (a disabled button reads as "broken", so it stays a plain
+    ///     display row).
+    ///   * `available` — a viable switch target: an enabled, quiet, hover-revealed button.
+    ///   * `blocked(reason)` — a wire-visibly non-viable target: a disabled button carrying its reason.
+    ///
+    /// `isEnabled` is accepted and DELIBERATELY IGNORED — pinned as a parameter (rather than simply not
+    /// consulted) so the "a parked account is still switchable" invariant is TESTABLE: a caller passing
+    /// `isEnabled: false` on an otherwise-viable row must still get `.available`. This mirrors the daemon:
+    /// `swap_command_verdict` (`src/daemon.rs`) takes no `enabled` input, so a parked account (issue #36,
+    /// out of the AUTO rotation) is reachable by a manual `use <account>` / panel switch. If a future edit
+    /// ever gates on `enabled` here, the parity test breaks loudly.
+    static func rowSwitchState(
+        isActive: Bool,
+        isQuarantined: Bool,
+        weeklyExhausted: Bool,
+        isEnabled: Bool
+    ) -> RowSwitchState {
+        _ = isEnabled   // intentionally not a gate — see the daemon-parity note above.
+        if isActive { return .notATarget }
+        if let block = switchBlock(quarantined: isQuarantined, weeklyExhausted: weeklyExhausted) {
+            return .blocked(block)
+        }
+        return .available
+    }
+
+    /// The pure verdict `rowSwitchState` returns — the panel's `RosterView` renders each case.
+    enum RowSwitchState: Equatable {
+        case notATarget
+        case available
+        case blocked(SwitchBlock)
+    }
+
+    /// Why a non-viable row cannot be switched to — shown as its hover tooltip and spoken by VoiceOver
+    /// (a `dimmed` trait alone never tells the operator WHY).
+    static func switchBlockedText(_ block: SwitchBlock) -> String {
+        switch block {
+        case .quarantined:     return "Can’t switch — credential is dead. Run claude /login."
+        case .weeklyExhausted: return "Can’t switch — weekly limit reached."
+        }
+    }
+
+    /// The viable row's (and the footer Swap button's) hover tooltip / accessibility hint.
+    static func switchHelpText(label: String) -> String {
+        "Switch to \(label)"
+    }
+
+    /// A row's spoken label, plus — for a non-viable switch target — the reason it is disabled.
+    static func rowSwitchAccessibilityLabel(base: String, block: SwitchBlock?) -> String {
+        guard let block else { return base }
+        return "\(base). \(switchBlockedText(block))"
+    }
+
+    // MARK: - Switch-affordance layout budget (issue #169 watch-out: never truncate to something uninformative)
+
+    /// The trailing hover-switch slot's own width in points — wide enough for the swap glyph and for the
+    /// small `ProgressView` that replaces it while the swap is in flight. This EXCLUDES the row `HStack`'s
+    /// 9 pt spacing that precedes it, so the slot's total trailing cost is `switchAffordanceSlotWidth + 9`.
+    ///
+    /// The slot is laid out on EVERY roster row — invisible on the active row, and at rest on the others.
+    /// Two consequences, both load-bearing: the auth column stays aligned across active and non-active
+    /// rows, and, decisively, revealing the glyph on hover can never REFLOW the row. The label's available
+    /// width is identical hovered and at rest, so its truncation is too.
+    static let switchAffordanceSlotWidth: Double = 18
+
+    /// The minimum row width, in points, at which the manual-switch affordance is offered at all.
+    ///
+    /// Derived from the row's fixed columns at their tightest: 16 (row insets) + 8 (status dot) + 9 +
+    /// 30 (monogram) + 9 + 64 (a label floor worth reading) + 6 (min spacer) + 60 (auth glyph + its
+    /// longest cue) + 27 (the slot plus its 9 pt spacing) ≈ 229, rounded up for breathing room. Below
+    /// this, the affordance is not merely hidden — the row is not interactive AT ALL, so a too-narrow row
+    /// can never degrade into an invisible whole-row hot-zone (the mis-click hazard hover-reveal exists to
+    /// prevent).
+    static let switchAffordanceMinRowWidth: Double = 240
+
+    /// Whether a row of `rowWidth` points can host the manual-switch affordance without squeezing the
+    /// label into an uninformative truncation. The panel is fixed-width today, so its caller derives
+    /// `rowWidth` from `defaultRowWidth` rather than measuring — see `StatusPanelView`.
+    static func rowFitsSwitchAffordance(rowWidth: Double) -> Bool {
+        rowWidth >= switchAffordanceMinRowWidth
+    }
+
+    /// The panel's fixed content width in points — the source of truth for the `.frame(width:)` the SwiftUI
+    /// `StatusPanelView` pins, kept HERE (in the testable, Foundation-only layer) alongside the width gate
+    /// it feeds so a test can assert the shipped geometry clears `switchAffordanceMinRowWidth`.
+    static let panelContentWidth: Double = 380
+
+    /// The roster's horizontal inset per side — each row sits inside it, so a row is this much narrower
+    /// than the panel on each edge.
+    static let rosterHorizontalInset: Double = 8
+
+    /// The width available to one roster row on the shipped fixed-width panel.
+    static var defaultRowWidth: Double { panelContentWidth - 2 * rosterHorizontalInset }
+
+    // MARK: - Swap phase copy (issue #169 — the in-flight / settled swap states)
+
+    /// The in-flight label, shown on the clicked row (or the footer Swap button) while the daemon runs
+    /// the swap. A swap is a REAL daemon-routed write, so a pending state is honest.
+    static let swapPendingText = "Switching…"
+
+    /// The success confirmation, named from the redacted ack's OWN labels — never a client guess about
+    /// what the daemon did. A no-op (`already_active`) says so plainly rather than claiming a switch.
+    static func swapDoneText(_ success: SwapSuccess) -> String {
+        switch success {
+        case .swapped(let from, let to): return "Switched \(from) → \(to)"
+        case .alreadyActive(let to):     return "\(to) is already active"
+        }
+    }
+
+    /// Human copy for a failed swap — the redacted machine verdict mapped to ONE operator-facing
+    /// sentence (never the raw kebab tag or transport jargon), actionable where there is an action. Pure:
+    /// a deterministic function of the non-secret `SwapFailure`, unit-tested in isolation.
+    ///
+    /// The two AMBIGUOUS transport outcomes — a timeout and an EOF before the ack — deliberately do NOT
+    /// say "the switch failed": the daemon writes the ack only AFTER the swap runs, so a lost ack means
+    /// the swap may well have COMMITTED. Claiming failure there would be a false negative; the copy sends
+    /// the operator to the roster (which the next `watch` snapshot settles authoritatively) instead.
+    static func swapErrorText(_ failure: SwapFailure) -> String {
+        switch failure {
+        case .rejected(let reason):
+            switch reason {
+            case .unknownTarget:    return "That account is no longer in the roster."
+            case .ambiguousTarget:  return "Two accounts share that label — rename one, then switch."
+            case .quarantined:      return "Credential is dead — run claude /login, then switch."
+            case .weeklyExhausted:  return "Weekly limit reached — that account can’t take the session yet."
+            case .cooldown:         return "Swapped too recently — try again in a moment."
+            case .noActiveAccount:  return "No active account to switch away from."
+            case .keychainLocked:   return "Keychain is locked — unlock it, then try again."
+            case .swapLockBusy:     return "The daemon is busy — try again in a moment."
+            case .failed:           return "Switch failed — try again."
+            }
+        case .daemonError(let reason):
+            // The same-user local peer should never be unauthorized; surface it plainly if it ever happens.
+            return reason == "unauthorized" ? "Not authorized to switch accounts." : "Switch failed — try again."
+        case .transport(let error):
+            switch error {
+            case .connectionRefused: return "The daemon isn’t running."
+            case .timedOut:          return "The daemon didn’t answer — check the roster before retrying."
+            case .closedBeforeAck:   return "The daemon closed the connection — check the roster before retrying."
+            case .encodeFailed, .io: return "Switch failed — try again."
+            }
+        case .undecodable:
+            return "Unexpected reply from the daemon."
+        case .unavailable:
+            return "The daemon socket is unreachable."
+        }
+    }
+
     // MARK: - Percentage cell (mirror `src/cli.rs` `pct`)
 
     /// A `0...100` percent as `N%`, or `n/a` when the last poll failed — never a fabricated `0`
