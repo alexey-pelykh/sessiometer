@@ -161,9 +161,36 @@ enum StatusPanelFormat {
     }
 
     /// The semantic tint ROLE for a health symbol. This Foundation-only namespace cannot name a SwiftUI
-    /// `Color`, so it names the ROLE; the view maps it to a system semantic color (green/yellow/orange/
-    /// red, `.secondary` for neutral) — never `Color.accentColor` (the AUTH glyph is never app-tinted, #84).
+    /// `Color`, so it names the ROLE; the view maps it (via `healthTint`) to a concrete tint — never
+    /// `Color.accentColor` (the AUTH glyph is never app-tinted, #84).
     enum HealthTint: Equatable { case green, yellow, orange, red, neutral }
+
+    /// The RESOLVED tint target for a panel role — the Foundation-only handle the SwiftUI view turns into a
+    /// concrete `Color`. `.asset` names an asset-catalog color set (#388: a theme-adaptive, contrast-safe
+    /// token carrying Any/Dark + Increased-Contrast variants, because a raw system `Color` fails WCAG
+    /// non-text/text contrast on the translucent vibrancy — system yellow ≈ 1.2:1 there); `.secondary` /
+    /// `.primary` keep the system semantic colors where contrast already passes (neutral / no-data — the
+    /// #137 "no false green").
+    enum PanelTint: Equatable {
+        case asset(String)
+        case secondary
+        case primary
+    }
+
+    /// The AUTH glyph's tint token (#388 token table). The healthy check and the warm warning tints move to
+    /// contrast-safe asset tokens (`--ok` / `--ut-a` / `--ut-o` / `--ut-r` from the design mock); `.neutral`
+    /// (unknown) stays `Color.secondary` — the #137 "no false green". `.yellow` (stale) and `.orange` (atRisk)
+    /// map to DISTINCT tokens (amber vs orange), never one collapsed amber: severity-by-warmth is a second
+    /// channel over the distinct shapes, and the `status` CLI keeps its 🟡 / 🟠 apart too (state-parity).
+    static func healthTint(_ tint: HealthTint) -> PanelTint {
+        switch tint {
+        case .green:   return .asset("HealthOK")    // mock --ok  (healthy)
+        case .yellow:  return .asset("UtilAmber")   // mock --ut-a (stale)
+        case .orange:  return .asset("UtilOrange")  // mock --ut-o (atRisk)
+        case .red:     return .asset("UtilRed")     // mock --ut-r (dead)
+        case .neutral: return .secondary            // mock --text-3 (unknown)
+        }
+    }
 
     /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a DEAD
     /// account's actionable `claude /login` cue (softened to `recovering` for a healing quarantined
@@ -336,6 +363,19 @@ enum StatusPanelFormat {
     /// downgrade are CLI-table concerns (the `ACCOUNT` cell), NOT the per-metric panel color, so the
     /// panel mirror is the three utilization bands only.
     enum UsageSeverity: Equatable { case green, yellow, red }
+
+    /// The usage %-TEXT tint token (#388). The meter percent is small text (WCAG 4.5:1), so it uses the
+    /// darker `--ut-*` TEXT family — NOT the brighter `--u-*` BAR-FILL family the meter bar keeps (a bar
+    /// is a non-text fill, 3:1, and the mock fills it with the system-bright colors). A failed poll (`nil`)
+    /// stays `.primary`: an uncolored metric, never a false "healthy" green (#137).
+    static func usageTextTint(_ severity: UsageSeverity?) -> PanelTint {
+        switch severity {
+        case .green:  return .asset("UtilGreen")   // mock --ut-g
+        case .yellow: return .asset("UtilAmber")   // mock --ut-a
+        case .red:    return .asset("UtilRed")     // mock --ut-r
+        case .none:   return .primary
+        }
+    }
 
     /// The urgency band for a utilization percent — the panel's mirror of `src/cli.rs` `util_severity`:
     /// `>= 90` Red (at/near the ~95% session swap-away trigger, #41), `>= 75` Yellow (worth watching),
