@@ -21,6 +21,14 @@ records a set of deliberate **non-decisions** — mechanisms considered and
 rejected. It lands **no code change**; it consolidates rationale that otherwise
 survives only in issue threads and `src/daemon.rs` doc-comments.
 
+> **Superseded in part by [ADR-0015](0015-reactive-refresh-unconditional-proactive-gated.md)** (2026-07-10).
+> **Decision 2** ("no auto-revive of the ACTIVE account in place") and **decision
+> 3** (the #253 exclusion "hold pending the #262 spike") — which § Negative below
+> already flagged as revisitable — are now retired: **#282** shipped in-place
+> active refresh (keep-warm), and **#262** resolved that Anthropic's endpoint
+> **rotates** the refresh token on exchange. **Decisions 1 and 4 stand**; this ADR
+> is not superseded as a whole.
+
 ## Context
 
 sessiometer keeps one live Claude Code credential active by rotating across a

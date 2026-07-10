@@ -1152,26 +1152,37 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // for the daemon's whole life, so a mid-run change silently failed EVERY refresh until a manual
     // restart. A per-cycle resolution failure is non-fatal (the sweep records an `error` event; the
     // #162 poll / #282 keep-warm paths treat the `Err` fail-safe) and retried next cycle — it never
-    // permanently disables the tick. When disabled nothing is wired and no resolution is attempted.
+    // permanently disables the tick. When `[refresh]` is disabled the PROACTIVE paths (this periodic
+    // tick + the #282 keep-warm below) are not wired; the #162 REACTIVE engine, by contrast, is
+    // ALWAYS wired (#426) so on-401 recovery of a parked account is unconditional.
     let refresh_enabled = config.refresh.enabled;
+    // Issue #426: the #162 REACTIVE refresh-then-retry is hoisted OUT of the `[refresh].enabled`
+    // gate so `poll_refresh` is ALWAYS `Some`. A usage 401 (usually a merely-expired access token)
+    // attempts one isolated refresh + re-poll BEFORE it counts toward the #42 dead-credential
+    // streak — closing the false-death window the ~10×-slower periodic sweep (#105) structurally
+    // cannot. This is a CORRECTNESS path, not proactive maintenance: without it a PARKED account
+    // whose ~8h access token expires 401-streaks into quarantine holding a still-valid refresh
+    // token (the false-🔴 the re-scope fixes). The path's #253 safety guards travel with the engine
+    // UNCHANGED by the hoist: once-per-episode (`consec_401 == 0`, no `claude -p` storm) and the
+    // active-account exclusion (`state.active != Some(i)`, token-first #207) — the isolated engine
+    // rotates the server-side token but CAS-writes only the STASH, never the live canonical, so it
+    // targets PARKED accounts only. A swap that later promotes such an account reads that SAME
+    // freshened stash (`incoming = target.stash()`) and runs strictly AFTER the reactive refresh in
+    // the single-threaded tick, so a refresh can never race a promotion into a torn canonical
+    // (ADR-0015). The `[refresh].enabled` toggle now gates ONLY the PROACTIVE maintenance below.
+    daemon = daemon.with_refresh_engine(Box::new(RealRefreshEngine::new(
+        RealAccountStash::new(),
+        config.refresh.claude_bin.clone(),
+    )));
     if refresh_enabled {
-        // Issue #162: the poll path's refresh-then-retry reuses the SAME #102 engine, so a
-        // usage 401 (usually a merely-expired access token) attempts one isolated refresh +
-        // re-poll BEFORE it counts toward the #42 dead-credential streak — closing the
-        // false-death window the ~10×-slower periodic sweep (#105) structurally cannot. Wired on
-        // the SAME switch as the periodic tick (`[refresh].enabled`); with refresh off the seam
-        // stays unset and the poll path behaves exactly as before.
-        daemon = daemon.with_refresh_engine(Box::new(RealRefreshEngine::new(
-            RealAccountStash::new(),
-            config.refresh.claude_bin.clone(),
-        )));
-        // Issue #282: the FOURTH refresh mechanism — the active account's canonical token is kept
-        // warm IN PLACE (proactively before expiry + a reactive backstop on an active 401), minted
-        // via the isolated spawn and promoted to the canonical item a live session reads. Wired on
-        // the SAME switch as the periodic tick and the #162 retry (`[refresh].enabled`), so
-        // `[refresh]` off leaves the active account lapsing at expiry exactly as before.
-        // `cadence()` (`[refresh].cadence_secs`) is the near-expiry horizon and the proactive
-        // throttle — no second config knob.
+        // Issue #282 (PROACTIVE maintenance — stays opt-in behind `[refresh].enabled`, #426): the
+        // active account's canonical token is kept warm IN PLACE (proactively before expiry + a
+        // reactive backstop on an active 401), minted via the isolated spawn and promoted to the
+        // canonical item a live session reads. UNLIKE the #162 reactive path above, this rotates
+        // the LIVE canonical token, so it stays behind the operator's opt-in: with `[refresh]` off
+        // the active account lapses at expiry and recovers via the #42 emergency swap to a live
+        // spare, exactly as before. `cadence()` (`[refresh].cadence_secs`) is the near-expiry
+        // horizon and the proactive throttle — no second config knob.
         daemon = daemon.with_keep_warm_engine(
             Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
             config.refresh.cadence(),

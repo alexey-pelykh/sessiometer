@@ -13812,6 +13812,77 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_reactive_refresh_of_a_swap_target_cannot_race_the_promotion() {
+        // Issue #426 council falsifier. The #162 reactive engine is now ALWAYS wired (hoisted out
+        // of `[refresh].enabled`), so the swap-race must be proven safe: a reactive refresh must
+        // never leave an account that is promoted to active THIS TICK holding a torn canonical.
+        // The adversarial tick does BOTH at once — reactively refresh a PARKED account on its 401
+        // AND promote that same account to active. It is safe by construction:
+        //   - the refresh fires while the target is still PARKED (`state.active != Some(i)`,
+        //     token-first #207): no live session reads its token, so the isolated engine writing
+        //     only its STASH (#253) harms nothing; and
+        //   - the swap runs STRICTLY AFTER the refresh in the single-threaded tick (`refresh_retry`
+        //     at the poll seam, THEN `decide_action`) and promotes FROM THAT SAME STASH
+        //     (`incoming = target.stash()`, read back in `record_swap`) — so the canonical a live
+        //     session reads post-swap is exactly the token the refresh left in the stash, never a
+        //     torn / stale one. There is no in-tick ordering that promotes the account FIRST and
+        //     then reactively refreshes its now-live canonical.
+        let (mut daemon, outcomes, calls) = seam_daemon(
+            Scripted::Unauthorized,    // spare (u-B): parked, its access token 401s…
+            RefreshOutcome::Refreshed, // …the isolated refresh succeeds…
+            Some(reading(0.10, 0.20)), // …reviving it to a VIABLE, below-floor swap target.
+            false,
+            3,
+        )
+        .await;
+        // work (u-A) is the ACTIVE account, carried OVER its session trigger (0.97 > 0.95) — so the
+        // very tick that revives the spare also decides to swap AWAY from work, TO the spare.
+        outcomes
+            .borrow_mut()
+            .insert("u-A".to_owned(), Scripted::Ok(reading(0.97, 0.40)));
+
+        // Tick 1 polls the active work (over trigger, but not yet warmed up → HELD). Tick 2 polls
+        // the parked spare: its 401 fires the reactive refresh (revive), and the now-warmed
+        // decision swaps work → spare in the SAME tick.
+        let _ = daemon.tick().await; // work polled → HELD (pre-warm-up)
+        let swap_tick = daemon.tick().await; // spare 401 → reactive refresh → swapped-to
+
+        assert_eq!(
+            swap_tick.action,
+            TickAction::Swapped { from: 0, to: 1 },
+            "the tick that reactively refreshes the parked spare also promotes it — the exact \
+             swap-race the falsifier stresses",
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "exactly ONE reactive refresh fired — the PARKED spare's; the active work account was \
+             never isolated-refreshed (the #253 / token-first #207 exclusion held throughout)",
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "the spare was promoted to the active account",
+        );
+        // The falsifier's core: the promoted canonical is the token the swap read from the spare's
+        // STASH — the very stash the reactive refresh owns (and, with the real engine, CAS-wrote the
+        // fresh post-rotation token to one step earlier). A torn race would leave the canonical
+        // holding work's OLD token (no promotion) or a stale value; it holds the spare's stash.
+        assert!(
+            daemon.store.read().await.unwrap().matches(&cred(b"B-token")),
+            "the canonical a live session reads holds the spare's stash token, promoted coherently \
+             AFTER the reactive refresh — never a torn write to a live credential",
+        );
+        // Cross-tick ordering: now that the spare is ACTIVE, a later 401 on it can NEVER be
+        // reactively refreshed (token-first #207 excludes the active account), so the feared
+        // swap-then-refresh-the-now-active ordering cannot arise on a subsequent tick either.
+        assert!(
+            !daemon.should_refresh_retry(1, &Err(Error::UsageUnauthorized)),
+            "the newly-promoted active account is excluded from reactive refresh going forward",
+        );
+    }
+
     /// Drive the #162 seam to exactly ONE poll-refresh firing (issue #255) and return the
     /// durable events the REFRESHING tick emitted: tick 1 polls `work` (healthy, seam inert),
     /// tick 2 is `spare`'s first 401 → [`refresh_retry`](Daemon::refresh_retry) → the
