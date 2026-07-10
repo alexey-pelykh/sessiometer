@@ -64,6 +64,11 @@ private enum PanelMetrics {
 /// resting popover keeps its "resets in" honest without a manual refresh.
 struct StatusPanelView: View {
     @EnvironmentObject private var store: WatchStatusStore
+    /// The capture affordance's model (issue #360), observed here for its `captureSurfaceRequested` flag
+    /// (issue #394): when the operator picks the status-item "Add account…" menu item, the panel presents
+    /// the capture surface over whatever state it is in, reusing the panel's own key/first-responder
+    /// plumbing. (`CaptureAffordance` reads the same model as its own `@EnvironmentObject`.)
+    @EnvironmentObject private var capture: AccountCaptureModel
 
     /// How often the resting panel re-derives clock-relative text (reset-in). A minute is finer than
     /// the reset-in's own minute granularity, so the displayed value never visibly lags the clock.
@@ -109,54 +114,75 @@ struct StatusPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             PanelHeader(subtitle: subtitle)
 
-            switch state {
-            case .emptyRoster:
-                // A live onboarding state, not stale data — distinct from daemon-down.
+            if capture.captureSurfaceRequested {
+                // The status-item "Add account…" capture surface (issue #394) — a focused capture card
+                // hosted in THIS panel (reusing its key/first-responder plumbing), reached only from the
+                // right-click menu now that the populated panel carries no persistent capture bar. The
+                // header above stays, so its honest state sub-line still governs; a capture attempt over a
+                // degraded daemon surfaces its own honest error through the affordance, never a false ok.
                 Divider().padding(.horizontal, 14)
-                OnboardingCard()
+                CaptureCard(title: "Add account")
                     .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+            } else {
+                stateBody(state: state, now: now, ageText: ageText, ageStale: ageStale)
+            }
+        }
+    }
 
-            case .connecting, .unsupported:
-                // No retained reading — a plain honest message (the reference's centered message card
-                // for these states, with its distinct per-state glyph, is #169).
-                Divider().padding(.horizontal, 14)
-                BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
-                    .padding(.horizontal, 14).padding(.vertical, 14)
+    /// The panel's normal, connection-state-driven body (roster / banner / onboarding card) plus the
+    /// snapshot-age footer — everything below the header when the operator has NOT summoned the #394
+    /// capture surface. A populated (`.connected` / `.stale`) roster carries NO capture bar: capture is
+    /// an empty-roster / first-run onboarding affordance, and adding an account otherwise lives off-panel
+    /// in the status-item right-click menu (issue #394; matches the re-locked mock, #387).
+    @ViewBuilder
+    private func stateBody(state: ConnectionState, now: Int64, ageText: String?, ageStale: Bool) -> some View {
+        switch state {
+        case .emptyRoster:
+            // A live onboarding state, not stale data — distinct from daemon-down.
+            Divider().padding(.horizontal, 14)
+            CaptureCard(title: "Capture your first account")
+                .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
 
-            case .disconnected:
-                // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
-                // frozen-as-live (#137). No swap callout / add-account (swaps are paused while dropped),
-                // and the roster rows are NOT switchable: a retained last-known row is not a live target,
-                // and a click over a dead socket would be a dead click (#169's honest-affordance rule).
-                HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
-                                                             ageText: ageText, ageStale: ageStale))
-                if !store.rows.isEmpty {
-                    RosterView(rows: store.rows, now: now, switchable: false).opacity(0.55)
-                }
+        case .connecting, .unsupported:
+            // No retained reading — a plain honest message (the reference's centered message card
+            // for these states, with its distinct per-state glyph, is #169).
+            Divider().padding(.horizontal, 14)
+            BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
+                .padding(.horizontal, 14).padding(.vertical, 14)
 
-            case .connected, .stale:
-                // Live (or connected-but-stale — the roster stays full-strength, the header/footer carry
-                // the "stale" mark). The full design reference: roster, swap-callout hero, add-account.
-                // The roster is switchable exactly where the swap-callout card renders, so the panel's two
-                // swap paths (per-row manual, footer recommendation) are live and dead together (#169).
-                Divider().padding(.horizontal, 14)
-                if !store.rows.isEmpty {
-                    RosterView(rows: store.rows, now: now, switchable: true)
-                }
-                if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
-                    SwapCalloutCard(target: target,
-                                    reason: StatusPanelFormat.swapCalloutReason(store.nextSwap))
-                }
-                SwapStatusLine()
-                AddAccountRow()
+        case .disconnected:
+            // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
+            // frozen-as-live (#137). No swap callout (swaps are paused while dropped), and the roster
+            // rows are NOT switchable: a retained last-known row is not a live target, and a click over
+            // a dead socket would be a dead click (#169's honest-affordance rule).
+            HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
+                                                         ageText: ageText, ageStale: ageStale))
+            if !store.rows.isEmpty {
+                RosterView(rows: store.rows, now: now, switchable: false).opacity(0.55)
             }
 
-            if let ageText {
-                // Freshness reads amber whenever the numbers should be distrusted — a wedged-but-
-                // heartbeating poll loop (ageStale) OR any non-live connection (stale / disconnected)
-                // showing a last-known reading — never a frozen-as-fresh green (#137).
-                FooterView(text: ageText, stale: ageStale || !state.isHealthy)
+        case .connected, .stale:
+            // Live (or connected-but-stale — the roster stays full-strength, the header/footer carry the
+            // "stale" mark). The design reference: roster + swap-callout hero. The roster is switchable
+            // exactly where the swap-callout card renders, so the panel's two swap paths (per-row manual,
+            // footer recommendation) are live and dead together (#169). No capture bar — capture moved to
+            // the status-item menu / empty-roster onboarding (issue #394).
+            Divider().padding(.horizontal, 14)
+            if !store.rows.isEmpty {
+                RosterView(rows: store.rows, now: now, switchable: true)
             }
+            if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
+                SwapCalloutCard(target: target,
+                                reason: StatusPanelFormat.swapCalloutReason(store.nextSwap))
+            }
+            SwapStatusLine()
+        }
+
+        if let ageText {
+            // Freshness reads amber whenever the numbers should be distrusted — a wedged-but-
+            // heartbeating poll loop (ageStale) OR any non-live connection (stale / disconnected)
+            // showing a last-known reading — never a frozen-as-fresh green (#137).
+            FooterView(text: ageText, stale: ageStale || !state.isHealthy)
         }
     }
 }
@@ -882,33 +908,35 @@ private struct SwapStatusLine: View {
 }
 
 /// The in-app capture affordance (issue #360) — a "Capture active account" button + an inline operator-
-/// label field, SHARED by the populated add-account row and the empty-roster onboarding card. It sends
-/// `{"cmd":"capture","label":…}` over the #358 control-command transport (via `AccountCaptureModel`) and
-/// renders the redacted ack's idle → pending → done → error phase. It NEVER inserts the captured row —
-/// that arrives on its own via the `watch` snapshot (issue #360 AC); on success the affordance just
-/// returns to idle. The client still originates NO credential (C-005 held): a verb + non-secret label out,
-/// a redacted ack back.
+/// label field, hosted by BOTH capture surfaces: the empty-roster / first-run onboarding card and the
+/// status-item "Add account…" menu surface (issue #394). It sends `{"cmd":"capture","label":…}` over the
+/// #358 control-command transport (via `AccountCaptureModel`) and renders the redacted ack's
+/// idle → pending → done → error phase. It NEVER inserts the captured row — that arrives on its own via the
+/// `watch` snapshot (issue #360 AC); on success the affordance just returns to idle. The client still
+/// originates NO credential (C-005 held): a verb + non-secret label out, a redacted ack back.
 ///
 /// Capture snapshots the account currently logged into Claude Code — it is NOT an account picker. To add a
 /// DIFFERENT account the operator runs `claude /login` first, then captures (the honest scope boundary,
-/// surfaced as the onboarding secondary hint). An already-active-and-rostered account is an idempotent
-/// refresh.
+/// surfaced as the secondary hint). An already-active-and-rostered account is an idempotent refresh.
 private struct CaptureAffordance: View {
-    /// Onboarding uses the prominent, stacked treatment (the first-run hero); the populated add-row uses
-    /// the compact inline one.
-    enum Style { case onboarding, addRow }
-    let style: Style
-
     @EnvironmentObject private var capture: AccountCaptureModel
     @State private var label = ""
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
-        Group {
-            switch style {
-            case .onboarding: onboarding
-            case .addRow:     addRow
+        // The prominent, stacked treatment — the field, the primary Capture button, the status line, then
+        // the scope hint. Both capture surfaces (#360 onboarding, #394 menu) use this one treatment.
+        VStack(alignment: .leading, spacing: 9) {
+            field
+            HStack(spacing: 8) {
+                button
+                Spacer(minLength: 0)
             }
+            status
+            Text("To add a different account, run claude /login first, then capture.")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         // Bridge the field's focus to the model — the panel-retain predicate (`isBusy`) gates the outside-
         // click dismiss on it, and focusing re-asserts the panel key so keystrokes land (issue #360).
@@ -939,7 +967,7 @@ private struct CaptureAffordance: View {
 
     /// The "Capture active account" button — the primary action; disabled and spinner-labelled while
     /// pending (a real pending state is honest now that capture is a real daemon-routed action).
-    private func button(prominent: Bool) -> some View {
+    private var button: some View {
         Button(action: submit) {
             if capture.phase.isPending {
                 HStack(spacing: 5) {
@@ -950,8 +978,9 @@ private struct CaptureAffordance: View {
                 Label("Capture active account", systemImage: "rectangle.badge.plus")
             }
         }
-        .font(.system(size: 12, weight: prominent ? .semibold : .regular))
+        .font(.system(size: 12, weight: .semibold))
         .controlSize(.small)
+        .buttonStyle(.borderedProminent)
         .disabled(capture.phase.isPending)
         .accessibilityLabel(capture.phase.isPending ? "Capturing the active account"
                                                      : "Capture the active account")
@@ -978,34 +1007,6 @@ private struct CaptureAffordance: View {
         }
     }
 
-    /// The prominent, stacked treatment for the first-run onboarding card.
-    private var onboarding: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            field
-            HStack(spacing: 8) {
-                button(prominent: true).buttonStyle(.borderedProminent)
-                Spacer(minLength: 0)
-            }
-            status
-            Text("To add a different account, run claude /login first, then capture.")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    /// The compact inline treatment beneath the populated roster.
-    private var addRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                field
-                button(prominent: false).buttonStyle(.bordered)
-            }
-            status
-        }
-        .padding(.horizontal, 12).padding(.top, 5).padding(.bottom, 3)
-    }
-
     /// Submit a capture of the currently-active account under the field's label (blank → the daemon derives
     /// the handle). The model owns the pending → done / failed transitions.
     private func submit() {
@@ -1014,33 +1015,29 @@ private struct CaptureAffordance: View {
     }
 }
 
-/// The always-on "Add account" row (issue #360) — the populated-roster capture affordance: the same
-/// "Capture active account" button + label field as the onboarding card, always available beneath the
-/// roster. Replaces the pre-#360 copy-command; the captured row arrives via the `watch` snapshot.
-private struct AddAccountRow: View {
-    var body: some View {
-        CaptureAffordance(style: .addRow)
-    }
-}
+// MARK: - Capture card
 
-// MARK: - Empty-roster onboarding
+/// The capture card — an explanatory title + line, plus the shared `CaptureAffordance`. Its TWO entry
+/// points differ only in `title`: the empty-roster / first-run onboarding state (issue #326 / #360:
+/// "Capture your first account", visually distinct from daemon-down) and the status-item "Add account…"
+/// menu surface (issue #394: "Add account", the populated-panel path now that the persistent capture bar
+/// is gone). The capture mechanics + honest pending → done → error are identical either way — the affordance
+/// sends the command over the #358 transport and renders the redacted ack; the captured row then arrives on
+/// its own via the `watch` snapshot (the app still originates no credential — a verb + label out, a redacted
+/// ack back).
+private struct CaptureCard: View {
+    let title: String
 
-/// The first-run onboarding card (issue #326 / #360): visually distinct from daemon-down, it explains the
-/// empty roster and offers the in-app capture affordance — a "Capture active account" button + label field
-/// that sends the capture command over the #358 transport and renders pending → done → error. The captured
-/// row then arrives on its own via the `watch` snapshot (the app still originates no credential — a verb +
-/// label out, a redacted ack back).
-private struct OnboardingCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("Capture your first account")
+            Text(title)
                 .font(.subheadline.weight(.semibold))
             Text("Capture the account you’re signed into — the daemon adds it to the roster and starts tracking it here.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            CaptureAffordance(style: .onboarding)
+            CaptureAffordance()
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)

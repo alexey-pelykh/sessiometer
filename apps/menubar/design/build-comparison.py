@@ -59,8 +59,8 @@ STATES = [
               "ago” footer mirrors the <code>status</code> CLI (R-2), not the mock’s illustrative "
               "“snapshot 12s old”; resets no longer diverge either — the mock now uses the CLI’s "
               "duration form too (“2h14m” / “3d”), and its usage meters carry the CLI’s 75/90 bands. "
-              "Conversely the panel still renders a capture bar here: the mock now specs capture on "
-              "first-run only, with Add account off-panel (#394 relocates it)."),
+              "Capture is now reconciled too: the populated panel carries no capture bar, matching the "
+              "mock — capture is empty-roster / first-run only, with Add account in the status-item menu (#394)."),
     dict(title="1 · Healthy — Status (dark)", theme="dark", design=1, capture="panel-healthy-dark.png",
          note="Same state, dark appearance — system semantic colours, not the mock’s hex."),
     dict(title="2 · Connecting / daemon-starting", theme="light", design=4, capture="panel-connecting-light.png",
