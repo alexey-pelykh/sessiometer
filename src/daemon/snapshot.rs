@@ -6,7 +6,7 @@
 //!
 //! [`StatusSnapshot`] is the daemon's per-cycle reading set; [`status_response`] projects it
 //! into the [`StatusResponse`] wire reply — handles + percentages + the `next_swap` candidate,
-//! never a token or email (the #15 discipline). [`credential_health`] is the pure 4-state
+//! never a token or email (the #15 discipline). [`credential_health`] is the pure 5-state
 //! rollup the display snapshot and the transition-event diff share. Each item is re-exported
 //! under `crate::daemon::*`, so relocating them is source-compatible for every existing consumer
 //! (cli / poke / use_account) and for the in-module test suite (`mod tests`' `use super::*`).
@@ -84,9 +84,9 @@ pub(crate) struct AccountReading {
     /// Whether the account is in the rotation (issue #36) — surfaced so `status`
     /// can mark a parked account. A disabled account is shown but never swapped to.
     pub(crate) enabled: bool,
-    /// Whether the account is QUARANTINED — its credential is dead and needs a
-    /// re-login (issue #42). The durable "needs re-login" status `status` surfaces;
-    /// non-secret (a plain flag on the account's handle).
+    /// Whether the account is QUARANTINED — its stored ACCESS token was rejected (a #42
+    /// 401-streak), so it is out of rotation. NON-TERMINAL (issue #427): the remedy is a
+    /// refresh (`poke`), not necessarily a re-login. Non-secret (a plain flag on the handle).
     pub(crate) quarantined: bool,
     /// Whether a quarantined account is mid-RECOVERY — its credential is currently
     /// answering again (`quarantined && recovery_successes > 0`), climbing toward the
@@ -112,7 +112,7 @@ pub(crate) struct AccountReading {
     /// The non-secret refresh-health inputs (issue #119), or `None` until a refresh has been
     /// observed. The rollup's at-risk / dead inputs plus the `--json` durability signal.
     pub(crate) refresh_health: Option<RefreshHealth>,
-    /// The daemon-computed 4-state credential-health rollup (issue #119) — the verdict the
+    /// The daemon-computed 5-state credential-health rollup (issue #119) — the verdict the
     /// thin `status` client projects to a glyph. Computed in [`Daemon::snapshot`] from this
     /// account's health state and the wall clock.
     pub(crate) health: CredentialHealth,
@@ -219,9 +219,10 @@ pub(crate) struct AccountStatusLine {
     /// Whether the account is in the rotation (issue #36); `false` for a parked
     /// account, which `status` marks. Non-secret — a plain flag.
     pub(crate) enabled: bool,
-    /// Whether the account is QUARANTINED — its credential is dead and needs a
-    /// re-login (issue #42). The durable "needs re-login" status; `false` for a
-    /// healthy account. Non-secret — a plain flag.
+    /// Whether the account is QUARANTINED — its stored ACCESS token was rejected (a #42
+    /// 401-streak), so it is out of rotation. NON-TERMINAL — the remedy is a refresh, not
+    /// necessarily a re-login (issue #427); `false` for a healthy account. Non-secret — a
+    /// plain flag.
     pub(crate) quarantined: bool,
     /// Whether a quarantined account is mid-RECOVERY — its credential is answering
     /// again and climbing toward un-quarantine (issue #109). Refines `quarantined`
@@ -270,7 +271,7 @@ pub(crate) struct AccountStatusLine {
     /// a pre-#119 daemon omits it → `None`.
     #[serde(default)]
     pub(crate) refresh_health: Option<RefreshHealth>,
-    /// The daemon-computed 4-state credential-auth rollup (issue #119): the verdict the
+    /// The daemon-computed 5-state credential-auth rollup (issue #119): the verdict the
     /// thin read-only client projects to a glyph (🟢/🟡/🟠/🔴/⚪) under the `AUTH` column.
     /// Serialized on the `--json` wire as **`auth`** (issue #143 — the field reports the
     /// credential-AUTH standing, not a vague "health"; renamed while pre-release, no stable

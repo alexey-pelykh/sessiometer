@@ -294,8 +294,8 @@ async fn poke_named<E: PokeEngine, N: RestoreNotifier>(
         });
     }
     let report = engine.refresh(account).await?;
-    let dead = daemon_marks_dead(daemon_status, &account.label);
-    let restore = resolve_restore(account, &report, dead, notifier).await;
+    let quarantined = daemon_marks_quarantined(daemon_status, &account.label);
+    let restore = resolve_restore(account, &report, quarantined, notifier).await;
     println!(
         "{}",
         poke_line(&account.label, &poke_outcome(&report, restore))
@@ -340,8 +340,8 @@ async fn poke_all<E: PokeEngine, N: RestoreNotifier>(
             // re-stashed refresh of a quarantined one ALSO clears its quarantine via the
             // #275 signal (#428), so a swept account recovers exactly as a named poke does.
             Ok(report) => {
-                let dead = daemon_marks_dead(daemon_status, &account.label);
-                let restore = resolve_restore(account, &report, dead, notifier).await;
+                let quarantined = daemon_marks_quarantined(daemon_status, &account.label);
+                let restore = resolve_restore(account, &report, quarantined, notifier).await;
                 poke_outcome(&report, restore)
             }
             // Secret-free: every `Error` Display is redaction-safe (issue #15).
@@ -384,16 +384,21 @@ fn outcome_label(report: &RefreshReport) -> &'static str {
 }
 
 /// Whether a completed cycle warrants clearing the daemon quarantine (issue #428): the
-/// daemon currently marks the account dead (`dead_per_daemon`, resolved by
-/// [`daemon_marks_dead`]) AND the cycle produced a fresh, re-stashed token — the exact
+/// daemon currently has the account OUT OF ROTATION (`quarantined_per_daemon`, resolved by
+/// [`daemon_marks_quarantined`] — a `Degraded` access-token 401-streak (issue #427) or a
+/// proven-`Dead` verdict (#261)) AND the cycle produced a fresh, re-stashed token — the exact
 /// condition that used to merely PRINT a "still dead" stall (#163), now the trigger to
 /// actually un-quarantine via the `#275 Restored` signal so the daemon re-polls through the
 /// fresh stash. A `no change` / `dead` / not-re-stashed cycle is NOT a proven refresh (the
 /// refresh token was never exercised, was cleared, or its fresh result was discarded by a
-/// concurrent change), so it never fires — a genuinely dead credential still points at
-/// `claude /login`.
-fn should_restore(report: &RefreshReport, dead_per_daemon: bool) -> bool {
-    dead_per_daemon && matches!(report.outcome, RefreshOutcome::Refreshed) && report.re_stashed
+/// concurrent change), so it never fires: a `Degraded` account whose refresh SUCCEEDS recovers
+/// here (the fix for issue #427 — its refresh token was always valid), while a genuinely dead
+/// credential — whose refresh returns `dead`, not `Refreshed` — is filtered out and still
+/// points at `claude /login`.
+fn should_restore(report: &RefreshReport, quarantined_per_daemon: bool) -> bool {
+    quarantined_per_daemon
+        && matches!(report.outcome, RefreshOutcome::Refreshed)
+        && report.re_stashed
 }
 
 /// What the issue-#428 quarantine-clear attempt did for a completed cycle — threaded into
@@ -402,8 +407,8 @@ fn should_restore(report: &RefreshReport, dead_per_daemon: bool) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Restore {
     /// No attempt: the cycle did not warrant one ([`should_restore`] false) — not
-    /// daemon-dead, or no fresh re-stashed token to re-poll through. The line carries the
-    /// cycle's own plain classification.
+    /// daemon-quarantined, or no fresh re-stashed token to re-poll through. The line carries
+    /// the cycle's own plain classification.
     Skipped,
     /// The `restored` signal was DELIVERED: the daemon un-quarantines and re-polls through
     /// the fresh stash, so the account recovers on the next tick — no re-login needed.
@@ -423,10 +428,10 @@ enum Restore {
 async fn resolve_restore<N: RestoreNotifier>(
     account: &Account,
     report: &RefreshReport,
-    dead_per_daemon: bool,
+    quarantined_per_daemon: bool,
     notifier: &N,
 ) -> Restore {
-    if !should_restore(report, dead_per_daemon) {
+    if !should_restore(report, quarantined_per_daemon) {
         return Restore::Skipped;
     }
     match notifier.send_restored(&account.account_uuid).await {
@@ -476,17 +481,21 @@ fn poke_line(label: &str, outcome: &str) -> String {
     format!("{label}: {outcome}")
 }
 
-/// Whether the daemon's snapshot currently marks `label`'s account DEAD — the exact
-/// verdict `status` projects to 🔴 (mirrors `cli::health_cell`): a current daemon's 4-state
-/// rollup (`health == Some(Dead)`, issue #119/#137), or — a pre-#119 daemon that sent no
-/// rollup (`health == None`) — its legacy `quarantined` flag (#42).
+/// Whether the daemon's snapshot currently has `label`'s account OUT OF ROTATION
+/// (quarantined) — the verdicts `status` projects to an action cue (mirrors `cli::health_cell`):
+/// a current daemon's rollup reading `Degraded` (an access-token 401-streak, issue #427) or
+/// `Dead` (a refresh proved the credential unrecoverable, #261), or — a pre-#119 daemon that
+/// sent no rollup (`health == None`) — its legacy `quarantined` flag (#42). Both modern states
+/// are quarantine states the #428 restore may clear; the `Refreshed && re_stashed` gate in
+/// [`should_restore`] then decides which actually recover (a Degraded account's refresh
+/// succeeds and clears; a Dead one's refresh returns `dead` and stays put — see there).
 ///
 /// A `None` snapshot (no daemon reachable) or a `label` absent from the snapshot is NOT
-/// dead: an indeterminate verdict `poke` reports with its plain wording (#163 AC-3), never a
-/// fabricated daemon-state claim. Matching is by label — the only account handle the wire
-/// [`AccountStatusLine`] carries (issue #15: never the uuid or email) — the same key `status`
-/// renders by; a renamed/stale label simply misses and degrades to the plain wording.
-fn daemon_marks_dead(daemon_status: Option<&StatusResponse>, label: &str) -> bool {
+/// quarantined: an indeterminate verdict `poke` reports with its plain wording (#163 AC-3),
+/// never a fabricated daemon-state claim. Matching is by label — the only account handle the
+/// wire [`AccountStatusLine`] carries (issue #15: never the uuid or email) — the same key
+/// `status` renders by; a renamed/stale label simply misses and degrades to the plain wording.
+fn daemon_marks_quarantined(daemon_status: Option<&StatusResponse>, label: &str) -> bool {
     let Some(status) = daemon_status else {
         return false;
     };
@@ -494,17 +503,18 @@ fn daemon_marks_dead(daemon_status: Option<&StatusResponse>, label: &str) -> boo
         .accounts
         .iter()
         .find(|line| line.label == label)
-        .is_some_and(line_is_dead)
+        .is_some_and(line_is_quarantined)
 }
 
-/// Resolve ONE status line's dead-ness the same way `status` does (`cli::health_cell`): the
-/// daemon's 4-state rollup when present (`health == Some(Dead)`), else — a pre-#119 daemon
-/// that sent no rollup (`health == None`) — the legacy `quarantined` flag, so an old daemon
-/// reads correctly rather than as a defaulted-healthy line over a dead account. `Healthy` /
-/// `Unknown` / `Stale` / `AtRisk` are all NOT dead (poke keeps the plain wording for them).
-fn line_is_dead(line: &AccountStatusLine) -> bool {
+/// Resolve ONE status line's quarantine the same way `status` does (`cli::health_cell`): the
+/// daemon's rollup when present — `Degraded` (a 401-streak, issue #427) and `Dead` (a proven
+/// refresh death, #261) are both out of rotation — else, a pre-#119 daemon that sent no rollup
+/// (`health == None`), the legacy `quarantined` flag, so an old daemon reads correctly rather
+/// than as a defaulted-healthy line over a quarantined account. `Healthy` / `Unknown` /
+/// `Stale` / `AtRisk` are all still IN rotation (poke keeps the plain wording for them).
+fn line_is_quarantined(line: &AccountStatusLine) -> bool {
     match line.health {
-        Some(health) => health == CredentialHealth::Dead,
+        Some(health) => matches!(health, CredentialHealth::Degraded | CredentialHealth::Dead),
         None => line.quarantined,
     }
 }
@@ -570,7 +580,7 @@ mod tests {
     }
 
     /// One daemon `status` line for `label`, carrying only the fields poke's #163 verdict
-    /// reads: the 4-state rollup (`health`) and the pre-#119 legacy `quarantined` flag.
+    /// reads: the 5-state rollup (`health`) and the pre-#119 legacy `quarantined` flag.
     /// Everything else is a benign default — poke never inspects it.
     fn status_line(
         label: &str,
@@ -771,80 +781,89 @@ mod tests {
     // --- #163 daemon-verdict resolution (pure) ------------------------------
 
     #[test]
-    fn line_is_dead_reads_the_rollup_then_the_legacy_flag() {
-        // A current daemon: the 4-state rollup is authoritative — only `Dead` is dead.
-        assert!(line_is_dead(&status_line(
+    fn line_is_quarantined_reads_the_rollup_then_the_legacy_flag() {
+        // A current daemon: the rollup is authoritative — `Degraded` (401-streak, #427) and
+        // `Dead` (proven death, #261) are both out of rotation; the rest are in rotation.
+        assert!(line_is_quarantined(&status_line(
+            "a",
+            Some(CredentialHealth::Degraded),
+            false
+        )));
+        assert!(line_is_quarantined(&status_line(
             "a",
             Some(CredentialHealth::Dead),
             false
         )));
-        assert!(!line_is_dead(&status_line(
+        assert!(!line_is_quarantined(&status_line(
             "a",
             Some(CredentialHealth::Healthy),
             false
         )));
-        assert!(!line_is_dead(&status_line(
+        assert!(!line_is_quarantined(&status_line(
             "a",
             Some(CredentialHealth::Unknown),
             false
         )));
-        assert!(!line_is_dead(&status_line(
+        assert!(!line_is_quarantined(&status_line(
             "a",
             Some(CredentialHealth::Stale),
             false
         )));
-        assert!(!line_is_dead(&status_line(
+        assert!(!line_is_quarantined(&status_line(
             "a",
             Some(CredentialHealth::AtRisk),
             false
         )));
-        // The rollup WINS when present: `Dead` is dead even with the raw `quarantined`
-        // flag unset (a refresh-cleared-in-place credential, #119), and `Healthy` is NOT
-        // dead even if a stale `quarantined` flag lingers — poke reads exactly what
-        // `status` renders.
-        assert!(line_is_dead(&status_line(
+        // The rollup WINS when present: a quarantine verdict holds even with the raw
+        // `quarantined` flag unset (a refresh-cleared-in-place credential, #119), and
+        // `Healthy` is NOT quarantined even if a stale `quarantined` flag lingers — poke
+        // reads exactly what `status` renders.
+        assert!(line_is_quarantined(&status_line(
             "a",
-            Some(CredentialHealth::Dead),
+            Some(CredentialHealth::Degraded),
             false
         )));
-        assert!(!line_is_dead(&status_line(
+        assert!(!line_is_quarantined(&status_line(
             "a",
             Some(CredentialHealth::Healthy),
             true
         )));
         // A pre-#119 daemon (no rollup): fall back to the legacy `quarantined` flag.
-        assert!(line_is_dead(&status_line("a", None, true)));
-        assert!(!line_is_dead(&status_line("a", None, false)));
+        assert!(line_is_quarantined(&status_line("a", None, true)));
+        assert!(!line_is_quarantined(&status_line("a", None, false)));
     }
 
     #[test]
-    fn daemon_marks_dead_reads_the_named_line_or_degrades_to_not_dead() {
+    fn daemon_marks_quarantined_reads_the_named_line_or_degrades_to_not_quarantined() {
         let snap = status_snapshot(vec![
-            status_line("work", Some(CredentialHealth::Dead), false),
+            status_line("work", Some(CredentialHealth::Degraded), false),
+            status_line("gone", Some(CredentialHealth::Dead), false),
             status_line("spare", Some(CredentialHealth::Healthy), false),
         ]);
-        // Each account's OWN verdict is read, by label.
-        assert!(daemon_marks_dead(Some(&snap), "work"));
-        assert!(!daemon_marks_dead(Some(&snap), "spare"));
-        // No daemon reachable (None) → indeterminate → not dead (plain wording, AC-3).
-        assert!(!daemon_marks_dead(None, "work"));
-        // A label the daemon does not list → indeterminate → not dead.
-        assert!(!daemon_marks_dead(Some(&snap), "ghost"));
+        // Each account's OWN verdict is read, by label — a Degraded 401-streak (#427) and a
+        // proven-Dead credential (#261) are both quarantined; a Healthy one is not.
+        assert!(daemon_marks_quarantined(Some(&snap), "work"));
+        assert!(daemon_marks_quarantined(Some(&snap), "gone"));
+        assert!(!daemon_marks_quarantined(Some(&snap), "spare"));
+        // No daemon reachable (None) → indeterminate → not quarantined (plain wording, AC-3).
+        assert!(!daemon_marks_quarantined(None, "work"));
+        // A label the daemon does not list → indeterminate → not quarantined.
+        assert!(!daemon_marks_quarantined(Some(&snap), "ghost"));
     }
 
     #[test]
-    fn should_restore_only_on_a_dead_verdict_plus_a_restashed_refresh() {
-        // The one firing case (issue #428): daemon-dead + a fresh, re-stashed token.
+    fn should_restore_only_on_a_quarantined_verdict_plus_a_restashed_refresh() {
+        // The one firing case (issue #428): daemon-quarantined + a fresh, re-stashed token.
         assert!(should_restore(
             &report(RefreshOutcome::Refreshed, true),
             true
         ));
-        // Same cycle, but the daemon does NOT mark it dead → nothing to clear.
+        // Same cycle, but the daemon does NOT mark it quarantined → nothing to clear.
         assert!(!should_restore(
             &report(RefreshOutcome::Refreshed, true),
             false
         ));
-        // A dead verdict, but the cycle did not PROVE the refresh token, so it never fires:
+        // A quarantined verdict, but the cycle did not PROVE the refresh token, so it never fires:
         // - a refresh a concurrent change kept from re-stashing (no fresh stash to re-poll),
         assert!(!should_restore(
             &report(RefreshOutcome::Refreshed, false),
@@ -925,7 +944,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_dead(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), "work"),
             &notifier,
         )
         .await;
@@ -940,6 +959,46 @@ mod tests {
         assert!(line.contains("cleared the daemon quarantine"));
         assert!(!line.contains("claude /login"), "no spurious re-login cue");
         assert!(!line.contains("sweep"), "no vacuous refresh-sweep promise");
+    }
+
+    #[tokio::test]
+    async fn degraded_account_restashed_refresh_clears_the_quarantine() {
+        // Issue #427 regression lock: a parked account the daemon marks `Degraded` — its
+        // ACCESS token 401-streaked into quarantine, but the REFRESH token is still valid —
+        // is refreshed + re-stashed by poke → the #275 restored signal fires and the
+        // quarantine clears. This is the exact remedy `status`'s 🟠 "run 'sessiometer poke'"
+        // cue advertises. Before #427 folded a bare 401-streak into `Degraded`, this state
+        // rendered `Dead` and the restore union already covered it; the rename MUST keep it
+        // covered, or poke would re-stash a fresh token yet strand the account quarantined.
+        let snap = status_snapshot(vec![status_line(
+            "work",
+            Some(CredentialHealth::Degraded),
+            false,
+        )]);
+        let account = acct("work", "u-A");
+        let report = report(RefreshOutcome::Refreshed, true);
+        let notifier = FakeRestoreNotifier::new();
+        let restore = resolve_restore(
+            &account,
+            &report,
+            daemon_marks_quarantined(Some(&snap), "work"),
+            &notifier,
+        )
+        .await;
+        assert_eq!(
+            restore,
+            Restore::Cleared,
+            "a refreshable 401-streak recovers"
+        );
+        assert_eq!(
+            notifier.sent(),
+            vec!["u-A"],
+            "the account's uuid was signalled"
+        );
+        let line = poke_outcome(&report, restore);
+        assert_ne!(line, "refreshed", "must NOT be the misleading bare wording");
+        assert!(line.contains("cleared the daemon quarantine"));
+        assert!(!line.contains("claude /login"), "no spurious re-login cue");
     }
 
     #[tokio::test]
@@ -958,7 +1017,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_dead(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), "work"),
             &notifier,
         )
         .await;
@@ -984,7 +1043,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_dead(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), "work"),
             &notifier,
         )
         .await;
@@ -1005,7 +1064,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &refreshed,
-            daemon_marks_dead(None, "work"),
+            daemon_marks_quarantined(None, "work"),
             &notifier,
         )
         .await;
@@ -1023,7 +1082,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &refreshed,
-            daemon_marks_dead(Some(&unknown), "work"),
+            daemon_marks_quarantined(Some(&unknown), "work"),
             &notifier,
         )
         .await;
@@ -1047,7 +1106,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_dead(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), "work"),
             &notifier,
         )
         .await;

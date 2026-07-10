@@ -9,7 +9,7 @@
 // this file did not format, so the parity tests in `StatusPanelFormatTests` gate the whole panel.
 //
 // Source of truth mirrored — do NOT re-derive (grep the symbols, they move):
-//   * `src/cli.rs` `health_glyph`      → `healthGlyph`      (the 4+1-state emoji rollup)
+//   * `src/cli.rs` `health_glyph`      → `healthGlyph`      (the 5+1-state emoji rollup)
 //   * `src/cli.rs` `health_cell`       → `authCell`         (glyph + `claude /login` / `recovering` cue + `disabled`)
 //   * `src/cli.rs` `legacy_health_tags`→ `legacyHealthTags` (the pre-#119 auth-nil fallback)
 //   * `src/cli.rs` `reset_cell`        → `resetCell`        (one window's "resets in", or `n/a`)
@@ -91,7 +91,9 @@ enum StatusPanelFormat {
     /// `enabled` is NOT a gate: `swap_command_verdict` does not read it. A parked account (issue #36) is
     /// out of the AUTO rotation, not un-switchable — the CLI's `use <account>` reaches it too.
     enum SwitchBlock: Equatable {
-        /// The credential is dead (issue #42) — the daemon refuses without `force`.
+        /// The credential is quarantined (issue #42) — its access token was rejected, so the
+        /// daemon refuses without `force`. NOT proven dead: a `sessiometer poke` may refresh
+        /// it (issue #427).
         case quarantined
         /// The weekly window is exhausted (issue #11/#37) — the daemon refuses without `force`.
         case weeklyExhausted
@@ -144,7 +146,7 @@ enum StatusPanelFormat {
     /// (a `dimmed` trait alone never tells the operator WHY).
     static func switchBlockedText(_ block: SwitchBlock) -> String {
         switch block {
-        case .quarantined:     return "Can’t switch — credential is dead. Run claude /login."
+        case .quarantined:     return "Can’t switch — credential is quarantined. Run sessiometer poke to refresh it."
         case .weeklyExhausted: return "Can’t switch — weekly limit reached."
         }
     }
@@ -230,7 +232,7 @@ enum StatusPanelFormat {
             switch reason {
             case .unknownTarget:    return "That account is no longer in the roster."
             case .ambiguousTarget:  return "Two accounts share that label — rename one, then switch."
-            case .quarantined:      return "Credential is dead — run claude /login, then switch."
+            case .quarantined:      return "Credential is quarantined — run sessiometer poke to refresh, then switch."
             case .weeklyExhausted:  return "Weekly limit reached — that account can’t take the session yet."
             case .cooldown:         return "Swapped too recently — try again in a moment."
             case .noActiveAccount:  return "No active account to switch away from."

@@ -261,7 +261,9 @@ struct SwapTarget {
 enum Viability {
     /// Below the weekly trigger — a sound destination.
     Viable,
-    /// The stored credential is dead (`401`/`403`) — quarantined / needs re-login (#42).
+    /// The stored ACCESS token was rejected (`401`/`403`) — quarantined / out of rotation
+    /// (#42). NOT proven dead: a 401 never sees the refresh token, so the remedy is a
+    /// refresh (`sessiometer poke`), not a re-login (issue #427).
     Quarantined,
     /// At/above the weekly trigger — the weekly window is exhausted (#11/#37).
     WeeklyExhausted,
@@ -288,7 +290,8 @@ enum Refusal {
     WeeklyExhausted,
     /// A swap cooldown is currently active.
     Cooldown,
-    /// The target is quarantined (dead credential).
+    /// The target is quarantined (its access token was rejected — out of rotation, but
+    /// not proven dead; issue #427).
     Quarantined,
 }
 
@@ -468,10 +471,13 @@ fn warn_weekly_exhausted(label: &str) -> String {
     format!("warning: forcing onto `{label}`, whose weekly window is exhausted")
 }
 
-/// The `--force` warning for forcing onto a quarantined (dead-credential) target.
-/// Names only the non-secret handle.
+/// The `--force` warning for forcing onto a quarantined target — its ACCESS token was
+/// rejected, so it is out of rotation, but a refresh (`sessiometer poke`) may revive it;
+/// it is NOT proven dead (issue #427). Names only the non-secret handle.
 fn warn_quarantined(label: &str) -> String {
-    format!("warning: forcing onto `{label}`, which is quarantined and needs re-login")
+    format!(
+        "warning: forcing onto `{label}`, which is quarantined (out of rotation — a `sessiometer poke` may refresh it)"
+    )
 }
 
 /// The `from` handle logged / printed for an adopt-target recovery (issue #212) when

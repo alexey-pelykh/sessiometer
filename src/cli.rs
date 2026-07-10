@@ -1958,7 +1958,7 @@ pub(crate) fn render_status(
         ),
     ];
     if rows.iter().any(|row| !row.status.is_empty()) {
-        // The AUTH column carries the credential-auth state — the 4-state+Unknown glyph
+        // The AUTH column carries the credential-auth state — the 5-state+Unknown glyph
         // (issue #119/#137) plus its cues (`claude /login` on 🔴, `recovering`, `disabled`);
         // it is never tinted (issue #84) — the glyph is self-coloring and the tags are their
         // own signal, so its severity getter is always `None`. Its header is `AUTH` (issue
@@ -2119,8 +2119,8 @@ fn render_snapshot_age(generated_at: i64, now: i64) -> String {
 
 /// The issue-#138 signal: ≥1 NON-ACTIVE account carries a non-healthy / unverified credential
 /// rollup, so its stored credential may be lapsing while the refresh tick is off. Keys off the
-/// daemon's 4-state rollup (`Some(h)`, a #119+ daemon): any of Unknown ⚪ / Stale 🟡 / AtRisk 🟠 /
-/// Dead 🔴 counts; Healthy 🟢 and a pre-#119 `None` (no rollup to judge) do not. The ACTIVE
+/// daemon's 5-state rollup (`Some(h)`, a #119+ daemon): any of Unknown ⚪ / Stale 🟡 / AtRisk 🟠 /
+/// Degraded 🟠 / Dead 🔴 counts; Healthy 🟢 and a pre-#119 `None` (no rollup to judge) do not. The ACTIVE
 /// account is excluded — the live daemon maintains it via the poll path (#162), so it is never
 /// the stale-fallback concern this advisory is about.
 fn has_stale_nonactive(response: &StatusResponse) -> bool {
@@ -2267,7 +2267,7 @@ fn health_cell(account: &AccountStatusLine) -> String {
     cell
 }
 
-/// The emoji glyph for a 4-state rollup verdict (issue #119). Self-coloring (the glyph is
+/// The emoji glyph for a 5-state rollup verdict (issue #119). Self-coloring (the glyph is
 /// content, not an ANSI overlay), so it conveys state even under `--no-color` and through a
 /// pipe; `display_width` already measures each as two terminal cells (emoji-presentation
 /// glyphs, per `unicode-width`), so the table stays aligned.
@@ -4124,7 +4124,7 @@ spare  22222222-2222\n\
         assert!(!out.to_lowercase().contains("token"));
     }
 
-    // --- status: 4-state credential-health rollup (issue #119) --------------
+    // --- status: 5-state credential-health rollup (issue #119) --------------
 
     #[test]
     fn health_cell_projects_each_rollup_state_to_a_glyph_with_an_actionable_cue() {
@@ -4182,7 +4182,7 @@ spare  22222222-2222\n\
 
     #[test]
     fn render_status_shows_the_health_glyph_per_account_and_the_dead_login_cue() {
-        // AC-1 end-to-end: a 4-state glyph per account, the credential-dead one showing 🔴 with
+        // AC-1 end-to-end: a 5-state glyph per account, the credential-dead one showing 🔴 with
         // the `claude /login` cue, and the wide emoji (two terminal cells) keeping the table
         // aligned. The healthy account is also USAGE-EXHAUSTED (maxed session + weekly, weekly
         // blocked) — yet still 🟢, because the rollup is credential health, ORTHOGONAL to usage:

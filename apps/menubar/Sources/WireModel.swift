@@ -15,7 +15,7 @@
 //     frozen contract).
 //   * `src/daemon/socket.rs` — `SnapshotFrame` / `HeartbeatFrame` encoders and
 //     `parse_watch_frame` (the reference decoder this file mirrors), issue #165.
-//   * `src/observability.rs` — `CredentialHealth` (the 4+1 state rollup).
+//   * `src/observability.rs` — `CredentialHealth` (the 5+1 state rollup).
 //
 // The wire is FLAT: the daemon `#[serde(flatten)]`s the payload into the envelope, so a
 // snapshot line is `{"type":"snapshot","schema_version":…,"generated_at":…,"accounts":…,
@@ -235,7 +235,7 @@ struct AccountStatusLine: Decodable, Equatable {
     let accessExpiresAt: Int64?
     /// The non-secret refresh-health inputs (issue #119); `nil` until a refresh is observed.
     let refreshHealth: RefreshHealth?
-    /// The 4+1-state credential-auth rollup (issue #119), wire key `auth`; `nil` for a pre-#119
+    /// The 5+1-state credential-auth rollup (issue #119), wire key `auth`; `nil` for a pre-#119
     /// daemon (the client then falls back to the quarantine flag rather than a defaulted value).
     let auth: CredentialHealth?
 

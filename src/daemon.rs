@@ -1014,14 +1014,14 @@ pub(crate) struct AccountHealth {
     /// Consecutive non-scope 401s on this account's stored token. Incremented on a
     /// 401, reset to 0 on ANY non-401 outcome (success, 403, transient, locked). The
     /// `consecutive=` field of a `monitor_401` event while still healthy; reaching
-    /// `monitor_401_n` declares the account DEAD ([`quarantined`](Self::quarantined)).
+    /// `monitor_401_n` QUARANTINES the account ([`quarantined`](Self::quarantined)).
     consec_401: u32,
-    /// Whether this account is QUARANTINED — its credential is dead (rejected
-    /// `monitor_401_n` times in a row), so the daemon stops polling and selecting it
-    /// for the rotation until the operator re-logs-in. The durable "needs re-login"
-    /// status surfaced by `status` (issue #42), and the edge that fires the
-    /// [`Event::CredentialDead`] / [`Event::CredentialRestored`] signals exactly once
-    /// per transition.
+    /// Whether this account is QUARANTINED — its stored ACCESS token was rejected
+    /// (`monitor_401_n` 401s in a row), so the daemon stops polling and selecting it for
+    /// the rotation until it recovers. NON-TERMINAL (issue #427): the remedy is a refresh
+    /// (`poke` / a restart), not necessarily a re-login — a modern `status` surfaces it as
+    /// the `Degraded` rollup (issue #42). The edge that fires the [`Event::CredentialDead`]
+    /// / [`Event::CredentialRestored`] signals exactly once per transition.
     quarantined: bool,
     /// Consecutive successful recovery probes on a quarantined account that recovers
     /// WITHOUT a re-login (issue #42). A re-login un-quarantines on the spot (the #13
@@ -3615,7 +3615,7 @@ where
         expires_at_ms.map(millis_to_secs)
     }
 
-    /// Recompute every account's 4-state credential-health rollup (issue #119) against
+    /// Recompute every account's 5-state credential-health rollup (issue #119) against
     /// `now_secs` and emit one [`Event::CredentialHealth`] per account whose verdict CHANGED
     /// since the last call — the edge-triggered health timeline the issue's AC-3 requires
     /// ("exactly one redacted event per transition"). The very first computation per account
@@ -3690,7 +3690,7 @@ where
                         weekly_exhausted: readings[i]
                             .is_some_and(|usage| usage.weekly >= self.weekly_trigger_base),
                         usage: readings[i],
-                        // The credential clocks + the daemon-computed 4-state rollup (issue
+                        // The credential clocks + the daemon-computed 5-state rollup (issue
                         // #119), projected from this account's carried health state. The
                         // rollup is computed HERE (daemon-side) against `now_secs`; the thin
                         // client just renders the verdict's glyph + the raw clocks. The wire
