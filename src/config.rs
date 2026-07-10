@@ -245,8 +245,9 @@ pub(crate) struct Tunables {
     #[allow(dead_code)]
     pub(crate) cooldown_secs: u64,
     /// Default-on swap-target session reserve (issue #398): only swap *to* an
-    /// account whose session usage is below this percent (`0..=session_trigger`),
-    /// so a freshly-swapped target keeps runway before the next poll. Always
+    /// account whose session usage is below this percent (`1..=session_trigger`; an
+    /// explicit `0` admits no target and is rejected), so a freshly-swapped target
+    /// keeps runway before the next poll. Always
     /// valued — an absent key means [`DEFAULT_SESSION_FLOOR`], not "off" (this
     /// supersedes #10's opt-in `Option`). To loosen it, raise toward
     /// `session_trigger` (equal is inert); the always-on session gate
@@ -1043,15 +1044,31 @@ impl Config {
         // (#417 — without the clamp a `session_trigger < 80` config loads with an
         // unchecked floor of 80 and then bricks after a render→parse round-trip, since
         // #398 renders the default as a live line; `floor == trigger` is inert per
-        // ADR-0013). When present, its lower bound is 0 and its upper bound is
+        // ADR-0013). When present, its lower bound is 1 (an explicit 0 admits no
+        // target, silently disabling proactive swapping) and its upper bound is
         // session_trigger (a higher floor could never admit a target), the latter a
         // distinct cross-field error.
         let session_floor = match t.session_floor {
             None => DEFAULT_SESSION_FLOOR.min(t.session_trigger as u8),
             Some(floor) => {
+                if floor == 0 {
+                    // The swap predicate is `usage.session < floor`, so a floor of 0
+                    // admits NO account and silently disables proactive swapping (the
+                    // daemon just holds). Because the name reads backwards (higher is
+                    // MORE permissive), 0 is the natural wrong guess for "no
+                    // restriction" — reject it with the remedy spelled out, rather than
+                    // let a live, hand-editable line brick swapping in silence.
+                    return Err(Error::ConfigInvalid(format!(
+                        "session_floor = 0 admits no swap target and silently disables \
+                         proactive swapping; it must be in 1..={}. To make the floor \
+                         more permissive, raise it toward session_trigger (higher admits \
+                         more targets), not lower it.",
+                        t.session_trigger
+                    )));
+                }
                 if floor < 0 {
                     return Err(Error::ConfigInvalid(format!(
-                        "session_floor must be in 0..={}, got {floor}",
+                        "session_floor must be in 1..={}, got {floor}",
                         t.session_trigger
                     )));
                 }
@@ -1301,9 +1318,10 @@ impl Config {
         out.push_str(&format!("cooldown_secs = {}\n", t.cooldown_secs));
         out.push_str(
             "# Only swap TO an account whose session usage is below this percent\n\
-             # (0..=session_trigger): a candidate must be at most this full to receive the\n\
+             # (1..=session_trigger): a candidate must be at most this full to receive the\n\
              # active session. This is NOT the level that triggers a swap. Default-on\n\
-             # (#398): to loosen, raise toward session_trigger (equal is inert).\n",
+             # (#398): to loosen, raise toward session_trigger (equal is inert). 0 is\n\
+             # rejected — it admits no target and would disable proactive swapping.\n",
         );
         out.push_str(&format!("session_floor = {}\n", t.session_floor));
         out.push_str(
@@ -2117,6 +2135,36 @@ label = "personal"
     }
 
     #[test]
+    fn rejects_zero_floor_naming_the_consequence() {
+        // #414: session_floor = 0 makes the swap predicate `usage.session < 0` admit no
+        // account, so proactive swapping is silently disabled and the daemon just holds.
+        // Since #398 made session_floor a live, hand-editable line, 0 is the natural
+        // (wrong) guess for "no restriction" — the exact opposite. validate must reject it
+        // with a message that names the consequence AND points at the remedy (raise the
+        // floor toward session_trigger, since the name reads backwards).
+        let toml = with_tunables("session_floor = 0\nsession_trigger = 90");
+        match Config::parse(&toml) {
+            Err(Error::ConfigInvalid(msg)) => assert!(
+                msg.contains("disables proactive swapping") && msg.contains("session_trigger"),
+                "rejection must name the consequence and the remedy, got: {msg}"
+            ),
+            Ok(_) => panic!("session_floor = 0 must be rejected, not accepted"),
+            Err(e) => panic!("session_floor = 0 must be ConfigInvalid, got: {e}"),
+        }
+
+        // The reject is precisely 0, not "any low floor": 1 is the valid lower edge and
+        // still parses (inert-but-valid — admits only accounts at 0% session).
+        let one = Config::parse(&with_tunables("session_floor = 1\nsession_trigger = 90"))
+            .expect("session_floor = 1 is the valid lower bound and must parse");
+        assert_eq!(one.tunables.session_floor, 1);
+
+        // …and the absent-key default path (#417 clamp) is untouched by the reject: an
+        // absent session_floor still yields the default-on reserve, never 0.
+        let absent = Config::parse(&with_tunables("session_trigger = 90")).unwrap();
+        assert_eq!(absent.tunables.session_floor, DEFAULT_SESSION_FLOOR);
+    }
+
+    #[test]
     fn session_floor_defaults_to_80_when_absent() {
         // #398: an absent session_floor takes the default-on reserve (80), even when
         // other tunables are set…
@@ -2926,10 +2974,11 @@ label = "personal"
 
     #[test]
     fn accepts_inclusive_bounds() {
-        // Each bound's edge is valid: trigger 50/99, floor == trigger, poll 5/3600,
-        // cooldown 5/3600 (5 = the non-zero floor, #272), monitor 1/20.
+        // Each bound's edge is valid: trigger 50/99, floor 1 (the non-zero lower bound;
+        // 0 admits no target) and floor == trigger, poll 5/3600, cooldown 5/3600 (5 =
+        // the non-zero floor, #272), monitor 1/20.
         for fragment in [
-            "session_trigger = 50\nsession_floor = 0",
+            "session_trigger = 50\nsession_floor = 1",
             "session_trigger = 99\nsession_floor = 99", // floor == trigger is allowed
             "weekly_trigger = 50",
             "weekly_trigger = 99",
