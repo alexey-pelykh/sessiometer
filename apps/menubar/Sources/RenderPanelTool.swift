@@ -77,12 +77,15 @@ enum RenderPanelTool {
             for scheme in [ColorScheme.light, .dark] {
                 let theme = scheme == .light ? "light" : "dark"
                 let name = "panel-\(fixture.name)-\(theme).png"
-                // The panel's capture affordance (#360) reads an `AccountCaptureModel` from the environment,
-                // and its swap affordance (#169) an `AccountSwapModel`; inject nil-client preview instances so
-                // the populated-roster capture bar (and the onboarding card) render idle instead of trapping on
-                // a missing environment object. A nil client renders the idle field/button and never touches a
-                // socket — the label field itself stays a known ImageRenderer blank (see design/README.md).
-                // (Absent since #360/#372 added the dependency.) The swap model renders at `.idle`, so the
+                // `StatusPanelView` reads an `AccountCaptureModel` from the environment (its top-level
+                // `captureSurfaceRequested` gate, #394, plus the empty-roster onboarding card's affordance,
+                // #360) and its swap affordance (#169) an `AccountSwapModel`; inject nil-client preview
+                // instances so every fixture resolves both instead of trapping on a missing environment
+                // object. The capture model renders at `.idle` with `captureSurfaceRequested == false`, so
+                // the populated fixtures show the roster with NO capture bar (capture is off-panel / empty-
+                // roster only now, #394) and the empty-roster fixture shows the onboarding card. A nil client
+                // renders the idle field/button and never touches a socket — the label field itself stays a
+                // known ImageRenderer blank (see design/README.md). The swap model renders at `.idle`, so the
                 // fixtures capture the RESTING row (no hover, no pending) — the hover-revealed switch glyph is
                 // not reachable from `ImageRenderer` and stays a manual-check surface (#380).
                 let view = StatusPanelView()

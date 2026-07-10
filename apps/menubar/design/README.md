@@ -59,18 +59,19 @@ which is the mock). Light shown here:
   affordance the mock does not spec, so the #169 body is its reference; at rest the row keeps a
   trailing action slot for it, which is why the auth glyph sits ~27 pt further left than in the mock
 - no Status/Stats segmented control — Stats has no socket data path (spike #356)
-- the panel still renders the capture bar on a **populated** roster; the mock now specs capture on
-  **empty-roster / first-run only**, with Add account moved off-panel. The panel-side relocation is
-  #394 — until it lands, a capture bar in `panel-healthy-*.png` is expected, not a defect
+
+(Capture placement is now reconciled with the mock, not a difference: the **populated** panel carries
+no capture bar — capture is **empty-roster / first-run only**, and Add account lives off-panel in the
+status-item right-click menu (#394). So `panel-healthy-*.png` correctly shows no capture bar.)
 
 **Harness limitation — the capture field is NOT verified by the tool.** SwiftUI `ImageRenderer`
 cannot rasterize the AppKit-backed `TextField` in the #360 capture affordance (the operator-label
-input on the empty-roster / first-run onboarding state — and, until #394 relocates it, the panel's
-Add-account bar): it draws a blank placeholder box, not the real field. So `--render-panel`
-faithfully captures every state's layout, color, and typography **except** that one label field — it
-needs a manual check against the mock in a real popover (first run — or the panel's Add-account bar,
-which the mock no longer specs). Treat a blank/placeholder capture-field box in the PNGs as a known
-tool artifact, not a panel defect.
+input on the empty-roster / first-run onboarding card): it draws a blank placeholder box, not the
+real field. So `--render-panel` faithfully captures every state's layout, color, and typography
+**except** that one label field — it needs a manual check against the mock in a real popover (first
+run). The status-item "Add account…" capture surface (#394) is a menu-triggered panel mode this tool
+does not render at all, so it is likewise a manual real-popover check. Treat a blank/placeholder
+capture-field box in the PNGs as a known tool artifact, not a panel defect.
 
 **Harness limitation — HOVER states are NOT captured.** `ImageRenderer` draws one resting frame, so
 the #169 per-row manual switch (its revealed `arrow.left.arrow.right` glyph, the `nosign` on a

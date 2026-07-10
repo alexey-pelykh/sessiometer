@@ -164,25 +164,41 @@ final class StatusItemController {
         }
     }
 
-    /// The secondary-click lifecycle menu. Today it carries only "Quit Sessiometer" — a pure-CLIENT
-    /// control that terminates the menu-bar app itself (`NSApp.terminate`, which runs the clean
-    /// `applicationWillTerminate` transport-stop path); it does NOT touch the daemon, whose
-    /// quit/restart lifecycle is #170. It is a right-click menu rather than a panel button so the
-    /// status panel stays a pure display + manual-swap surface (design C-005 IA scope guard), and is
-    /// the natural future home for the other runtime controls (#170 daemon quit/restart,
-    /// launch-at-login). Shown via a TRANSIENT `statusItem.menu` so AppKit positions and highlights
-    /// it natively under the item, then cleared so the primary click keeps toggling the panel.
+    /// The secondary-click menu — the OFF-PANEL home for cold-path actions, so the status panel stays a
+    /// pure display + manual-swap surface (design C-005 IA scope guard). It carries "Add account…" (issue
+    /// #394 — the capture entry point now that the populated panel has no persistent capture bar; capture
+    /// is a rare, deliberate action, neither display nor swap, so it belongs here) and "Quit Sessiometer"
+    /// (a pure-CLIENT control that terminates the menu-bar app via `NSApp.terminate`, the clean
+    /// `applicationWillTerminate` transport-stop path; it does NOT touch the daemon, whose quit/restart
+    /// lifecycle is #170). It is the natural future home for the other runtime controls (#170 daemon
+    /// quit/restart, launch-at-login). Shown via a TRANSIENT `statusItem.menu` so AppKit positions and
+    /// highlights it natively under the item, then cleared so the primary click keeps toggling the panel
+    /// (setting `statusItem.menu` permanently would hijack the primary click, #325/#326).
     private func showLifecycleMenu() {
         // Close the panel first if it is open: the click-outside global monitor never sees our own
         // status-item events, so without this a secondary click would leave the panel lingering.
         if panel.isVisible { closePanel() }
         let menu = NSMenu()
+        let addItem = NSMenuItem(title: "Add account…", action: #selector(addAccount), keyEquivalent: "")
+        addItem.target = self
+        menu.addItem(addItem)
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit Sessiometer", action: #selector(quit), keyEquivalent: "")
         quitItem.target = self
         menu.addItem(quitItem)
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
+    }
+
+    /// Open the capture surface from the "Add account…" menu item (issue #394). Sets the model flag the
+    /// panel observes, then opens (and keys) the panel — the capture surface then renders IN this panel,
+    /// reusing its key/first-responder plumbing (`captureModel.panelKeyRequest` + the label-field focus
+    /// bridge), not a second popover / window / alert. `closePanel` resets the flag, so this mode never
+    /// outlives the panel: a later primary click opens the normal roster.
+    @objc private func addAccount() {
+        captureModel.requestCaptureSurface()
+        openPanel()
     }
 
     /// Quit the menu-bar app (a pure-client control). The daemon keeps running — its lifecycle is #170.
@@ -235,6 +251,11 @@ final class StatusItemController {
 
     private func closePanel() {
         panel.orderOut(nil)
+        // Reset the #394 capture surface on every close path (toggle, secondary-click, outside-click) so a
+        // menu-summoned "Add account…" mode never outlives the panel — the next primary click opens the
+        // normal roster. A no-op when the surface was not requested; releases the outside-click retain
+        // predicate (a no-op while a capture is in flight, which runs to completion).
+        captureModel.dismissCaptureSurface()
         if let monitor = dismissMonitor {
             NSEvent.removeMonitor(monitor)
             dismissMonitor = nil

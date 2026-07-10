@@ -81,6 +81,16 @@ final class AccountCaptureModel: ObservableObject {
     /// accidental click outside (issue #360 AC).
     @Published private(set) var isEditing = false
 
+    /// Whether the operator explicitly asked to add an account from the status-item right-click menu
+    /// (issue #394). When true, the panel presents the capture surface OVER a populated roster — the only
+    /// populated-panel path to capture now that the persistent add-account bar is gone (capture inline is
+    /// empty-roster / first-run only). The capture surface REUSES the panel's own key/first-responder
+    /// plumbing (this model's `panelKeyRequest`, the label-field focus bridge) rather than a second popover
+    /// / window / alert, so the nonactivating-panel first-responder problem the panel already solved is not
+    /// re-opened. Reset when the panel is dismissed (`dismissCaptureSurface`), so a subsequent left-click
+    /// opens the normal roster, never a lingering capture surface.
+    @Published private(set) var captureSurfaceRequested = false
+
     /// Re-assert the host panel as key window. A non-activating `FloatingPanel` can lose key when focus
     /// moves, leaving the SwiftUI `TextField` unable to accept keystrokes; the controller injects
     /// `{ panel.makeKey() }` here, invoked when the field takes focus. A plain closure so this model names
@@ -111,6 +121,23 @@ final class AccountCaptureModel: ObservableObject {
         guard !phase.isPending else { return }
         isEditing = false
         phase = .idle
+    }
+
+    /// Present the capture surface in the panel — the status-item "Add account…" menu path (issue #394).
+    /// Sets the flag the panel observes; the controller opens (and keys) the panel alongside, and the label
+    /// field's focus bridge re-asserts key when it takes focus, so keystrokes land through the SAME plumbing
+    /// the empty-roster onboarding field already uses.
+    func requestCaptureSurface() {
+        captureSurfaceRequested = true
+    }
+
+    /// Dismiss the capture surface back to the normal panel (called on every panel close). Clears the flag
+    /// so the next open shows the roster, and releases the outside-click retain predicate via `cancelEditing`
+    /// (a no-op while a capture is in flight — that runs to completion; the flag still clears so a reopened
+    /// panel shows the roster while the capture settles in the background and its row arrives via `watch`).
+    func dismissCaptureSurface() {
+        captureSurfaceRequested = false
+        cancelEditing()
     }
 
     /// Submit a capture of the currently-active account under `rawLabel` (trimmed; blank → label-less, so

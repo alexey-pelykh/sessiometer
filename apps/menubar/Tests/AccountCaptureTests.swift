@@ -285,6 +285,62 @@ final class AccountCaptureTests: XCTestCase {
         XCTAssertEqual(model.phase, .idle)
     }
 
+    // MARK: - AccountCaptureModel: the #394 capture-surface presentation flag
+
+    // "Add account…" (the status-item menu path) requests the capture surface; the panel observes the flag
+    // and presents the capture card over the populated roster.
+    @MainActor
+    func testRequestCaptureSurfaceSetsFlag() {
+        let model = AccountCaptureModel(client: nil)
+        XCTAssertFalse(model.captureSurfaceRequested)
+        model.requestCaptureSurface()
+        XCTAssertTrue(model.captureSurfaceRequested)
+    }
+
+    // Every panel close dismisses the surface, so a menu-summoned capture mode never outlives the panel —
+    // the next open shows the normal roster.
+    @MainActor
+    func testDismissCaptureSurfaceClearsFlag() {
+        let model = AccountCaptureModel(client: nil)
+        model.requestCaptureSurface()
+        model.dismissCaptureSurface()
+        XCTAssertFalse(model.captureSurfaceRequested)
+    }
+
+    // Dismissing the surface also releases the outside-click retain predicate: a focused-but-idle field
+    // left `isEditing == true` would otherwise stick `isBusy` on the reopened roster panel.
+    @MainActor
+    func testDismissCaptureSurfaceReleasesEditingRetain() {
+        let model = AccountCaptureModel(client: nil)
+        model.requestCaptureSurface()
+        model.setEditing(true)
+        XCTAssertTrue(model.isBusy)
+        model.dismissCaptureSurface()
+        XCTAssertFalse(model.isBusy, "the reopened roster panel is dismissible again")
+        XCTAssertEqual(model.phase, .idle)
+    }
+
+    // A dismiss while a capture is in flight clears the surface flag but leaves the pending capture to run
+    // to completion (its row still arrives via the watch snapshot) — never a torn-off in-flight write.
+    @MainActor
+    func testDismissCaptureSurfaceLeavesInFlightCaptureRunning() async throws {
+        let conn = GatedCaptureConnection(ack: #"{"result":"captured","label":"work"}"#)
+        let model = AccountCaptureModel(
+            client: ControlCommandClient(connector: OneShotConnector(connection: conn), timeout: .seconds(10)))
+        model.requestCaptureSurface()
+
+        let task = Task { await model.capture(rawLabel: "work") }
+        try await waitUntil({ model.phase.isPending }, "pending")
+
+        model.dismissCaptureSurface()
+        XCTAssertFalse(model.captureSurfaceRequested, "the surface flag clears immediately")
+        XCTAssertTrue(model.phase.isPending, "but the in-flight capture is NOT cancelled")
+
+        conn.release()
+        await task.value
+        XCTAssertEqual(model.phase, .done(label: "work"), "the capture ran to completion")
+    }
+
     // MARK: - Helpers
 
     private func encode(_ command: CaptureCommand) throws -> String {
