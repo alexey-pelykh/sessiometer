@@ -233,7 +233,7 @@ impl KeepWarmTrigger {
     }
 }
 
-/// The 4-state per-account CREDENTIAL-health rollup `status` surfaces (issue #119): the
+/// The 5-state per-account CREDENTIAL-health rollup `status` surfaces (issue #119): the
 /// daemon-computed verdict the thin read-only `status` client just projects to a glyph
 /// (🟢/🟡/🟠/🔴). Lives HERE — the base observability module, with no `daemon`
 /// dependency — so the [`Event::CredentialHealth`] transition event can name it without
@@ -638,7 +638,7 @@ pub(crate) enum Event {
     /// two-edge idiom at the refresh-MECHANISM scope. No fields — a daemon-global recovery with
     /// nothing account-specific to carry (#15).
     RefreshSystemicRecovered,
-    /// `account`'s 4-state credential-health rollup (issue #119) TRANSITIONED to `state`
+    /// `account`'s 5-state credential-health rollup (issue #119) TRANSITIONED to `state`
     /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
     /// the state holds), so the event log carries the per-account health timeline. The
     /// daemon computes the rollup ([`crate::daemon`]) and diffs it across cycles; the
@@ -1206,7 +1206,7 @@ pub(crate) fn last_swap_at(path: &std::path::Path) -> Option<SystemTime> {
 /// account HANDLE — the daemon-INDEPENDENT read the offline `list` view (issue #120)
 /// surfaces alongside each account's stored-token expiry.
 ///
-/// The `status` view computes its 4-state rollup live in the daemon (issue #119); when
+/// The `status` view computes its 5-state rollup live in the daemon (issue #119); when
 /// the daemon is down — often exactly when a wedged credential needs inspecting — that
 /// path is unavailable, so `list` reads the durable record the refresh sweep already
 /// wrote: each [`Event::Refresh`] line (`event=refresh account={handle} outcome={token}`,

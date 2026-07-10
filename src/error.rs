@@ -398,11 +398,13 @@ pub(crate) enum Error {
     UseCooldownActive,
 
     /// The pre-swap gate REFUSED `use <label>` (without `--force`) because the
-    /// target is QUARANTINED — its stored credential is dead and needs a re-login
-    /// (issue #42 viability). ZERO writes; `--force` overrides (warn-and-proceed).
-    /// `label` is the target's non-secret handle.
+    /// target is QUARANTINED — its stored ACCESS token was rejected (`401`/`403`), so
+    /// it is out of rotation. NOT proven dead: a resource-server 401 never sees the
+    /// refresh token, so the remedy is a refresh (`sessiometer poke`), not a re-login
+    /// (issue #427). ZERO writes; `--force` overrides (warn-and-proceed). `label` is
+    /// the target's non-secret handle.
     #[error(
-        "refusing to swap to `{label}`: it is quarantined and needs re-login — use `--force` to override"
+        "refusing to swap to `{label}`: it is quarantined (out of rotation) — run `sessiometer poke` to refresh, or `--force` to override"
     )]
     UseTargetQuarantined { label: String },
 

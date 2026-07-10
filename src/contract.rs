@@ -114,7 +114,7 @@ pub(crate) struct SweepOutcome {
 /// One account's credential-clock observation from a sweep (issue #119): the stored
 /// access-token expiry the sweep read, plus — only when the account was actually
 /// refreshed this cycle — the refresh-health delta. The daemon folds these into its
-/// per-account health state ([`crate::daemon`]) for the `status` 4-state rollup; every
+/// per-account health state ([`crate::daemon`]) for the `status` 5-state rollup; every
 /// field is non-secret (a timestamp, a classification, a boolean — never a token / email).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RefreshObservation {

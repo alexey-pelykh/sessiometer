@@ -327,7 +327,10 @@ final class AccountSwapTests: XCTestCase {
         let quarantined = StatusPanelFormat.switchBlockedText(.quarantined)
         let weekly = StatusPanelFormat.switchBlockedText(.weeklyExhausted)
         XCTAssertNotEqual(quarantined, weekly)
-        XCTAssertTrue(quarantined.contains("claude /login"), "a dead credential names its remedy")
+        XCTAssertTrue(quarantined.contains("sessiometer poke"),
+                      "a quarantined credential names its refresh remedy (issue #427)")
+        XCTAssertFalse(quarantined.contains("claude /login"),
+                       "a refreshable quarantine must NOT tell the operator to re-login (issue #427)")
         for text in [quarantined, weekly] {
             XCTAssertFalse(text.isEmpty)
             XCTAssertFalse(text.contains("weekly-exhausted"), "never the raw machine tag: \(text)")
