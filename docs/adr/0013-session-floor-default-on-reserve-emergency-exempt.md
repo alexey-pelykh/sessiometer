@@ -33,8 +33,8 @@ has room to work before it trips its own trigger.
 **The name reads backwards.** A *higher* `session_floor` is *more permissive* — it is a
 **ceiling on the target's usage**, not a minimum. `session_floor == session_trigger` is
 inert (the floor then admits exactly what the always-on gate already admits). A rename
-(e.g. `target_max_usage`) is tracked separately; this ADR does not perform it, because
-the key is operator-visible in every rendered `config.toml`.
+(e.g. `target_max_usage`) is tracked separately as **#415**; this ADR does not perform
+it, because the key is operator-visible in every rendered `config.toml`.
 
 **Why it was turned off (#10).** The original code hardcoded `DEFAULT_SESSION_FLOOR =
 80`. Issue #10 ("Swap cooldown / anti-oscillation") removed it, making the floor opt-in
@@ -209,7 +209,7 @@ the proactive path and is DROPPED entirely on the emergency path — shipped ato
 - **The name still reads backwards.** `session_floor` is a ceiling on the target's usage;
   higher is more permissive. Documented in the rendered comment, the README, and here.
   Not renamed: the key is operator-visible in every existing `config.toml`, so a rename
-  is a migration, tracked separately.
+  is a migration (ADR-0006), tracked separately as **#415**.
 - **ADR-0005's `session_floor` illustration is now stale.** ADR-0005 (§ Context) cites
   the floor as an example of a *commented-out opt-in line* — `# session_floor =
   <session_trigger>` — embedding another field's value. `render()` now emits a live
@@ -225,7 +225,9 @@ the proactive path and is DROPPED entirely on the emergency path — shipped ato
   dead active + all-live-weekly-exhausted still returns `ActiveDeadNoTarget` — **open**,
   a follow-up decision, not blocking). **#401** (`config show --origin` — the
   effective-vs-on-disk observability this change makes more valuable). **#402**
-  (absent-section defaults are silent). Prior art: **#11** (the all-exhausted terminal
+  (absent-section defaults are silent). Follow-ups this ADR spawned: **#414** (the
+  `session_floor = 0` footgun — the strict predicate disables proactive swapping, and
+  `validate` permits it), **#415** (rename the backwards-reading key). Prior art: **#11** (the all-exhausted terminal
   state this event describes), **#15** (diagnostics secret-free by construction — the
   `SwapReason` enum reuse), **#37** (soonest-weekly-reset target ranking), **#42**
   (dead-vs-exhausted model), **#36** (disabled-account exclusion), **#88**
