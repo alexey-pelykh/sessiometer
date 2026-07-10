@@ -111,6 +111,40 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(names.count, 5)
     }
 
+    // MARK: - Tint tokens (#388 — role → contrast-safe asset-catalog token; the load-bearing warning fix)
+
+    func testHealthTintMapsEachRoleToItsContrastSafeToken() {
+        // The #388 token table: the healthy check + the warm warning tints move to asset-catalog color sets
+        // (the view resolves `.asset(name)` → `Color(name)`). Unknown stays `.secondary` — the #137 no-false-green.
+        XCTAssertEqual(StatusPanelFormat.healthTint(.green),   .asset("HealthOK"))
+        XCTAssertEqual(StatusPanelFormat.healthTint(.yellow),  .asset("UtilAmber"))
+        XCTAssertEqual(StatusPanelFormat.healthTint(.orange),  .asset("UtilOrange"))
+        XCTAssertEqual(StatusPanelFormat.healthTint(.red),     .asset("UtilRed"))
+        XCTAssertEqual(StatusPanelFormat.healthTint(.neutral), .secondary)
+    }
+
+    func testStaleAndAtRiskGlyphTintsStayDistinct() {
+        // #388: severity-by-warmth is a second channel on top of the distinct shapes; the two warning states
+        // must NOT collapse to one amber (the `status` CLI keeps 🟡 / 🟠 apart too — cross-surface parity).
+        XCTAssertNotEqual(StatusPanelFormat.healthTint(.yellow), StatusPanelFormat.healthTint(.orange))
+    }
+
+    func testUsageTextTintUsesTheDarkerTextTokenFamily() {
+        // The %-TEXT (small text, WCAG 4.5:1) takes the darker `--ut-*` tokens; a failed poll stays
+        // `.primary` — an uncolored metric, never a false "healthy" green (#137).
+        XCTAssertEqual(StatusPanelFormat.usageTextTint(.green),  .asset("UtilGreen"))
+        XCTAssertEqual(StatusPanelFormat.usageTextTint(.yellow), .asset("UtilAmber"))
+        XCTAssertEqual(StatusPanelFormat.usageTextTint(.red),    .asset("UtilRed"))
+        XCTAssertEqual(StatusPanelFormat.usageTextTint(nil),     .primary)
+    }
+
+    func testWarningTextAndGlyphShareOneTokenSource() {
+        // #388 widened charter — the %-text warning and the stale/dead glyph express the SAME warning
+        // semantic, so they resolve to the SAME token: one semantic source, not two ambers/reds that drift.
+        XCTAssertEqual(StatusPanelFormat.usageTextTint(.yellow), StatusPanelFormat.healthTint(.yellow))
+        XCTAssertEqual(StatusPanelFormat.usageTextTint(.red),    StatusPanelFormat.healthTint(.red))
+    }
+
     // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
 
     func testAuthCellMirrorsHealthCell() {

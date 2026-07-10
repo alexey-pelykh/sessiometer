@@ -75,8 +75,14 @@ enum RenderPanelTool {
             for scheme in [ColorScheme.light, .dark] {
                 let theme = scheme == .light ? "light" : "dark"
                 let name = "panel-\(fixture.name)-\(theme).png"
+                // The panel's capture affordance (#360) reads an `AccountCaptureModel` from the environment;
+                // inject a nil-client preview instance so the populated-roster capture bar (and the onboarding
+                // card) render idle instead of trapping on a missing environment object. A nil client renders
+                // the idle field/button and never touches a socket — the label field itself stays a known
+                // ImageRenderer blank (see design/README.md). (Absent since #360/#372 added the dependency.)
                 let view = StatusPanelView()
                     .environmentObject(store)
+                    .environmentObject(AccountCaptureModel(client: nil))
                     .environment(\.colorScheme, scheme)
                 let renderer = ImageRenderer(content: view)
                 renderer.scale = 2
