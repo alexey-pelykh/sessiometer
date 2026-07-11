@@ -21,6 +21,7 @@ decision, and gives the fix items a stable citation for *why*.
 | Finding | Title | Spike | Umbrella |
 |---------|-------|-------|----------|
 | [0465](0465-multi-session-rotation-interference.md) | Multi-session refresh-rotation interference on the shared credential | #465 | #463 |
+| [0476](0476-keep-warm-scrub-risk-tradeoff.md) | The scrub-risk cost of gating proactive keep-warm | #476 | #463 |
 
 ## Conventions
 
