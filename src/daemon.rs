@@ -233,6 +233,23 @@ const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 /// (issue #453 AC). Peers are unaffected — they keep the [`POLL_BACKOFF_CAP`] ceiling and
 /// the #294 pathological-`Retry-After` clamp.
 const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
+/// Interim `T` for the #452 bounded-blindness preemptive-swap gate (ADR-0017): the active
+/// account's retained pre-blind anchor must be stale beyond this before the gate turns eligible.
+/// Used HERE only to instrument the gate-premise SLI (issue #482, the
+/// [`Event::BlindGateEligible`] no-viable-target
+/// falsifier) BEFORE #452's swap path is built — #452 replaces this constant with the
+/// `session_blind_swap_secs` CONFIG tunable (ADR-0017 assigns the tunables to #452, not here). The
+/// interim value (300 s) is the one ADR-0017 names, to be finalised by the #451 gate; measuring at
+/// exactly it is what lets #451/#484 confirm-or-refute the constant against production.
+const BLIND_GATE_SECS: u64 = 300;
+/// Interim `risk_band` for the #452 gate (ADR-0017), as a session-usage fraction: the retained
+/// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) must be at/over this for the gate to
+/// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_trigger`
+/// ([`Daemon::session_trigger_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
+/// stale anchor, before the account would have tripped the reactive band. SLI-only (issue #482)
+/// until #452's `session_blind_risk_band` config tunable supersedes it; the interim value (65 %) is
+/// the one ADR-0017 names, to be finalised by #451.
+const BLIND_GATE_RISK_BAND: f64 = 0.65;
 /// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
 /// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
 /// the same config — and the N accounts within a cycle — do not synchronize an
@@ -1323,6 +1340,15 @@ struct DecisionState {
     /// reactive `swap::decide` path never reads it, so keeping it separate leaves that
     /// path byte-for-byte unchanged. See [`LastGood`].
     last_good: Option<LastGood>,
+    /// Edge-trigger latch for the #452 gate-premise SLI (issue #482): set once a
+    /// [`Event::BlindGateEligible`] has fired for the
+    /// CURRENT blind episode of the active account, so the SLI emits exactly ONCE per episode (the
+    /// gate would swap once, ending the episode) rather than every held blind tick. Cleared when the
+    /// active account regains a live reading (recovery) OR its anchor ([`last_good`](Self::last_good))
+    /// is dropped (swap-away / active-loss) — the latch and the anchor share the blind-episode
+    /// lifecycle, so [`note_blind_gate_eligibility`](Daemon::note_blind_gate_eligibility) manages both
+    /// clears in one place and no `last_good` reset site has to touch it.
+    blind_gate_signaled: bool,
     /// The staggered poll schedule for the CURRENT cycle (issues #80, #366): the roster
     /// indices to poll, in order — the active account INTERLEAVED before each enabled,
     /// non-quarantined non-active peer (`[active, p1, active, p2, …]`, issue #366), so
@@ -2029,17 +2055,22 @@ where
             // `swap::decide` had no reading to act on) and this poll reads it live again. Measured
             // from the retained pre-blind anchor (`last_good`, #450) — read HERE, before the refresh
             // below, so it is still the OLD anchor — so `duration_secs` is the `blind_elapsed` #452
-            // keys off, and `near_limit` tags whether the anchor sat at/over the session trigger (the
-            // risk band). The `last_readings[i].is_none()` was-blind check plus `last_good.is_some()`
-            // excludes a first-ever poll (a `None` slot that was never blind); `active == Some(i)`
-            // scopes it to the active account the anchor belongs to. Edge-triggered: the None→live
-            // transition fires exactly once per blind episode.
+            // keys off (and the "anchor_age" the #482 recovery SLI names), and `near_limit` tags
+            // whether the anchor sat at/over the session trigger (the risk band). `session_at_recovery`
+            // is this poll's FRESH session pct (issue #482): paired with the stale anchor
+            // (`session_pct`) + its age (`duration_secs`) it reconciles a hypothetical stale-anchor
+            // preemptive swap as necessary (still climbing) vs wasted (already reset). The
+            // `last_readings[i].is_none()` was-blind check plus `last_good.is_some()` excludes a
+            // first-ever poll (a `None` slot that was never blind); `active == Some(i)` scopes it to
+            // the active account the anchor belongs to. Edge-triggered: the None→live transition fires
+            // exactly once per blind episode.
             if active == Some(i) && result.is_ok() && self.state.last_readings[i].is_none() {
-                if let Some(anchor) = self.state.last_good {
+                if let (Some(anchor), Ok(fresh)) = (self.state.last_good, result.as_ref()) {
                     events.push(Event::BlindWindow {
                         account: self.roster[i].account_uuid.clone(),
                         duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
                         session_pct: to_pct(anchor.session),
+                        session_at_recovery: to_pct(fresh.session),
                         near_limit: anchor.session >= self.session_trigger_base,
                     });
                 }
@@ -2091,6 +2122,13 @@ where
         // (disabled / quarantined) non-active account back to `None` so its stale
         // carried value can never become a swap target (issue #80).
         let readings = self.decision_readings(active);
+        // Issue #482 (umbrella #363 Path B): record the #452 gate-premise SLI — at the moment the
+        // bounded-blindness preemptive swap gate (ADR-0017) turns eligible for the blind active
+        // account, whether a viable swap target exists. Evaluated on the SAME carried readings the
+        // decision below acts on, BEFORE `decide_action` may mutate state, so it captures the gate's
+        // eligibility entering the decision. Edge-triggered once per blind episode; a no-op on a
+        // live / dead / not-yet-eligible active. Instruments the premise before #452's swap is built.
+        self.note_blind_gate_eligibility(active, &readings, at, &mut events);
         // Issue #467: a SCRUBBED / empty shared canonical (Claude Code's first-`invalid_grant` scrub,
         // ADR-0018) locks out every local `claude` session. If a viable target exists, autonomously
         // adopt its token into the emptied canonical — the narrow ADR-0007 decision-4 carve-out —
@@ -2292,6 +2330,96 @@ where
                 }
             })
             .collect()
+    }
+
+    /// Record the #452 gate-premise SLI (issue #482): at the moment the bounded-blindness preemptive
+    /// swap gate (ADR-0017) turns ELIGIBLE for the active account, emit whether a viable swap target
+    /// exists — the no-viable-target-at-gate-fire FALSIFIER for the ADR's cost-asymmetry premise. This
+    /// instruments the gate premise BEFORE #452's swap path is built, so #451/#484 can finalise the
+    /// interim `T` / `risk_band` against production rather than a replay.
+    ///
+    /// Eligibility is the gate's first two ADR-0017 conditions on the retained pre-blind anchor
+    /// ([`last_good`](DecisionState::last_good), #450): the active account has been blind (its live
+    /// reading cleared, `last_readings[active].is_none()`) past the interim [`BLIND_GATE_SECS`], and
+    /// the anchor sat at/over the interim [`BLIND_GATE_RISK_BAND`]. The gate's THIRD condition — a
+    /// viable target — is the value the SLI records, selected exactly as #452's gate would via the
+    /// shared [`pick_target`] with the BASE (un-jittered) triggers (a standing measurement, not a
+    /// per-cycle swap draw). Gated on warm-up (#80): before the first full cycle the carried readings
+    /// are partial, so an unpolled peer would read as a FALSE no-viable-target; by `T` = 300 s warm-up
+    /// is long done, so this only guards the degenerate early window.
+    ///
+    /// Edge-triggered exactly ONCE per blind episode (the gate would swap once, ending the episode)
+    /// via [`blind_gate_signaled`](DecisionState::blind_gate_signaled). The latch is CLEARED here on
+    /// both episode-end edges — the active account regaining a live reading (recovery), and the anchor
+    /// being absent (swap-away / active-loss dropped `last_good`, or no active) — so no `last_good`
+    /// reset site has to touch it. `at` is the tick's monotonic clock, the SAME [`Instant`] the anchor
+    /// and swap cooldown use.
+    fn note_blind_gate_eligibility(
+        &mut self,
+        active: Option<usize>,
+        readings: &[Option<Usage>],
+        at: Instant,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(active_idx) = active else {
+            // No active resolved → no episode; the anchor is already dropped on active-loss. Clear.
+            self.state.blind_gate_signaled = false;
+            return;
+        };
+        // A live reading means the active account is NOT blind (recovered, or never blind) → the
+        // episode is over: clear the latch so the NEXT episode signals afresh.
+        if self.state.last_readings[active_idx].is_some() {
+            self.state.blind_gate_signaled = false;
+            return;
+        }
+        // A QUARANTINED (dead, #42) blind active belongs to the `emergency_swap` path, NOT the #452
+        // preemptive gate — ADR-0017 keeps the two separate (bounded blindness is a healthy 429'd
+        // active, not a dead one). Exclude it so the premise SLI measures only the #452 path and does
+        // not inflate the gate-eligible count with cases the emergency path would handle instead.
+        if self.state.health[active_idx].quarantined {
+            return;
+        }
+        // No anchor → no episode (swap-away / active-loss dropped `last_good`): the latch's other
+        // clear edge, so both ends of an episode reset it in this one place.
+        let Some(anchor) = self.state.last_good else {
+            self.state.blind_gate_signaled = false;
+            return;
+        };
+        // The gate's first two ADR-0017 conditions on the (constant-through-a-blind-episode) anchor:
+        // blind past the interim T AND the anchor in the interim risk band. Below either → not yet
+        // eligible; leave the latch untouched (it is already clear pre-first-emit).
+        let blind_elapsed = at.saturating_duration_since(anchor.at);
+        if blind_elapsed.as_secs() <= BLIND_GATE_SECS || anchor.session < BLIND_GATE_RISK_BAND {
+            return;
+        }
+        // Partial-reading guard (#80 warm-up): don't measure viable-target availability off an
+        // incomplete first cycle, or an unpolled peer fabricates a no-viable-target falsifier.
+        if !self.state.warmed_up {
+            return;
+        }
+        // Edge-trigger: already signalled this episode → the gate would have swapped once; be silent.
+        if self.state.blind_gate_signaled {
+            return;
+        }
+        // The gate's THIRD condition IS the SLI: a viable swap target — a peer under
+        // `target_max_session_usage` (ADR-0013) — chosen exactly as #452's gate would, via the shared
+        // `pick_target` with the BASE (un-jittered) triggers (the same preview `next_swap` uses).
+        let viable_target = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            Some(self.target_max_session_usage),
+            self.session_trigger_base,
+            self.weekly_trigger_base,
+        )
+        .is_some();
+        events.push(Event::BlindGateEligible {
+            account: self.roster[active_idx].account_uuid.clone(),
+            viable_target,
+            blind_secs: blind_elapsed.as_secs(),
+            session_pct: to_pct(anchor.session),
+        });
+        self.state.blind_gate_signaled = true;
     }
 
     /// The number of DISTINCT accounts in the current poll rotation (issue #80): the
@@ -7778,9 +7906,12 @@ mod tests {
                 account: "u-A".to_owned(),
                 duration_secs: 300,
                 session_pct: 96,
+                // Recovered at 97% — above the 96% anchor, so a stale-anchor preemptive swap would
+                // have been necessary (still climbing). The #482 recovery pct (raw, un-classified).
+                session_at_recovery: 97,
                 near_limit: true,
             }),
-            "the recovery must close the blind window with its duration + near-limit tag: {:?}",
+            "the recovery must close the blind window with its duration + recovery pct + near-limit tag: {:?}",
             recovered.events,
         );
         assert_eq!(
@@ -7813,6 +7944,7 @@ mod tests {
                 account: "u-A".to_owned(),
                 duration_secs: 120,
                 session_pct: 40,
+                session_at_recovery: 42,
                 near_limit: false,
             }),
             "a below-band blind window is recorded but not near-limit: {:?}",
@@ -7837,6 +7969,213 @@ mod tests {
                 .any(|e| matches!(e, Event::BlindWindow { .. })),
             "a clean re-poll closes no blind window: {:?}",
             second.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_eligible_signals_a_viable_target_once_past_the_interim_t() {
+        // Issue #482 SLI #1 (umbrella #363 Path B): the #452 preemptive-swap gate's premise falsifier.
+        // The active account's retained anchor sits at 70 % — inside the 65 % interim risk band, below
+        // the 95 % reactive trigger — and a peer (u-B) has session reserve under the 80 % target_max.
+        // Once the active has been blind past the interim T, the gate is ELIGIBLE and a viable target
+        // exists, so the ADR-0017 cost-asymmetry premise holds this episode: exactly one
+        // `blind_gate_eligible` with `viable_target=true`, emitted whether or not a swap follows.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        // Warm up the full interleaved cycle so the viable-target read is off a COMPLETE last-known
+        // set (the SLI's #80 warm-up guard), not a partial one that would fabricate a false verdict.
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+
+        // Blind the active: a 429 clears u-A's reading (the #450 anchor at 70 % is retained). No gate
+        // signal yet — blind_elapsed is still 0 under the frozen clock, below the interim T.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            let out = daemon.tick().await;
+            assert!(
+                !out.events
+                    .iter()
+                    .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+                "no gate signal before the interim T elapses: {:?}",
+                out.events,
+            );
+        }
+
+        // Cross the interim T — now the gate's first two conditions hold and a viable target exists.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let eligible = daemon.tick().await;
+        assert!(
+            eligible.events.iter().any(|e| matches!(
+                e,
+                Event::BlindGateEligible {
+                    viable_target: true,
+                    session_pct: 70,
+                    ..
+                }
+            )),
+            "the gate turns eligible with a viable target present: {:?}",
+            eligible.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_eligible_reports_no_viable_target_the_premise_falsifier() {
+        // Issue #482 SLI #1: the FALSIFIER. Same eligible active (anchor 70 %, blind past T) but every
+        // peer is over the 80 % target_max reserve (u-B 85 %, u-C 90 %) — session-viable readings, just
+        // no reserve to catch a swap. `pick_target` finds none, so the gate is eligible with NO viable
+        // target: `viable_target=false` is the ADR-0017 cost-asymmetry counter-evidence #482 exists to
+        // surface (if non-trivial, #452's predicate must be revisited).
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.85, 0.10)
+                .ok("u-C", 0.90, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.85, 0.10)
+            .ok("u-C", 0.90, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let eligible = daemon.tick().await;
+        assert!(
+            eligible.events.iter().any(|e| matches!(
+                e,
+                Event::BlindGateEligible {
+                    viable_target: false,
+                    ..
+                }
+            )),
+            "eligible but no peer has reserve → the no-viable-target falsifier fires: {:?}",
+            eligible.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_below_the_interim_risk_band_never_signals() {
+        // Issue #482 SLI #1: an anchor comfortably below the 65 % interim risk band (50 %) never makes
+        // the gate eligible, however long the active stays blind — the gate acts only on a near-band
+        // anchor, so a low-usage blind active is not a premise data point.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        // Well past the interim T — still no signal: the anchor is below the risk band.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS * 3));
+        let out = daemon.tick().await;
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "a below-band anchor never makes the gate eligible: {:?}",
+            out.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_signals_once_per_episode_and_rearms_after_recovery() {
+        // Issue #482 SLI #1: edge-triggered exactly ONCE per blind episode (the gate would swap once,
+        // ending it), then re-arms once the active recovers and blinds afresh — so a long blind window
+        // is ONE data point and a later episode is a distinct one.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+
+        // Episode 1: blind, cross T, signal — then stay blind several more ticks: still exactly one.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let mut episode1 = 0;
+        for _ in 0..5 {
+            episode1 += daemon
+                .tick()
+                .await
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::BlindGateEligible { .. }))
+                .count();
+            daemon.clock.advance(Duration::from_secs(60));
+        }
+        assert_eq!(episode1, 1, "exactly one gate signal per blind episode");
+
+        // Recover the active: a live reading closes the episode and re-arms the latch.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.70, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_none() {
+            daemon.tick().await;
+        }
+
+        // Episode 2: blind afresh, cross T → the gate signals again (a distinct episode).
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let episode2 = daemon.tick().await;
+        assert!(
+            episode2
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "a fresh blind episode re-arms the gate signal: {:?}",
+            episode2.events,
         );
     }
 
