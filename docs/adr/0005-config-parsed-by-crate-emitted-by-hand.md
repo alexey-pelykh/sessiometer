@@ -17,9 +17,11 @@ reinvented-wheels / library-usage audit finding; "low-priority consistency
 observation, not a bug"). A decision in force, not a code change — same posture as
 ADR-0002/0003.
 
-> **Update (#415):** the `session_floor` field used as a rendering illustration below
-> was renamed to **`target_max_usage`**; the examples are preserved as the historical
-> behavior they describe. `session_floor` still parses as a deprecated alias.
+> **Update (#415, #443):** the `session_floor` field used as a rendering illustration below
+> was renamed to **`target_max_usage`** (#415) and then **`target_max_session_usage`** (#443,
+> the unqualified `usage` hid the session axis); the examples are preserved as the historical
+> behavior they describe. Both `session_floor` and `target_max_usage` still parse as
+> deprecated aliases.
 
 ## Context
 

@@ -314,7 +314,7 @@ pub(crate) enum NextSwap {
     /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
     /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
     /// *live* (enabled, non-quarantined) other account has already been polled and none
-    /// qualifies (weekly-exhausted, or over the `target_max_usage` reserve) — even while other
+    /// qualifies (weekly-exhausted, or over the `target_max_session_usage` reserve) — even while other
     /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
     /// there is no live other account at all (every other disabled #36 or quarantined #42,
     /// its reading masked away by `decision_readings`, or there is simply no other account).
@@ -393,7 +393,7 @@ pub(crate) enum NextSwapReason {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NoTargetCause {
     /// A weekly-VIABLE account is held out only by session (over the session ceiling
-    /// `min(session_trigger, target_max_usage)`) — relief arrives at the sooner SESSION reset.
+    /// `min(session_trigger, target_max_session_usage)`) — relief arrives at the sooner SESSION reset.
     Session,
     /// Every candidate is weekly-EXHAUSTED (`weekly >= weekly_trigger`) — relief arrives at the
     /// WEEKLY reset (the #11 default, and the ONLY cause reachable on the emergency/dead-active
