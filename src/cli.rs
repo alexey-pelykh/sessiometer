@@ -1901,7 +1901,9 @@ fn management_suffix(managed: bool) -> &'static str {
 /// classify — `n/a` is not a false "healthy") stay uncolored.
 ///
 /// Sourced solely from the response's non-secret fields — labels, percentages,
-/// reset instants, a next-swap candidate label — so it can never print a token or email (issue #15);
+/// reset instants, a next-swap candidate label — so it can never print a token, nor any
+/// email EXCEPT an operator-authored account label the operator chose to set as their own
+/// label (issue #15; #444 — an authored email label is a permitted value, never a leak);
 /// the ANSI overlay adds only `\x1b[3Xm`…`\x1b[0m`, never a secret.
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
@@ -3912,8 +3914,8 @@ personal  22222222-2222-2222-2222-222222222222\n\
             1,
         );
         assert!(
-            !out.contains('@'),
-            "list output must not contain an email: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "list output must not contain a non-authored email (#15/#444): {out:?}"
         );
         assert!(
             !out.to_lowercase().contains("token"),
@@ -4062,8 +4064,9 @@ spare  22222222-2222\n\
             "carries the count: {down}"
         );
         assert!(
-            !out.contains('@') && !out.to_lowercase().contains("token"),
-            "no secret reaches the surface (#15): {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty()
+                && !out.to_lowercase().contains("token"),
+            "no secret reaches the surface (#15/#444): {out:?}"
         );
 
         // A threshold-of-1 config fires at the first all-error sweep — the noun stays singular.
@@ -4105,8 +4108,8 @@ spare  22222222-2222\n\
             "the dead account carries the durable re-login tag: {spare}"
         );
         assert!(
-            !out.contains('@'),
-            "no email on the printed surface: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "no non-authored email on the printed surface (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
     }
@@ -4142,8 +4145,8 @@ spare  22222222-2222\n\
         );
         // The tag is a plain string — no token, no email reaches the surface (#15).
         assert!(
-            !out.contains('@'),
-            "no email on the printed surface: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "no non-authored email on the printed surface (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
     }
@@ -4240,7 +4243,7 @@ spare  22222222-2222\n\
             "the dead account shows the red glyph and the actionable cue: {spare}"
         );
         // The glyph IS the signal — present even without color, and #15-clean.
-        assert!(!out.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&out, &[]).is_empty());
         assert!(!out.to_lowercase().contains("token"));
         // The AUTH column starts at the SAME display offset in both rows — the preceding
         // columns pad to one width despite the dead row's `n/a` cells and the healthy row's
@@ -4404,10 +4407,10 @@ spare  22222222-2222\n\
             "an account with no stored expiry reads an honest placeholder: {}",
             vline("spare")
         );
-        // #15: sourced from labels + a timestamp only, so no email rides the surface.
+        // #15/#444: labels + a timestamp only, so no NON-authored email rides the surface.
         assert!(
-            !verbose.contains('@'),
-            "no email on the verbose surface: {verbose}"
+            crate::redaction::meter::unauthored_emails(&verbose, &[]).is_empty(),
+            "no non-authored email on the verbose surface (#15/#444): {verbose}"
         );
     }
 
@@ -5235,8 +5238,8 @@ spare  22222222-2222\n\
         };
         let out = render_status(&response, NOW, None, false);
         assert!(
-            !out.contains('@'),
-            "status output must not contain an email: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "status output must not contain a non-authored email (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
     }
@@ -5918,8 +5921,8 @@ spare  22222222-2222\n\
         let out = render_status(&response, NOW, None, true);
         assert!(out.contains('\x1b'), "the overlay is active: {out:?}");
         assert!(
-            !out.contains('@'),
-            "no email on the colored surface: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "no non-authored email on the colored surface (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
         assert!(!out.contains("sk-ant-"));
@@ -6382,8 +6385,11 @@ spare  22222222-2222\n\
         assert!(json.contains("\"generated_at\": 1782777600"), "got {json}");
         // The payload stays FLAT at the top level (not nested under a key).
         assert!(json.contains("\"accounts\""), "got {json}");
-        // Redaction unchanged (issue #15): no email/token on the `--json` wire.
-        assert!(!json.contains('@'), "got {json}");
+        // Redaction (#15/#444): no NON-authored email, no token, on the `--json` wire.
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "got {json}"
+        );
         assert!(!json.to_lowercase().contains("token"), "got {json}");
     }
 

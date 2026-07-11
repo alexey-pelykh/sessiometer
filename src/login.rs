@@ -764,8 +764,8 @@ mod tests {
 
         // Channel — the engine's non-secret surface a caller logs: the account uuid + outcome
         // label. Neither may carry the fixture's tokens, blob, or email.
-        crate::redaction::meter::assert_clean(&uuid, &secrets);
-        crate::redaction::meter::assert_clean(&format!("captured account {uuid}"), &secrets);
+        crate::redaction::meter::assert_clean(&uuid, &secrets, &[]);
+        crate::redaction::meter::assert_clean(&format!("captured account {uuid}"), &secrets, &[]);
     }
 
     // Keep the production entry (and its production-only callees — `SpawnClaudeLogin`,
