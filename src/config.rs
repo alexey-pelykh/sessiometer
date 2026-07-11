@@ -379,6 +379,19 @@ pub(crate) struct RefreshConfig {
     /// (#375) style outage without waiting for an account to die. Bounds `1..=100`; **default**
     /// [`DEFAULT_REFRESH_SYSTEMIC_FAILURE_N`]. Governs detection only — never a swap/poll decision.
     pub(crate) systemic_failure_n: u32,
+    /// Whether the #282 PROACTIVE keep-warm of the ACTIVE account fires (issue #468). **Off by
+    /// default** — the second, tighter opt-in for a *live*-canonical rotation. Gated within
+    /// `[refresh].enabled` (which wires the keep-warm engine at all, ADR-0015): with the engine off
+    /// this is moot; with it on and this `false`, the active account is kept warm ONLY reactively
+    /// (`should_keep_warm_retry`, on a real 401) + recovered by the #467 autonomous adopt-target —
+    /// the pre-emptive near-expiry mint that rotates the live shared token every cadence is
+    /// suppressed. Finding #476 (`docs/findings/0476-keep-warm-scrub-risk-tradeoff.md`, predicate C)
+    /// measured that proactive mint at ~44 % of the daemon's canonical churn (4.6 rotation-yanks/day,
+    /// all `rotated=true`) and — since #467 re-based the scrub it guards against from fleet-wide
+    /// unrecoverable to `continue`-recoverable — recommends gating it off, leaning on the reactive
+    /// backstop. Set `true` to restore the pre-#468 proactive keep-warm (finding #476 fallback A's
+    /// base, or an on/off capture comparison). The reactive backstop is UNAFFECTED by this flag.
+    pub(crate) proactive_keep_warm: bool,
 }
 
 impl Default for RefreshConfig {
@@ -391,6 +404,10 @@ impl Default for RefreshConfig {
             timeout_secs: DEFAULT_REFRESH_TIMEOUT_SECS,
             claude_bin: None,
             systemic_failure_n: DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
+            // Issue #468 / finding #476 predicate C: proactive keep-warm of the active account is
+            // OFF by default (leans on the reactive backstop + #467 recovery); an explicit opt-in
+            // restores the pre-#468 pre-emptive mint.
+            proactive_keep_warm: false,
         }
     }
 }
@@ -873,6 +890,11 @@ impl Config {
                     present("refresh", "systemic_failure_n"),
                 ),
                 entry(
+                    "proactive_keep_warm",
+                    r.proactive_keep_warm.to_string(),
+                    present("refresh", "proactive_keep_warm"),
+                ),
+                entry(
                     "claude_bin",
                     render_optional_bin(&r.claude_bin),
                     present("refresh", "claude_bin"),
@@ -1192,6 +1214,7 @@ impl Config {
                 .filter(|bin| !bin.trim().is_empty())
                 .map(PathBuf::from),
             systemic_failure_n: r.systemic_failure_n as u32,
+            proactive_keep_warm: r.proactive_keep_warm,
         };
 
         // The one-shot `login` verb's settings (issue #135). The timeout is bounds-checked like the
@@ -1412,6 +1435,17 @@ impl Config {
              # signal (event + `status` indicator) distinct from per-account at-risk.\n",
         );
         out.push_str(&format!("systemic_failure_n = {}\n", r.systemic_failure_n));
+        out.push_str(
+            "# Pre-emptively refresh the ACTIVE account's token in place before it nears expiry\n\
+             # (issue #468). OFF by default: this rotates the live shared credential every cadence,\n\
+             # and the active account is instead kept warm reactively (on a real 401) and recovered\n\
+             # by autonomous adopt-target. Set true to restore the pre-emptive mint. Only takes\n\
+             # effect when enabled = true. See docs/findings/0476-keep-warm-scrub-risk-tradeoff.md.\n",
+        );
+        out.push_str(&format!(
+            "proactive_keep_warm = {}\n",
+            r.proactive_keep_warm
+        ));
         out.push_str(
             "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave\n\
              # empty) to resolve from $CLAUDE_BIN then $PATH.\n",
@@ -1802,6 +1836,11 @@ struct RawRefresh {
     claude_bin: Option<String>,
     #[serde(default = "default_refresh_systemic_failure_n")]
     systemic_failure_n: i64,
+    // Issue #468: an absent key resolves to `false` (proactive keep-warm OFF, predicate C) — the
+    // bool `Default`, so a plain `#[serde(default)]` is the right default here (unlike `enabled`,
+    // whose default is `true` and needs a named default fn).
+    #[serde(default)]
+    proactive_keep_warm: bool,
 }
 
 impl Default for RawRefresh {
@@ -1814,6 +1853,7 @@ impl Default for RawRefresh {
             timeout_secs: default_refresh_timeout_secs(),
             claude_bin: None,
             systemic_failure_n: default_refresh_systemic_failure_n(),
+            proactive_keep_warm: false,
         }
     }
 }
@@ -2503,6 +2543,8 @@ label = "personal"
                 idle_after_secs: 120,
                 timeout_secs: 60,
                 claude_bin: Some(PathBuf::from("/opt/claude/bin/claude")),
+                // Absent from the parsed TOML above → the #468 default (proactive keep-warm off).
+                proactive_keep_warm: false,
             }
         );
         // The cadence is also the near-expiry horizon, exposed as a Duration.
@@ -2530,6 +2572,35 @@ label = "personal"
         let toml = format!("{VALID}\n[refresh]\nenabled = false\n");
         let config = Config::parse(&toml).unwrap();
         assert!(!config.refresh.enabled);
+    }
+
+    #[test]
+    fn refresh_proactive_keep_warm_defaults_off() {
+        // Issue #468 / finding #476 predicate C: an absent `proactive_keep_warm` key resolves to
+        // OFF even with `[refresh]` maintenance ON — the active account is then kept warm reactively
+        // (on a real 401) + recovered by #467, not by the pre-emptive live-canonical mint.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.refresh.enabled);
+        assert!(
+            !config.refresh.proactive_keep_warm,
+            "proactive keep-warm is off by default (#468)"
+        );
+    }
+
+    #[test]
+    fn refresh_proactive_keep_warm_opt_in_parses_and_round_trips() {
+        // An operator restores the pre-#468 pre-emptive mint (finding #476 fallback A's base) with
+        // an explicit `proactive_keep_warm = true`; a present key is never overridden by the
+        // off-by-default serde default, and the opt-in survives the render->parse round trip.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\nproactive_keep_warm = true\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.refresh.proactive_keep_warm);
+        let reparsed = Config::parse(&config.render()).unwrap();
+        assert!(
+            reparsed.refresh.proactive_keep_warm,
+            "the opt-in survives emit->parse (#468)"
+        );
     }
 
     #[test]

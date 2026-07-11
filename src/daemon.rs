@@ -1471,10 +1471,23 @@ pub(crate) struct Daemon<P, C, S, K> {
     keep_warm: Option<Box<dyn KeepWarm>>,
     /// The keep-warm near-expiry horizon AND the proactive per-account attempt throttle
     /// (issue #282), sourced from `[refresh].cadence_secs` — the SAME dual-purpose knob the
-    /// parked sweep uses for its own near-expiry horizon (no second config knob). A per-account
-    /// stagger offset in `[0, cadence)` is added on top for de-correlation. Only read when
-    /// [`keep_warm`](Self::keep_warm) is wired; the `new` default is an inert placeholder.
+    /// parked sweep uses for its own near-expiry horizon (no second *cadence* knob; the #468
+    /// [`proactive_keep_warm`](Self::proactive_keep_warm) opt-in is a separate on/off gate, not a
+    /// cadence). A per-account stagger offset in `[0, cadence)` is added on top for de-correlation.
+    /// Only read when [`keep_warm`](Self::keep_warm) is wired; the `new` default is an inert
+    /// placeholder.
     keep_warm_cadence: Duration,
+    /// Whether the PROACTIVE keep-warm path ([`keep_active_warm`](Self::keep_active_warm)) fires
+    /// (issue #468, finding #476 predicate C). **`false` by default** — the pre-emptive near-expiry
+    /// mint that rotates the LIVE shared canonical every cadence is the ~44 % of daemon canonical
+    /// churn #476 measured, and #467's autonomous adopt-target re-based the scrub it guards against
+    /// to `continue`-recoverable, so the default leans on the REACTIVE backstop
+    /// ([`should_keep_warm_retry`](Self::should_keep_warm_retry)) + #467 instead. Set by
+    /// [`with_proactive_keep_warm`](Self::with_proactive_keep_warm) from `[refresh].proactive_keep_warm`;
+    /// gates ONLY the proactive path — the reactive backstop keys off [`keep_warm`](Self::keep_warm)
+    /// alone and is UNAFFECTED. Independent of, and nested within, the `[refresh].enabled` seam wiring
+    /// (an unwired [`keep_warm`](Self::keep_warm) makes this moot).
+    proactive_keep_warm: bool,
     /// The systemic refresh-failure threshold (issue #378): consecutive all-eligible-account
     /// refresh-error sweeps before the daemon surfaces a mechanism-down signal. Sourced from
     /// `[refresh].systemic_failure_n` (`1..=100`) via
@@ -1558,6 +1571,10 @@ where
             // inert placeholder until the engine is wired (it is read only when `keep_warm` is).
             keep_warm: None,
             keep_warm_cadence: Duration::from_secs(3600),
+            // Issue #468: proactive keep-warm of the active account is OFF by default (predicate C);
+            // production opts in via `with_proactive_keep_warm` from `[refresh].proactive_keep_warm`.
+            // The reactive backstop does not read this, so it is unaffected.
+            proactive_keep_warm: false,
             // The #378 systemic-failure threshold defaults to the config default (opt-in wiring
             // via `with_systemic_failure_n`); hermetic tests that exercise the detector pass the
             // threshold directly to `SystemicRefreshHealth::note`, so this placeholder only sets
@@ -1699,6 +1716,18 @@ where
     ) -> Self {
         self.keep_warm = Some(engine);
         self.keep_warm_cadence = cadence;
+        self
+    }
+
+    /// Opt the PROACTIVE keep-warm path in (issue #468, finding #476 predicate C). Off by default
+    /// (see [`proactive_keep_warm`](Self::proactive_keep_warm)); production passes
+    /// `[refresh].proactive_keep_warm` here, chained after [`with_keep_warm_engine`](Self::with_keep_warm_engine)
+    /// inside the `[refresh].enabled` block. Separate from the engine wiring because the flag gates
+    /// ONLY the proactive path while the REACTIVE backstop keys off the shared
+    /// [`keep_warm`](Self::keep_warm) seam alone — one seam, two independently-gated consumers.
+    /// Builder-style to mirror [`with_keep_warm_engine`](Self::with_keep_warm_engine).
+    pub(crate) fn with_proactive_keep_warm(mut self, enabled: bool) -> Self {
+        self.proactive_keep_warm = enabled;
         self
     }
 
@@ -2685,9 +2714,12 @@ where
     /// BEFORE any 401 — so a live session always reads a warm token and the overnight false-death
     /// cascade never starts. Serialized into [`tick`](Self::tick) just before
     /// [`decide_action`](Self::decide_action). Inert (an immediate return) unless the keep-warm
-    /// seam is wired.
+    /// seam is wired AND the proactive path is opted in.
     ///
     /// Gates, in order (each a cheap check before the expensive `claude -p` mint):
+    /// - the PROACTIVE path is opted in ([`proactive_keep_warm`](Self::proactive_keep_warm), issue
+    ///   #468 / finding #476 predicate C — OFF by default, so this whole path is inert unless an
+    ///   operator sets `[refresh].proactive_keep_warm = true`; the reactive backstop is unaffected);
     /// - the seam is wired, an active account resolved, and its canonical blob is readable;
     /// - the active account is NOT quarantined (a dead account is the streak's job, not re-warmed);
     /// - the token is within `[refresh].cadence_secs + `[`keep_warm_stagger_secs`]` of expiry (the
@@ -2706,6 +2738,17 @@ where
         now_ms: i64,
         events: &mut Vec<Event>,
     ) {
+        // Issue #468 / finding #476 predicate C: the proactive path is OFF by default. The
+        // pre-emptive near-expiry mint rotates the LIVE shared canonical every cadence (~44 % of
+        // daemon canonical churn, #476), so an operator opts in explicitly via
+        // `[refresh].proactive_keep_warm`; otherwise the active account leans on the REACTIVE
+        // backstop (`should_keep_warm_retry`, on a real 401) + the #467 autonomous adopt-target.
+        // This gate is proactive-only: `should_keep_warm_retry` does NOT read the flag, so the
+        // reactive backstop still fires. DO NOT remove this without the #476 fallback-A analysis —
+        // gating proactive off is only safe because #467 recovers the scrub it makes likelier.
+        if !self.proactive_keep_warm {
+            return;
+        }
         if self.keep_warm.is_none() {
             return;
         }
@@ -15588,7 +15631,10 @@ mod tests {
                 calls: calls.clone(),
             }),
             Duration::from_secs(3600),
-        );
+        )
+        // Issue #468: opt the proactive path IN for the seam tests (default is off) so the
+        // existing proactive assertions still exercise it; the new gate test overrides to `false`.
+        .with_proactive_keep_warm(true);
         (daemon, outcomes, calls)
     }
 
@@ -15896,6 +15942,63 @@ mod tests {
             "a quarantined active account is never re-warmed"
         );
         assert!(events.is_empty(), "no mint → no event");
+    }
+
+    #[tokio::test]
+    async fn proactive_keep_warm_gated_off_is_inert_but_the_reactive_backstop_still_fires() {
+        // Issue #468 / finding #476 predicate C. With `proactive_keep_warm = false` (the production
+        // DEFAULT) the proactive path is INERT even for a near-expiry active token — the pre-emptive
+        // live-canonical mint (~44 % of daemon canonical churn, #476) no longer fires, so the shared
+        // token is not rotated pre-emptively. The REACTIVE backstop is a SEPARATE consumer of the
+        // same seam and is UNAFFECTED: an active 401 still routes to `should_keep_warm_retry`, so the
+        // active token is kept warm exactly when a session needs it (predicate C leans on this + the
+        // #467 autonomous adopt-target for the residual scrub window).
+        let now_ms = 1_800_000_000_000;
+        // 60 s to expiry — INSIDE the near-expiry horizon, so ONLY the #468 gate can suppress the
+        // mint (isolating this gate from the far-from-expiry / quarantine / throttle gates).
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live");
+        let (daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            canonical.clone(),
+        )
+        .await;
+        // The seam-test helper opts proactive IN; override back to the production default (OFF).
+        let mut daemon = daemon.with_proactive_keep_warm(false);
+
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "proactive gated off → a near-expiry active token is NOT pre-emptively minted",
+        );
+        assert!(
+            events.is_empty(),
+            "no proactive mint → no keep_warm event: {events:?}",
+        );
+        assert!(
+            daemon.state.health[0].last_keep_warm_attempt.is_none(),
+            "no mint attempted → the proactive throttle stamp is untouched",
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            canonical.expose(),
+            "proactive gated off → the shared canonical token is left un-rotated (#468 AC-1)",
+        );
+
+        // #468 AC-3: the REACTIVE backstop keys off the seam alone, NOT the proactive flag — an active
+        // 401 still triggers keep-warm, so active-expiry mid-use is still prevented.
+        daemon.state.active = Some(0);
+        assert!(
+            daemon.should_keep_warm_retry(0, &Err(Error::UsageUnauthorized)),
+            "the reactive backstop is unaffected by the proactive #468 gate",
+        );
     }
 
     #[tokio::test]

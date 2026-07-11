@@ -571,6 +571,9 @@ accounts = []             # parked accounts by `list` label or account-uuid; [] 
 cadence_secs = 3600       # seconds between ticks AND the near-expiry horizon (60..=86400)
 idle_after_secs = 60      # idle seconds (no poll/swap) required before a refresh fires (0..=3600)
 timeout_secs = 90         # whole-cycle bound for one account's refresh (10..=600)
+proactive_keep_warm = false  # pre-emptively refresh the ACTIVE token before expiry; off by default
+                             # (it rotates the live shared credential each cadence) — the active
+                             # account is instead kept warm reactively on a 401. See below.
 # claude_bin = "/absolute/path/to/claude"   # overrides $CLAUDE_BIN/$PATH; omit to resolve normally
 ```
 
@@ -602,28 +605,38 @@ each account's *stash*, and rotating the active token there would strand the fre
 value where no live session reads it. But an idle machine left overnight can let the
 active token lapse and, on the next poll, a `401` is mistaken for a dead credential —
 starting a false-death logout cascade. To close that gap, whenever `[refresh]` is
-enabled the daemon **also keeps the active account's canonical token warm in place**:
+enabled the daemon **also keeps the active account's canonical token warm in place** —
+**reactively by default, and proactively when you opt in**:
 
-- **Proactively** — before the active token nears expiry, the daemon mints a fresh
-  token (the same isolated spawn the parked sweep uses, on a *copy* of the canonical
-  blob) and **promotes it to the canonical `Claude Code-credentials` item** a live
-  session actually reads — so the token is refreshed *ahead* of any `401`.
-- **As a reactive backstop** — if the active account does return a `401` with a still-
-  live refresh token, the daemon refreshes it in place and re-polls **before** the
+- **As a reactive backstop (default)** — if the active account returns a `401` with a
+  still-live refresh token, the daemon refreshes it in place and re-polls **before** the
   `401` counts toward the dead-credential streak. Only a genuinely dead credential (an
   empty refresh token, or a refresh that reports `dead`) advances the streak — so a
   truly-dead active account still quarantines and the emergency swap to a live spare is
-  preserved.
+  preserved. This is the layer that prevents active-token expiry mid-use.
+- **Proactively (opt-in, `proactive_keep_warm = true`, off by default)** — before the
+  active token nears expiry, the daemon mints a fresh token (the same isolated spawn the
+  parked sweep uses, on a *copy* of the canonical blob) and **promotes it to the canonical
+  `Claude Code-credentials` item** a live session reads — refreshing it *ahead* of any
+  `401`. This is **off by default** because it rotates the live shared credential on every
+  cadence, and that churn is a window for a rare multi-writer credential scrub; the reactive
+  backstop above (plus the daemon's autonomous recovery of a scrubbed credential) covers an
+  actively-used account without it. Enable it if you want the active token refreshed ahead
+  of expiry rather than on the first `401`. (See
+  [`docs/findings/0476`](docs/findings/0476-keep-warm-scrub-risk-tradeoff.md) for the
+  churn-vs-scrub tradeoff behind this default.)
 
 The in-place canonical write is serialized against account swaps (the same single-
 writer lock, an atomic keychain update, re-checked each cycle), so it can never tear a
 swap. Each account's keep-warm timing is **staggered** by a stable per-account offset,
 so a roster that logged in together does not all reach expiry — and refresh — in
-lockstep. This needs no extra configuration: it shares the `[refresh].enabled` switch
-and reuses `cadence_secs` as its near-expiry horizon. Every keep-warm firing is logged
-as a redacted `event=keep_warm` line (`trigger=proactive`/`reactive`, the classified
-outcome, and whether the refresh token rotated), never a token or an *unauthored*
-email (an operator-authored email label may appear — #444).
+lockstep. The reactive backstop needs no extra configuration — it rides the
+`[refresh].enabled` switch; the proactive layer is the one opt-in
+(`proactive_keep_warm = true`) and reuses `cadence_secs` as its near-expiry horizon.
+Every keep-warm firing is logged as a redacted `event=keep_warm` line
+(`trigger=proactive`/`reactive`, the classified outcome, and whether the refresh token
+rotated), never a token or an *unauthored* email (an operator-authored email label may
+appear — #444).
 
 ## Configuration
 
