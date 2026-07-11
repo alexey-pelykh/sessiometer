@@ -304,6 +304,38 @@ impl CredentialHealth {
     }
 }
 
+/// The shared canonical `Claude Code-credentials` item's OWN per-poll liveness (issue #464) — the
+/// one keychain item every local `claude` session reads, distinct from any single roster account's
+/// [`CredentialHealth`]. A closed classification carried on the `diag=canonical` per-poll line and
+/// driving the edge-triggered [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`] pair.
+/// Non-secret — a bare discriminant (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalLiveness {
+    /// Readable AND carrying a live (non-empty) refresh token — a usable shared credential every
+    /// session can authenticate with.
+    Present,
+    /// SCRUBBED / empty: readable but the tokens are cleared in place (an empty refresh token —
+    /// Claude Code's first-`invalid_grant` scrub, the DEAD signal per [`crate::refresh::refresh_token`]),
+    /// OR the item is gone entirely (`CredentialNotFound`). Either way no session can authenticate —
+    /// the "Not logged in" state umbrella #463 exists to make visible.
+    Scrubbed,
+    /// UNKNOWN: the read failed for a transient / non-lock, non-not-found reason, so this poll
+    /// carries no liveness evidence either way. The edge-trigger HOLDS its current signal rather
+    /// than invent a scrub or a recovery from a flaky read.
+    Unknown,
+}
+
+impl CanonicalLiveness {
+    /// The `state=` token for the `diag=canonical` line.
+    fn as_str(self) -> &'static str {
+        match self {
+            CanonicalLiveness::Present => "present",
+            CanonicalLiveness::Scrubbed => "scrubbed",
+            CanonicalLiveness::Unknown => "unknown",
+        }
+    }
+}
+
 /// The outcome of one `sessiometer login` invocation (issue #135) — the `outcome=` token of the
 /// single redacted [`Event::Login`] the verb emits. The four terminal states of a login:
 /// `Onboarded` / `Revived` map from the reconcile's [`crate::capture::LoginOutcome`] (a new vs an
@@ -538,6 +570,24 @@ pub(crate) enum Event {
     /// it and returned it to the rotation (issue #42). Edge-triggered: exactly ONCE
     /// on the recovery transition. `account` is the HANDLE — never a token or email.
     CredentialRestored { account: String },
+    /// The SHARED canonical `Claude Code-credentials` item was observed SCRUBBED/EMPTY — its
+    /// tokens cleared in place (Claude Code's first-`invalid_grant` scrub) or the item gone
+    /// entirely — so every local `claude` session now reads "Not logged in" (issue #464,
+    /// umbrella #463). Edge-triggered: emitted exactly ONCE on the transition INTO the scrubbed
+    /// state, never per poll while it stays scrubbed, and afresh if it recovers and is scrubbed
+    /// again. `account` is the last-known active HANDLE (operator label) the scrub emptied, or
+    /// absent when no active account was resolved (e.g. a daemon started against an already-empty
+    /// item) — never a token or email (issue #15). Distinct from [`Event::CredentialDead`] (a
+    /// PER-ACCOUNT quarantine edge keyed on a 401-streak): this is the SHARED item's OWN liveness,
+    /// the fleet-wide lockout no `credential_dead` fires for — the umbrella's core observability gap.
+    CanonicalScrubbed { account: Option<String> },
+    /// The shared canonical item RECOVERED — read live again (a non-empty refresh token) after a
+    /// scrub, so sessions can authenticate once more (issue #464). The clearing counterpart of
+    /// [`Event::CanonicalScrubbed`], mirroring the [`Event::CredentialDead`] /
+    /// [`Event::CredentialRestored`] durable-pair idiom. Edge-triggered: exactly ONCE on the
+    /// recovery transition. `account` is the newly-resolved HANDLE, or absent — never a token or
+    /// email (issue #15).
+    CanonicalRestored { account: Option<String> },
     /// `account`'s refresh token is confirmed DEAD and UNRECOVERABLE by automation: a
     /// quarantined account's isolated #106-sweep refresh returned `outcome=dead` (the
     /// stored refresh token is revoked/empty), so no daemon path can revive it — only
@@ -868,6 +918,23 @@ impl Event {
             }
             Event::CredentialRestored { account } => {
                 format!("ts={ts} event=credential_restored account={account}")
+            }
+            Event::CanonicalScrubbed { account } => {
+                // `account` trails optionally (an empty value would split the key=val grammar) —
+                // absent when no active account was resolved at scrub time. Mirrors
+                // `all_exhausted`'s optional `resets_at`.
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=canonical_scrubbed{account}")
+            }
+            Event::CanonicalRestored { account } => {
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=canonical_restored{account}")
             }
             Event::CredentialUnrecoverable { account } => {
                 format!("ts={ts} event=credential_unrecoverable account={account}")
@@ -1448,6 +1515,22 @@ pub(crate) enum Diagnostic {
         backoff_secs: Option<u64>,
         retry_after_secs: Option<u64>,
     },
+    /// The shared canonical `Claude Code-credentials` item's OWN per-poll reading (issue #464):
+    /// its liveness `state` ([`CanonicalLiveness`]: present / scrubbed / unknown), a redaction-safe
+    /// `fingerprint` of the current refresh token (a SHA-256 hex PREFIX — identity, never the
+    /// token), the resolved account `handle`, and the access-token `expires_at` (epoch seconds).
+    /// The LEVEL record emitted every poll — the measurable substrate the rotation-interference
+    /// rate (#465) and the autonomous-recovery trigger (#467) consume; its edge-crossings are the
+    /// durable [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`] pair. Every field is a
+    /// discriminant / hash-prefix / handle / timestamp — never a secret (issue #15). The three
+    /// optional fields are absent on a scrubbed / unknown read (no live token to fingerprint, no
+    /// expiry, possibly no resolvable handle).
+    Canonical {
+        state: CanonicalLiveness,
+        fingerprint: Option<String>,
+        account: Option<String>,
+        expires_at: Option<i64>,
+    },
     /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap
     /// target is possible again. The edge-triggered LEAVE marker — the symmetric
     /// partner of the event log's edge-triggered `all_exhausted` ENTER — so a stale
@@ -1515,6 +1598,31 @@ impl Diagnostic {
                     None => String::new(),
                 };
                 format!("ts={ts} diag=tick decision={decision}{backoff}{retry_after}")
+            }
+            Diagnostic::Canonical {
+                state,
+                fingerprint,
+                account,
+                expires_at,
+            } => {
+                let state = state.as_str();
+                // Each optional field renders only when present — an empty value after `=` would
+                // split the `key=val` grammar (mirrors `diag=tick`'s optional `backoff_secs`).
+                // `expires_at` is raw epoch SECONDS, matching this channel's `*_secs` convention
+                // and the wire's `access_expires_at` unit.
+                let fingerprint = match fingerprint {
+                    Some(fp) => format!(" fingerprint={fp}"),
+                    None => String::new(),
+                };
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                let expires_at = match expires_at {
+                    Some(secs) => format!(" expires_at={secs}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}")
             }
             Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
             Diagnostic::ActiveDeadNoTargetCleared => {
@@ -1782,6 +1890,81 @@ mod tests {
             line,
             format!("{TS0} event=credential_restored account=work")
         );
+    }
+
+    #[test]
+    fn canonical_scrubbed_carries_the_handle_when_known_and_omits_it_otherwise() {
+        // Issue #464: the shared-item scrub carries the last-known active HANDLE (never a token
+        // or email) — and omits `account` cleanly when no active account was resolved (a daemon
+        // started against an already-empty item), so an empty value never splits the grammar.
+        let with_handle = Event::CanonicalScrubbed {
+            account: Some("work".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            with_handle,
+            format!("{TS0} event=canonical_scrubbed account=work")
+        );
+
+        let no_handle = Event::CanonicalScrubbed { account: None }.to_log_line(at_epoch(0));
+        assert_eq!(no_handle, format!("{TS0} event=canonical_scrubbed"));
+    }
+
+    #[test]
+    fn canonical_restored_carries_the_handle_when_known_and_omits_it_otherwise() {
+        // Issue #464: the clearing counterpart, same optional-handle grammar.
+        let with_handle = Event::CanonicalRestored {
+            account: Some("work".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            with_handle,
+            format!("{TS0} event=canonical_restored account=work")
+        );
+
+        let no_handle = Event::CanonicalRestored { account: None }.to_log_line(at_epoch(0));
+        assert_eq!(no_handle, format!("{TS0} event=canonical_restored"));
+    }
+
+    #[test]
+    fn canonical_diagnostic_renders_state_and_appends_each_present_field() {
+        // Issue #464: the per-poll level line. A live read carries all four fields; a scrubbed /
+        // unknown read carries only `state` (no live token to fingerprint, no expiry), each
+        // optional field appended only when present (an empty value would split the grammar).
+        let present = Diagnostic::Canonical {
+            state: CanonicalLiveness::Present,
+            fingerprint: Some("0123456789abcdef".to_owned()),
+            account: Some("work".to_owned()),
+            expires_at: Some(1_782_777_600),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            present,
+            format!(
+                "{TS0} diag=canonical state=present fingerprint=0123456789abcdef account=work expires_at=1782777600"
+            )
+        );
+
+        let scrubbed = Diagnostic::Canonical {
+            state: CanonicalLiveness::Scrubbed,
+            fingerprint: None,
+            account: Some("work".to_owned()),
+            expires_at: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            scrubbed,
+            format!("{TS0} diag=canonical state=scrubbed account=work")
+        );
+
+        let unknown = Diagnostic::Canonical {
+            state: CanonicalLiveness::Unknown,
+            fingerprint: None,
+            account: None,
+            expires_at: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(unknown, format!("{TS0} diag=canonical state=unknown"));
     }
 
     #[test]

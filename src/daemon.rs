@@ -104,8 +104,9 @@ use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
 use crate::observability::{
-    BackoffClass, CaptureEventOutcome, CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog,
-    Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome, SwapReason,
+    BackoffClass, CanonicalLiveness, CaptureEventOutcome, CredentialHealth, DecisionClass,
+    Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome,
+    SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
@@ -866,6 +867,27 @@ fn has_live_refresh_token(canonical: &Credential) -> bool {
     matches!(crate::refresh::refresh_token(canonical.expose()), Some(rt) if !rt.is_empty())
 }
 
+/// The hex length of the canonical refresh-token FINGERPRINT (issue #464) — a SHA-256 hex
+/// PREFIX, never the token. 16 chars (64 bits) is ample to tell one credential's token from
+/// another across polls (the rotation-interference signal #465 reads) while staying UNDER the
+/// redaction meter's 20-char high-entropy-run backstop (`redaction::meter::ENTROPY_MIN_RUN`), so
+/// the fingerprint reads CLEAN; it matches the existing 16-hex uuid-seed slice in
+/// [`keep_warm_stagger_secs`].
+const CANONICAL_FINGERPRINT_HEX: usize = 16;
+
+/// A redaction-safe fingerprint of a canonical token: the first [`CANONICAL_FINGERPRINT_HEX`]
+/// chars of its SHA-256 hex digest (issue #464). Identity WITHOUT the secret — it changes when
+/// the canonical's token rotates (a refresh / swap / out-of-band `/login`), so the scrub-driving
+/// rotation is measurable from the log, yet reveals nothing of the token (a one-way hash,
+/// prefix-truncated). Hashing an INDIVIDUAL token (not the whole blob) keeps it distinct from the
+/// meter's `BlobSha256` fingerprint, and the 16-char prefix stays under its high-entropy backstop,
+/// so the value reads clean through the #15 meter. Reuses the hand-rolled [`crate::sha256`]
+/// primitive (no new dependency — the CONTRIBUTING minimal-dependency line). A pure function,
+/// unit-tested directly.
+fn canonical_fingerprint(token: &[u8]) -> String {
+    crate::sha256::sha256_hex(token)[..CANONICAL_FINGERPRINT_HEX].to_owned()
+}
+
 /// A deterministic per-account keep-warm stagger offset in `[0, cadence)` seconds (issue #282),
 /// ADDED to the near-expiry horizon so each account's proactive mint fires at a DIFFERENT phase of
 /// the shared ~8h token TTL. Without it a roster logged in together would all reach the same
@@ -1196,6 +1218,14 @@ struct DecisionState {
     /// backed-off retry while the keychain stays locked — mirroring
     /// `signaled_all_exhausted`.
     signaled_keychain_locked: bool,
+    /// Edge-trigger guard for the canonical-scrub signal (issue #464): set when a
+    /// `canonical_scrubbed` event is emitted (the shared `Claude Code-credentials` item was
+    /// observed empty/scrubbed), cleared when the item is next observed LIVE (which emits the
+    /// `canonical_restored` counterpart). So the scrub fires exactly ONCE per episode — not once
+    /// per poll while the item stays scrubbed — and afresh if it recovers and is scrubbed again.
+    /// Mirrors `signaled_all_exhausted`; UNLIKE it, a transient unreadable poll does NOT clear it
+    /// (only a confirmed live read does), so a flaky read never fabricates a recovery.
+    signaled_canonical_scrubbed: bool,
     /// Last-known usage reading per roster account (issue #80), indexed by roster
     /// position. The daemon polls ONE account per tick (staggered, the active
     /// interleaved before each peer — #366), so a decision is taken on the most recent
@@ -1704,6 +1734,11 @@ where
         // cycle and back off, #13), re-auth re-stash detection (the canonical
         // changed out-of-band, #13), and the active resolution below. A locked
         // keychain is the one outcome that short-circuits the entire tick.
+        // Issue #464: distinguish a CONFIRMED gone canonical (`CredentialNotFound`, exit 44 — the
+        // scrubbed/empty item) from a transient read failure, so `note_canonical_liveness` below
+        // edge-triggers the scrub only on the former and HOLDS the signal on the latter (a flaky
+        // read must never fabricate a scrub or a recovery).
+        let mut canonical_absent = false;
         let canonical = match self.store.read().await {
             Err(Error::KeychainLocked { .. }) => return self.locked_tick(),
             Ok(canonical) => {
@@ -1715,11 +1750,20 @@ where
                     .await;
                 Some(canonical)
             }
+            Err(Error::CredentialNotFound) => {
+                // The canonical item is GONE (exit 44) — a confirmed scrub/empty, not a lock:
+                // clear the back-off and fall through to poll (the loop never swaps on missing
+                // data, so an unknown active simply holds). `note_canonical_liveness` reads
+                // `canonical_absent` to edge-trigger the scrub event.
+                self.state.lock_backoff = None;
+                self.state.signaled_keychain_locked = false;
+                canonical_absent = true;
+                None
+            }
             Err(_) => {
-                // Unreadable for a non-lock reason (not-found / transient): no
-                // change-detection is possible, but it is not a lock — clear the
-                // back-off and fall through to poll (the loop never swaps on missing
-                // data, so an unknown active simply holds).
+                // Unreadable for a non-lock, non-not-found reason (transient): no
+                // change-detection is possible and it is not a confirmed scrub — clear the
+                // back-off and fall through to poll, holding the canonical signal.
                 self.state.lock_backoff = None;
                 self.state.signaled_keychain_locked = false;
                 None
@@ -1738,6 +1782,20 @@ where
             };
         }
         let active = self.state.active;
+
+        // Issue #464: record the canonical item's OWN per-poll liveness (present / scrubbed /
+        // unknown + a redaction-safe token fingerprint, handle, and expiry) and edge-trigger the
+        // durable `canonical_scrubbed` / `canonical_restored` events — so the shared-credential
+        // "Not logged in" scrub is diagnosable from `sessiometer.log` alone, even when no
+        // `credential_dead` fires (umbrella #463). Reuses the canonical already read above (no
+        // extra keychain read) and the just-resolved `active` for the handle.
+        self.note_canonical_liveness(
+            canonical.as_ref(),
+            canonical_absent,
+            active,
+            &mut events,
+            &mut diagnostics,
+        );
 
         // Poll ONE account this tick — the next entry in the staggered schedule
         // (issue #80): the active account interleaved before each enabled,
@@ -3774,6 +3832,88 @@ where
         expires_at_ms.map(millis_to_secs)
     }
 
+    /// Record the canonical `Claude Code-credentials` item's OWN per-poll liveness (issue #464)
+    /// and edge-trigger its durable scrub / recovery events — the shared-credential observability
+    /// umbrella #463 needs to make the fleet-wide "Not logged in" scrub visible and measurable.
+    ///
+    /// `canonical` is the blob read ONCE at top-of-tick (`None` when unreadable); `absent`
+    /// distinguishes a CONFIRMED gone item ([`Error::CredentialNotFound`]) from a transient read
+    /// failure, so a flaky read classifies [`CanonicalLiveness::Unknown`] (no event, hold the
+    /// signal) rather than a false scrub. `active` supplies the handle — on a scrub the last-known
+    /// active account is the one Claude Code emptied for everyone.
+    ///
+    /// Two outputs: (1) a `diag=canonical` LEVEL line every poll — the fingerprint series +
+    /// present/scrubbed reading #465/#467 consume; (2) on a present↔scrubbed transition, one
+    /// durable [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`]. Non-secret by
+    /// construction: a liveness discriminant, a hash-prefix fingerprint, a handle, and a timestamp
+    /// — never a token or email (issue #15). Present/empty and the fingerprint both key off the
+    /// single audited [`crate::refresh::refresh_token`] extractor — the same discipline
+    /// [`has_live_refresh_token`] follows — so the emptiness rule lives in one place.
+    fn note_canonical_liveness(
+        &mut self,
+        canonical: Option<&Credential>,
+        absent: bool,
+        active: Option<usize>,
+        events: &mut Vec<Event>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        let handle = active.map(|i| self.roster[i].label.clone());
+        let (state, fingerprint, expires_at) = match canonical {
+            Some(cred) => {
+                let blob = cred.expose();
+                match crate::refresh::refresh_token(blob) {
+                    // A live (non-empty) refresh token — a usable shared credential.
+                    Some(rt) if !rt.is_empty() => (
+                        CanonicalLiveness::Present,
+                        Some(canonical_fingerprint(&rt)),
+                        crate::refresh::expires_at(blob).map(millis_to_secs),
+                    ),
+                    // A present-but-EMPTY refresh token (`Some("")`): the tokens were cleared in
+                    // place — the dead signal per `refresh::refresh_token`. Claude Code's observed
+                    // scrub empties the whole ITEM (→ `CredentialNotFound` below, ADR-0018); this
+                    // arm defensively catches an in-place clear too. No live token to fingerprint.
+                    Some(_) => (CanonicalLiveness::Scrubbed, None, None),
+                    // An unparseable / non-`claudeAiOauth` blob (`refresh_token` → `None`): the
+                    // item is present but its liveness cannot be determined — honestly UNKNOWN, not
+                    // a confirmed scrub (a corrupt read must never fabricate a scrub edge).
+                    None => (CanonicalLiveness::Unknown, None, None),
+                }
+            }
+            // The item is GONE (`CredentialNotFound`, exit 44) — the confirmed scrub Claude Code's
+            // `invalid_grant` empties the item into (ADR-0018), and the exact signal #467 adopts on.
+            None if absent => (CanonicalLiveness::Scrubbed, None, None),
+            // Transient / unreadable for a non-lock, non-not-found reason — no evidence this poll.
+            None => (CanonicalLiveness::Unknown, None, None),
+        };
+
+        // (1) The per-poll LEVEL record on the diagnostic channel (issue #464): every poll, so the
+        // fingerprint series + present/scrubbed reading are measurable from the log alone.
+        diagnostics.push(Diagnostic::Canonical {
+            state,
+            fingerprint,
+            account: handle.clone(),
+            expires_at,
+        });
+
+        // (2) The durable, EDGE-triggered transition events (issue #464). A transient UNKNOWN
+        // carries no evidence — hold the current signal rather than fabricate a scrub or recovery.
+        match state {
+            CanonicalLiveness::Scrubbed => {
+                if !self.state.signaled_canonical_scrubbed {
+                    events.push(Event::CanonicalScrubbed { account: handle });
+                    self.state.signaled_canonical_scrubbed = true;
+                }
+            }
+            CanonicalLiveness::Present => {
+                if self.state.signaled_canonical_scrubbed {
+                    events.push(Event::CanonicalRestored { account: handle });
+                    self.state.signaled_canonical_scrubbed = false;
+                }
+            }
+            CanonicalLiveness::Unknown => {}
+        }
+    }
+
     /// Recompute every account's 5-state credential-health rollup (issue #119) against
     /// `now_secs` and emit one [`Event::CredentialHealth`] per account whose verdict CHANGED
     /// since the last call — the edge-triggered health timeline the issue's AC-3 requires
@@ -5248,6 +5388,20 @@ mod tests {
         panic!("warm-up did not complete within {max_ticks} ticks — empty/degenerate schedule?");
     }
 
+    /// The per-poll `diag=canonical` line every tick now emits (issue #464). These hermetic
+    /// tests seed the canonical store with an OPAQUE token (`b"A-token"`, etc.) rather than a
+    /// `claudeAiOauth`-shaped blob, so `refresh::refresh_token` cannot parse it — the item is
+    /// present but its liveness is UNKNOWN (never a false scrub), with the handle the resolved
+    /// active account's label. The expected leading diagnostic for any tick of such a daemon.
+    fn canonical_unknown_diag(active_label: &str) -> Diagnostic {
+        Diagnostic::Canonical {
+            state: CanonicalLiveness::Unknown,
+            fingerprint: None,
+            account: Some(active_label.to_owned()),
+            expires_at: None,
+        }
+    }
+
     // --- pick_target (pure) ------------------------------------------------
 
     // A weekly trigger well above every reading in the pick_target tests below, so
@@ -6046,6 +6200,7 @@ mod tests {
         assert_eq!(
             first.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::Live,
@@ -6064,6 +6219,7 @@ mod tests {
         assert_eq!(
             second.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "spare".to_owned(),
                     outcome: PollClass::Live,
@@ -6640,6 +6796,7 @@ mod tests {
         assert_eq!(
             first.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::RateLimited,
@@ -7922,6 +8079,7 @@ mod tests {
         assert_eq!(
             outcome.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::Live,
@@ -9455,6 +9613,251 @@ mod tests {
         assert!(corpus.contains(r#""refresh_health":{"#));
         // The rollup rides the wire under the `auth` key (issue #143 renamed `health` → `auth`).
         assert!(corpus.contains(r#""auth":"stale""#));
+        assert_clean(&corpus, &secrets, &[]);
+    }
+
+    #[test]
+    fn canonical_fingerprint_is_the_16_hex_prefix_of_the_token_sha256() {
+        // Issue #464: a stable, redaction-safe identity — the first 16 hex of the token's
+        // SHA-256, deterministic and distinct per token, never the token itself. 16 chars keeps
+        // it under the redaction meter's 20-char high-entropy backstop.
+        let fp = canonical_fingerprint(b"live-rt");
+        assert_eq!(fp.len(), CANONICAL_FINGERPRINT_HEX);
+        assert_eq!(fp, crate::sha256::sha256_hex(b"live-rt")[..16]);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // A different token yields a different fingerprint (identity, not a constant) — the
+        // rotation signal #465 reads.
+        assert_ne!(fp, canonical_fingerprint(b"other-rt"));
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_edge_triggers_the_scrub_once_then_the_restore() {
+        // Issue #464: the shared canonical's present↔scrubbed transitions each emit EXACTLY ONE
+        // durable event — the scrub fires once (not per poll while it stays empty), a transient
+        // unreadable poll HOLDS the signal, and only a confirmed live read fires the clearing
+        // restore. The core edge-trigger AC.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let live = cred(
+            br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"live-rt","expiresAt":1782777600000}}"#,
+        );
+
+        // Present while nothing is signalled: no event, one `diag=canonical` present line.
+        let mut events = Vec::new();
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&live), false, Some(0), &mut events, &mut diags);
+        assert!(
+            events.is_empty(),
+            "a present item with no prior scrub emits no event: {events:?}"
+        );
+        // The Present arm's field population through the METHOD: the fingerprint derived from the
+        // live refresh token and the `expiresAt` ms→s fold (1782777600000 ms → 1782777600 s).
+        assert_eq!(
+            diags,
+            vec![Diagnostic::Canonical {
+                state: CanonicalLiveness::Present,
+                fingerprint: Some(canonical_fingerprint(b"live-rt")),
+                account: Some("work".to_owned()),
+                expires_at: Some(1_782_777_600),
+            }]
+        );
+        assert!(!daemon.state.signaled_canonical_scrubbed);
+
+        // The item is scrubbed (gone) → exactly one `canonical_scrubbed` carrying the handle.
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(None, true, Some(0), &mut events, &mut Vec::new());
+        assert_eq!(
+            events,
+            vec![Event::CanonicalScrubbed {
+                account: Some("work".to_owned())
+            }]
+        );
+        assert!(daemon.state.signaled_canonical_scrubbed);
+
+        // Still scrubbed next poll → no repeat (edge-triggered, not level-triggered).
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(None, true, Some(0), &mut events, &mut Vec::new());
+        assert!(
+            events.is_empty(),
+            "a persisting scrub re-signals nothing: {events:?}"
+        );
+        assert!(daemon.state.signaled_canonical_scrubbed);
+
+        // A transient unreadable poll (absent=false) carries no evidence → no event, signal HELD:
+        // a flaky read must never fabricate a recovery.
+        let mut events = Vec::new();
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(None, false, Some(0), &mut events, &mut diags);
+        assert!(
+            events.is_empty(),
+            "a flaky read fabricates no recovery: {events:?}"
+        );
+        assert!(
+            daemon.state.signaled_canonical_scrubbed,
+            "the scrub signal survives a transient read"
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "the unknown level reading is still recorded"
+        );
+
+        // A confirmed live read → exactly one `canonical_restored`, signal cleared.
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(Some(&live), false, Some(0), &mut events, &mut Vec::new());
+        assert_eq!(
+            events,
+            vec![Event::CanonicalRestored {
+                account: Some("work".to_owned())
+            }]
+        );
+        assert!(!daemon.state.signaled_canonical_scrubbed);
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_treats_an_emptied_refresh_token_as_scrubbed() {
+        // Issue #464: Claude Code's in-place scrub clears the tokens rather than deleting the
+        // item — a readable blob with an EMPTY refresh token is the DEAD signal (refresh.rs), so
+        // it must classify scrubbed and edge-trigger the event just like a gone item, and the
+        // level line records the scrubbed state with no fingerprint / expiry.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let emptied =
+            cred(br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#);
+        let mut events = Vec::new();
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&emptied), false, Some(0), &mut events, &mut diags);
+        assert_eq!(
+            events,
+            vec![Event::CanonicalScrubbed {
+                account: Some("work".to_owned())
+            }]
+        );
+        assert_eq!(
+            diags,
+            vec![Diagnostic::Canonical {
+                state: CanonicalLiveness::Scrubbed,
+                fingerprint: None,
+                account: Some("work".to_owned()),
+                expires_at: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_omits_the_handle_when_no_active_is_resolved() {
+        // Issue #464: a daemon that first reads an already-scrubbed item has no active to name —
+        // the scrub still fires (the state is real), with the handle absent rather than fabricated.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(None, true, None, &mut events, &mut Vec::new());
+        assert_eq!(events, vec![Event::CanonicalScrubbed { account: None }]);
+    }
+
+    #[tokio::test]
+    async fn a_tick_observing_a_scrubbed_canonical_emits_the_edge_triggered_scrub_event() {
+        // Issue #464 AC-1 END-TO-END through the real poll path: when a tick's canonical read
+        // returns `CredentialNotFound` (Claude Code's `invalid_grant` scrub empties the item —
+        // ADR-0018), the tick emits exactly one durable `canonical_scrubbed` carrying the
+        // last-known active handle — even though no `credential_dead` fires (the observability
+        // gap the umbrella closes). Exercises the `Err(CredentialNotFound)` → `canonical_absent`
+        // → `Event::CanonicalScrubbed` wiring the direct-call tests reach only in halves.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // First tick: the canonical is readable (opaque `A-token`), active resolves to `work`,
+        // and no scrub is signalled.
+        let before = daemon.tick().await;
+        assert!(
+            !before
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalScrubbed { .. })),
+            "a readable canonical emits no scrub: {:?}",
+            before.events
+        );
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(!daemon.state.signaled_canonical_scrubbed);
+
+        // Claude Code scrubs the shared item to empty → the next read is `CredentialNotFound`.
+        daemon.store.set_not_found(true);
+        let scrubbed = daemon.tick().await;
+        assert_eq!(
+            scrubbed
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::CanonicalScrubbed { .. }))
+                .collect::<Vec<_>>(),
+            vec![&Event::CanonicalScrubbed {
+                account: Some("work".to_owned())
+            }],
+            "the poll that observes the emptied canonical emits exactly one scrub event: {:?}",
+            scrubbed.events
+        );
+        assert!(daemon.state.signaled_canonical_scrubbed);
+
+        // A second scrubbed tick re-signals nothing (edge-triggered, not level-triggered).
+        let still = daemon.tick().await;
+        assert!(
+            !still
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalScrubbed { .. })),
+            "a persisting scrub re-signals nothing: {:?}",
+            still.events
+        );
+    }
+
+    #[test]
+    fn redaction_meter_covers_the_canonical_snapshot_fields() {
+        use crate::redaction::meter::{assert_clean, Secrets};
+        // Issue #464 / #15: the per-poll canonical snapshot + its scrub/restore events must leak
+        // no secret. Build the log lines with a fingerprint derived from the fixture's REAL
+        // refresh token — so a path that emitted the token (or its raw/hashed blob) rather than
+        // the truncated per-token hash would surface here — and prove the value-based meter reads
+        // clean.
+        let secrets = Secrets::meter_fixture();
+        let blob = secrets.blob();
+        let rt = crate::refresh::refresh_token(blob).expect("fixture blob carries a refresh token");
+        let fingerprint = canonical_fingerprint(&rt);
+        let expires_at = crate::refresh::expires_at(blob).map(millis_to_secs);
+
+        let mut corpus = String::new();
+        corpus.push_str(
+            &Diagnostic::Canonical {
+                state: CanonicalLiveness::Present,
+                fingerprint: Some(fingerprint.clone()),
+                account: Some("work".to_owned()),
+                expires_at,
+            }
+            .to_log_line(std::time::SystemTime::UNIX_EPOCH),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &Event::CanonicalScrubbed {
+                account: Some("work".to_owned()),
+            }
+            .to_log_line(std::time::SystemTime::UNIX_EPOCH),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &Event::CanonicalRestored {
+                account: Some("work".to_owned()),
+            }
+            .to_log_line(std::time::SystemTime::UNIX_EPOCH),
+        );
+        corpus.push('\n');
+
+        // Cardinality (#15 non-vacuous gate): the fingerprint derived from the REAL fixture token
+        // actually reached the scanned corpus, and it is the 16-hex prefix — so the clean verdict
+        // below is not vacuously true on an empty/degraded corpus.
+        assert_eq!(fingerprint.len(), 16);
+        assert!(corpus.contains(&format!("fingerprint={fingerprint}")));
+        // …and the raw refresh token never rode alongside it.
+        assert!(!corpus.contains(std::str::from_utf8(&rt).unwrap()));
         assert_clean(&corpus, &secrets, &[]);
     }
 
