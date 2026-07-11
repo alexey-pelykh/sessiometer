@@ -1186,11 +1186,22 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         // the LIVE canonical token, so it stays behind the operator's opt-in: with `[refresh]` off
         // the active account lapses at expiry and recovers via the #42 emergency swap to a live
         // spare, exactly as before. `cadence()` (`[refresh].cadence_secs`) is the near-expiry
-        // horizon and the proactive throttle — no second config knob.
-        daemon = daemon.with_keep_warm_engine(
-            Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
-            config.refresh.cadence(),
-        );
+        // horizon and the proactive throttle (the near-expiry cadence is a single knob; the #468
+        // proactive on/off opt-in wired below is a separate boolean gate, not a second cadence).
+        // Issue #468 / finding #476 predicate C: the PROACTIVE path (the pre-emptive near-expiry
+        // mint) is a SECOND, default-off opt-in NESTED here. `with_proactive_keep_warm` gates ONLY
+        // that path; the REACTIVE backstop (`should_keep_warm_retry`, on an active 401) keys off the
+        // engine seam alone, so it fires whenever `[refresh].enabled` wires the engine, regardless
+        // of this flag. With `proactive_keep_warm = false` (the default) the active account is kept
+        // warm reactively + recovered by the #467 autonomous adopt-target, cutting the ~44 % of
+        // canonical churn the pre-emptive mint contributed (#476) — safe only because #467 re-based
+        // the scrub it guards against to `continue`-recoverable.
+        daemon = daemon
+            .with_keep_warm_engine(
+                Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
+                config.refresh.cadence(),
+            )
+            .with_proactive_keep_warm(config.refresh.proactive_keep_warm);
     }
     let mut refresh_tick = RefreshTick::new(
         config.roster.clone(),
