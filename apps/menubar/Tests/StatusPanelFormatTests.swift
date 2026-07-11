@@ -321,10 +321,33 @@ final class StatusPanelFormatTests: XCTestCase {
     // MARK: - nextSwapFooter (issue #326 AC: forward candidate, not history)
 
     func testNextSwapFooterWording() {
-        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal", reason: .onlyCandidate)), "Next swap → personal")
-        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.noViableTarget), "No viable target")
-        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.awaitingData), "Awaiting data")
-        XCTAssertNil(StatusPanelFormat.nextSwapFooter(nil))   // no active anchor → no footer
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal", reason: .onlyCandidate), now: 0), "Next swap → personal")
+        // A pre-#405 daemon (no cause) → the bare fallback, unchanged.
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: nil, resetsAt: nil), now: 0), "No viable target")
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.awaitingData, now: 0), "Awaiting data")
+        XCTAssertNil(StatusPanelFormat.nextSwapFooter(nil, now: 0))   // no active anchor → no footer
+    }
+
+    // #405: a `noViableTarget` carrying fleet-capacity relief renders the composite the panel's own
+    // way — STATE-parity with the CLI's `next swap: none …` footer (same facts, not the same bytes).
+    func testNextSwapFooterOutOfCapacityRelief() {
+        // Weekly-exhausted fleet: a week-long block → name the reset AND nudge to add an account.
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(
+                .noViableTarget(cause: .weekly, resetsAt: 1_000_000 + 2 * 86_400 + 4 * 3_600), now: 1_000_000),
+            "Out of capacity — resets in 2d4h · add an account")
+        // Weekly cause but the daemon did not know the reset → the nudge without a duration.
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: .weekly, resetsAt: nil), now: 1_000_000),
+            "Out of capacity · add an account")
+        // Over-session fleet: a transient block that resets soon → name the reset, NO add-account nudge.
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(
+                .noViableTarget(cause: .session, resetsAt: 1_000_000 + 47 * 60), now: 1_000_000),
+            "Every account over its session limit — resets in 47m")
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: .session, resetsAt: nil), now: 1_000_000),
+            "Every account over its session limit")
     }
 
     // MARK: - captureCommand (the CLI-equivalent subcommand; in-app capture affordance is #360)
@@ -418,7 +441,7 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertTrue(target.isNextSwapTarget)
         let other = try XCTUnwrap(rows.first { $0.label == "work" })
         XCTAssertFalse(other.isNextSwapTarget)
-        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal", reason: .onlyCandidate)), "Next swap → personal")
+        XCTAssertEqual(StatusPanelFormat.nextSwapFooter(.target(to: "personal", reason: .onlyCandidate), now: 0), "Next swap → personal")
     }
 
     // MARK: - Header subtitle (issue #355 — design-reference parity)
@@ -465,7 +488,7 @@ final class StatusPanelFormatTests: XCTestCase {
 
     func testSwapCalloutTargetIsPresentOnlyForAViableForwardCandidate() {
         XCTAssertEqual(StatusPanelFormat.swapCalloutTarget(.target(to: "personal", reason: .onlyCandidate)), "personal")
-        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.noViableTarget))
+        XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.noViableTarget(cause: nil, resetsAt: nil)))
         XCTAssertNil(StatusPanelFormat.swapCalloutTarget(.awaitingData))
         XCTAssertNil(StatusPanelFormat.swapCalloutTarget(nil))
     }
@@ -492,7 +515,7 @@ final class StatusPanelFormatTests: XCTestCase {
         // label — strictly more honest than the old superseded-rule story).
         XCTAssertNil(StatusPanelFormat.swapCalloutReason(.target(to: "spare", reason: nil)))
         // A non-target candidate (or no anchor) has no reason to render.
-        XCTAssertNil(StatusPanelFormat.swapCalloutReason(.noViableTarget))
+        XCTAssertNil(StatusPanelFormat.swapCalloutReason(.noViableTarget(cause: nil, resetsAt: nil)))
         XCTAssertNil(StatusPanelFormat.swapCalloutReason(.awaitingData))
         XCTAssertNil(StatusPanelFormat.swapCalloutReason(nil))
     }

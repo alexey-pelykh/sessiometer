@@ -15,7 +15,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 2))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 3))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
@@ -42,8 +42,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 2)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 2))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 3)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 3))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -100,15 +100,29 @@ final class WireDecoderTests: XCTestCase {
     }
 
     // AC: "All three `next_swap` states …" — `no_viable_target`. + `auth` stale, failure streak.
+    // AC (#405): the no-viable-target carries the fleet-capacity relief — `cause` = weekly (every
+    // account is weekly-exhausted) with the soonest weekly reset off the wire, so the client renders
+    // "out of capacity, resets in ⟨dur⟩" rather than re-deriving it (mirroring the #393 reason path).
     func testDecodesNoViableTargetAndStale() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotNoViable) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.nextSwap, .noViableTarget)
+        XCTAssertEqual(v.nextSwap, .noViableTarget(cause: .weekly, resetsAt: 1_893_800_500))
         let a = v.accounts[0]
         XCTAssertTrue(a.weeklyExhausted)
         XCTAssertEqual(a.auth, .stale)
         XCTAssertEqual(a.refreshHealth, RefreshHealth(lastOk: false, rotated: false, consecutiveFailures: 2))
+    }
+
+    // AC (#405): a pre-#405 daemon omits the additive `cause`/`resets_at` relief keys — a bare
+    // no-viable-target must decode to `cause: nil, resetsAt: nil` (the `decodeIfPresent` forward-compat
+    // path), NOT a decode error. The additive-minor contract that makes the #405 relief render-safe
+    // against an older daemon (mirrors `testPreReasonTargetDecodesWithNilReason` for #393).
+    func testDecodesNoViableTargetWithoutReliefIsForwardCompatible() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotNoViableNoRelief) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.nextSwap, .noViableTarget(cause: nil, resetsAt: nil))
     }
 
     // AC: "All three `next_swap` states …" — `awaiting_data`. + `auth` dead, quarantined.

@@ -141,8 +141,10 @@ pub(crate) struct SchemaVersion {
 /// [`StatusResponse::systemic_refresh_failure`] indicator (issue #378) — an optional field an
 /// older client tolerates by ignoring. `1.2` ADDED the [`NextSwap::Target`] `reason`
 /// ([`NextSwapReason`], issue #393) — the daemon's own selection rationale, likewise optional and
-/// tolerated-by-ignoring.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 2 };
+/// tolerated-by-ignoring. `1.3` ADDED the [`NextSwap::NoViableTarget`] `cause` + `resets_at`
+/// fleet-capacity relief hint ([`NoTargetCause`], issue #405) — two more optional
+/// tolerated-by-ignoring fields on a variant that was previously payload-free.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 3 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -316,7 +318,26 @@ pub(crate) enum NextSwap {
     /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
     /// there is no live other account at all (every other disabled #36 or quarantined #42,
     /// its reading masked away by `decision_readings`, or there is simply no other account).
-    NoViableTarget,
+    ///
+    /// Carries the same fleet-capacity RELIEF hint the durable `all_exhausted` /
+    /// `active_dead_no_target` events do (issue #405): `cause` names WHY the fleet is blocked
+    /// ([`NoTargetCause`]) and `resets_at` WHEN capacity returns — the [`all_exhausted_relief`]
+    /// classification, so BOTH the CLI footer and the menubar can tell the operator "out of
+    /// capacity, resets in ⟨dur⟩ — add an account" instead of a content-free "no viable target".
+    /// This surfaces the SAME hint whether the active is alive-and-over-trigger or DEAD-and-stranded
+    /// (the dead active's 🔴 health shows separately on its own account row, so the composite —
+    /// re-login the dead credential AND wait for / add capacity — emerges). Both fields are ADDITIVE
+    /// `Option`s (`#[serde(default)]`, the #164 minor-bump convention): a current daemon always
+    /// sends `Some(cause)` (relief always classifies a cause), and `resets_at` whenever the relevant
+    /// window reported a parseable reset; a pre-#405 daemon omits both → `None`, which a renderer
+    /// falls back to the bare "no viable target" on (the pre-freeze-compat posture `reason` on
+    /// [`Self::Target`] and `health` share).
+    NoViableTarget {
+        #[serde(default)]
+        cause: Option<NoTargetCause>,
+        #[serde(default)]
+        resets_at: Option<i64>,
+    },
     /// No reading yet for any *live* (enabled, non-quarantined) other account — the
     /// post-restart moment, before the staggered poll loop (#80) has read the rotation.
     /// Kept distinct from `NoViableTarget` because it is exactly the moment an operator
@@ -354,6 +375,30 @@ pub(crate) enum NextSwapReason {
     /// were viable here, so a renderer must never claim this one was the only one — that would be
     /// the very false-rationale bug #393 exists to remove. Carries no epoch because none exists.
     RosterOrder,
+}
+
+/// WHY [`NextSwap::NoViableTarget`] has no target — the fleet-capacity RELIEF cause (issue #405),
+/// the forward-looking sibling of the durable `all_exhausted` / `active_dead_no_target` events'
+/// `cause`. Carried on the wire so BOTH the CLI footer and the menubar render the ONE cause the
+/// daemon's [`all_exhausted_relief`] classification produced, each in its own idiom (R-2
+/// STATE-parity: a structured discriminant, not a pre-formatted string).
+///
+/// Deliberately a WIRE-LOCAL enum distinct from [`crate::observability::SwapReason`] — exactly as
+/// [`NextSwapReason`] is — for two reasons: `SwapReason` additionally carries `Manual` / `Forced`
+/// (operator-swap reasons that cannot arise from a no-target verdict), and it is not `serde`, so
+/// putting it on the wire would both widen the contract's value set nonsensically and couple the
+/// diagnostic enum to the wire. This carries ONLY the two causes relief can report. `snake_case`,
+/// so a value is `"session"` or `"weekly"`. Non-secret — a bare discriminant (issue #15).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NoTargetCause {
+    /// A weekly-VIABLE account is held out only by session (over the session ceiling
+    /// `min(session_trigger, target_max_usage)`) — relief arrives at the sooner SESSION reset.
+    Session,
+    /// Every candidate is weekly-EXHAUSTED (`weekly >= weekly_trigger`) — relief arrives at the
+    /// WEEKLY reset (the #11 default, and the ONLY cause reachable on the emergency/dead-active
+    /// path, which bypasses the session gate entirely).
+    Weekly,
 }
 
 /// Project a [`StatusSnapshot`] into the wire [`StatusResponse`]. Sourced solely

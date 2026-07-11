@@ -488,6 +488,29 @@ pub(crate) enum Event {
         cause: SwapReason,
         resets_at: Option<i64>,
     },
+    /// The ACTIVE account's credential is DEAD *and* no live account is a viable emergency
+    /// swap target — the strictly-WORSE sibling of [`Self::AllExhausted`] (issue #405). The
+    /// emergency path (issue #42) drops the `target_max_usage` reserve AND the session gate, so
+    /// the ONLY remaining filter is weekly exhaustion: reaching here means every live spare is
+    /// weekly-exhausted, and the daemon HOLDS on the dead active with no way to escape. Until now
+    /// this state returned SILENTLY — a strictly-worse condition than `all_exhausted` yet emitting
+    /// strictly-less signal; this event closes that asymmetry so the strand is diagnosable from the
+    /// log alone (issue #399), naming the real blocker and when it lifts.
+    ///
+    /// `hold` is the DEAD active's HANDLE (operator label) — the account the daemon is stuck on,
+    /// and the account to run `claude /login` against (it doubles as the re-login target). `cause`
+    /// (always [`SwapReason::Weekly`] on this path — the session gate is bypassed, so a
+    /// session-only block cannot arise) and `resets_at` are the fleet-capacity RELIEF hint from
+    /// `all_exhausted_relief`, naming WHEN a spare's weekly window frees capacity; `resets_at` is
+    /// that reset as epoch seconds (RFC 3339 in [`Event::to_log_line`], present whenever a spare
+    /// reported a parseable weekly reset, omitted otherwise). Edge-triggered like `all_exhausted`:
+    /// emitted exactly ONCE on entering the strand, cleared by [`Diagnostic::ActiveDeadNoTargetCleared`].
+    /// Secret-free by construction (#15): a closed enum + a label + a timestamp, never a token or email.
+    ActiveDeadNoTarget {
+        hold: String,
+        cause: SwapReason,
+        resets_at: Option<i64>,
+    },
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
     /// row — the climbing streak toward the dead-credential threshold (issue #42).
     /// Emitted per 401 while the account is still healthy; once it crosses
@@ -815,6 +838,21 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=all_exhausted hold={hold} cause={cause}{resets}")
+            }
+            Event::ActiveDeadNoTarget {
+                hold,
+                cause,
+                resets_at,
+            } => {
+                // Same `key=val` grammar as `all_exhausted` (its strictly-worse sibling, #405):
+                // `cause` required after `hold`, `resets_at` trailing + optional (an empty value
+                // would split the grammar).
+                let cause = cause.as_str();
+                let resets = match resets_at {
+                    Some(secs) => format!(" resets_at={}", rfc3339(system_time_from_epoch(*secs))),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=active_dead_no_target hold={hold} cause={cause}{resets}")
             }
             Event::Monitor401 {
                 account,
@@ -1416,6 +1454,12 @@ pub(crate) enum Diagnostic {
     /// "all exhausted" reading from an earlier episode can be told from a current
     /// one (the very confusion that motivated #77).
     AllExhaustedCleared,
+    /// The daemon LEFT the active-dead-no-target strand (issue #405): the dead active
+    /// recovered (re-login / spontaneous revive) or a live target became reachable
+    /// again. The edge-triggered LEAVE marker — the symmetric partner of the event
+    /// log's edge-triggered `active_dead_no_target` ENTER, mirroring
+    /// [`Self::AllExhaustedCleared`] — so a stale strand reading is told from a current one.
+    ActiveDeadNoTargetCleared,
 }
 
 impl Diagnostic {
@@ -1473,6 +1517,9 @@ impl Diagnostic {
                 format!("ts={ts} diag=tick decision={decision}{backoff}{retry_after}")
             }
             Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
+            Diagnostic::ActiveDeadNoTargetCleared => {
+                format!("ts={ts} diag=active_dead_no_target_cleared")
+            }
         }
     }
 }
@@ -1654,6 +1701,38 @@ mod tests {
             present,
             format!(
                 "{TS0} event=all_exhausted hold=work cause=session resets_at=2026-06-30T00:00:00Z"
+            )
+        );
+    }
+
+    #[test]
+    fn active_dead_no_target_mirrors_all_exhausted_grammar_and_omits_an_absent_reset() {
+        // #405: the strictly-worse sibling of `all_exhausted` renders the SAME `key=val` grammar —
+        // `hold` (the dead active), a required `cause`, and a trailing OPTIONAL `resets_at`. On the
+        // emergency (dead-active) path the cause is always weekly (the session gate is bypassed).
+        let absent = Event::ActiveDeadNoTarget {
+            hold: "work".to_owned(),
+            cause: SwapReason::Weekly,
+            resets_at: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            absent,
+            format!("{TS0} event=active_dead_no_target hold=work cause=weekly")
+        );
+        assert!(!absent.contains("resets_at"), "got: {absent}");
+
+        // A known spare weekly reset (epoch → RFC 3339 by the same formatter) trails the line.
+        let present = Event::ActiveDeadNoTarget {
+            hold: "work".to_owned(),
+            cause: SwapReason::Weekly,
+            resets_at: Some(1_782_777_600),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            present,
+            format!(
+                "{TS0} event=active_dead_no_target hold=work cause=weekly resets_at=2026-06-30T00:00:00Z"
             )
         );
     }
@@ -2171,6 +2250,11 @@ mod tests {
                 session_pct: 97,
             },
             Event::AllExhausted {
+                hold: "work".to_owned(),
+                cause: SwapReason::Weekly,
+                resets_at: Some(1_782_777_600),
+            },
+            Event::ActiveDeadNoTarget {
                 hold: "work".to_owned(),
                 cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
@@ -2854,6 +2938,15 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
+    fn active_dead_no_target_cleared_line_is_bare() {
+        // #405: the strand's LEAVE marker, mirroring `all_exhausted_cleared` — a bare edge token.
+        assert_eq!(
+            Diagnostic::ActiveDeadNoTargetCleared.to_log_line(at_epoch(0)),
+            format!("{TS0} diag=active_dead_no_target_cleared")
+        );
+    }
+
+    #[test]
     fn no_diagnostic_line_carries_an_email_or_token_sigil() {
         // #15: every diagnostic field is a handle / enum / number / timestamp, so a
         // token or email can never reach a rendered line. Mirrors the event-log guard.
@@ -2879,6 +2972,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 retry_after_secs: Some(3600),
             },
             Diagnostic::AllExhaustedCleared,
+            Diagnostic::ActiveDeadNoTargetCleared,
         ];
         for diag in &diags {
             let line = diag.to_log_line(at_epoch(0));

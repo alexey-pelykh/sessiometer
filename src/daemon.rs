@@ -136,8 +136,8 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, NextSwap, NextSwapReason, SchemaVersion, StatusResponse, StatusSnapshot,
-    VersionedStatus, STATUS_SCHEMA_VERSION,
+    AccountStatusLine, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
+    StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -1139,6 +1139,14 @@ struct DecisionState {
     /// ONCE per all-exhausted episode — not once per poll while every account
     /// stays exhausted — and fires afresh if the state clears and is re-entered.
     signaled_all_exhausted: bool,
+    /// Edge-trigger guard for the active-dead-no-target strand signal (issue #405):
+    /// set when an `active_dead_no_target` event is emitted (the emergency path found
+    /// no live target for a DEAD active), cleared by [`Daemon::tick`] on any cycle
+    /// that is NOT that strand. So the signal fires exactly ONCE per strand episode —
+    /// not once per emergency tick while every spare stays weekly-exhausted — and
+    /// fires afresh if the strand clears and is re-entered. The strictly-worse sibling
+    /// of `signaled_all_exhausted`, mirroring its edge-trigger idiom exactly.
+    signaled_active_dead_no_target: bool,
     /// The out-of-band canonical-change detector (issue #13 re-auth re-stash):
     /// tracks the last *committed* canonical credential so a rewrite by something
     /// other than the daemon — a `claude /login` re-auth, or a silent in-place
@@ -1839,6 +1847,17 @@ where
                 diagnostics.push(Diagnostic::AllExhaustedCleared);
             }
             self.state.signaled_all_exhausted = false;
+        }
+        // The matching LEAVE edge for the active-dead-no-target strand (issue #405), mirroring
+        // the `all_exhausted` clear above: any cycle that is NOT the strand clears the guard, and
+        // a still-set guard on that cycle means we are LEAVING the strand — push the
+        // `active_dead_no_target_cleared` marker BEFORE the reset, so a re-entry signals afresh and
+        // a stale strand reading is told from a current one.
+        if !matches!(action, TickAction::ActiveDeadNoTarget) {
+            if self.state.signaled_active_dead_no_target {
+                diagnostics.push(Diagnostic::ActiveDeadNoTargetCleared);
+            }
+            self.state.signaled_active_dead_no_target = false;
         }
         // The rate-limit / transient back-off is PER-ACCOUNT now (issue #293): it is
         // applied by skipping the throttled account's own poll above (`account_backing_off`
@@ -3346,6 +3365,37 @@ where
             f64::INFINITY,
             weekly_trigger,
         ) else {
+            // No live spare to escape to — the dead active is STRANDED (issue #405). The
+            // reserve and the session gate were both bypassed above, so reaching here means
+            // every live spare is weekly-exhausted; the daemon holds on the dead active. Emit
+            // ONE edge-triggered durable event (the strictly-worse sibling of `all_exhausted`,
+            // which until now returned SILENTLY) naming the dead active held and WHEN weekly
+            // relief arrives — so the operator sees the real blocker, not just the dead active's
+            // `claude /login` cue. Edge-triggered: emit only on ENTERING the strand (mirrors
+            // `signaled_all_exhausted`), so the payload is computed once per episode, not per tick.
+            if !self.state.signaled_active_dead_no_target {
+                // Reuse `all_exhausted_relief` — it already excludes the active index by masking
+                // (the dead active's reading is `None` on this branch, its precondition), so it
+                // works unchanged when the active IS the dead one. `session_ceiling = INFINITY`
+                // because the emergency path bypasses the session gate: relief here is NEVER a
+                // session reset (a weekly-viable-but-session-blocked spare would have been picked),
+                // so the classification correctly falls to the weekly-wide branch.
+                let (cause, _hold, resets_at) = all_exhausted_relief(
+                    active_idx,
+                    readings,
+                    &self.enabled_mask(),
+                    f64::INFINITY,
+                    weekly_trigger,
+                );
+                events.push(Event::ActiveDeadNoTarget {
+                    // The DEAD active's label — the account the daemon is stuck on, and the
+                    // `claude /login` target (issue #405); NEVER a token/email (#15).
+                    hold: self.roster[active_idx].label.clone(),
+                    cause,
+                    resets_at,
+                });
+                self.state.signaled_active_dead_no_target = true;
+            }
             return TickAction::ActiveDeadNoTarget;
         };
         // #6 is no-half-swap: an error (including a fail-closed contended swap lock,
@@ -3431,7 +3481,32 @@ where
         Some(if any_other_enabled && all_unpolled {
             NextSwap::AwaitingData
         } else {
-            NextSwap::NoViableTarget
+            // Carry the fleet-capacity RELIEF hint (issue #405) so the status footer can say WHY the
+            // fleet is blocked and WHEN capacity returns, instead of a content-free "no viable
+            // target". Uses the SAME `all_exhausted_relief` classification the durable events do,
+            // with the PROACTIVE session ceiling (`min(session_trigger_base, target_max_usage)`) so
+            // it agrees with the base-trigger `pick_target_with_reason` verdict just above (the
+            // snapshot keys off the BASE, un-jittered triggers — #88 — so the footer never flickers
+            // with the per-cycle swap-decision jitter). Covers BOTH the active-alive-and-over-trigger
+            // and the active-DEAD-and-stranded cases: a dead active leaves every live spare
+            // weekly-exhausted, so relief classifies `Weekly` here while the dead active's 🔴 health
+            // rides its own account row (the composite an operator needs — issue #405).
+            let session_ceiling = self.session_trigger_base.min(self.target_max_usage);
+            let (cause, _hold, resets_at) = all_exhausted_relief(
+                active_idx,
+                readings,
+                &enabled,
+                session_ceiling,
+                self.weekly_trigger_base,
+            );
+            let cause = match cause {
+                SwapReason::Session => Some(NoTargetCause::Session),
+                SwapReason::Weekly => Some(NoTargetCause::Weekly),
+                // `all_exhausted_relief` only ever classifies Session|Weekly; the operator-swap
+                // reasons (Manual / Forced) cannot arise from a no-target verdict.
+                SwapReason::Manual | SwapReason::Forced => None,
+            };
+            NextSwap::NoViableTarget { cause, resets_at }
         })
     }
 
@@ -10851,15 +10926,19 @@ mod tests {
         assert!(!json.contains('@'));
         assert!(!json.to_lowercase().contains("token"));
 
-        // The two no-candidate verdicts project as bare reasons (no label at all), so
-        // the client can tell `no viable target` from `awaiting usage data`.
+        // The two no-candidate verdicts project without a label, so the client can tell
+        // `no viable target` from `awaiting usage data`. `no_viable_target` now carries the #405
+        // fleet-capacity relief hint (`cause` + `resets_at`), projected straight to the wire.
         let no_target = StatusSnapshot {
-            next_swap: Some(NextSwap::NoViableTarget),
+            next_swap: Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: Some(1_893_800_500),
+            }),
             ..Default::default()
         };
         assert!(serde_json::to_string(&status_response(&no_target))
             .unwrap()
-            .contains("\"next_swap\":{\"state\":\"no_viable_target\"}"));
+            .contains(r#""next_swap":{"state":"no_viable_target","cause":"weekly","resets_at":1893800500}"#));
         let awaiting = StatusSnapshot {
             next_swap: Some(NextSwap::AwaitingData),
             ..Default::default()
@@ -10876,6 +10955,48 @@ mod tests {
         let json = serde_json::to_string(&status_response(&none)).unwrap();
         assert!(json.contains("\"next_swap\":null"), "got {json}");
         assert!(!json.contains("last_swap"), "got {json}");
+    }
+
+    #[test]
+    fn no_viable_target_relief_round_trips_and_its_absence_still_parses() {
+        // #405 / schema 1.2 → 1.3: the fleet-capacity relief payload on `no_viable_target`
+        // round-trips, and a PRE-#405 wire (the fields absent) still decodes to a bare no-target —
+        // the additive minor-bump forward-compat both media rest on.
+        let with_relief = NextSwap::NoViableTarget {
+            cause: Some(NoTargetCause::Weekly),
+            resets_at: Some(1_893_800_500),
+        };
+        let json = serde_json::to_string(&with_relief).unwrap();
+        assert_eq!(
+            json,
+            r#"{"state":"no_viable_target","cause":"weekly","resets_at":1893800500}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<NextSwap>(&json).unwrap(),
+            with_relief
+        );
+
+        // A current daemon that found no parseable reset: `cause` present, `resets_at` null.
+        let no_reset = NextSwap::NoViableTarget {
+            cause: Some(NoTargetCause::Session),
+            resets_at: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&no_reset).unwrap(),
+            r#"{"state":"no_viable_target","cause":"session","resets_at":null}"#
+        );
+
+        // ABSENCE still parses: a pre-#405 daemon omits BOTH fields → both `None`. An OLD client
+        // tolerates the NEW daemon by ignoring the added keys; a NEW client tolerates the OLD daemon
+        // by defaulting the absent ones (`#[serde(default)]`, mirrored by Swift `decodeIfPresent`).
+        let bare: NextSwap = serde_json::from_str(r#"{"state":"no_viable_target"}"#).unwrap();
+        assert_eq!(
+            bare,
+            NextSwap::NoViableTarget {
+                cause: None,
+                resets_at: None
+            }
+        );
     }
 
     // --- the frozen versioned wire contract (issue #164) -----------------------
@@ -10906,7 +11027,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":2}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":3}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -10949,7 +11070,10 @@ mod tests {
                 active: true,
                 ..Default::default()
             }],
-            next_swap: Some(NextSwap::NoViableTarget),
+            next_swap: Some(NextSwap::NoViableTarget {
+                cause: None,
+                resets_at: None,
+            }),
             refresh_enabled: false,
         };
         let wire = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
@@ -10957,7 +11081,13 @@ mod tests {
         assert_eq!(bare.accounts.len(), 1);
         assert_eq!(bare.accounts[0].label, "work");
         assert!(bare.accounts[0].active);
-        assert_eq!(bare.next_swap, Some(NextSwap::NoViableTarget));
+        assert_eq!(
+            bare.next_swap,
+            Some(NextSwap::NoViableTarget {
+                cause: None,
+                resets_at: None
+            })
+        );
     }
 
     #[test]
@@ -11287,22 +11417,32 @@ mod tests {
         );
 
         // Readings in hand but none viable (both over the 0.80 target-max-usage) → a
-        // genuine no-viable-target verdict, NOT awaiting-data.
+        // genuine no-viable-target verdict, NOT awaiting-data. Both spares are weekly-VIABLE
+        // (0.10 < 0.98) yet over the session ceiling (`min(0.95, 0.80)` = 0.80), so the fleet
+        // is blocked only by SESSION — the footer relief carries `Session` (issue #405). No
+        // parseable session reset in these readings → `resets_at` is `None`.
         assert_eq!(
             daemon.next_swap(
                 Some(0),
                 &[usage(0.97, 0.40), usage(0.95, 0.10), usage(0.90, 0.10)]
             ),
-            Some(NextSwap::NoViableTarget),
+            Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Session),
+                resets_at: None
+            }),
         );
 
-        // Every other account weekly-exhausted (>= 0.98 base) → no viable target.
+        // Every other account weekly-exhausted (>= 0.98 base) → no viable target; the block is
+        // WEEKLY-wide, so the relief carries `Weekly` (issue #405). No parseable weekly reset here.
         assert_eq!(
             daemon.next_swap(
                 Some(0),
                 &[usage(0.97, 0.40), usage(0.10, 0.99), usage(0.10, 0.99)]
             ),
-            Some(NextSwap::NoViableTarget),
+            Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: None
+            }),
         );
 
         // No reading for any other account yet — the post-restart moment #88 exists to
@@ -11320,7 +11460,10 @@ mod tests {
         // poll. Pins the deliberate all-vs-any choice (an `&=`→`=` mutation flips this).
         assert_eq!(
             daemon.next_swap(Some(0), &[usage(0.97, 0.40), usage(0.95, 0.10), None]),
-            Some(NextSwap::NoViableTarget),
+            Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Session),
+                resets_at: None
+            }),
         );
 
         // No active anchor to swap from → no candidate at all (renders a bare `none`).
@@ -11353,9 +11496,14 @@ mod tests {
         // would pass them) → no viable target, NOT awaiting-data.
         daemon.state.health[1].quarantined = true;
         daemon.state.health[2].quarantined = true;
+        // Every other reading masked to `None` → relief falls to the WEEKLY-wide default with no
+        // parseable reset (the per-account 🔴 health names the re-login remedy on each row; #405).
         assert_eq!(
             daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
-            Some(NextSwap::NoViableTarget),
+            Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: None
+            }),
         );
 
         // Revive one: a live, not-yet-polled other account restores the genuine
@@ -15058,10 +15206,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dead_active_account_with_no_viable_target_holds_silently() {
-        // Emergency-swap with nowhere to go: a dead active account whose only other
-        // account is also unavailable holds (`ActiveDeadNoTarget`) without thrashing
-        // — and silently, because `credential_dead` already fired on the transition.
+    async fn a_dead_active_account_with_no_viable_target_signals_the_strand_once() {
+        // Emergency-swap with nowhere to go: a dead active account whose only other account is
+        // also unavailable holds (`ActiveDeadNoTarget`) without thrashing — and now SURFACES the
+        // strand once (issue #405), the strictly-worse sibling of `all_exhausted`, which until now
+        // returned SILENTLY (the `credential_dead` transition already fired, but nothing named the
+        // fleet-capacity blocker or when it lifts).
         let mut daemon = lifecycle_daemon().await;
         let at = daemon.clock.now();
         daemon.state.active = Some(0);
@@ -15075,11 +15225,70 @@ mod tests {
             .await;
 
         assert_eq!(action, TickAction::ActiveDeadNoTarget);
-        assert!(
-            events.is_empty(),
-            "the stuck dead-active state re-signals nothing: {events:?}"
+        // ONE edge-triggered durable event names the DEAD active held (the re-login target) and WHY
+        // relief is blocked (`weekly` — the emergency path bypasses the session gate, so a
+        // session-only block cannot arise). No spare reported a weekly reset → `resets_at` absent.
+        // (Secret-freeness is covered exhaustively by the observability redaction scanner.)
+        assert_eq!(
+            events,
+            vec![Event::ActiveDeadNoTarget {
+                hold: "work".to_owned(),
+                cause: SwapReason::Weekly,
+                resets_at: None,
+            }]
         );
         assert_eq!(daemon.state.active, Some(0), "no swap with no target");
+
+        // Edge-triggered: a SECOND identical tick re-signals NOTHING (the latch is set), so the
+        // strand does not spam the log once per emergency tick while every spare stays exhausted.
+        let mut again = Vec::new();
+        let action = daemon
+            .decide_action(at, Some(0), &readings, &mut again)
+            .await;
+        assert_eq!(action, TickAction::ActiveDeadNoTarget);
+        assert!(
+            again.is_empty(),
+            "the stuck strand re-signals nothing on repeat: {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_the_active_dead_no_target_strand_emits_the_cleared_marker_once() {
+        // The matching LEAVE edge (issue #405), mirroring `all_exhausted_cleared`: once the strand
+        // clears (the dead active recovered, or a target became reachable), the daemon emits ONE
+        // `active_dead_no_target_cleared` and resets the guard — so a stale strand reading is told
+        // from a current one. A healthy active can never itself strand, so ANY tick here leaves it.
+        let mut daemon = lifecycle_daemon().await;
+        // Simulate having entered the strand on a prior episode.
+        daemon.state.signaled_active_dead_no_target = true;
+
+        let first = daemon.tick().await;
+        assert_ne!(
+            first.action,
+            TickAction::ActiveDeadNoTarget,
+            "a healthy active never strands"
+        );
+        assert!(
+            first
+                .diagnostics
+                .contains(&Diagnostic::ActiveDeadNoTargetCleared),
+            "leaving the strand emits the cleared marker: {:?}",
+            first.diagnostics
+        );
+        assert!(
+            !daemon.state.signaled_active_dead_no_target,
+            "the guard is reset on exit"
+        );
+
+        // Edge-triggered: a subsequent non-strand tick does NOT re-emit the cleared marker.
+        let second = daemon.tick().await;
+        assert!(
+            !second
+                .diagnostics
+                .contains(&Diagnostic::ActiveDeadNoTargetCleared),
+            "the LEAVE edge fires once, not every non-strand tick: {:?}",
+            second.diagnostics
+        );
     }
 
     #[tokio::test]
@@ -15966,6 +16175,13 @@ mod tests {
         assert!(
             corpus.contains("event=credential_dead account=work"),
             "log channel: credential_dead event missing"
+        );
+        assert!(
+            // Issue #405: on the dead-active tick the escape target is not yet polled, so the
+            // emergency path strands and emits the durable `active_dead_no_target` event through
+            // the real daemon path — proving the #15 secret-scan below covers it non-vacuously.
+            corpus.contains("event=active_dead_no_target hold=work cause=weekly"),
+            "log channel: active_dead_no_target event missing"
         );
         assert!(
             corpus.contains("event=emergency_swap from=work to=spare"),
