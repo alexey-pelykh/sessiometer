@@ -226,6 +226,20 @@ const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 /// immediate burst of usage requests. Small enough to stay responsive on launch.
 const STARTUP_DELAY_CAP: f64 = 30.0;
 
+/// Maximum autonomous scrubbed-canonical adopt-target recoveries (issue #467) within one
+/// [`SCRUB_ADOPT_WINDOW`] before the daemon BACKS OFF. An isolated scrub is healed at once; only a
+/// rapid re-scrub cluster — the canonical getting emptied again right after each adopt (a persistent
+/// multi-session rotation churn) — trips the bound, after which the daemon holds and surfaces the
+/// stuck state (the durable `canonical_recovery_exhausted` event + #469's status/menubar signal)
+/// rather than thrashing a re-auth loop.
+const SCRUB_ADOPT_MAX: u32 = 3;
+/// The rolling window over which [`SCRUB_ADOPT_MAX`] autonomous adopts are counted (issue #467).
+/// Sized comfortably above a few adopt→re-scrub cycles at the default 5-minute poll cadence
+/// ([`crate::config`] `DEFAULT_POLL_SECS` = 300) so a genuine churn burst is contained within one
+/// window, yet short enough that a fresh, isolated scrub an hour later opens a new episode and is
+/// healed immediately. On expiry the counter resets and autonomous recovery resumes.
+const SCRUB_ADOPT_WINDOW: Duration = Duration::from_secs(3600);
+
 /// Shutdown seam: resolves when a graceful stop has been requested. Behind a seam
 /// so the loop's stop path is driven deterministically in tests (a real
 /// implementation waits on SIGINT / SIGTERM).
@@ -941,6 +955,13 @@ pub(crate) enum TickAction {
     /// so this state is silent (no repeat-spam). The dead-credential cousin of
     /// [`NoViableTarget`](Self::NoViableTarget).
     ActiveDeadNoTarget,
+    /// The shared canonical `Claude Code-credentials` item was scrubbed/empty (Claude Code's
+    /// first-`invalid_grant` scrub, ADR-0018) and the daemon AUTONOMOUSLY adopted a viable roster
+    /// account (roster index `to`) into it — healing every local `claude` session on its next
+    /// request with no operator action (issue #467). The narrow ADR-0007 decision-4 carve-out: a
+    /// scrubbed canonical WITH a live target, distinct from the genuinely-all-dead
+    /// [`ActiveDeadNoTarget`](Self::ActiveDeadNoTarget) that still needs a manual `claude /login`.
+    CanonicalAdopted { to: usize },
     /// Active is over the trigger but no other account is a viable target: every
     /// other account is weekly-exhausted (or, with the opt-in target-max-session-usage
     /// enabled, all over it). The all-exhausted terminal state (#11) — the loop
@@ -976,6 +997,7 @@ impl TickAction {
             TickAction::Swapped { .. } => DecisionClass::Swap,
             TickAction::EmergencySwapped { .. } => DecisionClass::EmergencySwap,
             TickAction::ActiveDeadNoTarget => DecisionClass::ActiveDeadNoTarget,
+            TickAction::CanonicalAdopted { .. } => DecisionClass::CanonicalAdopted,
             TickAction::NoViableTarget => DecisionClass::AllExhausted,
             TickAction::SkippedActiveUnknown => DecisionClass::SkipActiveUnknown,
             TickAction::SkippedActiveUnavailable => DecisionClass::SkipActiveUnavailable,
@@ -1238,6 +1260,22 @@ struct DecisionState {
     /// `None` until the first Present observation seeds it, and reset to `None` on a scrub (so the next
     /// Present re-seeds without a false yank across the recovery edge).
     prev_canonical_fingerprint: Option<String>,
+    /// Count of autonomous scrubbed-canonical adopt-target recoveries (issue #467) within the current
+    /// churn window — the bound against a re-auth thrash loop when the canonical keeps getting
+    /// re-scrubbed right after each adopt. Incremented only on a LANDED adopt; reset to `0` when
+    /// [`scrub_adopt_window_start`](Self::scrub_adopt_window_start) is older than [`SCRUB_ADOPT_WINDOW`].
+    /// Once it reaches [`SCRUB_ADOPT_MAX`] the daemon backs off (holds + surfaces) for the rest of the
+    /// window. Default `0`.
+    scrub_adopt_count: u32,
+    /// When the current scrub-adopt churn window opened (issue #467): set on the FIRST adopt of an
+    /// episode, used to age out [`scrub_adopt_count`](Self::scrub_adopt_count) after
+    /// [`SCRUB_ADOPT_WINDOW`]. On the same monotonic clock as the tick's `at`. `None` between episodes.
+    scrub_adopt_window_start: Option<Instant>,
+    /// Edge-trigger guard for the scrub-adopt back-off signal (issue #467): set when a
+    /// `canonical_recovery_exhausted` event is emitted (the adopt bound was hit), cleared when the
+    /// churn window resets — so the back-off fires exactly ONCE per episode, not once per held tick
+    /// while the canonical stays scrubbed. Mirrors `signaled_all_exhausted`.
+    signaled_scrub_adopt_exhausted: bool,
     /// Last-known usage reading per roster account (issue #80), indexed by roster
     /// position. The daemon polls ONE account per tick (staggered, the active
     /// interleaved before each peer — #366), so a decision is taken on the most recent
@@ -1801,7 +1839,7 @@ where
         // "Not logged in" scrub is diagnosable from `sessiometer.log` alone, even when no
         // `credential_dead` fires (umbrella #463). Reuses the canonical already read above (no
         // extra keychain read) and the just-resolved `active` for the handle.
-        self.note_canonical_liveness(
+        let canonical_liveness = self.note_canonical_liveness(
             canonical.as_ref(),
             canonical_absent,
             active,
@@ -1958,7 +1996,23 @@ where
         // (disabled / quarantined) non-active account back to `None` so its stale
         // carried value can never become a swap target (issue #80).
         let readings = self.decision_readings(active);
-        let action = self.decide_action(at, active, &readings, &mut events).await;
+        // Issue #467: a SCRUBBED / empty shared canonical (Claude Code's first-`invalid_grant` scrub,
+        // ADR-0018) locks out every local `claude` session. If a viable target exists, autonomously
+        // adopt its token into the emptied canonical — the narrow ADR-0007 decision-4 carve-out —
+        // healing the fleet on the next request with no operator action. No viable target (or the
+        // churn bound already hit) falls THROUGH to the normal decision, so the genuinely-all-dead
+        // `active_dead_no_target` / surfaced scrub signal stands — never a silent adopt churn.
+        let action = if matches!(canonical_liveness, CanonicalLiveness::Scrubbed) {
+            match self
+                .recover_scrubbed_canonical(active, &readings, at, &mut events)
+                .await
+            {
+                Some(recovered) => recovered,
+                None => self.decide_action(at, active, &readings, &mut events).await,
+            }
+        } else {
+            self.decide_action(at, active, &readings, &mut events).await
+        };
         // Edge-trigger the all-exhausted signal (issue #11): clear the guard
         // whenever this cycle is NOT the no-viable-target state, so a later
         // re-entry signals afresh. `decide_action` sets the guard (and emits once)
@@ -2998,6 +3052,27 @@ where
         .await
     }
 
+    /// Run one out-of-band [`swap::adopt_target`] recovery (issue #467), serialized by the
+    /// single-writer swap lock (#64) when configured — the adopt counterpart of
+    /// [`locked_swap`](Self::locked_swap). UNLIKE a swap it does NOT re-stash an outgoing account
+    /// (the canonical is scrubbed / empty — there is nothing to re-stash); it only installs the
+    /// incoming account's token via the atomic `-U` write, honouring the no-torn-swap invariant
+    /// (ADR-0003). SAFETY is enforced inside the engine: a LOCKED / unreadable keychain aborts with
+    /// ZERO writes ("locked ≠ gone"), and the incoming stash is read before any mutation. With no
+    /// lock configured (hermetic tests) it runs unlocked — no second in-process writer to serialize.
+    async fn locked_adopt(&self, incoming: &str) -> Result<swap::SwapReport> {
+        swap::adopt_target_locked(
+            self.swap_lock_path
+                .as_deref()
+                .map(|path| (path, swap::SWAP_LOCK_MAX_WAIT)),
+            &self.store,
+            &self.stash,
+            incoming,
+            &self.claude_json,
+        )
+        .await
+    }
+
     /// Drop an in-flight recovery probe on an account that just LEFT the active slot
     /// via a manual `use` swap (issue #108). The spontaneous-revival recovery in
     /// [`note_poll_outcome`](Self::note_poll_outcome) advances ONLY while an account is
@@ -3573,6 +3648,120 @@ where
         }
     }
 
+    /// Autonomously recover a SCRUBBED / empty shared canonical (issue #467) — the ADR-0018
+    /// decision-1 mitigation. When Claude Code empties the shared `Claude Code-credentials` item on
+    /// its first `invalid_grant` (the fleet-wide "Not logged in" lockout, ADR-0018), the daemon
+    /// installs a VIABLE roster account's token back into the canonical via [`swap::adopt_target`],
+    /// so every live `claude` session re-reads a usable credential on its next request — no operator
+    /// `claude /login`.
+    ///
+    /// The narrow carve-out from ADR-0007 decision 4: recovery for a scrubbed canonical is
+    /// otherwise `use --force`-gated and the autonomous daemon never adopts; this relaxes the gate
+    /// ONLY for the scrubbed-**with-a-live-target** case. A genuinely-all-dead roster (no viable
+    /// target) is NOT this case — it returns `None` and falls through to the existing
+    /// `active_dead_no_target` / surfaced scrub signal, which still needs a manual `/login`
+    /// (ADR-0007 decision 4 / ADR-0016), never a silent adopt churn.
+    ///
+    /// Target selection mirrors [`emergency_swap`](Self::emergency_swap): [`pick_target`] with the
+    /// weekly-viability filter but the session gate and reserve bypassed (`f64::INFINITY` / `None`) —
+    /// liveness beats session headroom when the whole fleet is locked out. The active account is
+    /// EXCLUDED (`pick_target`'s always-on `i != active`): a scrubbed active is polled through the
+    /// now-empty canonical, so its reading is unreliable, whereas a spare is polled through its OWN
+    /// stash and is therefore a KNOWN-live token to adopt. An UNRESOLVED active
+    /// (`usize::MAX` sentinel — no roster index equals it) excludes nothing, so every account is a
+    /// candidate.
+    ///
+    /// BOUNDED against a re-auth thrash loop: at most [`SCRUB_ADOPT_MAX`] LANDED adopts per
+    /// [`SCRUB_ADOPT_WINDOW`]. On the bound the daemon backs off — emits one edge-triggered
+    /// [`Event::CanonicalRecoveryExhausted`] and holds — leaving the `canonical_scrubbed` signal up
+    /// for the operator (status / menubar, #469) rather than churning. The window ages out on its
+    /// own clock, so an isolated scrub an hour later opens a fresh episode and heals at once.
+    ///
+    /// Returns `Some(TickAction::CanonicalAdopted { to })` on a landed adopt (this cycle's decision
+    /// IS the recovery), else `None` to fall through to [`decide_action`](Self::decide_action).
+    async fn recover_scrubbed_canonical(
+        &mut self,
+        active: Option<usize>,
+        readings: &[Option<Usage>],
+        at: Instant,
+        events: &mut Vec<Event>,
+    ) -> Option<TickAction> {
+        // Age out the churn window: once the FIRST adopt of an episode is older than the window, open
+        // a fresh episode (counter + back-off latch reset), so an isolated scrub later heals at once.
+        // Elapsing is the ONLY reset — deliberately NOT an observed recovery (a top-of-tick canonical
+        // Present): under a SLOW re-scrub churn (each adopt survives a poll or two before CC re-scrubs)
+        // a reset-on-Present would clear the counter every episode and defeat the bound — the exact
+        // re-auth thrash AC4/#467 exists to cap.
+        if let Some(start) = self.state.scrub_adopt_window_start {
+            if at.saturating_duration_since(start) >= SCRUB_ADOPT_WINDOW {
+                self.state.scrub_adopt_count = 0;
+                self.state.scrub_adopt_window_start = None;
+                self.state.signaled_scrub_adopt_exhausted = false;
+            }
+        }
+
+        // Bound reached: BACK OFF rather than thrash the re-auth loop. Emit the durable back-off
+        // signal ONCE per episode (edge-triggered) and fall through — `canonical_scrubbed` already
+        // surfaces the stuck state for the operator (#469).
+        if self.state.scrub_adopt_count >= SCRUB_ADOPT_MAX {
+            if !self.state.signaled_scrub_adopt_exhausted {
+                events.push(Event::CanonicalRecoveryExhausted {
+                    account: active.map(|i| self.roster[i].label.clone()),
+                });
+                self.state.signaled_scrub_adopt_exhausted = true;
+            }
+            return None;
+        }
+
+        // Pick a VIABLE target with the emergency-path filter (mirroring `emergency_swap`): the
+        // weekly-exhaustion + enabled + not-active filter, but the session gate and reserve bypassed
+        // (`f64::INFINITY` / `None`) — the whole fleet is locked out, so liveness beats headroom. No
+        // viable target → `None`, falling through to the surfaced-signal path (never a churn).
+        let weekly_trigger = self.weekly_trigger_strategy.draw(
+            &mut self.rng,
+            WEEKLY_TRIGGER_PCT_LO,
+            WEEKLY_TRIGGER_PCT_HI,
+        ) / 100.0;
+        let target_idx = pick_target(
+            active.unwrap_or(usize::MAX),
+            readings,
+            &self.enabled_mask(),
+            None,
+            f64::INFINITY,
+            weekly_trigger,
+        )?;
+
+        // Install the target into the scrubbed canonical, lock-wrapped (#64). SAFETY holds inside the
+        // engine (ADR-0003): a LOCKED / unreadable keychain aborts with ZERO writes ("locked ≠
+        // gone"), the incoming stash is read before any mutation, and the canonical write is the
+        // atomic `-U` upsert (a concurrent reader sees the empty item then the adopted credential,
+        // never a torn blob). A concurrent WRITER — a `claude /login` landing a live token in the
+        // sub-tick window — is overwritten here by the known-live target: accepted last-writer-wins
+        // (ADR-0003 reconcile; ADR-0018 is reactive, not preventive), harmless as the fleet stays live
+        // and the window is a single tick's synchronous ms. #6 no-half-swap: a lock-busy / write error
+        // leaves the canonical un-torn and is retried next cycle — do NOT count it toward the bound (no
+        // adopt landed) and fall through to the normal decision this tick.
+        let incoming = self.roster[target_idx].stash();
+        match self.locked_adopt(&incoming).await {
+            Ok(_report) => {
+                // Adopt the swapped-in account exactly as a swap does: set it active, arm the
+                // post-swap cooldown, drop the departed pre-blind anchor, and COMMIT the write to the
+                // canonical_watch so the daemon's OWN adopt is not re-detected as an out-of-band
+                // `/login` (issue #13).
+                self.record_swap(target_idx, &incoming, at).await;
+                if self.state.scrub_adopt_window_start.is_none() {
+                    self.state.scrub_adopt_window_start = Some(at);
+                }
+                self.state.scrub_adopt_count += 1;
+                events.push(Event::CanonicalRecovered {
+                    account: self.roster[target_idx].label.clone(),
+                });
+                Some(TickAction::CanonicalAdopted { to: target_idx })
+            }
+            Err(_) => None,
+        }
+    }
+
     /// The forward-looking next-swap candidate for the `status` display (issue #88):
     /// who [`pick_target`] would choose right now, or why there is no candidate. THE
     /// candidate is computed daemon-side — the CLI never re-derives the selection rule
@@ -3861,6 +4050,10 @@ where
     /// — never a token or email (issue #15). Present/empty and the fingerprint both key off the
     /// single audited [`crate::refresh::refresh_token`] extractor — the same discipline
     /// [`has_live_refresh_token`] follows — so the emptiness rule lives in one place.
+    ///
+    /// RETURNS the classified [`CanonicalLiveness`] so the tick can react to a `Scrubbed` reading —
+    /// the autonomous adopt-target recovery (issue #467) heals a scrubbed canonical when a viable
+    /// target exists, off the same single audited emptiness rule this uses for the edge trigger.
     fn note_canonical_liveness(
         &mut self,
         canonical: Option<&Credential>,
@@ -3868,7 +4061,7 @@ where
         active: Option<usize>,
         events: &mut Vec<Event>,
         diagnostics: &mut Vec<Diagnostic>,
-    ) {
+    ) -> CanonicalLiveness {
         let handle = active.map(|i| self.roster[i].label.clone());
         let (state, fingerprint, expires_at) = match canonical {
             Some(cred) => {
@@ -3954,6 +4147,8 @@ where
             }
             CanonicalLiveness::Unknown => {}
         }
+
+        state
     }
 
     /// Recompute every account's 5-state credential-health rollup (issue #119) against
@@ -9794,6 +9989,234 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tick_adopts_a_viable_target_into_a_scrubbed_canonical() {
+        // Issue #467 AC1: an emptied canonical with a viable roster account → the daemon installs
+        // that account's token and emits a recovery event, with NO operator action — so a live
+        // session recovers on its next request. The narrow ADR-0007 d4 carve-out (ADR-0018 d1): a
+        // scrubbed canonical WITH a live target is not `active_dead_no_target`.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.40) // active, below trigger → warm-up holds, no swap
+            .ok("u-B", 0.10, 0.20) // viable spare — earliest index, so the pick
+            .ok("u-C", 0.15, 0.25); // viable spare
+        let mut daemon = three_account_daemon(poller).await;
+        // Warm-up runs on the opaque canonical (`refresh_token` can't parse `b"A-token"` → liveness
+        // UNKNOWN, never Scrubbed), so the recovery branch is NOT taken and nothing is adopted.
+        let warm = warmed_tick(&mut daemon).await;
+        assert!(
+            !matches!(warm.action, TickAction::CanonicalAdopted { .. }),
+            "an UNKNOWN-liveness (non-scrubbed) canonical never triggers an adopt: {:?}",
+            warm.action
+        );
+        assert_eq!(daemon.state.active, Some(0));
+
+        // Claude Code scrubs the shared canonical to empty on its first `invalid_grant` (ADR-0018).
+        daemon.store.set_not_found(true);
+        let outcome = daemon.tick().await;
+
+        assert_eq!(outcome.action, TickAction::CanonicalAdopted { to: 1 });
+        assert!(
+            outcome.events.contains(&Event::CanonicalRecovered {
+                account: "spare".to_owned()
+            }),
+            "the autonomous recovery emits a durable event naming the adopted account: {:?}",
+            outcome.events
+        );
+        // The scrub itself is still recorded (the fleet-wide lockout event), even though brief.
+        assert!(outcome.events.contains(&Event::CanonicalScrubbed {
+            account: Some("work".to_owned())
+        }));
+        // The canonical now holds the adopted spare's token, so every session re-reads a usable
+        // credential on its next request — no `claude /login`.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "the adopted account is now active"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_adopt_a_scrubbed_canonical_when_no_target_is_viable() {
+        // Issue #467 AC2: no viable target → fall THROUGH to the existing decision path (the surfaced
+        // signal), never a silent adopt churn. Here every spare is weekly-exhausted, so `pick_target`
+        // finds nothing and the recovery yields to the normal `decide_action` (Held) — the canonical
+        // stays scrubbed (zero adopt writes) and the durable `canonical_scrubbed` signal stands.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.40) // active, viable, below trigger
+            .ok("u-B", 0.10, 0.99) // weekly-EXHAUSTED (> 0.98 trigger) → not a viable target
+            .ok("u-C", 0.15, 0.99); // weekly-EXHAUSTED → not a viable target
+        let mut daemon = three_account_daemon(poller).await;
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+
+        daemon.store.set_not_found(true);
+        let outcome = daemon.tick().await;
+
+        assert!(
+            !matches!(outcome.action, TickAction::CanonicalAdopted { .. }),
+            "no viable target → no adopt: {:?}",
+            outcome.action
+        );
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalRecovered { .. })),
+            "no recovery event when nothing was adopted: {:?}",
+            outcome.events
+        );
+        // The scrub IS surfaced (the durable signal the operator acts on), not swallowed.
+        assert!(outcome.events.contains(&Event::CanonicalScrubbed {
+            account: Some("work".to_owned())
+        }));
+        // Zero adopt writes: the canonical stays scrubbed (no thrash) until a viable target appears
+        // or the operator re-logs-in (ADR-0007 d4 / ADR-0016 remedy for the all-dead case).
+        assert!(
+            matches!(daemon.store.read().await, Err(Error::CredentialNotFound)),
+            "the canonical is left scrubbed — no adopt write"
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no state change without an adopt"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_scrubbed_canonical_aborts_with_zero_writes_when_unreadable() {
+        // Issue #467 AC3 (no ADR-0003 regression): a LOCKED / unreadable keychain is "could not
+        // read", NOT "gone" — the adopt MUST abort with ZERO writes rather than clobber a canonical
+        // it could not read. Driven at the daemon layer by calling the recovery directly against an
+        // unreadable store; the engine-level matrix (locked / unreadable / absent-stash) is proven
+        // in `swap::tests::adopt_target_aborts_with_zero_writes_*`.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.40)
+            .ok("u-B", 0.10, 0.20) // a viable target exists — so only the unreadable canonical aborts
+            .ok("u-C", 0.15, 0.25);
+        let mut daemon = three_account_daemon(poller).await;
+        warmed_tick(&mut daemon).await;
+        let readings = daemon.decision_readings(Some(0));
+        let at = daemon.clock.now();
+
+        daemon.store.set_unreadable(true);
+        let mut events = Vec::new();
+        let outcome = daemon
+            .recover_scrubbed_canonical(Some(0), &readings, at, &mut events)
+            .await;
+
+        assert_eq!(outcome, None, "an unreadable canonical aborts the adopt");
+        assert!(
+            events.is_empty(),
+            "no false recovery event on an aborted adopt: {events:?}"
+        );
+        assert_eq!(
+            daemon.state.scrub_adopt_count, 0,
+            "an adopt that never landed is not counted toward the churn bound"
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no state change on an aborted adopt"
+        );
+        // Clearing the unreadable flag shows the canonical still holds the PRE-adopt token — the
+        // abort wrote nothing (ADR-0003 / #212 "locked ≠ gone").
+        daemon.store.set_unreadable(false);
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "zero writes: the canonical is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrubbed_canonical_recovery_is_bounded_then_resumes_after_the_window() {
+        // Issue #467 AC4: the recovery is BOUNDED against a re-auth churn loop. When the canonical
+        // keeps getting re-scrubbed right after each adopt, the daemon heals at most SCRUB_ADOPT_MAX
+        // times per window, then BACKS OFF (one durable `canonical_recovery_exhausted`, no more
+        // adopts) — leaving the scrub signal up for the operator — and RESUMES once the window
+        // elapses. A frozen clock holds every tick inside one window until we advance it.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.20, 0.30)
+            .ok("u-B", 0.10, 0.20)
+            .ok("u-C", 0.15, 0.25); // all viable, all below trigger → a target always exists
+        let mut daemon = three_account_daemon(poller).await;
+        warmed_tick(&mut daemon).await;
+
+        // Up to the bound: each re-scrub heals (a different viable account each time as the active
+        // rotates — `pick_target` excludes the current active).
+        let mut adopts = 0;
+        for _ in 0..SCRUB_ADOPT_MAX {
+            daemon.store.set_not_found(true);
+            let outcome = daemon.tick().await;
+            if matches!(outcome.action, TickAction::CanonicalAdopted { .. }) {
+                adopts += 1;
+                assert!(
+                    outcome
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, Event::CanonicalRecovered { .. })),
+                    "each landed adopt emits a recovery event"
+                );
+            }
+        }
+        assert_eq!(
+            adopts, SCRUB_ADOPT_MAX,
+            "every scrub within the bound is healed"
+        );
+        assert_eq!(daemon.state.scrub_adopt_count, SCRUB_ADOPT_MAX);
+
+        // The (MAX+1)th re-scrub in the same window BACKS OFF: no adopt, one back-off signal.
+        daemon.store.set_not_found(true);
+        let backoff = daemon.tick().await;
+        assert!(
+            !matches!(backoff.action, TickAction::CanonicalAdopted { .. }),
+            "the churn bound stops the adopt: {:?}",
+            backoff.action
+        );
+        assert!(
+            backoff
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalRecoveryExhausted { .. })),
+            "the back-off is surfaced durably: {:?}",
+            backoff.events
+        );
+
+        // A further re-scrub in the same window stays backed off AND does not re-emit (edge-triggered).
+        daemon.store.set_not_found(true);
+        let still = daemon.tick().await;
+        assert!(!matches!(still.action, TickAction::CanonicalAdopted { .. }));
+        assert!(
+            !still
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalRecoveryExhausted { .. })),
+            "the back-off signal is edge-triggered, not repeated per held tick"
+        );
+
+        // Once the churn window elapses, recovery RESUMES — an isolated later scrub heals at once.
+        daemon
+            .clock
+            .advance(SCRUB_ADOPT_WINDOW + Duration::from_secs(1));
+        daemon.store.set_not_found(true);
+        let resumed = daemon.tick().await;
+        assert!(
+            matches!(resumed.action, TickAction::CanonicalAdopted { .. }),
+            "recovery resumes after the window resets: {:?}",
+            resumed.action
+        );
+    }
+
     /// Extract the #475 yank marker (`rotated_from`) from a `diag=canonical` diagnostic, panicking
     /// on any other variant — a focused reader for the yank-detection assertions below.
     fn rotated_from_of(d: &Diagnostic) -> Option<String> {
@@ -12125,6 +12548,12 @@ mod tests {
         assert_eq!(
             swap_report(&outcome(TickAction::EmergencySwapped { from: 0, to: 1 })).as_deref(),
             Some("emergency-swapped off work onto spare (dead credential)"),
+        );
+        // #467: the autonomous scrubbed-canonical recovery echoes too, named distinctly so the
+        // operator sees the daemon self-healed the shared item back onto a live account.
+        assert_eq!(
+            swap_report(&outcome(TickAction::CanonicalAdopted { to: 1 })).as_deref(),
+            Some("recovered scrubbed canonical onto spare (was Not-logged-in)"),
         );
         assert_eq!(swap_report(&outcome(TickAction::Held)), None);
         assert_eq!(swap_report(&outcome(TickAction::SkippedCooldown)), None);
