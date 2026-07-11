@@ -213,13 +213,26 @@ const LOCK_BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// is the actual ceiling. `6` (×64) is past the cap for any realistic interval, so
 /// it is a safety bound, not the operative limit.
 const POLL_BACKOFF_MAX_SHIFT: u32 = 6;
-/// Ceiling on the rate-limit / transient poll back-off (issue #76). Under sustained
-/// `429` / `5xx` the effective poll spacing grows exponentially but settles here —
-/// one poll per hour, gentle on a throttling endpoint without going fully dark. A
-/// server-advised `Retry-After` is honoured as a MINIMUM but is itself clamped to this
-/// ceiling (issue #294), so this is the absolute maximum any single account's
-/// poll-backoff window can reach.
+/// Ceiling on the rate-limit / transient poll back-off (issue #76) for a NON-active
+/// (peer) account. Under sustained `429` / `5xx` the effective poll spacing grows
+/// exponentially but settles here — one poll per hour, gentle on a throttling endpoint
+/// without going fully dark. A server-advised `Retry-After` is honoured as a MINIMUM but
+/// is itself clamped to this ceiling (issue #294), so this is the absolute maximum a
+/// PEER's poll-backoff window can reach. The ACTIVE account is bounded MORE tightly by
+/// [`ACTIVE_POLL_BACKOFF_CAP`] and honours `Retry-After` as an un-clamped floor instead
+/// (issue #453).
 const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
+/// Ceiling on the ACTIVE account's OWN rate-limit / transient poll back-off (issue #453,
+/// the `active_backoff_cap_secs` tunable — default 120 s). Much tighter than the peer
+/// [`POLL_BACKOFF_CAP`]: a `429` on the active account blinds the very account being
+/// consumed, so its self-backoff (the exponential arm, when the server gives NO
+/// `Retry-After`) is clamped here to recover observability fast, rather than letting the
+/// exponential climb toward an hour. Applies ONLY to the exponential arm — a server
+/// `Retry-After` is an ABSOLUTE floor for the active account (never clamped by this or by
+/// [`POLL_BACKOFF_CAP`]), so the daemon never re-polls before the server said it may
+/// (issue #453 AC). Peers are unaffected — they keep the [`POLL_BACKOFF_CAP`] ceiling and
+/// the #294 pathological-`Retry-After` clamp.
+const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
 /// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
 /// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
 /// the same config — and the N accounts within a cycle — do not synchronize an
@@ -1175,7 +1188,8 @@ pub(crate) struct AccountHealth {
     /// A `429` (rate-limited) or `5xx` / network transient advances it; any other poll
     /// outcome resets it to 0. Drives the exponential widening of this account's back-off
     /// window: the wait is the jittered poll interval times `2^min(streak,
-    /// POLL_BACKOFF_MAX_SHIFT)`, capped at [`POLL_BACKOFF_CAP`] (never below a server
+    /// POLL_BACKOFF_MAX_SHIFT)`, capped at [`POLL_BACKOFF_CAP`] for a peer or the tighter
+    /// [`ACTIVE_POLL_BACKOFF_CAP`] for the active account (issue #453; never below a server
     /// `Retry-After`). Per-account so one account's throttle never widens another's cadence
     /// — see [`note_account_backoff`](Daemon::note_account_backoff).
     poll_backoff_streak: u32,
@@ -1976,9 +1990,12 @@ where
             });
             // Fold the outcome into account `i`'s OWN back-off (issue #293): a `429` / `5xx`
             // advances its per-account streak and arms its back-off window; any other
-            // outcome clears both. The returned widened wait rides the diagnostic tick line;
-            // the durable back-off ENTER / EXIT events (issue #399) ride `events`.
-            this_tick_backoff = self.note_account_backoff(i, &result, &mut events);
+            // outcome clears both. The ACTIVE account self-caps its back-off tighter and
+            // hard-floors `Retry-After` (issue #453), so pass whether `i` is the active
+            // account. The returned widened wait rides the diagnostic tick line; the durable
+            // back-off ENTER / EXIT events (issue #399) ride `events`.
+            this_tick_backoff =
+                self.note_account_backoff(i, active == Some(i), &result, &mut events);
             // A single monotonic read for this poll, shared by the velocity interval (#449), the
             // blind-window close (#449), and the `last_good` anchor refresh (#450) so all three
             // reason against the SAME instant.
@@ -4453,12 +4470,22 @@ where
     /// the diagnostic tick line — or `None` when the outcome was not a throttle.
     ///
     /// The base is this cycle's freshly-drawn, jittered poll interval — inheriting the #38
-    /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, clamped to
-    /// [`POLL_BACKOFF_CAP`]. The first throttled poll already earns ~2× the interval, so
-    /// the account's re-poll spacing is WIDER than the fixed cadence — #76's core ask, now
-    /// per-account. A server-advised `Retry-After` is honoured as a MINIMUM (the wait is
-    /// never shorter than it) but clamped to [`POLL_BACKOFF_CAP`] as a MAXIMUM, so a
-    /// pathological value cannot dark the account past the exponential ceiling (issue #294).
+    /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`. The first throttled
+    /// poll already earns ~2× the interval, so the account's re-poll spacing is WIDER than
+    /// the fixed cadence — #76's core ask, now per-account. The exponential arm is clamped
+    /// to a ceiling that DIFFERS by role (issue #453, `is_active`): a PEER settles at
+    /// [`POLL_BACKOFF_CAP`] (one poll/hour), while the ACTIVE account — whose throttle blinds
+    /// the very account being consumed — settles at the much tighter
+    /// [`ACTIVE_POLL_BACKOFF_CAP`], recovering observability fast instead of climbing toward
+    /// an hour.
+    ///
+    /// A server-advised `Retry-After` is honoured as a MINIMUM (the wait is never shorter
+    /// than it), but the MAXIMUM differs by role: for a PEER it is itself clamped to
+    /// [`POLL_BACKOFF_CAP`], so a pathological value cannot dark the account past the ceiling
+    /// (issue #294); for the ACTIVE account it is an ABSOLUTE, un-clamped floor, so the daemon
+    /// never re-polls before the server said it may (issue #453 AC) — even past
+    /// [`POLL_BACKOFF_CAP`]. Un-clamping the active floor re-introduces the unbounded-`wait`
+    /// overflow #294 had retired, so the armed instant is computed with `checked_add` below.
     ///
     /// Scoping BOTH the `429` and the transient per-account is deliberate (issue #293): the
     /// `429` is per-Anthropic-org (independent buckets), and under a genuine endpoint outage
@@ -4467,6 +4494,7 @@ where
     fn note_account_backoff(
         &mut self,
         i: usize,
+        is_active: bool,
         result: &Result<Usage>,
         events: &mut Vec<Event>,
     ) -> Option<TickBackoff> {
@@ -4493,23 +4521,45 @@ where
         let streak = self.state.health[i].poll_backoff_streak.saturating_add(1);
         self.state.health[i].poll_backoff_streak = streak;
         let shift = streak.min(POLL_BACKOFF_MAX_SHIFT);
+        // The exponential self-backoff ceiling is role-dependent (issue #453): the ACTIVE
+        // account clamps tighter (`ACTIVE_POLL_BACKOFF_CAP`) so a throttle on the consumed
+        // account does not go dark for long; a PEER keeps the #294 `POLL_BACKOFF_CAP` ceiling.
+        let exp_cap = if is_active {
+            ACTIVE_POLL_BACKOFF_CAP
+        } else {
+            POLL_BACKOFF_CAP
+        };
         let widened = self
             .next_poll_interval()
             .checked_mul(1u32 << shift)
-            .unwrap_or(POLL_BACKOFF_CAP)
-            .min(POLL_BACKOFF_CAP);
-        // Clamp to `POLL_BACKOFF_CAP` as a MAXIMUM (issue #294) — bounds a pathological or buggy
-        // `Retry-After` (e.g. `86400`). `widened` is already ≤ the cap, so this bites only the
-        // `Retry-After` arm.
+            .unwrap_or(exp_cap)
+            .min(exp_cap);
         let wait = match signal.retry_after {
-            Some(ra) => widened.max(ra),
+            // ACTIVE (issue #453): a server `Retry-After` is an ABSOLUTE floor — NOT clamped,
+            // so the daemon never re-polls before the server said it may, even past
+            // `POLL_BACKOFF_CAP`. (The exponential arm is already ≤ `ACTIVE_POLL_BACKOFF_CAP`.)
+            Some(ra) if is_active => widened.max(ra),
+            // PEER (issue #294): the `Retry-After` arm is clamped to `POLL_BACKOFF_CAP` as a
+            // MAXIMUM, bounding a pathological / buggy value (e.g. `86400`). `widened` is
+            // already ≤ the cap, so this bites only the `Retry-After` arm.
+            Some(ra) => widened.max(ra).min(POLL_BACKOFF_CAP),
             None => widened,
-        }
-        .min(POLL_BACKOFF_CAP);
-        // `wait` is bounded to `POLL_BACKOFF_CAP` above, so adding it to the monotonic
-        // instant cannot overflow — the value is bounded at the source (issue #294), which
-        // supersedes #293's `checked_add` guard against an unbounded `Retry-After`.
-        self.state.health[i].poll_backoff_until = Some(self.clock.now() + wait);
+        };
+        // Arm the window on the monotonic clock. A PEER's `wait` is bounded to `POLL_BACKOFF_CAP`,
+        // so `now + wait` cannot overflow. The ACTIVE account's `Retry-After` floor is un-clamped
+        // (issue #453), which re-opens the unbounded-`Retry-After` overflow #294 had retired — so
+        // arm with `checked_add`. A value large enough to overflow the monotonic instant (~hundreds
+        // of billions of years) is garbage, not a bona-fide server directive, so it falls back to
+        // the peer ceiling rather than panic. `now` is read ONCE, and the REPORTED window (`armed`)
+        // is derived from the armed `until`, so the durable event / tick line always AGREE with
+        // `poll_backoff_until` — including in that fallback, where they then render like the peer
+        // clamp (a bounded `backoff_secs` beside the raw pathological `retry_after_secs`).
+        let now = self.clock.now();
+        let until = now
+            .checked_add(wait)
+            .unwrap_or_else(|| now + POLL_BACKOFF_CAP);
+        self.state.health[i].poll_backoff_until = Some(until);
+        let armed = until.saturating_duration_since(now);
         // Durable ENTER (issue #399): make the previously stderr-only 429 / back-off signal durable
         // — the account UUID, the throttle class (`429` vs transient), the running streak, the RAW
         // server `Retry-After` (pre-cap #295), and the effective armed window. Emitted on EACH
@@ -4522,14 +4572,14 @@ where
             class: signal.class,
             consecutive: streak,
             retry_after_secs: signal.retry_after.map(|ra| ra.as_secs()),
-            backoff_secs: wait.as_secs(),
+            backoff_secs: armed.as_secs(),
         });
-        // Carry the RAW server `Retry-After` (pre-cap) alongside the effective `wait` so the
-        // diagnostic tick line can LABEL the wait's source (issue #295): a `Some` marks a
+        // Carry the RAW server `Retry-After` (pre-cap) alongside the effective `armed` window so
+        // the diagnostic tick line can LABEL the wait's source (issue #295): a `Some` marks a
         // server-advised floor, a `None` marks the self-capped exponential. Pre-cap keeps a
-        // pathological value the #294 clamp bit visible (`wait` ≪ `retry_after`).
+        // pathological value the #294 PEER clamp bit visible (`armed` ≪ `retry_after`).
         Some(TickBackoff {
-            wait,
+            wait: armed,
             retry_after: signal.retry_after,
         })
     }
@@ -4621,12 +4671,15 @@ struct BackoffSignal {
 
 /// The back-off one throttled poll imposed this tick (issue #293/#294), for the diagnostic
 /// tick line. The output sibling of [`BackoffSignal`] (the input): `wait` is the effective
-/// window armed on the account — `max(self-capped exponential, server Retry-After)`, clamped
-/// to [`POLL_BACKOFF_CAP`] — which the line renders as `backoff_secs`. `retry_after` is the
-/// RAW server-advised `Retry-After` the response supplied (issue #295), BEFORE that clamp,
-/// or `None` when the server sent none — the source label that tells a server-advised wait
-/// from the daemon's self-capped exponential. Pre-cap on purpose: a pathological value the
-/// #294 cap bit stays visible (`wait` = 3600 s beside `retry_after` = 86400 s), rather than
+/// window armed on the account — `max(self-capped exponential, server Retry-After)`, where
+/// the exponential self-caps at [`POLL_BACKOFF_CAP`] for a peer or the tighter
+/// [`ACTIVE_POLL_BACKOFF_CAP`] for the active account, and the `Retry-After` arm is clamped
+/// to [`POLL_BACKOFF_CAP`] for a peer but is an un-clamped floor for the active account
+/// (issue #453) — which the line renders as `backoff_secs`. `retry_after` is the RAW
+/// server-advised `Retry-After` the response supplied (issue #295), BEFORE any clamp, or
+/// `None` when the server sent none — the source label that tells a server-advised wait from
+/// the daemon's self-capped exponential. Pre-cap on purpose: a pathological value the #294
+/// PEER cap bit stays visible (`wait` = 3600 s beside `retry_after` = 86400 s), rather than
 /// collapsing into an unplaceable `backoff_secs=3600`.
 #[derive(Debug, Clone, Copy)]
 struct TickBackoff {
@@ -7126,8 +7179,9 @@ mod tests {
         // AC (issue #293): a sustained 429 WIDENS the account's effective poll spacing —
         // it is SKIPPED between re-attempts rather than re-polled at the fixed interval —
         // and the loop itself no longer globally backs off (`next_wait` stays `None`). The
-        // first throttled poll arms a 2×-interval (120 s) window; each throttled re-poll
-        // doubles it.
+        // first throttled poll arms a 2×-interval (120 s) window. A is the ACTIVE account, so
+        // that window is clamped at ACTIVE_POLL_BACKOFF_CAP (120 s, #453) and stays flat on
+        // re-poll rather than doubling — the widened-vs-fixed-interval spacing is what this pins.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
 
@@ -7169,43 +7223,46 @@ mod tests {
         assert_eq!(skipped.next_wait, None);
         assert_eq!(tick_backoff_secs(&skipped), None);
 
-        // Advancing past each window lets A be re-polled, and each throttled re-poll doubles
-        // the window: 240 s, then 480 s.
+        // Advancing past the window lets A be re-polled. A is the ACTIVE account, so its
+        // self-backoff is CLAMPED at ACTIVE_POLL_BACKOFF_CAP (120 s, issue #453) — it stays
+        // flat on each throttled re-poll rather than doubling toward the peer ceiling.
         daemon.clock.advance(Duration::from_secs(120));
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(240));
-        daemon.clock.advance(Duration::from_secs(240));
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(480));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+        daemon.clock.advance(Duration::from_secs(120));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
     }
 
     #[tokio::test]
-    async fn the_rate_limit_back_off_doubles_then_caps() {
-        // The per-account back-off grows exponentially from the interval and saturates at
-        // the cap, so a sustained-429 account settles at one re-poll per hour rather than
-        // growing without bound — mirroring the locked-keychain back-off shape. Advancing
-        // the clock past each window re-polls the (still-throttled) account, so its streak
-        // climbs tick over tick.
+    async fn the_active_accounts_back_off_is_capped_not_climbing() {
+        // AC (issue #453): the ACTIVE account's self-backoff is clamped to
+        // ACTIVE_POLL_BACKOFF_CAP (120 s) and does NOT climb toward the peer POLL_BACKOFF_CAP
+        // (3600 s) — a 429 blinds the very account being consumed, so recovering observability
+        // fast (a 120 s ceiling) beats the peer's gentle-on-the-endpoint hour. With the 60 s
+        // base the first throttle already sits at the 120 s cap, so every subsequent throttle
+        // stays FLAT at 120 s rather than doubling (240, 480, …) — the peer path (which DOES
+        // climb) is pinned separately in `consecutive_rate_limits_widen_a_peers_durable_backoff_window`.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
         let mut waits = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..7 {
             let secs = tick_backoff_secs(&daemon.tick().await).unwrap();
-            waits.push(Duration::from_secs(secs));
+            waits.push(secs);
             // Step past the just-armed window so the next tick re-polls (not skips) A.
             daemon.clock.advance(Duration::from_secs(secs));
         }
-        // 60 s × 2^streak: 120, 240, 480, 960, 1920, then 3840→capped 3600, then 3600.
-        assert_eq!(
-            waits,
-            vec![
-                Duration::from_secs(120),
-                Duration::from_secs(240),
-                Duration::from_secs(480),
-                Duration::from_secs(960),
-                Duration::from_secs(1920),
-                POLL_BACKOFF_CAP,
-                POLL_BACKOFF_CAP,
-                POLL_BACKOFF_CAP,
-            ]
+        // Flat at the active cap across a climbing streak — never 240/480/… (the PEER shape).
+        assert_eq!(waits, vec![120, 120, 120, 120, 120, 120, 120]);
+        // The durable event's streak still CLIMBS (the episode stays diagnosable) while the
+        // armed window stays pinned at the active cap: streak 8 on the next throttle, window 120.
+        let last = daemon.tick().await;
+        assert!(
+            last.events.iter().any(|e| matches!(
+                e,
+                Event::UsageBackoff { account, consecutive, backoff_secs, .. }
+                    if account == "u-A" && *consecutive == 8 && *backoff_secs == 120
+            )),
+            "active durable event: streak climbs to 8, window pinned at 120: {:?}",
+            last.events,
         );
     }
 
@@ -7213,8 +7270,10 @@ mod tests {
     async fn retry_after_is_honoured_as_a_minimum_wait() {
         // AC: Retry-After is honoured as a MINIMUM for the account's back-off window. When
         // it exceeds the exponential it wins; when it is smaller, the larger exponential
-        // governs but the window is never below Retry-After.
-        // Larger than the 120 s first-cycle exponential → Retry-After (600 s) wins.
+        // governs but the window is never below Retry-After. `u-A` is the ACTIVE account, so
+        // its exponential arm is the ACTIVE_POLL_BACKOFF_CAP (120 s) — which here coincides
+        // with the 60 s base's first-cycle 2× (issue #453 does not change RA-as-minimum).
+        // Larger than the 120 s cap → Retry-After (600 s) wins.
         let (_d1, mut bigger) = rate_limit_daemon(
             FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(600))),
         )
@@ -7230,24 +7289,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_large_retry_after_is_clamped_to_the_cap() {
-        // AC (issue #294): a server `Retry-After` is honoured as a MINIMUM but clamped to a
-        // sane MAXIMUM — POLL_BACKOFF_CAP — so a pathological value cannot dark the account
-        // past the exponential ceiling. Supersedes the pre-#294 behaviour (a larger
-        // `Retry-After` overrode the cap unboundedly), whose premise this reverses.
-        //
-        // A full day of `Retry-After` clamps down to the 1 h cap.
+    async fn the_active_accounts_retry_after_is_an_absolute_floor() {
+        // AC (issue #453): for the ACTIVE account a server `Retry-After` is an ABSOLUTE floor —
+        // the daemon NEVER re-polls before it — so it is NOT clamped to POLL_BACKOFF_CAP the way
+        // a PEER's is (issue #294). A pathological full-day `Retry-After` therefore governs the
+        // active window IN FULL (it does not collapse to the 1 h peer ceiling); the peer clamp
+        // is pinned separately in `a_large_retry_after_is_clamped_to_the_cap_for_a_peer`.
         let one_day = Duration::from_secs(86_400);
         assert!(one_day > POLL_BACKOFF_CAP);
         let (_d1, mut pathological) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(one_day))).await;
         assert_eq!(
             tick_backoff_secs(&pathological.tick().await),
-            Some(POLL_BACKOFF_CAP.as_secs()),
+            Some(86_400),
+            "active Retry-After is an un-clamped floor — no re-poll before it (AC #453)",
         );
 
-        // Just below the cap is still honoured in full — the clamp bounds only the excess,
-        // it does not swallow a legitimate long-but-sane `Retry-After`.
+        // A value above the active cap but below the peer cap is likewise honoured verbatim
+        // (the active exponential arm is 120 s, so the 3599 s server floor governs).
         let just_under = POLL_BACKOFF_CAP - Duration::from_secs(1);
         let (_d2, mut sane) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(just_under))).await;
@@ -7298,43 +7357,67 @@ mod tests {
         assert_eq!(tick_backoff_secs(&tick), Some(120));
         assert_eq!(tick_retry_after_secs(&tick), Some(10));
 
-        // (4) Server-advised, capped: the flagship #295 case. A pathological `Retry-After`
-        // (a full day) the #294 cap clamps to 1 h is now VISIBLE as the raw pre-cap label —
-        // the exact `backoff_secs=3600` ambiguity (server-advised vs self-capped) resolved.
-        let (_d4, mut capped) = rate_limit_daemon(
-            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(86_400))),
-        )
-        .await;
-        let tick = capped.tick().await;
-        assert_eq!(tick_backoff_secs(&tick), Some(POLL_BACKOFF_CAP.as_secs()));
-        assert_eq!(tick_retry_after_secs(&tick), Some(86_400));
+        // (The flagship #295 clamp case — a pathological `Retry-After` clamped to the cap with
+        // the raw value still surfaced on the label — is now PEER-only, since the active `u-A`
+        // hard-floors `Retry-After` un-clamped (#453). It is pinned in
+        // `a_large_retry_after_is_clamped_to_the_cap_for_a_peer`.)
     }
 
     #[tokio::test]
-    async fn a_clean_cycle_resets_the_rate_limit_back_off() {
-        // Once the account polls clean again the back-off clears (no more skipping, streak
-        // reset), so a LATER 429 restarts at 2× — not where the prior episode left off.
-        let (_dir, mut daemon) =
-            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
-        daemon.clock.advance(Duration::from_secs(120));
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(240));
-
-        // A clean poll clears the back-off and resets the streak. Advance past the window
-        // so the account is actually re-polled (not skipped) this tick.
-        daemon.clock.advance(Duration::from_secs(240));
-        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
-        let clean = daemon.tick().await;
-        assert!(
-            tick_polled(&clean),
-            "the window elapsed → the account is re-polled"
+    async fn a_clean_cycle_resets_a_peer_rate_limit_back_off() {
+        // Once an account polls clean again the back-off clears (streak + window reset), so a
+        // LATER 429 restarts at the base 2× — not where the prior episode left off. The reset
+        // path is role-agnostic (it runs before the active/peer split), but the "restart at
+        // base, not at 480" evidence needs the exponential CLIMB, which is PEER-only since #453
+        // — so this pins it on the throttled non-active `spare` (u-B); `work` (u-A) stays
+        // active and clean.
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", None),
+        )
+        .await;
+        // Climb the peer's window: 120 → 240.
+        assert_eq!(
+            tick_backoff_secs(&next_peer_tick(&mut daemon).await),
+            Some(120)
         );
-        assert_eq!(tick_backoff_secs(&clean), None);
+        daemon.clock.advance(Duration::from_secs(120));
+        assert_eq!(
+            tick_backoff_secs(&next_peer_tick(&mut daemon).await),
+            Some(240)
+        );
 
-        // A later 429 restarts the climb at the base multiplier, not at 480 (the cleared
-        // window means the account is polled straightaway, no advance needed).
-        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+        // The peer polls clean → its back-off clears. Advance past the 240 s window so the peer
+        // is actually re-polled (not skipped) on its next turn.
+        daemon.clock.advance(Duration::from_secs(240));
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.20, 0.10);
+        let cleared = next_peer_tick(&mut daemon).await;
+        assert_eq!(
+            tick_backoff_secs(&cleared),
+            None,
+            "the peer re-polled clean → no back-off"
+        );
+        assert!(
+            cleared.events.iter().any(|e| matches!(
+                e, Event::UsageBackoffCleared { account } if account == "u-B"
+            )),
+            "the clean re-poll emits a durable CLEARED, bracketing the episode: {:?}",
+            cleared.events,
+        );
+
+        // A later 429 restarts the climb at the base multiplier (120), NOT at 480 — the cleared
+        // window means the peer is re-polled straightaway, no advance needed.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .rate_limited("u-B", None);
+        assert_eq!(
+            tick_backoff_secs(&next_peer_tick(&mut daemon).await),
+            Some(120),
+            "streak reset → later 429 restarts at base, not where it left off",
+        );
     }
 
     #[tokio::test]
@@ -7425,22 +7508,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_durable_backoff_event_carries_the_raw_retry_after() {
-        // The durable event carries the RAW server `Retry-After` (pre-cap #294/#295), so the
-        // flagship pathological case stays diagnosable from the log alone: a full day of
-        // `Retry-After` clamped to the 1 h window renders `backoff_secs=3600 retry_after_secs=86400`.
-        let (_dir, mut daemon) = rate_limit_daemon(
-            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(86_400))),
+    async fn a_large_retry_after_is_clamped_to_the_cap_for_a_peer() {
+        // AC (issue #294, UNCHANGED for peers by #453): a PEER's server `Retry-After` is honoured
+        // as a MINIMUM but clamped to POLL_BACKOFF_CAP as a MAXIMUM, so a pathological value cannot
+        // dark the peer past the 1 h ceiling. Both the tick line and the durable event surface the
+        // RAW pre-cap value beside the clamped window (`backoff_secs=3600 retry_after_secs=86400`),
+        // resolving the #295 ambiguity. Contrast the active account, whose `Retry-After` is an
+        // un-clamped floor (`the_active_accounts_retry_after_is_an_absolute_floor`). `spare` (u-B)
+        // is the throttled peer; `work` (u-A) stays active and clean.
+        let one_day = Duration::from_secs(86_400);
+        assert!(one_day > POLL_BACKOFF_CAP);
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", Some(one_day)),
         )
         .await;
-        let first = daemon.tick().await;
-        assert!(first.events.contains(&Event::UsageBackoff {
-            account: "u-A".to_owned(),
-            class: BackoffClass::RateLimited,
-            consecutive: 1,
-            retry_after_secs: Some(86_400),
-            backoff_secs: POLL_BACKOFF_CAP.as_secs(),
-        }));
+        let outcome = next_peer_tick(&mut daemon).await;
+        // The pathological full-day floor clamps to the 1 h peer cap...
+        assert_eq!(
+            tick_backoff_secs(&outcome),
+            Some(POLL_BACKOFF_CAP.as_secs())
+        );
+        // ...while the RAW server value stays visible on the tick label (pre-cap #295)...
+        assert_eq!(tick_retry_after_secs(&outcome), Some(86_400));
+        // ...and on the durable event (clamped window beside the raw retry_after).
+        assert!(
+            outcome.events.contains(&Event::UsageBackoff {
+                account: "u-B".to_owned(),
+                class: BackoffClass::RateLimited,
+                consecutive: 1,
+                retry_after_secs: Some(86_400),
+                backoff_secs: POLL_BACKOFF_CAP.as_secs(),
+            }),
+            "peer durable event: clamped window + raw retry_after: {:?}",
+            outcome.events,
+        );
     }
 
     #[tokio::test]
@@ -7460,31 +7563,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_rate_limits_widen_the_durable_backoff_window() {
-        // Each throttled re-poll emits a fresh durable ENTER with the climbing streak and the
-        // widened window (120 → 240 → 480). This WIDENING is the residual-late-swap signal (#363's
-        // ~1674 s active-account gap) that a single first-throttle line would hide — the reason the
-        // event is emitted on EVERY throttle, not just the first.
-        let (_dir, mut daemon) =
-            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+    async fn consecutive_rate_limits_widen_a_peers_durable_backoff_window() {
+        // AC (issue #453): a PEER's back-off is UNCHANGED from #293/#294 — the exponential still
+        // doubles from the interval toward POLL_BACKOFF_CAP (1 h), NOT the tight active cap. Each
+        // throttled re-poll widens the window (120 → 240 → 480) and emits a fresh durable ENTER
+        // with the climbing streak — the residual-late-swap signal (#363's ~1674 s active-account
+        // gap) a single first-throttle line would hide. `spare` (u-B) is the throttled non-active
+        // peer; `work` (u-A) stays active and clean. Contrast the active account, capped flat
+        // (`the_active_accounts_back_off_is_capped_not_climbing`).
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", None),
+        )
+        .await;
         let mut seen = Vec::new();
+        let mut prior_window = 0u64;
         for _ in 0..3 {
-            let outcome = daemon.tick().await;
+            if prior_window != 0 {
+                // Advance past the peer's prior window so its next turn re-polls (not skips).
+                daemon.clock.advance(Duration::from_secs(prior_window));
+            }
+            let outcome = next_peer_tick(&mut daemon).await;
+            let window = tick_backoff_secs(&outcome).expect("the peer's turn armed a back-off");
             for e in &outcome.events {
                 if let Event::UsageBackoff {
+                    account,
                     consecutive,
                     backoff_secs,
                     ..
                 } = e
                 {
-                    seen.push((*consecutive, *backoff_secs));
+                    if account == "u-B" {
+                        seen.push((*consecutive, *backoff_secs));
+                    }
                 }
             }
-            // Step past the just-armed window so the next tick re-polls (not skips) A.
-            if let Some(secs) = tick_backoff_secs(&outcome) {
-                daemon.clock.advance(Duration::from_secs(secs));
-            }
+            prior_window = window;
         }
+        // Peer doubling toward the 1 h ceiling — the exact #293/#294 shape, unchanged by #453.
         assert_eq!(seen, vec![(1, 120), (2, 240), (3, 480)]);
     }
 
@@ -7773,6 +7890,30 @@ mod tests {
             &tun,
         );
         (dir, daemon)
+    }
+
+    /// Tick a [`two_account_rate_limit_daemon`] until the NON-active peer `spare` (u-B) is
+    /// actually POLLED this tick — throttled or clean — returning that tick's outcome. The #366
+    /// schedule interleaves `[active, peer, …]`, so the active `work` ticks (and any skipped peer
+    /// ticks still inside a back-off window) are consumed until the peer's turn lands. The caller
+    /// MUST `advance` the clock past the peer's PRIOR window before each call after the first,
+    /// else the peer is skipped (still backing off) and never re-polls. Bounded so a misuse fails
+    /// loudly instead of hanging. The peer-path counterpart of driving the single-account
+    /// [`rate_limit_daemon`] every tick — needed because #453's active/peer split means the
+    /// peer's UNCHANGED back-off (climb-to-`POLL_BACKOFF_CAP`, #294 clamp) can only be observed on
+    /// a genuinely non-active account.
+    async fn next_peer_tick(daemon: &mut FakeDaemon) -> TickOutcome {
+        for _ in 0..6 {
+            let outcome = daemon.tick().await;
+            if outcome.diagnostics.iter().any(
+                |d| matches!(d, Diagnostic::Poll { account, .. } if account.as_str() == "spare"),
+            ) {
+                return outcome;
+            }
+        }
+        panic!(
+            "the peer `spare` was never polled — advance past its back-off window before calling"
+        );
     }
 
     #[tokio::test]
