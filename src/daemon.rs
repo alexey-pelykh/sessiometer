@@ -1110,8 +1110,12 @@ pub(crate) struct AccountHealth {
     recovery_successes: u32,
     /// The last-observed stored access-token `expiresAt` as epoch SECONDS (issue #119),
     /// folded from a refresh sweep's [`RefreshObservation`] (the engine reads it in MS;
-    /// converted at the fold). `None` until the refresh engine has observed this account
-    /// (e.g. `[refresh]` is off). The rollup's `Stale` (expired) input + the wire clock.
+    /// converted at the fold), AND — for the ACTIVE account, which the parked sweep excludes —
+    /// reconciled to the freshly-PROMOTED canonical token on each keep-warm promote (issue #477,
+    /// [`promote_canonical`](Daemon::promote_canonical)), so the rollup judges staleness off the
+    /// live canonical the sessions read rather than the un-restashed (deliberately stale) stash.
+    /// `None` until the refresh engine has observed this account (e.g. `[refresh]` is off). The
+    /// rollup's `Stale` (expired) input + the wire clock.
     access_expires_at: Option<i64>,
     /// The access-token `expiresAt` as epoch SECONDS observed on the POLL path (issue
     /// #141) — read from the SAME credential the usage poll used (the canonical item for
@@ -2883,6 +2887,19 @@ where
         self.store.write(cred).await?;
         // Baseline-commit so #140 / the #13 reconcile do not misfire on the daemon's own write.
         self.state.canonical_watch.commit(cred);
+        // Issue #477: the token just promoted IS the live canonical the active account now
+        // resolves to — so reconcile the rollup's staleness input to it. A keep-warm is
+        // `refreshed_not_restashed` (it PROMOTES to canonical, never re-stashes), and the active
+        // account is excluded from the parked refresh sweep that folds `access_expires_at`, so
+        // without this the field stays pinned to the deliberately-stale un-restashed stash expiry
+        // and `credential_health` false-fires `Stale` while the canonical is fresh (the 2026-07-11
+        // forensic case). MS→s at the boundary, matching `apply_refresh_observation`. The genuine
+        // signal is preserved: this only runs on a real promote (a written canonical), so a
+        // dead/rejected canonical is never bumped and still reads `Stale` — whether short-circuited
+        // BEFORE the mint (an empty refresh token, `has_live_refresh_token`) or AFTER it (a server
+        // `Dead` / `NoChange` mint with no fresh token to promote, the `match minted` arm).
+        self.state.health[i].access_expires_at =
+            crate::refresh::expires_at(cred.expose()).map(millis_to_secs);
         Ok(true)
     }
 
@@ -15905,6 +15922,124 @@ mod tests {
                 outcome: RefreshEventOutcome::RefreshedNotReStashed,
                 refresh_token_rotated: true,
             }],
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proactive_promote_reconciles_the_rollup_expiry_to_the_fresh_canonical() {
+        // Issue #477 (AC-1 / AC-3): after a proactive keep-warm PROMOTES a fresh token to the
+        // canonical, the rollup's staleness input (`access_expires_at`) must reflect that fresh
+        // canonical — NOT the un-restashed stash the keep-warm deliberately leaves behind
+        // (`refreshed_not_restashed`). The 2026-07-11 forensic case: a fresh canonical (7+ h to
+        // expiry) beside an EXPIRED stash false-fired `stale`, because the rollup judged staleness
+        // off the stale stash-sourced expiry the parked sweep last folded (the active account is
+        // excluded from that sweep, so the field froze there and keep-warm never bumped it).
+        let now_ms = 1_800_000_000_000;
+        let now_secs = now_ms / 1000;
+        // Active canonical 60 s from expiry → inside the near-expiry horizon, so the mint fires.
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live");
+        // The promoted token is fresh: 7 h to expiry (the observed case).
+        let fresh_expiry_ms = now_ms + 7 * 3_600_000;
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(warm_canonical(fresh_expiry_ms, "rt-live")),
+            canonical.clone(),
+        )
+        .await;
+        // The un-restashed stash the parked sweep last folded is already EXPIRED — the
+        // false-staleness source the keep-warm leaves behind.
+        daemon.state.health[0].access_expires_at = Some(now_secs - 100);
+
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the near-expiry active token is minted proactively"
+        );
+        // The fresh token reached the canonical the live sessions read…
+        assert_eq!(
+            crate::refresh::expires_at(daemon.store.read().await.unwrap().expose()),
+            Some(fresh_expiry_ms),
+            "the fresh token is promoted to the canonical item",
+        );
+        // …and the rollup's staleness input is reconciled to it (the #477 fix). Before the fix this
+        // stayed pinned to the expired stash → a false `stale`.
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(fresh_expiry_ms / 1000),
+            "the rollup expiry reflects the promoted canonical, not the stale stash",
+        );
+        // The verdict is judged off the fresh canonical → NOT `stale`. `has_fresh_reading = false`
+        // isolates the expiry-driven verdict: it proves the FIX (not a masking fresh poll) cleared
+        // the false stale — the Stale branch precedes the Healthy branch, so a stale expiry would
+        // still read `stale` here regardless of a fresh reading.
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                now_secs,
+            ),
+            CredentialHealth::Healthy,
+            "a fresh promoted canonical reads healthy, not a false stale",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_promote_keep_warm_leaves_a_genuinely_stale_canonical_stale() {
+        // Issue #477 (AC-2): the #477 reconcile bumps `access_expires_at` ONLY on a real promote. A
+        // genuinely dead / server-rejected canonical (an empty refresh token CC cannot exchange)
+        // never mints and never promotes, so the stale expiry is preserved and the account still
+        // reads `stale` — the real signal #464/#465 depend on is not lost.
+        let now_ms = 1_800_000_000_000;
+        let now_secs = now_ms / 1000;
+        // Near expiry (inside the horizon) but a DEAD (empty) refresh token → `has_live_refresh_token`
+        // false → no mint, no promote (the invariant-4 case the keep-warm must not try to revive).
+        let canonical = warm_canonical(now_ms + 60_000, "");
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(warm_canonical(now_ms + 7 * 3_600_000, "rt-live")),
+            canonical.clone(),
+        )
+        .await;
+        // A genuinely expired canonical expiry.
+        daemon.state.health[0].access_expires_at = Some(now_secs - 100);
+
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(calls.get(), 0, "a dead refresh token is never minted");
+        // The stale expiry is UNTOUCHED — the reconcile only fires on a real promote.
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(now_secs - 100),
+            "no promote → the rollup expiry is not bumped",
+        );
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                now_secs,
+            ),
+            CredentialHealth::Stale,
+            "a genuinely stale / rejected canonical still reads stale",
         );
     }
 
