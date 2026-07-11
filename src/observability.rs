@@ -577,9 +577,13 @@ pub(crate) enum Event {
     /// state, never per poll while it stays scrubbed, and afresh if it recovers and is scrubbed
     /// again. `account` is the last-known active HANDLE (operator label) the scrub emptied, or
     /// absent when no active account was resolved (e.g. a daemon started against an already-empty
-    /// item) — never a token or email (issue #15). Distinct from [`Event::CredentialDead`] (a
-    /// PER-ACCOUNT quarantine edge keyed on a 401-streak): this is the SHARED item's OWN liveness,
-    /// the fleet-wide lockout no `credential_dead` fires for — the umbrella's core observability gap.
+    /// item) — never a token or email (issue #15). Renders `mode=scrub` (issue #475): the
+    /// UNRECOVERABLE (`/login`-needed) half of the two-mode `mode=(yank|scrub)` classification — the
+    /// RECOVERABLE rotation-yank is carried as `mode=yank` on the `diag=canonical` line, so an
+    /// operator `grep mode=` sees both "Not logged in" causes and their opposite remedies. Distinct
+    /// from [`Event::CredentialDead`] (a PER-ACCOUNT quarantine edge keyed on a 401-streak): this is
+    /// the SHARED item's OWN liveness, the fleet-wide lockout no `credential_dead` fires for — the
+    /// umbrella's core observability gap.
     CanonicalScrubbed { account: Option<String> },
     /// The shared canonical item RECOVERED — read live again (a non-empty refresh token) after a
     /// scrub, so sessions can authenticate once more (issue #464). The clearing counterpart of
@@ -927,7 +931,13 @@ impl Event {
                     Some(label) => format!(" account={label}"),
                     None => String::new(),
                 };
-                format!("ts={ts} event=canonical_scrubbed{account}")
+                // `mode=scrub` (issue #475): the durable half of the two-mode `mode=(yank|scrub)`
+                // classification the umbrella needs — this UNRECOVERABLE empty-canonical scrub (needs
+                // `/login`) vs the RECOVERABLE rotation-yank carried as `mode=yank` on the
+                // `diag=canonical` line. A constant token (not a stored field — the event's identity
+                // already fixes the mode), so an operator `grep mode=` surfaces BOTH modes in one
+                // vocabulary. Renders before the optional `account` to keep a stable line prefix.
+                format!("ts={ts} event=canonical_scrubbed mode=scrub{account}")
             }
             Event::CanonicalRestored { account } => {
                 let account = match account {
@@ -1530,6 +1540,17 @@ pub(crate) enum Diagnostic {
         fingerprint: Option<String>,
         account: Option<String>,
         expires_at: Option<i64>,
+        /// The PRIOR poll's canonical fingerprint when THIS poll observed a Present→Present
+        /// rotation (issue #475) — `Some(prev)` iff the refresh-token fingerprint CHANGED since
+        /// the last Present observation (a rotation-YANK: the shared item rotated under mid-flight
+        /// sessions, which get a RECOVERABLE 401 while the item stays live — distinct from the
+        /// UNRECOVERABLE scrub the durable [`Event::CanonicalScrubbed`] carries). Renders the
+        /// additive trailing `mode=yank prev=<prev>` marker, giving the `diag=canonical` line the
+        /// same `mode=(yank|scrub)` vocabulary the durable scrub event carries — so `grep mode=`
+        /// surfaces both "Not logged in" modes. `None` on a non-rotating poll, the seeding first
+        /// observation, and every non-Present read. A non-secret 16-hex SHA-256 prefix (issue #15),
+        /// the same shape as `fingerprint` — never a token.
+        rotated_from: Option<String>,
     },
     /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap
     /// target is possible again. The edge-triggered LEAVE marker — the symmetric
@@ -1604,6 +1625,7 @@ impl Diagnostic {
                 fingerprint,
                 account,
                 expires_at,
+                rotated_from,
             } => {
                 let state = state.as_str();
                 // Each optional field renders only when present — an empty value after `=` would
@@ -1622,7 +1644,17 @@ impl Diagnostic {
                     Some(secs) => format!(" expires_at={secs}"),
                     None => String::new(),
                 };
-                format!("ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}")
+                // The rotation-YANK marker (issue #475): additive TRAILING tokens present ONLY on a
+                // Present→Present fingerprint delta, so a non-rotating poll line is byte-for-byte
+                // unchanged (every existing `key=val` parser is unaffected). `prev` is the prior
+                // fingerprint — a non-secret hash prefix like `fingerprint`, never the prior token.
+                let rotated = match rotated_from {
+                    Some(prev) => format!(" mode=yank prev={prev}"),
+                    None => String::new(),
+                };
+                format!(
+                    "ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}{rotated}"
+                )
             }
             Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
             Diagnostic::ActiveDeadNoTargetCleared => {
@@ -1893,21 +1925,25 @@ mod tests {
     }
 
     #[test]
-    fn canonical_scrubbed_carries_the_handle_when_known_and_omits_it_otherwise() {
-        // Issue #464: the shared-item scrub carries the last-known active HANDLE (never a token
-        // or email) — and omits `account` cleanly when no active account was resolved (a daemon
-        // started against an already-empty item), so an empty value never splits the grammar.
+    fn canonical_scrubbed_carries_the_scrub_mode_and_optional_handle() {
+        // Issue #464/#475: the shared-item scrub renders the constant `mode=scrub` classification
+        // (the durable half of `mode=(yank|scrub)`) then the last-known active HANDLE (never a
+        // token or email) — and omits `account` cleanly when no active account was resolved (a
+        // daemon started against an already-empty item), keeping a stable `... mode=scrub` prefix.
         let with_handle = Event::CanonicalScrubbed {
             account: Some("work".to_owned()),
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             with_handle,
-            format!("{TS0} event=canonical_scrubbed account=work")
+            format!("{TS0} event=canonical_scrubbed mode=scrub account=work")
         );
 
         let no_handle = Event::CanonicalScrubbed { account: None }.to_log_line(at_epoch(0));
-        assert_eq!(no_handle, format!("{TS0} event=canonical_scrubbed"));
+        assert_eq!(
+            no_handle,
+            format!("{TS0} event=canonical_scrubbed mode=scrub")
+        );
     }
 
     #[test]
@@ -1936,6 +1972,7 @@ mod tests {
             fingerprint: Some("0123456789abcdef".to_owned()),
             account: Some("work".to_owned()),
             expires_at: Some(1_782_777_600),
+            rotated_from: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -1950,6 +1987,7 @@ mod tests {
             fingerprint: None,
             account: Some("work".to_owned()),
             expires_at: None,
+            rotated_from: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -1962,9 +2000,32 @@ mod tests {
             fingerprint: None,
             account: None,
             expires_at: None,
+            rotated_from: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(unknown, format!("{TS0} diag=canonical state=unknown"));
+    }
+
+    #[test]
+    fn canonical_diagnostic_appends_the_yank_marker_only_on_a_rotation() {
+        // Issue #475: a Present→Present fingerprint delta appends the additive TRAILING
+        // `mode=yank prev=<prior-fingerprint>` marker (after every #464 field), giving the level
+        // line the same `mode=(yank|scrub)` vocabulary the durable scrub event carries. `prev` is a
+        // non-secret hash prefix, never a token.
+        let yank = Diagnostic::Canonical {
+            state: CanonicalLiveness::Present,
+            fingerprint: Some("0123456789abcdef".to_owned()),
+            account: Some("work".to_owned()),
+            expires_at: Some(1_782_777_600),
+            rotated_from: Some("fedcba9876543210".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            yank,
+            format!(
+                "{TS0} diag=canonical state=present fingerprint=0123456789abcdef account=work expires_at=1782777600 mode=yank prev=fedcba9876543210"
+            )
+        );
     }
 
     #[test]
