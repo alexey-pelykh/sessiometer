@@ -1226,6 +1226,18 @@ struct DecisionState {
     /// Mirrors `signaled_all_exhausted`; UNLIKE it, a transient unreadable poll does NOT clear it
     /// (only a confirmed live read does), so a flaky read never fabricates a recovery.
     signaled_canonical_scrubbed: bool,
+    /// The PRIOR poll's canonical refresh-token FINGERPRINT (issue #475), retained across polls to
+    /// detect a rotation-YANK: a Present→Present fingerprint change means the shared item ROTATED
+    /// under any mid-flight sessions, which get a RECOVERABLE 401 → "Not logged in" (they re-read
+    /// the still-live item on `continue`, no `/login`) — the frequent sibling of the rare,
+    /// UNRECOVERABLE scrub `signaled_canonical_scrubbed` tracks (umbrella #463). A non-secret 16-hex
+    /// SHA-256 prefix (issue #15), NEVER a token. Updated ONLY by [`note_canonical_liveness`](Daemon::note_canonical_liveness)
+    /// — NOT committed by the daemon's OWN swap / keep-warm canonical writes, UNLIKE `canonical_watch`
+    /// — so a self-authored rotation is still observed as a yank, keeping the diagnostic yank series
+    /// the full canonical-rotation denominator #465 measures (and a reconcile-independent cross-check).
+    /// `None` until the first Present observation seeds it, and reset to `None` on a scrub (so the next
+    /// Present re-seeds without a false yank across the recovery edge).
+    prev_canonical_fingerprint: Option<String>,
     /// Last-known usage reading per roster account (issue #80), indexed by roster
     /// position. The daemon polls ONE account per tick (staggered, the active
     /// interleaved before each peer — #366), so a decision is taken on the most recent
@@ -3886,13 +3898,43 @@ where
             None => (CanonicalLiveness::Unknown, None, None),
         };
 
+        // Rotation-YANK detection (issue #475): a Present→Present canonical fingerprint change means
+        // the shared item ROTATED under any mid-flight sessions — the RECOVERABLE "Not logged in"
+        // mode (they re-read the still-live item on `continue`, no `/login`), distinct from the
+        // UNRECOVERABLE scrub below. Derived purely from the observed present/valid state + the
+        // fingerprint delta (AC1: "not guessed"). The anchor is advanced ONLY here — never by the
+        // daemon's own swap / keep-warm canonical writes (UNLIKE `canonical_watch`) — so a
+        // self-authored rotation is still marked, keeping the yank series the full canonical-rotation
+        // denominator #465 measures.
+        let rotated_from = match (state, &fingerprint) {
+            (CanonicalLiveness::Present, Some(fp)) => {
+                // Advance the anchor; if a DIFFERENT fingerprint was anchored, mark the yank carrying
+                // the PRIOR fingerprint. The first observation (anchor `None`) seeds silently.
+                match self.state.prev_canonical_fingerprint.replace(fp.clone()) {
+                    Some(prev) if prev != *fp => Some(prev),
+                    _ => None,
+                }
+            }
+            // A scrub CLEARS the anchor: a rotation spanning a scrub is a scrub + recovery, not a
+            // yank — the `canonical_restored` edge marks the recovery, re-seeding on the next Present.
+            (CanonicalLiveness::Scrubbed, _) => {
+                self.state.prev_canonical_fingerprint = None;
+                None
+            }
+            // Unknown (or a present blob with no parseable fingerprint): no evidence — HOLD the anchor
+            // and mark nothing, the same "a flaky read carries no signal" hold the scrub edge uses.
+            _ => None,
+        };
+
         // (1) The per-poll LEVEL record on the diagnostic channel (issue #464): every poll, so the
-        // fingerprint series + present/scrubbed reading are measurable from the log alone.
+        // fingerprint series + present/scrubbed reading are measurable from the log alone. On a
+        // rotation, the additive `mode=yank prev=…` marker (issue #475) rides this same line.
         diagnostics.push(Diagnostic::Canonical {
             state,
             fingerprint,
             account: handle.clone(),
             expires_at,
+            rotated_from,
         });
 
         // (2) The durable, EDGE-triggered transition events (issue #464). A transient UNKNOWN
@@ -5399,6 +5441,7 @@ mod tests {
             fingerprint: None,
             account: Some(active_label.to_owned()),
             expires_at: None,
+            rotated_from: None,
         }
     }
 
@@ -9650,7 +9693,9 @@ mod tests {
             "a present item with no prior scrub emits no event: {events:?}"
         );
         // The Present arm's field population through the METHOD: the fingerprint derived from the
-        // live refresh token and the `expiresAt` ms→s fold (1782777600000 ms → 1782777600 s).
+        // live refresh token and the `expiresAt` ms→s fold (1782777600000 ms → 1782777600 s). This
+        // is the FIRST Present observation, so it SEEDS the yank anchor silently (`rotated_from:
+        // None` — no rotation to mark).
         assert_eq!(
             diags,
             vec![Diagnostic::Canonical {
@@ -9658,9 +9703,15 @@ mod tests {
                 fingerprint: Some(canonical_fingerprint(b"live-rt")),
                 account: Some("work".to_owned()),
                 expires_at: Some(1_782_777_600),
+                rotated_from: None,
             }]
         );
         assert!(!daemon.state.signaled_canonical_scrubbed);
+        assert_eq!(
+            daemon.state.prev_canonical_fingerprint,
+            Some(canonical_fingerprint(b"live-rt")),
+            "the first Present observation seeds the yank anchor"
+        );
 
         // The item is scrubbed (gone) → exactly one `canonical_scrubbed` carrying the handle.
         let mut events = Vec::new();
@@ -9738,7 +9789,77 @@ mod tests {
                 fingerprint: None,
                 account: Some("work".to_owned()),
                 expires_at: None,
+                rotated_from: None,
             }]
+        );
+    }
+
+    /// Extract the #475 yank marker (`rotated_from`) from a `diag=canonical` diagnostic, panicking
+    /// on any other variant — a focused reader for the yank-detection assertions below.
+    fn rotated_from_of(d: &Diagnostic) -> Option<String> {
+        match d {
+            Diagnostic::Canonical { rotated_from, .. } => rotated_from.clone(),
+            other => panic!("expected a diag=canonical, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_marks_a_present_to_present_rotation_as_a_yank() {
+        // Issue #475: a Present→Present canonical fingerprint CHANGE is a rotation-YANK — the
+        // frequent, RECOVERABLE "Not logged in" mode. The FIRST Present seeds the anchor silently; a
+        // later Present with a DIFFERENT refresh token carries `rotated_from = Some(prior-fingerprint)`
+        // (rendered `mode=yank prev=…`); an UNCHANGED Present carries none; a scrub CLEARS the anchor
+        // so the recovery Present re-seeds WITHOUT a false yank across the restore edge. Derived
+        // purely from the observed present/valid state + fingerprint delta (AC1: "not guessed").
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let rt1 = cred(
+            br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt-1","expiresAt":1782777600000}}"#,
+        );
+        let rt2 = cred(
+            br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt-2","expiresAt":1782777600000}}"#,
+        );
+
+        // (1) First Present: seed the anchor, no yank marker.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt1), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            None,
+            "the first Present observation seeds the anchor without a yank"
+        );
+
+        // (2) Present with a DIFFERENT token: a rotation → yank carrying rt-1's fingerprint.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt2), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            Some(canonical_fingerprint(b"rt-1")),
+            "a Present→Present token change marks a yank carrying the PRIOR fingerprint"
+        );
+
+        // (3) Present with the SAME token: no rotation, no marker.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt2), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            None,
+            "an unchanged Present marks no yank"
+        );
+
+        // (4) A scrub CLEARS the anchor.
+        daemon.note_canonical_liveness(None, true, Some(0), &mut Vec::new(), &mut Vec::new());
+        assert_eq!(
+            daemon.state.prev_canonical_fingerprint, None,
+            "a scrub clears the yank anchor"
+        );
+
+        // (5) Recovery Present: re-seeds silently — a restore is NOT a yank.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt1), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            None,
+            "the Present that recovers a scrub re-seeds without a false yank"
         );
     }
 
@@ -9814,11 +9935,13 @@ mod tests {
     #[test]
     fn redaction_meter_covers_the_canonical_snapshot_fields() {
         use crate::redaction::meter::{assert_clean, Secrets};
-        // Issue #464 / #15: the per-poll canonical snapshot + its scrub/restore events must leak
-        // no secret. Build the log lines with a fingerprint derived from the fixture's REAL
+        // Issue #464 / #475 / #15: the per-poll canonical snapshot + its scrub/restore events must
+        // leak no secret. Build the log lines with a fingerprint derived from the fixture's REAL
         // refresh token — so a path that emitted the token (or its raw/hashed blob) rather than
         // the truncated per-token hash would surface here — and prove the value-based meter reads
-        // clean.
+        // clean. The Present line ALSO carries the #475 `mode=yank prev=<fingerprint>` marker with a
+        // real-token-derived prior fingerprint, so a bug rendering the raw prior token in the `prev=`
+        // slot (rather than its hash prefix) would surface here too.
         let secrets = Secrets::meter_fixture();
         let blob = secrets.blob();
         let rt = crate::refresh::refresh_token(blob).expect("fixture blob carries a refresh token");
@@ -9832,6 +9955,7 @@ mod tests {
                 fingerprint: Some(fingerprint.clone()),
                 account: Some("work".to_owned()),
                 expires_at,
+                rotated_from: Some(fingerprint.clone()),
             }
             .to_log_line(std::time::SystemTime::UNIX_EPOCH),
         );

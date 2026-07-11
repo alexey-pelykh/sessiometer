@@ -109,6 +109,39 @@ distinct active hour-buckets):
   canonical is rotated ~9.4×/day by the daemon *plus* once per session refresh (log-invisible, and
   in a busy fleet the dominant term).
 
+### The two rates, separately: yank-rate vs scrub-rate (#475)
+
+The live forensics split the single "Not logged in" symptom into **two modes of opposite severity and
+remedy**, which this finding reports **as two distinct rates** — the conflation [#475](https://github.com/alexey-pelykh/sessiometer/issues/475)
+removes. Each is now its own `grep`-able signal in the daemon's own log (the #475 `mode=` instrumentation,
+landing with this refinement), so the split is directly measurable going forward — not inferred by
+cross-correlating fingerprint deltas against swap/keep-warm lines by hand:
+
+| Mode | Trigger | Signal (#475) | Rate | Remedy |
+|---|---|---|---|---|
+| **rotation-yank** (frequent, RECOVERABLE) | the shared canonical ROTATES while a session is mid-flight — a daemon `swap` / `keep_warm`, or a concurrent `claude` session refresh — so a session pinned to the outgoing token gets a 401 while the item stays live | `mode=yank prev=<fp>` on the per-poll `diag=canonical` line (a Present→Present fingerprint delta) | **measured: ≥ 9.4 canonical rotations/day** (0.62/active-hour) by the daemon alone (§ 2 table), **plus** one per concurrent session refresh (log-invisible, dominant in a busy fleet) | none — sessions self-recover on `continue` |
+| **invalid_grant-scrub** (rare, UNRECOVERABLE) | a rotated-out/dead token is the canonical's *current* value when a refresh hits it AND no fresh token landed (the CAS-still-dead straddle, § 1 / § 3) — CC empties the item on the first `invalid_grant` | `event=canonical_scrubbed mode=scrub` (a durable Present→empty edge) | **numerator 🟡 capture-pending** (pre-instrumentation log carried zero scrubs); modeled *low* — the CAS-surviving subset of straddling refreshes | every session needs `claude /login` |
+
+The two signals sit on **different log sinks**, by the #475 design: `mode=scrub` is a durable
+`event=` line in `sessiometer.log`, while `mode=yank` rides the per-poll `diag=canonical` line on the
+**`-v` diagnostic channel** (as this finding's own methodology already runs the daemon — § Provenance).
+This asymmetry is deliberate: a yank needs no *new* durable event. Every canonical rotation the daemon
+can attribute is already durably logged — its own writes as `swap` / `keep_warm` (§ 2), an
+externally-authored rotation it detects as `re_stash` / `uncaptured_login` (§ 3) — while the sub-poll
+session refreshes that dominate the churn are invisible to *any* daemon event alike. A durable
+`canonical_yanked` would therefore only duplicate the former while still missing the latter; `mode=yank`
+instead labels the observable rotation series on the channel this analysis already reads.
+
+The **yank-rate is the canonical-rotation rate** measured in § 2: the #475 marker fires on every
+observed Present→Present rotation, so its count *is* that rotation series — and the yank-*rate* is
+quantified from the durable § 2 rotation counts (swap/keep-warm `event=` lines), so it holds even
+without `-v` (whether a given rotation actually stranded a live session is client-side and unobservable
+to the daemon — the rate bounds exposure, § "Why only a *few* …"). The **scrub-rate is the
+`canonical_scrubbed mode=scrub` count** — an
+edge-triggered *subset* of the yanking rotations (only those that straddle a rotation *and* survive CC's
+CAS guard), which is why it is rare in absolute terms yet fleet-wide in blast radius. The two are **not
+independent**: every scrub is preceded by a yank-eligible rotation; almost no yank becomes a scrub.
+
 ## (3) Concurrency model + cross-process guard
 
 **Who writes the one shared `Claude Code-credentials` item:** every local `claude` session (on its own
@@ -174,8 +207,11 @@ evidence gap #464 exists to close.
 - **#468 (gate proactive keep-warm) — confirmed a partial mitigation, not a pure win.** It reduces the
   daemon's canonical-churn share (measured 31 keep-warm writes = 33% of the 95 daemon canonical
   writes) but trades against recoverability (#476). Quantifying that trade is #476's job.
-- **#475 (distinguish rotation-yank from scrub)** — this finding sharpens the split: the *measured*
-  churn (swaps + keep-warm, frequent, recoverable) vs the *modeled* scrub (rare, unrecoverable).
+- **#475 (distinguish rotation-yank from scrub) — landed with this refinement.** This finding now
+  reports the two as separate rates (§ "The two rates, separately"): the *measured* rotation-yank
+  (swaps + keep-warm + session refreshes, frequent, recoverable, `mode=yank` on `diag=canonical`) vs
+  the *modeled* scrub (rare, unrecoverable, `event=canonical_scrubbed mode=scrub`). The `mode=`
+  classification makes each mode a first-class `grep` axis rather than a hand-correlated fingerprint delta.
 - **#477 (stash staleness)** — the swap-installs-stale-stash trigger path is mechanistically live but
   **did not fire in-window** (0 `refreshed_not_restashed` stash writes); worth confirming under load.
 - **Follow-up capture (prerequisite for the 🟡 items):** rebuild + restart the daemon on the #464
