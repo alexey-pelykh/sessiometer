@@ -110,6 +110,17 @@ enum Fixtures {
     {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":3}}
     """#
 
+    /// The daemon `stats` socket reply (issue #356) — the bounded per-account daily series the panel
+    /// Stats tab reads over the control socket. Byte-exact daemon output: `serde_json::to_string` of
+    /// the SAME `StatsWire` the CLI `stats --json` emits, serialized COMPACT (the socket frame), from
+    /// the CLI byte-stability golden report (`src/stats.rs` `wire_golden_report`). Byte-identical to
+    /// the Rust-emitted `wire-stats-basic.json` golden (`WireGoldenTests`), putting `StatsWire` under
+    /// the cross-language byte-drift guard (#340) for the first time. The stats DECODER lands with the
+    /// Stats tab (#446); this fixture freezes the shape now so the decoder cannot drift from it.
+    static let statsBasic = #"""
+    {"schema":1,"window":{"start":1782864000,"end":1782907200,"label":"last 24h (Jul 1–Jul 1)","period":"day"},"accounts":[],"series":[{"start":0,"end":21600,"roster":{"swap_count":1,"swaps":{"session":1,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"work":{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.9,"p95":0.85},"weekly":{"mean":0.3,"peak":0.4,"p95":0.38},"cap_hits":1,"time_at_cap_secs":300,"contribution_share":1.0,"band":"high"}}}],"summary":{"roster":{"swap_count":1,"swaps":{"session":1,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"work":{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.9,"p95":0.85},"weekly":{"mean":0.3,"peak":0.4,"p95":0.38},"cap_hits":1,"time_at_cap_secs":300,"contribution_share":1.0,"band":"high"}}}}
+    """#
+
     // ---- Backward/forward-compat frames (hand-built to the same contract) -------------------
 
     /// A pre-#119 daemon: `auth` present as null. The client must read it as "no verdict" (nil),

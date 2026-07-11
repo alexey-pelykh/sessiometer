@@ -162,7 +162,7 @@ pub(crate) use socket::{
 #[cfg(test)]
 pub(crate) use socket::{
     control_reply, encode_heartbeat_frame, encode_snapshot_frame, parse_watch_frame, serve_control,
-    serve_watch, ServeOutcome, WatchFrame, MAX_CONTROL_LINE_BYTES,
+    serve_stats, serve_watch, ServeOutcome, StatsRequest, WatchFrame, MAX_CONTROL_LINE_BYTES,
 };
 
 mod run_loop;
@@ -9644,7 +9644,82 @@ mod tests {
             ServeOutcome::Capture(..) => {
                 panic!("a watch command must route to a watch stream, not a capture handoff")
             }
+            ServeOutcome::Stats(..) => {
+                panic!("a watch command must route to a watch stream, not a stats handoff")
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_a_stats_command_to_a_handoff_unauthenticated() {
+        use tokio::io::AsyncWriteExt;
+        // A `stats` command is a non-secret READ (issue #356): like `watch`, it is UN-auth-gated
+        // (peer `false`) and NOT answered inline — it hands the connection back so the caller
+        // computes the series in a SPAWNED task, off the run loop. The `period` rides the handoff to
+        // the task verbatim.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"stats\",\"period\":\"week\"}\n")
+            .await
+            .unwrap();
+        let (_stream, request) = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap()
+            .stats();
+        assert_eq!(
+            request.period.as_deref(),
+            Some("week"),
+            "the stats period rides the handoff to the spawned task verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_a_periodless_stats_command() {
+        use tokio::io::AsyncWriteExt;
+        // A `stats` command with no `period` is well-formed — the task defaults it to `week` (the
+        // 7-day daily-bucket window), so the handoff carries `None` and there is no inline rejection.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"stats\"}\n").await.unwrap();
+        let (_stream, request) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .stats();
+        assert!(
+            request.period.is_none(),
+            "a periodless stats request hands off None (defaulted to week in the task)"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_stats_writes_exactly_one_json_line() {
+        use tokio::io::AsyncBufReadExt;
+        // End-to-end of the spawned answer path (issue #356): `serve_stats` computes off the runtime
+        // thread (`spawn_blocking`) and writes ONE newline-delimited JSON reply, then closes. The
+        // store state is environment-dependent (a real store, or none → an `{"error":…}` envelope),
+        // so assert the request/response FRAMING (AC3), not the payload: a single line that parses as
+        // one JSON object, then EOF. Exercises the `spawn_blocking` + `write_line` + timeout glue.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_stats(
+            server,
+            StatsRequest {
+                period: Some("week".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.ends_with('\n'), "the stats reply is newline-delimited");
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("the stats reply is one JSON object");
+        assert!(
+            value.is_object(),
+            "the reply is a JSON object — a StatsWire or an {{\"error\":…}} envelope"
+        );
+        let mut extra = String::new();
+        let n = reader.read_line(&mut extra).await.unwrap();
+        assert_eq!(n, 0, "stats is a one-shot reply, not a stream");
     }
 
     #[tokio::test]
