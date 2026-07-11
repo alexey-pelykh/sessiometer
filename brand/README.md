@@ -34,6 +34,14 @@ Status is therefore **doubly encoded**: hue *and* needle position.
 mark in bone `#EDE8DF`. The warmth is deliberate: a cold black + pure white
 would read as clinical AI-lab monochrome.
 
+> **Superseded — menu-bar status item.** The menu-bar status item now ships as a
+> **monochrome template**: state is carried by the glyph **shape**, not colour (a
+> menu-bar image is system-tinted, so colour cannot encode health — see #325). The
+> free-standing *colour* menu-bar glyph sets described below are being retired — #437
+> draws the bespoke monochrome bar glyphs, #439 removes the colour sets from
+> `generate.sh`. The colour "living instrument" still governs the **app icon, Dock,
+> and in-panel** surfaces; only the **menu bar** is monochrome.
+
 **Status.** The menu-bar glyph is a free-standing *colored* (non-template) image,
 so it must clear contrast against the bar it sits on:
 
