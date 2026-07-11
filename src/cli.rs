@@ -796,7 +796,11 @@ const CAPTURE_USAGE: &str = "sessiometer capture — stash the active account in
 USAGE:
     sessiometer capture [<label>]
 
-    <label>     a name for the captured account (auto-derived from its account-uuid if omitted)
+    <label>     a name for the captured account. Omit it at a terminal and capture
+                offers the account's email as an editable, pre-filled default —
+                press Enter to accept it, or type a shorter handle (e.g. `work`).
+                Omit it when piped/scripted and the label auto-derives from the
+                account-uuid (no prompt, and never the email unconfirmed).
     -h, --help  print this help
 ";
 

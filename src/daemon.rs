@@ -366,8 +366,13 @@ fn record_usage_sample(
 /// - **Gap honesty**: a FAILED poll (`Err` — API error, 401, offline) records
 ///   NOTHING. A gap is absent, never a fabricated zero/healthy sample (issue #157
 ///   reads a missing sample as UNKNOWN, never zero).
-/// - **Redaction-clean**: `acct` is the account's redacted handle (`label`), never
-///   an email or token — the store's invariant (issue #15).
+/// - **Redaction-clean**: `acct` is the account's roster `label` — never a token or a
+///   credential-read email. Since #444/#447 an operator-*authored* label MAY be an
+///   email (the capture prompt pre-fills the harvested address), so the store carries
+///   it verbatim under the SAME provenance-scoped rule as the render/event channels:
+///   an authored email label is permitted; an UNAUTHORED email (a stranger's address,
+///   a blob spill) is not (issue #15, relaxed by #444; see
+///   `redaction::meter::unauthored_emails`).
 /// - **Fail-open**: a store-write error (disk full, permission, torn write) is logged
 ///   and swallowed; it must never break the poll/swap loop or crash the daemon. The
 ///   credential rotation/health path is unaffected by a sampling failure.
@@ -16664,13 +16669,61 @@ mod tests {
         assert_eq!(s.severity.as_deref(), Some("critical"), "severity retained");
         assert_eq!(s.spend, None, "no spend producer yet (forward slot)");
 
-        // Redaction: the persisted line carries no email/token shape (issue #15).
+        // Redaction: a handle fixture carries no email at all — with an empty
+        // allow-set that is the strict bar (any `@`-shape would be UNAUTHORED and
+        // fail), now in the provenance vocabulary rather than a blanket no-`@`
+        // (issue #15, relaxed provenance-scoped by #444/#447).
         let raw = std::fs::read_to_string(&samples_path).unwrap();
-        assert!(!raw.contains('@'), "no email may reach the store: {raw}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&raw, &[]).is_empty(),
+            "no unauthored email may reach the store: {raw}"
+        );
         assert!(
             !raw.contains("sk-ant"),
             "no token may reach the store: {raw}"
         );
+    }
+
+    /// #447: an operator-authored email label flows through the collector into the
+    /// store verbatim (`append_sample_for_poll` copies the roster label into
+    /// `Sample.acct`) and is PERMITTED under the provenance-scoped waiver — while a
+    /// stray unauthored email would still fail. Companion to the handle-fixture case
+    /// above; guards that the store bar tracks the label's provenance, not the mere
+    /// presence of an `@`.
+    #[test]
+    fn collector_carries_an_operator_authored_email_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: 0.42,
+                weekly: 0.88,
+                weekly_resets_at: Some(1_700_600_000),
+                session_resets_at: Some(1_700_003_600),
+            },
+            severity: Some("critical".to_owned()),
+        });
+        let authored = "alice@example.com";
+
+        append_sample_for_poll(&samples_path, authored, &reading, 1_700_000_000);
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(samples[0].acct, authored, "the authored label, verbatim");
+
+        let raw = std::fs::read_to_string(&samples_path).unwrap();
+        // Permitted WHEN authored…
+        assert!(
+            crate::redaction::meter::unauthored_emails(&raw, &[authored]).is_empty(),
+            "an operator-authored email label is permitted: {raw}"
+        );
+        // …but the very same bytes surface as a leak WITHOUT the provenance allow-set
+        // (the assertion is not vacuous).
+        assert_eq!(
+            crate::redaction::meter::unauthored_emails(&raw, &[]),
+            vec![authored.to_owned()],
+            "without provenance the label reads as an unauthored email: {raw}"
+        );
+        assert!(!raw.contains("sk-ant"), "no token: {raw}");
     }
 
     /// A reading whose optional `severity` is absent still yields a valid sample
