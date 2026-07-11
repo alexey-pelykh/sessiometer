@@ -111,3 +111,6 @@ target/
 # REPO ROOT (as the menubar build command documents). `apps/menubar/.gitignore` only covers that path
 # relative to its own directory, so a root-level build needs its own entry.
 .build/
+
+# Generated brand assets (regenerate with ./brand/generate.sh)
+brand/dist/

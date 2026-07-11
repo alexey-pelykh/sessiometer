@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sessiometer — social preview</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{width:1200px;height:630px;overflow:hidden}
+  body{
+    background:
+      radial-gradient(760px 520px at 20% 34%, rgba(237,232,223,.055), transparent 68%),
+      linear-gradient(140deg,#2c2b27 0%,#242320 46%,#191815 100%);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+    display:flex;align-items:center;gap:74px;padding:0 82px;position:relative;
+  }
+  .mark{flex:0 0 auto;width:296px;height:296px;display:grid;place-items:center}
+  .mark svg{width:296px;height:296px;display:block}
+  .txt{flex:1 1 auto;padding-bottom:6px}
+  h1{font-size:88px;line-height:1;font-weight:700;letter-spacing:-.035em;color:#F3EFE7}
+  .tag{margin-top:26px;font-size:34px;line-height:1.32;font-weight:400;color:#B6B0A3;letter-spacing:-.008em}
+  .tag b{color:#DDD7CA;font-weight:600}
+  .micro{margin-top:34px;display:flex;align-items:center;gap:13px;font-size:21px;color:#89836F;letter-spacing:.005em}
+  .dots{display:flex;gap:7px}
+  .dots i{width:11px;height:11px;border-radius:50%;display:block}
+  .unoff{position:absolute;left:82px;bottom:42px;font-size:19px;color:#5E5A52;letter-spacing:.01em}
+</style>
+</head>
+<body>
+  <div class="mark">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#EDE8DF" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/>
+      <path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#EDE8DF" stroke-width="0.6"/>
+      <path d="M12 12 14.75 7.24" stroke-width="2.2"/>
+      <circle cx="12" cy="12" r="1.5" fill="#EDE8DF" stroke="none"/>
+    </svg>
+  </div>
+  <div class="txt">
+    <h1>Sessiometer</h1>
+    <div class="tag">Your usage,<br><b>at a glance.</b></div>
+    <div class="micro">
+      <span class="dots"><i style="background:#30D158"></i><i style="background:#FF9F0A"></i><i style="background:#FF453A"></i></span>
+      <span>Session meter for Claude Code &middot; macOS &middot; open source</span>
+    </div>
+  </div>
+  <div class="unoff">Unofficial &middot; not affiliated with Anthropic</div>
+</body>
+</html>
