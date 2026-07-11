@@ -750,3 +750,102 @@ platform-property premises:
   this entry; if a knob lands upstream it attacks the root cause and is preferable to reactive recovery).
 
 CC 2.1.207 · macOS 26.5.1 / 25F80 · sessiometer #470 → ADR-0018.
+
+---
+
+# Issue #466 — a knob to disable the `invalid_grant` scrub? **No knob.** (spike)
+
+The knob half of the **#463** umbrella, and the resolution of the **pending** marker in **#470** above.
+#470 records *that* CC 2.1.207 empties the shared `Claude Code-credentials` item on the first
+`invalid_grant`; this spike asks whether a Claude Code **setting** stops it — the cheapest possible fix,
+which if it existed would supersede or shrink the reactive-recovery work (#467/#468).
+
+**Verdict: no knob.** No config / env / flag / feature-gate (a) **disables** the scrub, (b) adds
+**retry / backoff** before it, or (c) **softens** it into a recoverable state. So #470's premise stands:
+recovery must be the daemon's (#467/#468), not a Claude Code toggle. A knob-*absence* can only be
+established by inspecting the shipped build (the ledger's #100/#101 method — an observable probe shows the
+default scrub but cannot prove no disabling setting exists); the **behavior, interaction, and
+"does-not-widen-the-range" caveat are #470's and are not repeated here.**
+
+## Results at a glance
+
+| # | Question | Verdict | Evidence |
+|---|---|---|---|
+| **a** | A knob to **disable** the scrub? | ❌ no knob | fires unconditionally on (invalid_grant ∧ had-RT); no `process.env` / settings key / feature-gate in the refresh function |
+| **b** | A knob to **add retry / backoff**? | ❌ no knob | one `/v1/oauth/token` attempt → scrub, 0 retries; the only retry (`maxRetries:5`) is for **ELOCKED** lock-contention, hardcoded |
+| **c** | A knob to **soften** to recoverable? | ❌ no knob | clears `refreshToken:"",accessToken:"",expiresAt:0` — no keep-last-good mode |
+| — | The one timeout knob that exists | ⚠️ wrong path | `CLAUDE_CODE_OAUTH_401_WAIT_MS` / `HOST_AUTH_REFRESH_TIMEOUT_MS` govern the **env-token/host-auth** 401-recovery branch, never the first-party scrub |
+| — | Upstream-report | 🟡 low value / optional | already concurrency-guarded; residual is a non-standard shared-item scenario |
+
+## The scrub is unconditional — no gate to hang a knob off
+
+The first-party refresh function (owns the shared item via `g.claudeAiOauth`) POSTs the refresh token
+once; its failure branch, verbatim:
+
+```js
+let p=await BF();
+if(p&&p.accessToken!==i)return N("tengu_oauth_token_refresh_race_recovered",{}),"refreshed"; // race guard: a concurrent writer already landed a fresh token
+if(OXe(d)&&c){                                                                                // OXe=is-invalid_grant ; c=the RT used
+  UBn.add(c),N("tengu_oauth_refresh_token_marked_dead_invalid_grant",{});
+  let m=await Fc().mutate((g)=>{let y=g.claudeAiOauth;
+    if(!y||y.refreshToken!==c)return g;                                                       // CAS: only scrub if the stored RT is still the dead one
+    return f=!0,{...g,claudeAiOauth:{...y,refreshToken:"",accessToken:"",expiresAt:0}}});      // the scrub — both tokens
+}
+```
+`OXe(e)` = axios err, status 400|401, body `code==="invalid_grant"`. Symbol names are 2.1.207 minified
+identifiers (unstable across versions — the drift canary below keys on the stable `tengu_oauth_*` events).
+
+- **(a) no disable.** The `Fc().mutate` scrub runs whenever `OXe(d)&&c` (invalid_grant, had an RT). No
+  `process.env`, no settings.json key, no statsig/feature-gate anywhere in the function (a scan of the
+  scrub window returns none). Its only two guards are automatic **race-checks** (`accessToken!==i`; CAS
+  `refreshToken!==c`) — the "guarded" behavior #470 notes — not operator knobs.
+- **(b) no retry/backoff.** A single refresh POST; `invalid_grant` → scrub, zero retries. The function's
+  only retry loop is `ELOCKED` lock-acquisition (`maxRetries:5`, 1–2 s jittered) — hardcoded, unrelated.
+  (A scope-fallback retry exists, but fires on an invalid *scope*, not grant.)
+- **(c) no softening.** The mutate clears both tokens + `expiresAt:0`; no retain-dead mode, no setting.
+
+## The one timeout knob — a different path
+
+`function XTh(){let e=be.CLAUDE_CODE_OAUTH_401_WAIT_MS;if(e!==void 0)return e;return be.CLAUDE_CODE_REMOTE_SESSION_ID?60000:0}`
+is read **only** in the env-token / host-auth 401-recovery branch (reached when `CLAUDE_CODE_OAUTH_TOKEN`
+or the `CCR` token-file is set), where CC re-reads disk / **waits for a host-rotated env token** — it never
+runs first-party refresh, so never scrubs. Pointed at the first-party path it has no effect; it is not an
+answer to (b). (Same for `CLAUDE_CODE_HOST_AUTH_REFRESH_TIMEOUT_MS`.)
+
+## Adjacent — auth-source precedence (out of scope; not recommended)
+
+CC resolves its bearer `ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > CCR-file >
+apiKeyHelper > profile > firstParty-keychain`. A session whose bearer comes from `CLAUDE_CODE_OAUTH_TOKEN`
+never runs first-party refresh → never scrubs — but that hands credential rotation to the *host*
+(Sessiometer would then own the rotating-RT refresh itself, relocating the #465 race), a different
+ownership model incompatible with the shared-keychain rotation of ADR-0002 / ADR-0003 without a redesign.
+**Not** a drop-in setting; recorded for deliberate weighing, not recommended as this spike's answer.
+
+## Downstream + upstream
+
+- **#467 / #468 — confirmed necessary.** No setting disables, delays, or softens the scrub, so #470's
+  mitigations stand; #466 removes the "a cheap knob supersedes the fix" branch and **resolves #470's
+  pending knob-outcome marker**.
+- **Drift canary** — [`scripts/spike-466-invalid-grant-scrub-probe.sh`](../scripts/spike-466-invalid-grant-scrub-probe.sh)
+  re-asserts, offline against the stock binary, that the scrub is still present, still empties both
+  tokens, and has **no `process.env`/gate at the scrub site** (anchored on the code occurrence, not merely
+  the event name). It flips if a future CC adds a knob — operationalizing #470's "whether a knob now
+  exists" re-check trigger.
+- **Upstream-report: low value / optional.** CC already concurrency-guards the scrub (pre-scrub re-read +
+  `accessToken` race-check + CAS on the stored RT); the residual #463 window is a rotating-RT shared item
+  with many writers — outside CC's single-user model, where `invalid_grant` is an intentional
+  deprovisioning hook (CC's own mock-API doc string: *"Return `401 {"error":"invalid_grant"}` to force
+  re-login — this is your deprovisioning hook"*). A courteous low-priority observation (a brief pre-scrub
+  grace / one re-read, or leaving `accessToken` intact) is defensible; do **not** block — Sessiometer owns
+  recovery regardless.
+
+## Provenance
+
+Static decode of the stock **CC 2.1.207** binary (`~/.local/share/claude/versions/2.1.207`; a byte-patched
+wrapper may sit on `$PATH`, so inspection targeted the stock binary). **No credential read or written; no
+network call.** Quoted expressions are verbatim. Public-safety (#463): #470 carries the observable
+behavior; this spike's build inspection is the ledger's established #100 / #101 method — the only way to
+establish a *knob-absence* — and stays scoped to that one question. Cross-checks: #470 (observable scrub +
+interaction), #101 (store model), #465 (refresh-token rotation).
+
+CC 2.1.207 · macOS 26.5.2 / 25F84 · sessiometer #466.
