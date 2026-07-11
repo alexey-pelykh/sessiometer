@@ -692,3 +692,61 @@ Two harness bugs produced false `Not logged in · Please run /login` results bef
   (`/abs/path → 6d80187b`) before use.
 
 CC 2.1.195 (B) / 2.1.197 (A) · macOS 26.5.1 / 25F80 · sessiometer #145.
+
+---
+
+# Issue #470 — Claude Code scrubs the shared credential on the first `invalid_grant` ⚠ (CC 2.1.207)
+
+The credential-lifecycle finding the **#463** umbrella rests on, recorded here from **observable**
+Claude Code behavior (no reverse-engineered internals). Full rationale + mitigation decisions:
+[ADR-0018](../docs/adr/0018-shared-credential-scrub-multi-writer-lockout.md).
+
+## Finding — the first `invalid_grant` empties the shared item ⚠
+
+On the shipped **2.1.207** build, when a refresh is refused with `invalid_grant`, Claude Code
+**empties** the shared `Claude Code-credentials` keychain item (tokens cleared) rather than leaving
+the existing token in place. Every session then shows **"Not logged in · Please run /login"** until an
+operator re-authenticates. Claude Code re-reads the item per request and **self-heals a merely-stale
+*in-memory* token** (it picks up a fresh token that has landed in the canonical), but it **cannot**
+self-heal from an **emptied** item — there is nothing valid to re-read. The scrub is **guarded**: it
+does not clobber a fresh token that already landed, so it bites specifically when a **dead token is the
+item's current token with no valid replacement**.
+
+Strictly worse than the two shared-item modes already in this ledger and the daemon's own #253/#254 fix
+(active account excluded from poll-refresh): those leave *some* token in the canonical to re-read; the
+scrub leaves **nothing**, defeating the per-request self-heal.
+
+## Interaction + asymmetry (why it goes fleet-wide, silently)
+
+- **Interaction**: one shared item + refresh-token rotation on **every** exchange (RFC 9700 default for
+  a public OAuth client; observable as `rotated=true` in the daemon logs) + multiple writers (N sessions
+  + daemon swaps + proactive keep-warm) ⇒ windows where a rotated-out (dead) token is the item's
+  *current* token ⇒ a refresh against it → `invalid_grant` → scrub → **fleet-wide** "Not logged in."
+- **Asymmetry (observability gap)**: Claude Code scrubs on the **1st** `invalid_grant`; the daemon
+  declares DEAD + quarantines only after `monitor_401_n` **consecutive** 401s
+  (`DEFAULT_MONITOR_401_N = 3`, `src/config.rs`). So the operator can hit the lockout with **no
+  `credential_dead` event** in `sessiometer.log` (observed: a ~4 h window with zero recorded deaths yet
+  live, fleet-wide lockouts).
+
+## Does NOT widen the supported range
+
+This 2.1.207 observation is a **failure-mode characterization**, **not** a re-verification of the
+version-sensitive findings the supported range gates (H3 fresh-start adoption, the #100
+keychain-service derivation). It was observed **above** `CC_SUPPORTED_MAX` (`2.1.197`) but does **not**
+widen it: the range stays `2.1.181`–`2.1.197` until H3 / #100 are re-verified per the header protocol.
+The scrub is a Claude Code auth behavior, not a macOS-keychain property.
+
+## Deferred-live re-check trigger (the ADR-0002 / ADR-0003 pattern)
+
+On a Claude Code **auth bump** (a new build touching login / token-refresh / credential storage),
+re-verify — the same deferred-live-oracle discipline ADR-0002 / ADR-0003 record for their
+platform-property premises:
+
+- **Does the first `invalid_grant` still empty the shared item**, or has the behavior changed (token
+  left in place, scrubbed differently, or a knob added)? The #463 mitigations
+  ([ADR-0018](../docs/adr/0018-shared-credential-scrub-multi-writer-lockout.md)) target *this* observed
+  behavior; a change silently invalidates their premise.
+- **Whether a knob to disable the scrub now exists** (the **#466** spike — outcome **pending** as of
+  this entry; if a knob lands upstream it attacks the root cause and is preferable to reactive recovery).
+
+CC 2.1.207 · macOS 26.5.1 / 25F80 · sessiometer #470 → ADR-0018.
