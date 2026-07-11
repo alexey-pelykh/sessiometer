@@ -592,6 +592,25 @@ pub(crate) enum Event {
     /// recovery transition. `account` is the newly-resolved HANDLE, or absent — never a token or
     /// email (issue #15).
     CanonicalRestored { account: Option<String> },
+    /// The daemon AUTONOMOUSLY adopted a viable roster account's token into a scrubbed/empty
+    /// canonical (issue #467), healing every local `claude` session on its next request — no
+    /// operator action. The narrow carve-out from ADR-0007 decision 4 that ADR-0018 decision 1
+    /// automates: recovery for a scrubbed canonical was `use --force`-gated, but when the canonical
+    /// is empty AND a live target exists (NOT the genuinely-all-dead `active_dead_no_target` case),
+    /// the daemon may adopt without the gate. `account` is the ADOPTED target's HANDLE (operator
+    /// label), never a token or email (issue #15). Distinct from [`Event::CanonicalRestored`], which
+    /// is the OBSERVATION that the item reads live again on a later poll (and also fires after an
+    /// operator `claude /login`): this names the daemon's own recovery ACTION and WHICH account it
+    /// adopted, emitted at adopt time.
+    CanonicalRecovered { account: String },
+    /// The daemon BACKED OFF autonomous scrubbed-canonical recovery (issue #467): the canonical was
+    /// re-scrubbed more than the bound allows within the churn window (a persistent multi-session
+    /// rotation churn), so continuing to adopt would thrash the re-auth loop. The daemon holds and
+    /// leaves the `canonical_scrubbed` signal up for the operator (status + menubar, issue #469)
+    /// rather than churning. Edge-triggered: emitted ONCE per back-off episode, afresh after the
+    /// churn window resets and recovery resumes. `account` is the last-known active HANDLE the scrub
+    /// emptied, or absent when none was resolved — never a token or email (issue #15).
+    CanonicalRecoveryExhausted { account: Option<String> },
     /// `account`'s refresh token is confirmed DEAD and UNRECOVERABLE by automation: a
     /// quarantined account's isolated #106-sweep refresh returned `outcome=dead` (the
     /// stored refresh token is revoked/empty), so no daemon path can revive it — only
@@ -945,6 +964,19 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=canonical_restored{account}")
+            }
+            Event::CanonicalRecovered { account } => {
+                format!("ts={ts} event=canonical_recovered account={account}")
+            }
+            Event::CanonicalRecoveryExhausted { account } => {
+                // `account` trails optionally (an empty value would split the key=val grammar) —
+                // absent when no active account was resolved at back-off time. Mirrors
+                // `canonical_scrubbed`'s optional `account`.
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=canonical_recovery_exhausted{account}")
             }
             Event::CredentialUnrecoverable { account } => {
                 format!("ts={ts} event=credential_unrecoverable account={account}")
@@ -1445,6 +1477,9 @@ pub(crate) enum DecisionClass {
     /// The active credential is dead and no target is viable — held, unable to
     /// escape (issue #42).
     ActiveDeadNoTarget,
+    /// The shared canonical was scrubbed/empty and the daemon autonomously adopted a
+    /// viable target's token into it, healing every session (issue #467).
+    CanonicalAdopted,
     /// The active account could not be identified — poll-only.
     SkipActiveUnknown,
     /// The active account's reading was unavailable this cycle — never swap on
@@ -1467,6 +1502,7 @@ impl DecisionClass {
             DecisionClass::EmergencySwap => "emergency_swap",
             DecisionClass::AllExhausted => "all_exhausted",
             DecisionClass::ActiveDeadNoTarget => "active_dead_no_target",
+            DecisionClass::CanonicalAdopted => "canonical_adopted",
             DecisionClass::SkipActiveUnknown => "skip_active_unknown",
             DecisionClass::SkipActiveUnavailable => "skip_active_unavailable",
             DecisionClass::SkipCooldown => "skip_cooldown",
@@ -1960,6 +1996,43 @@ mod tests {
 
         let no_handle = Event::CanonicalRestored { account: None }.to_log_line(at_epoch(0));
         assert_eq!(no_handle, format!("{TS0} event=canonical_restored"));
+    }
+
+    #[test]
+    fn canonical_recovered_carries_the_adopted_account_handle() {
+        // Issue #467: the autonomous adopt-target recovery renders the adopted account HANDLE
+        // (never a token or email). `account` is required — recovery only fires with a viable
+        // target in hand, so there is always a handle to name.
+        let line = Event::CanonicalRecovered {
+            account: "spare".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=canonical_recovered account=spare")
+        );
+    }
+
+    #[test]
+    fn canonical_recovery_exhausted_carries_the_handle_when_known_and_omits_it_otherwise() {
+        // Issue #467: the back-off surface when re-scrub churn exceeds the window bound — same
+        // optional-handle grammar as `canonical_scrubbed` (an empty value would split key=val),
+        // absent when no active account was resolved at back-off time.
+        let with_handle = Event::CanonicalRecoveryExhausted {
+            account: Some("work".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            with_handle,
+            format!("{TS0} event=canonical_recovery_exhausted account=work")
+        );
+
+        let no_handle =
+            Event::CanonicalRecoveryExhausted { account: None }.to_log_line(at_epoch(0));
+        assert_eq!(
+            no_handle,
+            format!("{TS0} event=canonical_recovery_exhausted")
+        );
     }
 
     #[test]
@@ -3170,6 +3243,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             (DecisionClass::EmergencySwap, "emergency_swap"),
             (DecisionClass::AllExhausted, "all_exhausted"),
             (DecisionClass::ActiveDeadNoTarget, "active_dead_no_target"),
+            (DecisionClass::CanonicalAdopted, "canonical_adopted"),
             (DecisionClass::SkipActiveUnknown, "skip_active_unknown"),
             (
                 DecisionClass::SkipActiveUnavailable,
