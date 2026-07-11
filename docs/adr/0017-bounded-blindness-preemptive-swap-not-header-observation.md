@@ -154,8 +154,8 @@ The path honours the **#369** cautions on a reactive fast-path:
    - **Cons**: acts on a **stale** pre-blind anchor rather than fresh truth — a
      deliberate trade, since the fresh reading is provably unavailable. A **static**
      `risk_band` may over- or under-trigger; mitigated by treating the constants as
-     interim (finalised by **#451**) and deferring a velocity-projection arm to
-     **#455**.
+     interim (finalised by **#451**) and by the deferred velocity-projection arm
+     (a **#452** Future note, gated on **#455**'s SLIs).
 
 ## Consequences
 
@@ -184,9 +184,9 @@ The path honours the **#369** cautions on a reactive fast-path:
   `risk_band` (only near-band anchors qualify) and by requiring a viable target.
 - **Interim constants are not yet empirically tuned.** `T=300s` / `risk_band=65%`
   await **#451**; a velocity-projection arm (`last_good + rate_preblind ×
-  blind_elapsed >= trigger`) is deferred to **#455** pending SLI evidence. Wrong
-  constants over- or under-trigger; the kill-switch (`session_blind_swap_secs` set
-  high) is the escape hatch.
+  blind_elapsed >= trigger`) is deferred as a **#452** Future note, gated on
+  **#455**'s SLI evidence. Wrong constants over- or under-trigger; the
+  kill-switch (`session_blind_swap_secs` set high) is the escape hatch.
 - **Implementation is pending (#452).** This ADR records the decision ahead of the
   code, so until #452 lands the daemon still exhibits the S1 blindness. The record
   exists to lock the rationale — especially the header-path rejection — before the
@@ -195,13 +195,15 @@ The path honours the **#369** cautions on a reactive fast-path:
 ## Related
 
 - Issues: **#454** (this ADR). **#452** (the design recorded here — the
-  bounded-blindness preemptive swap; implementation tracked there). **#451** (the
+  bounded-blindness preemptive swap; implementation tracked there, and the home of
+  the deferred velocity-projection arm note). **#451** (the
   premise-confirmation + constants finalisation gate for `T` / `risk_band`).
   **#450** (the retained `last_good` pre-blind anchor the path keys off). **#363**
   (the reaction-latency umbrella). **#369** (the reactive fast-path open question
   whose cautions this honours). **#42** (the dead-vs-exhausted model the separate
-  availability path preserves). **#455** (the deferred velocity-projection arm,
-  gated on SLIs). **#80** (the burst-`429` exposure that rules out harder polling).
+  availability path preserves). **#455** (the reliability SLO readout for
+  swap-out overshoot; its SLIs gate the deferred **#452** velocity-projection
+  arm). **#80** (the burst-`429` exposure that rules out harder polling).
   [anthropics/claude-code#55333](https://github.com/anthropics/claude-code/issues/55333)
   (upstream FR: Claude Code does not persist its usage headers). **#15**
   (diagnostics stay secret-free — the swap keys off the account's own usage and
