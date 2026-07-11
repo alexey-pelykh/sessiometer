@@ -1291,6 +1291,14 @@ struct DecisionState {
     /// ([`decision_readings`](Daemon::decision_readings)), so stale carried data can
     /// never leak into [`pick_target`].
     last_readings: Vec<Option<Usage>>,
+    /// When each [`last_readings`](Self::last_readings) slot was observed (issue #449), indexed in
+    /// lockstep with it — the monotonic ([`Instant`]) time of the reading now in that slot, `None`
+    /// whenever the slot is `None` (never polled, or cleared by a failed poll). The per-account
+    /// usage-velocity signal divides its delta by `now - last_reading_at[i]` to normalize to %/min;
+    /// keeping the timestamp PARALLEL to `last_readings` (rather than folding it into the `Copy`
+    /// decision [`Usage`]) leaves the swap-decision type lean and every reader of `last_readings`
+    /// unchanged. Process-local: never serialized (an [`Instant`] is meaningless across the socket).
+    last_reading_at: Vec<Option<Instant>>,
     /// The ACTIVE account's retained pre-blind anchor (issue #450): its last
     /// SUCCESSFUL reading (`session` / `weekly` fractions) plus the monotonic time it
     /// was observed, kept ACROSS a `429` / `5xx` blindness window that clears
@@ -1523,6 +1531,9 @@ where
         // Carried last-known reading + warm-up tracking per account (issue #80), one
         // slot per account, sized to the roster like `health`.
         let last_readings = vec![None; roster.len()];
+        // Reading timestamps parallel to `last_readings` (issue #449), for the %/min velocity
+        // interval — sized to the roster like `last_readings`, `None` until each account is polled.
+        let last_reading_at = vec![None; roster.len()];
         let polled_once = vec![false; roster.len()];
         Self {
             roster,
@@ -1587,6 +1598,7 @@ where
             state: DecisionState {
                 health,
                 last_readings,
+                last_reading_at,
                 polled_once,
                 ..DecisionState::default()
             },
@@ -1967,25 +1979,59 @@ where
             // outcome clears both. The returned widened wait rides the diagnostic tick line;
             // the durable back-off ENTER / EXIT events (issue #399) ride `events`.
             this_tick_backoff = self.note_account_backoff(i, &result, &mut events);
-            // Durable per-account usage VELOCITY (issue #399): the signed percent delta between
-            // this reading and the account's previous one, so the durable log carries how fast each
-            // account is climbing (the gated #368 adaptive-trigger measurement). Both readings must
-            // be present — the account's FIRST reading, or a reading after a throttle / failure
-            // (which clears the slot below to `None`), has nothing to diff — and the account must
-            // have measurably MOVED (a non-zero rounded delta in either dimension), mirroring
-            // `usage_rollup`'s no-op silence so a flat idle account stays quiet on the always-on log.
-            if let (Some(prev), Ok(next)) = (self.state.last_readings[i].as_ref(), result.as_ref())
-            {
+            // A single monotonic read for this poll, shared by the velocity interval (#449), the
+            // blind-window close (#449), and the `last_good` anchor refresh (#450) so all three
+            // reason against the SAME instant.
+            let now = self.clock.now();
+            // Durable per-account usage VELOCITY (issue #399), normalized to %/min (issue #449): the
+            // signed percent delta between this reading and the account's previous one, carried with
+            // the `elapsed_secs` interval so the durable log expresses a TIME rate (the gated #451
+            // spike / #368 measurement). Both readings AND the prior timestamp must be present — the
+            // account's FIRST reading, or a reading after a throttle / failure (which clears the slot
+            // + its timestamp below), has nothing to diff — the interval must be positive, and the
+            // account must have measurably MOVED (a non-zero rounded delta in either dimension),
+            // mirroring `usage_rollup`'s no-op silence so a flat idle account stays quiet.
+            if let (Some(prev), Ok(next), Some(prev_at)) = (
+                self.state.last_readings[i].as_ref(),
+                result.as_ref(),
+                self.state.last_reading_at[i],
+            ) {
                 let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
-                if session_delta_pct != 0 || weekly_delta_pct != 0 {
+                let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
+                if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
                     events.push(Event::UsageVelocity {
                         account: self.roster[i].account_uuid.clone(),
                         session_delta_pct,
                         weekly_delta_pct,
+                        elapsed_secs,
+                    });
+                }
+            }
+            // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
+            // the active had gone blind (a `429` / `5xx` cleared `last_readings[active]` so
+            // `swap::decide` had no reading to act on) and this poll reads it live again. Measured
+            // from the retained pre-blind anchor (`last_good`, #450) — read HERE, before the refresh
+            // below, so it is still the OLD anchor — so `duration_secs` is the `blind_elapsed` #452
+            // keys off, and `near_limit` tags whether the anchor sat at/over the session trigger (the
+            // risk band). The `last_readings[i].is_none()` was-blind check plus `last_good.is_some()`
+            // excludes a first-ever poll (a `None` slot that was never blind); `active == Some(i)`
+            // scopes it to the active account the anchor belongs to. Edge-triggered: the None→live
+            // transition fires exactly once per blind episode.
+            if active == Some(i) && result.is_ok() && self.state.last_readings[i].is_none() {
+                if let Some(anchor) = self.state.last_good {
+                    events.push(Event::BlindWindow {
+                        account: self.roster[i].account_uuid.clone(),
+                        duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
+                        session_pct: to_pct(anchor.session),
+                        near_limit: anchor.session >= self.session_trigger_base,
                     });
                 }
             }
             self.state.last_readings[i] = result.ok();
+            // Track WHEN this reading was observed, in lockstep with `last_readings` (issue #449):
+            // `now` on a live reading, cleared on a failed poll — so the velocity interval above
+            // spans only two real consecutive readings (never a gap).
+            self.state.last_reading_at[i] = self.state.last_readings[i].as_ref().map(|_| now);
             // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
             // anchor, SEPARATE from `last_readings` (which the assignment above clears to
             // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
@@ -1996,11 +2042,10 @@ where
             // so the anchor always belongs to the current active account.
             if active == Some(i) {
                 if let Some(reading) = self.state.last_readings[i] {
-                    let at = self.clock.now();
                     self.state.last_good = Some(LastGood {
                         session: reading.session,
                         weekly: reading.weekly,
-                        at,
+                        at: now,
                     });
                 }
             }
@@ -3559,6 +3604,7 @@ where
         // handful of accounts, so the per-account `position` scan is inconsequential.)
         let mut health = Vec::with_capacity(new_roster.len());
         let mut last_readings = Vec::with_capacity(new_roster.len());
+        let mut last_reading_at = Vec::with_capacity(new_roster.len());
         let mut polled_once = Vec::with_capacity(new_roster.len());
         for account in &new_roster {
             match self
@@ -3569,11 +3615,13 @@ where
                 Some(old_idx) => {
                     health.push(self.state.health[old_idx].clone());
                     last_readings.push(self.state.last_readings[old_idx]);
+                    last_reading_at.push(self.state.last_reading_at[old_idx]);
                     polled_once.push(self.state.polled_once[old_idx]);
                 }
                 None => {
                     health.push(AccountHealth::default());
                     last_readings.push(None);
+                    last_reading_at.push(None);
                     polled_once.push(false);
                 }
             }
@@ -3591,6 +3639,7 @@ where
         self.roster = new_roster;
         self.state.health = health;
         self.state.last_readings = last_readings;
+        self.state.last_reading_at = last_reading_at;
         self.state.polled_once = polled_once;
         self.state.active = active;
         // Issue #450: `last_good` belongs to the active account by identity; reconcile
@@ -7479,9 +7528,10 @@ mod tests {
 
     #[tokio::test]
     async fn usage_velocity_is_emitted_on_the_second_reading() {
-        // AC (issue #399): velocity is queryable from the durable log. The FIRST reading has no
-        // prior to diff (silent); the SECOND emits a `usage_velocity` with the signed percent delta
-        // — here session climbed 10% → 17% (=+7) while weekly held at 20% (=0).
+        // AC (issue #399, normalized by #449): velocity is queryable from the durable log. The FIRST
+        // reading has no prior to diff (silent); the SECOND emits a `usage_velocity` with the signed
+        // percent delta AND the interval it spanned — here session climbed 10% → 17% (=+7) while
+        // weekly held at 20% (=0) over 60 s (so the rendered rate is 7.00 %/min).
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
         let first = daemon.tick().await;
@@ -7493,6 +7543,9 @@ mod tests {
             "the first reading has no prior to diff: {:?}",
             first.events,
         );
+        // The velocity is a %/min rate now (#449), so an interval must elapse between the two
+        // readings — advance the monotonic clock 60 s before the second poll.
+        daemon.clock.advance(Duration::from_secs(60));
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.17, 0.20);
         let second = daemon.tick().await;
         assert!(
@@ -7500,8 +7553,9 @@ mod tests {
                 account: "u-A".to_owned(),
                 session_delta_pct: 7,
                 weekly_delta_pct: 0,
+                elapsed_secs: 60,
             }),
-            "the second reading must emit its velocity: {:?}",
+            "the second reading must emit its velocity + interval: {:?}",
             second.events,
         );
     }
@@ -7509,10 +7563,13 @@ mod tests {
     #[tokio::test]
     async fn usage_velocity_is_silent_when_the_reading_is_flat() {
         // A flat reading (no measurable change) emits no `usage_velocity` — the no-op silence that
-        // keeps an idle account quiet on the always-on event log (mirroring `usage_rollup`).
+        // keeps an idle account quiet on the always-on event log (mirroring `usage_rollup`). Time
+        // DOES elapse (60 s) between the two reads, so the suppression is proven to come from the
+        // zero delta, not a zero interval (#449).
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
         daemon.tick().await; // seed the prior reading
+        daemon.clock.advance(Duration::from_secs(60));
         let flat = daemon.tick().await; // an identical reading → zero delta
         assert!(
             !flat
@@ -7527,16 +7584,19 @@ mod tests {
     #[tokio::test]
     async fn usage_velocity_is_negative_when_a_window_resets() {
         // A window reset drops the reading, so the delta is NEGATIVE (session 90% → 5% = -85) — the
-        // durable log distinguishes a reset from a climb by sign, the signal #368 consumes.
+        // durable log distinguishes a reset from a climb by sign, the signal #368 consumes. The
+        // reset spans a 60 s interval (#449), so the rendered rate is -85.00 %/min.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.90, 0.30)).await;
         daemon.tick().await; // seed a prior reading at 90% session
+        daemon.clock.advance(Duration::from_secs(60));
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.05, 0.30);
         let reset = daemon.tick().await;
         assert!(reset.events.contains(&Event::UsageVelocity {
             account: "u-A".to_owned(),
             session_delta_pct: -85,
             weekly_delta_pct: 0,
+            elapsed_secs: 60,
         }));
     }
 
@@ -7564,6 +7624,102 @@ mod tests {
                 .any(|e| matches!(e, Event::UsageVelocity { .. })),
             "a velocity must not span a throttle gap: {:?}",
             post_gap.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_close_is_emitted_on_active_recovery_with_duration_and_near_limit() {
+        // Issue #449 (umbrella #363 Path B): the active account was near the limit (96%) when a 429
+        // blinded it — its `last_readings` slot cleared, so `swap::decide` had no reading. Five
+        // minutes later it reads live again; the daemon emits ONE durable `blind_window` close with
+        // the blind DURATION (300 s), the pre-blind anchor's session pct (96), and `near_limit=true`
+        // (the anchor sat at/over the 95% trigger). The two SLIs the #451 spike reads.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.96, 0.30)).await;
+        daemon.tick().await; // seed the pre-blind anchor at 96% session (in the risk band)
+
+        // A 429 blinds the active account: its reading is cleared, the #450 anchor is retained. No
+        // blind-window closes while still blind.
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        let blind = daemon.tick().await;
+        assert!(
+            !blind
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindWindow { .. })),
+            "no blind-window closes while still blind: {:?}",
+            blind.events,
+        );
+        daemon.clock.advance(Duration::from_secs(300));
+
+        // The recovering clean poll closes the blind window — exactly one `blind_window` event,
+        // measured from the retained anchor.
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.97, 0.30);
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 96,
+                near_limit: true,
+            }),
+            "the recovery must close the blind window with its duration + near-limit tag: {:?}",
+            recovered.events,
+        );
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::BlindWindow { .. }))
+                .count(),
+            1,
+            "exactly one blind_window per episode: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_close_tags_a_below_band_anchor_not_near_limit() {
+        // A blind window whose pre-blind anchor was well below the trigger (40%) is STILL recorded
+        // (the spike wants the full distribution) but tagged `near_limit=false` — it does not count
+        // toward time-blind-near-limit (#449).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.40, 0.30)).await;
+        daemon.tick().await; // anchor at 40% session — below the 95% risk band
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // blind
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.42, 0.30);
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 120,
+                session_pct: 40,
+                near_limit: false,
+            }),
+            "a below-band blind window is recorded but not near-limit: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_reactive_re_poll_emits_no_blind_window() {
+        // The negative: two consecutive LIVE active readings (no intervening blindness) close no
+        // blind window — the None→live edge never occurs, so `blind_window` is silent (#449).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.50, 0.30)).await;
+        daemon.tick().await; // first live reading (sets the anchor)
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.55, 0.30);
+        let second = daemon.tick().await; // a second live reading — never blind
+        assert!(
+            !second
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindWindow { .. })),
+            "a clean re-poll closes no blind window: {:?}",
+            second.events,
         );
     }
 

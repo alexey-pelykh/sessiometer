@@ -843,21 +843,55 @@ pub(crate) enum Event {
     /// [`Event::UsageRollup`]'s no-op silence. `account` is the account UUID — never the operator
     /// `label` (#15), matching [`Event::UsageBackoff`].
     UsageBackoffCleared { account: String },
-    /// The per-account usage VELOCITY between the last two readings (issue #399): the SIGNED change
-    /// in each rounded-percent dimension since the account's previous reading (`to_pct(next) -
-    /// to_pct(prev)`), so the durable log carries how fast each account is climbing — the
-    /// measurement the gated adaptive-trigger follow-up (#368) is waiting on. Emitted only when the
-    /// account measurably MOVED (a non-zero delta in either dimension), so a flat idle account
-    /// stays silent (again mirroring [`Event::UsageRollup`]); never emitted across a poll gap (a
-    /// throttle / failure clears the prior reading), so a delta always spans two real consecutive
-    /// readings. `session_delta_pct` / `weekly_delta_pct` are POSITIVE when usage is rising and
-    /// NEGATIVE when a window reset dropped it. `account` is the account UUID (#15); both deltas are
-    /// bare signed percents (a difference of two `0..=100` values, so within `-100..=100`), never a
-    /// token.
+    /// The per-account usage VELOCITY between the last two readings (issue #399, normalized to
+    /// %/min by issue #449): the SIGNED change in each rounded-percent dimension since the account's
+    /// previous reading (`to_pct(next) - to_pct(prev)`), carried alongside the `elapsed_secs`
+    /// interval between those two readings so the durable log expresses how fast each account is
+    /// climbing as a TIME-NORMALIZED rate — the measurement the gated bounded-blindness spike (#451)
+    /// and the adaptive-trigger follow-up (#368) are waiting on. A raw per-reading delta is
+    /// ambiguous without its interval (a `+7` over one minute burns far faster than `+7` over ten),
+    /// so [`to_log_line`](Event::to_log_line) derives and renders `session_pct_per_min` /
+    /// `weekly_pct_per_min` from the stored delta and `elapsed_secs` — the same
+    /// store-the-ingredients-derive-the-view idiom as the refresh line's `window_secs`. Emitted only
+    /// when the account measurably MOVED (a non-zero delta in either dimension) AND the interval is
+    /// known and positive, so a flat idle account stays silent (again mirroring
+    /// [`Event::UsageRollup`]); never emitted across a poll gap (a throttle / failure clears the
+    /// prior reading AND its timestamp), so a delta always spans two real consecutive readings.
+    /// `session_delta_pct` / `weekly_delta_pct` are POSITIVE when usage is rising and NEGATIVE when a
+    /// window reset dropped it. `account` is the account UUID (#15); both deltas are bare signed
+    /// percents (a difference of two `0..=100` values, so within `-100..=100`) and `elapsed_secs` a
+    /// bare duration, never a token.
     UsageVelocity {
         account: String,
         session_delta_pct: i16,
         weekly_delta_pct: i16,
+        /// Whole seconds between the two readings this velocity spans (issue #449) — the interval
+        /// [`to_log_line`](Event::to_log_line) divides the deltas by to render the %/min rate.
+        /// Always `> 0` at emission (the daemon suppresses a zero / unknown interval), so the rate
+        /// derivation never divides by zero.
+        elapsed_secs: u64,
+    },
+    /// The ACTIVE account's session-usage BLIND WINDOW just closed (issue #449, umbrella #363 Path
+    /// B): the account had gone blind — a `429` / `5xx` / failed poll cleared its
+    /// [`crate::daemon`] `last_readings` slot so [`crate::swap::decide`] had no reading to act on —
+    /// and this poll read it live again. `duration_secs` is how long it was blind, measured from the
+    /// retained pre-blind anchor ([`crate::daemon`]'s `last_good`, issue #450) to this recovery — the
+    /// same `blind_elapsed` the bounded-blindness preemptive swap (#452, ADR-0017) keys off, now made
+    /// durable so the spike (#451) can derive its constants from real blind-window distributions
+    /// rather than a replay. `session_pct` is the anchor's session usage (how NEAR the limit the
+    /// account was when it went blind), and `near_limit` tags whether that anchor was at/over the
+    /// session trigger (the "risk band"): the two together export BOTH umbrella SLIs — the
+    /// blind-window duration (`duration_secs`) and time-blind-near-limit (`duration_secs` summed over
+    /// the `near_limit=true` episodes, the anchor being fixed for a whole window). Edge-triggered:
+    /// emitted exactly ONCE per blind episode, on the recovery poll — never per held blind tick, and
+    /// only for the ACTIVE account (the anchor belongs to it by identity). `account` is the account
+    /// UUID (#15) — matching the usage-family `acct=` (never the free-form label); every other field
+    /// a bare number / bool, never a token or email.
+    BlindWindow {
+        account: String,
+        duration_secs: u64,
+        session_pct: u8,
+        near_limit: bool,
     },
 }
 
@@ -1220,12 +1254,36 @@ impl Event {
                 account,
                 session_delta_pct,
                 weekly_delta_pct,
+                elapsed_secs,
             } => {
-                // Both deltas are bare SIGNED percents (a difference of two `0..=100` values), so a
-                // `-` sign can prefix the number — a `key=val` token existing parsers read as-is.
-                // `acct=` is the UUID (#15), matching the sibling `usage_backoff` line.
+                // Normalized to %/min (issue #449): the raw per-reading delta was ambiguous without
+                // its interval, so the velocity is rendered as a TIME rate — each delta divided by
+                // the interval in minutes (`elapsed_secs / 60`), to two decimals. Derived HERE from
+                // the stored delta + `elapsed_secs` (the same store-ingredients-derive-view idiom the
+                // refresh line's `window_secs` uses); `elapsed_secs > 0` at emission, so this never
+                // divides by zero. The raw signed deltas + interval trail the rate so the exact
+                // measurement stays recoverable for the #451 spike. `acct=` is the UUID (#15),
+                // matching the sibling `usage_backoff` line; a negative rate / delta renders its `-`
+                // sign, a `key=val` token existing parsers read as-is.
+                let minutes = *elapsed_secs as f64 / 60.0;
+                let session_pct_per_min = f64::from(*session_delta_pct) / minutes;
+                let weekly_pct_per_min = f64::from(*weekly_delta_pct) / minutes;
                 format!(
-                    "ts={ts} event=usage_velocity acct={account} session_delta_pct={session_delta_pct} weekly_delta_pct={weekly_delta_pct}"
+                    "ts={ts} event=usage_velocity acct={account} session_pct_per_min={session_pct_per_min:.2} weekly_pct_per_min={weekly_pct_per_min:.2} elapsed_secs={elapsed_secs} session_delta_pct={session_delta_pct} weekly_delta_pct={weekly_delta_pct}"
+                )
+            }
+            Event::BlindWindow {
+                account,
+                duration_secs,
+                session_pct,
+                near_limit,
+            } => {
+                // The active account's blind-window CLOSE (issue #449). All bare numbers + a bool
+                // (#15): how long it was blind, the pre-blind anchor's session pct (how near the
+                // limit it was), and whether that anchor sat in the risk band. `acct=` is the UUID,
+                // matching the usage-family lines.
+                format!(
+                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} near_limit={near_limit}"
                 )
             }
         }
@@ -3063,30 +3121,93 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
-    fn usage_velocity_line_carries_signed_percent_deltas() {
-        // A climbing account: both deltas POSITIVE (the #368 adaptive-trigger measurement).
+    fn usage_velocity_line_normalizes_the_signed_deltas_to_percent_per_minute() {
+        // A climbing account, normalized to %/min (issue #449): session +7 over a 300 s (5 min)
+        // interval renders `session_pct_per_min=1.40` (7 / 5), weekly +2 → `0.40` — the raw deltas +
+        // interval trail so the exact measurement stays recoverable for the #451 spike.
         let climbing = Event::UsageVelocity {
             account: "u-A".to_owned(),
             session_delta_pct: 7,
             weekly_delta_pct: 2,
+            elapsed_secs: 300,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             climbing,
-            format!("{TS0} event=usage_velocity acct=u-A session_delta_pct=7 weekly_delta_pct=2")
+            format!("{TS0} event=usage_velocity acct=u-A session_pct_per_min=1.40 weekly_pct_per_min=0.40 elapsed_secs=300 session_delta_pct=7 weekly_delta_pct=2")
         );
 
-        // A window reset dropped the reading: a NEGATIVE session delta renders with its `-` sign,
-        // a `key=val` token existing parsers read as-is.
+        // A window reset dropped the reading over a 60 s interval: a NEGATIVE rate renders with its
+        // `-` sign (−92 / 1 min = −92.00), a `key=val` token existing parsers read as-is.
         let reset = Event::UsageVelocity {
             account: "u-A".to_owned(),
             session_delta_pct: -92,
             weekly_delta_pct: 0,
+            elapsed_secs: 60,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             reset,
-            format!("{TS0} event=usage_velocity acct=u-A session_delta_pct=-92 weekly_delta_pct=0")
+            format!("{TS0} event=usage_velocity acct=u-A session_pct_per_min=-92.00 weekly_pct_per_min=0.00 elapsed_secs=60 session_delta_pct=-92 weekly_delta_pct=0")
+        );
+    }
+
+    #[test]
+    fn usage_velocity_rate_depends_on_the_interval_not_just_the_delta() {
+        // The point of the #449 normalization: the SAME +6 delta is a different %/min depending on
+        // how long it took. Over 1 min it is 6.00 %/min; over 6 min it is 1.00 %/min — the durable
+        // log now distinguishes a fast burn from a slow climb that a raw delta alone conflated.
+        let fast = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: 6,
+            weekly_delta_pct: 0,
+            elapsed_secs: 60,
+        }
+        .to_log_line(at_epoch(0));
+        let slow = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: 6,
+            weekly_delta_pct: 0,
+            elapsed_secs: 360,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(fast.contains("session_pct_per_min=6.00"), "{fast}");
+        assert!(slow.contains("session_pct_per_min=1.00"), "{slow}");
+    }
+
+    #[test]
+    fn blind_window_line_carries_duration_anchor_pct_and_near_limit() {
+        // The active account recovered after 8 min (480 s) blind while its pre-blind anchor sat at
+        // 96 % — in the risk band, so `near_limit=true`. Both umbrella #363 SLIs read off this line:
+        // the blind-window duration, and (filtered to `near_limit=true`) time-blind-near-limit.
+        let line = Event::BlindWindow {
+            account: "u-A".to_owned(),
+            duration_secs: 480,
+            session_pct: 96,
+            near_limit: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=blind_window acct=u-A duration_secs=480 session_pct=96 near_limit=true")
+        );
+    }
+
+    #[test]
+    fn blind_window_line_marks_a_below_band_recovery_not_near_limit() {
+        // A blind window whose anchor was comfortably below the trigger (40 %) is STILL recorded —
+        // the spike wants the full distribution — but `near_limit=false` keeps it out of the
+        // time-blind-near-limit sum.
+        let line = Event::BlindWindow {
+            account: "u-B".to_owned(),
+            duration_secs: 90,
+            session_pct: 40,
+            near_limit: false,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=blind_window acct=u-B duration_secs=90 session_pct=40 near_limit=false")
         );
     }
 
@@ -3112,6 +3233,14 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 account: "u-A".to_owned(),
                 session_delta_pct: -5,
                 weekly_delta_pct: 1,
+                elapsed_secs: 120,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 97,
+                near_limit: true,
             }
             .to_log_line(at_epoch(0)),
         ];
