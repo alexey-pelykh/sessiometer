@@ -29,6 +29,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0014](0014-refresh-error-backoff-is-tick-owned.md) | Refresh error back-off is tick-owned, not on `AccountHealth` | Accepted |
 | [0015](0015-reactive-refresh-unconditional-proactive-gated.md) | Reactive on-401 refresh is unconditional; `[refresh].enabled` gates only proactive maintenance | Accepted |
 | [0016](0016-dead-active-no-target-surfaced-not-relaxed.md) | A dead active with no viable target is a surfaced capacity signal, not a swap-eligibility bug | Accepted |
+| [0017](0017-bounded-blindness-preemptive-swap-not-header-observation.md) | Bounded-blindness preemptive swap-away, not header-based active-observation | Accepted |
 
 ## Conventions
 
