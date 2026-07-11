@@ -888,11 +888,50 @@ pub(crate) enum Event {
     /// only for the ACTIVE account (the anchor belongs to it by identity). `account` is the account
     /// UUID (#15) — matching the usage-family `acct=` (never the free-form label); every other field
     /// a bare number / bool, never a token or email.
+    ///
+    /// `session_at_recovery` is the POST-RECOVERY swap-necessity SLI (issue #482): the FRESH session
+    /// pct the account read live at this recovery poll, distinct from `session_pct` (the STALE
+    /// pre-blind anchor). Together with the anchor (`session_pct`) and the anchor's age
+    /// (`duration_secs` doubles as the "anchor_age" #482 names — both are `now - anchor.at`), it
+    /// reconciles whether a HYPOTHETICAL (or, once #452 lands, actual) preemptive swap-away keyed on
+    /// the stale anchor would have been `swap_necessary` (the account really was climbing toward the
+    /// ceiling — `session_at_recovery` held at/above the anchor) or `wasted` (it had already reset /
+    /// wasn't climbing — `session_at_recovery` dropped well below). The RAW recovery pct is recorded,
+    /// NOT a baked classification: the necessary/wasted THRESHOLD is #451/#484's to derive against
+    /// production, so this SLI supplies the ingredient and leaves the verdict a query-time view.
     BlindWindow {
         account: String,
         duration_secs: u64,
         session_pct: u8,
+        session_at_recovery: u8,
         near_limit: bool,
+    },
+    /// The #452 bounded-blindness preemptive-swap GATE became ELIGIBLE for the ACTIVE account
+    /// (issue #482, umbrella #363 Path B) — the no-viable-target-at-gate-fire SLI, the FALSIFIER for
+    /// the ADR-0017 cost-asymmetry premise ("firing early on a stale anchor is cheap because a
+    /// viable target reliably exists to catch the swap"). Emitted at the moment the gate's first two
+    /// conditions hold — the active account has been blind past the interim `T`
+    /// ([`crate::daemon`]'s `BLIND_GATE_SECS`) AND its retained pre-blind anchor (`last_good`, #450)
+    /// sat at/over the interim `risk_band` ([`crate::daemon`]'s `BLIND_GATE_RISK_BAND`, LOWER than
+    /// the reactive session trigger) — recording whether the gate's THIRD condition, a viable swap
+    /// target (a peer under `target_max_session_usage`, ADR-0013), is present. `viable_target=false`
+    /// is the premise's counter-evidence: if it is non-trivial, #452's predicate must be revisited.
+    ///
+    /// Instruments the gate premise BEFORE #452 is built (ADR-0017 implementation pending), keyed on
+    /// the interim constants the ADR names, so #451/#484 can finalize `T` / `risk_band` against
+    /// production rather than a replay. DISTINCT from #449's `blind_window` (which closes on
+    /// RECOVERY) and #455's swap-out overshoot SLO (which measures the swap): this measures the GATE
+    /// and its premise, whether or not any swap follows. Edge-triggered: emitted exactly ONCE per
+    /// blind episode (the gate would swap once, ending the episode), on the tick the gate first turns
+    /// eligible — never per held blind tick. `blind_secs` is the blind_elapsed at that moment and
+    /// `session_pct` the anchor's session usage (context for the reading). `account` is the account
+    /// UUID (#15) — matching the usage-family `acct=`; every other field a bare number / bool, never
+    /// a token or email.
+    BlindGateEligible {
+        account: String,
+        viable_target: bool,
+        blind_secs: u64,
+        session_pct: u8,
     },
 }
 
@@ -1277,14 +1316,33 @@ impl Event {
                 account,
                 duration_secs,
                 session_pct,
+                session_at_recovery,
                 near_limit,
             } => {
-                // The active account's blind-window CLOSE (issue #449). All bare numbers + a bool
-                // (#15): how long it was blind, the pre-blind anchor's session pct (how near the
-                // limit it was), and whether that anchor sat in the risk band. `acct=` is the UUID,
-                // matching the usage-family lines.
+                // The active account's blind-window CLOSE (issue #449) + the post-recovery
+                // swap-necessity SLI (issue #482). All bare numbers + a bool (#15): how long it was
+                // blind (= the anchor's age), the pre-blind anchor's session pct (how near the limit
+                // it was), the FRESH session pct read at recovery, and whether that anchor sat in the
+                // risk band. `session_at_recovery` vs `session_pct` reconciles a stale-anchor swap as
+                // necessary-vs-wasted (the threshold left to #451/#484). `acct=` is the UUID, matching
+                // the usage-family lines.
                 format!(
-                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} near_limit={near_limit}"
+                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}"
+                )
+            }
+            Event::BlindGateEligible {
+                account,
+                viable_target,
+                blind_secs,
+                session_pct,
+            } => {
+                // The #452 gate-eligibility SLI (issue #482). All bare numbers + a bool (#15):
+                // whether a viable swap target existed when the preemptive gate turned eligible, how
+                // long the active account had been blind, and the pre-blind anchor's session pct.
+                // `viable_target=false` is the premise falsifier. `acct=` is the UUID, matching the
+                // usage-family lines.
+                format!(
+                    "ts={ts} event=blind_gate_eligible acct={account} viable_target={viable_target} blind_secs={blind_secs} session_pct={session_pct}"
                 )
             }
         }
@@ -3180,20 +3238,24 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
-    fn blind_window_line_carries_duration_anchor_pct_and_near_limit() {
+    fn blind_window_line_carries_duration_anchor_pct_recovery_pct_and_near_limit() {
         // The active account recovered after 8 min (480 s) blind while its pre-blind anchor sat at
-        // 96 % — in the risk band, so `near_limit=true`. Both umbrella #363 SLIs read off this line:
-        // the blind-window duration, and (filtered to `near_limit=true`) time-blind-near-limit.
+        // 96 % — in the risk band, so `near_limit=true` — and read live at 98 % on recovery (still
+        // climbing above the anchor → a stale-anchor preemptive swap would have been NECESSARY,
+        // issue #482). Three umbrella #363 SLIs read off this line: the blind-window duration,
+        // time-blind-near-limit (filtered to `near_limit=true`), and post-recovery swap-necessity
+        // (`session_at_recovery` vs the `session_pct` anchor).
         let line = Event::BlindWindow {
             account: "u-A".to_owned(),
             duration_secs: 480,
             session_pct: 96,
+            session_at_recovery: 98,
             near_limit: true,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             line,
-            format!("{TS0} event=blind_window acct=u-A duration_secs=480 session_pct=96 near_limit=true")
+            format!("{TS0} event=blind_window acct=u-A duration_secs=480 session_pct=96 session_at_recovery=98 near_limit=true")
         );
     }
 
@@ -3201,17 +3263,50 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     fn blind_window_line_marks_a_below_band_recovery_not_near_limit() {
         // A blind window whose anchor was comfortably below the trigger (40 %) is STILL recorded —
         // the spike wants the full distribution — but `near_limit=false` keeps it out of the
-        // time-blind-near-limit sum.
+        // time-blind-near-limit sum. Recovery read 42 % (near the anchor, never climbed toward the
+        // ceiling): the #482 recovery pct is recorded regardless of the near-limit tag.
         let line = Event::BlindWindow {
             account: "u-B".to_owned(),
             duration_secs: 90,
             session_pct: 40,
+            session_at_recovery: 42,
             near_limit: false,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             line,
-            format!("{TS0} event=blind_window acct=u-B duration_secs=90 session_pct=40 near_limit=false")
+            format!("{TS0} event=blind_window acct=u-B duration_secs=90 session_pct=40 session_at_recovery=42 near_limit=false")
+        );
+    }
+
+    #[test]
+    fn blind_gate_eligible_line_carries_viable_target_blind_secs_and_anchor_pct() {
+        // The #452 preemptive gate turned eligible for the active account after 360 s blind with its
+        // anchor at 70 % (in the interim risk band) — and a viable swap target WAS present, so the
+        // ADR-0017 cost-asymmetry premise holds this time (`viable_target=true`, issue #482).
+        let present = Event::BlindGateEligible {
+            account: "u-A".to_owned(),
+            viable_target: true,
+            blind_secs: 360,
+            session_pct: 70,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            present,
+            format!("{TS0} event=blind_gate_eligible acct=u-A viable_target=true blind_secs=360 session_pct=70")
+        );
+        // The FALSIFIER case: the gate was eligible but NO viable target existed — the premise's
+        // counter-evidence, the whole reason #482 measures at gate-fire and not only at swap.
+        let absent = Event::BlindGateEligible {
+            account: "u-B".to_owned(),
+            viable_target: false,
+            blind_secs: 900,
+            session_pct: 88,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            absent,
+            format!("{TS0} event=blind_gate_eligible acct=u-B viable_target=false blind_secs=900 session_pct=88")
         );
     }
 
@@ -3244,7 +3339,15 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 account: "u-A".to_owned(),
                 duration_secs: 300,
                 session_pct: 97,
+                session_at_recovery: 99,
                 near_limit: true,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::BlindGateEligible {
+                account: "u-A".to_owned(),
+                viable_target: false,
+                blind_secs: 600,
+                session_pct: 88,
             }
             .to_log_line(at_epoch(0)),
         ];
