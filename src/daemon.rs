@@ -3492,8 +3492,13 @@ where
             // weekly-exhausted, so relief classifies `Weekly` here while the dead active's 🔴 health
             // rides its own account row (the composite an operator needs — issue #405).
             let session_ceiling = self.session_trigger_base.min(self.target_max_usage);
-            let (cause, _hold, resets_at) =
-                all_exhausted_relief(active_idx, readings, &enabled, session_ceiling, self.weekly_trigger_base);
+            let (cause, _hold, resets_at) = all_exhausted_relief(
+                active_idx,
+                readings,
+                &enabled,
+                session_ceiling,
+                self.weekly_trigger_base,
+            );
             let cause = match cause {
                 SwapReason::Session => Some(NoTargetCause::Session),
                 SwapReason::Weekly => Some(NoTargetCause::Weekly),
@@ -10966,7 +10971,10 @@ mod tests {
             json,
             r#"{"state":"no_viable_target","cause":"weekly","resets_at":1893800500}"#
         );
-        assert_eq!(serde_json::from_str::<NextSwap>(&json).unwrap(), with_relief);
+        assert_eq!(
+            serde_json::from_str::<NextSwap>(&json).unwrap(),
+            with_relief
+        );
 
         // A current daemon that found no parseable reset: `cause` present, `resets_at` null.
         let no_reset = NextSwap::NoViableTarget {
