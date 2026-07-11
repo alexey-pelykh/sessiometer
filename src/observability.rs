@@ -2178,7 +2178,10 @@ mod tests {
         }
         .to_log_line(at_epoch(0));
         for line in [&rollup, &gap] {
-            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
             // The refresh/login events use `outcome=`/`token`; ours carry no credential field.
             assert!(!line.contains("token"), "no token may appear: {line}");
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
@@ -2202,7 +2205,10 @@ mod tests {
 
         // The #15 single-surface guarantee: the only free field is the redacted uuid handle —
         // never an email or token.
-        assert!(!with_uuid.contains('@'), "no email may appear: {with_uuid}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&with_uuid, &[]).is_empty(),
+            "no non-authored email may appear (#15/#444): {with_uuid}"
+        );
         assert!(
             !with_uuid.contains("token"),
             "no token may appear: {with_uuid}"
@@ -2240,8 +2246,9 @@ mod tests {
 
     #[test]
     fn no_event_line_carries_an_email_or_token_sigil() {
-        // #15: every field is a handle / enum / number / timestamp, so a token or
-        // email can never reach a rendered line. Handles here are plain labels.
+        // #15/#444: every field is a handle / enum / number / timestamp, so a token
+        // or a NON-authored email can never reach a rendered line. The handles here are
+        // plain (non-email) labels; an operator's own email label would be permitted.
         let events = [
             Event::Swap {
                 from: "work".to_owned(),
@@ -2304,7 +2311,10 @@ mod tests {
         ];
         for event in &events {
             let line = event.to_log_line(at_epoch(0));
-            assert!(!line.contains('@'), "no email sigil: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email sigil (#15/#444): {line}"
+            );
             assert!(!line.to_lowercase().contains("token"), "no token: {line}");
             // Exactly one line — no embedded newline could split or forge a record.
             assert_eq!(line.lines().count(), 1, "single line: {line}");
@@ -2365,7 +2375,7 @@ mod tests {
         for line in logged.lines() {
             assert!(line.starts_with("ts="), "every line is stamped: {line:?}");
         }
-        assert!(!logged.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty());
     }
 
     #[test]
@@ -2650,7 +2660,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         }
         .to_log_line(at_epoch(0));
         for line in [&export, &import] {
-            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
             assert!(!line.contains("token"), "no token may appear: {line}");
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
             assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
@@ -2786,7 +2799,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             .to_log_line(at_epoch(0)),
         ];
         for line in &lines {
-            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
             assert!(!line.contains("token"), "no token may appear: {line}");
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
             assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
@@ -2976,7 +2992,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         ];
         for diag in &diags {
             let line = diag.to_log_line(at_epoch(0));
-            assert!(!line.contains('@'), "no email sigil: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email sigil (#15/#444): {line}"
+            );
             assert!(!line.to_lowercase().contains("token"), "no token: {line}");
             assert_eq!(line.lines().count(), 1, "single line: {line}");
         }

@@ -1748,7 +1748,7 @@ mod tests {
         assert_eq!(report.outcome, RefreshOutcome::Refreshed);
 
         // Channel 1 — the engine's in-process output: the RefreshReport's full Debug rendering.
-        crate::redaction::meter::assert_clean(&format!("{report:?}"), &secrets);
+        crate::redaction::meter::assert_clean(&format!("{report:?}"), &secrets, &[]);
 
         // Channel 2 — the durable per-cycle event line (issue #106): the tick builds an
         // `Event::Refresh` from THIS real-secret cycle's report and the daemon emits it to the
@@ -1761,7 +1761,7 @@ mod tests {
             line.contains("event=refresh"),
             "built the event line: {line}"
         );
-        crate::redaction::meter::assert_clean(&line, &secrets);
+        crate::redaction::meter::assert_clean(&line, &secrets, &[]);
     }
 
     #[tokio::test]
@@ -1801,6 +1801,6 @@ mod tests {
             line.contains("backoff_secs=120"),
             "the error line carries the #408 back-off: {line}"
         );
-        crate::redaction::meter::assert_clean(&line, &secrets);
+        crate::redaction::meter::assert_clean(&line, &secrets, &[]);
     }
 }

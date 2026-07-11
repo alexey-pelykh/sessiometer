@@ -8522,7 +8522,7 @@ mod tests {
         assert!(!json.contains("last_swap"));
         // Issue #15: the projection sources only labels + percentages, so neither an
         // email nor a token can ever reach the wire — the new candidate included.
-        assert!(!json.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
         assert!(!json.to_lowercase().contains("token"));
     }
 
@@ -9235,7 +9235,7 @@ mod tests {
         assert!(corpus.contains(r#""refresh_health":{"#));
         // The rollup rides the wire under the `auth` key (issue #143 renamed `health` → `auth`).
         assert!(corpus.contains(r#""auth":"stale""#));
-        assert_clean(&corpus, &secrets);
+        assert_clean(&corpus, &secrets, &[]);
     }
 
     #[test]
@@ -9318,7 +9318,7 @@ mod tests {
         );
         assert!(reply.contains("\"label\":\"work\""));
         assert!(reply.contains("\"session_pct\":50"));
-        assert!(!reply.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&reply, &[]).is_empty());
     }
 
     #[tokio::test]
@@ -9504,7 +9504,10 @@ mod tests {
                 assert_eq!(v.generated_at, 100);
                 assert_eq!(v.status.accounts[0].label, "work");
                 assert_eq!(v.status.accounts[0].session_pct, Some(20));
-                assert!(!initial.contains('@'), "no email can travel (issue #15)");
+                assert!(
+                    crate::redaction::meter::unauthored_emails(&initial, &[]).is_empty(),
+                    "no non-authored email can travel (#15/#444)"
+                );
             }
             other => panic!("expected an initial snapshot, got {other:?}"),
         }
@@ -10317,7 +10320,10 @@ mod tests {
         );
         // …and its SERIALIZED bytes leak neither the credential (named `*-token`) nor an email (#15).
         let wire = serde_json::to_string(&ack).unwrap();
-        assert!(!wire.contains('@'), "the ack leaks no email: {wire}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&wire, &[]).is_empty(),
+            "the ack leaks no non-authored email (#15/#444): {wire}"
+        );
         assert!(
             !wire.to_lowercase().contains("token"),
             "the ack leaks no credential: {wire}",
@@ -10693,7 +10699,10 @@ mod tests {
         );
         // …and its SERIALIZED bytes leak neither the credential (named `*-token`) nor an email (#15).
         let wire = serde_json::to_string(&ack).unwrap();
-        assert!(!wire.contains('@'), "the ack leaks no email: {wire}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&wire, &[]).is_empty(),
+            "the ack leaks no non-authored email (#15/#444): {wire}"
+        );
         assert!(
             !wire.to_lowercase().contains("token"),
             "the ack leaks no credential: {wire}",
@@ -10923,7 +10932,7 @@ mod tests {
             "got {json}"
         );
         // #15: a label only — never an email or token sigil.
-        assert!(!json.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
         assert!(!json.to_lowercase().contains("token"));
 
         // The two no-candidate verdicts project without a label, so the client can tell
@@ -11155,7 +11164,10 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
-        assert!(!json.contains('@'), "got {json}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "got {json}"
+        );
         assert!(!json.to_lowercase().contains("token"), "got {json}");
     }
 
@@ -11707,8 +11719,8 @@ mod tests {
         );
         // #15: the wire ack leaks neither the credential (named `*-token`) nor an email.
         assert!(
-            !reply.contains('@'),
-            "the ack wire leaks no email: {reply:?}"
+            crate::redaction::meter::unauthored_emails(&reply, &[]).is_empty(),
+            "the ack wire leaks no non-authored email (#15/#444): {reply:?}"
         );
         assert!(
             !reply.to_lowercase().contains("token"),
@@ -11811,8 +11823,8 @@ mod tests {
         );
         // #15: the wire ack leaks neither the credential (named `*-token`) nor an email.
         assert!(
-            !reply.contains('@'),
-            "the ack wire leaks no email: {reply:?}"
+            crate::redaction::meter::unauthored_emails(&reply, &[]).is_empty(),
+            "the ack wire leaks no non-authored email (#15/#444): {reply:?}"
         );
         assert!(
             !reply.to_lowercase().contains("token"),
@@ -13239,7 +13251,10 @@ mod tests {
             "spare verified healthy once polled after the swap (#137): {logged:?}"
         );
         assert!(logged.starts_with("ts="), "stamped: {logged:?}");
-        assert!(!logged.contains('@'), "no email: {logged:?}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty(),
+            "no non-authored email (#15/#444): {logged:?}"
+        );
     }
 
     #[tokio::test]
@@ -13430,7 +13445,10 @@ mod tests {
             logged.lines().all(|l| l.starts_with("ts=")),
             "stamped: {logged:?}"
         );
-        assert!(!logged.contains('@'), "no email: {logged:?}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty(),
+            "no non-authored email (#15/#444): {logged:?}"
+        );
 
         // The 401 streak is per-occurrence and climbs across ticks.
         assert!(
@@ -15387,7 +15405,10 @@ mod tests {
         let json = serde_json::to_string(&status_response(&outcome.snapshot)).unwrap();
         assert!(json.contains(r#""quarantined":true"#), "got {json}");
         assert!(json.contains(r#""recovering":false"#), "got {json}");
-        assert!(!json.contains('@'), "no email on the wire: {json}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "no non-authored email on the wire (#15/#444): {json}"
+        );
         assert!(!json.to_lowercase().contains("token"));
     }
 
@@ -15430,7 +15451,10 @@ mod tests {
         // The wire carries the derived flag but never a secret.
         let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
         assert!(json.contains(r#""recovering":true"#), "got {json}");
-        assert!(!json.contains('@'), "no email on the wire: {json}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "no non-authored email on the wire (#15/#444): {json}"
+        );
         assert!(!json.to_lowercase().contains("token"));
     }
 
@@ -16301,7 +16325,70 @@ mod tests {
         // The METER: no token prefix, no known token, no blob fingerprint (leading
         // bytes or sha256), no email shape, and no high-entropy run — on ANY of the
         // channels above.
-        assert_clean(&corpus, &secrets);
+        assert_clean(&corpus, &secrets, &[]);
+    }
+
+    #[tokio::test]
+    async fn redaction_meter_permits_an_operator_authored_email_label_across_channels() {
+        use crate::redaction::meter::{assert_clean, scan, Finding, Secrets};
+        // #444: the operator may label an account with their OWN email. That authored
+        // label legitimately reaches EVERY operator-facing channel (the event log, the
+        // `status` render — colored and not —, the UDS wire, the swap echo). The METER
+        // must PERMIT it there — while STILL failing on the credential-read email, which
+        // is never a label. Proves the relaxation is uniform (no panel/CLI divergence)
+        // AND provenance-scoped: the allow-set is the capture-input label, never the
+        // credential-read email.
+        let secrets = Secrets::meter_fixture();
+        const EMAIL_LABEL: &str = "me@my-own.example"; // the operator's own choice (capture-input)
+        const A: (&str, &str) = ("11111111-1111-1111-1111-111111111111", EMAIL_LABEL);
+        const B: (&str, &str) = ("22222222-2222-2222-2222-222222222222", "spare");
+
+        let poller = FakeRosterPoller::new()
+            .ok(A.0, 0.97, 0.40) // active, over the session trigger
+            .ok(B.0, 0.10, 0.20); // the viable target
+        let tun = tunables(95, 80, 0);
+        let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+
+        let mut corpus = String::new();
+        harvest_channels(&outcome, &mut corpus);
+
+        // The authored email label DID reach a channel (else the test is vacuous).
+        assert!(
+            corpus.contains(EMAIL_LABEL),
+            "the authored email label reached an operator-facing channel: {corpus}"
+        );
+        // The credential-read email is seeded into the stashes + `~/.claude.json` only —
+        // it must NEVER surface on a harvested channel (#444 AC2).
+        assert!(
+            !corpus.contains(secrets.email()),
+            "the credential-read email must not leak onto any channel"
+        );
+
+        // With the label in the capture-input allow-set, the METER PASSES — the
+        // relaxation applies uniformly to EVERY channel the corpus spans.
+        assert_clean(&corpus, &secrets, &[EMAIL_LABEL]);
+        // Provenance seam: the label classifies as a permitted KnownEmail, never leak.
+        let findings = scan(&corpus, &secrets, &[EMAIL_LABEL]);
+        assert!(
+            findings.iter().any(|f| matches!(f, Finding::KnownEmail)),
+            "the authored label classifies as a permitted KnownEmail: {findings:#?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::EmailShape { .. })),
+            "no unauthored email shape on any channel: {findings:#?}"
+        );
+        // Divergence guard: WITHOUT authoring it, the SAME corpus fails — proving it is
+        // the allow-set (not an accident of the fixture) that permits the label.
+        assert!(
+            scan(&corpus, &secrets, &[])
+                .iter()
+                .any(|f| matches!(f, Finding::EmailShape { matched } if matched == EMAIL_LABEL)),
+            "an un-authored email label is a leak on the strict scan"
+        );
     }
 
     /// The 0.1.0 "done-when" acceptance, driven end-to-end through the four seams
@@ -16541,7 +16628,7 @@ mod tests {
         // The METER gate (#15): no token prefix, known token, blob fingerprint (leading
         // bytes or sha256), email shape, or high-entropy run leaked onto ANY channel
         // across the whole acceptance loop.
-        assert_clean(&corpus, &secrets);
+        assert_clean(&corpus, &secrets, &[]);
     }
 
     // --- Usage-sample collector (issue #156) ------------------------------
@@ -16831,7 +16918,10 @@ mod tests {
         // NO PII on the rendered gap line — handle + timestamp only.
         let line = e3[0].to_log_line(std::time::UNIX_EPOCH);
         assert!(line.contains("event=usage_gap acct=work"), "got: {line}");
-        assert!(!line.contains('@'), "no email: {line}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&line, &[]).is_empty(),
+            "no non-authored email (#15/#444): {line}"
+        );
         assert!(!line.contains("sk-ant"), "no token: {line}");
     }
 

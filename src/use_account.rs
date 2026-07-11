@@ -2613,6 +2613,6 @@ mod tests {
             Error::KeychainLocked { op: "read" }.to_string(),
         ]
         .join("\n");
-        meter::assert_clean(&corpus, &secrets);
+        meter::assert_clean(&corpus, &secrets, &[]);
     }
 }
