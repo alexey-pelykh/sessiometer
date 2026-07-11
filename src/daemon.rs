@@ -1006,6 +1006,30 @@ struct LastSwap {
     at: Instant,
 }
 
+/// The ACTIVE account's last SUCCESSFUL usage reading, retained as a pre-blind
+/// anchor (issue #450) SEPARATELY from [`DecisionState::last_readings`] — which a
+/// failed / throttled poll clears to `None`, leaving the reactive swap path
+/// (`swap::decide`) byte-for-byte unchanged but losing any answer to "how near the
+/// band was the active account when it went blind?". Refreshed on every successful
+/// active-account poll and carried untouched across a `429` / `5xx`, so the
+/// bounded-blindness preemptive swap (issue #452, ADR-0017) can key off `session`
+/// and `blind_elapsed = now - at`. Reset to `None` on every swap-away / active-loss
+/// (the reset sites at [`record_swap`](Daemon::record_swap),
+/// [`adopt_manual_swap`](Daemon::adopt_manual_swap), and the reconcile paths), so it
+/// always describes the CURRENT active account — which is why the anchor carries no
+/// account handle of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LastGood {
+    /// Session-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading.
+    session: f64,
+    /// Weekly-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading.
+    weekly: f64,
+    /// When the reading was observed — monotonic ([`Instant`]), so #452 measures
+    /// `blind_elapsed` against the SAME clock as the swap cooldown ([`LastSwap::at`]).
+    /// Process-local: never serialized (an [`Instant`] is meaningless across the socket).
+    at: Instant,
+}
+
 /// Per-account health carried ACROSS ticks — the dead-credential lifecycle state
 /// (issue #42), indexed by roster position. Daemon-level (not per-poll) because the
 /// 401 streak and the recovery probe must accumulate across ticks: a per-poll
@@ -1183,6 +1207,16 @@ struct DecisionState {
     /// ([`decision_readings`](Daemon::decision_readings)), so stale carried data can
     /// never leak into [`pick_target`].
     last_readings: Vec<Option<Usage>>,
+    /// The ACTIVE account's retained pre-blind anchor (issue #450): its last
+    /// SUCCESSFUL reading (`session` / `weekly` fractions) plus the monotonic time it
+    /// was observed, kept ACROSS a `429` / `5xx` blindness window that clears
+    /// [`last_readings`](Self::last_readings)`[active]` to `None`. `None` until the
+    /// active account is polled successfully once, and reset to `None` on every
+    /// swap-away / active-loss so it always belongs to the CURRENT active account.
+    /// Consumed by the bounded-blindness preemptive swap (issue #452, ADR-0017); the
+    /// reactive `swap::decide` path never reads it, so keeping it separate leaves that
+    /// path byte-for-byte unchanged. See [`LastGood`].
+    last_good: Option<LastGood>,
     /// The staggered poll schedule for the CURRENT cycle (issues #80, #366): the roster
     /// indices to poll, in order — the active account INTERLEAVED before each enabled,
     /// non-quarantined non-active peer (`[active, p1, active, p2, …]`, issue #366), so
@@ -1811,6 +1845,24 @@ where
                 }
             }
             self.state.last_readings[i] = result.ok();
+            // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
+            // anchor, SEPARATE from `last_readings` (which the assignment above clears to
+            // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
+            // Refreshed on every successful active poll and carried untouched across a
+            // throttle / failure, so the bounded-blindness preemptive swap (#452) can reason
+            // about how near the band the active account was when it went blind. Reset to
+            // `None` on swap-away (`record_swap` / `adopt_manual_swap` / the reconcile paths),
+            // so the anchor always belongs to the current active account.
+            if active == Some(i) {
+                if let Some(reading) = self.state.last_readings[i] {
+                    let at = self.clock.now();
+                    self.state.last_good = Some(LastGood {
+                        session: reading.session,
+                        weekly: reading.weekly,
+                        at,
+                    });
+                }
+            }
             // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
             // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
             // rollup reads, so `status --json` surfaces the access-token expiry with
@@ -2161,6 +2213,9 @@ where
                         // re-resolved against the new canonical below.
                         self.state.canonical_watch.commit(canonical);
                         self.state.active = None;
+                        // Issue #450: the departed active's `last_good` is now stale —
+                        // drop it (mirrors the swap-away reset in `record_swap`).
+                        self.state.last_good = None;
                     }
                     // else: the re-stash failed (e.g. a locked keychain) — do NOT
                     // commit; leave the change to re-fire and catch up next cycle.
@@ -2189,6 +2244,9 @@ where
                     // or display match and re-resolves to `None`, so `decide_action`
                     // routes to the safe `SkippedActiveUnknown` path.
                     self.state.active = None;
+                    // Issue #450: the departed active's `last_good` is now stale — drop
+                    // it (mirrors the swap-away reset in `record_swap`).
+                    self.state.last_good = None;
                 }
             },
         }
@@ -2834,6 +2892,12 @@ where
     /// the normal swap and the emergency swap (#42).
     async fn record_swap(&mut self, target_idx: usize, incoming: &str, at: Instant) {
         self.state.active = Some(target_idx);
+        // Issue #450: the swapped-TO account has no pre-blind anchor yet — drop the
+        // departing active's `last_good` so a stale foreign anchor cannot outlive the
+        // swap. Load-bearing for the bounded-blindness path (#452): its OWN swap lands
+        // here, so without this the anchor would still describe the account just left,
+        // and the path could re-fire on it once the cooldown lapses.
+        self.state.last_good = None;
         self.state.last_swap = Some(LastSwap { at });
         if let Ok(incoming_stashed) = self.stash.read(incoming).await {
             self.state
@@ -2943,6 +3007,13 @@ where
             // canonical-watch baseline below, so `reconcile_canonical_change` will see
             // this write as `Unchanged` and never re-observe it.
             self.deactivate_recovery_probe(prev_active, next_active);
+            // Issue #450: a manual swap to a DIFFERENT account leaves the departing
+            // active's `last_good` stale — drop it so the anchor tracks the new active.
+            // A duplicate / same-account notification (`next == prev`) keeps it. Mirrors
+            // the reset in `record_swap`.
+            if next_active != prev_active {
+                self.state.last_good = None;
+            }
             self.state.canonical_watch.commit(&canonical);
         }
         // Record it as the latest swap: arms the cooldown (#10). The cooldown arming
@@ -3317,6 +3388,14 @@ where
         self.state.last_readings = last_readings;
         self.state.polled_once = polled_once;
         self.state.active = active;
+        // Issue #450: `last_good` belongs to the active account by identity; reconcile
+        // keeps it whole if that account persists (it is merely re-indexed, like
+        // `last_readings` above), but drops it if the active account left the roster —
+        // a removed account's anchor must not leak into the next active's blindness
+        // reasoning (#452).
+        if active.is_none() {
+            self.state.last_good = None;
+        }
         // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
         // fresh one (the active interleaved before each enabled non-quarantined peer,
         // #366) at the next cycle start.
@@ -6113,6 +6192,142 @@ mod tests {
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn last_good_retains_the_pre_blind_reading_across_an_active_429() {
+        // Issue #450 AC1: a `429` on the active account's poll clears `last_readings[active]`
+        // to `None` (the reactive `decide()` path is unchanged — it never swaps on missing
+        // data), but the SEPARATE `last_good` anchor keeps the pre-blind reading + its
+        // timestamp, so #452 can still reason about how near the band the active account was
+        // when it went blind.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.68, 0.40)
+                .ok("u-B", 0.05, 0.05)
+                .ok("u-C", 0.05, 0.05),
+        )
+        .await;
+
+        // Tick 1 polls the active `work` (u-A) — a clean reading seeds both the reactive slot
+        // and the anchor.
+        daemon.tick().await;
+        assert_eq!(
+            daemon.state.last_readings[0].map(|r| (r.session, r.weekly)),
+            Some((0.68, 0.40)),
+        );
+        let anchor = daemon
+            .state
+            .last_good
+            .expect("a clean active poll sets last_good");
+        assert_eq!((anchor.session, anchor.weekly), (0.68, 0.40));
+
+        // The active now `429`s. Drive to its next scheduled poll — the #366 interleave
+        // re-observes the active on tick 3 (`[active, peer, active, peer]`).
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.05, 0.05)
+            .ok("u-C", 0.05, 0.05);
+        daemon.tick().await; // tick 2 — peer `spare`
+        daemon.tick().await; // tick 3 — active `work` 429s
+
+        // Reactive path byte-for-byte unchanged: the slot is cleared to `None`.
+        assert_eq!(daemon.state.last_readings[0], None);
+        // …but the pre-blind anchor is retained intact.
+        assert_eq!(
+            daemon.state.last_good.map(|g| (g.session, g.weekly)),
+            Some((0.68, 0.40)),
+            "a 429 must not disturb the retained last-good anchor",
+        );
+    }
+
+    #[tokio::test]
+    async fn last_good_refreshes_on_each_successful_active_poll() {
+        // Issue #450 AC2: every successful active-account poll overwrites the anchor with the
+        // fresh reading AND a fresh observation time.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.20, 0.10)
+                .ok("u-B", 0.05, 0.05)
+                .ok("u-C", 0.05, 0.05),
+        )
+        .await;
+
+        daemon.tick().await; // tick 1 — active `work` at 0.20
+        let first = daemon
+            .state
+            .last_good
+            .expect("the first active poll sets the anchor");
+        assert_eq!((first.session, first.weekly), (0.20, 0.10));
+
+        // A later active poll reads higher, at a later time.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.30)
+            .ok("u-B", 0.05, 0.05)
+            .ok("u-C", 0.05, 0.05);
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.tick().await; // tick 2 — peer `spare`
+        daemon.tick().await; // tick 3 — active `work` re-observed (#366)
+
+        let second = daemon.state.last_good.expect("the anchor is still set");
+        assert_eq!(
+            (second.session, second.weekly),
+            (0.50, 0.30),
+            "the anchor tracks the latest active reading",
+        );
+        assert!(
+            second.at > first.at,
+            "the anchor's timestamp advances with each refresh",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swap_away_clears_last_good_so_it_never_describes_the_departed_active() {
+        // Issue #450: the anchor is "for the ACTIVE account", so a swap-away must clear it —
+        // otherwise the bounded-blindness path (#452), whose OWN swap lands in `record_swap`,
+        // would keep reading the near-band anchor of the account it just left and could
+        // spuriously re-swap once the cooldown lapses. (The reset also fires at
+        // `adopt_manual_swap` and the reconcile paths; this exercises the load-bearing
+        // daemon-swap path.)
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Active `work` sits over the trigger; `spare` is wide open — a viable target.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.05, 0.05);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+        daemon.state.active = Some(0);
+        daemon.state.last_swap = Some(LastSwap {
+            at: daemon.clock.now(),
+        });
+        daemon.clock.advance(Duration::from_secs(150)); // past the 100s cooldown
+
+        // The warming run polls the active at 0.97 (which sets the anchor), then swaps away
+        // from it — you cannot swap an over-trigger active without first observing it, so the
+        // anchor is provably populated before the swap.
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+
+        assert_eq!(daemon.state.active, Some(1));
+        assert_eq!(
+            daemon.state.last_good, None,
+            "swapping away from the active account must clear its pre-blind anchor",
+        );
     }
 
     #[tokio::test]
