@@ -2440,7 +2440,55 @@ mod tests {
     #[test]
     fn json_handles_are_redacted_and_no_secret_leaks() {
         let json = render_json(&report_fixture()).unwrap();
-        assert!(!json.contains('@'), "no email may reach the wire: {json}");
+        // Handle fixture (`work`/`play`): no authored labels, so an empty allow-set is
+        // the strict bar — any `@`-shape would be UNAUTHORED and fail. Provenance
+        // vocabulary rather than a blanket no-`@` (issue #15, relaxed by #444/#447 —
+        // an operator-authored email label reaches `stats` via `Sample.acct`).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "no unauthored email may reach the wire: {json}"
+        );
+        assert!(!json.contains("sk-ant"), "no token may reach the wire");
+    }
+
+    #[test]
+    fn json_permits_an_operator_authored_email_label() {
+        // #447: `stats` reads the persisted store and keys `per_account` by
+        // `Sample.acct` — the roster label, which may now be an operator-authored
+        // email. That label surfaces verbatim as a JSON account key; it is PERMITTED
+        // under the same provenance-scoped waiver as the store's write side (#444),
+        // while a stray UNAUTHORED email would still fail.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let authored = "alice@example.com";
+        let store = data(
+            vec![
+                sample(now - 2 * HOUR_SECS, authored, 0.9, 0.4),
+                sample(now - HOUR_SECS, authored, 0.99, 0.45),
+            ],
+            "",
+        );
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        let report = build_report(&store, window, vec![], None, &params(), 0);
+        let json = render_json(&report).unwrap();
+
+        // The authored email label IS the account key on the wire (runtime honesty)…
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["summary"]["accounts"][authored].is_object(),
+            "the authored email label keys the account: {json}"
+        );
+        // …permitted WHEN authored…
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[authored]).is_empty(),
+            "an operator-authored email label is permitted: {json}"
+        );
+        // …but the same bytes read as a leak WITHOUT the provenance allow-set (the
+        // assertion is not vacuous — the label really does carry an `@`; it recurs
+        // across the summary + series, so assert containment, not an exact count).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).contains(&authored.to_owned()),
+            "without provenance the label reads as an unauthored email: {json}"
+        );
         assert!(!json.contains("sk-ant"), "no token may reach the wire");
     }
 

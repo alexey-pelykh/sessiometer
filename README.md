@@ -44,7 +44,9 @@ accounts is permitted under them.
 
 ```sh
 # 1. Capture each account's credential. Sign in to the account in Claude Code,
-#    then stash its current credential:
+#    then stash its current credential. At a terminal, `capture` offers the
+#    account's email as an editable label default — press Enter to keep it, or
+#    type a shorter handle like `work`. Pass `capture <label>` to skip the prompt.
 sessiometer capture
 
 # 2. Run the foreground daemon. It polls usage and swaps the active credential
@@ -262,7 +264,8 @@ sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
 ```
 
 The output is sourced solely from non-secret fields (labels, percentages, reset
-instants, a next-swap candidate label), so it never prints a token or email (issue #15).
+instants, a next-swap candidate label), so it never prints a token or an *unauthored*
+email (issue #15; an operator-authored email label may appear — #444).
 
 For each account's raw **access-token expiry**, pass `-v` (or `--verbose`):
 
@@ -288,7 +291,8 @@ the 🔴 `claude /login` cue in the `AUTH` column. The raw clock is kept out of 
 table (where it would be misread as a deadline); `--verbose` is the opt-in for it in the
 text view, mirroring `--json`, which already carries the raw `access_expires_at` for every
 account. Like the table, the block is content (it survives a pipe), never colored, and
-sourced only from non-secret fields, so it never prints a token or email (issue #15).
+sourced only from non-secret fields, so it never prints a token or an *unauthored* email
+(issue #15; an operator-authored email label may appear — #444).
 
 ## Listing accounts (offline)
 
@@ -321,12 +325,14 @@ keychain) drops the expiry, and an account the refresh tick has never touched dr
 the refresh tag — so a config-only roster reads as the plain `label` + `uuid` view.
 The reads are **daemon-independent and read-only**: no daemon, no `/usage` call, no
 live refresh, and — like `status` — only non-secret fields (a timestamp-derived
-duration and a bare outcome token), never a token or email (issue #15).
+duration and a bare outcome token), never a token or an *unauthored* email (issue #15;
+an operator-authored email label may appear — #444).
 
 ## Watching the daemon (diagnostics)
 
 `run` writes to two operator-facing channels, neither of which ever carries a
-token or email (issue #15):
+token or an *unauthored* email (issue #15; an operator-authored email label may
+appear — see below):
 
 - **The event log** — durable, edge-triggered STATE CHANGES (a swap, a re-stash, a
   dead credential, entering the all-exhausted state, …), one `key=val` line each,
@@ -338,9 +344,13 @@ token or email (issue #15):
 The event log — and the `-v` diagnostic channel — identify accounts by their
 **`label`**, written **verbatim** as the account handle (e.g. `event=swap from=…
 to=…`, `diag=poll account=…`). It is the one operator-chosen, free-form field on
-the durable surface, so keep every label a **non-PII nickname** (`work`, `spare`),
-never an email or username: the secret-free-by-construction guarantee (issue #15)
-extends to the label only while it stays PII-free. Labels are set at
+the durable surface. The label may be the account's **email** — `capture` pre-fills
+the harvested address as an editable default (#447), and an operator-authored email
+is permitted verbatim (a *provenance-scoped* waiver: you chose it, so it is not a
+leak — #444) — or any **nickname** you prefer (`work`, `spare`); a non-PII nickname
+remains a fine choice, no longer a requirement. What still holds unconditionally: no
+token, and no *unauthored* email (a stranger's address, a credential spill) ever
+reaches this surface (issue #15). Labels are set at capture time or
 [`sessiometer login <label>`](#logging-in--re-authenticating).
 
 Pass `-v` (or `--verbose`) to opt into the diagnostic channel:
@@ -495,11 +505,15 @@ sessiometer login spare
 ```
 
 The optional `<label>` names a **new** account — omit it and the label is
-auto-derived from the account's `account_uuid` (exactly as `capture`); a re-login of
-an already-rostered account keeps its existing label unless you pass a new one.
-Pick a **non-PII nickname** (`work`, `spare`), never an email or username — the
-label is written verbatim into the daemon's durable
-[event log](#watching-the-daemon-diagnostics) (issue #15).
+auto-derived from the account's `account_uuid` (exactly as non-interactive
+`capture`); a re-login of an already-rostered account keeps its existing label
+unless you pass a new one. Name it with the account's **email** or any **nickname**
+you prefer (`work`, `spare`): the label is written verbatim into the daemon's durable
+[event log](#watching-the-daemon-diagnostics), so an operator-authored email is
+permitted (a *provenance-scoped* waiver — #444) while an unauthored one never appears
+(issue #15). A non-PII nickname stays a fine option, no longer a requirement.
+(`login` takes the label as an explicit argument; the editable email pre-fill is
+`capture`'s interactive prompt — #447.)
 `login` needs a real terminal and the `claude` binary on your `PATH` (or
 `$CLAUDE_BIN`); tune its timeout in the [`[login]`](#login) block. On success it
 prints one redacted line — `Onboarded` (new) or `Revived` (existing); an unfinished
@@ -608,7 +622,8 @@ so a roster that logged in together does not all reach expiry — and refresh �
 lockstep. This needs no extra configuration: it shares the `[refresh].enabled` switch
 and reuses `cadence_secs` as its near-expiry horizon. Every keep-warm firing is logged
 as a redacted `event=keep_warm` line (`trigger=proactive`/`reactive`, the classified
-outcome, and whether the refresh token rotated), never a token or email.
+outcome, and whether the refresh token rotated), never a token or an *unauthored*
+email (an operator-authored email label may appear — #444).
 
 ## Configuration
 
@@ -841,7 +856,7 @@ owned by you:
 |----------|-------|----------|
 | `~/Library/Application Support/sessiometer/config.toml` (or `$XDG_CONFIG_HOME/sessiometer/config.toml`) | The **roster** — `[[account]]` labels and `account_uuid`s pointing at the keychain stashes — plus the tunables | **No** — the roster references stashes; the credential blobs stay in the keychain |
 | `~/Library/Application Support/sessiometer/` | The daemon's runtime files: `daemon.lock`, `daemon.sock` (control socket), `swap.lock`, the usage store (`usage-samples.jsonl`, `usage-rollup.json`), and the ephemeral `refresh/` and `login/` isolation directories | No |
-| `~/Library/Logs/sessiometer/sessiometer.log` | The event log — durable state changes | No — every line passes a CI redaction check; never a token or email |
+| `~/Library/Logs/sessiometer/sessiometer.log` | The event log — durable state changes | No — every line passes a CI redaction check; never a token or an *unauthored* email (an operator-authored email label may appear — #444) |
 
 The config directory is `$XDG_CONFIG_HOME/sessiometer` when `$XDG_CONFIG_HOME` is
 set, otherwise `~/Library/Application Support/sessiometer`; the daemon's runtime

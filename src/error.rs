@@ -874,6 +874,44 @@ mod tests {
     }
 
     #[test]
+    fn label_bearing_errors_carry_an_authored_email_label_but_flag_an_unauthored_one() {
+        // #444/#447: the label-bearing errors quote the account's roster label, which
+        // MAY now be an operator-authored email (the capture prompt pre-fills it). The
+        // handle-fixture tests above stay green because their labels are handles; this
+        // guards the email-label case directly — an authored email label is PERMITTED
+        // (it is the operator's own value, shown back to them), while an UNAUTHORED
+        // email spilled into the same message would still be caught. Provenance-scoped,
+        // consistent with the render/event/store channels (see
+        // `redaction::meter::unauthored_emails`).
+        let authored = "alice@example.com";
+        for message in [
+            Error::AccountLabelNotFound {
+                label: authored.into(),
+            }
+            .to_string(),
+            Error::UseTargetQuarantined {
+                label: authored.into(),
+            }
+            .to_string(),
+        ] {
+            // The authored email label IS quoted in the operator-facing message…
+            assert!(message.contains(authored), "label is quoted: {message}");
+            // …and permitted WHEN authored…
+            assert!(
+                crate::redaction::meter::unauthored_emails(&message, &[authored]).is_empty(),
+                "an operator-authored email label is permitted: {message}"
+            );
+            // …but the same shape reads as a leak WITHOUT the provenance allow-set
+            // (the assertion is not vacuous — the message really does carry an `@`).
+            assert_eq!(
+                crate::redaction::meter::unauthored_emails(&message, &[]),
+                vec![authored.to_owned()],
+                "without provenance the label reads as an unauthored email: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn active_account_unresolved_names_an_actionable_recovery_not_a_viewer() {
         // Issue #210: when `use` cannot identify the active account to swap away from,
         // the message must point the operator at a REAL recovery next step —

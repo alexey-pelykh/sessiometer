@@ -56,10 +56,15 @@
 //!
 //! The store carries **no secret**: a [`Sample`] holds percentages, epoch
 //! timestamps, a provider tag, an optional severity label and an optional spend
-//! estimate, plus `acct` — the account's existing **redacted handle** (the
-//! operator's non-secret label), never an email or token. Every field is therefore
-//! safe to persist and safe to `Debug`, unlike the credential-bearing types
-//! ([`crate::keychain`] / [`crate::claude_state`]) that deliberately omit `Debug`.
+//! estimate, plus `acct` — the account's **roster label**. Since #444/#447 that
+//! label may be an operator-authored email (the capture prompt pre-fills the
+//! harvested address), carried under the same provenance-scoped rule as the
+//! render/event channels: an authored email label is permitted, but an UNAUTHORED
+//! email (a stranger's address, a credential-blob spill) or a token never is
+//! (issue #15, relaxed by #444; see `redaction::meter::unauthored_emails`). Every
+//! field is therefore safe to persist and safe to `Debug`, unlike the
+//! credential-bearing types ([`crate::keychain`] / [`crate::claude_state`]) that
+//! deliberately omit `Debug`.
 //!
 //! # Not-yet-wired seam
 //!
@@ -118,11 +123,12 @@ const STORE_LOCK_RETRY: Duration = Duration::from_millis(20);
 
 /// One point-in-time usage reading for one account, as persisted to the raw tier.
 ///
-/// Provider-tagged and redaction-clean: `acct` is the account's existing redacted
-/// handle (never an email/token), and every other field is a non-secret percentage,
-/// timestamp or label — so `Debug` is safe here (contrast the credential-bearing
-/// types that omit it). The four optional fields are omitted from the JSON entirely
-/// when absent, keeping each line minimal.
+/// Provider-tagged and secret-free: `acct` is the account's roster label (an
+/// operator-authored email permitted since #444/#447, an unauthored email or a token
+/// never — see the module's redaction note), and every other field is a non-secret
+/// percentage, timestamp or label — so `Debug` is safe here (contrast the
+/// credential-bearing types that omit it). The four optional fields are omitted from
+/// the JSON entirely when absent, keeping each line minimal.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Sample {
     /// When the reading was taken, as whole UTC epoch seconds.
@@ -130,8 +136,10 @@ pub(crate) struct Sample {
     /// The quota provider this reading came from (e.g. `"claude"`) — a tag, so a
     /// future multi-provider store keeps readings distinguishable.
     pub(crate) provider: String,
-    /// The account's **redacted handle** (the operator's non-secret label). NEVER
-    /// an email or token — the store's redaction invariant (issue #15).
+    /// The account's **roster label** (the operator's non-secret handle). An
+    /// operator-authored email label is permitted (provenance-scoped, #444/#447); an
+    /// UNAUTHORED email or a token NEVER — the store's redaction invariant (issue #15;
+    /// see `redaction::meter::unauthored_emails`).
     pub(crate) acct: String,
     /// Fraction in `[0.0, …]` of the rolling 5-hour session window consumed
     /// (`1.0` = exhausted; readings can exceed it).
@@ -1185,10 +1193,18 @@ mod tests {
         assert!((bucket.coverage - 6.0 / 288.0).abs() < 1e-9, "coverage");
     }
 
-    // --- AC 5: store carries redacted handles only (no email/token) -----------
+    // --- AC 5: store carries redacted handles + provenance-scoped labels only -----
+    //
+    // The store's `acct` is the account's roster label (copied verbatim by the
+    // daemon collector). Since #444 legitimized an operator-*authored* email label,
+    // and #447 makes such labels common (the capture prompt pre-fills the email),
+    // the store's bar is the SAME provenance-scoped rule the render/event channels
+    // carry: NO UNAUTHORED email (a stranger's address, a credential-blob spill) may
+    // reach the store, but an operator-authored email label may. Tokens are NEVER
+    // waived. See `redaction::meter::unauthored_emails`.
 
     #[test]
-    fn persisted_store_carries_no_email_or_token() {
+    fn persisted_store_carries_no_unauthored_email_or_token() {
         let dir = tempfile::tempdir().unwrap();
         let (samples_path, rollup_path) = store_paths(dir.path());
         // A realistic sample: a redacted handle + a severity label, nothing secret.
@@ -1207,13 +1223,78 @@ mod tests {
 
         for path in [&samples_path, &rollup_path] {
             if let Ok(text) = fs::read_to_string(path) {
-                assert!(!text.contains('@'), "no email may reach the store: {text}");
+                // No authored labels here (the fixture uses the `work` handle), so an
+                // empty allow-set is the strict bar: any `@`-shape would be UNAUTHORED
+                // and fail — identical strength to the former `!contains('@')`, now in
+                // the provenance vocabulary rather than a blanket no-`@` claim.
+                assert!(
+                    crate::redaction::meter::unauthored_emails(&text, &[]).is_empty(),
+                    "no unauthored email may reach the store: {text}"
+                );
                 assert!(
                     !text.contains("sk-ant"),
                     "no token may reach the store: {text}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn persisted_store_permits_an_operator_authored_email_label() {
+        // #447: once the capture prompt pre-fills the email, an operator-authored
+        // email label reaches the raw samples tier verbatim (the daemon copies the
+        // roster label into `Sample.acct`). That authored email is PERMITTED — the
+        // same provenance-scoped waiver #444 established for the render/event channels
+        // — while a stray UNAUTHORED email would still fail.
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        let authored = "alice@example.com";
+        append_sample(
+            &samples_path,
+            &Sample::new(1_700_000_000, "claude", authored, 0.9, 0.7)
+                .with_severity(Some("critical".to_owned())),
+        )
+        .unwrap();
+
+        // Assert on the RAW samples file — where `acct` is written verbatim — BEFORE
+        // any compaction (which folds samples into the acct-free rollup tier below).
+        let samples = fs::read_to_string(&samples_path).unwrap();
+        // The authored email label IS carried by the raw store (runtime honesty — the
+        // former `!contains('@')` bar was only green because fixtures used handles).
+        assert!(
+            samples.contains(authored),
+            "the authored email label reaches the store: {samples}"
+        );
+        // Provenance-scoped: permitted WHEN authored…
+        assert!(
+            crate::redaction::meter::unauthored_emails(&samples, &[authored]).is_empty(),
+            "an operator-authored email label is permitted: {samples}"
+        );
+        // …and the assertion is not vacuous: WITHOUT the provenance allow-set the very
+        // same bytes surface as a leaking (unauthored) email shape.
+        assert_eq!(
+            crate::redaction::meter::unauthored_emails(&samples, &[]),
+            vec![authored.to_owned()],
+            "without provenance the label reads as an unauthored email: {samples}"
+        );
+        // Tokens are never waived, authored or not.
+        assert!(!samples.contains("sk-ant"), "no token: {samples}");
+
+        // The aggregate rollup tier drops `acct` entirely (it buckets by time only),
+        // so it is email-free by construction — the label never reaches the
+        // lowest-resolution, lifetime-kept tier, authored or not.
+        compact_and_roll(
+            &samples_path,
+            &rollup_path,
+            1_700_000_000 + 400 * DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .unwrap();
+        let rollup = fs::read_to_string(&rollup_path).unwrap();
+        assert!(
+            !rollup.contains('@'),
+            "the acct-free rollup carries no label at all: {rollup}"
+        );
     }
 
     #[test]
