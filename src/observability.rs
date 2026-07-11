@@ -490,7 +490,7 @@ pub(crate) enum Event {
     },
     /// The ACTIVE account's credential is DEAD *and* no live account is a viable emergency
     /// swap target — the strictly-WORSE sibling of [`Self::AllExhausted`] (issue #405). The
-    /// emergency path (issue #42) drops the `target_max_usage` reserve AND the session gate, so
+    /// emergency path (issue #42) drops the `target_max_session_usage` reserve AND the session gate, so
     /// the ONLY remaining filter is weekly exhaustion: reaching here means every live spare is
     /// weekly-exhausted, and the daemon HOLDS on the dead active with no way to escape. Until now
     /// this state returned SILENTLY — a strictly-worse condition than `all_exhausted` yet emitting
@@ -1417,7 +1417,7 @@ pub(crate) enum Diagnostic {
     Start {
         accounts: usize,
         poll_secs: u64,
-        target_max_usage: u8,
+        target_max_session_usage: u8,
         session_trigger: u8,
         weekly_trigger: u8,
         monitor_401_n: u8,
@@ -1474,17 +1474,17 @@ impl Diagnostic {
             Diagnostic::Start {
                 accounts,
                 poll_secs,
-                target_max_usage,
+                target_max_session_usage,
                 session_trigger,
                 weekly_trigger,
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
-                // target_max_usage (#398) is always-valued — render its percent directly,
+                // target_max_session_usage (#398) is always-valued — render its percent directly,
                 // like the other counts/percentages (no `off` sentinel to carry).
                 format!(
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
-                     target_max_usage={target_max_usage} session_trigger={session_trigger} \
+                     target_max_session_usage={target_max_session_usage} session_trigger={session_trigger} \
                      weekly_trigger={weekly_trigger} monitor_401_n={monitor_401_n} \
                      monitor_recovery_m={monitor_recovery_m}"
                 )
@@ -2799,12 +2799,12 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn start_line_renders_the_effective_config_summary() {
-        // target_max_usage (#398, always-valued) renders as its percent, like the rest —
+        // target_max_session_usage (#398, always-valued) renders as its percent, like the rest —
         // counts and percentages only, no handle.
         let line = Diagnostic::Start {
             accounts: 3,
             poll_secs: 30,
-            target_max_usage: 70,
+            target_max_session_usage: 70,
             session_trigger: 90,
             weekly_trigger: 98,
             monitor_401_n: 5,
@@ -2814,7 +2814,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         assert_eq!(
             line,
             format!(
-                "{TS0} diag=start accounts=3 poll_secs=30 target_max_usage=70 \
+                "{TS0} diag=start accounts=3 poll_secs=30 target_max_session_usage=70 \
                  session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4"
             )
         );
@@ -2954,7 +2954,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             Diagnostic::Start {
                 accounts: 2,
                 poll_secs: 30,
-                target_max_usage: 70,
+                target_max_session_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 98,
                 monitor_401_n: 5,
