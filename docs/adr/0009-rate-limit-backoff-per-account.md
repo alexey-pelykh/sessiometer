@@ -173,7 +173,13 @@ longer globally waits for a rate-limit.
   — closed at `3d08218`). Supersedes the endpoint-global framing of **#76** (poll
   cadence + jitter + rate-limit back-off — closed), which was never formalised in
   an ADR. **#294** (cap the honoured `Retry-After` — **open**; the policy bound the
-  `checked_add` arithmetic-safety floor defers to). Prior art: **#282** (the
+  `checked_add` arithmetic-safety floor defers to). **#453** later **re-parameterises
+  the ACTIVE account's arm** without changing the per-account *scoping* this ADR
+  decides: the active account self-caps at `ACTIVE_POLL_BACKOFF_CAP` = 120 s (vs the
+  peer `POLL_BACKOFF_CAP`) and honours `Retry-After` as an **un-clamped floor** (never
+  re-poll before it), so a throttle on the *consumed* account recovers observability
+  fast — the `note_account_backoff` `is_active` branch; peers stay exactly as decided
+  here. Prior art: **#282** (the
   monotonic-deadline keep-warm idiom this back-off mirrors — closed), **#38**
   (parameterized jitter the widening inherits — closed), **#13** (the one remaining
   whole-loop wait: a locked keychain — closed), **#5** (per-account usage quota,

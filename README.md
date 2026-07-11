@@ -373,7 +373,7 @@ ts=2026-06-30T00:00:30Z diag=tick decision=hold
 ```
 
 When a `429` carries a `Retry-After`, the `tick` line adds `retry_after_secs=<n>`
-— the raw server-advised wait (delta-seconds, **before** the ~1 h cap) — so you
+— the raw server-advised wait (delta-seconds), **before** any daemon cap — so you
 can **place the back-off's source** (issue #295) by comparing it to `backoff_secs`:
 
 - **no `retry_after_secs`** — the server advised nothing; the wait is the daemon's
@@ -381,14 +381,20 @@ can **place the back-off's source** (issue #295) by comparing it to `backoff_sec
 - **`retry_after_secs` == `backoff_secs`** — the **server-advised** wait governed.
 - **`retry_after_secs` < `backoff_secs`** — the server advised a smaller floor, but
   the daemon's larger **self-capped** exponential governed the wait.
-- **`retry_after_secs` > `backoff_secs`** — the server advised more than the wait:
-  the ~1 h cap clamped a pathological value, which a bare `backoff_secs=3600` alone
-  could never tell you:
+- **`retry_after_secs` > `backoff_secs`** — a **non-active** account only: the server
+  advised more than the wait, so the ~1 h cap clamped a pathological value, which a
+  bare `backoff_secs=3600` alone could never tell you:
 
 ```text
-ts=2026-06-30T00:02:00Z diag=poll account=work outcome=rate_limited
-ts=2026-06-30T00:02:00Z diag=tick decision=skip_active_unavailable backoff_secs=3600 retry_after_secs=86400
+ts=2026-06-30T00:02:00Z diag=poll account=spare outcome=rate_limited
+ts=2026-06-30T00:02:00Z diag=tick decision=hold backoff_secs=3600 retry_after_secs=86400
 ```
+
+The **active** account is the exception (issue #453): its `Retry-After` is an
+**un-clamped floor** — the daemon never re-polls before it — and its self-backoff
+caps far tighter (**120 s**, not the ~1 h peer ceiling), recovering observability
+fast after a throttle. So `retry_after_secs > backoff_secs` never appears for the
+active account; a large server value governs it in full (the `==` case above).
 
 Both channels carry handles, enums, percentages, and timestamps only — and a CI
 redaction meter scans every rendered line of each (issues #9, #15, #77).

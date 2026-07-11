@@ -821,8 +821,9 @@ pub(crate) enum Event {
     /// (rate-limit) from a `5xx` / network transient — what makes the "429 count" queryable;
     /// `consecutive` is the account's per-account back-off streak (#293, the exponential-widening
     /// driver, the same running-count idiom [`Event::Monitor401`] carries); `retry_after_secs` is
-    /// the RAW server-advised `Retry-After` when the response supplied one, BEFORE the
-    /// [`crate::daemon`] `POLL_BACKOFF_CAP` clamp (#294/#295); and `backoff_secs` is the resulting
+    /// the RAW server-advised `Retry-After` when the response supplied one, BEFORE any
+    /// [`crate::daemon`] `POLL_BACKOFF_CAP` clamp (#294/#295 — peer-only since #453, where the
+    /// active account hard-floors `Retry-After` un-clamped); and `backoff_secs` is the resulting
     /// armed window (the effective wait). Emitted on EACH throttled poll, not just the first, so
     /// the durable log shows the window WIDEN across the episode — the residual-late-swap signal
     /// (#363/#368/#369) that a single first-throttle line would hide. `account` is the account
@@ -1604,16 +1605,19 @@ pub(crate) enum Diagnostic {
     /// the normal jittered interval.
     ///
     /// `retry_after_secs` LABELS the SOURCE of that wait (issue #295): the RAW
-    /// server-advised `Retry-After` (delta-seconds, BEFORE the `POLL_BACKOFF_CAP`
-    /// clamp) the throttled poll's response supplied, when any. `Some` ⇒ the server
+    /// server-advised `Retry-After` (delta-seconds, BEFORE any daemon cap — the
+    /// `POLL_BACKOFF_CAP` clamp is peer-only since #453) the throttled poll's response
+    /// supplied, when any. `Some` ⇒ the server
     /// advised a floor; `None` ⇒ the wait is the daemon's self-capped exponential (or
     /// the keychain-lock back-off), with no server advice. It disambiguates a
     /// `backoff_secs` an operator otherwise cannot place, by comparison: absent ⇒
     /// self-capped exponential; `== backoff_secs` ⇒ the server-advised wait governed;
     /// `< backoff_secs` ⇒ the server advised a smaller floor but the exponential governed;
-    /// `> backoff_secs` ⇒ the #294 cap clamped a pathological value (e.g.
+    /// `> backoff_secs` ⇒ the #294 cap clamped a pathological value on a PEER (e.g.
     /// `backoff_secs=3600 retry_after_secs=86400`). Pre-cap on purpose, so that clamped
     /// value stays visible rather than collapsing into an indistinguishable `backoff_secs=3600`.
+    /// The ACTIVE account never shows `> backoff_secs`: its `Retry-After` is an un-clamped
+    /// floor (issue #453), so `backoff_secs >= retry_after_secs` always holds for it.
     Tick {
         decision: DecisionClass,
         backoff_secs: Option<u64>,
