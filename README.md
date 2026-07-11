@@ -203,14 +203,19 @@ next swap: spare
   columns); the column is omitted only when no account carries a state.
 
 The **`next swap:`** footer names the account the daemon would rotate to next — the
-viable target whose weekly quota resets soonest. It reads `none (no viable target)`
-when no other account is a sound swap destination — every one is weekly-exhausted,
-session-saturated (over its swap-away session trigger), over the swap-target
-`target_max_usage` reserve, or quarantined (out of rotation until it recovers) — and
-`none (awaiting usage data)` right after the daemon starts, before it has polled the
-other accounts. It is **forward-looking** and recomputed every cycle, so —
-unlike a remembered "last swap" — it survives a daemon restart and always shows where
-the next rotation will land.
+viable target whose weekly quota resets soonest. When no other account is a sound swap
+destination — every one is weekly-exhausted, session-saturated (over its swap-away
+session trigger), over the swap-target `target_max_usage` reserve, or quarantined (out
+of rotation until it recovers) — it names *why*, so a stranded operator sees the real
+blocker and when it lifts rather than a content-free "none": a weekly-exhausted fleet
+reads `none — every account is weekly-exhausted; resets in ⟨when⟩ — add an account` (a
+week-long block, so a new account is the remedy), an over-session fleet reads `none —
+every account is over its session limit; resets in ⟨when⟩` (a transient block — no
+add-account nudge), and any residual dead end falls back to the bare `none (no viable
+target)`. Right after the daemon starts, before it has polled the other accounts, it
+reads `none (awaiting usage data)`. It is **forward-looking** and recomputed every
+cycle, so — unlike a remembered "last swap" — it survives a daemon restart and always
+shows where the next rotation will land.
 
 On a terminal too narrow for the full table the lowest-priority columns drop in
 order — the **weekly pair** (`weekly%` + `weekly-reset`) first and together, then

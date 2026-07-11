@@ -23,8 +23,8 @@ use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
     run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap,
-    NextSwapReason, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion,
-    StatusResponse, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
+    NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown,
+    SchemaVersion, StatusResponse, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -2041,7 +2041,31 @@ pub(crate) fn render_status(
             };
             out.push_str(&format!("next swap: {to}{why}\n"));
         }
-        Some(NextSwap::NoViableTarget) => out.push_str("next swap: none (no viable target)\n"),
+        // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
+        // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
+        // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
+        // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
+        // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
+        // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
+        Some(NextSwap::NoViableTarget { cause, resets_at }) => {
+            let relief = match resets_at {
+                Some(at) => format!("; resets in {}", humanize_until(at - now)),
+                None => String::new(),
+            };
+            match cause {
+                // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
+                // the meaningful escape is more accounts.
+                Some(NoTargetCause::Weekly) => out.push_str(&format!(
+                    "next swap: none — every account is weekly-exhausted{relief} — add an account\n"
+                )),
+                // A session-wide block lifts at the sooner session reset (minutes/hours), so the
+                // reset time itself is the remedy.
+                Some(NoTargetCause::Session) => out.push_str(&format!(
+                    "next swap: none — every account is over its session limit{relief}\n"
+                )),
+                None => out.push_str("next swap: none (no viable target)\n"),
+            }
+        }
         Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
         None => out.push_str("next swap: none\n"),
     }
@@ -3734,7 +3758,7 @@ fn remove_confirmation(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Tunables;
-    use crate::daemon::{AccountStatusLine, NextSwap};
+    use crate::daemon::{AccountStatusLine, NextSwap, NoTargetCause};
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -4920,8 +4944,40 @@ spare  22222222-2222\n\
             })),
             "next swap: spare"
         );
+        // The fleet-capacity relief hint (issue #405): a WEEKLY-wide block names the terminal
+        // signal + the reset that ends it + the escape action (the wait is days). `resets_at`
+        // humanizes with the same `humanize_until` the per-account cells use → `2d4h`.
         assert_eq!(
-            footer(Some(NextSwap::NoViableTarget)),
+            footer(Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: Some(NOW + 2 * 86_400 + 4 * 3_600),
+            })),
+            "next swap: none — every account is weekly-exhausted; resets in 2d4h — add an account"
+        );
+        // Weekly-exhausted but no spare reported a parseable reset → the reset clause drops, the
+        // terminal signal + action remain.
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: None,
+            })),
+            "next swap: none — every account is weekly-exhausted — add an account"
+        );
+        // A SESSION-wide block lifts at the sooner session reset (minutes/hours) — the reset time
+        // itself is the remedy, so no "add an account" nudge.
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Session),
+                resets_at: Some(NOW + 47 * 60),
+            })),
+            "next swap: none — every account is over its session limit; resets in 47m"
+        );
+        // A pre-schema-1.3 daemon carries no relief (`cause` absent) → the honest bare fallback.
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget {
+                cause: None,
+                resets_at: None,
+            })),
             "next swap: none (no viable target)"
         );
         assert_eq!(

@@ -151,11 +151,27 @@ extension NextSwapReason: Decodable {
     }
 }
 
+/// WHY the daemon has no viable swap target (`src/daemon/snapshot.rs` `NoTargetCause`), carried on
+/// `NextSwap.noViableTarget` (issue #405) so a renderer can name the fleet-capacity RELIEF instead
+/// of a content-free "no viable target". A PLAIN string on the wire (`"session"` / `"weekly"`, NOT
+/// internally tagged — it is the daemon's `all_exhausted_relief` classification, not one of serde's
+/// tagged enums), so a `String`-raw enum decodes it; an UNKNOWN value is a hard decode error,
+/// mirroring serde's rejection of an unknown unit-enum variant. Non-secret — a bare discriminant
+/// (issue #15). Distinct from `NextSwapReason` (why a particular TARGET won): this says why NONE did.
+enum NoTargetCause: String, Decodable, Equatable {
+    /// Every other account is over its session limit — a transient block; the session windows reset
+    /// soon, so the remedy is to WAIT (the CLI names the reset and does not nudge "add an account").
+    case session
+    /// Every other account is weekly-exhausted (issue #37) — a week-long block; capacity returns only
+    /// at the soonest weekly reset, so ADDING an account is the real remedy (the render nudges it).
+    case weekly
+}
+
 /// The next swap candidate (`src/daemon/snapshot.rs` `NextSwap`): who the daemon would rotate
 /// the active session to, or why there is no candidate. Internally tagged on `state`
 /// (`snake_case`), so a value is one of three shapes:
 ///   * `{"state":"target","to":"<label>","reason":<NextSwapReason>}`
-///   * `{"state":"no_viable_target"}`
+///   * `{"state":"no_viable_target","cause":<NoTargetCause>,"resets_at":<epoch>}`
 ///   * `{"state":"awaiting_data"}`
 ///
 /// An UNKNOWN `state` is a decode error — faithfully mirroring serde's internally-tagged enum,
@@ -163,10 +179,12 @@ extension NextSwapReason: Decodable {
 /// The whole `next_swap` key is optional (`null` when there is no active anchor), handled at
 /// `VersionedStatus`. The target's `reason` (issue #393) is ADDITIVE and optional — a current
 /// daemon always sends it, but a pre-#393 daemon omits it → `nil`, tolerated via `decodeIfPresent`
-/// (the same additive-minor forward-compat the whole contract rests on).
+/// (the same additive-minor forward-compat the whole contract rests on). `no_viable_target`'s
+/// `cause` + `resets_at` (issue #405) are ADDITIVE the same way — a current daemon carries the
+/// fleet-capacity relief, a pre-#405 daemon omits both → `nil`, tolerated identically.
 enum NextSwap: Equatable {
     case target(to: String, reason: NextSwapReason?)
-    case noViableTarget
+    case noViableTarget(cause: NoTargetCause?, resetsAt: Int64?)
     case awaitingData
 }
 
@@ -175,6 +193,8 @@ extension NextSwap: Decodable {
         case state
         case to
         case reason
+        case cause
+        case resetsAt = "resets_at"
     }
 
     init(from decoder: Decoder) throws {
@@ -187,7 +207,10 @@ extension NextSwap: Decodable {
                 reason: try container.decodeIfPresent(NextSwapReason.self, forKey: .reason)
             )
         case "no_viable_target":
-            self = .noViableTarget
+            self = .noViableTarget(
+                cause: try container.decodeIfPresent(NoTargetCause.self, forKey: .cause),
+                resetsAt: try container.decodeIfPresent(Int64.self, forKey: .resetsAt)
+            )
         case "awaiting_data":
             self = .awaitingData
         default:

@@ -28,6 +28,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0013](0013-session-floor-default-on-reserve-emergency-exempt.md) | `session_floor` (renamed `target_max_usage`, #415) is a default-on swap-target reserve, exempt on the emergency path | Accepted |
 | [0014](0014-refresh-error-backoff-is-tick-owned.md) | Refresh error back-off is tick-owned, not on `AccountHealth` | Accepted |
 | [0015](0015-reactive-refresh-unconditional-proactive-gated.md) | Reactive on-401 refresh is unconditional; `[refresh].enabled` gates only proactive maintenance | Accepted |
+| [0016](0016-dead-active-no-target-surfaced-not-relaxed.md) | A dead active with no viable target is a surfaced capacity signal, not a swap-eligibility bug | Accepted |
 
 ## Conventions
 

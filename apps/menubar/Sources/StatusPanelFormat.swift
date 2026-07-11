@@ -616,12 +616,28 @@ enum StatusPanelFormat {
     /// The footer line for the daemon's `next_swap` candidate, or `nil` when there is no active anchor
     /// to swap from (the footer is then absent). Renders the FORWARD candidate the `watch` wire carries
     /// — NOT swap history (a true last-swap needs a new daemon source; issue #326 note).
-    static func nextSwapFooter(_ nextSwap: NextSwap?) -> String? {
+    ///
+    /// A `noViableTarget` carrying the #405 fleet-capacity relief renders it the panel's own concise
+    /// way (R-2 STATE-parity — the SAME facts as the CLI's `next swap: none …` footer, not the same
+    /// bytes): a weekly-exhausted fleet reads "Out of capacity … · add an account" (a week-long block
+    /// — adding an account is the remedy), an over-session fleet reads "every account over its session
+    /// limit" WITHOUT the nudge (a transient block that resets soon), each naming the reset when the
+    /// daemon knew it. A pre-#405 daemon (no `cause`) falls back to the bare "No viable target".
+    static func nextSwapFooter(_ nextSwap: NextSwap?, now: Int64) -> String? {
         switch nextSwap {
-        case .target(let to, _): return "Next swap → \(to)"
-        case .noViableTarget:    return "No viable target"
-        case .awaitingData:      return "Awaiting data"
-        case nil:                return nil
+        case .target(let to, _):
+            return "Next swap → \(to)"
+        case .noViableTarget(let cause, let resetsAt):
+            let relief = resetsAt.map { " — resets in \(humanizeUntil($0 - now))" } ?? ""
+            switch cause {
+            case .weekly:  return "Out of capacity\(relief) · add an account"
+            case .session: return "Every account over its session limit\(relief)"
+            case nil:      return "No viable target"
+            }
+        case .awaitingData:
+            return "Awaiting data"
+        case nil:
+            return nil
         }
     }
 
