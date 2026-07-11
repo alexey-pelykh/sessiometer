@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Fail the build if the menu-bar app's own source acquires a network-egress or
-# keychain surface. The app is a pure local-socket client: it reaches the daemon
-# over a raw POSIX AF_UNIX control socket ONLY (ADR-0011) — no host networking, no
-# analytics, no outbound call of any kind — and it never touches the keychain
-# (credentials are the daemon's job). This guard is the Swift-side peer of
-# scripts/check-no-security-framework.sh (#316): a regression gate so a future
-# change can't silently pull the app onto the host network or into the keychain
-# (issue #328).
+# Fail the build if the menu-bar app's own source acquires a network-egress, a
+# keychain, or an offline-store-read surface. The app is a pure local-socket client:
+# it reaches the daemon over a raw POSIX AF_UNIX control socket ONLY (ADR-0011) — no
+# host networking, no analytics, no outbound call of any kind — it never touches the
+# keychain (credentials are the daemon's job), and it never reads the daemon's offline
+# usage store: everything it needs, including the usage-history series, comes OVER THE
+# SOCKET (the daemon `stats` verb, #356), never from the store files directly. This
+# guard is the Swift-side peer of scripts/check-no-security-framework.sh (#316): a
+# regression gate so a future change can't silently pull the app onto the host network,
+# into the keychain, or into a direct store-read (issue #328).
+#
+# The store-read half closes the #328 gap #356 flagged: the network/keychain checks
+# below never forbade a filesystem read of the daemon's store, so a direct store-read
+# from the app would have shipped green — precisely the anti-pattern #356's socket verb
+# exists to make unnecessary. We forbid the app naming the store ARTIFACTS
+# (usage-samples / usage-rollup); the app has no legitimate reason to name them (it
+# still references the support-dir SOCKET path, which is allowed and untouched here).
 #
 # Why source-level, not `otool -L` of the built .app:
 # The daemon guard works at the build-INPUT level — it asks whether the
@@ -78,6 +87,16 @@ fi
 #      with no plausible benign identifier containing them:
 #        URLSession URLRequest NSURLConnection
 #        NWConnection NWListener NWEndpoint NWBrowser NWPath
+#
+#   3. Forbidden STORE ARTIFACTS — the daemon's offline usage store, which the app must
+#      never read directly (it gets the usage series over the socket, #356). Matched as
+#      substrings of the store filenames (src/paths.rs), distinctive enough to have no
+#      benign use in the app — and, being code-only like the rest, a doc comment that
+#      NAMES them (e.g. explaining why the app doesn't read them) is not a violation.
+#      The support-dir SOCKET path (Library/Application Support/sessiometer/daemon.sock)
+#      is deliberately NOT matched — that reference is the app's legitimate transport:
+#        usage-samples   the raw usage-sample log (usage-samples.jsonl)
+#        usage-rollup    the rolled usage aggregates (usage-rollup.json)
 hits="$(
     awk '
         { code = $0; sub(/\/\/.*/, "", code) }
@@ -85,6 +104,8 @@ hits="$(
             { printf "%s:%d: forbidden import (keychain/host-networking) -> %s\n", FILENAME, FNR, $0; next }
         code ~ /(URLSession|URLRequest|NSURLConnection|NWConnection|NWListener|NWEndpoint|NWBrowser|NWPath)/ \
             { printf "%s:%d: forbidden host-networking symbol -> %s\n", FILENAME, FNR, $0 }
+        code ~ /(usage-samples|usage-rollup)/ \
+            { printf "%s:%d: forbidden store-path read (socket client, not a store reader) -> %s\n", FILENAME, FNR, $0 }
     ' "${swift_files[@]}" || true
 )"
 
@@ -106,14 +127,16 @@ fi
 if [ -n "$hits" ] || [ -n "$ent_hits" ]; then
     {
         echo "error: the menu-bar app must stay a pure local-socket client (zero network"
-        echo "       egress, no keychain), but a forbidden egress/keychain surface appeared:"
+        echo "       egress, no keychain, no store-read), but a forbidden surface appeared:"
         echo
         [ -n "$hits" ] && printf '%s\n' "$hits" | sed 's/^/  /'
         [ -n "$ent_hits" ] && printf '%s\n' "$ent_hits" | sed 's/^/  network entitlement -> /'
         echo
         echo "The app talks to the daemon over a raw POSIX AF_UNIX socket ONLY (ADR-0011):"
         echo "no Network.framework/NWConnection, no URLSession/URLRequest, no Security.framework"
-        echo "keychain access (credentials are the daemon's job), and no network entitlement."
+        echo "keychain access (credentials are the daemon's job), no network entitlement, and no"
+        echo "direct read of the daemon's usage store (the usage series comes over the socket via"
+        echo "the daemon 'stats' verb, #356 — never from usage-samples/usage-rollup directly)."
         echo "If this surface is genuinely intended it is an architecture change — reconsider it"
         echo "against ADR-0011, don't relax the gate."
     } >&2
@@ -121,4 +144,4 @@ if [ -n "$hits" ] || [ -n "$ent_hits" ]; then
 fi
 
 echo "ok: menu-bar app is a pure local-socket client — no Security/Network/URLSession"
-echo "    surface in apps/menubar/Sources, and no network entitlement."
+echo "    surface in apps/menubar/Sources, no network entitlement, and no store-path read."

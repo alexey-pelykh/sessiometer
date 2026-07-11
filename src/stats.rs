@@ -318,6 +318,64 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     Ok(())
 }
 
+/// The daemon `stats` socket verb (issue #356): read the store, compute the bounded per-account
+/// daily series, and return the reply line the spawned socket task writes verbatim — the compact
+/// `StatsWire` JSON for `period`, or a non-secret `{"error":"…"}` envelope on an invalid period or
+/// an unreadable store.
+///
+/// Reads the SAME on-disk store `sessiometer stats` reads and runs it through the SAME
+/// [`build_report`] + [`stats_wire`] pipeline, so a socket read equals `sessiometer stats --period
+/// <period> --json` for the same instant (R-2 parity) — only the serialization differs (compact
+/// here, for the newline-delimited socket frame; the CLI pretty-prints for a file). `period` is the
+/// CLI `--period` grammar (`day|week|month|lifetime`); the panel Stats tab's 7-day daily series is
+/// `week` (the CLI has NO `--period 7d` — `7d` is `--since` grammar — so the issue's `"7d"` example
+/// maps to `week`, the 7-day daily-bucket window). A missing `period` defaults to `week`, mirroring
+/// the CLI default.
+///
+/// Pure of daemon state — only the store files + wall clock + on-disk config — so the daemon answers
+/// it in a blocking task OFF the run loop (the store read is blocking `std::fs`; ADR-0001 forbids
+/// stalling the single runtime thread). Non-secret by construction: usage fractions + already-
+/// redacted roster labels (issue #15), never a credential — so, like `status` / `watch`, the verb is
+/// un-auth-gated.
+pub(crate) fn socket_stats_reply(period: Option<&str>) -> String {
+    let now = wall_clock_now();
+    let offset = local_offset_secs(now);
+    match NativeHistoryStore::from_paths().and_then(|store| StoreData::read(&store)) {
+        Ok(data) => stats_socket_json(&data, now, offset, period),
+        // An unreadable / missing store is a non-secret failure, not a panic — the panel shows
+        // "stats unavailable" rather than a broken view (the same tolerance the CLI reader has).
+        Err(_) => r#"{"error":"stats unavailable"}"#.to_owned(),
+    }
+}
+
+/// Build the compact `stats` socket reply from an already-read store — the testable core of
+/// [`socket_stats_reply`], split out so a controlled `StoreData` can assert R-2 parity with the CLI
+/// `--json` render without touching the real on-disk store. Same [`build_report`] + [`stats_wire`]
+/// pipeline [`render_json`] uses, serialized COMPACT (no trailing newline — the socket framing
+/// appends it). Returns a redacted `{"error":…}` envelope on an invalid period or a non-finite usage
+/// value; the caller maps an unreadable store to the same shape.
+fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&str>) -> String {
+    // `since` is always `None` over the socket — only the CLI `--since` grammar drives that path — so
+    // the sole `plan_window` failure here is an unknown `--period` value (`StatsPeriodInvalid`).
+    let window = match plan_window(period, None, now, data) {
+        Ok(window) => window,
+        Err(_) => return r#"{"error":"invalid period"}"#.to_owned(),
+    };
+    // One config load feeds both the aggregator thresholds and roster reconciliation, exactly as
+    // `run` does; a missing / malformed config falls back to defaults (the read-only view still
+    // works pre-`capture`). Re-read from disk — the same config the CLI reader sees — rather than
+    // the daemon's in-memory copy (which the spawned, `Send`-only task cannot borrow), so the socket
+    // series stays byte-parity with `stats --json`.
+    let config = Config::load().ok();
+    let params = params_from(config.as_ref());
+    let roster = config.as_ref().map(roster_handles);
+    // No account filter over the socket — the whole roster (matches `stats --period <p> --json` with
+    // no `--account`).
+    let report = build_report(data, window, Vec::new(), roster.as_ref(), &params, offset);
+    serde_json::to_string(&stats_wire(&report))
+        .unwrap_or_else(|_| r#"{"error":"stats unavailable"}"#.to_owned())
+}
+
 /// The resolved terminal environment for the human render — the ONE impure probe of
 /// stdout (width + colour gate + glyph ramp), computed in [`run`] and then passed as
 /// plain data so the whole chart pipeline is a pure function of it (issue #159). Mirrors
@@ -1112,13 +1170,16 @@ impl CoverageClass {
     }
 }
 
-/// Render the stable `--json` document.
-fn render_json(report: &Report) -> Result<String> {
+/// Build the stable `--json` wire document from a resolved report. Extracted from [`render_json`]
+/// so BOTH the CLI `--json` render (pretty, below) AND the daemon `stats` socket verb (issue #356,
+/// [`socket_stats_reply`], compact) serialize the IDENTICAL `StatsWire` — the R-2 parity guarantee
+/// is structural (one builder), not a re-derivation kept in lockstep by hand.
+fn stats_wire(report: &Report) -> StatsWire<'_> {
     let (period, since) = match &report.window.kind {
         WindowKind::Period(p) => (Some(p.wire_tag()), None),
         WindowKind::Since(s) => (None, Some(s.as_str())),
     };
-    let wire = StatsWire {
+    StatsWire {
         schema: JSON_SCHEMA_VERSION,
         window: WindowWire {
             start: report.window.start,
@@ -1143,8 +1204,14 @@ fn render_json(report: &Report) -> Result<String> {
             accounts: accounts_wire(&report.summary.per_account),
         },
         orphans: accounts_wire(&report.orphans),
-    };
-    let mut json = serde_json::to_string_pretty(&wire)
+    }
+}
+
+/// Render the stable `--json` document — the human / file view: PRETTY-printed with a trailing
+/// newline. (The daemon `stats` socket verb serializes the same [`stats_wire`] COMPACT, no trailing
+/// newline — issue #356; the newline is the socket framing, added on write.)
+fn render_json(report: &Report) -> Result<String> {
+    let mut json = serde_json::to_string_pretty(&stats_wire(report))
         .map_err(|_| Error::StatsSerialize("a usage value was not a finite number"))?;
     json.push('\n');
     Ok(json)
@@ -3360,5 +3427,146 @@ mod tests {
         );
         let head = out.split("not in roster").next().unwrap();
         assert!(!head.contains("backup"), "never rendered as a live account");
+    }
+
+    // --- daemon `stats` socket verb (issue #356) --------------------------------------
+
+    #[test]
+    fn socket_stats_json_equals_the_cli_json_for_the_same_report() {
+        // R-2 parity (issue #356), structural: the socket verb and `stats --json` serialize the SAME
+        // `stats_wire` from the SAME report — the socket COMPACT, the CLI PRETTY — so they must
+        // decode to the identical JSON value (the bytes differ only in whitespace). Parity is
+        // guaranteed by the shared builder, not kept in lockstep by hand.
+        let report = report_fixture();
+        let socket = serde_json::to_string(&stats_wire(&report)).unwrap();
+        let cli = render_json(&report).unwrap();
+        let socket_v: serde_json::Value = serde_json::from_str(&socket).unwrap();
+        let cli_v: serde_json::Value = serde_json::from_str(cli.trim_end()).unwrap();
+        assert_eq!(
+            socket_v, cli_v,
+            "the stats socket wire must equal `stats --json` for the same window (R-2 parity)"
+        );
+    }
+
+    #[test]
+    fn socket_stats_defaults_a_missing_period_to_week() {
+        // A `stats` request with no period resolves the SAME window as an explicit `week` — the
+        // 7-day daily-bucket series the panel Stats tab reads (the CLI's own default, too).
+        let now = epoch("2026-07-08T00:00:00Z");
+        let store = data(
+            vec![
+                sample(now - 2 * DAY_SECS, "work", 0.6, 0.3),
+                sample(now - 5 * DAY_SECS, "spare", 0.2, 0.1),
+            ],
+            "",
+        );
+        assert_eq!(
+            stats_socket_json(&store, now, 0, None),
+            stats_socket_json(&store, now, 0, Some("week")),
+            "a periodless stats request is the 7-day `week` window"
+        );
+        // And it is genuinely the 7-day series: 7 bounded daily buckets, period tag `week`.
+        let v: serde_json::Value =
+            serde_json::from_str(&stats_socket_json(&store, now, 0, None)).unwrap();
+        assert_eq!(v["window"]["period"], "week");
+        assert_eq!(v["series"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn socket_stats_rejects_an_invalid_period_with_a_redacted_envelope() {
+        // The issue's literal `"7d"` example is NOT a valid `--period` (it is `--since` grammar) — the
+        // 7-day series is `"week"`, not `"7d"`. The socket rejects an unknown period with a non-secret
+        // machine envelope, exactly as the CLI errors on it (issue #356). Rejection precedes any store
+        // read, so an empty store still yields the envelope, never a panic.
+        let store = data(vec![], "");
+        assert_eq!(
+            stats_socket_json(&store, 1_000_000, 0, Some("7d")),
+            r#"{"error":"invalid period"}"#
+        );
+        assert_eq!(
+            stats_socket_json(&store, 1_000_000, 0, Some("garbage")),
+            r#"{"error":"invalid period"}"#
+        );
+    }
+
+    #[test]
+    fn socket_stats_serves_an_empty_store_as_a_valid_empty_series() {
+        // An empty store is not an error — the panel shows an empty 7-day series, not "unavailable"
+        // (the same tolerance the CLI reader has). A bounded, well-formed reply.
+        let now = epoch("2026-07-08T00:00:00Z");
+        let reply = stats_socket_json(&data(vec![], ""), now, 0, Some("week"));
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(
+            v["series"].as_array().unwrap().len(),
+            7,
+            "still 7 bounded daily buckets"
+        );
+        assert!(
+            v["summary"]["accounts"].as_object().unwrap().is_empty(),
+            "no accounts in an empty store"
+        );
+    }
+
+    // --- Cross-language wire golden: stats socket reply (issues #356 / #340) -----------
+    //
+    // The `stats` socket verb (#356) puts `StatsWire` on the cross-language boundary for the first
+    // time (the Swift menubar previously mirrored only the snapshot/heartbeat/status frames). This is
+    // its byte-drift golden — the stats sibling of daemon.rs's snapshot/heartbeat goldens (#340),
+    // living here because `StatsWire` + `stats_wire` are private to this module. Deterministic (a
+    // fixed report), so the pin test re-emits in-process and asserts byte-equality — the same
+    // discipline as the daemon goldens. Mirrored by Swift `Fixtures.statsBasic`
+    // (`apps/menubar/Tests/Fixtures.swift`), which the CI swift job pins to the SAME committed bytes.
+
+    /// The frozen `stats` socket reply the cross-language guard pins: the SAME [`wire_golden_report`]
+    /// the CLI `--json` byte-stability golden ([`WIRE_GOLDEN`]) uses, serialized the way the socket
+    /// verb emits it — COMPACT (`to_string`, no trailing newline; the newline is the socket framing).
+    /// Freezing the identical report both PRETTY (CLI) and COMPACT (socket) makes R-2 parity
+    /// self-evident: one `stats_wire`, two serializations.
+    fn wire_golden_stats_socket_frame() -> String {
+        serde_json::to_string(&stats_wire(&wire_golden_report()))
+            .expect("the stats golden report serializes")
+    }
+
+    /// One-time emitter for the committed `stats` socket golden (issues #356 / #340). `#[ignore]` —
+    /// NOT part of the suite; it WRITES the bytes the pin test and Swift `Fixtures.statsBasic`
+    /// consume. Run it ONLY alongside a deliberate `StatsWire` change:
+    ///   `cargo test -- --ignored emit_wire_stats_golden_fixture`
+    /// then update the Swift mirror (`apps/menubar/Tests/Fixtures.swift`) so the byte-equality holds.
+    #[test]
+    #[ignore = "one-time wire-stats-golden emitter — run ONLY alongside a deliberate StatsWire change"]
+    fn emit_wire_stats_golden_fixture() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/fixtures");
+        std::fs::create_dir_all(&dir).expect("create build/fixtures");
+        std::fs::write(
+            dir.join("wire-stats-basic.json"),
+            wire_golden_stats_socket_frame(),
+        )
+        .expect("write wire-stats golden");
+    }
+
+    /// The committed `stats` socket golden — the exact bytes Swift `Fixtures.statsBasic` is pinned to.
+    /// `include_str!` makes the file a compile-time input, so it must exist before this module
+    /// compiles (emit once via [`emit_wire_stats_golden_fixture`]).
+    const WIRE_STATS_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-stats-basic.json"
+    ));
+
+    #[test]
+    fn the_committed_stats_wire_golden_still_matches_the_socket_encoder() {
+        // The cross-language pin (issues #356 / #340), the stats sibling of daemon.rs's
+        // snapshot/heartbeat goldens. `StatsWire` serialization is deterministic, so re-emitting
+        // in-process and comparing to the COMMITTED bytes catches any shape drift — a renamed /
+        // added / reordered / re-typed field, a `schema` bump — that shifts the bytes: the golden
+        // goes stale and this fails, forcing a regenerate (`emit_wire_stats_golden_fixture`) that in
+        // turn breaks the Swift byte-equality until the hand-written Swift mirror is updated too.
+        assert_eq!(
+            wire_golden_stats_socket_frame(),
+            WIRE_STATS_GOLDEN,
+            "the committed wire-stats golden drifted from the stats socket encoder — re-run \
+             `cargo test -- --ignored emit_wire_stats_golden_fixture`, then update the Swift mirror \
+             (apps/menubar/Tests/Fixtures.swift) so its fixture stays byte-identical"
+        );
     }
 }

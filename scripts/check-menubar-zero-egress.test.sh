@@ -121,7 +121,21 @@ cat > "$entfile/Menubar.entitlements" <<'EOF'
 EOF
 check "network entitlement in *.entitlements is RED" 1 "$(run "$entfile")"
 
-# Case 11: missing Sources dir -> RED (fail-closed: never silently pass on a
+# Case 11: the app naming a store artifact (a direct store-read) -> RED. This is the
+# #328 gap #356 closes: the app must get the usage series OVER THE SOCKET, never by
+# reading the daemon's usage-samples / usage-rollup store files itself.
+storeread="$(new_tree storeread)"
+printf 'let s = try String(contentsOfFile: dir + "usage-samples.jsonl")\n' >> "$storeread/Sources/WatchTransport.swift"
+check "store-path read (names usage-samples) is RED" 1 "$(run "$storeread")"
+
+# Case 12: a comment naming a store artifact is NOT a violation -> GREEN (the same
+# code-only discipline as the network-symbol comment-safety case above — the awk strips
+# // comments before matching, so documenting the invariant by naming the file is safe).
+storecomment="$(new_tree storecomment)"
+printf '// the series comes over the socket; the app never reads usage-samples/usage-rollup\n' >> "$storecomment/Sources/WatchTransport.swift"
+check "comment naming a store artifact is GREEN" 0 "$(run "$storecomment")"
+
+# Case 13: missing Sources dir -> RED (fail-closed: never silently pass on a
 # degenerate/empty subject).
 empty="$work/empty"
 mkdir -p "$empty"

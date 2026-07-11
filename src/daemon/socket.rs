@@ -7,6 +7,12 @@
 //! newline-delimited JSON reply. The commands:
 //!   - `status` (#9/#164) — a non-secret READ, answered for ANY peer (the frozen versioned snapshot).
 //!   - `watch` (#165) — a non-secret snapshot STREAM, also un-auth-gated (ADR-0011).
+//!   - `stats` (#356) — a non-secret READ answering a bounded per-account daily usage series
+//!     (`{"cmd":"stats","period":"<day|week|month|lifetime>"}`; `period` optional → `week`, the
+//!     7-day daily-bucket window). Un-auth-gated like `watch`, and answered OFF the run loop in a
+//!     SPAWNED task because the store read is blocking `std::fs` (ADR-0001); the reply is byte-parity
+//!     with `sessiometer stats --period <p> --json` (the same `StatsWire`). A request/response verb —
+//!     OFF the always-on `watch` stream, whose frozen contract is unchanged.
 //!   - `manual-swapped` (#64) / `roster-reload` (#139) / `restored` (#275) — state-affecting
 //!     fire-and-forget signals, honored ONLY for an authenticated same-user peer (an unauthenticated
 //!     one gets `{"error":"unauthorized"}` and produces NO signal).
@@ -208,6 +214,20 @@ impl Control for UnixControl {
                     Ok(ServeOutcome::Capture(stream, command)) => {
                         ControlYield::Capture(stream, command)
                     }
+                    // A `stats` command (issue #356): like `watch`, a non-secret READ answered in a
+                    // SPAWNED task so the blocking store read never stalls the run loop's idle select
+                    // (ADR-0001). The task owns only `Send` data (the stream + the parsed period),
+                    // never the `!Send` daemon seams, so `tokio::spawn` is `Send`-clean; it reads the
+                    // store, computes the series, writes ONE reply line, and closes. Un-auth-gated,
+                    // so no peer check — and it never mutates daemon state, so it produces no signal.
+                    Ok(ServeOutcome::Stats(stream, request)) => {
+                        tokio::spawn(async move {
+                            // Best-effort: a disconnected subscriber or any I/O error just ends the
+                            // exchange (the reply carries nothing secret) — never affects the daemon.
+                            let _ = serve_stats(stream, request).await;
+                        });
+                        ControlYield::Signal(None)
+                    }
                     Err(_) => ControlYield::Signal(None),
                 }
             }
@@ -251,6 +271,12 @@ struct ControlRequest {
     /// uuid, NEVER the email (#15/#134). `#[serde(default)]` so every other command omits it.
     #[serde(default)]
     label: Option<String>,
+    /// The `stats` command's OPTIONAL period selector (issue #356): the CLI `--period` grammar
+    /// (`day|week|month|lifetime`). An omitted period defaults to `week` (the 7-day daily-bucket
+    /// window the panel Stats tab reads). `#[serde(default)]` so every other command omits it, and
+    /// the value is validated (and mapped to the series) in the spawned task, never here.
+    #[serde(default)]
+    period: Option<String>,
 }
 
 /// A parsed `swap` control request (issue #167): an operator-supplied target handle plus the
@@ -335,6 +361,22 @@ pub(crate) struct CaptureCommand {
     /// The operator's label for the account, or `None` to auto-derive it from the account uuid
     /// (never the email — #15/#134).
     pub(crate) label: Option<String>,
+}
+
+/// A parsed `stats` control request (issue #356): the operator's OPTIONAL period selector, and
+/// NOTHING else — never a credential, never a write. Handed from [`serve_control`] to a SPAWNED
+/// task (via [`ServeOutcome::Stats`] → [`serve_stats`]) so the bounded per-account daily series is
+/// computed OFF the run loop — the store read is blocking `std::fs`, and ADR-0001's single runtime
+/// thread must never block a tick (the same reason `watch` spawns, taken one step further). A
+/// non-secret READ (usage fractions + already-redacted roster labels, issue #15), so — unlike
+/// `swap` / `capture` — it is UN-auth-gated, exactly like `status` / `watch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatsRequest {
+    /// The CLI `--period` grammar (`day|week|month|lifetime`), or `None` to default to `week`
+    /// (the 7-day daily-bucket window). Validated — and mapped to the series — by
+    /// [`crate::stats::socket_stats_reply`] in the spawned task, never here; an unknown value
+    /// yields a redacted `{"error":"invalid period"}` reply.
+    pub(crate) period: Option<String>,
 }
 
 /// The redacted acknowledgement the daemon returns for a `capture` control command (issue #359) —
@@ -507,6 +549,12 @@ pub(crate) enum ServeOutcome<RW> {
     /// a `capture` needs no `target`, so an authenticated request is ALWAYS well-formed (the label
     /// is optional); the only inline rejection is the unauthorized peer.
     Capture(RW, CaptureCommand),
+    /// A `stats` command was requested (issue #356); the connection is handed back — NO reply
+    /// written yet — for the caller to answer in a SPAWNED task ([`serve_stats`]), like `watch`
+    /// (issue #165), so the blocking store read runs OFF the run loop (ADR-0001). UN-auth-gated: a
+    /// non-secret read, so an authenticated peer is NOT required, and the request is ALWAYS
+    /// well-formed (the period is optional and validated in the task).
+    Stats(RW, StatsRequest),
 }
 
 /// Serve one control exchange: read one newline-delimited JSON request and either write one
@@ -548,6 +596,20 @@ where
             // unlike `swap` below — it is NOT auth-gated; hand the connection to the streaming path.
             Ok(request) if request.cmd == "watch" => {
                 return Ok(ServeOutcome::Watch(buffered.into_inner()));
+            }
+            // A `stats` request (issue #356): a non-secret READ (a bounded per-account usage series
+            // + redacted roster labels, like `status` / `watch`), so — unlike `swap` / `capture`
+            // below — it is NOT auth-gated. Hand the connection to the spawned `serve_stats` task so
+            // the blocking store read + aggregation runs OFF the run loop (ADR-0001), exactly like
+            // `watch`. The period is optional (defaults to `week` in the task) and validated there,
+            // so an authenticated peer is never required and there is no malformed-inline case.
+            Ok(request) if request.cmd == "stats" => {
+                return Ok(ServeOutcome::Stats(
+                    buffered.into_inner(),
+                    StatsRequest {
+                        period: request.period,
+                    },
+                ));
             }
             // A `swap` command (issue #167): STATE-AFFECTING, so authenticate FIRST (like
             // `manual-swapped`). An unauthenticated peer gets `{"error":"unauthorized"}` and NO
@@ -638,6 +700,9 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Capture(..) => {
                 panic!("expected a one-shot reply, got a capture handoff")
             }
+            ServeOutcome::Stats(..) => {
+                panic!("expected a one-shot reply, got a stats handoff")
+            }
         }
     }
 
@@ -649,6 +714,7 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::OneShot(_) => panic!("expected a swap handoff, got a one-shot reply"),
             ServeOutcome::Watch(_) => panic!("expected a swap handoff, got a watch subscription"),
             ServeOutcome::Capture(..) => panic!("expected a swap handoff, got a capture handoff"),
+            ServeOutcome::Stats(..) => panic!("expected a swap handoff, got a stats handoff"),
         }
     }
 
@@ -663,6 +729,19 @@ impl<RW> ServeOutcome<RW> {
                 panic!("expected a capture handoff, got a watch subscription")
             }
             ServeOutcome::Swap(..) => panic!("expected a capture handoff, got a swap handoff"),
+            ServeOutcome::Stats(..) => panic!("expected a capture handoff, got a stats handoff"),
+        }
+    }
+
+    /// The handed-back stream + parsed request of a [`Stats`](ServeOutcome::Stats) outcome, panicking
+    /// on any other — for the issue-#356 stats-handoff tests, which always expect a stats handoff.
+    pub(crate) fn stats(self) -> (RW, StatsRequest) {
+        match self {
+            ServeOutcome::Stats(stream, request) => (stream, request),
+            ServeOutcome::OneShot(_) => panic!("expected a stats handoff, got a one-shot reply"),
+            ServeOutcome::Watch(_) => panic!("expected a stats handoff, got a watch subscription"),
+            ServeOutcome::Swap(..) => panic!("expected a stats handoff, got a swap handoff"),
+            ServeOutcome::Capture(..) => panic!("expected a stats handoff, got a capture handoff"),
         }
     }
 }
@@ -760,10 +839,47 @@ where
     Ok(())
 }
 
-/// Upper bound on writing one `swap` ack (issue #167). The ack carries nothing secret, so a
-/// disconnected / wedged `swap` client just drops it; time-box the write so it can never stall the
-/// run loop (the ack is written INLINE in the run loop's post-idle, unlike the `watch` stream that
-/// runs in a spawned task). Mirrors [`CONTROL_EXCHANGE_TIMEOUT`], the serve-side one-shot bound.
+/// Answer one `stats` control request (issue #356) in a SPAWNED task: compute the bounded
+/// per-account daily series and write it as one newline-delimited JSON reply, then close. Spawned
+/// (like `watch`, [`UnixControl::serve`]) precisely so the store read never stalls the run loop's
+/// idle select — and the read itself is blocking `std::fs` inside
+/// [`crate::stats::socket_stats_reply`], so it runs in [`tokio::task::spawn_blocking`], OFF the
+/// single runtime thread (ADR-0001, one step past `watch`, which only awaits a channel). The reply
+/// is byte-parity with `sessiometer stats --period <period> --json` — the SAME `StatsWire` over the
+/// SAME on-disk store (issue #356) — serialized COMPACT for the newline-delimited frame. Non-secret
+/// by construction: usage fractions + already-redacted roster labels (issue #15), never a
+/// credential. Best-effort + time-boxed ([`SWAP_ACK_WRITE_TIMEOUT`]): a disconnected / wedged client
+/// just drops the reply. Generic over the stream so it is testable over an in-memory duplex, exactly
+/// like [`serve_watch`].
+pub(crate) async fn serve_stats<RW>(mut stream: RW, request: StatsRequest) -> Result<()>
+where
+    RW: tokio::io::AsyncWrite + Unpin,
+{
+    // The store read + aggregation is blocking I/O + CPU; move it OFF the runtime thread so a large
+    // samples file never blocks a tick (ADR-0001 — the reason `watch` spawns, here taken one step
+    // further because this arm does synchronous file I/O, not just an await). `spawn_blocking` runs
+    // on the blocking pool even on the current-thread runtime; a join error (the blocking closure
+    // panicked) degrades to the same non-secret envelope any other failure uses.
+    let reply = tokio::task::spawn_blocking(move || {
+        crate::stats::socket_stats_reply(request.period.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| r#"{"error":"stats unavailable"}"#.to_owned());
+    // The reply carries nothing secret, so a disconnected client just drops it; time-box the write
+    // so a wedged client can never park the spawned task indefinitely (mirrors the swap/capture ack
+    // bound, even though — being spawned — this write is already off the run loop's critical path).
+    let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_line(&mut stream, &reply)).await;
+    Ok(())
+}
+
+/// Upper bound on writing one one-shot control reply — shared by the `swap` ack (issue #167), the
+/// `capture` ack (issue #359), and the `stats` series reply (issue #356). Each reply carries nothing
+/// secret, so a disconnected / wedged client just drops it; time-box the write so a stalled client
+/// can never park its writer. The swap / capture acks are written INLINE in the run loop's post-idle,
+/// so this bound is what stops a wedged client from stalling the loop; the `stats` reply is written
+/// from a SPAWNED task (already off the run loop's critical path), where the same bound instead just
+/// keeps that task from parking indefinitely. Mirrors [`CONTROL_EXCHANGE_TIMEOUT`], the serve-side
+/// one-shot bound.
 pub(crate) const SWAP_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Write a redacted [`SwapAck`] as one newline-delimited JSON line to a `swap` client (issue
