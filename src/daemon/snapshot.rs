@@ -56,6 +56,15 @@ pub(crate) struct StatusSnapshot {
     /// [`status_response`] copies it straight onto the wire. `None` by `Default` (an all-defaults
     /// snapshot reads as healthy). A STATE discriminant only — never a token or email (the #15 discipline).
     pub(crate) canonical_scrub: Option<CanonicalScrub>,
+    /// The daemon-level KEYCHAIN-LOCKED rollup (issue #498): `true` while the macOS login keychain is
+    /// LOCKED, so the daemon cannot READ the shared credential item at ALL (access denied) — distinct
+    /// from `canonical_scrub`, where the item IS readable but its token was scrubbed/emptied (#469/#463).
+    /// Computed in [`Daemon::snapshot`] from the edge-latched `signaled_keychain_locked` signal;
+    /// [`status_response`] copies it straight onto the wire. `false` by `Default` (an all-defaults
+    /// snapshot reads as unlocked/healthy). A bare BINARY state discriminant — never a token or email
+    /// (the #15 discipline). The remedy the operator sees (unlock the keychain) is the surfacing
+    /// consumer's concern (the menubar #498 card), NOT this wire increment's.
+    pub(crate) keychain_locked: bool,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -218,8 +227,13 @@ pub(crate) struct SchemaVersion {
 /// fleet-wide scrubbed / recovery-exhausted signal, likewise optional and (via `skip_serializing_if`)
 /// omitted entirely when healthy, so a non-scrub frame's bytes are unchanged. Like
 /// `systemic_refresh_failure` it is daemon-level, but it takes `blind_active`'s `skip_serializing_if`
-/// omit-when-healthy pattern rather than `systemic_refresh_failure`'s always-emitted `null`.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 5 };
+/// omit-when-healthy pattern rather than `systemic_refresh_failure`'s always-emitted `null`. `1.6`
+/// ADDED the daemon-level [`StatusResponse::keychain_locked`] flag (issue #498) — a fleet-wide
+/// "the login keychain is LOCKED so the shared credential is unreadable" signal, a bare `bool`
+/// (via `skip_serializing_if`) omitted entirely when unlocked, so a non-locked frame's bytes are
+/// unchanged. The daemon-level sibling of `canonical_scrub`, but for an UNREADABLE item rather than
+/// a readable-but-scrubbed one; the wire prerequisite for the menubar #498 surface.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 6 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -266,6 +280,20 @@ pub(crate) struct StatusResponse {
     /// never a token or email (issue #15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) canonical_scrub: Option<CanonicalScrub>,
+    /// The daemon-level KEYCHAIN-LOCKED flag (issue #498): `true` while the macOS login keychain is
+    /// LOCKED, so the daemon cannot READ the shared credential item at ALL — the daemon-LEVEL sibling
+    /// of `canonical_scrub`, but for an UNREADABLE item (access denied) rather than a readable-but-
+    /// scrubbed one, so the operator remedy differs (unlock the keychain, not `claude /login`). Lets
+    /// `sessiometer status` + the menubar (#498) surface a fleet-wide unreadable-credential lockout no
+    /// per-account `auth` rollup reflects. A bare `bool` + `#[serde(default, skip_serializing_if =
+    /// "std::ops::Not::not")]` per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump
+    /// 1.5 → 1.6, taking `canonical_scrub`'s omit-when-healthy pattern): a pre-#498 daemon omits the
+    /// field → `false`, AND an unlocked snapshot omits it entirely, so a non-locked frame's bytes are
+    /// byte-for-byte unchanged (a pre-#498 client ignores the unknown key, the minor-bump
+    /// tolerate-by-ignoring convention). A bare BINARY state discriminant — never a token or email
+    /// (issue #15).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) keychain_locked: bool,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -540,6 +568,10 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // The daemon-level canonical-scrub rollup (issue #516), copied straight to the wire:
         // `Some(Recovering | Exhausted)` while the shared canonical is scrubbed, `None` when healthy.
         canonical_scrub: snapshot.canonical_scrub,
+        // The daemon-level keychain-locked flag (issue #498), copied straight to the wire: `true`
+        // while the login keychain is locked (the shared credential is unreadable), `false` when
+        // unlocked (and then omitted from the wire via `skip_serializing_if`).
+        keychain_locked: snapshot.keychain_locked,
     }
 }
 

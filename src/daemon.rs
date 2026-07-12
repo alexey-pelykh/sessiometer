@@ -4637,6 +4637,14 @@ where
             } else {
                 None
             },
+            // The daemon-level keychain-locked flag (issue #498): project the edge-latched
+            // `signaled_keychain_locked` signal straight onto the wire so `status` / the menubar (#498)
+            // can surface the fleet-wide unreadable-credential lockout (the login keychain is LOCKED, so
+            // the shared item can't be READ at all — distinct from a readable-but-scrubbed canonical).
+            // Read directly, mirroring `canonical_scrub` above: the latch is `true` for exactly the
+            // duration of a lock episode — set in `locked_tick` before this snapshot is built, cleared
+            // on the first readable cycle — so a direct read is a faithful "currently locked" indicator.
+            keychain_locked: self.state.signaled_keychain_locked,
         }
     }
 
@@ -10052,6 +10060,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
             canonical_scrub: None,
+            keychain_locked: false,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -10825,6 +10834,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
             canonical_scrub: None,
+            keychain_locked: false,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -11466,6 +11476,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
             canonical_scrub: None,
+            keychain_locked: false,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -11640,6 +11651,7 @@ mod tests {
         StatusSnapshot {
             systemic_refresh: None,
             canonical_scrub: None,
+            keychain_locked: false,
             generated_at,
             refresh_enabled: false,
             next_swap: None,
@@ -13442,6 +13454,67 @@ mod tests {
     }
 
     #[test]
+    fn keychain_locked_rides_the_wire_as_an_additive_flag_and_an_unlocked_snapshot_omits_it() {
+        // Issue #498 / schema 1.5 → 1.6: the daemon-level `keychain_locked` flag rides the wire as an
+        // additive OPTIONAL field — present as `"keychain_locked":true` while the login keychain is
+        // LOCKED (the shared credential is UNREADABLE), OMITTED (`skip_serializing_if`) when unlocked,
+        // so a non-locked frame's bytes stay unchanged (mirroring `canonical_scrub`). Round-trips back
+        // to the same flag, and carries a bare BINARY state discriminant only — never a token or email
+        // (#15). Distinct from `canonical_scrub`: an UNREADABLE item (keychain locked) vs a readable-
+        // but-scrubbed one.
+        let snapshot = StatusSnapshot {
+            keychain_locked: true,
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(
+            json.contains(r#""keychain_locked":true"#),
+            "the keychain-locked flag rides the wire: {json}"
+        );
+        // #15: a bare boolean discriminant — never an email or token sigil. Non-vacuous: the label
+        // "work" reaches the scanned corpus (a real handle rode the wire), so the clean verdict is
+        // not vacuously true on an empty payload.
+        assert!(json.contains("\"label\":\"work\""), "got {json}");
+        assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
+        assert!(!json.to_lowercase().contains("token"));
+        // Round-trip: the flag decodes back unchanged (a current client reads it).
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.keychain_locked);
+
+        // An UNLOCKED snapshot omits the field ENTIRELY (`skip_serializing_if`), so its bytes are
+        // byte-for-byte unchanged across the additive minor bump — the property the golden pins.
+        let unlocked = StatusSnapshot {
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&unlocked)).unwrap();
+        assert!(
+            !json.contains("keychain_locked"),
+            "an unlocked snapshot omits the field: {json}"
+        );
+        // …and the omitted field decodes back to `false` (serde default) — a current client reads an
+        // unlocked frame as "not locked".
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.keychain_locked);
+
+        // Explicit forward/back-compat: a pre-#498 (schema 1.5) frame that never carried the key
+        // decodes to `false` — the `#[serde(default)]` tolerate-by-ignoring contract a current client
+        // relies on (mirrors the Swift `decodeIfPresent(Bool.self) ?? false` path).
+        let pre_498 = r#"{"accounts":[],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":null}"#;
+        let parsed: StatusResponse = serde_json::from_str(pre_498).unwrap();
+        assert!(!parsed.keychain_locked);
+    }
+
+    #[test]
     fn the_status_wire_is_flat_and_carries_the_frozen_meta() {
         // AC-1: the snapshot carries `schema_version` + `generated_at`, and the payload stays
         // FLAT at the top level (the settled #137–#143 shape, only prefixed with the two meta
@@ -13456,7 +13529,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":5}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":6}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -13494,6 +13567,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
             canonical_scrub: None,
+            keychain_locked: false,
             generated_at: 1_782_777_600,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -13683,6 +13757,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
             canonical_scrub: None,
+            keychain_locked: false,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![

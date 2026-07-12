@@ -415,6 +415,15 @@ struct VersionedStatus: Decodable, Equatable {
     /// there, so a non-scrub frame is byte-unchanged). Added by the MINOR `1.4 → 1.5` bump — an older
     /// client tolerates it by ignoring; a bare state discriminant, never a token or email (issue #15).
     let canonicalScrub: CanonicalScrub?
+    /// The daemon-level KEYCHAIN-LOCKED flag (`src/daemon/snapshot.rs` `StatusResponse.keychain_locked`,
+    /// issue #498): `true` while the macOS login keychain is LOCKED, so the daemon cannot READ the shared
+    /// credential item at all (access denied) — the daemon-LEVEL sibling of `canonicalScrub`, but for an
+    /// UNREADABLE item rather than a readable-but-scrubbed one (so the operator remedy differs: unlock the
+    /// keychain, not `claude /login`). `false` for a pre-#498 daemon AND for an unlocked one
+    /// (`skip_serializing_if` omits it there, so a non-locked frame is byte-unchanged). Added by the MINOR
+    /// `1.5 → 1.6` bump — an older client tolerates it by ignoring; a bare binary state discriminant,
+    /// never a token or email (issue #15).
+    let keychainLocked: Bool
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -424,6 +433,7 @@ struct VersionedStatus: Decodable, Equatable {
         case refreshEnabled = "refresh_enabled"
         case systemicRefreshFailure = "systemic_refresh_failure"
         case canonicalScrub = "canonical_scrub"
+        case keychainLocked = "keychain_locked"
     }
 
     init(from decoder: Decoder) throws {
@@ -437,6 +447,7 @@ struct VersionedStatus: Decodable, Equatable {
         refreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .refreshEnabled)
         systemicRefreshFailure = try c.decodeIfPresent(UInt32.self, forKey: .systemicRefreshFailure)
         canonicalScrub = try c.decodeIfPresent(CanonicalScrub.self, forKey: .canonicalScrub)
+        keychainLocked = try c.decodeIfPresent(Bool.self, forKey: .keychainLocked) ?? false
     }
 
     /// Whether this snapshot's contract major is one the client can render (`WireContract`).

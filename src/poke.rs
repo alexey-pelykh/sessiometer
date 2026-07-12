@@ -612,6 +612,7 @@ mod tests {
         StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: lines,
             next_swap: None,
