@@ -1466,6 +1466,7 @@ mod tests {
         // A unique handle match → its verdict.
         let unique = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),
@@ -1484,6 +1485,7 @@ mod tests {
         // fallback, never a guess.
         let duped = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("dup", false, false, Some(10)),
@@ -1799,6 +1801,7 @@ mod tests {
 
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),

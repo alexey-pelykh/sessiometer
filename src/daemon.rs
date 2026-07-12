@@ -137,8 +137,8 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, BlindActive, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion,
-    StatusResponse, StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
+    AccountStatusLine, BlindActive, CanonicalScrub, NextSwap, NextSwapReason, NoTargetCause,
+    SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -4617,6 +4617,26 @@ where
             // when healthy — surfaced by `status` so the mechanism-down state is visible without
             // waiting for an account to die. A COUNT only (#15).
             systemic_refresh: self.state.systemic_refresh.status(),
+            // The daemon-level canonical-scrub rollup (issue #516): project the two edge-latched scrub
+            // signals into the wire discriminant so `status` / the menubar (#469) can surface the
+            // fleet-wide scrubbed lockout. GATE on `signaled_canonical_scrubbed` FIRST (the master "is
+            // the canonical currently empty" signal), THEN refine by exhaustion — because the restore
+            // path clears `signaled_canonical_scrubbed` (a live re-read) but NOT
+            // `signaled_scrub_adopt_exhausted` (cleared only on churn-window age-out, inside the
+            // scrubbed-gated `recover_scrubbed_canonical`), so `(scrubbed=false, exhausted=true)` is
+            // reachable after a `claude /login` recovery. Checking exhaustion first would then FALSELY
+            // report un-recoverable over a HEALED canonical. Recovery-EXHAUSTED (#467, the residual
+            // #469 renders with the `claude /login` remedy) outranks merely-scrubbed-but-RECOVERING
+            // (#464); both clear to `None` (healthy) once the canonical is observed live again.
+            canonical_scrub: if self.state.signaled_canonical_scrubbed {
+                if self.state.signaled_scrub_adopt_exhausted {
+                    Some(CanonicalScrub::Exhausted)
+                } else {
+                    Some(CanonicalScrub::Recovering)
+                }
+            } else {
+                None
+            },
         }
     }
 
@@ -10031,6 +10051,7 @@ mod tests {
     fn status_response_carries_handles_and_percentages_and_never_a_secret() {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -10743,6 +10764,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_projects_the_canonical_scrub_rollup_gated_on_the_scrubbed_signal() {
+        // Issue #516: `snapshot` projects the two edge-latched scrub signals into the wire rollup,
+        // GATED on `signaled_canonical_scrubbed` FIRST and only THEN refined by exhaustion. The gate
+        // is load-bearing: the restore path clears `signaled_canonical_scrubbed` (a confirmed live
+        // re-read) but NOT `signaled_scrub_adopt_exhausted` (cleared only on a churn-window age-out,
+        // inside the scrubbed-gated `recover_scrubbed_canonical`), so `(scrubbed=false, exhausted=true)`
+        // is REACHABLE after a `claude /login` recovery — and MUST read healthy, never a stale
+        // un-recoverable. This projection is the daemon-side wiring the pure serialize test can't reach.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        const NOW: i64 = 1_782_777_600;
+        let no_readings: [Option<Usage>; 3] = [None, None, None];
+        let rollup = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).canonical_scrub;
+
+        // Healthy: neither signal set → the rollup is absent.
+        assert_eq!(
+            rollup(&daemon),
+            None,
+            "a healthy canonical projects no rollup"
+        );
+
+        // Scrubbed, adopt still in progress (#464) → Recovering, the lower-severity self-may-heal state.
+        daemon.state.signaled_canonical_scrubbed = true;
+        assert_eq!(
+            rollup(&daemon),
+            Some(CanonicalScrub::Recovering),
+            "a scrubbed-but-recovering canonical projects Recovering"
+        );
+
+        // Scrubbed AND recovery exhausted (#467) → Exhausted, the residual un-recoverable state #469
+        // renders with the `claude /login` remedy. Exhaustion OUTRANKS recovering (most-severe wins).
+        daemon.state.signaled_scrub_adopt_exhausted = true;
+        assert_eq!(
+            rollup(&daemon),
+            Some(CanonicalScrub::Exhausted),
+            "recovery-exhausted outranks merely-recovering"
+        );
+
+        // THE GATE (the correctness subtlety): the canonical RECOVERS — a live re-read clears
+        // `signaled_canonical_scrubbed` — while the exhausted latch still lingers (not yet aged out).
+        // The rollup MUST read healthy, never a stale `Exhausted` over a healed canonical.
+        daemon.state.signaled_canonical_scrubbed = false;
+        assert_eq!(
+            rollup(&daemon),
+            None,
+            "a healed canonical reads healthy even while the exhausted latch lingers"
+        );
+    }
+
     #[test]
     fn redaction_meter_covers_the_new_credential_clock_fields() {
         use crate::redaction::meter::{assert_clean, Secrets};
@@ -10754,6 +10824,7 @@ mod tests {
         let secrets = Secrets::meter_fixture();
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -11394,6 +11465,7 @@ mod tests {
 
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -11567,6 +11639,7 @@ mod tests {
     fn watch_snapshot(label: &str, generated_at: i64, session: f64) -> StatusSnapshot {
         StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
             generated_at,
             refresh_enabled: false,
             next_swap: None,
@@ -11965,6 +12038,20 @@ mod tests {
         encode_snapshot_frame(&versioned_status_response(&snapshot))
     }
 
+    /// A snapshot frame whose `canonical_scrub` carries the #516 daemon-level rollup — the basic
+    /// golden OMITS the field entirely (a healthy snapshot, `skip_serializing_if`), so the
+    /// [`CanonicalScrub`] discriminant (the whole point of #516) has NO byte-drift coverage without
+    /// this. Freezes the `{…,"canonical_scrub":{"state":"exhausted"}}` shape (the residual
+    /// un-recoverable state #469 renders with the `claude /login` remedy), so the cross-language guard
+    /// fails if the Rust rollup encoder and the Swift mirror ever diverge. Built as the basic frame
+    /// with the scrub field set, so it differs from `wire_golden_snapshot_frame` in exactly that one
+    /// ADDED key. Mirrored by Swift `Fixtures.snapshotCanonicalScrubExhausted`.
+    fn wire_golden_snapshot_canonical_scrub_frame() -> String {
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.canonical_scrub = Some(CanonicalScrub::Exhausted);
+        encode_snapshot_frame(&versioned_status_response(&snapshot))
+    }
+
     /// One-time emitter for the committed wire goldens. `#[ignore]` — NOT part of the suite; it
     /// WRITES the bytes the pin test and the Swift fixtures consume. Run it ONLY alongside a
     /// deliberate wire-contract change:
@@ -11991,6 +12078,11 @@ mod tests {
             wire_golden_snapshot_next_swap_frame(),
         )
         .expect("write wire-snapshot-next-swap golden");
+        std::fs::write(
+            dir.join("wire-snapshot-canonical-scrub.json"),
+            wire_golden_snapshot_canonical_scrub_frame(),
+        )
+        .expect("write wire-snapshot-canonical-scrub golden");
     }
 
     /// The committed snapshot-frame golden — the exact bytes Swift `Fixtures.snapshotBasic` is
@@ -12013,6 +12105,13 @@ mod tests {
     const WIRE_SNAPSHOT_NEXT_SWAP_GOLDEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/build/fixtures/wire-snapshot-next-swap.json"
+    ));
+
+    /// The committed canonical-scrub snapshot golden (issue #516) — the exact bytes Swift
+    /// `Fixtures.snapshotCanonicalScrubExhausted` is pinned to.
+    const WIRE_SNAPSHOT_CANONICAL_SCRUB_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-snapshot-canonical-scrub.json"
     ));
 
     #[test]
@@ -12045,6 +12144,13 @@ mod tests {
             "the committed wire-snapshot-next-swap golden drifted from the next_swap reason encoder \
              (issue #393) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, then update \
              the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
+        );
+        assert_eq!(
+            wire_golden_snapshot_canonical_scrub_frame(),
+            WIRE_SNAPSHOT_CANONICAL_SCRUB_GOLDEN,
+            "the committed wire-snapshot-canonical-scrub golden drifted from the canonical_scrub \
+             rollup encoder (issue #516) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, \
+             then update the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
         );
     }
 
@@ -13273,6 +13379,69 @@ mod tests {
     }
 
     #[test]
+    fn canonical_scrub_rides_the_wire_as_an_additive_rollup_and_a_healthy_snapshot_omits_it() {
+        // Issue #516 / schema 1.4 → 1.5: the daemon-level `canonical_scrub` rollup rides the wire as
+        // an additive OPTIONAL field — present as a `{"state":…}` discriminant while the shared
+        // canonical is scrubbed, OMITTED (`skip_serializing_if`) when healthy, so a non-scrub frame's
+        // bytes stay unchanged (mirroring `blind_active`). Round-trips back to the same rollup, and
+        // carries a bare STATE discriminant only — never a token or email (#15).
+        for (scrub, wire) in [
+            (
+                CanonicalScrub::Recovering,
+                r#""canonical_scrub":{"state":"recovering"}"#,
+            ),
+            (
+                CanonicalScrub::Exhausted,
+                r#""canonical_scrub":{"state":"exhausted"}"#,
+            ),
+        ] {
+            let snapshot = StatusSnapshot {
+                canonical_scrub: Some(scrub),
+                accounts: vec![AccountReading {
+                    label: "work".to_owned(),
+                    active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+            assert!(
+                json.contains(wire),
+                "the scrub rollup rides the wire: {json}"
+            );
+            // #15: a bare state discriminant — never an email or token sigil. Non-vacuous: the label
+            // "work" reaches the scanned corpus (a real handle rode the wire), so the clean verdict
+            // is not vacuously true on an empty payload.
+            assert!(json.contains("\"label\":\"work\""), "got {json}");
+            assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
+            assert!(!json.to_lowercase().contains("token"));
+            // Round-trip: the rollup decodes back unchanged (a current client reads it).
+            let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.canonical_scrub, Some(scrub));
+        }
+
+        // A HEALTHY snapshot omits the field ENTIRELY (`skip_serializing_if`), so its bytes are
+        // byte-for-byte unchanged across the additive minor bump — the property the golden pins.
+        let healthy = StatusSnapshot {
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&healthy)).unwrap();
+        assert!(
+            !json.contains("canonical_scrub"),
+            "a healthy snapshot omits the field: {json}"
+        );
+        // …and the omitted field decodes back to None (serde default) — a current client reads a
+        // pre-#516 / healthy frame as "no scrub".
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.canonical_scrub.is_none());
+    }
+
+    #[test]
     fn the_status_wire_is_flat_and_carries_the_frozen_meta() {
         // AC-1: the snapshot carries `schema_version` + `generated_at`, and the payload stays
         // FLAT at the top level (the settled #137–#143 shape, only prefixed with the two meta
@@ -13287,7 +13456,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":4}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":5}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -13324,6 +13493,7 @@ mod tests {
         // backward-compat guarantee the flatten design rests on.
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
             generated_at: 1_782_777_600,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -13512,6 +13682,7 @@ mod tests {
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![

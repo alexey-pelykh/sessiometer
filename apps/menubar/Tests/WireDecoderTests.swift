@@ -15,12 +15,13 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 4))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 5))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
         XCTAssertEqual(v.refreshEnabled, false)
         XCTAssertNil(v.systemicRefreshFailure, "systemic_refresh_failure null decodes to nil")
+        XCTAssertNil(v.canonicalScrub, "canonical_scrub absent (healthy) decodes to nil")
         XCTAssertEqual(v.accounts.count, 1)
 
         let a = v.accounts[0]
@@ -42,8 +43,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 4)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 4))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 5)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 5))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -148,6 +149,32 @@ final class WireDecoderTests: XCTestCase {
         let a = v.accounts[0]
         XCTAssertTrue(a.quarantined)
         XCTAssertEqual(a.auth, .degraded)
+    }
+
+    // AC (#516): the daemon-level `canonical_scrub` = `exhausted` rollup decodes — the fleet-wide
+    // scrubbed-AND-recovery-exhausted (un-recoverable) state that no per-account `auth` reflects, which
+    // #469 renders with the `claude /login` remedy. Byte-pinned to the Rust golden (WireGoldenTests),
+    // so the `{"state":"exhausted"}` discriminant is under the cross-language byte-drift guard.
+    func testDecodesCanonicalScrubExhausted() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubExhausted) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 5))
+        XCTAssertEqual(v.canonicalScrub, .exhausted)
+        // The rest of the frame still decodes normally alongside the added rollup.
+        XCTAssertEqual(v.accounts.count, 1)
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
+    // AC (#516): the OTHER known `canonical_scrub` state — `recovering` (scrubbed, adopt in progress,
+    // the self-may-heal state) — decodes to its own case. The client must decode every KNOWN state the
+    // daemon emits (an UNKNOWN one is a HARD error — `testUnknownCanonicalScrubStateThrows`), which one
+    // byte-golden (carrying `exhausted`) cannot cover.
+    func testDecodesCanonicalScrubRecovering() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubRecovering) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.canonicalScrub, .recovering)
     }
 
     // AC: "`auth` → CredentialHealth including `null`".
@@ -263,6 +290,13 @@ final class WireDecoderTests: XCTestCase {
     // Faithful mirror: an unknown internally-tagged `next_swap` state is a hard error.
     func testUnknownNextSwapStateThrows() {
         XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotUnknownNextSwap))
+    }
+
+    // Faithful mirror (#516): an unknown internally-tagged `canonical_scrub` state is a hard error —
+    // the same reject posture as `next_swap.state` (a mis-rendered fleet state is dangerous), NOT the
+    // tolerated-decoration posture of an unknown `reason.kind`.
+    func testUnknownCanonicalScrubStateThrows() {
+        XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotUnknownCanonicalScrub))
     }
 
     // Faithful mirror: an unknown `auth` value is a hard error.

@@ -50,6 +50,12 @@ pub(crate) struct StatusSnapshot {
     /// `Default` (an all-defaults snapshot reads as healthy). A COUNT only — never a token,
     /// path, or email (the #15 discipline).
     pub(crate) systemic_refresh: Option<u32>,
+    /// The daemon-level CANONICAL-SCRUB rollup (issue #516): `Some(Recovering | Exhausted)` while the
+    /// shared canonical item is scrubbed, else `None` when healthy. Computed in [`Daemon::snapshot`]
+    /// from the edge-latched scrub signals (`signaled_canonical_scrubbed` / `signaled_scrub_adopt_exhausted`);
+    /// [`status_response`] copies it straight onto the wire. `None` by `Default` (an all-defaults
+    /// snapshot reads as healthy). A STATE discriminant only — never a token or email (the #15 discipline).
+    pub(crate) canonical_scrub: Option<CanonicalScrub>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -102,6 +108,33 @@ pub(crate) struct BlindActive {
     /// exactly). `false` = OK: the account is blind, but not yet past the gate threshold, or the
     /// anchor sat below the risk band — auto-protection is nominally intact.
     pub(crate) auto_protection_degraded: bool,
+}
+
+/// The daemon-level CANONICAL-SCRUB rollup (issue #516, umbrella #463) — present only while the
+/// shared `Claude Code-credentials` canonical item is SCRUBBED (its refresh token cleared): the
+/// fleet-wide lockout NO per-account `credential_dead` fires for (the shared item is emptied while
+/// account rows can still read perfectly healthy). Surfaced so `status` + the menubar (issue #469)
+/// can render the scrubbed / un-recoverable state that no per-account `auth` rollup, and no #479
+/// `blind_active`, reflects — a signal only the DAEMON holds (it lives in the durable event log,
+/// #464/#467, never on the frozen wire until this field). Distinct from the ADR-0016
+/// `ActiveDeadNoTarget` case (which IS wire-derivable from `next_swap` + a dead active row).
+///
+/// Internally tagged on `state` (mirroring [`NextSwap`]), so a future per-variant field — e.g. the
+/// roster handle the `canonical_scrubbed` / `canonical_recovery_exhausted` events already carry — is
+/// an ADDITIVE change rather than a breaking `string → object` reshape. A fleet-wide STATE
+/// discriminant only: never per-account, never a token or email (issue #15).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub(crate) enum CanonicalScrub {
+    /// The canonical is scrubbed, but the daemon's autonomous adopt-recovery is still in progress
+    /// (issue #467): a viable spare's known-live token may yet be adopted into the emptied canonical,
+    /// healing the fleet with no operator action. The lower-severity, self-may-heal state.
+    Recovering,
+    /// The canonical is scrubbed AND recovery is EXHAUSTED (issue #467): the bounded adopt churn hit
+    /// its cap (or no viable adopt target exists), so the daemon has BACKED OFF and the canonical
+    /// stays empty until a `claude /login` re-authenticates it. The residual UN-RECOVERABLE state
+    /// #469 renders with that remedy. Ranks above [`Self::Recovering`] (most-severe wins).
+    Exhausted,
 }
 
 /// One account's latest reading.
@@ -180,8 +213,13 @@ pub(crate) struct SchemaVersion {
 /// per-account [`AccountStatusLine::blind_active`] bounded-blindness projection ([`BlindActive`],
 /// issue #479) — an optional field an older client tolerates by ignoring, and (via
 /// `skip_serializing_if`) omitted entirely except on a blind active account, so a non-blind frame's
-/// per-line bytes are unchanged.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 4 };
+/// per-line bytes are unchanged. `1.5` ADDED the daemon-level
+/// [`StatusResponse::canonical_scrub`] canonical-scrub rollup ([`CanonicalScrub`], issue #516) — a
+/// fleet-wide scrubbed / recovery-exhausted signal, likewise optional and (via `skip_serializing_if`)
+/// omitted entirely when healthy, so a non-scrub frame's bytes are unchanged. Like
+/// `systemic_refresh_failure` it is daemon-level, but it takes `blind_active`'s `skip_serializing_if`
+/// omit-when-healthy pattern rather than `systemic_refresh_failure`'s always-emitted `null`.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 5 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -216,6 +254,18 @@ pub(crate) struct StatusResponse {
     /// path, or email (issue #15).
     #[serde(default)]
     pub(crate) systemic_refresh_failure: Option<u32>,
+    /// The daemon-level CANONICAL-SCRUB rollup (issue #516): `Some(Recovering | Exhausted)` while the
+    /// shared canonical item is scrubbed (recovering vs recovery-exhausted / un-recoverable), else
+    /// absent when healthy. Lets `sessiometer status` + the menubar (#469) surface the fleet-wide
+    /// scrubbed lockout that no per-account `auth` rollup reflects — the daemon-LEVEL sibling of the
+    /// per-account `blind_active`. `Option` + `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump 1.4 → 1.5, mirroring
+    /// `blind_active`): a pre-#516 daemon omits the field → `None`, AND a HEALTHY snapshot omits it
+    /// entirely, so a non-scrub frame's bytes are byte-for-byte unchanged (a pre-#516 client ignores
+    /// the unknown key, the minor-bump tolerate-by-ignoring convention). A STATE discriminant only —
+    /// never a token or email (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) canonical_scrub: Option<CanonicalScrub>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -487,6 +537,9 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // The daemon-level systemic refresh-failure indicator (issue #378), copied straight to the
         // wire: `Some(n)` while the mechanism is down, `None` when healthy.
         systemic_refresh_failure: snapshot.systemic_refresh,
+        // The daemon-level canonical-scrub rollup (issue #516), copied straight to the wire:
+        // `Some(Recovering | Exhausted)` while the shared canonical is scrubbed, `None` when healthy.
+        canonical_scrub: snapshot.canonical_scrub,
     }
 }
 

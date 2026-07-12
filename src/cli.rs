@@ -4144,6 +4144,7 @@ spare  22222222-2222\n\
         spare.enabled = false;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4170,6 +4171,7 @@ spare  22222222-2222\n\
         // and distinct from the per-account `needs re-login`. #15-clean: a count only, no token/email.
         let response = |systemic| StatusResponse {
             systemic_refresh_failure: systemic,
+            canonical_scrub: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: None,
@@ -4220,6 +4222,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![degraded],
             next_swap: None,
@@ -4254,6 +4257,7 @@ spare  22222222-2222\n\
         let out = render_status(
             &StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
                 refresh_enabled: None,
                 accounts: vec![ok],
                 next_swap: None,
@@ -4271,6 +4275,7 @@ spare  22222222-2222\n\
         let normal = render_status(
             &StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, None, None)],
                 next_swap: None,
@@ -4292,6 +4297,7 @@ spare  22222222-2222\n\
         // uses) while the OK line stays PLAIN — an OK line is never emphasized even with color on.
         let blind = |degraded: bool| StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
@@ -4326,6 +4332,7 @@ spare  22222222-2222\n\
         spare.quarantined = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4362,6 +4369,7 @@ spare  22222222-2222\n\
         dead.quarantined = true; // quarantined but NOT recovering — still dead
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
             next_swap: None,
@@ -4461,6 +4469,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![healthy_but_spent, dead],
             next_swap: None,
@@ -4502,6 +4511,7 @@ spare  22222222-2222\n\
         // columns). Any glyph rollup materializes the column and its label.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 health: Some(CredentialHealth::Healthy),
@@ -4530,6 +4540,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 line("healthy", Healthy),
@@ -4596,6 +4607,7 @@ spare  22222222-2222\n\
         // expiry reads an honest `unknown`. The DEFAULT table stays compact — no raw clock.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 AccountStatusLine {
@@ -4654,6 +4666,7 @@ spare  22222222-2222\n\
         // `status --verbose` on an empty roster adds nothing.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![],
             next_swap: None,
@@ -4845,6 +4858,7 @@ spare  22222222-2222\n\
         work.active = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 work,
@@ -4885,6 +4899,7 @@ spare  22222222-2222\n\
         // these display labels.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -4938,6 +4953,7 @@ spare  22222222-2222\n\
         // only the weekly reset; now it shows the session reset too.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 // healthy: session 12m, weekly 5d — both appear.
@@ -5024,6 +5040,7 @@ spare  22222222-2222\n\
         quarantined.quarantined = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             next_swap: None,
@@ -5049,6 +5066,7 @@ spare  22222222-2222\n\
         // takes its label with it.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![{
                 let mut a = status_line_resets(
@@ -5136,6 +5154,7 @@ spare  22222222-2222\n\
         let footer = |next_swap| {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap,
@@ -5234,6 +5253,7 @@ spare  22222222-2222\n\
         // per-cell health coloring is #84, orthogonal; the footer stays uncolored.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
@@ -5270,6 +5290,7 @@ spare  22222222-2222\n\
         // interactive TTY).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5303,6 +5324,7 @@ spare  22222222-2222\n\
         for health in [Unknown, Stale, AtRisk, Degraded, Dead] {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
                 refresh_enabled: Some(false),
                 accounts: vec![
                     health_line("account-a", true, Healthy),
@@ -5324,6 +5346,7 @@ spare  22222222-2222\n\
         // non-active account — the maintenance mechanism is already on.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: Some(true),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5343,6 +5366,7 @@ spare  22222222-2222\n\
         // AC-2: refresh off, but every NON-ACTIVE account is 🟢 Healthy → nothing to advise.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5365,6 +5389,7 @@ spare  22222222-2222\n\
         // non-active accounts healthy does NOT arm the advisory.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Dead),
@@ -5387,6 +5412,7 @@ spare  22222222-2222\n\
         // ANSI overlay. Same response as AC-1, only the gate differs.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5412,6 +5438,7 @@ spare  22222222-2222\n\
         // it cannot know.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5434,6 +5461,7 @@ spare  22222222-2222\n\
         // (cli.rs:951-953), so the advisory can never reach a `--json | jq` consumer as data.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5458,6 +5486,7 @@ spare  22222222-2222\n\
         // next-swap candidate label, so a token / email can never reach the printed surface.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5770,6 +5799,7 @@ spare  22222222-2222\n\
         // a pipe / redirect / log never carries an escape (the gate's promise).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "hot",
@@ -5792,6 +5822,7 @@ spare  22222222-2222\n\
     fn color_on_tints_each_row_and_strips_back_to_the_exact_plain_table() {
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 // green: low utilization.
@@ -5852,6 +5883,7 @@ spare  22222222-2222\n\
         // per-cell color, not one row-wide tint.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -5889,6 +5921,7 @@ spare  22222222-2222\n\
         // utilization (both `%` here are a calm green).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -5932,6 +5965,7 @@ spare  22222222-2222\n\
         // while its colored siblings prove the overlay is active.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "half",
@@ -5967,6 +6001,7 @@ spare  22222222-2222\n\
         // misalign it — and keeps the `SESSION%` header (issue #99) over its data too.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6021,6 +6056,7 @@ spare  22222222-2222\n\
         // now-correct `display_width` (2 cells for the coalesced glyph), not char count.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6107,6 +6143,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![
                 line_for("ascii", Some(NOW + 4 * 3_600)),
@@ -6140,6 +6177,7 @@ spare  22222222-2222\n\
         // never an `@`-email or a token sigil.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6243,6 +6281,7 @@ spare  22222222-2222\n\
         // serializes this exact response verbatim, the same surface scripts consume.)
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6447,6 +6486,7 @@ spare  22222222-2222\n\
             generated_at: 1_782_777_600,
             status: StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: Some(NextSwap::Target {
@@ -6507,6 +6547,7 @@ spare  22222222-2222\n\
             generated_at,
             status: StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: None,
