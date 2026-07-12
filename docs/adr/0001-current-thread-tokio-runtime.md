@@ -48,8 +48,20 @@ work-stealing runtime.
      single-threaded interior mutability (`Rc<Cell<…>>`, `Rc<RefCell<…>>` in the
      `daemon` test module), which is `!Send`; a `Send` bound would force
      `Arc<Mutex<…>>` and cross-thread synchronization the real workload never needs.
-   - **Why rejected**: it buys parallelism the workload has none of, while taxing the
-     seam/test architecture that is this module's main quality lever.
+   - **Cons (soundness, not just ergonomics)**: the crate resolves the user's home and
+     login name through `getpwuid` (`src/paths.rs`) — a non-reentrant `libc` call that
+     returns a pointer into a process-wide **static buffer**. Its `// SAFETY:` argument
+     rests on this runtime being single-threaded, with `paths.rs` the crate's *only*
+     `getpw*` caller, so no concurrent `getpw*` can race that buffer. A work-stealing
+     runtime could poll that FFI from multiple worker threads, racing the shared buffer
+     into **undefined behavior** — a strictly graver failure than the `Send`-bound
+     friction above, and one the `Send` bound does **not** catch (the calls are
+     synchronous, so nothing is held across an `.await` for the bound to reject).
+     Multi-threading would first require moving these sites to the reentrant `getpwuid_r`.
+   - **Why rejected**: it buys parallelism the workload has none of, taxes the seam/test
+     architecture that is this module's main quality lever, and would void the
+     single-thread soundness invariant the `getpwuid` security FFI depends on
+     (`src/paths.rs`; the FFI itself is scoped in ADR-0004).
 2. **No async runtime (blocking, thread-per-concern)** — hand-manage threads for the
    timer, subprocess I/O, socket server, and signals.
    - **Pros**: no async machinery at all.
@@ -84,10 +96,19 @@ work-stealing runtime.
   (`SwapLock::acquire` in `src/swap.rs`; see ADR-0003).
 - A future that accidentally introduces heavy compute or a blocking syscall would
   degrade responsiveness and would need `spawn_blocking` or explicit yielding.
+- **The runtime is load-bearing for FFI soundness, not only test ergonomics.** The
+  `getpwuid` security FFI (`src/paths.rs`) is sound *because* the crate is
+  single-threaded (see its `// SAFETY:` blocks). A later "just switch to `multi_thread`
+  for throughput" is therefore not a drop-in change — it would need `getpwuid_r` first
+  (see Alternatives §1). Recorded here so the constraint is legible at the decision
+  level, not only at the call site.
 
 ## Related
 
 - ADR-0003 (no-torn-swap): the swap lock's cooperative async wait depends on this
   runtime choice.
+- ADR-0004 (incidental libc FFI kept raw): scopes the `getpwuid` / `getpeereid` /
+  `getuid` **security** FFI out as "deliberately raw"; their single-thread **soundness**
+  dependency is recorded here, with the per-site `// SAFETY:` detail in `src/paths.rs`.
 - Code: `src/main.rs` (`main`), `src/daemon.rs` (module docs, `Daemon`),
   `src/paths.rs`.
