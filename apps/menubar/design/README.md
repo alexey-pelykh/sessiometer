@@ -82,10 +82,12 @@ resting glyph (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at
 emphasis. What a single resting frame still can't show is the ARMED state — the hover/focus brighten to
 `.secondary`, the row wash, the `pointingHand` cursor — nor the in-flight `Switching…` spinner; those
 are interaction states, so they stay a manual operator check (#380) — as does the real-popover swap
-round-trip. **Note:** the committed `panel-healthy-*.png` are stale (pre-#448) — `--render-panel`
-currently crashes on `main` (missing `PanelStatsModel`, issue #504); regenerate them once #504 lands.
-#448 validated against the **mock** render (`all-states.png`, which does show the chip) + unit tests
-instead.
+round-trip. **Note:** the committed `panel-healthy-*.png` are stale (pre-#448). The `--render-panel`
+crash that blocked regeneration (a missing `PanelStatsModel` environment object) is FIXED as of #504,
+but regenerating the PNGs runs the built app's `ImageRenderer` path, which needs a GUI / windowserver
+session — so it is a **manual pre-release step** (run the command above on a workstation), not something
+headless CI can do. #448 validated against the **mock** render (`all-states.png`, which does show the
+chip) + unit tests instead.
 
 ### Design vs. capture, screen by screen
 

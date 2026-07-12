@@ -80,21 +80,29 @@ enum RenderPanelTool {
             for scheme in [ColorScheme.light, .dark] {
                 let theme = scheme == .light ? "light" : "dark"
                 let name = "panel-\(fixture.name)-\(theme).png"
-                // `StatusPanelView` reads an `AccountCaptureModel` from the environment (its top-level
-                // `captureSurfaceRequested` gate, #394, plus the empty-roster onboarding card's affordance,
-                // #360) and its swap affordance (#169) an `AccountSwapModel`; inject nil-client preview
-                // instances so every fixture resolves both instead of trapping on a missing environment
-                // object. The capture model renders at `.idle` with `captureSurfaceRequested == false`, so
-                // the populated fixtures show the roster with NO capture bar (capture is off-panel / empty-
-                // roster only now, #394) and the empty-roster fixture shows the onboarding card. A nil client
-                // renders the idle field/button and never touches a socket — the label field itself stays a
-                // known ImageRenderer blank (see design/README.md). The swap model renders at `.idle`, so the
-                // fixtures capture the RESTING row (no hover, no pending) — the hover-revealed switch glyph is
-                // not reachable from `ImageRenderer` and stays a manual-check surface (#380).
+                // Inject the COMPLETE panel environment via the shared `statusPanelEnvironment` modifier — the
+                // SAME wiring `StatusItemController` uses for the live app, so the harness and the app cannot
+                // drift and every `@EnvironmentObject` the panel reads is resolved instead of trapping (issue
+                // #504: missing `PanelStatsModel` here was exactly that drift). All three take a NIL client, so
+                // each renders its resting, socket-free surface:
+                //   • `AccountCaptureModel` renders at `.idle` with `captureSurfaceRequested == false`, so the
+                //     populated fixtures show the roster with NO capture bar (capture is off-panel / empty-
+                //     roster only now, #394) and the empty-roster fixture shows the onboarding card. The nil
+                //     client renders the idle field/button and never touches a socket — the label field itself
+                //     stays a known ImageRenderer blank (see design/README.md).
+                //   • `AccountSwapModel` renders at `.idle`, so the fixtures capture the RESTING row (no hover,
+                //     no pending). As of #448 the per-row switch chip is PERSISTENT, so its resting glyph
+                //     (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) IS captured in a static
+                //     render; only the ARMED hover/focus brighten and the in-flight `Switching…` spinner stay a
+                //     manual-check surface (#380).
+                //   • `PanelStatsModel` (#446) renders at its default `.status` tab / `.idle` phase, so every
+                //     fixture shows the Status glance (never a not-yet-loaded Stats tab) and the nil client
+                //     never fires a socket-bound `stats` query.
                 let view = StatusPanelView()
-                    .environmentObject(store)
-                    .environmentObject(AccountCaptureModel(client: nil))
-                    .environmentObject(AccountSwapModel(client: nil))
+                    .statusPanelEnvironment(store: store,
+                                            capture: AccountCaptureModel(client: nil),
+                                            swap: AccountSwapModel(client: nil),
+                                            stats: PanelStatsModel(client: nil))
                     .environment(\.colorScheme, scheme)
                 let renderer = ImageRenderer(content: view)
                 renderer.scale = 2
