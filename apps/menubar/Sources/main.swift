@@ -78,9 +78,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             swapClient = nil
         }
 
+        // The Stats-tab read path (issue #446): the SAME short-lived control-command transport, for the
+        // one-shot `stats` query (#356) the panel runs when the operator opens the Stats tab. A bounded READ
+        // answered off the daemon's run loop (no lock, unlike `swap`), so a modest 5 s budget clears a slower
+        // store aggregation without the swap path's 15 s lock headroom. A resolve failure degrades to a nil
+        // client → the tab shows an honest "unavailable" (and the watch transport ALSO fails, so the panel is
+        // disconnected and never offers the seg anyway).
+        let statsClient: ControlCommandClient?
+        switch ControlCommandClient.production(timeout: .seconds(5)) {
+        case .success(let client):
+            statsClient = client
+        case .failure(let error):
+            appLog.error("stats client unavailable: \(String(describing: error), privacy: .public)")
+            statsClient = nil
+        }
+
         let controller = StatusItemController(store: store,
                                               captureClient: captureClient,
-                                              swapClient: swapClient)
+                                              swapClient: swapClient,
+                                              statsClient: statsClient)
         controller.start()
         statusItemController = controller
 

@@ -439,3 +439,183 @@ private struct HeartbeatFrame: Decodable {
             ?? .preFreeze
     }
 }
+
+// MARK: - Stats wire (issue #356 socket verb / #446 Stats-tab decoder)
+
+// The daemon `stats` socket reply (`{"cmd":"stats","period":…}` → one `StatsWire` line, issue #356) —
+// the bounded per-account daily usage series the panel Stats tab reads (#446). Hand-mirrors the Rust
+// `StatsWire` serializer (`src/stats.rs` `stats_wire` / `StatsWire` … `SwapsWire` / `Band` / `CoverageClass`),
+// which is the SAME document `sessiometer stats --json` emits — R-2 parity is STRUCTURAL (one Rust builder,
+// `stats_wire`), not re-derived here. Decoded field-by-field like the `watch` mirror above; byte-frozen by
+// `Fixtures.statsBasic` + the cross-language golden guard (`WireGoldenTests`, #340).
+//
+// Unlike the `watch` frames this carries NO `type` tag — it is a request→response body decoded directly
+// (an `{"error":…}` envelope on an invalid period is detected first, see `decodeStatsReply`). `#159`/`#160`
+// extend the contract ADDITIVELY without bumping `schema`, so absent keys are tolerated: `orphans`
+// (`skip_serializing_if` when empty) and `period` / `since` (`Option::is_none`) each decode to a default.
+//
+// Source of truth (mirror, do not re-derive): `src/stats.rs` — `StatsWire`, `WindowWire`, `BucketWire`,
+// `PeriodWire`, `AccountWire`, `DimWire`, `RosterWire`, `SwapsWire`, `Band`, `CoverageClass`.
+
+/// The top-level `stats` reply document (`src/stats.rs` `StatsWire`).
+struct StatsWire: Decodable, Equatable {
+    let schema: UInt32
+    let window: StatsWindow
+    /// The applied account filter (redacted handles); empty means "all" — the socket verb never filters.
+    let accounts: [String]
+    /// The per-bucket series — the Stats-tab sparkline source (one `session.peak` per bucket, #446).
+    let series: [StatsBucket]
+    /// The whole-window aggregate — the Stats row's numeric body + the aggregate callout.
+    let summary: StatsPeriodBody
+    /// Non-roster ("orphan") handles (issue #314), keyed like `summary.accounts` but OMITTED when none
+    /// (Rust `skip_serializing_if`), so an absent key decodes to empty — never plotted (summary-window only).
+    let orphans: [String: StatsAccountStats]
+
+    private enum CodingKeys: String, CodingKey {
+        case schema, window, accounts, series, summary, orphans
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try c.decode(UInt32.self, forKey: .schema)
+        window = try c.decode(StatsWindow.self, forKey: .window)
+        accounts = try c.decodeIfPresent([String].self, forKey: .accounts) ?? []
+        series = try c.decode([StatsBucket].self, forKey: .series)
+        summary = try c.decode(StatsPeriodBody.self, forKey: .summary)
+        orphans = try c.decodeIfPresent([String: StatsAccountStats].self, forKey: .orphans) ?? [:]
+    }
+}
+
+/// The resolved reporting window (`src/stats.rs` `WindowWire`): `[start, end)` epoch seconds, the human
+/// echo, and how it was selected — a preset `period` (the socket path always sets this) OR a raw `since`.
+/// Both selectors are optional (Rust `skip_serializing_if = Option::is_none`); the synthesized `Decodable`
+/// decodes each with `decodeIfPresent`, so an absent OR null key is tolerated.
+struct StatsWindow: Decodable, Equatable {
+    let start: Int64
+    let end: Int64
+    let label: String
+    let period: String?
+    let since: String?
+}
+
+/// One series bucket (`src/stats.rs` `BucketWire`): its `[start, end)` plus the same per-account + roster
+/// body as the summary. The `session.peak` of each account across the buckets IS the sparkline series.
+struct StatsBucket: Decodable, Equatable {
+    let start: Int64
+    let end: Int64
+    let roster: StatsRoster
+    let accounts: [String: StatsAccountStats]
+}
+
+/// The per-account + roster body shared by the summary and each series bucket (`src/stats.rs` `PeriodWire`).
+struct StatsPeriodBody: Decodable, Equatable {
+    let roster: StatsRoster
+    let accounts: [String: StatsAccountStats]
+}
+
+/// One account's window aggregate (`src/stats.rs` `AccountWire`). `session` / `weekly` are FRACTIONS
+/// (0…1, over the quota cap) — the panel renders them as percents; `band` is the neutral session-peak
+/// descriptor the Stats-tab signal pill collapses (`StatusPanelFormat.statsSignal`).
+struct StatsAccountStats: Decodable, Equatable {
+    let seen: UInt32
+    let coverage: Double
+    let coverageClass: StatsCoverageClass
+    let session: StatsDim
+    let weekly: StatsDim
+    let capHits: UInt32
+    let timeAtCapSecs: Int64
+    let contributionShare: Double
+    let band: StatsBand
+
+    private enum CodingKeys: String, CodingKey {
+        case seen, coverage
+        case coverageClass = "coverage_class"
+        case session, weekly
+        case capHits = "cap_hits"
+        case timeAtCapSecs = "time_at_cap_secs"
+        case contributionShare = "contribution_share"
+        case band
+    }
+}
+
+/// One quota dimension's mean / peak / p95 (`src/stats.rs` `DimWire`) — each a fraction (0…1) of the cap.
+struct StatsDim: Decodable, Equatable {
+    let mean: Double
+    let peak: Double
+    let p95: Double
+}
+
+/// Roster-wide statistics for a window (`src/stats.rs` `RosterWire`): swap frequency and the
+/// all-accounts-high water — the source of the Stats tab's aggregate callout.
+struct StatsRoster: Decodable, Equatable {
+    let swapCount: UInt32
+    let swaps: StatsSwaps
+    let allHighEpisodes: UInt32
+    let allHighSecs: Int64
+
+    private enum CodingKeys: String, CodingKey {
+        case swapCount = "swap_count"
+        case swaps
+        case allHighEpisodes = "all_high_episodes"
+        case allHighSecs = "all_high_secs"
+    }
+}
+
+/// The swap-count breakdown by trigger (`src/stats.rs` `SwapsWire`).
+struct StatsSwaps: Decodable, Equatable {
+    let session: UInt32
+    let weekly: UInt32
+    let manual: UInt32
+    let forced: UInt32
+    let emergency: UInt32
+}
+
+/// A neutral utilisation band from the session peak (`src/stats.rs` `Band`, snake_case wire). A DESCRIPTOR,
+/// not a signal — it classifies the level, never recommends. An UNKNOWN value is a hard decode error,
+/// mirroring serde's rejection of an unknown unit-enum variant (a drifted daemon degrades loudly).
+enum StatsBand: String, Decodable, Equatable {
+    case idle
+    case low
+    case moderate
+    case high
+    case atCap = "at_cap"
+}
+
+/// A neutral data-completeness descriptor (`src/stats.rs` `CoverageClass`, snake_case wire). UNKNOWN →
+/// decode error, exactly like `StatsBand`.
+enum StatsCoverageClass: String, Decodable, Equatable {
+    case complete
+    case partial
+    case absent
+}
+
+/// The two shapes a `stats` reply can take: the full `StatsWire` document, or a redacted `{"error":…}`
+/// envelope (an invalid `--period` — never on the panel's always-`week` path, but surfaced honestly rather
+/// than mis-decoded). `Equatable` so the model's phase can compare.
+enum StatsReply: Equatable {
+    case ok(StatsWire)
+    case error(String)
+}
+
+/// The `error`-key probe: the daemon writes ONLY `{"error":…}` on the stats error path, so an object
+/// carrying that key is the error envelope; any other object is the full document. `error` is optional, so
+/// a valid `StatsWire` (no top-level `error` key) probes to `nil` and falls through to the full decode.
+private struct StatsErrorProbe: Decodable {
+    let error: String?
+}
+
+/// Decode one `stats` reply line into `.ok(StatsWire)` or `.error(reason)` — the probe-then-decode shape
+/// `parseWatchFrame` uses. Probes the `error` key FIRST (the sole key on the daemon's error path), then
+/// decodes the full document. THROWS on a non-JSON line or a well-formed-but-off-contract document (a
+/// missing required field, an unknown `band` / `coverage_class`) — a drifted daemon degrades loudly, exactly
+/// like the `watch` decoder. Pure: no I/O, no clock.
+func decodeStatsReply(_ line: String) throws -> StatsReply {
+    let data = Data(line.utf8)
+    let decoder = JSONDecoder()
+    // A valid error envelope carries a STRING `error`; anything else (a full document, or an object with a
+    // non-string/absent `error`) falls through to the full decode.
+    if let reason = (try? decoder.decode(StatsErrorProbe.self, from: data))?.error {
+        return .error(reason)
+    }
+    return .ok(try decoder.decode(StatsWire.self, from: data))
+}

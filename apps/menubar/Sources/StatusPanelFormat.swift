@@ -857,4 +857,227 @@ enum StatusPanelFormat {
         }
         return phrase
     }
+
+    // MARK: - Stats tab (issue #446 — the mock's `.stats` view, fed by the #356 socket `stats` verb)
+    //
+    // Pure presentation over the decoded `StatsWire` (WireModel.swift), mirroring the design mock
+    // (`apps/menubar/design/menubar-preview.html` `.stats`) — so the SwiftUI `StatsView` stays a thin
+    // consumer and every number is unit-asserted against the oracle (the panel cannot be screenshot-verified
+    // in CI, exactly like the #388 chrome tokens above; the `StatusPanelFormatTests` assertion is the gate).
+
+    /// The Stats-tab header phrase for the resolved window — mock `.app-sub` "Usage stats · last 7 days" for
+    /// the panel's default `week` window. Derived from the wire's OWN window (not hardcoded), so a different
+    /// period reads honestly and the header never fabricates a phrase it did not query.
+    static func statsHeaderSubtitle(_ window: StatsWindow) -> String {
+        "Usage stats · \(statsWindowPhrase(window))"
+    }
+
+    /// The Stats-tab header shown BEFORE the wire's own window arrives (loading / failed / idle): the phrase
+    /// for the panel's fixed `week` query (`StatsCommand.period`). A `week`-window `statsHeaderSubtitle`
+    /// renders the identical string — `StatsTests.testDefaultHeaderSubtitleMatchesTheWeekWindowHeader` locks
+    /// the two together so this pre-load constant can never drift from the loaded-window header.
+    static let statsDefaultHeaderSubtitle = "Usage stats · last 7 days"
+
+    /// The compact window phrase for the Stats header / aggregate callout. The preset periods read as the
+    /// mock's spelled-out spans; a `--since` window falls back to its raw offset, and anything else to the
+    /// wire's own human echo — never an invented span.
+    static func statsWindowPhrase(_ window: StatsWindow) -> String {
+        switch window.period {
+        case "day": return "last 24h"
+        case "week": return "last 7 days"
+        case "month": return "last 30 days"
+        case "lifetime": return "all time"
+        default:
+            if let since = window.since { return "since \(since)" }
+            return window.label
+        }
+    }
+
+    /// A quota fraction (0…1, the `StatsDim` wire scale) as a whole percent — the stats analogue of the CLI's
+    /// `pct` (`src/stats.rs`), which rounds `fraction × 100`. Clamped at the floor so a tiny negative never
+    /// prints; NOT clamped at the top (an over-cap peak legitimately reads > 100%).
+    static func statsPercent(_ fraction: Double) -> Int {
+        Int((max(0, fraction) * 100).rounded())
+    }
+
+    /// The Stats row's "Session m/pk" cell — mean then peak, mock `.sc-val` "42 / 100%" (the mean bare, the
+    /// peak carrying the single trailing `%`).
+    static func statsSessionMeanPeak(_ account: StatsAccountStats) -> String {
+        "\(statsPercent(account.session.mean)) / \(statsPercent(account.session.peak))%"
+    }
+
+    /// The Stats row's "Weekly pk" cell — the weekly peak percent, mock `.sc-val` "88%".
+    static func statsWeeklyPeak(_ account: StatsAccountStats) -> String {
+        "\(statsPercent(account.weekly.peak))%"
+    }
+
+    /// The honest one-line message the Stats tab shows when the query did not yield a series — never a blank
+    /// tab, never a fabricated number (the crown-jewel honesty rule, applied to the read-only Stats surface).
+    static func statsFailureText(_ failure: StatsFailure) -> String {
+        switch failure {
+        case .unavailable:
+            return "Usage stats unavailable — the daemon socket didn't resolve."
+        case .transport:
+            return "Couldn't reach the daemon for usage stats."
+        case .daemonError(let reason):
+            return "Usage stats error: \(reason)."
+        case .undecodable:
+            return "Usage stats came back in an unreadable form."
+        }
+    }
+
+    /// The neutral three-way utilisation signal the mock's `.signal` pill shows, collapsed from the wire's
+    /// finer `band` EXACTLY as the CLI does (`src/stats.rs` `SignalBand::of`): idle/low → underused,
+    /// moderate → balanced, high/at-cap → saturated. A DESCRIPTOR (equal-weight departures from the balanced
+    /// middle), never a recommendation — the Stats tab is read-only.
+    enum StatSignal: Equatable {
+        case underused
+        case balanced
+        case saturated
+
+        /// The provisional descriptor word (mock `.signal` label; final copy pending #160's framing review).
+        var label: String {
+            switch self {
+            case .underused: return "underused"
+            case .balanced: return "balanced"
+            case .saturated: return "saturated"
+            }
+        }
+    }
+
+    /// Collapse a wire `band` into the mock's three-way signal (see `StatSignal`).
+    static func statsSignal(_ band: StatsBand) -> StatSignal {
+        switch band {
+        case .idle, .low: return .underused
+        case .moderate: return .balanced
+        case .high, .atCap: return .saturated
+        }
+    }
+
+    /// The aggregate callout under the Stats rows — mock `.agg` "All accounts ≥90% at once — 3 episodes
+    /// (1h40m) · swaps 28 · last 7 days", built from the summary `roster` (`StatsRoster`) + the window phrase.
+    /// Facts only (magnitudes + the neutral span), never a recommendation.
+    static func statsAggregateText(roster: StatsRoster, window: StatsWindow) -> String {
+        let episodes = roster.allHighEpisodes
+        let epWord = episodes == 1 ? "episode" : "episodes"
+        return "All accounts ≥90% at once — \(episodes) \(epWord) (\(statsDuration(roster.allHighSecs)))"
+            + " · swaps \(roster.swapCount) · \(statsWindowPhrase(window))"
+    }
+
+    /// A whole-second span as the compact coarse duration the aggregate callout uses — the two-largest-unit
+    /// form mirroring the CLI's `fmt_dur` (`src/stats.rs`): `1h40m` / `1h` / `40m` / `30s`; a non-positive
+    /// span is `0s`. Distinct from `humanizeUntil` (the reset-in cell, which reads `now` / `<1m`).
+    static func statsDuration(_ secs: Int64) -> String {
+        if secs <= 0 { return "0s" }
+        let hour: Int64 = 3600
+        let hours = secs / hour
+        let mins = (secs % hour) / 60
+        let s = secs % 60
+        if hours > 0 {
+            return mins > 0 ? "\(hours)h\(mins)m" : "\(hours)h"
+        } else if mins > 0 {
+            return "\(mins)m"
+        } else {
+            return "\(s)s"
+        }
+    }
+
+    // MARK: - Stats sparkline geometry (issue #446 — R-2 parity with the CLI trend sparkline)
+
+    /// One sparkline vertex in the SVG-style box, as raw `Double`s (Foundation-only, so it stays in the
+    /// logic-test bundle and is component-wise `Equatable`-testable). The view maps these to `CGPoint`s.
+    struct SparkPoint: Equatable {
+        let x: Double
+        let y: Double
+    }
+
+    /// The per-bucket session-peak series for `handle`, in bucket order — the CLI trend sparkline's pick
+    /// (`src/stats.rs`: "the per-bucket session peak — the sparkline 'how hot did it get' pick"). A bucket
+    /// with no reading for the handle plots at the floor (`0`), honestly — the aggregator never invents a
+    /// reading, and neither does this: an unmeasured bucket is a real low, not a gap the sparkline hides.
+    static func sparkSeries(_ series: [StatsBucket], handle: String) -> [Double] {
+        series.map { $0.accounts[handle]?.session.peak ?? 0 }
+    }
+
+    /// Map a value series to sparkline vertices in a `width` × `height` box, on the FIXED [0, 1] (0–100% of
+    /// the quota cap) scale — R-2 parity with the CLI sparkline (`src/stats.rs` `ramp_level`, which clamps to
+    /// `[0, 1]`), NOT auto-normalised per account: a value of `1.0` reaches the top, `0.0` the floor, an
+    /// over-cap reading clamps to the top. `inset` keeps the stroke off the edges; with the mock's box
+    /// (96 × 28, inset 3) this reproduces the mock's `.spark` path vertices exactly. `x` is evenly spaced
+    /// across the plot; a single-point series centres. An empty series yields no points.
+    static func sparkPoints(
+        _ values: [Double],
+        width: Double,
+        height: Double,
+        inset: Double
+    ) -> [SparkPoint] {
+        guard !values.isEmpty else { return [] }
+        let left = inset, right = width - inset
+        let top = inset, bottom = height - inset
+        let n = values.count
+        return values.enumerated().map { index, value in
+            let x = n == 1 ? (left + right) / 2 : left + Double(index) / Double(n - 1) * (right - left)
+            let clamped = min(1, max(0, value))
+            let y = bottom - clamped * (bottom - top)
+            return SparkPoint(x: x, y: y)
+        }
+    }
+
+    /// The Stats rows, ORDERED to match the Status roster (so the two tabs list accounts identically), with
+    /// any stats-only handle (present in the window but not the live roster — normally none, the daemon splits
+    /// orphans out) appended alphabetically. Pure over the two key sets, so the view's roster join is testable
+    /// without SwiftUI. Handles NOT in `summaryHandles` (a roster account with no reading this window) are
+    /// omitted — the Stats view shows what was MEASURED, matching the CLI summary.
+    static func orderedStatHandles(summaryHandles: Set<String>, rosterOrder: [String]) -> [String] {
+        var out: [String] = []
+        var placed: Set<String> = []
+        for label in rosterOrder where summaryHandles.contains(label) {
+            out.append(label)
+            placed.insert(label)
+        }
+        for handle in summaryHandles.sorted() where !placed.contains(handle) {
+            out.append(handle)
+        }
+        return out
+    }
+
+    // MARK: - Stats color tokens (issue #446 — mock `--spark` + `--sig-*`, theme-aware, unit-testable)
+
+    /// The sparkline stroke / area / end-dot color — mock `--spark` (`rgba(60,60,67,.55)` light /
+    /// `rgba(235,235,245,.5)` dark), the secondary-label neutral graphic tint. Carried as an exact `FillRGBA`
+    /// (like the #388 neutral fills) so it is unit-assertable in the asset-catalog-free logic bundle; the view
+    /// renders the line/dot at this alpha and the area at a fraction of it (mock `.sp-area { fill-opacity:.2 }`).
+    /// Its OWN label-family base (60,60,67)/(235,235,245) — distinct from the (120,120,128)/white chrome-fill
+    /// family (`neutralFill`) — so it is a separate token, not a `NeutralFillRole` case.
+    static func sparkColor(dark: Bool) -> FillRGBA {
+        dark
+            ? FillRGBA(red: 235.0 / 255, green: 235.0 / 255, blue: 245.0 / 255, alpha: 0.5)
+            : FillRGBA(red: 60.0 / 255, green: 60.0 / 255, blue: 67.0 / 255, alpha: 0.55)
+    }
+
+    /// The signal pill's background FILL — mock `--sig-under-bg` / `--sig-bal-bg` / `--sig-sat-bg`, per theme.
+    static func statsSignalFill(_ signal: StatSignal, dark: Bool) -> FillRGBA {
+        switch (signal, dark) {
+        case (.underused, false): return FillRGBA(red: 0, green: 122.0 / 255, blue: 255.0 / 255, alpha: 0.12)
+        case (.underused, true): return FillRGBA(red: 64.0 / 255, green: 140.0 / 255, blue: 230.0 / 255, alpha: 0.20)
+        case (.balanced, false): return FillRGBA(red: 30.0 / 255, green: 150.0 / 255, blue: 105.0 / 255, alpha: 0.13)
+        case (.balanced, true): return FillRGBA(red: 50.0 / 255, green: 180.0 / 255, blue: 130.0 / 255, alpha: 0.18)
+        case (.saturated, false): return FillRGBA(red: 178.0 / 255, green: 120.0 / 255, blue: 20.0 / 255, alpha: 0.15)
+        case (.saturated, true): return FillRGBA(red: 210.0 / 255, green: 160.0 / 255, blue: 80.0 / 255, alpha: 0.20)
+        }
+    }
+
+    /// The signal pill's foreground (label + dot) color — mock `--sig-under-fg` / `--sig-bal-fg` /
+    /// `--sig-sat-fg`, per theme. Opaque (alpha 1); it carries text, so — unlike the decorative bg fill — it
+    /// is the readable channel.
+    static func statsSignalText(_ signal: StatSignal, dark: Bool) -> FillRGBA {
+        switch (signal, dark) {
+        case (.underused, false): return FillRGBA(red: 38.0 / 255, green: 104.0 / 255, blue: 189.0 / 255, alpha: 1)
+        case (.underused, true): return FillRGBA(red: 130.0 / 255, green: 179.0 / 255, blue: 237.0 / 255, alpha: 1)
+        case (.balanced, false): return FillRGBA(red: 28.0 / 255, green: 138.0 / 255, blue: 95.0 / 255, alpha: 1)
+        case (.balanced, true): return FillRGBA(red: 96.0 / 255, green: 207.0 / 255, blue: 161.0 / 255, alpha: 1)
+        case (.saturated, false): return FillRGBA(red: 150.0 / 255, green: 102.0 / 255, blue: 17.0 / 255, alpha: 1)
+        case (.saturated, true): return FillRGBA(red: 224.0 / 255, green: 178.0 / 255, blue: 104.0 / 255, alpha: 1)
+        }
+    }
 }

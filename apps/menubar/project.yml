@@ -72,6 +72,12 @@ targets:
       # connector. No socket, no live daemon, and so never a real credential swap in a test run. `SwapAck`
       # is already compiled above as the decoder this model routes on.
       - path: Sources/AccountSwapModel.swift
+      # Stats tab (#446): the AppKit-free Stats-tab model (idle → loading → loaded → failed) + its
+      # `StatsCommand` / `StatsFailure`, over the SAME WatchConnection seam, so the one-shot `stats` query's
+      # phase machine — including the "keep prior series while refetching" gate and the decode/error/transport
+      # branches — is driven hermetically by the in-process fake connector. No socket, no live daemon. The
+      # `StatsWire` decoder it routes on is already compiled via WireModel.swift above.
+      - path: Sources/PanelStatsModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT

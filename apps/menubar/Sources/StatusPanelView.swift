@@ -61,6 +61,27 @@ fileprivate extension Color {
     static func accentEmphasis(_ emphasis: StatusPanelFormat.AccentEmphasis, dark: Bool) -> Color {
         Color.accentColor.opacity(StatusPanelFormat.accentOpacity(emphasis, dark: dark))
     }
+
+    /// The Stats sparkline stroke / area / dot color (#446) — mock `--spark`, from the testable
+    /// `StatusPanelFormat.sparkColor` spec (a plain sRGB translucent color, like `panelFill`). The area is
+    /// this at a fraction of the alpha (drawn by the view: mock `.sp-area { fill-opacity:.2 }`).
+    static func spark(dark: Bool) -> Color {
+        let c = StatusPanelFormat.sparkColor(dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The Stats signal pill's background fill (#446) — mock `--sig-*-bg`, from `StatusPanelFormat.statsSignalFill`.
+    static func statsSignalFill(_ signal: StatusPanelFormat.StatSignal, dark: Bool) -> Color {
+        let c = StatusPanelFormat.statsSignalFill(signal, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The Stats signal pill's foreground (label + dot) color (#446) — mock `--sig-*-fg`, from
+    /// `StatusPanelFormat.statsSignalText`.
+    static func statsSignalText(_ signal: StatusPanelFormat.StatSignal, dark: Bool) -> Color {
+        let c = StatusPanelFormat.statsSignalText(signal, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
 }
 
 /// The panel's fixed layout constants — thin references to the source-of-truth in `StatusPanelFormat`
@@ -88,6 +109,10 @@ struct StatusPanelView: View {
     /// the capture surface over whatever state it is in, reusing the panel's own key/first-responder
     /// plumbing. (`CaptureAffordance` reads the same model as its own `@EnvironmentObject`.)
     @EnvironmentObject private var capture: AccountCaptureModel
+    /// The Stats-tab model (issue #446): the panel's Status|Stats tab selection + the one-shot `stats`
+    /// query's phase. Observed here to render the seg control's on-state and to switch the body to the
+    /// Stats view. (`StatsView` and `PanelHeader`'s seg read the same model.)
+    @EnvironmentObject private var stats: PanelStatsModel
 
     /// How often the resting panel re-derives clock-relative text (reset-in). A minute is finer than
     /// the reset-in's own minute granularity, so the displayed value never visibly lags the clock.
@@ -120,18 +145,38 @@ struct StatusPanelView: View {
         } ?? false
         let state = store.connectionState
         let activeLabel = store.rows.first(where: \.isActive)?.label
-        let subtitle = StatusPanelFormat.headerSubtitle(state: state,
+
+        // The Status|Stats switcher (issue #446) is offered ONLY where the Stats tab can deliver: a live
+        // roster (`.connected` / `.stale`) and NOT while the #394 capture surface is up. In every degraded
+        // state the header carries just the honest identity — a Stats affordance that can only fail is not
+        // an honest affordance (matches the mock, which shows the seg only in the healthy Status/Stats states).
+        let showsSwitcher = (state == .connected || state == .stale) && !capture.captureSurfaceRequested
+        let onStatsTab = showsSwitcher && stats.tab == .stats
+
+        // The Stats tab replaces the honest-state sub-line with the mock's "Usage stats · last 7 days" (from
+        // the loaded window when present, else the default phrase for the always-`week` query). Derived in a
+        // closure — a single `let` binding the enclosing `@ViewBuilder` skips as a declaration, where a bare
+        // `if/else` assignment would instead be read as a (non-`View`) conditional branch.
+        let subtitle: String = {
+            if onStatsTab, let window = stats.phase.wire?.window {
+                return StatusPanelFormat.statsHeaderSubtitle(window)
+            } else if onStatsTab {
+                return StatusPanelFormat.statsDefaultHeaderSubtitle
+            } else {
+                return StatusPanelFormat.headerSubtitle(state: state,
                                                         accountCount: store.rows.count,
                                                         activeLabel: activeLabel,
                                                         ageStale: ageStale)
+            }
+        }()
 
         // The design reference's chrome (`apps/menubar/design/menubar-preview.html`): an app-identity
-        // header, a hairline divider, the state's body, and a snapshot-age footer. Sections own their
-        // insets (no uniform padding) so the header/roster/callout/footer spacing matches the reference.
-        // Honest-state is carried by the header sub-line (never a false "active" on a degraded daemon)
-        // plus, on a dropped connection, an explicit strip over a dimmed last-known roster.
+        // header (with the Status|Stats seg when offered), a hairline divider, the state's body, and a
+        // snapshot-age footer. Sections own their insets (no uniform padding) so the spacing matches the
+        // reference. Honest-state is carried by the header sub-line (never a false "active" on a degraded
+        // daemon) plus, on a dropped connection, an explicit strip over a dimmed last-known roster.
         VStack(alignment: .leading, spacing: 0) {
-            PanelHeader(subtitle: subtitle)
+            PanelHeader(subtitle: subtitle, showsSwitcher: showsSwitcher)
 
             if capture.captureSurfaceRequested {
                 // The status-item "Add account…" capture surface (issue #394) — a focused capture card
@@ -142,6 +187,12 @@ struct StatusPanelView: View {
                 Divider().padding(.horizontal, 14)
                 CaptureCard(title: "Add account")
                     .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+            } else if onStatsTab {
+                // The Stats tab (issue #446): the mock's per-account 7-day sparklines + numeric body,
+                // aggregate callout, and signal legend — fed by the socket `stats` verb (never a store read).
+                // A separate view from the Status body; the footer's `next_swap` line stays the Status tab's.
+                Divider().padding(.horizontal, 14)
+                StatsView()
             } else {
                 stateBody(state: state, now: now, ageText: ageText, ageStale: ageStale)
             }
@@ -739,34 +790,108 @@ private struct UsageBar: View {
 /// Provider-neutral (issue #15): a generic gauge, no brand mark or color.
 private struct PanelHeader: View {
     let subtitle: String
+    /// Whether to show the Status|Stats seg control (issue #446). Only where the Stats tab can deliver (a
+    /// live roster, not the capture surface; gated in `content`). Defaults off, so every degraded-state
+    /// header is byte-unchanged from before #446.
+    var showsSwitcher: Bool = false
+    @EnvironmentObject private var stats: PanelStatsModel
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 7)
-                // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
-                .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
-                .frame(width: 27, height: 27)
-                .overlay(
-                    Image(systemName: "gauge.medium")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
-                )
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Sessiometer")
-                    .font(.system(size: 13.5, weight: .semibold))
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+            // The identity block (glyph + name + sub-line) combines into ONE accessibility element; the seg
+            // control keeps its own button traits alongside it, so VoiceOver reads "Sessiometer, …" then the
+            // two tab buttons rather than one merged blob.
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 7)
+                    // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
+                    .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
+                    .frame(width: 27, height: 27)
+                    .overlay(
+                        Image(systemName: "gauge.medium")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                    )
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Sessiometer")
+                        .font(.system(size: 13.5, weight: .semibold))
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Sessiometer. \(subtitle)")
+
             Spacer(minLength: 0)
+
+            if showsSwitcher {
+                // Mock `.seg` — right-aligned Status|Stats switcher (issue #446). Drives the stats model's
+                // tab selection; switching TO Stats triggers the one-shot socket query.
+                PanelTabSwitcher(tab: stats.tab) { stats.select($0) }
+            }
         }
         .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 11)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Sessiometer. \(subtitle)")
+    }
+}
+
+/// The mock's `.seg` Status|Stats control (issue #446): a rounded two-button switcher, right-aligned in the
+/// header. The active tab carries the raised `--seg-on` chip; the inactive is a quiet transparent button.
+/// Provider-neutral, read-only chrome — selecting Stats only QUERIES (UI never acts). The seg colors are the
+/// mock's exact `--seg-*` chrome values inline (decorative control chrome, not a data-bearing tint — the
+/// data colors, `--spark` / `--sig-*`, live in the testable `StatusPanelFormat` layer).
+private struct PanelTabSwitcher: View {
+    let tab: PanelStatsModel.Tab
+    let select: (PanelStatsModel.Tab) -> Void
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(spacing: 2) {
+            segButton("Status", target: .status)
+            segButton("Stats", target: .stats)
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(segBackground)
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(segBorder, lineWidth: 0.5))
+        )
+    }
+
+    private func segButton(_ title: String, target: PanelStatsModel.Tab) -> some View {
+        let on = tab == target
+        return Button { select(target) } label: {
+            Text(title)
+                .font(.system(size: 11, weight: on ? .semibold : .medium))
+                .foregroundStyle(on ? Color.primary : Color.secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 2.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(on ? segOnFill : Color.clear)
+                        .shadow(color: on ? Color.black.opacity(0.18) : .clear, radius: 0.75, y: 0.5)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(on ? [.isButton, .isSelected] : .isButton)
+    }
+
+    // Mock `--seg-bg` / `--seg-border` / `--seg-on` (light / dark), inline as exact sRGB chrome values.
+    private var dark: Bool { colorScheme == .dark }
+    private var segBackground: Color {
+        dark ? Color(.sRGB, white: 1, opacity: 0.08)
+             : Color(.sRGB, red: 120.0 / 255, green: 120.0 / 255, blue: 128.0 / 255, opacity: 0.12)
+    }
+    private var segBorder: Color {
+        dark ? Color(.sRGB, white: 1, opacity: 0.06) : Color(.sRGB, white: 0, opacity: 0.05)
+    }
+    private var segOnFill: Color {
+        dark ? Color(.sRGB, white: 1, opacity: 0.18) : Color(.sRGB, white: 1, opacity: 1)
     }
 }
 
@@ -1107,6 +1232,278 @@ private struct CaptureCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         // Mock `--card-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.08)`.
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
+    }
+}
+
+// MARK: - Stats tab (issue #446 — the mock's `.stats` view over the socket `stats` verb)
+
+/// The Stats tab body (issue #446): the mock's per-account 7-day sparklines + numeric body, aggregate
+/// callout, and signal legend — fed by the socket `stats` verb (never a store read). Renders the stats
+/// model's phase honestly: a loading placeholder, a failure message (never a blank tab), or the loaded
+/// content. READ-ONLY — it queries and renders, it never acts (the crown-jewel + footer-`next_swap`
+/// invariants belong to the Status tab).
+private struct StatsView: View {
+    @EnvironmentObject private var store: WatchStatusStore
+    @EnvironmentObject private var stats: PanelStatsModel
+
+    var body: some View {
+        switch stats.phase {
+        case .idle, .loading:
+            StatsMessage(text: "Loading usage stats…")
+        case .failed(let failure):
+            StatsMessage(text: StatusPanelFormat.statsFailureText(failure))
+        case .loaded(let wire):
+            StatsContent(wire: wire,
+                         activeLabel: store.rows.first(where: \.isActive)?.label,
+                         rosterOrder: store.rows.map(\.label))
+        }
+    }
+}
+
+/// A centered one-line Stats-tab message — the loading placeholder and the honest failure surface. Keeps the
+/// tab from ever rendering blank (or a fabricated number) when there is no series to show.
+private struct StatsMessage: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, 20).padding(.vertical, 22)
+    }
+}
+
+/// The loaded Stats view: the per-account rows (ordered to match the Status roster), then the aggregate
+/// callout + signal legend. Identity (name + monogram + active marker) joins the stats handles with the
+/// live roster the panel already holds — provider-neutral (#15), exactly like the Status roster.
+private struct StatsContent: View {
+    let wire: StatsWire
+    /// The active account's handle (from the watch snapshot the panel already renders) — marks the active
+    /// stats row, the only roster fact the Stats tab reads. `nil` when none is active.
+    let activeLabel: String?
+    /// The roster's handle order, so the Stats rows list accounts identically to the Status tab.
+    let rosterOrder: [String]
+
+    var body: some View {
+        let handles = StatusPanelFormat.orderedStatHandles(
+            summaryHandles: Set(wire.summary.accounts.keys), rosterOrder: rosterOrder)
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(handles, id: \.self) { handle in
+                    if let account = wire.summary.accounts[handle] {
+                        StatStripRow(handle: handle,
+                                     account: account,
+                                     series: StatusPanelFormat.sparkSeries(wire.series, handle: handle),
+                                     isActive: handle == activeLabel)
+                    }
+                }
+            }
+            // Mock `.stats { padding:6px 8px 2px }` — inset to align with the roster + aggregate below.
+            .padding(.horizontal, PanelMetrics.rosterInset).padding(.top, 6).padding(.bottom, 2)
+
+            StatsAggregate(roster: wire.summary.roster, window: wire.window)
+            SignalLegend()
+        }
+    }
+}
+
+/// One account's Stats row (mock `.stat`): identity + a 7-day session-peak sparkline + the neutral signal
+/// pill, over a three-cell numeric body (session mean/peak, weekly peak, cap-hits). The active account wears
+/// the accent-tint card fill (mock `.stat.active`, the SAME `--active-bg` token the Status roster uses).
+private struct StatStripRow: View {
+    let handle: String
+    let account: StatsAccountStats
+    /// The per-bucket session-peak series (0…1, fixed-scale) — the sparkline source.
+    let series: [Double]
+    let isActive: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let signal = StatusPanelFormat.statsSignal(account.band)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                StatusDot(isActive: isActive)
+                MonogramBadge(label: handle)
+                // Provider-neutral name (#15): the redacted handle, exactly as the Status roster shows it —
+                // the mock's `.s-prov` provider brand is intentionally dropped (the shipped app names no provider).
+                Text(handle)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1).truncationMode(.tail)
+                Spacer(minLength: 6)
+                Sparkline(values: series)
+                SignalPill(signal: signal)
+            }
+            HStack(alignment: .top, spacing: 8) {
+                StatCell(label: "Session m/pk", value: StatusPanelFormat.statsSessionMeanPeak(account))
+                StatCell(label: "Weekly pk", value: StatusPanelFormat.statsWeeklyPeak(account))
+                StatCell(label: "Cap-hits", value: "\(account.capHits)")
+            }
+            .padding(.leading, 17)  // mock `.stat-body { margin-left:17px }` — aligns the body under the name
+        }
+        .padding(.vertical, 10).padding(.horizontal, 8)  // mock `.stat { padding:10px 8px }`
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(isActive ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark) : Color.clear)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// The spoken row summary — identity + signal + the numeric body, so the sparkline (accessibility-hidden,
+    /// a purely visual trend) is still conveyed as facts.
+    private var accessibilityLabel: String {
+        let signal = StatusPanelFormat.statsSignal(account.band)
+        let sessionMean = StatusPanelFormat.statsPercent(account.session.mean)
+        let sessionPeak = StatusPanelFormat.statsPercent(account.session.peak)
+        let weeklyPeak = StatusPanelFormat.statsPercent(account.weekly.peak)
+        let active = isActive ? ", active" : ""
+        return "\(handle)\(active). \(signal.label). Session mean \(sessionMean) percent, "
+            + "peak \(sessionPeak) percent. Weekly peak \(weeklyPeak) percent. \(account.capHits) cap hits."
+    }
+}
+
+/// One numeric cell of the Stats row's three-column body (mock `.sc`): an uppercase micro-label over a
+/// tabular-figure value. Equal-width (`maxWidth: .infinity`), mirroring the mock's `repeat(3, 1fr)` grid.
+private struct StatCell: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased())
+                .font(.system(size: 9, weight: .semibold)).tracking(0.5)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The per-account 7-day sparkline (mock `.spark`): a drawn area + line + end-dot over the per-bucket session
+/// peaks, on the FIXED [0, 1] (0–100% of cap) scale — R-2 parity with the CLI trend sparkline (`src/stats.rs`),
+/// NOT auto-normalised. The 96 × 28 box + inset 3 reproduce the mock's `.spark` viewBox exactly. The geometry
+/// is the pure, unit-tested `StatusPanelFormat.sparkPoints`; this view only strokes/fills it.
+private struct Sparkline: View {
+    let values: [Double]
+    @Environment(\.colorScheme) private var colorScheme
+
+    private let boxWidth = 96.0
+    private let boxHeight = 28.0
+    private let inset = 3.0
+
+    var body: some View {
+        Canvas { context, _ in
+            let points = StatusPanelFormat.sparkPoints(values, width: boxWidth, height: boxHeight, inset: inset)
+            guard points.count >= 2 else { return }
+            let color = Color.spark(dark: colorScheme == .dark)
+
+            var line = Path()
+            line.move(to: CGPoint(x: points[0].x, y: points[0].y))
+            for point in points.dropFirst() {
+                line.addLine(to: CGPoint(x: point.x, y: point.y))
+            }
+
+            // Area = the line closed down to the plot baseline (mock `.sp-area` closes to y = height − inset),
+            // filled at a fraction of the stroke alpha (mock `.sp-area { fill-opacity:.2 }`).
+            let baseline = boxHeight - inset
+            var area = line
+            area.addLine(to: CGPoint(x: points[points.count - 1].x, y: baseline))
+            area.addLine(to: CGPoint(x: points[0].x, y: baseline))
+            area.closeSubpath()
+            context.fill(area, with: .color(color.opacity(0.2)))
+
+            context.stroke(line, with: .color(color),
+                           style: StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round))
+
+            // The end dot marks the latest bucket (mock `.sp-dot`, r 1.7).
+            let last = points[points.count - 1]
+            let dot = Path(ellipseIn: CGRect(x: last.x - 1.7, y: last.y - 1.7, width: 3.4, height: 3.4))
+            context.fill(dot, with: .color(color))
+        }
+        .frame(width: boxWidth, height: boxHeight)
+        .accessibilityHidden(true)  // a purely visual trend; the row label speaks the numeric values
+    }
+}
+
+/// The neutral utilisation signal pill (mock `.signal`): a colored dot + descriptor word (underused /
+/// balanced / saturated), tinted by the mock's `--sig-*` tokens. A DESCRIPTOR of the session-peak band, never
+/// a recommendation — the read-only Stats tab states the magnitude, it does not advise.
+private struct SignalPill: View {
+    let signal: StatusPanelFormat.StatSignal
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let dark = colorScheme == .dark
+        HStack(spacing: 5) {
+            Circle()
+                .fill(Color.statsSignalText(signal, dark: dark))
+                .frame(width: 6, height: 6)
+            Text(signal.label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.statsSignalText(signal, dark: dark))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background(Capsule().fill(Color.statsSignalFill(signal, dark: dark)))
+        .fixedSize()
+        .accessibilityHidden(true)  // spoken via the row's accessibility label
+    }
+}
+
+/// The aggregate callout under the Stats rows (mock `.agg`): the roster-wide all-accounts-high water + swap
+/// count over the window, in a neutral card. Facts only (magnitudes + the span), never a recommendation.
+private struct StatsAggregate: View {
+    let roster: StatsRoster
+    let window: StatsWindow
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "chart.line.uptrend.xyaxis")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Text(StatusPanelFormat.statsAggregateText(roster: roster, window: window))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 9).padding(.horizontal, 11)
+        .background(RoundedRectangle(cornerRadius: 9).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
+        .padding(.horizontal, 12).padding(.vertical, 6)  // mock `.agg { margin:6px 12px }`
+    }
+}
+
+/// The signal legend (mock `.sig-legend`): the three descriptor pills + the neutrality note. Reinforces the
+/// read-only ethos — "descriptive · equal weight · no action implied" — so the pills never read as an alarm.
+private struct SignalLegend: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Text("SIGNAL")
+                    .font(.system(size: 9.5, weight: .semibold)).tracking(0.6)
+                    .foregroundStyle(.tertiary)
+                SignalPill(signal: .underused)
+                SignalPill(signal: .balanced)
+                SignalPill(signal: .saturated)
+                Spacer(minLength: 0)
+            }
+            Text("descriptive · equal weight · no action implied")
+                .font(.system(size: 10)).italic()
+                .foregroundStyle(.tertiary)
+        }
+        // Mock `.sig-legend { margin:2px 12px 13px; border-top }` — a hairline over the note.
+        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 13)
+        .overlay(alignment: .top) {
+            Divider().padding(.horizontal, 12)
+        }
+        .accessibilityHidden(true)  // static explanatory chrome; the per-row labels speak each signal
     }
 }
 
