@@ -4176,6 +4176,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4203,6 +4204,7 @@ spare  22222222-2222\n\
         let response = |systemic| StatusResponse {
             systemic_refresh_failure: systemic,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: None,
@@ -4247,6 +4249,7 @@ spare  22222222-2222\n\
         let response = |scrub| StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: scrub,
+            keychain_locked: false,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(60), Some(25))],
             next_swap: None,
@@ -4326,6 +4329,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![degraded],
             next_swap: None,
@@ -4361,6 +4365,7 @@ spare  22222222-2222\n\
             &StatusResponse {
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
+                keychain_locked: false,
                 refresh_enabled: None,
                 accounts: vec![ok],
                 next_swap: None,
@@ -4379,6 +4384,7 @@ spare  22222222-2222\n\
             &StatusResponse {
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
+                keychain_locked: false,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, None, None)],
                 next_swap: None,
@@ -4401,6 +4407,7 @@ spare  22222222-2222\n\
         let blind = |degraded: bool| StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
@@ -4436,6 +4443,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4473,6 +4481,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
             next_swap: None,
@@ -4573,6 +4582,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![healthy_but_spent, dead],
             next_swap: None,
@@ -4615,6 +4625,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 health: Some(CredentialHealth::Healthy),
@@ -4644,6 +4655,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 line("healthy", Healthy),
@@ -4711,6 +4723,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 AccountStatusLine {
@@ -4770,6 +4783,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![],
             next_swap: None,
@@ -4962,6 +4976,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 work,
@@ -5003,6 +5018,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5057,6 +5073,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 // healthy: session 12m, weekly 5d — both appear.
@@ -5144,6 +5161,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             next_swap: None,
@@ -5170,6 +5188,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![{
                 let mut a = status_line_resets(
@@ -5258,6 +5277,7 @@ spare  22222222-2222\n\
             let response = StatusResponse {
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
+                keychain_locked: false,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap,
@@ -5357,6 +5377,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
@@ -5394,6 +5415,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5428,6 +5450,7 @@ spare  22222222-2222\n\
             let response = StatusResponse {
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
+                keychain_locked: false,
                 refresh_enabled: Some(false),
                 accounts: vec![
                     health_line("account-a", true, Healthy),
@@ -5450,6 +5473,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(true),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5470,6 +5494,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5493,6 +5518,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Dead),
@@ -5516,6 +5542,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5542,6 +5569,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5565,6 +5593,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5590,6 +5619,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5903,6 +5933,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "hot",
@@ -5926,6 +5957,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 // green: low utilization.
@@ -5987,6 +6019,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -6025,6 +6058,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -6069,6 +6103,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "half",
@@ -6105,6 +6140,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6160,6 +6196,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6247,6 +6284,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![
                 line_for("ascii", Some(NOW + 4 * 3_600)),
@@ -6281,6 +6319,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6385,6 +6424,7 @@ spare  22222222-2222\n\
         let response = StatusResponse {
             systemic_refresh_failure: None,
             canonical_scrub: None,
+            keychain_locked: false,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6590,6 +6630,7 @@ spare  22222222-2222\n\
             status: StatusResponse {
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
+                keychain_locked: false,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: Some(NextSwap::Target {
@@ -6651,6 +6692,7 @@ spare  22222222-2222\n\
             status: StatusResponse {
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
+                keychain_locked: false,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: None,
