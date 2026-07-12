@@ -545,21 +545,22 @@ private struct AccountRowView: View {
                 Spacer(minLength: 6)
 
                 if row.isActive {
-                    // The "ACTIVE" tag — one of the row's THREE active cues (leading filled dot + this tag +
-                    // accent-tint row), so active never rides on color alone (R-2 / WCAG 1.4.1). TREATMENT
-                    // DIVERGES from the current mock and is tracked in #501: this renders an ACCENT,
-                    // letter-spaced, outlined uppercase pill, but the perfected mock
-                    // (`menubar-preview.html:215-225`) specifies a NEUTRAL sentence-case capsule (`--badge-bg`
-                    // fill, `--text-2` text, NO border) to cut active over-signalling (#387 M5). Re-tinting is
-                    // a treatment change beyond #388's color/opacity scope, so the accent-border opacity below
-                    // is intentionally NOT theme-bumped here — the mock has no accent tag border to match.
-                    Text("ACTIVE")
-                        .font(.system(size: 9, weight: .bold))
-                        .tracking(0.6)
-                        .foregroundStyle(.tint)
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .overlay(RoundedRectangle(cornerRadius: 4)
-                            .strokeBorder(Color.accentColor.opacity(0.42), lineWidth: 0.5))
+                    // The active tag — one of the row's THREE redundant "active" cues (leading filled dot +
+                    // this tag + accent-tint row fill), so active never rides on colour alone (R-2 / WCAG
+                    // 1.4.1). Treatment matches the perfected mock `.tag` (`menubar-preview.html:243`): a calm
+                    // NEUTRAL sentence-case capsule — the same `--badge-bg` neutral fill as the monogram badge
+                    // (`Color.panelFill(.badge, …)`) + `--text-2` text (`.secondary`), NO accent border, NO
+                    // letter-spaced uppercase. The accent DOT already carries the active colour; a second
+                    // accent element here (the old outlined uppercase "ACTIVE" pill) re-inflated the active
+                    // over-signalling #387 M5 reduced and sank the same-hue label to ~3:1. The neutral label
+                    // stays as the WCAG 1.4.1 non-colour cue (clears 1.4.11 on the capsule — see #501 tests);
+                    // it is `accessibilityHidden` because the row's spoken label already says ", active" (#325).
+                    Text(StatusPanelFormat.activeTagLabel)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7).padding(.vertical, 1.5)
+                        .background(RoundedRectangle(cornerRadius: 5)
+                            .fill(Color.panelFill(.badge, dark: colorScheme == .dark)))
                         .accessibilityHidden(true)
                 }
 
