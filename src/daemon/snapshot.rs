@@ -228,7 +228,7 @@ pub(crate) struct SchemaVersion {
 /// omitted entirely when healthy, so a non-scrub frame's bytes are unchanged. Like
 /// `systemic_refresh_failure` it is daemon-level, but it takes `blind_active`'s `skip_serializing_if`
 /// omit-when-healthy pattern rather than `systemic_refresh_failure`'s always-emitted `null`. `1.6`
-/// ADDED the daemon-level [`StatusResponse::keychain_locked`] flag ([issue #498]) — a fleet-wide
+/// ADDED the daemon-level [`StatusResponse::keychain_locked`] flag (issue #498) — a fleet-wide
 /// "the login keychain is LOCKED so the shared credential is unreadable" signal, a bare `bool`
 /// (via `skip_serializing_if`) omitted entirely when unlocked, so a non-locked frame's bytes are
 /// unchanged. The daemon-level sibling of `canonical_scrub`, but for an UNREADABLE item rather than
