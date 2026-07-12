@@ -65,6 +65,33 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertNil(personal.sessionPct)
     }
 
+    // #469 / #516: the daemon-level `canonical_scrub` rollup projects from the snapshot exactly as
+    // `nextSwap` does — a fleet-wide fault that rides ALONGSIDE a healthy roster (each row reads healthy
+    // while the shared `Claude Code-credentials` item sits emptied). The View surfaces it as an honest
+    // banner; here we assert the pure core carries the discriminant so the store can publish it.
+    func testProjectsCanonicalScrubAlongsideAHealthyRoster() throws {
+        let exhausted = machine([.connected, .line(Fixtures.snapshotCanonicalScrubExhausted)])
+        XCTAssertEqual(exhausted.canonicalScrub, .exhausted)
+        // The scrub is a SEPARATE daemon-level signal, not a connection degradation: the roster still
+        // reads healthy/connected (the crown-jewel case the banner exists to surface honestly).
+        XCTAssertEqual(exhausted.connectionState, .connected)
+        XCTAssertEqual(exhausted.rows.count, 1)
+        XCTAssertEqual(try XCTUnwrap(exhausted.rows.first).auth, .healthy)
+
+        let recovering = machine([.connected, .line(Fixtures.snapshotCanonicalScrubRecovering)])
+        XCTAssertEqual(recovering.canonicalScrub, .recovering)
+
+        // A healthy daemon (the wire key omitted) carries no scrub → nil, so no banner ever renders.
+        let healthy = machine([.connected, .line(Fixtures.snapshotBasic)])
+        XCTAssertNil(healthy.canonicalScrub)
+
+        // Retained across a transition to `.stale` (like `rows`/`nextSwap`) — the View renders the scrub
+        // banner in `.stale` too, off the last-known value, so a quiet-then-scrubbed daemon still warns.
+        let staleScrub = machine([.connected, .line(Fixtures.snapshotCanonicalScrubExhausted), .stale])
+        XCTAssertEqual(staleScrub.connectionState, .stale)
+        XCTAssertEqual(staleScrub.canonicalScrub, .exhausted, "scrub retained into stale, like the roster")
+    }
+
     // MARK: - AC: empty accounts → empty-roster (DISTINCT from daemon-down)
 
     func testEmptyAccountsGoesEmptyRosterNotDisconnectedNotHealthy() {

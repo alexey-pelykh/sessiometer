@@ -377,6 +377,13 @@ struct HonestStateMachine {
     private(set) var nextSwap: NextSwap?
     private(set) var refreshEnabled: Bool?
     private(set) var generatedAt: Int64?
+    /// The daemon-level shared-canonical scrub rollup (#469, wire #516), carried from the last applied
+    /// snapshot exactly as `nextSwap` is: a fleet-wide lockout NO per-account `auth` reflects (each row
+    /// can read healthy while the shared `Claude Code-credentials` item sits emptied). RETAINED across a
+    /// drop (shown under the dimmed last-known render, like `nextSwap`) and REFUSED with the other numbers
+    /// on an unsupported-major frame. `nil` when the shared canonical is healthy — or a pre-#516 daemon
+    /// omits the wire key (`decodeIfPresent`), so a healthy/legacy daemon never renders a scrub banner.
+    private(set) var canonicalScrub: CanonicalScrub?
 
     /// The honest connection state — a PURE function of `(liveness, snapshotClass)`. This is where the
     /// never-healthy-when-dead invariant lives: `.connected` is returned on exactly one combination.
@@ -582,11 +589,13 @@ struct HonestStateMachine {
         guard status.isSchemaSupported else {
             // A breaking-major snapshot: reach `.unsupported` and REFUSE its numbers (do not render a
             // roster read through a contract we cannot safely parse). generatedAt is left at its
-            // last-known value — the unsupported banner shows no freshness.
+            // last-known value — the unsupported banner shows no freshness. The scrub rollup is refused
+            // with the rest (a fault read through an unreadable contract is not trustworthy either).
             snapshotClass = .unsupported
             rows = []
             nextSwap = nil
             refreshEnabled = nil
+            canonicalScrub = nil
             return .unsupportedSchema
         }
         snapshotClass = status.accounts.isEmpty ? .empty : .healthy
@@ -594,6 +603,7 @@ struct HonestStateMachine {
         nextSwap = status.nextSwap
         refreshEnabled = status.refreshEnabled
         generatedAt = status.generatedAt
+        canonicalScrub = status.canonicalScrub
         return .appliedSnapshot
     }
 
@@ -605,6 +615,7 @@ struct HonestStateMachine {
             rows = []
             nextSwap = nil
             refreshEnabled = nil
+            canonicalScrub = nil
             return .unsupportedSchema
         }
         // Liveness/keepalive ONLY — a heartbeat carries no roster, so it must NOT be treated as a

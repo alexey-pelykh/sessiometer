@@ -481,48 +481,58 @@ final class StatusPanelFormatTests: XCTestCase {
             "Every account over its session limit")
     }
 
-    // MARK: - canonicalScrubFooter (issue #469 — the fleet-wide scrubbed-canonical signal)
+    // MARK: - canonicalScrubBanner (issue #469 — the fleet-wide scrubbed-canonical signal)
 
-    // #469: the daemon's `canonical_scrub` rollup renders a distinct footer naming the state and, for
-    // the un-recoverable residual, the `claude /login` remedy — content-parity with the CLI's
-    // `shared login: scrubbed …` footer (same state + same byte-shared remedy, R-2 state-parity per
-    // medium). Absent (nil) when the shared canonical is healthy.
-    func testCanonicalScrubFooterNamesTheStateAndRemedy() {
-        // Exhausted → the state + the actionable re-login remedy.
-        XCTAssertEqual(
-            StatusPanelFormat.canonicalScrubFooter(.exhausted),
-            "Shared login scrubbed · run claude /login")
-        // Recovering → the calm, no-action cue; the fleet may self-heal, so NO re-login prompt.
-        XCTAssertEqual(
-            StatusPanelFormat.canonicalScrubFooter(.recovering),
-            "Shared login scrubbed · recovering automatically")
-        // Healthy (nil) → no footer (same single-cardinality as `nextSwapFooter(nil)`).
-        XCTAssertNil(StatusPanelFormat.canonicalScrubFooter(nil))
+    // #469: the daemon's `canonical_scrub` rollup renders a distinct HONEST BANNER (title + detail +
+    // kind) naming the state and, for the un-recoverable residual, the `claude /login` remedy. The View
+    // renders it ABOVE the roster in `.connected` / `.stale`, so a connected-but-scrubbed panel reads
+    // visibly degraded (never healthy). Absent (nil) when the shared canonical is healthy.
+    func testCanonicalScrubBannerNamesTheStateAndRemedy() throws {
+        // Exhausted → an `.error` banner: the state (title) + the actionable re-login remedy (detail).
+        let exhausted = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.exhausted))
+        XCTAssertEqual(exhausted.title, "Shared login scrubbed")
+        XCTAssertEqual(exhausted.kind, .error, "the un-recoverable residual reads as an error")
+        XCTAssertTrue(exhausted.detail.contains("claude /login"), "detail names the remedy: \(exhausted.detail)")
+
+        // Recovering → a calm `.info` banner; the fleet may self-heal, so NO re-login prompt.
+        let recovering = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.recovering))
+        XCTAssertEqual(recovering.title, "Shared login scrubbed")
+        XCTAssertEqual(recovering.kind, .info, "the self-healing state is calm, not an error")
+        XCTAssertFalse(recovering.detail.contains("claude /login"),
+                       "recovering carries no re-login remedy — it may self-heal")
+
+        // Healthy (nil) → no banner (same single-cardinality as `nextSwapFooter(nil)`).
+        XCTAssertNil(StatusPanelFormat.canonicalScrubBanner(nil))
     }
 
-    // #469 content-parity with the CLI (`src/cli.rs` `render_status`): both surfaces name the SAME
-    // state ("scrubbed") and, on the exhausted case, the SAME byte-shared `claude /login` remedy; the
-    // recovering case names "recovering automatically" and carries NO re-login remedy on BOTH surfaces.
-    func testCanonicalScrubFooterIsContentParityWithTheCLI() {
-        let exhausted = try! XCTUnwrap(StatusPanelFormat.canonicalScrubFooter(.exhausted))
-        XCTAssertTrue(exhausted.contains("scrubbed"), "names the state: \(exhausted)")
-        XCTAssertTrue(exhausted.contains("claude /login"), "names the byte-shared remedy: \(exhausted)")
+    // #469 content-parity with the CLI (`src/cli.rs` `render_status`): both surfaces name the SAME state
+    // ("scrubbed") and, on the exhausted case, the SAME `claude /login` remedy; the recovering case names
+    // "recovering automatically" and carries NO re-login remedy on BOTH surfaces (R-2 STATE-parity — the
+    // same facts, each medium phrasing its own way, so the panel checks its own rendered title + detail).
+    func testCanonicalScrubBannerIsContentParityWithTheCLI() throws {
+        let exhausted = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.exhausted))
+        let exhaustedText = "\(exhausted.title) \(exhausted.detail)"
+        XCTAssertTrue(exhaustedText.contains("scrubbed"), "names the state: \(exhaustedText)")
+        XCTAssertTrue(exhaustedText.contains("claude /login"), "names the shared remedy: \(exhaustedText)")
 
-        let recovering = try! XCTUnwrap(StatusPanelFormat.canonicalScrubFooter(.recovering))
-        XCTAssertTrue(recovering.contains("scrubbed"), "names the state: \(recovering)")
-        XCTAssertTrue(recovering.contains("recovering automatically"), "names the calm cue: \(recovering)")
-        XCTAssertFalse(recovering.contains("claude /login"),
+        let recovering = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.recovering))
+        let recoveringText = "\(recovering.title) \(recovering.detail)"
+        XCTAssertTrue(recoveringText.contains("scrubbed"), "names the state: \(recoveringText)")
+        XCTAssertTrue(recoveringText.lowercased().contains("recovering automatically"),
+                      "names the calm self-heal cue: \(recoveringText)")
+        XCTAssertFalse(recoveringText.contains("claude /login"),
                        "recovering carries no re-login remedy — parity with the CLI")
     }
 
-    // #469 / #15: no secret in EITHER surface's canonical-scrub output — a bare state discriminant,
-    // never a token or email. The wire rollup carries no handle at all today (even a future additive
-    // handle would be a non-secret roster label, #516), so the footer is trivially redaction-clean.
-    func testCanonicalScrubFooterCarriesNoSecret() {
+    // #469 / #15: no secret in the canonical-scrub banner — a bare state discriminant, never a token or
+    // email. The wire rollup carries no handle at all today (even a future additive handle would be a
+    // non-secret roster label, #516), so the banner is trivially redaction-clean.
+    func testCanonicalScrubBannerCarriesNoSecret() throws {
         for scrub in [CanonicalScrub.exhausted, .recovering] {
-            let footer = try! XCTUnwrap(StatusPanelFormat.canonicalScrubFooter(scrub))
-            XCTAssertFalse(footer.lowercased().contains("token"), "no token in the scrub footer: \(footer)")
-            XCTAssertFalse(footer.contains("@"), "no email in the scrub footer: \(footer)")
+            let banner = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(scrub))
+            let text = "\(banner.title) \(banner.detail)"
+            XCTAssertFalse(text.lowercased().contains("token"), "no token in the scrub banner: \(text)")
+            XCTAssertFalse(text.contains("@"), "no email in the scrub banner: \(text)")
         }
     }
 

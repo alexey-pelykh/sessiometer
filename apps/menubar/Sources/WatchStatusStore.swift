@@ -8,7 +8,7 @@
 // surfaces:
 //
 //   * the `@Published` projection (`connectionState` + `rows` + `nextSwap` + `refreshEnabled` +
-//     `generatedAt`) that the SwiftUI detail panel observes; and
+//     `generatedAt` + `canonicalScrub`) that the SwiftUI detail panel observes; and
 //   * the `presentations` stream (glyph + a11y label) that the AppKit `NSStatusItem` glance consumes.
 //
 // ALL honest-state logic — and the crown-jewel "never healthy on a degraded/absent daemon" invariant
@@ -51,6 +51,11 @@ final class WatchStatusStore: ObservableObject {
     /// The `generated_at` of the last snapshot (or the last heartbeat's freshness stamp) — the
     /// live-vs-stale signal the panel compares against the wall clock.
     @Published private(set) var generatedAt: Int64?
+    /// The daemon-level shared-canonical scrub rollup (#469, wire #516) — a fleet-wide `claude`-login
+    /// lockout NO per-account `auth` cell reflects (each row can read healthy while the shared item sits
+    /// emptied). The panel renders it as an honest banner above the roster; `nil` when the shared
+    /// canonical is healthy (or a pre-#516 daemon omits the wire key).
+    @Published private(set) var canonicalScrub: CanonicalScrub?
 
     // MARK: - The glance presentation stream (the status item consumes this)
 
@@ -179,6 +184,7 @@ final class WatchStatusStore: ObservableObject {
         nextSwap = machine.nextSwap
         refreshEnabled = machine.refreshEnabled
         generatedAt = machine.generatedAt
+        canonicalScrub = machine.canonicalScrub
         presentationsContinuation.yield(machine.presentation)
     }
 
@@ -298,12 +304,14 @@ extension WatchStatusStore {
     /// design-parity review against the mock. NOT a production path — the real state is machine-derived
     /// from the wire, never set directly. Same-file so it can set the `private(set)` projection.
     static func preview(state: ConnectionState, rows: [AccountRow],
-                        nextSwap: NextSwap?, generatedAt: Int64?) -> WatchStatusStore {
+                        nextSwap: NextSwap?, generatedAt: Int64?,
+                        canonicalScrub: CanonicalScrub? = nil) -> WatchStatusStore {
         let store = WatchStatusStore()
         store.connectionState = state
         store.rows = rows
         store.nextSwap = nextSwap
         store.generatedAt = generatedAt
+        store.canonicalScrub = canonicalScrub
         return store
     }
 }
