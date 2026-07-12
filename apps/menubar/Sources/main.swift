@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var store: WatchStatusStore?
     private var statusItemController: StatusItemController?
     private var transport: WatchTransport?
+    private var accountEventNotifier: AccountEventNotifier?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
@@ -99,6 +100,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                               statsClient: statsClient)
         controller.start()
         statusItemController = controller
+
+        // Native swap / all-accounts-exhausted notifications (issue #267, REQ-MBR-B-017): a thin
+        // observer over the SAME redacted store the panel renders. It posts a GENERIC macOS
+        // notification (the EVENT, never the account — no label / email / credential, the redaction AC)
+        // when the active account changes or the fleet runs out of viable targets. A `UserDefaults`
+        // on/off toggle (default on) is the persisted home #268's settings UI will later surface;
+        // authorization + display are OS-bound (a manual pre-release step). Zero egress:
+        // `UNUserNotificationCenter` is a local OS call, no network. Installed BEFORE `store.start(...)`
+        // below so the observer never misses the first snapshot's transition.
+        let notifier = AccountEventNotifier(preferences: NotificationPreferences(),
+                                            presenter: UserNotificationPresenter())
+        notifier.start(observing: store)
+        accountEventNotifier = notifier
 
         // Feed the store from the daemon's watch socket — or degrade loudly if the path won't resolve.
         switch WatchTransport.production() {
