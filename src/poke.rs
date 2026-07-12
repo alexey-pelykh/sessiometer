@@ -611,6 +611,7 @@ mod tests {
     fn status_snapshot(lines: Vec<AccountStatusLine>) -> StatusResponse {
         StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
             refresh_enabled: None,
             accounts: lines,
             next_swap: None,

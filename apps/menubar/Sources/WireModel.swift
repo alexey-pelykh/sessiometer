@@ -255,6 +255,55 @@ extension NextSwap: Decodable {
     }
 }
 
+/// The daemon-level CANONICAL-SCRUB rollup (`src/daemon/snapshot.rs` `CanonicalScrub`, issue #516):
+/// present only while the shared `Claude Code-credentials` canonical item is SCRUBBED — the
+/// fleet-wide lockout NO per-account `auth` rollup reflects (the shared item is emptied while account
+/// rows can read perfectly healthy). Distinguishes the daemon still autonomously RECOVERING (adopt in
+/// progress) from RECOVERY-EXHAUSTED (the un-recoverable residual that needs a `claude /login`, which
+/// #469 renders with that remedy). Internally tagged on `state` (`snake_case`), so a value is one of
+/// two shapes:
+///   * `{"state":"recovering"}`
+///   * `{"state":"exhausted"}`
+///
+/// An UNKNOWN `state` is a HARD decode error — faithfully mirroring the daemon's internally-tagged
+/// enum, which rejects a variant it does not know. A mis-rendered fleet STATE is dangerous, so this
+/// takes the same reject posture as an unknown `next_swap.state` (NOT the tolerated-decoration posture
+/// of an unknown `reason.kind`). The whole `canonical_scrub` key is optional (ABSENT when healthy),
+/// handled at `VersionedStatus` via `decodeIfPresent` — the additive-minor forward-compat the #164
+/// contract rests on. Non-secret — a bare state discriminant, never a token or email (issue #15).
+enum CanonicalScrub: Equatable {
+    /// Scrubbed, but the daemon's autonomous adopt-recovery is still in progress — the fleet may
+    /// self-heal with no operator action. The lower-severity state.
+    case recovering
+    /// Scrubbed AND recovery exhausted — the daemon backed off, so the canonical stays empty until a
+    /// `claude /login`. The residual un-recoverable state #469 renders with that remedy.
+    case exhausted
+}
+
+extension CanonicalScrub: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case state
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let state = try container.decode(String.self, forKey: .state)
+        switch state {
+        case "recovering":
+            self = .recovering
+        case "exhausted":
+            self = .exhausted
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .state,
+                in: container,
+                debugDescription:
+                    "unknown canonical_scrub state '\(state)' — an incompatible wire contract"
+            )
+        }
+    }
+}
+
 // MARK: - The redacted per-account payload line
 
 /// One account's redacted status line (`src/daemon/snapshot.rs` `AccountStatusLine`) — a
@@ -359,6 +408,13 @@ struct VersionedStatus: Decodable, Equatable {
     /// visible without waiting for an account to die; `nil` for a pre-#378 daemon (rendered as
     /// healthy). Added by the MINOR `1.0 → 1.1` bump — an older client tolerates it by ignoring.
     let systemicRefreshFailure: UInt32?
+    /// The daemon-level CANONICAL-SCRUB rollup (`src/daemon/snapshot.rs` `StatusResponse.canonical_scrub`,
+    /// issue #516): `.recovering` / `.exhausted` while the shared canonical item is scrubbed, else `nil`
+    /// (ABSENT) when healthy — the fleet-wide scrubbed / un-recoverable lockout no per-account `auth`
+    /// rollup reflects. `nil` for a pre-#516 daemon AND for a healthy one (`skip_serializing_if` omits it
+    /// there, so a non-scrub frame is byte-unchanged). Added by the MINOR `1.4 → 1.5` bump — an older
+    /// client tolerates it by ignoring; a bare state discriminant, never a token or email (issue #15).
+    let canonicalScrub: CanonicalScrub?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -367,6 +423,7 @@ struct VersionedStatus: Decodable, Equatable {
         case nextSwap = "next_swap"
         case refreshEnabled = "refresh_enabled"
         case systemicRefreshFailure = "systemic_refresh_failure"
+        case canonicalScrub = "canonical_scrub"
     }
 
     init(from decoder: Decoder) throws {
@@ -379,6 +436,7 @@ struct VersionedStatus: Decodable, Equatable {
         nextSwap = try c.decodeIfPresent(NextSwap.self, forKey: .nextSwap)
         refreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .refreshEnabled)
         systemicRefreshFailure = try c.decodeIfPresent(UInt32.self, forKey: .systemicRefreshFailure)
+        canonicalScrub = try c.decodeIfPresent(CanonicalScrub.self, forKey: .canonicalScrub)
     }
 
     /// Whether this snapshot's contract major is one the client can render (`WireContract`).
