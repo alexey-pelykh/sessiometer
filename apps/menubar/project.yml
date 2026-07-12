@@ -80,6 +80,12 @@ targets:
       - path: Sources/PanelStatsModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
+      # Native swap / all-accounts-exhausted notifications (#267): the pure event deriver + neutral
+      # (redacted) content + toggle-gating shell. Compiled here (NOT UserNotificationPresenter.swift or
+      # main.swift — those touch UNUserNotificationCenter / AppKit the headless bundle can't drive) so
+      # swap/exhausted detection, content redaction, and toggle gating are tested against a spy
+      # presenter with no OS notification surface.
+      - path: Sources/AccountEventNotifier.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
       # StatusItemController/StatusPanelView/main.swift — those touch NSStatusBar/AppKit UI that a
       # headless logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
