@@ -224,6 +224,14 @@
     color:var(--text-2); background:var(--badge-bg); padding:1.5px 7px; border-radius:5px;
   }
   .health{ display:inline-flex; color:var(--ok) }
+  /* per-row manual-switch chip (#448 — persistent quiet, brightens when armed): #169's per-row swap made
+     DISCOVERABLE at rest. Neutral --text-3 at rest (never accent — the one accent action is the footer Swap,
+     Von Restorff), brightening to --text-2 when the row is armed (hover / focus). No wash / cursor at rest,
+     so it reads as a quiet HINT, not a loud control; the active row (not a switch target) omits it. Mirrors
+     SwiftUI `StatusPanelFormat.switchChipEmphasis` → `.tertiary` (rest) / `.secondary` (armed). */
+  .rowact{ flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; color:var(--text-3) }
+  .acct:hover .rowact{ color:var(--text-2) }   /* armed on hover (the steady state is the quiet rest above) */
+  .rowact.armed{ color:var(--text-2) }          /* explicit armed modifier (preview the brighten statically) */
 
   .meters{ margin-top:9px; display:grid; gap:6px }
   .meter{ display:grid; grid-template-columns:52px 1fr 40px 52px; align-items:center; column-gap:9px }
@@ -536,7 +544,7 @@
                   <span class="dot"></span>
                   <span class="badge">P</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
@@ -549,7 +557,7 @@
                   <span class="dot"></span>
                   <span class="badge">S</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
@@ -602,7 +610,7 @@
                   <span class="dot"></span>
                   <span class="badge">P</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
@@ -614,7 +622,7 @@
                   <span class="dot"></span>
                   <span class="badge">S</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
@@ -997,7 +1005,7 @@
                   <span class="dot"></span>
                   <span class="badge">P</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
@@ -1009,7 +1017,7 @@
                   <span class="dot"></span>
                   <span class="badge">S</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
@@ -1311,6 +1319,7 @@
       <li><b>Capture is a real action; copy-command only where the app can&rsquo;t act.</b> <b>First-run / empty-roster onboarding</b> <b>captures</b> the active account in-app (#360) &mdash; a button + optional label field that sends the verb over the #358 control socket and renders an honest <i>pending &rarr; done &rarr; error</i> from the redacted ack (no credential ever reaches the client). It is an <i>onboarding</i> affordance: a populated panel carries no capture bar, so the steady state stays a read-only glance and adding an account lives off-panel. The captured row then arrives on its own via the live watch stream &mdash; the affordance never inserts it. To add a <i>different</i> account the operator runs <code>claude /login</code> first, then captures (capture snapshots the active account; it is not a picker). Only where the app genuinely can&rsquo;t act does it still copy a command: version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>). <b>daemon-starting</b> stays a <i>static</i> forming glyph &mdash; the app fakes no progress it isn&rsquo;t doing.</li>
       <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
       <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each provider gets the same monochrome monogram badge and a plain text label (no brand colour or logo). The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
+      <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
       <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges, the orange at-risk lock and the amber stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>
     </ul>

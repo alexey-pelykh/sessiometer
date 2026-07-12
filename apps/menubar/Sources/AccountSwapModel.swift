@@ -34,7 +34,7 @@ private let swapLog = Logger(subsystem: "org.sessiometer.menubar", category: "sw
 ///
 /// `force` is ALWAYS `false` from the panel, deliberately. It is a POLICY-only bypass
 /// (`swap_command_verdict`, `src/daemon.rs`): it skips the quarantined / weekly-exhausted / cooldown
-/// gates that exist to protect the operator. A hover-revealed row click is a low-ceremony gesture — far
+/// gates that exist to protect the operator. An armed-on-hover row click is a low-ceremony gesture — far
 /// too low to carry a silent policy override — so forcing stays where it is explicit and deliberate:
 /// the CLI's `use --force`. The field is sent explicitly (not omitted) because the daemon's
 /// `ControlRequest.force` is a plain `bool`.

@@ -19,9 +19,10 @@
 //
 // Two swap verbs, read differently (issue #169, Von Restorff): the footer **Swap** button is the
 // panel's ONE accent/primary action — the daemon's own recommendation, sent WYSIWYG as the displayed
-// `next_swap` target. A per-row manual switch is a quiet, neutral-weight, hover-revealed affordance —
-// the operator choosing an arbitrary target. Both send the SAME `swap` command; the daemon re-validates
-// every target from its own state, so the client never sends a viability hint.
+// `next_swap` target. A per-row manual switch is a quiet, neutral-weight affordance — persistent but
+// low-key at rest, arming on hover (#448) — the operator choosing an arbitrary target. Both send the
+// SAME `swap` command; the daemon re-validates every target from its own state, so the client never
+// sends a viability hint.
 //
 // Provider-neutral by construction: the wire carries only the operator-chosen `label` (never an email
 // — issue #15) and no provider field, so a row is plain text with no brand color or logo. Every row is
@@ -345,13 +346,15 @@ private struct RowSwitchButtonStyle: ButtonStyle {
         configuration.label
             // MIS-CLICK GUARD (issue #169 falsifier b) — resolved deliberately, not by accident. The
             // checklist item forbids "an INVISIBLE whole-row click"; the watch-out phrases it as "not a
-            // whole-row HOT-ZONE". Both are honored by REVEAL, not by shrinking the hit target:
-            //   * At rest the row is pure data — no wash, no glyph, no `pointingHand`: it does not read as
-            //     pressable, so the invisible-click hazard the checklist names cannot occur.
+            // whole-row HOT-ZONE". Both are honored by ARMING, not by shrinking the hit target:
+            //   * At rest the row shows only a QUIET chip (#448) — no wash, no `pointingHand`: the chip
+            //     hints the row is actionable, but WITHOUT the wash + cursor it does not yet read as an
+            //     armed, pressable control, so the invisible-click hazard the checklist names cannot occur
+            //     (the persistent chip aids DISCOVERY; the wash + cursor still gate ARMING).
             //   * The hit rect is the whole row (per the explicit "implement the row as a Button"
-            //     instruction + Fitts's law — an 18 pt glyph-only target would be a worse, error-prone
-            //     mechanism), but it is ARMED only once hover has revealed the glyph + wash + cursor, so
-            //     the operator always SEES the row is live before a press can land.
+            //     instruction + Fitts's law — a glyph-only target would be a worse, error-prone
+            //     mechanism), but it is ARMED only once hover has added the wash + cursor and brightened
+            //     the chip, so the operator always SEES the row is live before a press can land.
             //   * Residual accidental-press risk is bounded by three things the daemon and model already
             //     enforce: the daemon re-validates every target (a stray press can't do something unsafe),
             //     a swap is reversible (undo = switch back), and a sibling swap is `.disabled()` mid-flight.
@@ -378,7 +381,8 @@ private struct RowSwitchButtonStyle: ButtonStyle {
 /// The whole row is a single VoiceOver element.
 ///
 /// A non-active row is ALSO the manual-switch affordance (issue #169): a `Button` whose trailing swap
-/// glyph is revealed on hover. The resting row stays pure data.
+/// chip is PERSISTENT — quiet at rest, brightening when the row is armed on hover (#448). The resting
+/// row carries the quiet chip; arming still gates the wash + `pointingHand` cursor.
 private struct AccountRowView: View {
     let row: AccountRow
     let now: Int64
@@ -565,33 +569,47 @@ private struct AccountRowView: View {
         )
     }
 
-    /// The trailing manual-switch slot (issue #169) — HOVER-REVEALED, never a resting affordance.
+    /// The swap glyph the chip draws — a swap arrow, or a DISTINCT `nosign` on a wire-blocked target
+    /// ("you cannot switch here" is a different fact from "switch here", and shape carries it without
+    /// color). The tint is applied by `switchSlot` per emphasis level, so this stays tint-free.
+    private var chipGlyph: some View {
+        Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
+            .font(.system(size: 11, weight: .semibold))
+    }
+
+    /// The trailing manual-switch chip (issue #169, made PERSISTENT by #448) — a quiet affordance shown at
+    /// rest on every switch target, that BRIGHTENS when the row is armed (hover / focus). #169 revealed it
+    /// only on hover, so on a transient popover a first-time operator never saw a row was actionable; the
+    /// persistent-quiet chip makes the row discoverable without an always-loud control.
     ///
-    /// The slot's WIDTH is laid out on every roster row, always, even where the glyph is invisible or the
-    /// row is not switchable at all. Two things fall out of that, both load-bearing:
-    ///   * revealing the glyph on hover can never REFLOW the row, so the label's truncation is identical
-    ///     hovered and at rest — the affordance can never truncate the label into something uninformative
-    ///     (the issue's row-width watch-out); and
-    ///   * the auth column stays aligned across active and non-active rows.
-    /// The why-text itself never truncates: it is a native `.help` tooltip, not an inline label.
+    /// The slot's WIDTH is laid out on every roster row, always — even where the chip is hidden (the active
+    /// row) — so NEITHER the chip's resting presence NOR its hover-brighten can REFLOW the row: the label's
+    /// available width is identical hidden / resting / armed, and so is its truncation (the issue's
+    /// row-width watch-out). The auth column also stays aligned across active and non-active rows. The
+    /// why-text never truncates: it is a native `.help` tooltip, not an inline label.
     ///
-    /// This hover-reveal is itself the mis-click guard — the full rationale lives on `RowSwitchButtonStyle`.
+    /// The emphasis (hidden / resting / armed) is a pure `StatusPanelFormat.switchChipEmphasis` verdict, so
+    /// the resting-visible-vs-armed-brighten distinction is unit-asserted; the view only maps it to a
+    /// neutral system tint. ARMING (not the resting presence) is the mis-click guard — the full rationale
+    /// lives on `RowSwitchButtonStyle`.
     @ViewBuilder
     private var switchSlot: some View {
         Group {
             if isSwitching {
                 ProgressView().controlSize(.small)
-            } else if offersSwitch, isHovering {
-                // A blocked row reveals a DISTINCT glyph (`nosign`), not a dimmer swap arrow: "you cannot
-                // switch here" is a different fact from "switch here", and shape carries it without color.
-                Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
-                    .font(.system(size: 11, weight: .semibold))
-                    // Neutral / secondary-text weight — never `.tint`. The accent belongs to the footer
-                    // Swap button alone (Von Restorff: one accent action per panel).
-                    .foregroundStyle(.secondary)
-                    .opacity(blockReason == nil ? 1 : 0.55)
             } else {
-                Color.clear
+                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, armed: isHovering) {
+                case .hidden:
+                    Color.clear
+                case .resting:
+                    // Quiet at rest — `.tertiary` ≈ the mock's `--text-3` decorative token. Never `.tint`:
+                    // the one accent action is the footer Swap (Von Restorff, one accent per panel).
+                    chipGlyph.foregroundStyle(.tertiary)
+                case .armed:
+                    // Brightened once armed — `.secondary` ≈ the mock's `--text-2`. A SEMANTIC tint step,
+                    // not a hardcoded opacity (#388 / #448).
+                    chipGlyph.foregroundStyle(.secondary)
+                }
             }
         }
         .frame(width: CGFloat(StatusPanelFormat.switchAffordanceSlotWidth), alignment: .trailing)

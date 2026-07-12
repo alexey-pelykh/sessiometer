@@ -21,11 +21,12 @@ blacks out the vibrancy). Run from this directory:
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --hide-scrollbars --force-device-scale-factor=1.5 \
-  --window-size=1200,8200 --screenshot=renders/all-states.png \
+  --window-size=1200,8600 --screenshot=renders/all-states.png \
   menubar-preview.html
 ```
 
-(Bump the `--window-size` height if the page ever grows past it.)
+(Bump the `--window-size` height if the page ever grows past it — the committed render is
+1800×12900 at this `8600` height × the `1.5` device scale; a shorter height clips the notes.)
 
 ## Rendering the BUILT panel (design-parity check)
 
@@ -55,9 +56,11 @@ which is the mock). Light shown here:
   the mock's illustrative "snapshot 12s old". Resets no longer diverge: the mock now uses the CLI's
   compact duration form too ("2h14m" / "3d"), not a day-name (#387)
 - the **Swap** button is LIVE as of #169 (it sends the displayed `next_swap` target over the daemon's
-  `swap` command). Each non-active roster row is also a quiet, hover-revealed manual switch — an
-  affordance the mock does not spec, so the #169 body is its reference; at rest the row keeps a
-  trailing action slot for it, which is why the auth glyph sits ~27 pt further left than in the mock
+  `swap` command). Each non-active roster row is also a manual switch — as of #448 a **persistent, quiet
+  trailing chip** (neutral `.tertiary` at rest, brightening to `.secondary` when the row is armed on
+  hover/focus), which the mock now specs (the resting chip on every switchable row); at rest the row
+  keeps a trailing action slot for it, which is why the auth glyph sits ~37 pt further left than in the
+  mock (the #448-widened 28 pt slot + its 9 pt spacing)
 - no Status/Stats segmented control — Stats has no socket data path (spike #356)
 
 (Capture placement is now reconciled with the mock, not a difference: the **populated** panel carries
@@ -73,11 +76,16 @@ run). The status-item "Add account…" capture surface (#394) is a menu-triggere
 does not render at all, so it is likewise a manual real-popover check. Treat a blank/placeholder
 capture-field box in the PNGs as a known tool artifact, not a panel defect.
 
-**Harness limitation — HOVER states are NOT captured.** `ImageRenderer` draws one resting frame, so
-the #169 per-row manual switch (its revealed `arrow.left.arrow.right` glyph, the `nosign` on a
-non-viable row, the row wash, the `pointingHand` cursor) and the in-flight `Switching…` spinner never
-appear in these PNGs — the rows correctly render at rest. Those states, like the real-popover swap
-round-trip, are a manual operator check (#380).
+**Harness limitation — ARMED / in-flight states are NOT captured.** `ImageRenderer` draws one resting
+frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a **fresh** render captures its
+resting glyph (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at its quiet `.tertiary`
+emphasis. What a single resting frame still can't show is the ARMED state — the hover/focus brighten to
+`.secondary`, the row wash, the `pointingHand` cursor — nor the in-flight `Switching…` spinner; those
+are interaction states, so they stay a manual operator check (#380) — as does the real-popover swap
+round-trip. **Note:** the committed `panel-healthy-*.png` are stale (pre-#448) — `--render-panel`
+currently crashes on `main` (missing `PanelStatsModel`, issue #504); regenerate them once #504 lands.
+#448 validated against the **mock** render (`all-states.png`, which does show the chip) + unit tests
+instead.
 
 ### Design vs. capture, screen by screen
 

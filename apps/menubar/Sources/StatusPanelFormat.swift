@@ -112,7 +112,8 @@ enum StatusPanelFormat {
     /// its affordance:
     ///   * `notATarget` — the ACTIVE row (a disabled button reads as "broken", so it stays a plain
     ///     display row).
-    ///   * `available` — a viable switch target: an enabled, quiet, hover-revealed button.
+    ///   * `available` — a viable switch target: an enabled button carrying a persistent, quiet swap chip
+    ///     (visible at rest, brightening on hover — #448).
     ///   * `blocked(reason)` — a wire-visibly non-viable target: a disabled button carrying its reason.
     ///
     /// `isEnabled` is accepted and DELIBERATELY IGNORED — pinned as a parameter (rather than simply not
@@ -164,24 +165,31 @@ enum StatusPanelFormat {
 
     // MARK: - Switch-affordance layout budget (issue #169 watch-out: never truncate to something uninformative)
 
-    /// The trailing hover-switch slot's own width in points — wide enough for the swap glyph and for the
-    /// small `ProgressView` that replaces it while the swap is in flight. This EXCLUDES the row `HStack`'s
-    /// 9 pt spacing that precedes it, so the slot's total trailing cost is `switchAffordanceSlotWidth + 9`.
+    /// The trailing swap-chip slot's own width in points — wide enough for the swap glyph and for the small
+    /// `ProgressView` that replaces it while the swap is in flight. This EXCLUDES the row `HStack`'s 9 pt
+    /// spacing that precedes it, so the slot's total trailing cost is `switchAffordanceSlotWidth + 9`.
     ///
-    /// The slot is laid out on EVERY roster row — invisible on the active row, and at rest on the others.
-    /// Two consequences, both load-bearing: the auth column stays aligned across active and non-active
-    /// rows, and, decisively, revealing the glyph on hover can never REFLOW the row. The label's available
-    /// width is identical hovered and at rest, so its truncation is too.
-    static let switchAffordanceSlotWidth: Double = 18
+    /// #448 widened this 18 → 28: the chip is no longer hover-REVEALED but PERSISTENT — a quiet, low-emphasis
+    /// mark shown at rest on every switch target so a first-time operator sees the row is actionable on a
+    /// transient popover — so the slot now carries a visible glyph in the steady state and earns a little
+    /// more room to sit comfortably (still far under the row's spare width; see `switchAffordanceMinRowWidth`).
+    ///
+    /// The slot is laid out on EVERY roster row — empty on the active row, the quiet chip at rest on the
+    /// others. Two consequences, both load-bearing: the auth column stays aligned across active and
+    /// non-active rows, and, decisively, NEITHER the chip's resting presence NOR its hover-brighten can
+    /// REFLOW the row (the slot width is identical hidden / resting / armed). The label's available width is
+    /// constant, so its truncation is too.
+    static let switchAffordanceSlotWidth: Double = 28
 
     /// The minimum row width, in points, at which the manual-switch affordance is offered at all.
     ///
     /// Derived from the row's fixed columns at their tightest: 16 (row insets) + 8 (status dot) + 9 +
     /// 30 (monogram) + 9 + 64 (a label floor worth reading) + 6 (min spacer) + 60 (auth glyph + its
-    /// longest cue) + 27 (the slot plus its 9 pt spacing) ≈ 229, rounded up for breathing room. Below
-    /// this, the affordance is not merely hidden — the row is not interactive AT ALL, so a too-narrow row
-    /// can never degrade into an invisible whole-row hot-zone (the mis-click hazard hover-reveal exists to
-    /// prevent).
+    /// longest cue) + 37 (the #448-widened 28 pt slot plus its 9 pt spacing) ≈ 239 — kept at the round 240
+    /// floor (the shipped `defaultRowWidth` ≈ 364 clears it with ~125 pt to spare, so the +10 slot bump does
+    /// not press it). Below this, the affordance is not merely hidden — the row is not interactive AT ALL, so
+    /// a too-narrow row can never degrade into an invisible whole-row hot-zone (the mis-click hazard the
+    /// arm-on-hover guard exists to prevent: the chip is quiet and cursor-less at rest, armed only on hover).
     static let switchAffordanceMinRowWidth: Double = 240
 
     /// Whether a row of `rowWidth` points can host the manual-switch affordance without squeezing the
@@ -202,6 +210,35 @@ enum StatusPanelFormat {
 
     /// The width available to one roster row on the shipped fixed-width panel.
     static var defaultRowWidth: Double { panelContentWidth - 2 * rosterHorizontalInset }
+
+    // MARK: - Swap-chip emphasis (issue #448 — persistent-quiet, brightens when armed)
+
+    /// The per-row swap chip's emphasis level. #169 revealed the trailing swap glyph ONLY on hover, so on a
+    /// transient popover a first-time operator never saw a row was actionable. #448 makes it PERSISTENT: a
+    /// quiet, low-emphasis mark shown AT REST on every switch target, that BRIGHTENS when the row is armed
+    /// (hover / focus). The view maps each level to a neutral SYSTEM tint — `.resting` → `.tertiary`
+    /// (≈ the mock's `--text-3` decorative token), `.armed` → `.secondary` (≈ `--text-2`) — a SEMANTIC tint
+    /// step, never a hardcoded opacity (the #388 "tints/opacities live in the testable layer" discipline).
+    /// Neutral at every level, never `.tint`: the one accent action is the footer Swap (Von Restorff).
+    enum SwitchChipEmphasis: Equatable {
+        /// No chip — the active row / a dropped connection (the row is not a switch target), left pure data.
+        case hidden
+        /// Visible but quiet — the steady state on a switch target (viable OR wire-blocked; the glyph SHAPE,
+        /// arrow vs `nosign`, carries the block, not the emphasis).
+        case resting
+        /// Brightened — the row is armed (hovered / focused), inviting the press.
+        case armed
+    }
+
+    /// The chip emphasis for a row (issue #448). Kept HERE (not decided inline in the view) so the
+    /// resting-visible-vs-armed-brighten distinction is unit-asserted against the design intent rather than
+    /// buried in SwiftUI. `offersSwitch` is the view's own gate (a non-active row that fits the width);
+    /// `armed` is whether the row is currently hovered/focused. A non-target row is `.hidden`; a switch
+    /// target is `.resting` at rest and `.armed` once armed — the persistent-quiet → brighten behavior.
+    static func switchChipEmphasis(offersSwitch: Bool, armed: Bool) -> SwitchChipEmphasis {
+        guard offersSwitch else { return .hidden }
+        return armed ? .armed : .resting
+    }
 
     // MARK: - Swap phase copy (issue #169 — the in-flight / settled swap states)
 
