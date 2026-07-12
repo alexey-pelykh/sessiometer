@@ -42,6 +42,25 @@ fileprivate extension Color {
         case .primary:         return .primary
         }
     }
+
+    /// Build a neutral panel FILL (#388) from the testable `StatusPanelFormat.neutralFill` spec as a PLAIN
+    /// sRGB translucent color — deliberately NOT routed through the panel material, so the source-over
+    /// composite matches the mock's rgba math. This REPLACES `Color.secondary.opacity(k)` for chrome fills:
+    /// `.secondary` is a label-family tint (already ~0.5 alpha over base ~(60,60,67)), so opacity-ing it for
+    /// a fill washed out at ≈half the mock's alpha over the wrong hue (the #388 washout). The theme value is
+    /// chosen by the caller from `@Environment(\.colorScheme)`.
+    static func panelFill(_ role: StatusPanelFormat.NeutralFillRole, dark: Bool) -> Color {
+        let c = StatusPanelFormat.neutralFill(role, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// Build an accent-emphasis fill (#388) — `Color.accentColor` at the role's theme-aware `accentOpacity`.
+    /// The accent counterpart to `panelFill`: it centralises the `accentColor.opacity(accentOpacity(…))`
+    /// composition so each call site names the emphasis SURFACE, not the mechanism. The accent HUE stays the
+    /// brand-blue `AccentColor` asset (#391); only the theme-variant alpha comes from the token.
+    static func accentEmphasis(_ emphasis: StatusPanelFormat.AccentEmphasis, dark: Bool) -> Color {
+        Color.accentColor.opacity(StatusPanelFormat.accentOpacity(emphasis, dark: dark))
+    }
 }
 
 /// The panel's fixed layout constants — thin references to the source-of-truth in `StatusPanelFormat`
@@ -290,6 +309,9 @@ private struct RowSwitchButtonStyle: ButtonStyle {
             .contentShape(RoundedRectangle(cornerRadius: 9))
             .background(
                 RoundedRectangle(cornerRadius: 9)
+                    // #388-EXEMPT: a COMPUTED hover/press interaction wash, not one of the mock's absolute
+                    // chrome fills (the static mock has no hover state), so it keeps `Color.secondary.opacity(k)`
+                    // rather than a `panelFill` token — `wash` is 0 at rest, a faint neutral only while live+hovered.
                     .fill(Color.secondary.opacity(wash(pressed: configuration.isPressed)))
             )
     }
@@ -314,6 +336,8 @@ private struct AccountRowView: View {
     let switchState: StatusPanelFormat.RowSwitchState
 
     @EnvironmentObject private var swap: AccountSwapModel
+    /// The active row's accent-tint fill opacity is theme-aware (#388): the mock raises it in dark mode.
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovering = false
     /// Whether this row currently owns a pushed `pointingHand` cursor — tracked so a push is always
     /// balanced by exactly one pop, even when the row stops being live WHILE the pointer is inside it
@@ -444,9 +468,14 @@ private struct AccountRowView: View {
                 Spacer(minLength: 6)
 
                 if row.isActive {
-                    // The design reference's accent "ACTIVE" tag — one of the row's THREE active cues
-                    // (leading filled dot + this tag + accent-tint row), so active never rides on color
-                    // alone (R-2 / WCAG 1.4.1).
+                    // The "ACTIVE" tag — one of the row's THREE active cues (leading filled dot + this tag +
+                    // accent-tint row), so active never rides on color alone (R-2 / WCAG 1.4.1). TREATMENT
+                    // DIVERGES from the current mock and is tracked in #501: this renders an ACCENT,
+                    // letter-spaced, outlined uppercase pill, but the perfected mock
+                    // (`menubar-preview.html:215-225`) specifies a NEUTRAL sentence-case capsule (`--badge-bg`
+                    // fill, `--text-2` text, NO border) to cut active over-signalling (#387 M5). Re-tinting is
+                    // a treatment change beyond #388's color/opacity scope, so the accent-border opacity below
+                    // is intentionally NOT theme-bumped here — the mock has no accent tag border to match.
                     Text("ACTIVE")
                         .font(.system(size: 9, weight: .bold))
                         .tracking(0.6)
@@ -475,10 +504,13 @@ private struct AccountRowView: View {
         // dropped (#387 M5, ratified) to cut active over-signaling — active stays redundantly encoded by
         // the filled leading dot (shape) + the "ACTIVE" tag + the tint, so color is never the SOLE signal
         // (WCAG 1.4.1 / R-2 state-parity holds). The mock's active-ring is dropped in lockstep
-        // (menubar-preview.html `.acct.active` / `.stat.active`).
+        // (menubar-preview.html `.acct.active` / `.stat.active`). The fill OPACITY is theme-aware (#388,
+        // mock `--active-bg`): .08 light / .15 dark — the dark active row was ~1.5× too faint when hardcoded.
         .background(
             RoundedRectangle(cornerRadius: 9)
-                .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
+                .fill(row.isActive
+                      ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark)
+                      : Color.clear)
         )
     }
 
@@ -586,10 +618,12 @@ private struct AccountRowView: View {
 /// brand mark or color). Accessibility-hidden; the row's VoiceOver label already speaks the identity.
 private struct MonogramBadge: View {
     let label: String
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         RoundedRectangle(cornerRadius: 8)
-            .fill(Color.secondary.opacity(0.16))
+            // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
+            .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
             .frame(width: 30, height: 30)
             .overlay(
                 Text(initial)
@@ -652,6 +686,9 @@ private struct UsageMeter: View {
         case .red:    return .red
         case .yellow: return .orange
         case .green:  return .green
+        // #388-EXEMPT: reached only when `severity == nil` ⇒ `pct == nil` ⇒ `fraction == 0` ⇒ the `UsageBar`
+        // fill has ZERO width (a failed poll shows a BARE track, matching the mock), so this muted color never
+        // actually paints. No absolute mock fill exists for the failed-poll bar → keeps `secondary.opacity`.
         case .none:   return Color.secondary.opacity(0.45)
         }
     }
@@ -671,11 +708,13 @@ private struct UsageMeter: View {
 private struct UsageBar: View {
     let fraction: Double
     let color: Color
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.secondary.opacity(0.20))
+                // Track = mock `--track` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.20)`.
+                Capsule().fill(Color.panelFill(.track, dark: colorScheme == .dark))
                 Capsule().fill(color)
                     .frame(width: fillWidth(geo.size.width))
             }
@@ -700,11 +739,13 @@ private struct UsageBar: View {
 /// Provider-neutral (issue #15): a generic gauge, no brand mark or color.
 private struct PanelHeader: View {
     let subtitle: String
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 7)
-                .fill(Color.secondary.opacity(0.16))
+                // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
+                .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
                 .frame(width: 27, height: 27)
                 .overlay(
                     Image(systemName: "gauge.medium")
@@ -735,19 +776,29 @@ private struct PanelHeader: View {
 /// VoiceOver label state it in words.
 private struct StatusDot: View {
     let isActive: Bool
+    /// The active halo opacity is theme-aware (#388, mock `--accent-halo`); the inactive ring takes the
+    /// mock's `--text-3` (a tertiary-label neutral), not a washed `secondary.opacity`.
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Circle()
             .fill(isActive ? Color.accentColor : Color.clear)
             .overlay(
-                Circle().strokeBorder(Color.secondary.opacity(0.55), lineWidth: isActive ? 0 : 1.5)
+                // Inactive ring = mock `--text-3` (`.acct:not(.active) .dot { inset 0 0 0 1.5px var(--text-3) }`).
+                // `.tertiaryLabelColor` is the label-family neutral the footer freshness line also uses for
+                // `--text-3` (one token, one impl); it REPLACES `Color.secondary.opacity(0.55)`, which
+                // rendered ≈half the mock's neutral (the #388 washout).
+                Circle().strokeBorder(Color(nsColor: .tertiaryLabelColor), lineWidth: isActive ? 0 : 1.5)
             )
             .frame(width: 8, height: 8)
             // The design reference rings the active disc with a soft accent halo (`box-shadow 0 0 0 3px`) —
-            // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue.
+            // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue. Its
+            // opacity is theme-aware (#388, mock `--accent-halo`): .20 light / .30 dark.
             .background {
                 if isActive {
-                    Circle().fill(Color.accentColor.opacity(0.20)).frame(width: 14, height: 14)
+                    Circle()
+                        .fill(Color.accentEmphasis(.activeDotHalo, dark: colorScheme == .dark))
+                        .frame(width: 14, height: 14)
                 }
             }
             .accessibilityHidden(true)
@@ -808,6 +859,8 @@ private struct SwapCalloutCard: View {
     let reason: String?
 
     @EnvironmentObject private var swap: AccountSwapModel
+    /// The callout's accent-tint fill + border opacities are theme-aware (#388): the mock raises them in dark.
+    @Environment(\.colorScheme) private var colorScheme
 
     /// The in-flight swap is this card's own target (as opposed to a per-row switch elsewhere).
     private var isSwitchingToTarget: Bool { swap.phase.pendingTarget == target }
@@ -861,11 +914,13 @@ private struct SwapCalloutCard: View {
                                 : StatusPanelFormat.switchHelpText(label: target))
         }
         .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
+        // Fill + border opacities are theme-aware (#388, mock `--accent-tint` / `--accent-tint-border`):
+        // .10/.20 light, .16/.30 dark — the dark callout was too faint hardcoded to the light values.
         .background(
             RoundedRectangle(cornerRadius: 9)
-                .fill(Color.accentColor.opacity(0.10))
+                .fill(Color.accentEmphasis(.swapCalloutFill, dark: colorScheme == .dark))
                 .overlay(RoundedRectangle(cornerRadius: 9)
-                    .strokeBorder(Color.accentColor.opacity(0.20), lineWidth: 0.5))
+                    .strokeBorder(Color.accentEmphasis(.swapCalloutBorder, dark: colorScheme == .dark), lineWidth: 0.5))
         )
         .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
     }
@@ -1035,6 +1090,7 @@ private struct CaptureAffordance: View {
 /// ack back).
 private struct CaptureCard: View {
     let title: String
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -1049,7 +1105,8 @@ private struct CaptureCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+        // Mock `--card-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.08)`.
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
     }
 }
 
