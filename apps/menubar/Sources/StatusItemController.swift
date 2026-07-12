@@ -62,15 +62,13 @@ final class StatusItemController {
         self.statsModel = statsModel
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        // #326's status panel reads the store via `@EnvironmentObject` (a thin view over the
-        // `src/cli.rs`-mirroring `StatusPanelFormat`), so inject it here rather than through an init. The
-        // #360 capture affordance reads the `AccountCaptureModel` the same way, and the #169 swap
-        // affordance the `AccountSwapModel` — all injected alongside.
+        // #326's status panel reads its dependencies via `@EnvironmentObject`: the store (a thin view over the
+        // `src/cli.rs`-mirroring `StatusPanelFormat`), the #360 capture affordance's `AccountCaptureModel`, the
+        // #169 swap affordance's `AccountSwapModel`, and the #446 Stats tab's `PanelStatsModel`. Inject the
+        // COMPLETE set here through the shared `statusPanelEnvironment` modifier — the SAME wiring the DEBUG
+        // `--render-panel` harness uses, so the app and the harness cannot drift (issue #504).
         let hosting = NSHostingView(rootView: StatusPanelView()
-            .environmentObject(store)
-            .environmentObject(captureModel)
-            .environmentObject(swapModel)
-            .environmentObject(statsModel))
+            .statusPanelEnvironment(store: store, capture: captureModel, swap: swapModel, stats: statsModel))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         self.hostingView = hosting
 
