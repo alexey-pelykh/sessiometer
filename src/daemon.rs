@@ -239,17 +239,41 @@ const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
 /// [`Event::BlindGateEligible`] no-viable-target
 /// falsifier) BEFORE #452's swap path is built — #452 replaces this constant with the
 /// `session_blind_swap_secs` CONFIG tunable (ADR-0017 assigns the tunables to #452, not here). The
-/// interim value (300 s) is the one ADR-0017 names, to be finalised by the #451 gate; measuring at
-/// exactly it is what lets #451/#484 confirm-or-refute the constant against production.
+/// interim value (300 s) is the one ADR-0017 names; measuring the SLI at exactly it is what lets
+/// #484 confirm-or-refute the constant against production.
+///
+/// INTERIM / REVERSIBLE — stays so until the production ratification bar (issue #484, documented on
+/// [`BLIND_GATE_RISK_BAND`] and shared by both constants) is met; promotion reads PRODUCTION SLIs
+/// (#482 / #449 / #455), NOT a re-run of the #451 replay.
 const BLIND_GATE_SECS: u64 = 300;
 /// Interim `risk_band` for the #452 gate (ADR-0017), as a session-usage fraction: the retained
 /// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) must be at/over this for the gate to
 /// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_trigger`
 /// ([`Daemon::session_trigger_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
 /// stale anchor, before the account would have tripped the reactive band. SLI-only (issue #482)
-/// until #452's `session_blind_risk_band` config tunable supersedes it; the interim value (65 %) is
-/// the one ADR-0017 names, to be finalised by #451.
-const BLIND_GATE_RISK_BAND: f64 = 0.65;
+/// until #452's `session_blind_risk_band` config tunable supersedes it.
+///
+/// INTERIM / REVERSIBLE, biased CONSERVATIVE (issue #484). ADR-0017 named the interim at 65 %; #484
+/// biases it to the low end of a conservative **[60, 65] band** — the interim evolution the ADR
+/// anticipated ("to be finalised"), not a rewrite. Why low: the #451 replay is FLAT (0 walls /
+/// disasters / false-preempts) all the way from 68 % down to 50 %, so the data bounds only the
+/// CEILING (≤ 68 % — above it the gate can't fire before S1's own pre-blind anchor) and leaves the
+/// floor free. With the floor undetermined the swap-timing asymmetry decides it: firing LATE misses
+/// the swap outright (unrecoverable), firing EARLY only spends a swap onto a still-recoverable
+/// target — so more margin (a lower band) is the cheap-error direction. 60 % is that low end;
+/// production evidence is required to move it UP.
+///
+/// PROMOTION BAR (interim → locked), shared with [`BLIND_GATE_SECS`], read off PRODUCTION SLIs — NOT
+/// a re-run of the #451 replay (which only reproduces its own assumptions: linear velocity,
+/// `t_fire = T` ignoring the ±1-poll-tick granularity, n=3 from one fleet). Holds interim until ALL:
+/// (1) **≥ 5** distinct gated-eligible blind episodes (#482 [`Event::BlindGateEligible`],
+/// `viable_target=true`) — 5 itself a conservative interim, above the replay's discredited n=3;
+/// (2) **zero session walls** across them (no `reason=session` swap-out or blind recovery at/over
+/// ~99 %, via #455's swap-out overshoot P100 SLO + #449's `blind_window` `session_at_recovery`);
+/// (3) a **majority** classified `swap_necessary=true` (#482's post-recovery swap-necessity —
+/// `session_at_recovery` climbed meaningfully above the stale anchor over its `anchor_age`). A
+/// promotion commit cites those readings; absent them the band holds at 60 %.
+const BLIND_GATE_RISK_BAND: f64 = 0.60;
 /// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
 /// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
 /// the same config — and the N accounts within a cycle — do not synchronize an
@@ -7975,8 +7999,8 @@ mod tests {
     #[tokio::test]
     async fn blind_gate_eligible_signals_a_viable_target_once_past_the_interim_t() {
         // Issue #482 SLI #1 (umbrella #363 Path B): the #452 preemptive-swap gate's premise falsifier.
-        // The active account's retained anchor sits at 70 % — inside the 65 % interim risk band, below
-        // the 95 % reactive trigger — and a peer (u-B) has session reserve under the 80 % target_max.
+        // The active account's retained anchor sits at 70 % — inside the interim risk band (≥ 60 %,
+        // #484), below the 95 % reactive trigger — and a peer (u-B) has session reserve under the 80 % target_max.
         // Once the active has been blind past the interim T, the gate is ELIGIBLE and a viable target
         // exists, so the ADR-0017 cost-asymmetry premise holds this episode: exactly one
         // `blind_gate_eligible` with `viable_target=true`, emitted whether or not a swap follows.
@@ -8072,9 +8096,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blind_gate_risk_band_holds_in_the_conservative_interim_band() {
+        // Issue #484: the interim `risk_band` is biased CONSERVATIVE to the 0.60 low end and MUST
+        // sit in the [0.60, 0.65] band until the documented production ratification bar (≥ 5
+        // gated-eligible episodes, zero session walls, majority `swap_necessary`) promotes it. The
+        // #451 replay bounds only the ≤ 0.68 CEILING, so the floor is a deliberate conservative choice,
+        // not data — this locks it against silently drifting back up toward that ceiling absent
+        // production evidence.
+        assert!(
+            (0.60..=0.65).contains(&BLIND_GATE_RISK_BAND),
+            "risk_band {BLIND_GATE_RISK_BAND} left the conservative interim [0.60, 0.65] band (#484)"
+        );
+    }
+
     #[tokio::test]
     async fn blind_gate_below_the_interim_risk_band_never_signals() {
-        // Issue #482 SLI #1: an anchor comfortably below the 65 % interim risk band (50 %) never makes
+        // Issue #482 SLI #1: an anchor comfortably below the interim risk band (50 % < 60 %, #484) never makes
         // the gate eligible, however long the active stays blind — the gate acts only on a near-band
         // anchor, so a low-usage blind active is not a premise data point.
         let mut daemon = three_account_daemon(
