@@ -2078,6 +2078,42 @@ pub(crate) fn render_status(
     }
 
     out.push('\n');
+    // The bounded-blindness active-state line (issue #479, umbrella #363 Path B): when the daemon
+    // holds a retained pre-blind anchor for a BLIND active account, narrate the REAL state — how
+    // long it has been blind, its last-known session %, and whether ADR-0017 auto-protection is OK
+    // or DEGRADED — instead of leaving the active row a content-free `n/a … 🟡`. Printed as DATA
+    // (unconditional, so it survives a pipe / redirect / `status | grep` — an operator's health
+    // check must be able to see it), like the systemic-refresh line below; only the DEGRADED
+    // emphasis is color-gated. The surface only REFLECTS daemon-pushed state — it never self-polls
+    // the usage API and never self-swaps (the #169 UI-never-acts invariant). `blind_active` is set
+    // only on the active account and only while blind (a pre-#479 daemon omits it → no line).
+    if let Some((label, blind)) = response
+        .accounts
+        .iter()
+        .find(|account| account.active)
+        .and_then(|account| account.blind_active.map(|blind| (&account.label, blind)))
+    {
+        let dur = humanize_until(blind.blind_secs as i64);
+        let last_known = blind.last_known_session_pct;
+        // DEGRADED is a fault: the ADR-0017 preemptive gate is armed but acting on a STALE anchor.
+        // Red emphasis when the color gate is open AND degraded — the SAME SGR overlay the
+        // systemic-refresh line uses — while the plain text still conveys it under --no-color.
+        let verdict = if blind.auto_protection_degraded {
+            "DEGRADED (acting on a stale anchor)"
+        } else {
+            "OK"
+        };
+        let body = format!(
+            "active {label}: blind for {dur} — last-known session {last_known}% — \
+             auto-protection {verdict}"
+        );
+        if color && blind.auto_protection_degraded {
+            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
+        } else {
+            out.push_str(&body);
+            out.push('\n');
+        }
+    }
     // The forward-looking next-swap candidate (issue #88), computed daemon-side
     // ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like
     // the table footer it replaces (per-cell health coloring is #84, orthogonal). A
@@ -2274,7 +2310,15 @@ impl StatusRow {
         let marker = if account.active { '*' } else { ' ' };
         StatusRow {
             account: format!("{marker} {}", account.label),
-            session: pct(account.session_pct),
+            // A blind active account with a retained anchor shows its last-known session % with a
+            // `~` (stale / approximate) marker, NOT a bare `n/a` — the row stops reporting "no data"
+            // when the daemon holds a pre-blind anchor (#479); the full state (blind duration +
+            // auto-protection OK/DEGRADED) trails as the footer line. Every other account keeps the
+            // fresh-reading-or-`n/a` cell.
+            session: match account.blind_active {
+                Some(blind) => format!("~{}%", blind.last_known_session_pct),
+                None => pct(account.session_pct),
+            },
             session_reset: reset_cell(account.session_resets_at, now),
             weekly: pct(account.weekly_pct),
             weekly_reset: reset_cell(account.weekly_resets_at, now),
@@ -2285,7 +2329,13 @@ impl StatusRow {
             // its OWN proximity (issue #94), how soon that window flips. A cell with no
             // reading stays `None` (uncolored).
             account_severity: severity(account, now),
-            session_severity: account.session_pct.map(util_severity),
+            // A blind active account colors its stale `~%` by the last-known utilization band — the
+            // anchor's near-limit reading IS the risk the operator should see (#479); otherwise the
+            // fresh reading's band, or uncolored when there is no reading.
+            session_severity: match account.blind_active {
+                Some(blind) => Some(util_severity(blind.last_known_session_pct)),
+                None => account.session_pct.map(util_severity),
+            },
             session_reset_severity: proximity_severity(account.session_resets_at, now),
             weekly_severity: weekly_cell_severity(account),
             weekly_reset_severity: proximity_severity(account.weekly_resets_at, now),
@@ -3815,7 +3865,7 @@ fn remove_confirmation(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Tunables;
-    use crate::daemon::{AccountStatusLine, NextSwap, NoTargetCause};
+    use crate::daemon::{AccountStatusLine, BlindActive, NextSwap, NoTargetCause};
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -4135,6 +4185,119 @@ spare  22222222-2222\n\
         assert!(
             !render_status(&response(None), NOW, None, false).contains("refresh mechanism"),
             "no DOWN line when the mechanism is healthy"
+        );
+    }
+
+    #[test]
+    fn render_status_narrates_a_blind_active_account_instead_of_bare_n_a() {
+        // Issue #479: a blind active account with a retained anchor renders a SEMANTIC line (blind
+        // duration + last-known session % + auto-protection state) plus a stale `~%` cell, not the
+        // content-free `n/a … 🟡` the bare failed-poll row shows.
+        let degraded = AccountStatusLine {
+            health: Some(CredentialHealth::Stale),
+            blind_active: Some(BlindActive {
+                blind_secs: 480,
+                last_known_session_pct: 87,
+                auto_protection_degraded: true,
+            }),
+            ..status_line("work", true, None, None)
+        };
+        let response = StatusResponse {
+            systemic_refresh_failure: None,
+            refresh_enabled: None,
+            accounts: vec![degraded],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        // The semantic footer line states the REAL state — not "no data".
+        assert!(
+            out.contains("active work: blind for")
+                && out.contains("last-known session 87%")
+                && out.contains("auto-protection DEGRADED"),
+            "the blind active account is narrated with its retained anchor + degraded gate: {out}",
+        );
+        // The row's SESSION% cell shows the stale last-known `~87%`, not a bare `n/a`.
+        assert!(
+            out.contains("~87%"),
+            "the session cell shows the stale anchor pct, not n/a: {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_blind_active_ok_below_the_gate_and_absent_when_not_blind() {
+        // Issue #479: OK (blind but not past the gate) says auto-protection OK, no DEGRADED alarm;
+        // a non-blind active account carries no projection → no line and the usual `n/a` cell.
+        let ok = AccountStatusLine {
+            blind_active: Some(BlindActive {
+                blind_secs: 30,
+                last_known_session_pct: 42,
+                auto_protection_degraded: false,
+            }),
+            ..status_line("work", true, None, None)
+        };
+        let out = render_status(
+            &StatusResponse {
+                systemic_refresh_failure: None,
+                refresh_enabled: None,
+                accounts: vec![ok],
+                next_swap: None,
+            },
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            out.contains("auto-protection OK") && !out.contains("DEGRADED"),
+            "a blind-but-not-yet-degraded active reads OK: {out}",
+        );
+
+        // A normal (non-blind) active account: no `blind_active` → no narration line, bare `n/a` cell.
+        let normal = render_status(
+            &StatusResponse {
+                systemic_refresh_failure: None,
+                refresh_enabled: None,
+                accounts: vec![status_line("work", true, None, None)],
+                next_swap: None,
+            },
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            !normal.contains("blind for") && normal.contains("n/a"),
+            "a non-blind account is unchanged — no line, bare n/a: {normal}",
+        );
+    }
+
+    #[test]
+    fn render_status_blind_active_colors_only_the_degraded_footer_under_color() {
+        // Issue #479: the blind footer's color gate is `color && auto_protection_degraded`, so under
+        // `--color` the DEGRADED line is red-wrapped (the SAME SGR overlay the systemic-refresh line
+        // uses) while the OK line stays PLAIN — an OK line is never emphasized even with color on.
+        let blind = |degraded: bool| StatusResponse {
+            systemic_refresh_failure: None,
+            refresh_enabled: None,
+            accounts: vec![AccountStatusLine {
+                blind_active: Some(BlindActive {
+                    blind_secs: 480,
+                    last_known_session_pct: 87,
+                    auto_protection_degraded: degraded,
+                }),
+                ..status_line("work", true, None, None)
+            }],
+            next_swap: None,
+        };
+        // DEGRADED + color → the footer body is wrapped in the red SGR (the reset directly follows it).
+        let degraded = render_status(&blind(true), NOW, None, true);
+        assert!(
+            degraded.contains("auto-protection DEGRADED (acting on a stale anchor)\x1b[0m"),
+            "the degraded blind footer is red-wrapped under --color: {degraded:?}",
+        );
+        // OK + color → the footer stays PLAIN (newline-terminated, no SGR) — the `&& degraded` guard.
+        let ok = render_status(&blind(false), NOW, None, true);
+        assert!(
+            ok.contains("auto-protection OK\n") && !ok.contains("auto-protection OK\x1b[0m"),
+            "the OK blind footer stays plain even under --color: {ok:?}",
         );
     }
 
@@ -4609,6 +4772,7 @@ spare  22222222-2222\n\
             access_expires_at: None,
             refresh_health: None,
             health: None,
+            blind_active: None,
         }
     }
 
@@ -4636,6 +4800,7 @@ spare  22222222-2222\n\
             access_expires_at: None,
             refresh_health: None,
             health: None,
+            blind_active: None,
         }
     }
 

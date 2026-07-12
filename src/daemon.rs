@@ -137,8 +137,8 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
-    StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
+    AccountStatusLine, BlindActive, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion,
+    StatusResponse, StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -274,6 +274,54 @@ const BLIND_GATE_SECS: u64 = 300;
 /// `session_at_recovery` climbed meaningfully above the stale anchor over its `anchor_age`). A
 /// promotion commit cites those readings; absent them the band holds at 60 %.
 const BLIND_GATE_RISK_BAND: f64 = 0.60;
+
+/// The ADR-0017 preemptive-gate ARMING predicate on the retained pre-blind anchor: blind past the
+/// interim [`BLIND_GATE_SECS`] (strict `>`) AND the anchor at/over the interim [`BLIND_GATE_RISK_BAND`]
+/// (`>=`). The SINGLE source of truth for "the gate is armed", so [`blind_active_view`]'s
+/// `auto_protection_degraded` projection (#479) and [`Daemon::note_blind_gate_eligibility`]'s
+/// not-eligible guard (#482) cannot drift apart — both express THIS one predicate (the latter as its
+/// negation) rather than re-encoding the two comparisons independently.
+fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
+    blind_secs > BLIND_GATE_SECS && anchor_session >= BLIND_GATE_RISK_BAND
+}
+
+/// Project the active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) for the
+/// `status` wire, or `None` when the account is not in bounded blindness. PURE — a function of the
+/// retained pre-blind anchor (`last_good`, #450), the blind predicate, the quarantine flag, and the
+/// monotonic clock — so it is unit-tested directly and `status` surfaces a SEMANTIC line
+/// (blind duration + last-known session % + auto-protection OK/DEGRADED) instead of the content-free
+/// `n/a … 🟡` a bare failed-poll row shows.
+///
+/// Returns `Some` only when ALL hold — the same episode shape [`Daemon::note_blind_gate_eligibility`]
+/// gates on, MINUS its viable-target check (surfacing the state does not need a target):
+/// - `active_is_blind` — the active account's live reading is cleared (`last_readings[active]` is
+///   `None`, a `429`/`5xx` blind window), AND
+/// - `!quarantined` — a DEAD (#42) blind active belongs to the `emergency_swap` path, not bounded
+///   blindness; ADR-0017 keeps the two separate, so a quarantined active is excluded, AND
+/// - a retained anchor exists (`anchor` is `Some`, #450) — never a spurious projection on a
+///   genuinely-unknown account with no reading to key off.
+///
+/// `auto_protection_degraded` is the shared [`blind_gate_armed`] predicate — the SAME arming test
+/// [`Daemon::note_blind_gate_eligibility`] gates on (there as its negation), so the two projections
+/// cannot drift apart.
+fn blind_active_view(
+    anchor: Option<LastGood>,
+    active_is_blind: bool,
+    quarantined: bool,
+    at: Instant,
+) -> Option<BlindActive> {
+    if quarantined || !active_is_blind {
+        return None;
+    }
+    let anchor = anchor?;
+    let blind_secs = at.saturating_duration_since(anchor.at).as_secs();
+    Some(BlindActive {
+        blind_secs,
+        last_known_session_pct: to_pct(anchor.session),
+        auto_protection_degraded: blind_gate_armed(blind_secs, anchor.session),
+    })
+}
+
 /// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
 /// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
 /// the same config — and the N accounts within a cycle — do not synchronize an
@@ -2409,11 +2457,12 @@ where
             self.state.blind_gate_signaled = false;
             return;
         };
-        // The gate's first two ADR-0017 conditions on the (constant-through-a-blind-episode) anchor:
-        // blind past the interim T AND the anchor in the interim risk band. Below either → not yet
-        // eligible; leave the latch untouched (it is already clear pre-first-emit).
+        // The gate's first two ADR-0017 conditions on the (constant-through-a-blind-episode) anchor,
+        // via the shared [`blind_gate_armed`] predicate (the same test #479's `blind_active_view`
+        // projects): NOT armed — not yet past the interim T, or the anchor below the risk band → not
+        // yet eligible; leave the latch untouched (it is already clear pre-first-emit).
         let blind_elapsed = at.saturating_duration_since(anchor.at);
-        if blind_elapsed.as_secs() <= BLIND_GATE_SECS || anchor.session < BLIND_GATE_RISK_BAND {
+        if !blind_gate_armed(blind_elapsed.as_secs(), anchor.session) {
             return;
         }
         // Partial-reading guard (#80 warm-up): don't measure viable-target availability off an
@@ -4482,6 +4531,11 @@ where
         readings: &[Option<Usage>],
         now_secs: i64,
     ) -> StatusSnapshot {
+        // One monotonic read for the bounded-blindness projection (issue #479): `blind_elapsed` is
+        // measured against the SAME clock the retained anchor's `at` was stamped on (`last_good`,
+        // #450) — the monotonic `clock` seam, DISTINCT from the wall-clock `now_secs` the freshness
+        // stamp + health rollup read.
+        let blind_at = self.clock.now();
         StatusSnapshot {
             accounts: self
                 .roster
@@ -4526,6 +4580,23 @@ where
                             readings[i].is_some(),
                             now_secs,
                         ),
+                        // The bounded-blindness projection (issue #479): ONLY the active account can
+                        // be in bounded blindness — it is the only one that self-exhausts while
+                        // active and the only one the `last_good` anchor belongs to. Keyed off
+                        // `last_readings[active].is_none()` (the true blind predicate the anchor +
+                        // `note_blind_gate_eligibility` logic use, NOT the masked `readings` arg) and
+                        // the retained anchor; `None` for every other account (and omitted from the
+                        // wire there via `skip_serializing_if`).
+                        blind_active: if active == Some(i) {
+                            blind_active_view(
+                                self.state.last_good,
+                                self.state.last_readings[i].is_none(),
+                                health.quarantined,
+                                blind_at,
+                            )
+                        } else {
+                            None
+                        },
                     }
                 })
                 .collect(),
@@ -8093,6 +8164,145 @@ mod tests {
             )),
             "eligible but no peer has reserve → the no-viable-target falsifier fires: {:?}",
             eligible.events,
+        );
+    }
+
+    #[test]
+    fn blind_active_view_projects_ok_below_the_gate_and_degraded_past_it() {
+        // Issue #479: the bounded-blindness projection is a PURE function of the retained anchor,
+        // the blind predicate, the quarantine flag, and the monotonic clock. A base instant + fixed
+        // deltas make `blind_elapsed` deterministic regardless of wall time.
+        let base = Instant::now();
+        let near_band = LastGood {
+            session: 0.70,
+            weekly: 0.20,
+            at: base,
+        };
+
+        // Blind, anchor in-band, but at EXACTLY T → OK: the gate arms on a strict `>` (matching
+        // `note_blind_gate_eligibility`), so at T it is not yet armed.
+        let ok = blind_active_view(
+            Some(near_band),
+            true,
+            false,
+            base + Duration::from_secs(BLIND_GATE_SECS),
+        )
+        .expect("a blind active account with an anchor projects a state");
+        assert_eq!(ok.blind_secs, BLIND_GATE_SECS);
+        assert_eq!(ok.last_known_session_pct, 70);
+        assert!(
+            !ok.auto_protection_degraded,
+            "at exactly T the strict `>` gate is not yet armed",
+        );
+
+        // One second past T with the anchor in-band → DEGRADED (mirrors the gate exactly).
+        let degraded = blind_active_view(
+            Some(near_band),
+            true,
+            false,
+            base + Duration::from_secs(BLIND_GATE_SECS + 1),
+        )
+        .expect("still projects a state past T");
+        assert!(
+            degraded.auto_protection_degraded,
+            "past T with the anchor at/over the risk band is DEGRADED",
+        );
+        assert_eq!(degraded.blind_secs, BLIND_GATE_SECS + 1);
+
+        // Long past T but the anchor sat BELOW the risk band → OK: the gate would never arm on it,
+        // so auto-protection is nominally intact regardless of how long the account has been blind.
+        let below_band = LastGood {
+            session: BLIND_GATE_RISK_BAND - 0.01,
+            weekly: 0.10,
+            at: base,
+        };
+        let ok_below = blind_active_view(
+            Some(below_band),
+            true,
+            false,
+            base + Duration::from_secs(BLIND_GATE_SECS + 100),
+        )
+        .expect("blind with an anchor still projects");
+        assert!(
+            !ok_below.auto_protection_degraded,
+            "a below-band anchor is never DEGRADED, however long it is blind",
+        );
+    }
+
+    #[test]
+    fn blind_active_view_is_none_when_not_bounded_blindness() {
+        let base = Instant::now();
+        let anchor = LastGood {
+            session: 0.70,
+            weekly: 0.20,
+            at: base,
+        };
+        let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
+        // A live reading (not blind) → no projection, even with an in-band anchor past T.
+        assert!(blind_active_view(Some(anchor), false, false, past_t).is_none());
+        // Blind but NO retained anchor (a genuinely-unknown active) → no spurious projection (#450).
+        assert!(blind_active_view(None, true, false, past_t).is_none());
+        // Blind WITH an anchor but QUARANTINED (dead, #42) → the emergency_swap path owns it, not
+        // bounded blindness (ADR-0017 keeps the two separate).
+        assert!(blind_active_view(Some(anchor), true, true, past_t).is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_projects_blind_active_degraded_for_the_blind_active_account() {
+        // Issue #479: the daemon projects the bounded-blindness state onto the wire snapshot for the
+        // ACTIVE account only. Drive u-A (active, index 0) blind past the interim T with its anchor
+        // in-band, then assert the snapshot carries a DEGRADED `blind_active` on u-A and `None` on
+        // the peers — the same episode the #482 gate-eligibility SLI keys off, now SURFACED.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snap = daemon.snapshot(daemon.state.active, &readings, 0);
+        let active = snap
+            .accounts
+            .iter()
+            .find(|account| account.active)
+            .expect("an active account");
+        let blind = active
+            .blind_active
+            .expect("the blind active account carries a bounded-blindness projection");
+        assert!(
+            blind.auto_protection_degraded,
+            "blind past T with an in-band anchor is DEGRADED: {blind:?}",
+        );
+        assert_eq!(
+            blind.last_known_session_pct, 70,
+            "the projection carries the retained anchor's last-known session pct",
+        );
+        assert!(
+            blind.blind_secs > BLIND_GATE_SECS,
+            "blind_elapsed exceeds the interim T: {}",
+            blind.blind_secs,
+        );
+        assert!(
+            snap.accounts
+                .iter()
+                .filter(|account| !account.active)
+                .all(|account| account.blind_active.is_none()),
+            "only the active account carries a bounded-blindness projection",
         );
     }
 
@@ -13001,6 +13211,68 @@ mod tests {
     }
 
     #[test]
+    fn a_blind_active_account_serializes_its_projection_and_a_normal_one_omits_it() {
+        // Issue #479: `blind_active` rides the wire as an additive OPTIONAL field — present (with its
+        // three sub-fields) for a blind active account, OMITTED (`skip_serializing_if`) for a
+        // non-blind one, so a non-blind frame's per-line bytes stay unchanged across the 1.3 → 1.4
+        // minor bump. Round-trips back to the same projection.
+        let snapshot = StatusSnapshot {
+            generated_at: 42,
+            accounts: vec![
+                AccountReading {
+                    label: "work".to_owned(),
+                    active: true,
+                    blind_active: Some(BlindActive {
+                        blind_secs: 480,
+                        last_known_session_pct: 87,
+                        auto_protection_degraded: true,
+                    }),
+                    ..Default::default()
+                },
+                AccountReading {
+                    label: "spare".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(
+            json.contains(
+                r#""blind_active":{"blind_secs":480,"last_known_session_pct":87,"auto_protection_degraded":true}"#
+            ),
+            "the blind active account carries its projection on the wire: {json}",
+        );
+        // The non-blind peer omits the field entirely (`skip_serializing_if`).
+        let spare_tail = json.split(r#""label":"spare""#).nth(1).unwrap();
+        assert!(
+            !spare_tail.contains("blind_active"),
+            "a non-blind account omits `blind_active` from the wire: {json}",
+        );
+        // Round-trip: the projection decodes back unchanged (a current client reads it).
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        let work = parsed.accounts.iter().find(|a| a.active).unwrap();
+        assert_eq!(
+            work.blind_active,
+            Some(BlindActive {
+                blind_secs: 480,
+                last_known_session_pct: 87,
+                auto_protection_degraded: true,
+            }),
+        );
+        assert!(
+            parsed
+                .accounts
+                .iter()
+                .find(|a| !a.active)
+                .unwrap()
+                .blind_active
+                .is_none(),
+            "the omitted field decodes back to None (serde default)",
+        );
+    }
+
+    #[test]
     fn the_status_wire_is_flat_and_carries_the_frozen_meta() {
         // AC-1: the snapshot carries `schema_version` + `generated_at`, and the payload stays
         // FLAT at the top level (the settled #137–#143 shape, only prefixed with the two meta
@@ -13015,7 +13287,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":3}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":4}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
