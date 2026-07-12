@@ -29,10 +29,14 @@
 //
 // SCOPE: the #324 MINIMAL honest-state baseline — connecting / connected / empty-roster / stale /
 // disconnected / unsupported — PLUS the #169 crash-loop healthy-flash debounce (the crown-jewel
-// anti-#137 mitigation: a crash-looping daemon is held in `.crashLooping`, never flickered healthy).
-// The REMAINING degraded-state-map facets are tracked siblings, NOT this file: keychain-locked (needs
-// a daemon-side wire signal — the watch stream carries none), the not-running / daemon-starting split
-// (needs transport connect-refused enrichment), and the rich version-skew upgrade UX.
+// anti-#137 mitigation: a crash-looping daemon is held in `.crashLooping`, never flickered healthy)
+// PLUS the #499 not-running / daemon-starting split: a COLD connect-refused (no live connection EVER
+// held this session — discriminated by `hasEverConnected`, NOT by transport enrichment) reads as the
+// transient `.starting` within a short start grace, then escalates to the durable `.notRunning` once
+// the grace elapses still refused — both distinct from a WARM `.disconnected` drop (a live connection
+// held, then lost). The REMAINING degraded-state-map facets are tracked siblings, NOT this file:
+// keychain-locked (needs a daemon-side wire signal — the watch stream carries none) and the rich
+// version-skew upgrade UX.
 //
 // STORE-SIDE STALENESS WATCHDOG (#344): staleness must NOT depend solely on the transport's
 // byte-level liveness timer. The transport re-arms that timer on ANY non-empty line — garbage,
@@ -86,6 +90,20 @@ enum ConnectionState: Equatable, Sendable {
     /// single drop) and `.connecting` (a benign first/single (re)connect still awaiting stabilization).
     case crashLooping
 
+    /// The daemon is being (re)connected but the socket has REFUSED the connect and NO live connection has
+    /// ever been held this session, WITHIN a short start grace (issue #499) — a transient "coming up" state
+    /// that self-resolves the moment the daemon accepts the socket. Distinct from `.connecting` (the first
+    /// connect still IN FLIGHT, no refusal observed yet) — they share the benign forming glance but carry
+    /// different panel banners. NEVER healthy. Escalates to `.notRunning` if the grace elapses still refused.
+    case starting
+
+    /// A connect-refused that has PERSISTED past the start grace with no live connection ever held (issue
+    /// #499) — the durable "no daemon" state: the one that WOULD host a Start-daemon affordance (launch-at-
+    /// login is #170, deferred → degrades to an inert explanatory banner, no button). Distinct from
+    /// `.disconnected` (a socket that WAS connected and then dropped — a warm loss, not an absent daemon)
+    /// and from `.starting` (still within the hopeful grace). NEVER healthy.
+    case notRunning
+
     /// Whether this is the one healthy state. The never-healthy-when-dead invariant is exactly
     /// "`isHealthy` is false on every degraded or absent path".
     var isHealthy: Bool {
@@ -111,6 +129,13 @@ enum StatusGlyph: Equatable, Sendable {
     /// The crash-loop FAULT glyph (issue #169) — a persistent fault shape, emitted for
     /// `ConnectionState.crashLooping`; never the healthy glyph.
     case crashLooping
+    /// The daemon-starting forming glyph (issue #499) — a STATIC "coming up" shape emitted for
+    /// `ConnectionState.starting` (never a fake spinner; the app fakes no progress). A benign forming
+    /// glance, never healthy.
+    case starting
+    /// The daemon-not-running glyph (issue #499) — a distinct "no daemon" shape emitted for
+    /// `ConnectionState.notRunning`; never healthy, and distinct from `.disconnected` (a dropped socket).
+    case notRunning
 }
 
 /// What the status item renders: the glance `glyph` plus a VoiceOver `accessibilityLabel`. The label
@@ -145,6 +170,12 @@ struct PresentationState: Equatable, Sendable {
         case .crashLooping:
             return PresentationState(glyph: .crashLooping,
                                      accessibilityLabel: "Sessiometer: the daemon is restarting repeatedly — holding status until it stays up")
+        case .starting:
+            return PresentationState(glyph: .starting,
+                                     accessibilityLabel: "Sessiometer: the daemon is starting…")
+        case .notRunning:
+            return PresentationState(glyph: .notRunning,
+                                     accessibilityLabel: "Sessiometer: the daemon is not running")
         }
     }
 }
@@ -247,9 +278,11 @@ struct HonestStateMachine {
     /// valid DATA, not raw bytes.
     private enum Liveness: Equatable {
         case initial                      // before the first connect
+        case starting                     // cold connect-refused, no live connection ever held, within the start grace (#499)
+        case notRunning                   // cold connect-refused past the start grace, no live connection ever held (#499)
         case live                         // connected and delivering valid frames
         case stale                        // connection open, daemon silent past the liveness window
-        case disconnected(reason: String) // the socket dropped
+        case disconnected(reason: String) // the socket dropped (a live connection was held, then lost)
     }
 
     /// What the last decoded SNAPSHOT said. Reset to `.none` on every (re)connect so a healthy verdict
@@ -263,6 +296,13 @@ struct HonestStateMachine {
 
     private var liveness: Liveness = .initial
     private var snapshotClass: SnapshotClass = .none
+
+    /// Whether a LIVE connection has ever been held this session (any transition of `liveness` to `.live`).
+    /// It discriminates a COLD connect-refused (never connected → the daemon-absent `.starting`/`.notRunning`
+    /// track, #499) from a WARM drop (a connection WAS held, then lost → `.disconnected`, the socket-dropped
+    /// track). Set once, never cleared: a session that has ever reached the daemon is past the cold-start
+    /// question for good, so a later refused reconnect reads as a drop, not "never running".
+    private var hasEverConnected = false
 
     /// The store-side valid-frame watchdog token (#344), mirroring `WatchStateMachine`'s
     /// `livenessGeneration`: bumped every time the watchdog is (re)armed by a valid decodable frame
@@ -314,6 +354,24 @@ struct HonestStateMachine {
         liveness == .live && snapshotClass == .healthy && hasEverDisconnected && !stabilizedThisConnection
     }
 
+    // MARK: - Start-grace: split daemon-starting (transient) from not-running (durable) (#169/#499)
+
+    /// The start-grace timer token (#499), mirroring `watchdogGeneration` / `stabilityGeneration`: bumped
+    /// whenever a COLD connect-refused first enters `.starting` (ARM the grace) and whenever that grace is
+    /// LEFT — the daemon finally connected (`apply`), or the grace elapsed to the durable `.notRunning`
+    /// (`graceElapsed`). A fired `graceElapsed` whose `generation` ≠ this is a superseded timer and is
+    /// ignored. The shell re-arms its real `Task.sleep` timer whenever this value changes across a mutation.
+    private(set) var graceGeneration = 0
+
+    /// Whether a COLD connect-refused is currently within the start grace (liveness `.starting`): the shell
+    /// runs the real grace `Task.sleep` exactly while this is `true`. `.initial` (first connect in flight),
+    /// `.notRunning` (grace already elapsed), and every connected/stale/dropped state are NOT awaiting, so
+    /// the shell cancels (not re-arms) its grace timer when this is `false`.
+    var isAwaitingStartGrace: Bool {
+        if case .starting = liveness { return true }
+        return false
+    }
+
     /// The derived view outputs (mirrored into the store's `@Published` surface).
     private(set) var rows: [AccountRow] = []
     private(set) var nextSwap: NextSwap?
@@ -326,6 +384,10 @@ struct HonestStateMachine {
         switch liveness {
         case .disconnected(let reason):
             return .disconnected(reason: reason)
+        case .starting:
+            return .starting
+        case .notRunning:
+            return .notRunning
         case .stale:
             return .stale
         case .initial:
@@ -361,6 +423,10 @@ struct HonestStateMachine {
         // snapshot drops and (b) arm/invalidate the stability timer on a TRANSITION only — never on a
         // repeat frame within one hold, which must not reset the window (#169).
         let wasStabilizing = isStabilizing
+        // Capture the pre-event start-grace state too, so the grace timer is armed on the false→true
+        // transition (first cold refusal) and cancelled on true→false (connected), never re-armed on a
+        // repeat refusal within one grace — mirroring the `wasStabilizing` transition-guard (#499).
+        let wasAwaitingStartGrace = isAwaitingStartGrace
         let outcome: LineOutcome?
         switch event {
         case .connected:
@@ -370,24 +436,47 @@ struct HonestStateMachine {
             // blanked) until a fresh snapshot confirms them. A (re)connect must also RE-EARN stability
             // (#169): clear `stabilizedThisConnection` so a post-drop connection is debounced afresh.
             liveness = .live
+            hasEverConnected = true        // a live connection was held → past the cold-start question (#499)
             snapshotClass = .none
             stabilizedThisConnection = false
             watchdogGeneration += 1        // ARM: expect a valid frame within the window (#344)
             outcome = nil
         case .disconnected(let reason):
-            // A drop while a held snapshot was still stabilizing = an UNSTABLE reconnect: the clock-free
-            // crash-loop signal (#169). Count it BEFORE mutating liveness (which flips `isStabilizing`).
-            if wasStabilizing { consecutiveUnstableReconnects += 1 }
-            // Socket dropped: last-good rows/nextSwap/generatedAt are RETAINED but the state is now
-            // `.disconnected` (never live). The transport reconnects with backoff on its own. Also
-            // reset the snapshot classification: the roster is no longer confirmed, so healthy must be
-            // re-earned by a FRESH snapshot — this makes the never-healthy invariant hold STRUCTURALLY
-            // even if a heartbeat were somehow to arrive before the reconnect `.connected` (the
-            // transport orders `.connected` first, but the invariant must not depend on that).
-            liveness = .disconnected(reason: reason)
-            snapshotClass = .none
-            hasEverDisconnected = true     // ARM the debounce for every subsequent reconnect (#169)
-            watchdogGeneration += 1        // INVALIDATE: already non-live, no watchdog needed (#344)
+            // The transport emits `.disconnected` for BOTH a connect-refused (daemon absent / coming up)
+            // AND a drop of an established connection. Split them on lineage (#499): a live connection ever
+            // held ⇒ WARM drop; never held ⇒ COLD connect-refused, the daemon-absent track.
+            if hasEverConnected {
+                // WARM: a live connection was held, then lost — the socket-dropped state (unchanged). A
+                // drop while a held snapshot was still stabilizing = an UNSTABLE reconnect: the clock-free
+                // crash-loop signal (#169). Count it BEFORE mutating liveness (which flips `isStabilizing`).
+                if wasStabilizing { consecutiveUnstableReconnects += 1 }
+                // Last-good rows/nextSwap/generatedAt are RETAINED but the state is now `.disconnected`
+                // (never live). The transport reconnects with backoff on its own. Also reset the snapshot
+                // classification: the roster is no longer confirmed, so healthy must be re-earned by a
+                // FRESH snapshot — this makes the never-healthy invariant hold STRUCTURALLY even if a
+                // heartbeat were somehow to arrive before the reconnect `.connected` (the transport orders
+                // `.connected` first, but the invariant must not depend on that).
+                liveness = .disconnected(reason: reason)
+                snapshotClass = .none
+                hasEverDisconnected = true     // ARM the debounce for every subsequent reconnect (#169)
+                watchdogGeneration += 1        // INVALIDATE: already non-live, no watchdog needed (#344)
+            } else {
+                // COLD: no live connection has EVER been held this session — the connect is being REFUSED
+                // (daemon absent, or still coming up), NOT a drop. Enter `.starting` on the FIRST refusal
+                // (the apply-level start-grace delta below arms the grace); STAY on repeat refusals within
+                // the backoff loop, so the grace timer alone owns the escalation to `.notRunning` — a
+                // repeat refusal must not keep resetting the window. Deliberately does NOT touch
+                // `hasEverDisconnected`: a daemon we are merely WAITING for must promote to healthy
+                // IMMEDIATELY when it finally connects (a clean cold start), never be debounced as a
+                // crash-loop reconnect (the load-bearing #499 ↔ #169 interaction). There are no rows to
+                // retain (none were ever shown) and no valid-frame watchdog to invalidate (never was live).
+                switch liveness {
+                case .starting, .notRunning:
+                    break                      // already in the cold-refused track — the grace owns starting → not-running
+                default:                       // .initial — the first refusal
+                    liveness = .starting
+                }
+            }
             outcome = nil
         case .stale:
             // Connection still open, daemon silent: last-good data retained but MARKED stale.
@@ -406,6 +495,9 @@ struct HonestStateMachine {
         // stabilizing condition — mirroring the watchdog's generation bump. Staying stabilizing (a
         // repeat snapshot/heartbeat within one hold) does NOT bump, so the window keeps counting (#169).
         if isStabilizing != wasStabilizing { stabilityGeneration += 1 }
+        // Likewise arm (false→true, first cold refusal) or cancel (true→false, the daemon connected) the
+        // start grace ONLY on a transition — a repeat refusal within one grace leaves it counting (#499).
+        if isAwaitingStartGrace != wasAwaitingStartGrace { graceGeneration += 1 }
         return outcome
     }
 
@@ -443,6 +535,21 @@ struct HonestStateMachine {
         stabilityGeneration += 1     // consume: the hold is over (`isStabilizing` is now false)
     }
 
+    /// Fold in an elapsed start grace (#499): a COLD connect-refused has stayed refused for the WHOLE grace
+    /// with no live connection ever held — so the daemon is absent, not merely coming up. Promote the
+    /// transient `.starting` to the durable `.notRunning`. Generation-guarded exactly like `watchdogElapsed`
+    /// / `stabilityElapsed` (a token superseded by the daemon connecting, or by any later re-arm, is
+    /// ignored) and gated on actually still being within the grace, so it can never manufacture
+    /// `.notRunning` from a connected / dropped / already-not-running state, nor fire twice. The clock lives
+    /// in the `WatchStatusStore` shell, which performs the real `Task.sleep` and feeds the elapse back —
+    /// the pure core stays clock-free (mirroring `watchdogElapsed`).
+    mutating func graceElapsed(generation: Int) {
+        guard generation == graceGeneration else { return }         // superseded (e.g. the daemon connected) → ignore
+        guard case .starting = liveness else { return } // only a still-starting connection escalates
+        liveness = .notRunning
+        graceGeneration += 1     // consume: the grace is over (`isAwaitingStartGrace` is now false)
+    }
+
     // MARK: - Line handling (decode-defensive)
 
     private mutating func applyLine(_ line: String) -> LineOutcome {
@@ -471,6 +578,7 @@ struct HonestStateMachine {
 
     private mutating func applySnapshot(_ status: VersionedStatus) -> LineOutcome {
         liveness = .live
+        hasEverConnected = true            // a valid frame proves a live connection was held (#499)
         guard status.isSchemaSupported else {
             // A breaking-major snapshot: reach `.unsupported` and REFUSE its numbers (do not render a
             // roster read through a contract we cannot safely parse). generatedAt is left at its
@@ -491,6 +599,7 @@ struct HonestStateMachine {
 
     private mutating func applyHeartbeat(generatedAt: Int64, schemaVersion: SchemaVersion) -> LineOutcome {
         liveness = .live
+        hasEverConnected = true            // a valid frame proves a live connection was held (#499)
         guard WireContract.isSupported(schemaVersion) else {
             snapshotClass = .unsupported
             rows = []

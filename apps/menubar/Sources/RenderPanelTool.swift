@@ -69,6 +69,10 @@ enum RenderPanelTool {
             Fixture(name: "disconnected", state: .disconnected(reason: "the daemon is not responding"),
                     rows: rows, nextSwap: nil, generatedAt: now - 240),
             Fixture(name: "connecting", state: .connecting, rows: [], nextSwap: nil, generatedAt: nil),
+            // #499: the cold-refused daemon-absent states (no reading ever held) — a forming card for
+            // starting, and the not-running card whose Start-daemon button degrades to an inert line (#170).
+            Fixture(name: "starting", state: .starting, rows: [], nextSwap: nil, generatedAt: nil),
+            Fixture(name: "not-running", state: .notRunning, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "crash-looping", state: .crashLooping, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "unsupported", state: .unsupported, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "empty-roster", state: .emptyRoster, rows: [], nextSwap: nil, generatedAt: nil),

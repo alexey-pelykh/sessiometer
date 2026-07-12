@@ -339,6 +339,22 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(crash.title, "Daemon crash-looping")
         XCTAssertEqual(crash.detail, "Restarting repeatedly; holding status until it stays up.")
 
+        // #499: daemon-starting is a transient info banner; not-running is an absent-daemon error banner —
+        // distinct titles, so both read distinct from EACH OTHER and from the socket-dropped banner.
+        let starting = StatusPanelFormat.banner(for: .starting, accountCount: 0)
+        XCTAssertEqual(starting.kind, .info)
+        XCTAssertEqual(starting.title, "Starting…")
+        let notRunning = StatusPanelFormat.banner(for: .notRunning, accountCount: 0)
+        XCTAssertEqual(notRunning.kind, .error)
+        XCTAssertEqual(notRunning.title, "Daemon not running")
+        let dropped = StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 0)
+        let staleBanner = StatusPanelFormat.banner(for: .stale, accountCount: 0)
+        XCTAssertNotEqual(notRunning.title, dropped.title, "not-running must not read as the socket-dropped banner")
+        XCTAssertNotEqual(starting.title, dropped.title, "starting must not read as the socket-dropped banner")
+        XCTAssertNotEqual(starting.title, staleBanner.title, "starting must not read as the stale banner")
+        XCTAssertNotEqual(notRunning.title, staleBanner.title, "not-running must not read as the stale banner")
+        XCTAssertNotEqual(starting.title, notRunning.title)
+
         // Only `.connected` is ever the healthy kind (the never-healthy-when-dead invariant).
         for state in Self.allNonConnectedStates {
             XCTAssertNotEqual(StatusPanelFormat.banner(for: state, accountCount: 1).kind, .healthy,
@@ -384,8 +400,9 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertTrue(
             StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2, ageText: "updated 4m ago")
                 .detail.contains("· updated 4m ago."))
-        // …while transient / refused states never do (no retained reading to age).
-        for state in [ConnectionState.connecting, .emptyRoster, .unsupported] {
+        // …while transient / refused states never do (no retained reading to age) — including the #499
+        // cold-refused daemon-absent states, which never held a reading.
+        for state in [ConnectionState.connecting, .emptyRoster, .unsupported, .starting, .notRunning] {
             XCTAssertFalse(
                 StatusPanelFormat.banner(for: state, accountCount: 0, ageText: "updated 12s ago")
                     .detail.contains("updated"),
@@ -789,6 +806,7 @@ final class StatusPanelFormatTests: XCTestCase {
 
     private static let allNonConnectedStates: [ConnectionState] = [
         .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported, .crashLooping,
+        .starting, .notRunning,   // #499
     ]
 
     /// A DEAD account that is mid-recovery (#109) — the current daemon's `snapshotAwaitingDead` golden

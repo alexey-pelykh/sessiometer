@@ -680,6 +680,20 @@ enum StatusPanelFormat {
             return Banner(title: "Daemon crash-looping",
                           detail: "Restarting repeatedly; holding status until it stays up.",
                           kind: .error)
+        case .starting:
+            // The daemon-starting banner (#499): a transient, non-degraded "coming up" state — same weight
+            // as `.connecting` (`.info`). A STATIC message; the app fakes no progress it isn't doing.
+            return Banner(title: "Starting…",
+                          detail: "Waiting for the daemon to come up.",
+                          kind: .info)
+        case .notRunning:
+            // The not-running banner (#499): the daemon is absent, so numbers are not trustworthy
+            // (`.error`, like `.disconnected` / `.unsupported`). The Start-daemon affordance is #170
+            // (launch-at-login via SMAppService), deferred and signing-blocked — so the banner degrades
+            // to this inert explanatory line, with no button yet.
+            return Banner(title: "Daemon not running",
+                          detail: "The daemon isn't running.",
+                          kind: .error)
         }
     }
 
@@ -807,6 +821,8 @@ enum StatusPanelFormat {
         let count = "\(accountCount) account\(plural)"
         switch state {
         case .connecting:   return "Connecting to the daemon…"
+        case .starting:     return "Connecting to the daemon…"   // #499: the "coming up" identity line (mock app-sub)
+        case .notRunning:   return "Daemon not running"          // #499: no last-known reading to age (never connected)
         case .emptyRoster:  return "Welcome"
         case .unsupported:  return "Version mismatch"
         case .crashLooping: return "Daemon fault"

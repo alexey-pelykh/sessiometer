@@ -213,6 +213,65 @@ final class WatchStatusStoreTests: XCTestCase {
         continuation.finish()
     }
 
+    // MARK: - AC (#499): the store drives the start-grace escalation end-to-end
+
+    // The store-level proof of the not-running/starting split: a COLD connect-refused (a `.disconnected`
+    // with no prior `.connected`) is shown as the transient `.starting`, then the injected start grace
+    // elapses still refused and the store escalates ITSELF to the durable `.notRunning` — neither ever
+    // healthy. The grace is the "clock" the test advances (real `Task.sleep`), mirroring the watchdog /
+    // stability tests. Before #499 this stream flipped straight to the socket-dropped `.disconnected`.
+    func testColdRefusedGoesStartingThenNotRunningViaTheStartGrace() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(startGraceWindow: .milliseconds(200))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
+        // Daemon absent at launch: the transport refuses the connect and emits `.disconnected` with no
+        // prior `.connected`. The store shows the transient starting glance first…
+        continuation.yield(.disconnected(reason: "connect refused"))
+        try await waitForGlyph(recorder, .starting)
+        XCTAssertEqual(store.connectionState, .starting)
+        XCTAssertFalse(store.connectionState.isHealthy)
+
+        // …then the start grace elapses still refused → the store escalates itself to not-running.
+        try await waitForGlyph(recorder, .notRunning)
+        XCTAssertEqual(store.connectionState, .notRunning)
+        XCTAssertFalse(store.connectionState.isHealthy, "an absent daemon is never healthy")
+
+        continuation.finish()
+    }
+
+    // A daemon that comes up DURING the grace connects straight to healthy — the store's grace timer is
+    // superseded by the connect (the shell cancels it), so the genuinely-starting case resolves cleanly.
+    func testDaemonConnectingDuringGraceGoesHealthy() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(startGraceWindow: .milliseconds(500))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
+        continuation.yield(.disconnected(reason: "connect refused"))
+        try await waitForGlyph(recorder, .starting)
+        // The daemon comes up well within the grace → connect + snapshot → healthy.
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotBasic))
+        try await waitForGlyph(recorder, .healthy)
+        XCTAssertEqual(store.connectionState, .connected)
+
+        continuation.finish()
+    }
+
+    // The default start grace is a SHORT, bounded window: positive (starting is a real transient state) and
+    // no longer than a few seconds (a truly-absent daemon must reach the actionable not-running promptly).
+    // Pins the "short grace" intent so a future edit can't quietly stretch it into a dead-end.
+    func testDefaultStartGraceIsAShortBoundedWindow() {
+        let grace = WatchStatusStore.defaultStartGraceWindow
+        XCTAssertGreaterThan(grace, .zero, "the grace must be positive — starting is a real transient window")
+        XCTAssertLessThanOrEqual(grace, .seconds(10),
+                                 "a 'short' grace — a truly-absent daemon must reach not-running promptly")
+    }
+
     // MARK: - Event-stream awaiting helpers (mirror of the transport suite's)
 
     private enum WaitError: Error { case timeout }

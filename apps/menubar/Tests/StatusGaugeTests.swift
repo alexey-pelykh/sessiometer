@@ -20,7 +20,8 @@ final class StatusGaugeTests: XCTestCase {
 
     /// Every glance state the store can emit — the domain the gauge must total over.
     private let allGlyphs: [StatusGlyph] =
-        [.connecting, .healthy, .empty, .stale, .disconnected, .unsupported, .crashLooping]
+        [.connecting, .healthy, .empty, .stale, .disconnected, .unsupported, .crashLooping,
+         .starting, .notRunning]
 
     // MARK: - AC: shape (not color) encodes state → one distinct silhouette per glyph
 
@@ -54,8 +55,9 @@ final class StatusGaugeTests: XCTestCase {
     func testSymbolsAreProviderNeutralGeometry() {
         // The gauge is a generic circle-family shape set; assert every symbol is one of that neutral
         // vocabulary. A provider mark (a brand glyph / logo symbol) would not match — this fails if a
-        // future edit swaps in anything but neutral geometry.
-        let neutralPrefixes = ["circle", "exclamationmark"]
+        // future edit swaps in anything but neutral geometry. `power` (#499, not-running) is the universal
+        // IEC power glyph — generic system geometry, not any provider's mark — so it joins the vocabulary.
+        let neutralPrefixes = ["circle", "exclamationmark", "power"]
         for glyph in allGlyphs {
             let name = StatusGauge.symbolName(for: glyph)
             XCTAssertTrue(neutralPrefixes.contains { name == $0 || name.hasPrefix($0 + ".") },
@@ -85,5 +87,27 @@ final class StatusGaugeTests: XCTestCase {
         XCTAssertNotEqual(crash, StatusGauge.symbolName(for: .unsupported),
                           "crash-looping (triangle) must not read as version-skew (circle)")
         XCTAssertEqual(StatusGauge.accessibilityDescription(for: .crashLooping), "crash-looping")
+    }
+
+    // MARK: - #499: starting and not-running are distinct daemon-absent shapes
+
+    // The AC's visual-distinctness requirement at the glyph layer: starting (forming) and not-running
+    // (power) are distinct from EACH OTHER and — the load-bearing pair — from the socket-dropped
+    // (`.disconnected`) and stale silhouettes, so a not-running daemon never reads as a dropped socket.
+    func testStartingAndNotRunningAreDistinctFromEachOtherAndFromDroppedAndStale() {
+        let starting = StatusGauge.symbolName(for: .starting)
+        let notRunning = StatusGauge.symbolName(for: .notRunning)
+        let dropped = StatusGauge.symbolName(for: .disconnected)
+        let stale = StatusGauge.symbolName(for: .stale)
+        XCTAssertNotEqual(starting, notRunning, "starting and not-running need distinct shapes")
+        for other in [dropped, stale] {
+            XCTAssertNotEqual(starting, other, "starting must not read as socket-dropped / stale")
+            XCTAssertNotEqual(notRunning, other, "not-running must not read as socket-dropped / stale")
+        }
+        // Neither is the healthy disc.
+        XCTAssertNotEqual(starting, StatusGauge.symbolName(for: .healthy))
+        XCTAssertNotEqual(notRunning, StatusGauge.symbolName(for: .healthy))
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .starting), "starting")
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .notRunning), "not running")
     }
 }
