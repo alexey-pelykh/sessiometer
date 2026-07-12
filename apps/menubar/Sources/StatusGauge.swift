@@ -32,6 +32,8 @@ enum StatusGauge {
     ///   * `.stale`        → `circle.bottomhalf.filled` — a half-filled disc: data fading / may be frozen
     ///   * `.disconnected` → `circle.slash`             — a slashed ring: the daemon is absent
     ///   * `.unsupported`  → `exclamationmark.circle`   — a marked ring: numbers refused (version skew)
+    ///   * `.crashLooping` → `exclamationmark.triangle` — a fault TRIANGLE (distinct from the circle
+    ///                                                     family): the daemon keeps restarting (#169)
     ///
     /// All are generic geometric system symbols (provider-neutral) shipped since macOS ≤ 12, so they
     /// resolve on the app's macOS 13 floor. Pure and total — every `StatusGlyph` maps (checked in tests).
@@ -48,6 +50,7 @@ enum StatusGauge {
         case .stale:        return "circle.bottomhalf.filled"
         case .disconnected: return "circle.slash"
         case .unsupported:  return "exclamationmark.circle"
+        case .crashLooping: return "exclamationmark.triangle"
         }
     }
 
@@ -79,6 +82,7 @@ enum StatusGauge {
         case .stale:        return "stale"
         case .disconnected: return "disconnected"
         case .unsupported:  return "unsupported"
+        case .crashLooping: return "crash-looping"
         }
     }
 

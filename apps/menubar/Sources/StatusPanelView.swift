@@ -143,9 +143,12 @@ struct StatusPanelView: View {
             CaptureCard(title: "Capture your first account")
                 .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
 
-        case .connecting, .unsupported:
-            // No retained reading — a plain honest message (the reference's centered message card
-            // for these states, with its distinct per-state glyph, is #169).
+        case .connecting, .unsupported, .crashLooping:
+            // No trustworthy reading to show — a plain honest message card. `.crashLooping` (#169) holds
+            // here too: the daemon served a snapshot but keeps dropping before it stabilizes, so its
+            // numbers are refused ("holding status until it stays up") rather than flickered as live —
+            // the crown-jewel anti-#137 debounce. (The fuller per-state message-card fidelity and the
+            // lifecycle affordances — View log / Restart — are #169 siblings.)
             Divider().padding(.horizontal, 14)
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
                 .padding(.horizontal, 14).padding(.vertical, 14)

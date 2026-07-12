@@ -89,8 +89,26 @@ final class WatchStatusStore: ObservableObject {
     /// The in-flight watchdog timer, re-armed whenever the pure core bumps its watchdog generation.
     private var watchdogTask: Task<Void, Never>?
 
-    init(validFrameWindow: Duration = WatchStatusStore.defaultValidFrameWindow) {
+    /// The default crash-loop stability window (#169): how long a POST-RECONNECT connection must stay
+    /// up (holding a fresh snapshot) before it is promoted to healthy. 8 s — comfortably longer than a
+    /// fast crash-loop's up-period (a daemon that dies on startup within a second or two never survives
+    /// it, so it is held `.crashLooping` instead of flickering healthy) yet short enough that a genuine
+    /// single reconnect settles quickly. The FIRST connect is EXEMPT (`HonestStateMachine.isStabilizing`
+    /// is false until a drop), so a cold clean start is immediate. Injected so tests drive it
+    /// deterministically. `nonisolated` for the `init` default-argument expression, as
+    /// `defaultValidFrameWindow`.
+    nonisolated static let defaultStabilityWindow: Duration = .seconds(8)
+
+    /// How long the store holds a post-reconnect snapshot before promoting it to healthy — injected so
+    /// tests drive the timer deterministically (as `validFrameWindow`).
+    private let stabilityWindow: Duration
+    /// The in-flight stability timer, re-armed whenever the pure core bumps its stability generation.
+    private var stabilityTask: Task<Void, Never>?
+
+    init(validFrameWindow: Duration = WatchStatusStore.defaultValidFrameWindow,
+         stabilityWindow: Duration = WatchStatusStore.defaultStabilityWindow) {
         self.validFrameWindow = validFrameWindow
+        self.stabilityWindow = stabilityWindow
         (presentations, presentationsContinuation) =
             AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
         // Seed the glance with the initial `.connecting` so a consumer attaching before the first
@@ -110,20 +128,27 @@ final class WatchStatusStore: ObservableObject {
             }
             self?.presentationsContinuation.finish()
             self?.watchdogTask?.cancel()          // teardown: drop the in-flight valid-frame watchdog
+            self?.stabilityTask?.cancel()         // teardown: drop the in-flight stability timer (#169)
         }
     }
 
     private func ingest(_ event: TransportEvent) {
-        let watchdogGenerationBefore = machine.watchdogGeneration
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
         let outcome = machine.apply(event)
         log(outcome)
-        // The pure core bumps its watchdog token whenever a valid frame (re)arms it, or a
-        // connect / drop / transport-stale arms/invalidates it. When it changed, mirror that intent
-        // onto the real timer — (re)arm on a live connection, cancel otherwise (#344).
-        if machine.watchdogGeneration != watchdogGenerationBefore {
-            rearmValidFrameWatchdog()
-        }
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore)
         publish()
+    }
+
+    /// Re-arm / cancel each real timer to match the pure core's intent, but ONLY when its generation
+    /// token changed across the mutation — the token changes exactly when the timer should (re)start or
+    /// stop, so a routine event that touches neither leaves both counting down untouched. Shared by
+    /// event ingestion AND both timer-fired paths so a cross-timer effect (e.g. the valid-frame watchdog
+    /// tripping `.stale`, which also ends a stabilization hold) re-syncs BOTH (#344, #169).
+    private func resyncTimers(watchdogBefore: Int, stabilityBefore: Int) {
+        if machine.watchdogGeneration != watchdogBefore { rearmValidFrameWatchdog() }
+        if machine.stabilityGeneration != stabilityBefore { rearmStabilityTimer() }
     }
 
     /// Mirror the pure core's derived state onto the published surface + the glance stream. Shared by
@@ -158,9 +183,41 @@ final class WatchStatusStore: ObservableObject {
     }
 
     /// The watchdog fired: fold the elapse into the machine (a superseded token is ignored there) and
-    /// re-publish in case it downgraded a live connection to `.stale`.
+    /// re-publish in case it downgraded a live connection to `.stale`. Re-syncs BOTH timers because
+    /// going stale also ends an in-flight stabilization hold (#169), invalidating that timer too.
     private func validFrameWatchdogElapsed(generation: Int) {
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
         machine.watchdogElapsed(generation: generation)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore)
+        publish()
+    }
+
+    // MARK: - Store-side crash-loop stability timer (#169)
+
+    /// (Re)arm — or cancel — the store-side stability timer to match the pure core's current intent, the
+    /// crash-loop-debounce analogue of `rearmValidFrameWatchdog`: while a post-reconnect snapshot is
+    /// held (`machine.isStabilizing`), sleep the window then feed the (generation-guarded) elapse back,
+    /// which promotes the held snapshot to healthy. A drop / stale before the window elapses supersedes
+    /// the token, so a crash-looping daemon never reaches the promote — it stays held, never healthy.
+    private func rearmStabilityTimer() {
+        stabilityTask?.cancel()
+        guard machine.isStabilizing else { stabilityTask = nil; return }
+        let generation = machine.stabilityGeneration
+        let window = stabilityWindow
+        stabilityTask = Task { [weak self] in
+            do { try await Task.sleep(for: window) } catch { return }   // cancelled → drop
+            self?.stabilityWindowElapsed(generation: generation)
+        }
+    }
+
+    /// The stability window fired: fold the elapse into the machine (a superseded token — a drop / stale
+    /// mid-window — is ignored there) and re-publish, in case it promoted the held snapshot to healthy.
+    private func stabilityWindowElapsed(generation: Int) {
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
+        machine.stabilityElapsed(generation: generation)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore)
         publish()
     }
 

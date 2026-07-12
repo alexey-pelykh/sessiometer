@@ -237,10 +237,11 @@ final class HonestStateMachineTests: XCTestCase {
 
     // MARK: - Reconnect must re-confirm with a fresh snapshot (no resurrection from stale rows)
 
-    func testReconnectPassesThroughConnectingThenHealthyOnFreshSnapshot() {
+    func testReconnectPassesThroughConnectingThenHealthyAfterStabilityWindow() {
         var m = HonestStateMachine()
         _ = m.apply(.connected)
         _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connected, "first connect promotes immediately (never debounced)")
         _ = m.apply(.disconnected(reason: "EOF"))
         XCTAssertFalse(m.connectionState.isHealthy)
         // Bare reconnect: the socket is back but no fresh snapshot yet → connecting, NOT resurrected
@@ -248,9 +249,15 @@ final class HonestStateMachineTests: XCTestCase {
         _ = m.apply(.connected)
         XCTAssertEqual(m.connectionState, .connecting, "reconnect must re-confirm before healthy")
         XCTAssertFalse(m.connectionState.isHealthy)
-        // A fresh snapshot promotes to healthy.
+        // A fresh snapshot post-reconnect is HELD by the crash-loop debounce (#169) — the connection
+        // must survive the stability window before healthy, so a would-be flash never renders healthy.
         _ = m.apply(.line(Fixtures.snapshotBasic))
-        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertEqual(m.connectionState, .connecting, "post-reconnect snapshot is held (debounced), not healthy")
+        XCTAssertTrue(m.isStabilizing)
+        XCTAssertFalse(m.connectionState.isHealthy)
+        // Surviving the stability window promotes it to healthy.
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertEqual(m.connectionState, .connected, "stayed up past the stability window → healthy")
     }
 
     // Defense-in-depth: a disconnect drops the snapshot classification, so even a heartbeat arriving
@@ -265,8 +272,12 @@ final class HonestStateMachineTests: XCTestCase {
         _ = m.apply(.line(Fixtures.heartbeatBasic))
         XCTAssertEqual(m.connectionState, .connecting)
         XCTAssertFalse(m.connectionState.isHealthy)
-        _ = m.apply(.line(Fixtures.snapshotBasic))    // a fresh snapshot re-earns healthy
-        XCTAssertEqual(m.connectionState, .connected)
+        // A fresh snapshot re-confirms, but the crash-loop debounce (#169) HOLDS it until the connection
+        // survives the stability window — a post-reconnect snapshot is not immediately healthy.
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connecting, "held by the debounce, not yet healthy")
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertEqual(m.connectionState, .connected, "survived the stability window → healthy")
     }
 
     // A snapshot arriving AFTER stale (same connection) refreshes the roster and returns to healthy.
@@ -428,5 +439,144 @@ final class HonestStateMachineTests: XCTestCase {
                        "Sessiometer: disconnected — the daemon is not responding")
         XCTAssertEqual(machine([.line(Fixtures.snapshotUnsupportedMajor)]).presentation.accessibilityLabel,
                        "Sessiometer: daemon version unsupported — update required")
+    }
+
+    // MARK: - AC (#169): the crash-loop healthy-flash debounce
+
+    /// Fold a healthy snapshot into a machine that has ALREADY disconnected once (so the debounce is
+    /// armed), leaving a held (stabilizing) post-reconnect snapshot awaiting the stability window.
+    private func reconnectedWithHeldSnapshot() -> HonestStateMachine {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))          // first connect → healthy immediately
+        _ = m.apply(.disconnected(reason: "EOF"))           // arms the debounce (hasEverDisconnected)
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))          // post-reconnect snapshot → HELD
+        return m
+    }
+
+    // The clean-start happy path is UNCHANGED: the very first connect promotes to healthy the instant a
+    // fresh snapshot arrives — the debounce is armed only by a prior drop, so a cold start is immediate.
+    func testFirstConnectPromotesToHealthyImmediatelyNoDebounce() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertFalse(m.isStabilizing, "the first connect is never debounced")
+        XCTAssertEqual(m.stabilityGeneration, 0, "no stability timer is armed on a cold start")
+    }
+
+    // A post-reconnect snapshot is HELD (not healthy) until the connection survives the stability window
+    // — a single clean restart reads as the benign `.connecting`, never the `.crashLooping` fault.
+    func testPostReconnectSnapshotIsHeldUntilStabilityWindow() {
+        let m = reconnectedWithHeldSnapshot()
+        XCTAssertEqual(m.connectionState, .connecting, "a single restart holds as connecting, not crash-looping")
+        XCTAssertTrue(m.isStabilizing)
+        XCTAssertFalse(m.connectionState.isHealthy, "the healthy-flash is debounced")
+        XCTAssertEqual(m.consecutiveUnstableReconnects, 0)
+    }
+
+    // Surviving the stability window promotes the held snapshot to healthy and re-earns stability.
+    func testStabilityWindowSurvivedPromotesToHealthy() {
+        var m = reconnectedWithHeldSnapshot()
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertFalse(m.isStabilizing, "stabilized → no longer holding")
+    }
+
+    // THE crash-loop invariant: a daemon that repeatedly (re)connects, serves a snapshot, then DROPS
+    // before the stability window elapses climbs the unstable-reconnect count and, past the threshold,
+    // reads as `.crashLooping` — and NEVER healthy — for the whole loop (anti-#137 healthy-flash).
+    func testRepeatedUnstableReconnectsSurfaceCrashLoopingNeverHealthy() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))          // first connect → one honest healthy moment
+        _ = m.apply(.disconnected(reason: "EOF"))           // arms the debounce; churn still 0
+
+        // Each subsequent cycle: reconnect → snapshot (HELD) → drop before stabilizing → churn += 1.
+        var sawHealthyDuringLoop = false
+        for _ in 0..<4 {
+            _ = m.apply(.connected)
+            _ = m.apply(.line(Fixtures.snapshotBasic))
+            if m.connectionState.isHealthy { sawHealthyDuringLoop = true }
+            _ = m.apply(.disconnected(reason: "EOF"))       // dropped before the stability window
+        }
+        XCTAssertFalse(sawHealthyDuringLoop, "a crash-looping daemon must NEVER flicker healthy (#137)")
+        XCTAssertGreaterThanOrEqual(m.consecutiveUnstableReconnects, HonestStateMachine.crashLoopThreshold)
+
+        // On the next held snapshot, past the threshold, the state is the `.crashLooping` fault.
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .crashLooping)
+        XCTAssertEqual(m.presentation.glyph, .crashLooping)
+        XCTAssertFalse(m.connectionState.isHealthy)
+    }
+
+    // A held snapshot that SURVIVES the window resets the churn — so a daemon that recovers stops
+    // reading as crash-looping and returns to healthy.
+    func testStabilizationResetsTheUnstableReconnectChurn() {
+        var m = HonestStateMachine()
+        _ = m.apply(.connected)
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        for _ in 0..<3 {                                     // drive several unstable reconnects
+            _ = m.apply(.disconnected(reason: "EOF"))
+            _ = m.apply(.connected)
+            _ = m.apply(.line(Fixtures.snapshotBasic))
+        }
+        XCTAssertGreaterThanOrEqual(m.consecutiveUnstableReconnects, HonestStateMachine.crashLoopThreshold)
+        XCTAssertEqual(m.connectionState, .crashLooping)
+        // The daemon finally stays up past the window → churn clears, healthy returns.
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertEqual(m.consecutiveUnstableReconnects, 0, "stabilizing clears the crash-loop churn")
+    }
+
+    // `stabilityElapsed` is generation-guarded, stabilizing-only, and idempotent — a superseded token,
+    // an elapse after a drop, or a repeat elapse can never manufacture healthy or fire twice (mirrors
+    // the watchdog's guard tests).
+    func testStabilityElapseIsGenerationGuardedStabilizingOnlyAndIdempotent() {
+        // A superseded token (an old generation) is ignored.
+        var m = reconnectedWithHeldSnapshot()
+        let held = m.stabilityGeneration
+        m.stabilityElapsed(generation: held - 1)
+        XCTAssertEqual(m.connectionState, .connecting, "a superseded stability token must not promote")
+        XCTAssertTrue(m.isStabilizing)
+
+        // An elapse after a drop (no longer stabilizing) cannot resurrect healthy.
+        var n = reconnectedWithHeldSnapshot()
+        let tokenBeforeDrop = n.stabilityGeneration
+        _ = n.apply(.disconnected(reason: "EOF"))
+        n.stabilityElapsed(generation: tokenBeforeDrop)
+        XCTAssertFalse(n.connectionState.isHealthy, "an elapse after a drop must not promote to healthy")
+
+        // Idempotent: a second elapse of the (now consumed) token is a no-op.
+        var p = reconnectedWithHeldSnapshot()
+        p.stabilityElapsed(generation: p.stabilityGeneration)
+        XCTAssertEqual(p.connectionState, .connected)
+        p.stabilityElapsed(generation: p.stabilityGeneration)
+        XCTAssertEqual(p.connectionState, .connected, "a second elapse is a no-op")
+    }
+
+    // A transport `.stale` (or the watchdog) while a held snapshot is stabilizing ENDS the hold honestly
+    // — it reads `.stale`, never healthy, and never leaves a dangling promote.
+    func testStaleWhileStabilizingEndsTheHoldNeverHealthy() {
+        var m = reconnectedWithHeldSnapshot()
+        XCTAssertTrue(m.isStabilizing)
+        _ = m.apply(.stale)
+        XCTAssertEqual(m.connectionState, .stale)
+        XCTAssertFalse(m.isStabilizing, "going stale ends the stabilization hold")
+        // A superseded stability elapse can no longer promote it.
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertFalse(m.connectionState.isHealthy)
+    }
+
+    // The crash-loop presentation: a distinct fault glyph + a plain spoken label, never the healthy glyph.
+    func testCrashLoopingPresentation() {
+        let presentation = PresentationState.make(for: .crashLooping, accountCount: 2)
+        XCTAssertEqual(presentation.glyph, .crashLooping)
+        XCTAssertNotEqual(presentation.glyph, .healthy)
+        XCTAssertFalse(ConnectionState.crashLooping.isHealthy)
+        XCTAssertEqual(presentation.accessibilityLabel,
+                       "Sessiometer: the daemon is restarting repeatedly — holding status until it stays up")
     }
 }

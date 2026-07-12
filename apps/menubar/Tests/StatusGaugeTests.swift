@@ -20,7 +20,7 @@ final class StatusGaugeTests: XCTestCase {
 
     /// Every glance state the store can emit — the domain the gauge must total over.
     private let allGlyphs: [StatusGlyph] =
-        [.connecting, .healthy, .empty, .stale, .disconnected, .unsupported]
+        [.connecting, .healthy, .empty, .stale, .disconnected, .unsupported, .crashLooping]
 
     // MARK: - AC: shape (not color) encodes state → one distinct silhouette per glyph
 
@@ -73,5 +73,17 @@ final class StatusGaugeTests: XCTestCase {
                           StatusGauge.symbolName(for: .connecting))
         XCTAssertNotEqual(StatusGauge.symbolName(for: .healthy),
                           StatusGauge.symbolName(for: .disconnected))
+    }
+
+    // MARK: - Crash-looping (#169): a distinct fault TRIANGLE, never confused with the circle family
+
+    func testCrashLoopingIsADistinctFaultShape() {
+        let crash = StatusGauge.symbolName(for: .crashLooping)
+        XCTAssertEqual(crash, "exclamationmark.triangle")
+        // Distinct from healthy, and from `.unsupported` — the other marked/degraded shape.
+        XCTAssertNotEqual(crash, StatusGauge.symbolName(for: .healthy))
+        XCTAssertNotEqual(crash, StatusGauge.symbolName(for: .unsupported),
+                          "crash-looping (triangle) must not read as version-skew (circle)")
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .crashLooping), "crash-looping")
     }
 }
