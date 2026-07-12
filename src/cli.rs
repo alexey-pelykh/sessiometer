@@ -545,19 +545,31 @@ fn parse_stats(parser: &mut lexopt::Parser) -> Result<Command> {
     }))
 }
 
-/// Parse `reliability [--json]` (issue #455) — the offline reliability-SLO readout. Only
-/// `--json` is accepted; there are no positionals. Aggregation lives in `reliability::run`.
+/// Parse `reliability [--since <duration>] [--json]` (issues #455/#494) — the offline
+/// reliability-SLO readout. `--since` takes a relative-duration value (space- or
+/// `=`-separated, handled by lexopt); there are no positionals. Duration parse and
+/// validation live in `reliability::run`, so this layer just captures the raw string
+/// (mirrors `parse_stats`).
 fn parse_reliability(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut json = false;
+    let mut since = None;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Reliability)),
             Long("json") => json = true,
+            Long("since") => {
+                since = Some(
+                    required_value(parser, "since", HelpTopic::Reliability)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             other => return Err(unexpected(other, HelpTopic::Reliability)),
         }
     }
     Ok(Command::Reliability(crate::reliability::ReliabilityArgs {
         json,
+        since,
     }))
 }
 
@@ -1010,17 +1022,21 @@ USAGE:
 const RELIABILITY_USAGE: &str = "sessiometer reliability — swap-out overshoot SLO readout, offline (reads the event log directly)
 
 USAGE:
-    sessiometer reliability [--json]
+    sessiometer reliability [--since <duration>] [--json]
 
-    --json      print the readout as JSON (schema:1, for scripts) instead of the text view
+    --since <d> bound all four indicators to events at/after now - <duration>. <duration> is a
+                non-negative integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w). Omit for
+                the whole-log aggregate (the default).
+    --json      print the readout as JSON (schema:2, for scripts) instead of the text view
     -h, --help  print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
-works when the daemon is down. It reports four indicators over the whole log, each with its
-target: swap-out session_pct P50/P95/P100 (targets P50 <= 97, P100 < 99); time spent blind while
-near the limit; a false-preempt proxy from the blind-window recovery reconciliation; and the
-usage-poll 429 vs transient counts. The readout is roster-wide numbers only — no per-account
-breakdown, no identifiers.
+works when the daemon is down. It reports four indicators, each with its target: swap-out
+session_pct P50/P95/P100 (targets P50 <= 97, P100 < 99); time spent blind while near the limit; a
+false-preempt proxy from the blind-window recovery reconciliation; and the usage-poll 429 vs
+transient counts. By default the indicators fold the whole log; --since <duration> bounds them to a
+recent window (the cutoff is documented in both output forms). The readout is roster-wide numbers
+only — no per-account breakdown, no identifiers.
 ";
 
 const EXPORT_USAGE: &str = "sessiometer export — serialize state to an (encrypted by default) migration artifact
@@ -8026,16 +8042,53 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn reliability_parses_bare_and_with_json() {
-        // The readout takes only `--json`; bare defaults to the human view.
+    fn reliability_parses_bare_json_and_since() {
+        // Bare defaults to the human view with no window.
         assert_eq!(
             parse_argv(&["reliability"]).unwrap(),
-            Command::Reliability(crate::reliability::ReliabilityArgs { json: false })
+            Command::Reliability(crate::reliability::ReliabilityArgs {
+                json: false,
+                since: None,
+            })
         );
         assert_eq!(
             parse_argv(&["reliability", "--json"]).unwrap(),
-            Command::Reliability(crate::reliability::ReliabilityArgs { json: true })
+            Command::Reliability(crate::reliability::ReliabilityArgs {
+                json: true,
+                since: None,
+            })
         );
+        // `--since` captures its RAW value (space- or `=`-separated); duration parse + validation
+        // are deferred to `reliability::run`, so the CLI layer just carries the string through.
+        for argv in [
+            vec!["reliability", "--since", "7d"],
+            vec!["reliability", "--since=7d"],
+        ] {
+            assert_eq!(
+                parse_argv(&argv).unwrap(),
+                Command::Reliability(crate::reliability::ReliabilityArgs {
+                    json: false,
+                    since: Some("7d".to_string()),
+                }),
+                "argv {argv:?} must carry the raw --since value",
+            );
+        }
+        // `--since` composes with `--json`.
+        assert_eq!(
+            parse_argv(&["reliability", "--since", "24h", "--json"]).unwrap(),
+            Command::Reliability(crate::reliability::ReliabilityArgs {
+                json: true,
+                since: Some("24h".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn reliability_since_without_a_value_is_a_clear_error() {
+        // `--since` as the last token → a clear "needs a value", not a silent empty window.
+        let err = parse_argv(&["reliability", "--since"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("since"), "got: {err}");
     }
 
     #[test]
