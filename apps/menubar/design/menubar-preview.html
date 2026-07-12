@@ -23,14 +23,21 @@
   term for it, NOT a separate field (the redundant-alias premise is retired: `label` already is the
   operator-chosen name). When an account has no custom label, `label` defaults to its account UUID
   (shown truncated, e.g. a1b2c3… · Claude Code) — still the same field, still on the primary line;
-  there is no separate "handle". The label owns the truncating line; the monogram badge shows its
-  initial (W / P / S). Labels here are ILLUSTRATIVE, not real user data.
+  there is no separate "handle". The label owns the MIDDLE-truncating line (#445: middle, not tail, so a
+  same-local-part label's distinguishing suffix / domain survives the elision); the badge shows a SMART
+  2-char monogram (WO / PE / SC — from the distinguishing token, not `label.first`, so a roster of
+  same-local-part accounts stays legible) over a per-account IDENTITY COLOUR seeded from the label (#445 —
+  in the app a deterministic label→slot hash over a fixed palette; illustrated here for Work/Personal/Scratch).
+  Labels here are ILLUSTRATIVE, not real user data.
 
   Hard invariants honored across ALL 9 states:
     - identifiers minimized — the operator-chosen label leads, provider-only secondary. With no
       custom label the field defaults to the account UUID (e.g. a1b2c3…); the label is never the
       email (the roster stores no email — it lives only in the encrypted credential). No full email renders.
-    - provider-neutral — monochrome monogram badge + plain text label, no brand colour/logo.
+    - provider-neutral — the badge carries a per-account IDENTITY colour + smart 2-char monogram (#445): a
+      generic LOW-CHROMA disambiguation cue (a fixed palette, accent hue excluded), NOT a provider brand
+      colour/logo; plain-text label, and the colour is never colour-alone (always paired with the monogram
+      glyph + the label text — WCAG 1.4.1).
     - capture is a REAL in-app daemon-routed action (#360 — a button + optional label field that sends
       the verb over the #358 control socket and renders an honest pending → done → error from the
       redacted ack; no credential ever reaches the client). `brew upgrade` (version-skew) STAYS a
@@ -152,6 +159,10 @@
     --accent:#007aff; --accent-halo:rgba(0,122,255,.2);
     --accent-tint:rgba(0,122,255,.10); --accent-tint-border:rgba(0,122,255,.2);
     --badge-bg:rgba(120,120,128,.16); --track:rgba(120,120,128,.22);
+    /* #445 per-account identity colours (illustrative Work/Personal/Scratch): low-chroma muted hues, the
+       accent EXCLUDED, monogram glyph a high-contrast neutral ON the fill. A DELIBERATE deviation from the
+       monochrome --badge-bg badge; a generic identity cue, never provider branding (#173). */
+    --id-work-bg:#4e4070; --id-personal-bg:#743a62; --id-scratch-bg:#266058; --id-mono:#f5f5f7;
     --seg-bg:rgba(120,120,128,.12); --seg-border:rgba(0,0,0,.05); --seg-on:#ffffff;
     --btn-bg:rgba(255,255,255,.72); --btn-border:rgba(0,0,0,.14); --code-bg:rgba(120,120,128,.15);
     --ok:#2ba24a; --spark:rgba(60,60,67,.55);
@@ -169,6 +180,9 @@
     --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3);
     --accent-tint:rgba(10,132,255,.16); --accent-tint-border:rgba(10,132,255,.3);
     --badge-bg:rgba(255,255,255,.10); --track:rgba(255,255,255,.14);
+    /* #445 per-account identity colours (dark): the same hues INVERTED to a muted mid-LIGHT tone so a near-
+       black monogram reads on them and they clear the near-black panel (WCAG-AA both themes). */
+    --id-work-bg:#beb0d8; --id-personal-bg:#daa8c8; --id-scratch-bg:#94ccc2; --id-mono:#1c1c1e;
     --seg-bg:rgba(255,255,255,.08); --seg-border:rgba(255,255,255,.06); --seg-on:rgba(255,255,255,.18);
     --btn-bg:rgba(255,255,255,.10); --btn-border:rgba(255,255,255,.16); --code-bg:rgba(255,255,255,.10);
     --ok:#30d158; --spark:rgba(235,235,245,.5);
@@ -208,6 +222,13 @@
     background:var(--badge-bg); color:var(--text-2);
     font-size:13px; font-weight:700; letter-spacing:.03em; font-variant-numeric:tabular-nums;
   }
+  /* #445 per-account identity colour + smart 2-char monogram. Seeded from the account `label` (a fixed
+     low-chroma palette, accent hue excluded); ALWAYS paired with the monogram glyph + the label text, never
+     colour-alone (WCAG 1.4.1). In the app the palette is a deterministic label→slot hash over ~8 hues; these
+     three are the mock's illustrative Work/Personal/Scratch. The base `.badge` neutral stays the fallback. */
+  .badge.id-work{ background:var(--id-work-bg); color:var(--id-mono) }
+  .badge.id-personal{ background:var(--id-personal-bg); color:var(--id-mono) }
+  .badge.id-scratch{ background:var(--id-scratch-bg); color:var(--id-mono) }
   .id-meta{ flex:1 1 auto; min-width:0 }
   .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
@@ -529,7 +550,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -542,7 +563,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
@@ -555,7 +576,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
@@ -596,7 +617,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -608,7 +629,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
@@ -620,7 +641,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
@@ -661,7 +682,7 @@
               <div class="stat active">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
                   <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
@@ -675,7 +696,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
                   <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
@@ -689,7 +710,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
                   <span class="signal underused"><span class="sig-dot"></span>underused</span>
@@ -734,7 +755,7 @@
               <div class="stat active">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
                   <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
@@ -748,7 +769,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
                   <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
@@ -762,7 +783,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
                   <span class="signal underused"><span class="sig-dot"></span>underused</span>
@@ -931,7 +952,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
@@ -943,7 +964,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
@@ -955,7 +976,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
@@ -991,7 +1012,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1003,7 +1024,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
@@ -1015,7 +1036,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
@@ -1066,7 +1087,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health locked"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span></span>
                 </div>
@@ -1078,7 +1099,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1090,7 +1111,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1133,7 +1154,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health locked"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span></span>
                 </div>
@@ -1145,7 +1166,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1157,7 +1178,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1318,7 +1339,8 @@
       <li><b>Blocked states are honest and non-intrusive.</b> <b>Keychain-locked</b> keeps the fresh roster but marks the active account with an <i>orange at-risk</i> lock &mdash; the refresh path is broken while the token may still work, so it outranks a mere amber <i>stale</i> mark (🟡&nbsp;&lt;&nbsp;🟠, the CLI&rsquo;s ladder) &mdash; pauses the swap callout, and only <i>waits</i>: the app never prompts or auto-unlocks. <b>Version-skew</b> refuses to render any % and offers a copy-command instead.</li>
       <li><b>Capture is a real action; copy-command only where the app can&rsquo;t act.</b> <b>First-run / empty-roster onboarding</b> <b>captures</b> the active account in-app (#360) &mdash; a button + optional label field that sends the verb over the #358 control socket and renders an honest <i>pending &rarr; done &rarr; error</i> from the redacted ack (no credential ever reaches the client). It is an <i>onboarding</i> affordance: a populated panel carries no capture bar, so the steady state stays a read-only glance and adding an account lives off-panel. The captured row then arrives on its own via the live watch stream &mdash; the affordance never inserts it. To add a <i>different</i> account the operator runs <code>claude /login</code> first, then captures (capture snapshots the active account; it is not a picker). Only where the app genuinely can&rsquo;t act does it still copy a command: version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>). <b>daemon-starting</b> stays a <i>static</i> forming glyph &mdash; the app fakes no progress it isn&rsquo;t doing.</li>
       <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
-      <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each provider gets the same monochrome monogram badge and a plain text label (no brand colour or logo). The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
+      <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each account gets a per-account IDENTITY colour + smart monogram (a generic, low-chroma disambiguation cue &mdash; #445 below) and a plain text label, never a brand colour or logo. The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
+      <li><b>Same-local-part accounts stay distinguishable (#445).</b> A roster of accounts sharing a local-part (<code>work-alice</code>, <code>work-bob</code>, …) would collapse to one badge letter under <code>label.first</code> + tail-truncation. The disambiguation kit restores legibility with THREE cues, none alone sufficient: a per-account <b>colour</b> (a fixed low-chroma palette, <b>accent hue excluded</b>, seeded client-side from the wire <code>label</code> &mdash; the one identity handle, R-2; there is no <code>account_uuid</code> on the wire), a smart <b>2-char monogram</b> from the label's distinguishing token (collision-escalating, so two similar labels never share a pair), and <b>middle-</b>truncation (not tail) so the distinguishing suffix / domain survives elision. The colour is <b>never colour-alone</b> &mdash; always paired with the monogram glyph + the label text (WCAG 1.4.1) &mdash; and clears WCAG-AA in both themes (badge fill &ge;3:1, monogram &ge;4.5:1). The per-account colour is a <b>deliberate deviation</b> from this mock's former monochrome badge; a faithful real-popover screenshot vs this updated oracle (both themes) + an owner eyeball is the pre-lock check (render re-baseline is #440).</li>
       <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
       <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges, the orange at-risk lock and the amber stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>

@@ -83,6 +83,21 @@ fileprivate extension Color {
         let c = StatusPanelFormat.statsSignalText(signal, dark: dark)
         return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
     }
+
+    /// The per-account badge FILL (#445) — the `label`-seeded palette hue, as a plain sRGB color (like
+    /// `panelFill`). A LOW-CHROMA muted identity tone, never provider branding (#173); the accent hue is
+    /// excluded. Resolved by the testable `StatusPanelFormat.accountBadgeFill`.
+    static func accountBadge(_ label: String, dark: Bool) -> Color {
+        let c = StatusPanelFormat.accountBadgeFill(for: label, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The account MONOGRAM glyph color (#445) — the high-contrast neutral that reads on the badge fill in
+    /// both themes (asserted ≥ 4.5:1 against every slot). From `StatusPanelFormat.accountMonogramColor`.
+    static func accountMonogram(dark: Bool) -> Color {
+        let c = StatusPanelFormat.accountMonogramColor(dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
 }
 
 /// The panel's fixed layout constants — thin references to the source-of-truth in `StatusPanelFormat`
@@ -311,6 +326,9 @@ private struct RosterView: View {
     let switchable: Bool
 
     var body: some View {
+        // Resolve every row's smart monogram ONCE over the whole roster (issue #445), so collision-escalation
+        // sees all sibling labels — a same-local-part roster gets distinct 2-char monograms, not one letter.
+        let monograms = StatusPanelFormat.accountMonograms(rows.map(\.label))
         VStack(alignment: .leading, spacing: 2) {
             ForEach(rows) { row in
                 // On a dropped connection every row is `notATarget` (non-interactive); otherwise the pure
@@ -323,7 +341,7 @@ private struct RosterView: View {
                                                        weeklyExhausted: row.weeklyExhausted,
                                                        isEnabled: row.isEnabled)
                     : .notATarget
-                AccountRowView(row: row, now: now, switchState: state)
+                AccountRowView(row: row, monogram: monograms[row.label] ?? "?", now: now, switchState: state)
             }
         }
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
@@ -385,6 +403,8 @@ private struct RowSwitchButtonStyle: ButtonStyle {
 /// row carries the quiet chip; arming still gates the wash + `pointingHand` cursor.
 private struct AccountRowView: View {
     let row: AccountRow
+    /// The roster-resolved 2-char monogram for this row's label (issue #445), computed once by `RosterView`.
+    let monogram: String
     let now: Int64
     /// The row's manual-switch verdict (issue #169). `.notATarget` — the ACTIVE row, or any row on a
     /// dropped connection — stays a plain, non-interactive display row.
@@ -512,13 +532,15 @@ private struct AccountRowView: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
                 StatusDot(isActive: row.isActive)
-                MonogramBadge(label: row.label)
+                MonogramBadge(label: row.label, monogram: monogram)
 
                 Text(row.label)
                     .font(.body)
                     .fontWeight(.semibold)
                     .lineLimit(1)
-                    .truncationMode(.tail)
+                    // MIDDLE-truncation (issue #445): a same-local-part label's distinguishing suffix /
+                    // domain survives when it elides, where tail-truncation hid exactly that part.
+                    .truncationMode(.middle)
 
                 Spacer(minLength: 6)
 
@@ -683,31 +705,34 @@ private struct AccountRowView: View {
 
 // MARK: - Row building blocks (per the design reference)
 
-/// The account's monogram — provider-neutral by construction (issue #15: the label's initial, never a
-/// brand mark or color). Accessibility-hidden; the row's VoiceOver label already speaks the identity.
+/// The account's monogram badge — a smart 2-char MONOGRAM over a per-account identity COLOR (issue #445),
+/// both seeded from the operator `label` (never a provider brand mark or logo — #15/#173: the color is a
+/// LOW-CHROMA generic identity hue with the accent EXCLUDED, and it is only ever a REDUNDANT cue beside the
+/// monogram glyph + the row's label text, never color-alone — WCAG 1.4.1). The monogram is PRE-RESOLVED by
+/// the parent (`RosterView` / `StatsContent`) so its collision-escalation sees every sibling label.
+/// Accessibility-hidden; the row's VoiceOver label already speaks the identity.
 private struct MonogramBadge: View {
     let label: String
+    /// The roster-resolved 2-char monogram (issue #445) — derived from the label's distinguishing token, so
+    /// a same-local-part roster does not collapse to one letter. Computed once per roster by the parent.
+    let monogram: String
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
+        let dark = colorScheme == .dark
         RoundedRectangle(cornerRadius: 8)
-            // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
-            .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
+            // Per-account identity color (issue #445), seeded from `label` — the deliberate deviation from the
+            // mock's neutral `--badge-bg` monochrome badge. A low-chroma muted hue, never provider branding.
+            .fill(Color.accountBadge(label, dark: dark))
             .frame(width: 30, height: 30)
             .overlay(
-                Text(initial)
+                Text(monogram)
                     .font(.system(size: 13, weight: .bold))
                     .tracking(0.4)
-                    .foregroundStyle(.secondary)
+                    // High-contrast neutral glyph ON the fill (asserted ≥ 4.5:1 per slot, both themes).
+                    .foregroundStyle(Color.accountMonogram(dark: dark))
             )
             .accessibilityHidden(true)
-    }
-
-    /// The first character of the operator label, uppercased — `?` for an empty/whitespace label.
-    private var initial: String {
-        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return "?" }
-        return String(first).uppercased()
     }
 }
 
@@ -1018,10 +1043,17 @@ private struct SwapCalloutCard: View {
             // (Combining the whole card, as this did while the button was dead, would now swallow a live
             // control and leave it unreachable.)
             VStack(alignment: .leading, spacing: 1) {
-                (Text("Next swap → ") + Text(target).fontWeight(.semibold))
-                    .font(.system(size: 12))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                // MIDDLE-truncate the TARGET label (issue #445), keeping the "Next swap →" prefix whole, so a
+                // same-local-part target's distinguishing suffix survives the elision (the earlier "clunky"
+                // read was a tail-truncated target). The prefix is `.fixedSize`d; the target absorbs the
+                // squeeze. The spoken label (`accessibilityText`) is unchanged — it carries the full target.
+                HStack(spacing: 0) {
+                    Text("Next swap → ").fixedSize()
+                    Text(target).fontWeight(.semibold)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(.system(size: 12))
                 if let reason {
                     Text(reason)
                         .font(.system(size: 10.5))
@@ -1308,11 +1340,15 @@ private struct StatsContent: View {
     var body: some View {
         let handles = StatusPanelFormat.orderedStatHandles(
             summaryHandles: Set(wire.summary.accounts.keys), rosterOrder: rosterOrder)
+        // Resolve monograms over the SAME handle set the Stats tab lists (issue #445) — the disambiguation
+        // kit applies identically on both tabs, since they render the same accounts.
+        let monograms = StatusPanelFormat.accountMonograms(handles)
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(handles, id: \.self) { handle in
                     if let account = wire.summary.accounts[handle] {
                         StatStripRow(handle: handle,
+                                     monogram: monograms[handle] ?? "?",
                                      account: account,
                                      series: StatusPanelFormat.sparkSeries(wire.series, handle: handle),
                                      isActive: handle == activeLabel)
@@ -1333,6 +1369,8 @@ private struct StatsContent: View {
 /// the accent-tint card fill (mock `.stat.active`, the SAME `--active-bg` token the Status roster uses).
 private struct StatStripRow: View {
     let handle: String
+    /// The roster-resolved 2-char monogram for this handle (issue #445), computed once by `StatsContent`.
+    let monogram: String
     let account: StatsAccountStats
     /// The per-bucket session-peak series (0…1, fixed-scale) — the sparkline source.
     let series: [Double]
@@ -1344,12 +1382,14 @@ private struct StatStripRow: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
                 StatusDot(isActive: isActive)
-                MonogramBadge(label: handle)
+                MonogramBadge(label: handle, monogram: monogram)
                 // Provider-neutral name (#15): the redacted handle, exactly as the Status roster shows it —
                 // the mock's `.s-prov` provider brand is intentionally dropped (the shipped app names no provider).
                 Text(handle)
                     .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1).truncationMode(.tail)
+                    // MIDDLE-truncation (issue #445) — same as the Status roster, so a same-local-part handle's
+                    // distinguishing suffix survives elision on the Stats tab too.
+                    .lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 6)
                 Sparkline(values: series)
                 SignalPill(signal: signal)
