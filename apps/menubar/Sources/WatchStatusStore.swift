@@ -105,10 +105,27 @@ final class WatchStatusStore: ObservableObject {
     /// The in-flight stability timer, re-armed whenever the pure core bumps its stability generation.
     private var stabilityTask: Task<Void, Never>?
 
+    /// The default start grace (#499): how long a COLD connect-refused shows as the transient `.starting`
+    /// before it escalates to the durable `.notRunning`. 3 s — a "short grace" that comfortably covers a
+    /// daemon coming up (a launchd (re)start binds its socket within a second or two, so a genuinely-
+    /// starting daemon connects INSIDE the grace and never flickers "not running") yet is short enough
+    /// that a truly-absent daemon reaches the actionable not-running state promptly. Injected so tests
+    /// drive it deterministically. `nonisolated` for the `init` default-argument
+    /// expression, as the other windows.
+    nonisolated static let defaultStartGraceWindow: Duration = .seconds(3)
+
+    /// How long the store holds a cold connect-refused as `.starting` before escalating to `.notRunning`
+    /// — injected so tests drive the grace timer deterministically (as `validFrameWindow`).
+    private let startGraceWindow: Duration
+    /// The in-flight start-grace timer, re-armed whenever the pure core bumps its grace generation (#499).
+    private var graceTask: Task<Void, Never>?
+
     init(validFrameWindow: Duration = WatchStatusStore.defaultValidFrameWindow,
-         stabilityWindow: Duration = WatchStatusStore.defaultStabilityWindow) {
+         stabilityWindow: Duration = WatchStatusStore.defaultStabilityWindow,
+         startGraceWindow: Duration = WatchStatusStore.defaultStartGraceWindow) {
         self.validFrameWindow = validFrameWindow
         self.stabilityWindow = stabilityWindow
+        self.startGraceWindow = startGraceWindow
         (presentations, presentationsContinuation) =
             AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
         // Seed the glance with the initial `.connecting` so a consumer attaching before the first
@@ -129,26 +146,29 @@ final class WatchStatusStore: ObservableObject {
             self?.presentationsContinuation.finish()
             self?.watchdogTask?.cancel()          // teardown: drop the in-flight valid-frame watchdog
             self?.stabilityTask?.cancel()         // teardown: drop the in-flight stability timer (#169)
+            self?.graceTask?.cancel()             // teardown: drop the in-flight start-grace timer (#499)
         }
     }
 
     private func ingest(_ event: TransportEvent) {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
         let outcome = machine.apply(event)
         log(outcome)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
         publish()
     }
 
     /// Re-arm / cancel each real timer to match the pure core's intent, but ONLY when its generation
     /// token changed across the mutation — the token changes exactly when the timer should (re)start or
-    /// stop, so a routine event that touches neither leaves both counting down untouched. Shared by
-    /// event ingestion AND both timer-fired paths so a cross-timer effect (e.g. the valid-frame watchdog
-    /// tripping `.stale`, which also ends a stabilization hold) re-syncs BOTH (#344, #169).
-    private func resyncTimers(watchdogBefore: Int, stabilityBefore: Int) {
+    /// stop, so a routine event that touches none leaves all three counting down untouched. Shared by
+    /// event ingestion AND every timer-fired path so a cross-timer effect (e.g. the valid-frame watchdog
+    /// tripping `.stale`, which also ends a stabilization hold) re-syncs ALL (#344, #169, #499).
+    private func resyncTimers(watchdogBefore: Int, stabilityBefore: Int, graceBefore: Int) {
         if machine.watchdogGeneration != watchdogBefore { rearmValidFrameWatchdog() }
         if machine.stabilityGeneration != stabilityBefore { rearmStabilityTimer() }
+        if machine.graceGeneration != graceBefore { rearmGraceTimer() }
     }
 
     /// Mirror the pure core's derived state onto the published surface + the glance stream. Shared by
@@ -188,8 +208,9 @@ final class WatchStatusStore: ObservableObject {
     private func validFrameWatchdogElapsed(generation: Int) {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
         machine.watchdogElapsed(generation: generation)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
         publish()
     }
 
@@ -216,8 +237,40 @@ final class WatchStatusStore: ObservableObject {
     private func stabilityWindowElapsed(generation: Int) {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
         machine.stabilityElapsed(generation: generation)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
+        publish()
+    }
+
+    // MARK: - Store-side start-grace timer (#499)
+
+    /// (Re)arm — or cancel — the store-side start-grace timer to match the pure core's current intent, the
+    /// not-running-split analogue of `rearmStabilityTimer`: while a COLD connect-refused is held as
+    /// `.starting` (`machine.isAwaitingStartGrace`), sleep the grace then feed the (generation-guarded)
+    /// elapse back, which escalates the held `.starting` to the durable `.notRunning`. The daemon
+    /// connecting before the grace elapses supersedes the token (the pure core bumps `graceGeneration` on
+    /// the `.starting`→`.live` transition), so a daemon that was merely coming up never reaches the
+    /// escalate — it goes straight to connected.
+    private func rearmGraceTimer() {
+        graceTask?.cancel()
+        guard machine.isAwaitingStartGrace else { graceTask = nil; return }
+        let generation = machine.graceGeneration
+        let window = startGraceWindow
+        graceTask = Task { [weak self] in
+            do { try await Task.sleep(for: window) } catch { return }   // cancelled → drop
+            self?.startGraceElapsed(generation: generation)
+        }
+    }
+
+    /// The start grace fired: fold the elapse into the machine (a superseded token — the daemon connected
+    /// mid-grace — is ignored there) and re-publish, in case it escalated `.starting` to `.notRunning`.
+    private func startGraceElapsed(generation: Int) {
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
+        machine.graceElapsed(generation: generation)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
         publish()
     }
 

@@ -133,6 +133,7 @@ final class HonestStateMachineTests: XCTestCase {
     func testNeverHealthyOnAnyDegradedOrAbsentPath() {
         let degradedPaths: [(name: String, events: [TransportEvent])] = [
             ("fresh, never connected", []),
+            ("cold connect-refused within grace — starting (#499)", [.disconnected(reason: "connect refused")]),
             ("connected, no snapshot yet", [.connected]),
             ("error-only line (unknown frame)", [.connected, .line(#"{"error":"unknown command"}"#)]),
             ("undecodable garbage line", [.connected, .line("not json")]),
@@ -435,10 +436,20 @@ final class HonestStateMachineTests: XCTestCase {
                        "Sessiometer: connected — no accounts configured")
         XCTAssertEqual(machine([.line(Fixtures.snapshotBasic), .stale]).presentation.accessibilityLabel,
                        "Sessiometer: data may be stale — the daemon has gone quiet")
-        XCTAssertEqual(machine([.disconnected(reason: "EOF")]).presentation.accessibilityLabel,
+        // A WARM drop — a live connection was HELD (the snapshot) then lost — is the socket-dropped state
+        // (#499: `hasEverConnected` discriminates this from a cold connect-refused).
+        XCTAssertEqual(machine([.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: "EOF")]).presentation.accessibilityLabel,
                        "Sessiometer: disconnected — the daemon is not responding")
         XCTAssertEqual(machine([.line(Fixtures.snapshotUnsupportedMajor)]).presentation.accessibilityLabel,
                        "Sessiometer: daemon version unsupported — update required")
+        // #499: a COLD connect-refused (fresh machine, never connected) is the transient starting state —
+        // NOT the socket-dropped label (the pre-#499 collapse this fixes).
+        XCTAssertEqual(machine([.disconnected(reason: "connect refused")]).presentation.accessibilityLabel,
+                       "Sessiometer: the daemon is starting…")
+        // …and the durable not-running label (built directly; the grace-driven escalation is exercised in
+        // the dedicated transition tests below).
+        XCTAssertEqual(PresentationState.make(for: .notRunning, accountCount: 0).accessibilityLabel,
+                       "Sessiometer: the daemon is not running")
     }
 
     // MARK: - AC (#169): the crash-loop healthy-flash debounce
@@ -578,5 +589,138 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertFalse(ConnectionState.crashLooping.isHealthy)
         XCTAssertEqual(presentation.accessibilityLabel,
                        "Sessiometer: the daemon is restarting repeatedly — holding status until it stays up")
+    }
+
+    // MARK: - AC (#499): split daemon-starting (transient) from not-running (durable)
+
+    // A fresh launch with the daemon absent: the transport refuses the connect and emits `.disconnected`
+    // BEFORE any `.connected`. Never having held a live connection, that reads as the transient `.starting`
+    // glance (a "daemon coming up" state that self-resolves) — NOT the socket-dropped state; then the grace
+    // elapses still refused → the durable `.notRunning`. Neither is ever healthy.
+    func testColdRefusedGoesStartingThenNotRunningAfterGraceNeverHealthy() {
+        var m = HonestStateMachine()
+        _ = m.apply(.disconnected(reason: "connect refused"))
+        XCTAssertEqual(m.connectionState, .starting)
+        XCTAssertEqual(m.presentation.glyph, .starting)
+        XCTAssertFalse(m.connectionState.isHealthy)
+        XCTAssertTrue(m.isAwaitingStartGrace)
+        if case .disconnected = m.connectionState { XCTFail("a cold refusal must not read as socket-dropped") }
+
+        // The grace elapses with the connect still refused → the durable not-running state (the one that
+        // WOULD host a Start-daemon affordance, #170).
+        m.graceElapsed(generation: m.graceGeneration)
+        XCTAssertEqual(m.connectionState, .notRunning)
+        XCTAssertEqual(m.presentation.glyph, .notRunning)
+        XCTAssertFalse(m.connectionState.isHealthy)
+        XCTAssertFalse(m.isAwaitingStartGrace, "not-running is durable — the grace is done")
+    }
+
+    // The SAME `.disconnected` transport event means DIFFERENT states by lineage (#499): a WARM drop (a
+    // live connection was held, then lost) is the socket-dropped state; a COLD refusal (never connected) is
+    // the starting state. They must NOT collapse to one presentation (the pre-#499 bug).
+    func testWarmDropIsSocketDroppedNotStartingOrNotRunning() {
+        let warm = machine([.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: "EOF")])
+        XCTAssertEqual(warm.connectionState, .disconnected(reason: "EOF"))
+        XCTAssertEqual(warm.presentation.glyph, .disconnected)
+
+        let cold = machine([.disconnected(reason: "connect refused")])
+        XCTAssertEqual(cold.connectionState, .starting)
+        XCTAssertEqual(cold.presentation.glyph, .starting)
+
+        XCTAssertNotEqual(warm.connectionState, cold.connectionState,
+                          "a warm drop and a cold refusal must NOT collapse to the same state (#499)")
+        XCTAssertNotEqual(warm.presentation.glyph, cold.presentation.glyph)
+    }
+
+    // The backoff loop retries and is refused again several times: the state stays `.starting` and the grace
+    // generation does NOT advance — so the real timer keeps counting toward not-running rather than resetting
+    // on every retry (which would starve the escalation and never reach not-running).
+    func testRepeatedColdRefusalStaysStartingAndDoesNotResetTheGrace() {
+        var m = HonestStateMachine()
+        _ = m.apply(.disconnected(reason: "connect refused"))
+        XCTAssertEqual(m.connectionState, .starting)
+        let armed = m.graceGeneration
+        for _ in 0..<4 {
+            _ = m.apply(.disconnected(reason: "connect refused"))
+            XCTAssertEqual(m.connectionState, .starting)
+            XCTAssertEqual(m.graceGeneration, armed, "a repeat refusal must NOT re-arm (reset) the grace")
+        }
+        m.graceElapsed(generation: armed)
+        XCTAssertEqual(m.connectionState, .notRunning)
+    }
+
+    // THE load-bearing #499 ↔ #169 interaction: a daemon we were merely WAITING for (starting → not-running)
+    // must promote to healthy IMMEDIATELY when it finally connects — a clean cold start, NOT a debounced
+    // reconnect. The cold-refused track never arms the crash-loop debounce (`hasEverDisconnected`), so no
+    // stability hold is ever imposed.
+    func testDaemonConnectingAfterNotRunningPromotesImmediatelyNoDebounce() {
+        var m = HonestStateMachine()
+        _ = m.apply(.disconnected(reason: "connect refused"))   // cold refused → starting
+        m.graceElapsed(generation: m.graceGeneration)           // grace elapses → not running
+        XCTAssertEqual(m.connectionState, .notRunning)
+
+        _ = m.apply(.connected)
+        XCTAssertEqual(m.connectionState, .connecting, "connected socket, awaiting the first snapshot")
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connected, "promotes immediately — not debounced as a reconnect")
+        XCTAssertFalse(m.isStabilizing, "the cold-refused track must not arm the crash-loop debounce")
+        XCTAssertEqual(m.stabilityGeneration, 0, "no stability hold was ever armed by the cold-refused track")
+    }
+
+    // A daemon that connects DURING the grace (the genuinely-starting case) promotes immediately too — it
+    // never reaches not-running, and the pending grace timer is superseded by the connect.
+    func testDaemonConnectingDuringGracePromotesAndSupersedesTheGrace() {
+        var m = HonestStateMachine()
+        _ = m.apply(.disconnected(reason: "connect refused"))
+        XCTAssertEqual(m.connectionState, .starting)
+        let staleToken = m.graceGeneration
+        _ = m.apply(.connected)                                 // the daemon came up within the grace
+        XCTAssertFalse(m.isAwaitingStartGrace, "connecting cancels the start grace")
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connected, "a daemon that came up within the grace goes healthy")
+        // The superseded grace timer firing late is a harmless no-op — it cannot force not-running onto a
+        // now-healthy connection.
+        m.graceElapsed(generation: staleToken)
+        XCTAssertEqual(m.connectionState, .connected, "a superseded grace elapse must not resurrect not-running")
+    }
+
+    // `graceElapsed` is generation-guarded, starting-only, and idempotent — a superseded token, an elapse
+    // after the daemon connected, or a repeat elapse can never manufacture not-running or fire twice (mirrors
+    // the watchdog / stability guard tests).
+    func testGraceElapseIsGenerationGuardedStartingOnlyAndIdempotent() {
+        // A superseded token (an old generation) is ignored.
+        var m = HonestStateMachine()
+        _ = m.apply(.disconnected(reason: "refused"))
+        m.graceElapsed(generation: m.graceGeneration - 1)
+        XCTAssertEqual(m.connectionState, .starting, "a superseded grace token must not escalate")
+
+        // Starting-only: once escalated to not-running, a repeat elapse of the consumed token is a no-op.
+        var p = HonestStateMachine()
+        _ = p.apply(.disconnected(reason: "refused"))
+        let t = p.graceGeneration
+        p.graceElapsed(generation: t)
+        XCTAssertEqual(p.connectionState, .notRunning)
+        p.graceElapsed(generation: p.graceGeneration)
+        XCTAssertEqual(p.connectionState, .notRunning, "a second elapse is a no-op")
+    }
+
+    // The presentation surface: starting and not-running are distinct glances from each other and — the
+    // load-bearing pair — from the socket-dropped and stale glances, and neither is ever healthy.
+    func testStartingAndNotRunningPresentationAreDistinctAndNeverHealthy() {
+        let starting = PresentationState.make(for: .starting, accountCount: 0)
+        let notRunning = PresentationState.make(for: .notRunning, accountCount: 0)
+        XCTAssertEqual(starting.glyph, .starting)
+        XCTAssertEqual(notRunning.glyph, .notRunning)
+        XCTAssertNotEqual(starting.glyph, notRunning.glyph)
+        XCTAssertNotEqual(starting.accessibilityLabel, notRunning.accessibilityLabel)
+        for other: ConnectionState in [.disconnected(reason: "EOF"), .stale] {
+            let o = PresentationState.make(for: other, accountCount: 0)
+            XCTAssertNotEqual(starting.glyph, o.glyph, "starting must be distinct from \(other)")
+            XCTAssertNotEqual(notRunning.glyph, o.glyph, "not-running must be distinct from \(other)")
+            XCTAssertNotEqual(starting.accessibilityLabel, o.accessibilityLabel, "starting label must be distinct from \(other)")
+            XCTAssertNotEqual(notRunning.accessibilityLabel, o.accessibilityLabel, "not-running label must be distinct from \(other)")
+        }
+        XCTAssertFalse(ConnectionState.starting.isHealthy)
+        XCTAssertFalse(ConnectionState.notRunning.isHealthy)
     }
 }

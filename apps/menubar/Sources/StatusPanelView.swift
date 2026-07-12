@@ -229,12 +229,16 @@ struct StatusPanelView: View {
             CaptureCard(title: "Capture your first account")
                 .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
 
-        case .connecting, .unsupported, .crashLooping:
+        case .connecting, .starting, .notRunning, .unsupported, .crashLooping:
             // No trustworthy reading to show — a plain honest message card. `.crashLooping` (#169) holds
             // here too: the daemon served a snapshot but keeps dropping before it stabilizes, so its
             // numbers are refused ("holding status until it stays up") rather than flickered as live —
-            // the crown-jewel anti-#137 debounce. (The fuller per-state message-card fidelity and the
-            // lifecycle affordances — View log / Restart — are #169 siblings.)
+            // the crown-jewel anti-#137 debounce. `.starting` / `.notRunning` (#499) are the cold-refused
+            // daemon-absent states: neither ever held a reading, so both render the honest banner card. The
+            // not-running state WOULD host a "Start daemon" button — launch-at-login is #170 (deferred,
+            // signing-blocked), so it degrades to the inert explanatory banner (no button yet). (The fuller
+            // per-state message-card fidelity and the lifecycle affordances — View log / Restart / Start —
+            // are #169 / #170 siblings.)
             Divider().padding(.horizontal, 14)
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
                 .padding(.horizontal, 14).padding(.vertical, 14)

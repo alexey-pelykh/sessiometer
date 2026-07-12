@@ -51,6 +51,11 @@ enum StatusGauge {
         case .disconnected: return "circle.slash"
         case .unsupported:  return "exclamationmark.circle"
         case .crashLooping: return "exclamationmark.triangle"
+        // #499: a STATIC forming ring for daemon-starting (distinct from connecting's dashed ring — both
+        // benign "coming up" shapes) and the universal power glyph for not-running (a distinct silhouette
+        // from the slashed disconnected ring — "the daemon is off; start it").
+        case .starting:     return "circle.dotted"
+        case .notRunning:   return "power"
         }
     }
 
@@ -83,6 +88,8 @@ enum StatusGauge {
         case .disconnected: return "disconnected"
         case .unsupported:  return "unsupported"
         case .crashLooping: return "crash-looping"
+        case .starting:     return "starting"
+        case .notRunning:   return "not running"
         }
     }
 
