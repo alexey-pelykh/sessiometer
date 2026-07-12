@@ -55,8 +55,9 @@ enum Fixtures {
     /// `next_swap` = target with the #393 `roster_order` reason: ≥2 accounts qualified but none
     /// reported a weekly reset, so no soonest-reset tiebreak existed and the earliest roster index
     /// won. Hand-built to the contract (the byte-pinned golden above carries `soonest_reset`) — it
-    /// pins that the client accepts the tag the daemon emits, since an unknown `kind` is a HARD
-    /// decode error and one golden cannot cover every variant.
+    /// pins that the client decodes each KNOWN tag the daemon emits to its own case, which one golden
+    /// cannot cover. (An UNKNOWN `kind`, by contrast, degrades to `reason: nil` — issue #412,
+    /// `snapshotUnknownReasonKind` — rather than failing the frame.)
     static let snapshotRosterOrderTarget = #"""
     {"type":"snapshot","schema_version":{"major":1,"minor":4},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"roster_order"}},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
@@ -166,6 +167,17 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":1},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare"},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
+    /// A NEWER daemon (minor 5) whose `next_swap.target` carries a `reason.kind` this panel does not
+    /// recognise — a FUTURE #393 variant (here a hypothetical `headroom`, with its own additive
+    /// payload). The unrecognised DECORATION must degrade to `reason: nil` (the bare target label —
+    /// exactly the pre-#393 `snapshotTargetNoReason` path) and the frame must STILL decode, never a
+    /// lost snapshot (issue #412). The forward-compat INVERSE of `snapshotUnknownNextSwap`: an unknown
+    /// `reason.kind` is TOLERATED (a decoration), an unknown `state` is REJECTED (state). Hand-built to
+    /// a state the current daemon never emits, so — like its siblings above — it has no Rust golden.
+    static let snapshotUnknownReasonKind = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":5},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"headroom","headroom_pct":42}},"refresh_enabled":false,"systemic_refresh_failure":null}
+    """#
+
     // ---- Malformed / rejected bodies --------------------------------------------------------
 
     /// An unknown `next_swap` state — the daemon's internally-tagged enum rejects it, so the
@@ -192,6 +204,14 @@ enum Fixtures {
     /// `next_swap` = target but missing the required `to` label — an error.
     static let snapshotTargetMissingTo = #"""
     {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":1,"accounts":[],"next_swap":{"state":"target"},"refresh_enabled":false}
+    """#
+
+    /// `next_swap` = target with a MALFORMED known `reason.kind`: `soonest_reset` WITHOUT its required
+    /// `resets_at` epoch. This is CORRUPTION, not forward-compat — a KNOWN variant with a missing
+    /// required field — so it must stay a hard decode error. The `UnknownKind` tolerance (issue #412)
+    /// is for UNRECOGNISED kinds only, never a malformed known one; contrast `snapshotUnknownReasonKind`.
+    static let snapshotTargetMalformedReason = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":1,"accounts":[],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset"}},"refresh_enabled":false}
     """#
 
     /// A `schema_version` object present but missing `minor` (the inner fields carry no default,

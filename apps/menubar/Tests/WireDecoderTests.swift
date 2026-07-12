@@ -89,9 +89,10 @@ final class WireDecoderTests: XCTestCase {
     }
 
     // AC (#393): the `roster_order` reason decodes — ≥2 accounts qualified, none reported a weekly
-    // reset, so the earliest roster index won. The client must accept every tag the daemon emits
-    // (an unknown `kind` is a hard decode error), and must never render this as "only viable
-    // target" — other targets were viable.
+    // reset, so the earliest roster index won. The client must decode every KNOWN tag the daemon
+    // emits to its own case (an UNKNOWN `kind` now degrades to `reason: nil` — issue #412,
+    // `testUnknownReasonKindDecodesToNilReasonAndFrameStillDecodes`), and must never render this as
+    // "only viable target" — other targets were viable.
     func testDecodesNextSwapTargetWithRosterOrderReason() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotRosterOrderTarget) else {
             return XCTFail("expected a snapshot frame")
@@ -195,6 +196,32 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 1))
         XCTAssertTrue(v.isSchemaSupported, "a pre-#393 minor stays supported")
         XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: nil))
+    }
+
+    // AC (#412): a NEWER daemon's unrecognised `next_swap.reason.kind` is a forward-compat DECORATION
+    // — it must degrade to `reason: nil` (the bare target label, the SAME path as a pre-#393 omitted
+    // reason) and the frame must STILL decode, never be lost. This is the whole fix: one unknown
+    // rationale must not silently freeze the panel (`WatchStatusStore` drops an undecodable line, so
+    // an unrecognised kind used to take down every account row, every meter, the whole frame).
+    func testUnknownReasonKindDecodesToNilReasonAndFrameStillDecodes() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotUnknownReasonKind) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertTrue(v.isSchemaSupported, "a newer minor stays supported")
+        // The unrecognised reason degrades to the bare target label (reason == nil)…
+        XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: nil))
+        // …and the REST of the frame survived — this is the regression the fix prevents.
+        XCTAssertEqual(v.accounts.count, 1, "the whole frame decoded, not just next_swap")
+        XCTAssertEqual(v.accounts[0].label, "work")
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
+    // AC (#412): the tolerance is for UNRECOGNISED kinds ONLY. A MALFORMED known kind — here
+    // `soonest_reset` without its required `resets_at` — is corruption, not forward-compat, so it
+    // stays a HARD decode error; it must NOT be swallowed to `nil` the way an unknown kind is. This
+    // pins the tolerate-vs-reject discriminator so a future refactor cannot over-tolerate into it.
+    func testMalformedKnownReasonKindStillThrows() {
+        XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotTargetMalformedReason))
     }
 
     // AC: "Unknown `type` → ignored (returns an 'unknown' frame, NOT an error)".
