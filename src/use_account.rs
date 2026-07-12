@@ -1424,6 +1424,9 @@ mod tests {
             access_expires_at: None,
             refresh_health: None,
             health: None,
+            // Bounded-blindness (#479) is a daemon `status`-snapshot concern, not read by the
+            // cached-viability gate — inert here.
+            blind_active: None,
         }
     }
 

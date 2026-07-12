@@ -76,6 +76,34 @@ pub(crate) struct RefreshHealth {
     pub(crate) consecutive_failures: u32,
 }
 
+/// The active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) — present only
+/// when the active account has gone blind (its `/oauth/usage` poll is failing / backing off, so its
+/// live reading is cleared) AND the daemon still holds a retained pre-blind anchor (`last_good`,
+/// #450). Surfaced so `status` renders a SEMANTIC line — blind duration, last-known session %, and
+/// whether ADR-0017 auto-protection is OK or DEGRADED — instead of the content-free `n/a … 🟡` a
+/// bare failed-poll row shows. The surface only REFLECTS this daemon-pushed state; it never
+/// self-polls or self-swaps (the #169 UI-never-acts invariant). Non-secret — a duration and two
+/// small numbers, never a token or email (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BlindActive {
+    /// Seconds the active account has been blind — `blind_elapsed`, measured from the retained
+    /// pre-blind anchor's observation instant (`last_good.at`, #450) to snapshot assembly on the
+    /// daemon's MONOTONIC clock (the SAME clock #452's gate and the swap cooldown use). A DURATION
+    /// (not an absolute instant, which an [`std::time::Instant`] cannot cross the socket as), so the
+    /// client renders it verbatim against nothing.
+    pub(crate) blind_secs: u64,
+    /// The retained pre-blind SESSION-window usage percent (`0..=100`) the anchor holds
+    /// (`last_good.session`, #450) — the last-known reading before the account went blind. This is
+    /// why the row stops reporting "no data": the daemon DID retain a reading.
+    pub(crate) last_known_session_pct: u8,
+    /// Whether ADR-0017 preemptive auto-protection is DEGRADED — the gate is armed but acting on a
+    /// STALE anchor: `blind_secs > BLIND_GATE_SECS` AND the anchor sat at/over `BLIND_GATE_RISK_BAND`
+    /// (the gate's first two ADR-0017 conditions, mirroring [`Daemon::note_blind_gate_eligibility`]
+    /// exactly). `false` = OK: the account is blind, but not yet past the gate threshold, or the
+    /// anchor sat below the risk band — auto-protection is nominally intact.
+    pub(crate) auto_protection_degraded: bool,
+}
+
 /// One account's latest reading.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccountReading {
@@ -116,6 +144,11 @@ pub(crate) struct AccountReading {
     /// thin `status` client projects to a glyph. Computed in [`Daemon::snapshot`] from this
     /// account's health state and the wall clock.
     pub(crate) health: CredentialHealth,
+    /// The active account's bounded-blindness projection (issue #479), or `None` when this is not
+    /// the active account, or the active account is not blind, or there is no retained anchor.
+    /// Computed in [`Daemon::snapshot`] from the retained `last_good` anchor (#450) and the ADR-0017
+    /// gate thresholds; copied straight to the wire ([`status_response`]).
+    pub(crate) blind_active: Option<BlindActive>,
 }
 
 /// The status-snapshot wire contract's version (issue #164): a `major.minor` the daemon stamps
@@ -143,8 +176,12 @@ pub(crate) struct SchemaVersion {
 /// ([`NextSwapReason`], issue #393) — the daemon's own selection rationale, likewise optional and
 /// tolerated-by-ignoring. `1.3` ADDED the [`NextSwap::NoViableTarget`] `cause` + `resets_at`
 /// fleet-capacity relief hint ([`NoTargetCause`], issue #405) — two more optional
-/// tolerated-by-ignoring fields on a variant that was previously payload-free.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 3 };
+/// tolerated-by-ignoring fields on a variant that was previously payload-free. `1.4` ADDED the
+/// per-account [`AccountStatusLine::blind_active`] bounded-blindness projection ([`BlindActive`],
+/// issue #479) — an optional field an older client tolerates by ignoring, and (via
+/// `skip_serializing_if`) omitted entirely except on a blind active account, so a non-blind frame's
+/// per-line bytes are unchanged.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 4 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -284,6 +321,16 @@ pub(crate) struct AccountStatusLine {
     /// `healthy` over a dead account.
     #[serde(default, rename = "auth")]
     pub(crate) health: Option<CredentialHealth>,
+    /// The active account's bounded-blindness projection (issue #479, umbrella #363 Path B): blind
+    /// duration + last-known session % + whether ADR-0017 auto-protection is DEGRADED — or absent
+    /// when the active account is not blind (or this is not the active account). The client renders
+    /// it as a SEMANTIC status line in place of the bare `n/a … 🟡` active row. `#[serde(default)]`
+    /// decodes an omitting daemon to `None`; `skip_serializing_if` OMITS it whenever absent, so a
+    /// non-blind account's per-line wire bytes are byte-for-byte unchanged — the additive MINOR
+    /// `1.3 → 1.4` field appears ONLY on a blind active account (a pre-#479 client ignores the
+    /// unknown key, the minor-bump tolerate-by-ignoring convention). Non-secret (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blind_active: Option<BlindActive>,
 }
 
 /// The next swap candidate shown by `status` (issue #88): who the daemon would
@@ -425,6 +472,10 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 access_expires_at: account.access_expires_at,
                 refresh_health: account.refresh_health,
                 health: Some(account.health),
+                // The bounded-blindness projection (issue #479), already resolved daemon-side in
+                // `Daemon::snapshot`; copied straight to the wire. `None` for every non-active or
+                // non-blind account, so `skip_serializing_if` omits it there.
+                blind_active: account.blind_active,
             })
             .collect(),
         // Already computed at snapshot build (issue #88); copy it to the wire.

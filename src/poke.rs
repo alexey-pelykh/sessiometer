@@ -601,6 +601,8 @@ mod tests {
             access_expires_at: None,
             refresh_health: None,
             health,
+            // Bounded-blindness (#479) is not read by poke's verdict — inert here.
+            blind_active: None,
         }
     }
 
