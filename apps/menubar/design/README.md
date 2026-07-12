@@ -139,7 +139,10 @@ healthy on a degraded daemon.
 
 - **Identity** — each row leads with the account's operator-chosen **label** (never the email;
   defaults to the account UUID when unset), provider on a quieter secondary line.
-- **Provider-neutral** — a monochrome monogram badge + plain-text label, no brand color or logo.
+- **Provider-neutral** — the badge carries a per-account **identity color + smart 2-char monogram** (#445):
+  a generic low-chroma disambiguation cue (a fixed palette, accent hue excluded, seeded from the `label`),
+  **not** a provider brand color/logo, and never color-alone (always paired with the monogram + label text,
+  WCAG 1.4.1). Same-local-part rosters stay legible via the monogram's distinguishing token + middle-truncation.
 - **Capture is a real action; copy-command only where the app can't act** — first-run / empty-roster
   onboarding captures the active account in-app (#360), sending the verb over the #358 control socket
   and rendering an honest pending → done → error (redacted ack; no credential ever reaches the client);

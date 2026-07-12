@@ -587,6 +587,124 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertNil(StatusPanelFormat.swapCalloutReason(nil))
     }
 
+    // MARK: - Account identity color (issue #445 — deterministic label→palette hash, WCAG-AA, accent-excluded)
+
+    func testAccountColorIndexIsStableAndBounded() {
+        // Deterministic: the same label maps to the same slot on EVERY call (FNV-1a — never the per-process
+        // randomized `Hasher`, which would reshuffle every account's color each launch).
+        for label in ["work-alice", "work-bob", "acme.gmail.com", "", "Personal", "  spaced  "] {
+            let a = StatusPanelFormat.accountColorIndex(for: label)
+            let b = StatusPanelFormat.accountColorIndex(for: label)
+            XCTAssertEqual(a, b, "index for '\(label)' must be stable across calls")
+            XCTAssertTrue((0..<StatusPanelFormat.accountColorCount).contains(a),
+                          "index \(a) for '\(label)' must be within the palette")
+        }
+        // Leading/trailing whitespace is trimmed before hashing, so a padded label keeps its color.
+        XCTAssertEqual(StatusPanelFormat.accountColorIndex(for: "work"),
+                       StatusPanelFormat.accountColorIndex(for: "  work  "))
+        // A 6-account same-local-part roster spreads across several slots, not one collapsed color.
+        let indices = ["work-alice", "work-bob", "work-carol", "work-dave", "work-erin", "work-frank"]
+            .map(StatusPanelFormat.accountColorIndex(for:))
+        XCTAssertGreaterThanOrEqual(Set(indices).count, 3,
+                                    "a 6-account same-local-part roster should not collapse to < 3 colors")
+    }
+
+    func testEveryPaletteSlotIsReachable() {
+        // Each of the N slots is hit by some label — no dead palette entry (also proves the probe helper
+        // works). Keyed by the fill's components (FillRGBA is Equatable, not Hashable) → distinct per slot.
+        let keys = (0..<StatusPanelFormat.accountColorCount).map { slot -> String in
+            let fill = paletteFill(slot, dark: false)
+            return "\(fill.red),\(fill.green),\(fill.blue)"
+        }
+        XCTAssertEqual(Set(keys).count, StatusPanelFormat.accountColorCount,
+                       "every palette slot must be reachable and its fill distinct")
+    }
+
+    func testAccountPaletteMeetsWcagAAAgainstThePanelReferenceBase() {
+        // The panel floats on live vibrancy — NOT headlessly measurable (the owner-eyeball residual, same class
+        // as #326/#388/#446/#504). We assert against the mock's OPAQUE popover reference base, the same
+        // convention the #388 `--text-2` comment uses ("4.53:1 over #f5f5f7"): light #f7f7fa / dark #26262b.
+        let lightBase = RGB(247, 247, 250)
+        let darkBase = RGB(38, 38, 43)
+        let lightText = StatusPanelFormat.accountMonogramColor(dark: false)
+        let darkText = StatusPanelFormat.accountMonogramColor(dark: true)
+        for slot in 0..<StatusPanelFormat.accountColorCount {
+            let lightFill = paletteFill(slot, dark: false)
+            let darkFill = paletteFill(slot, dark: true)
+            // Badge FILL vs the panel base — WCAG 1.4.11 non-text ≥ 3:1 (a perceptible color region).
+            XCTAssertGreaterThanOrEqual(contrast(lightFill, lightBase), 3.0,
+                                        "light fill \(slot) must clear 3:1 on the panel base")
+            XCTAssertGreaterThanOrEqual(contrast(darkFill, darkBase), 3.0,
+                                        "dark fill \(slot) must clear 3:1 on the panel base")
+            // Monogram GLYPH vs its actual background (the opaque fill) — WCAG 1.4.3 text ≥ 4.5:1.
+            XCTAssertGreaterThanOrEqual(contrast(lightText, lightFill), 4.5,
+                                        "light monogram \(slot) must clear 4.5:1 on its fill")
+            XCTAssertGreaterThanOrEqual(contrast(darkText, darkFill), 4.5,
+                                        "dark monogram \(slot) must clear 4.5:1 on its fill")
+        }
+    }
+
+    func testAccountPaletteExcludesTheAccentHue() {
+        // Accent = brand blue (#007aff light / #0a84ff dark), hue ≈ 211°. Every palette hue sits ≥ 25° away so
+        // the identity color never reads as the one accent action (#445 AC "excluding the active/accent hue").
+        let accentHue = hue(RGB(0, 122, 255))
+        for slot in 0..<StatusPanelFormat.accountColorCount {
+            let h = hue(paletteFill(slot, dark: false))
+            let delta = min(abs(h - accentHue), 360 - abs(h - accentHue))
+            XCTAssertGreaterThanOrEqual(delta, 25,
+                                        "palette hue \(slot) (\(Int(h))°) is too close to the accent (\(Int(accentHue))°)")
+        }
+    }
+
+    // MARK: - Smart monogram (issue #445 — distinguishing token, collision-escalating, never label.first)
+
+    func testMonogramUsesTheDistinguishingTokenNotLabelFirst() {
+        // `label.first` would collapse a same-local-part roster to one letter; the smart monogram pairs the
+        // first token's initial with the distinguishing suffix token's initial.
+        let m = StatusPanelFormat.accountMonograms(["work-alice", "work-bob", "work-carol"])
+        XCTAssertEqual(m["work-alice"], "WA")
+        XCTAssertEqual(m["work-bob"], "WB")
+        XCTAssertEqual(m["work-carol"], "WC")
+        XCTAssertFalse(Set(m.values).contains("W"), "must not collapse to label.first")
+    }
+
+    func testMonogramsAreDistinctAcrossSimilarRosters() {
+        // The core AC property: two similar labels never collapse to the same pair — the resolved set is fully
+        // distinct, each ≤ 2 chars, non-empty.
+        let rosters: [[String]] = [
+            ["work-alice", "work-bob", "work-carol", "work-dave", "work-erin", "work-frank"],
+            // Shared prefix AND suffix — the distinguishing token is in the MIDDLE, so first⋅last collapses
+            // (all → "WX") and the ladder must escalate to first⋅second to stay distinct.
+            ["work-alpha-x", "work-beta-x", "work-gamma-x"],
+            ["acme.gmail.com", "acme.work.com", "acme.proton.me"],
+            ["proj-1", "proj-2", "proj-10", "proj-11"],
+            ["work", "works", "working", "workflow"],
+            ["a", "b", "c"],
+            ["team/alpha", "team/beta", "team/gamma"],
+        ]
+        for roster in rosters {
+            let m = StatusPanelFormat.accountMonograms(roster)
+            XCTAssertEqual(Set(m.values).count, roster.count, "monograms must be distinct for \(roster)")
+            for (label, mono) in m {
+                XCTAssertFalse(mono.isEmpty, "monogram for '\(label)' must be non-empty")
+                XCTAssertLessThanOrEqual(mono.count, 2, "monogram '\(mono)' must be ≤ 2 chars")
+            }
+        }
+    }
+
+    func testMonogramDerivationIsDeterministic() {
+        let roster = ["work-alice", "work-bob", "acme.gmail.com"]
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(roster), StatusPanelFormat.accountMonograms(roster))
+    }
+
+    func testMonogramSingleTokenAndDegenerateLabels() {
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["Work"])["Work"], "WO")   // 2 chars from one token
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["camelCase"])["camelCase"], "CC")  // camelCase split
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["x"])["x"], "X")          // lone char → itself
+        XCTAssertEqual(StatusPanelFormat.accountMonograms([""])[""], "?")            // empty → sentinel
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["  "])["  "], "?")        // whitespace → sentinel
+    }
+
     // MARK: - Helpers
 
     private func cell(_ auth: CredentialHealth, recovering: Bool = false, enabled: Bool = true) -> String {
@@ -602,6 +720,22 @@ final class StatusPanelFormatTests: XCTestCase {
         return AccountRow.rows(from: status)
     }
 
+    /// The badge fill for palette slot `index` — found via the REAL public API by probing for a label that
+    /// hashes to that slot (so the test exercises `accountColorIndex` + `accountBadgeFill`, not a private peek).
+    private func paletteFill(_ index: Int, dark: Bool) -> StatusPanelFormat.FillRGBA {
+        StatusPanelFormat.accountBadgeFill(for: probeLabel(mappingTo: index), dark: dark)
+    }
+
+    /// A short label whose color hash lands on `index` — a deterministic search over the FNV-1a mapping.
+    private func probeLabel(mappingTo index: Int) -> String {
+        for n in 0..<100_000 {
+            let candidate = "probe\(n)"
+            if StatusPanelFormat.accountColorIndex(for: candidate) == index { return candidate }
+        }
+        XCTFail("no probe label mapped to palette slot \(index)")
+        return ""
+    }
+
     private static let allNonConnectedStates: [ConnectionState] = [
         .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported, .crashLooping,
     ]
@@ -613,3 +747,57 @@ final class StatusPanelFormatTests: XCTestCase {
     {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":1,"accounts":[{"label":"heal","active":false,"enabled":true,"quarantined":true,"recovering":true,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":null,"refresh_enabled":false}
     """#
 }
+
+// MARK: - #445 palette test helpers: WCAG contrast + hue over sRGB
+//
+// Pure color math for the palette assertions — the standard WCAG 2.x relative-luminance / contrast-ratio and
+// an HSV hue, over sRGB. Kept in the test target (not shipped) so `StatusPanelFormat` stays a plain color
+// vocabulary; the assertions do the verification. The palette fills are opaque (alpha 1), so a fill's own
+// color IS its rendered color — no compositing needed here.
+
+private struct RGB {
+    let red, green, blue: Double
+    init(_ r: Int, _ g: Int, _ b: Int) {
+        red = Double(r) / 255; green = Double(g) / 255; blue = Double(b) / 255
+    }
+    init(_ c: StatusPanelFormat.FillRGBA) { red = c.red; green = c.green; blue = c.blue }
+}
+
+private func srgbToLinear(_ c: Double) -> Double {
+    c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+}
+
+private func relativeLuminance(_ c: RGB) -> Double {
+    0.2126 * srgbToLinear(c.red) + 0.7152 * srgbToLinear(c.green) + 0.0722 * srgbToLinear(c.blue)
+}
+
+private func contrast(_ a: RGB, _ b: RGB) -> Double {
+    let hi = max(relativeLuminance(a), relativeLuminance(b))
+    let lo = min(relativeLuminance(a), relativeLuminance(b))
+    return (hi + 0.05) / (lo + 0.05)
+}
+
+private func contrast(_ a: StatusPanelFormat.FillRGBA, _ b: RGB) -> Double { contrast(RGB(a), b) }
+private func contrast(_ a: StatusPanelFormat.FillRGBA, _ b: StatusPanelFormat.FillRGBA) -> Double {
+    contrast(RGB(a), RGB(b))
+}
+
+/// The HSV hue in degrees (0…360); 0 for an achromatic color (never expected in the palette).
+private func hue(_ c: RGB) -> Double {
+    let maxComponent = max(c.red, c.green, c.blue)
+    let minComponent = min(c.red, c.green, c.blue)
+    let delta = maxComponent - minComponent
+    guard delta > 0 else { return 0 }
+    var h: Double
+    if maxComponent == c.red {
+        h = (c.green - c.blue) / delta
+    } else if maxComponent == c.green {
+        h = 2 + (c.blue - c.red) / delta
+    } else {
+        h = 4 + (c.red - c.green) / delta
+    }
+    h *= 60
+    return h < 0 ? h + 360 : h
+}
+
+private func hue(_ c: StatusPanelFormat.FillRGBA) -> Double { hue(RGB(c)) }

@@ -1117,4 +1117,176 @@ enum StatusPanelFormat {
         case (.saturated, true): return FillRGBA(red: 224.0 / 255, green: 178.0 / 255, blue: 104.0 / 255, alpha: 1)
         }
     }
+
+    // MARK: - Account identity disambiguation kit (issue #445 — per-account color + smart monogram)
+    //
+    // A roster of same-local-part accounts (`work-alice`, `work-bob`, …) collapses the panel's identity
+    // cues: every MonogramBadge shows the same first letter and tail-truncation hides the one distinguishing
+    // part of each label. This restores distinguishability with THREE cues, none alone sufficient (WCAG
+    // 1.4.1 — color is NEVER the sole signal, always paired with the monogram + the label text): a per-account
+    // COLOR, a smart 2-char MONOGRAM from the distinguishing token, and MIDDLE-truncation (the last is a view-
+    // layer `.truncationMode` change; the two below are the testable pure core).
+    //
+    // IDENTITY HANDLE = `label` (issue #15 / R-2). The AC says "seed the color from the on-wire
+    // `account_uuid`", but `account_uuid` is NOT on the status wire: `AccountStatusLine` (`snapshot.rs` /
+    // `WireModel.swift`) carries `label` as the ONE identity handle and never a uuid, and no uuid rides any
+    // wire golden. Seeding from `label` keeps the AC's "no wire change" TRUE and honors R-2 (one handle,
+    // rendered per-medium — the handle IS `label`). Trade-off accepted: the color re-derives if the operator
+    // renames the label — fine for a disambiguation AID (rename is rare; the color is never the sole cue).
+
+    /// A resolved fill helper — an opaque sRGB `FillRGBA` from 0…255 components (like the mock's hex values).
+    private static func accountRGB(_ red: Double, _ green: Double, _ blue: Double) -> FillRGBA {
+        FillRGBA(red: red / 255, green: green / 255, blue: blue / 255, alpha: 1)
+    }
+
+    /// The per-account badge FILL palette (issue #445) — 8 LOW-CHROMA, colorblind-considerate hues (they vary
+    /// in luminance as well as hue, so the cue survives color-vision deficiency), the active/accent blue hue
+    /// EXCLUDED. Per theme the fill inverts to stay high-contrast on the panel: LIGHT is a muted mid-DARK tone
+    /// (a near-white monogram reads on it, and it clears the near-white panel); DARK is a muted mid-LIGHT tone
+    /// (a near-black monogram reads on it, and it clears the near-black panel). Exact sRGB so
+    /// `StatusPanelFormatTests` can assert WCAG-AA against the panel reference base. NEUTRAL by construction
+    /// (#173): a muted identity hue, never a vivid provider brand color.
+    private static let accountFillPalette: [(light: FillRGBA, dark: FillRGBA)] = [
+        (accountRGB(78,  64, 112), accountRGB(190, 176, 216)),  // violet
+        (accountRGB(100, 60, 112), accountRGB(206, 172, 214)),  // purple
+        (accountRGB(116, 58,  98), accountRGB(218, 168, 200)),  // magenta
+        (accountRGB(122, 56,  66), accountRGB(226, 168, 174)),  // rose
+        (accountRGB(122, 74,  46), accountRGB(226, 182, 150)),  // clay
+        (accountRGB(98,  80,  38), accountRGB(210, 190, 138)),  // ochre
+        (accountRGB(64,  92,  50), accountRGB(176, 202, 156)),  // moss
+        (accountRGB(38,  96,  88), accountRGB(148, 204, 194)),  // teal
+    ]
+
+    /// The number of palette slots — the modulus of the color hash, exposed for the palette tests.
+    static var accountColorCount: Int { accountFillPalette.count }
+
+    /// The palette index for a label (issue #445) — a STABLE, deterministic FNV-1a hash of the trimmed label
+    /// mod the palette size. Deliberately NOT Swift's `Hasher`/`hashValue`, which is per-process RANDOMIZED
+    /// (it would reshuffle every account's color on each launch and defeat any test); FNV-1a is a fixed
+    /// function, so an account keeps its color across launches and the mapping is unit-assertable.
+    static func accountColorIndex(for label: String) -> Int {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        var hash: UInt32 = 2_166_136_261
+        for byte in trimmed.utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16_777_619
+        }
+        return Int(hash % UInt32(accountFillPalette.count))
+    }
+
+    /// The badge FILL for a label + theme (issue #445) — the label-seeded palette hue.
+    static func accountBadgeFill(for label: String, dark: Bool) -> FillRGBA {
+        let slot = accountFillPalette[accountColorIndex(for: label)]
+        return dark ? slot.dark : slot.light
+    }
+
+    /// The account MONOGRAM glyph color for a theme (issue #445) — a high-contrast neutral (near-white in
+    /// light, near-black in dark) that carries the 2-char monogram ON the badge fill (the opaque fill is the
+    /// glyph's real background). Theme-uniform across the palette; the per-account HUE lives in the FILL, so
+    /// the glyph itself stays neutral and legible on every slot in both themes (asserted ≥ 4.5:1 in tests).
+    static func accountMonogramColor(dark: Bool) -> FillRGBA {
+        dark ? accountRGB(28, 28, 30) : accountRGB(245, 245, 247)
+    }
+
+    /// A roster-aware map of `label` → 2-char MONOGRAM (issue #445). Derived from the label's DISTINGUISHING
+    /// token — NOT `label.first`, which collapses a same-local-part roster (`work-alice`, `work-bob`, … all →
+    /// "W"). Collision-ESCALATING: assigned greedily in roster order, each label taking its most-distinguishing
+    /// FREE candidate, so two similar labels never collapse to the same pair — the resolved set is fully
+    /// DISTINCT for distinct labels. A single-token short label degenerates to its first two chars ("Work" →
+    /// "WO"); a lone character is itself ("x" → "X"); an empty/whitespace label is "?".
+    static func accountMonograms(_ labels: [String]) -> [String: String] {
+        var result: [String: String] = [:]
+        var used: Set<String> = []
+        for label in labels {
+            if result[label] != nil { continue }   // a duplicate label resolves once to the same monogram
+            let candidate = monogramCandidates(label).first { !used.contains($0) }
+                ?? uniqueMonogramFallback(label, used: used)
+            result[label] = candidate
+            used.insert(candidate)
+        }
+        return result
+    }
+
+    /// The ordered candidate monograms for a label, most-distinguishing first (issue #445): the FIRST token's
+    /// initial paired with the LAST token's initial (`work-alice` → "WA" — the same-local-part case the kit
+    /// targets), then first⋅second, then the identity-initial paired with each later char of the collapsed
+    /// string (keeps the leading letter while escalating), then each token's own leading pair, then the
+    /// collapsed leading pair. All 2-char, uppercased, de-duplicated; a lone char / empty label falls to a
+    /// 1-char / "?" tail so `accountMonograms` always has a non-empty seed.
+    private static func monogramCandidates(_ label: String) -> [String] {
+        let tokens = monogramTokens(label)
+        let collapsed = tokens.joined()
+        var out: [String] = []
+        func push(_ s: String) {
+            if s.count == 2 && !out.contains(s) { out.append(s) }
+        }
+        if tokens.count >= 2 {
+            push(monogramInitial(tokens[0]) + monogramInitial(tokens[tokens.count - 1]))  // first ⋅ last
+            push(monogramInitial(tokens[0]) + monogramInitial(tokens[1]))                 // first ⋅ second
+        }
+        if let first = collapsed.first {
+            let lead = String(first).uppercased()
+            for ch in collapsed.dropFirst() {                                             // first ⋅ each later char
+                push(lead + String(ch).uppercased())
+            }
+        }
+        for token in tokens.reversed() { push(monogramLeadingPair(token)) }               // each token's own pair
+        push(monogramLeadingPair(collapsed))
+        if out.isEmpty {
+            out.append(collapsed.first.map { String($0).uppercased() } ?? "?")            // lone char / empty
+        }
+        return out
+    }
+
+    /// Split a label into alphanumeric tokens (issue #445) — separators are any non-alphanumeric PLUS the
+    /// lowercase→uppercase and letter↔digit boundaries, so `work-alice`, `work.alice`, `workAlice`, and
+    /// `work1` all tokenize to their parts. Empty runs are dropped.
+    private static func monogramTokens(_ label: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var previous: Character?
+        for ch in label {
+            guard ch.isLetter || ch.isNumber else {
+                if !current.isEmpty { tokens.append(current); current = "" }
+                previous = nil
+                continue
+            }
+            if let prev = previous, monogramIsBoundary(prev, ch), !current.isEmpty {
+                tokens.append(current); current = ""
+            }
+            current.append(ch)
+            previous = ch
+        }
+        if !current.isEmpty { tokens.append(current) }
+        return tokens
+    }
+
+    /// A camelCase / letter↔digit split point — the boundaries `monogramTokens` cuts on (beyond punctuation).
+    private static func monogramIsBoundary(_ a: Character, _ b: Character) -> Bool {
+        if a.isLowercase && b.isUppercase { return true }
+        if a.isLetter && b.isNumber { return true }
+        if a.isNumber && b.isLetter { return true }
+        return false
+    }
+
+    /// A token's first character, uppercased (empty for an empty token — never passed one).
+    private static func monogramInitial(_ token: String) -> String {
+        token.first.map { String($0).uppercased() } ?? ""
+    }
+
+    /// A token's leading two characters, uppercased — a 1-char token yields a 1-char string that
+    /// `monogramCandidates` skips (candidates must be 2 chars), so it never emits a half-pair.
+    private static func monogramLeadingPair(_ token: String) -> String {
+        String(token.prefix(2)).uppercased()
+    }
+
+    /// A guaranteed-UNIQUE monogram when every derived candidate is already taken (issue #445) — the first
+    /// alnum char paired with a digit, then the bare char, then a "?"-series. Rarely reached (the candidate
+    /// walk resolves realistic rosters), it exists so full distinctness is an INVARIANT, not a hope.
+    private static func uniqueMonogramFallback(_ label: String, used: Set<String>) -> String {
+        let base = monogramTokens(label).joined().first.map { String($0).uppercased() } ?? "?"
+        for n in 2...9 where !used.contains(base + String(n)) { return base + String(n) }
+        if !used.contains(base) { return base }
+        for n in 1...99 where !used.contains("?" + String(n)) { return "?" + String(n) }
+        return "?"
+    }
 }
