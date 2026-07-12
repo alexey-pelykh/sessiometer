@@ -519,6 +519,19 @@ enum StatusPanelFormat {
         return FillRGBA(red: base.r, green: base.g, blue: base.b, alpha: alpha)
     }
 
+    // MARK: - Active-row tag (issue #501 — neutral sentence-case capsule, mock `.tag`)
+
+    /// The roster active-row tag label. A calm NEUTRAL sentence-case capsule (mock `.tag`,
+    /// `apps/menubar/design/menubar-preview.html:243`) — `--badge-bg` fill + `--text-2` text, NO
+    /// border — reusing the same neutral `.badge` fill token (`neutralFill(.badge, …)`) as the
+    /// monogram badge. The tag is ONE of the row's THREE redundant "active" cues (filled accent dot +
+    /// this tag + accent-tint row fill), so active never rides on colour alone (WCAG 1.4.1 / R-2). It
+    /// is SENTENCE-CASE — NOT the letter-spaced uppercase "ACTIVE" that read as an accent web badge and,
+    /// as a second accent element beside the dot, re-inflated the active over-signalling #387 M5 reduced
+    /// (a same-hue accent-on-accent-tint pill also sank the label to ~3:1). On the neutral capsule the
+    /// label clears the WCAG 1.4.11 3:1 floor (≈4.1:1 light / ≈3.7:1 dark — asserted in `StatusPanelFormatTests`).
+    static let activeTagLabel = "Active"
+
     /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a
     /// PROVEN-DEAD account's `claude /login` cue and a `degraded` (quarantined-but-refreshable) one's
     /// needs-refresh `degradedCue` (issue #427) — each softened to `recovering` for a healing account

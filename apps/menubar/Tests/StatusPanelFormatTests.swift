@@ -209,6 +209,57 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: true).red, 1.0)  // dark base is pure white
     }
 
+    // MARK: - Active-row tag (issue #501 — neutral sentence-case capsule, mock `.tag`)
+
+    func testActiveTagLabelIsNeutralSentenceCase() {
+        // The active tag is a calm SENTENCE-CASE capsule (mock `.tag`), NOT the old letter-spaced accent
+        // uppercase pill. Guard the exact label so a regression back to "ACTIVE" — which read as an accent
+        // web badge and re-inflated the active over-signalling #387 M5 reduced — fails loudly.
+        XCTAssertEqual(StatusPanelFormat.activeTagLabel, "Active")
+        XCTAssertNotEqual(StatusPanelFormat.activeTagLabel, "ACTIVE")
+        // Sentence-case: leading capital, remainder lowercase — never all-caps.
+        XCTAssertNotEqual(StatusPanelFormat.activeTagLabel, StatusPanelFormat.activeTagLabel.uppercased(),
+                          "the tag must be sentence-case, not letter-spaced uppercase (mock `.tag`)")
+        XCTAssertEqual(StatusPanelFormat.activeTagLabel.prefix(1), "A")
+        XCTAssertEqual(String(StatusPanelFormat.activeTagLabel.dropFirst()),
+                       StatusPanelFormat.activeTagLabel.dropFirst().lowercased())
+    }
+
+    func testActiveTagLabelClearsContrastOnTheBadgeCapsuleBothThemes() {
+        // The tag reuses the neutral `.badge` fill (`neutralFill(.badge, …)`) + `--text-2` text; on the
+        // capsule the label must clear the WCAG 1.4.11 3:1 floor (the tag is a DECORATIVE non-text
+        // redundancy cue — `accessibilityHidden`, the row's spoken label already carries ", active"). This
+        // reproduces the mock's design-token math over a representative opaque chrome base and guards the
+        // tokens from drifting below the floor; the mock claims ~3.9:1 light / ~3.8:1 dark. Reuses the
+        // shared `RGB` / `contrast` WCAG helpers below; only the capsule's translucent compositing is local.
+
+        // LIGHT — `--text-2` rgba(60,60,67,.72) on the `.badge` capsule over #f5f5f7 (the mock's stated
+        // opaque light base, `menubar-preview.html:155`). Observed ≈4.1:1.
+        let lightText2 = StatusPanelFormat.FillRGBA(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.72)
+        let lightCapsule = composite(StatusPanelFormat.neutralFill(.badge, dark: false), over: RGB(245, 245, 247))
+        let lightRatio = contrast(composite(lightText2, over: lightCapsule), lightCapsule)
+        XCTAssertGreaterThanOrEqual(lightRatio, 3.0,
+                                    "light tag label must clear WCAG 1.4.11 3:1 (observed ≈4.1:1)")
+
+        // DARK — `--text-2` rgba(235,235,245,.6) on the `.badge` capsule over #3a3a3c (the standard macOS
+        // dark control tone the mock's ~3.8:1 claim corresponds to). Observed ≈3.7:1.
+        let darkText2 = StatusPanelFormat.FillRGBA(red: 235/255, green: 235/255, blue: 245/255, alpha: 0.6)
+        let darkCapsule = composite(StatusPanelFormat.neutralFill(.badge, dark: true), over: RGB(58, 58, 60))
+        let darkRatio = contrast(composite(darkText2, over: darkCapsule), darkCapsule)
+        XCTAssertGreaterThanOrEqual(darkRatio, 3.0,
+                                    "dark tag label must clear WCAG 1.4.11 3:1 (observed ≈3.7:1)")
+    }
+
+    /// Source-over composite of a translucent `FillRGBA` over an opaque `RGB` base → the opaque rendered
+    /// colour. The shared palette helpers assume opaque fills; the #501 tag capsule (and its `--text-2`
+    /// label over it) is translucent, so flatten each layer before measuring contrast.
+    private func composite(_ top: StatusPanelFormat.FillRGBA, over base: RGB) -> RGB {
+        let a = top.alpha
+        return RGB(a * top.red   + (1 - a) * base.red,
+                   a * top.green + (1 - a) * base.green,
+                   a * top.blue  + (1 - a) * base.blue)
+    }
+
     // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
 
     func testAuthCellMirrorsHealthCell() {
@@ -760,6 +811,8 @@ private struct RGB {
     init(_ r: Int, _ g: Int, _ b: Int) {
         red = Double(r) / 255; green = Double(g) / 255; blue = Double(b) / 255
     }
+    /// Raw sRGB components already in 0…1 (e.g. a composited result).
+    init(_ r: Double, _ g: Double, _ b: Double) { red = r; green = g; blue = b }
     init(_ c: StatusPanelFormat.FillRGBA) { red = c.red; green = c.green; blue = c.blue }
 }
 
