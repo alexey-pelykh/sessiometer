@@ -116,12 +116,28 @@ struct RefreshHealth: Decodable, Equatable {
 ///     existed and the earliest roster index won. NEVER render this as "only viable target":
 ///     other targets were viable, and that false claim is the bug #393 removes.
 ///
-/// An UNKNOWN `kind` is a decode error, mirroring serde's internally-tagged enum. Mirrors the
-/// daemon's variant set; render each medium's own way, never a pre-formatted string (state-parity).
+/// An UNKNOWN `kind` throws `UnknownKind`, which the CARRYING `NextSwap.target` decoder TOLERATES by
+/// degrading `reason` to `nil` (the bare target label) rather than losing the whole frame (issue
+/// #412). `reason` is a DECORATION on an already-understood `target` state, so a future variant an
+/// older panel does not recognise must not brick the snapshot — unlike an unknown `next_swap.state`,
+/// which stays a hard error (a mis-rendered STATE is dangerous; a missing rationale is not). A
+/// MALFORMED known `kind` (e.g. `soonest_reset` without `resets_at`) is corruption, NOT forward-compat,
+/// so it stays a hard `DecodingError`. Mirrors the daemon's variant set; render each medium's own way,
+/// never a pre-formatted string (state-parity).
 enum NextSwapReason: Equatable {
     case soonestReset(resetsAt: Int64)
     case onlyCandidate
     case rosterOrder
+
+    /// Thrown by the decoder when `kind` is a value this client does not recognise — a forward-compat
+    /// DECORATION the carrying `NextSwap.target` decoder catches and degrades to `reason == nil` (issue
+    /// #412). Deliberately a DISTINCT error type, NOT a `DecodingError`, so that decoder can tell
+    /// "unknown decoration → tolerate" apart from "malformed known `kind` → propagate as a hard error"
+    /// by the error's TYPE alone.
+    struct UnknownKind: Error, Equatable {
+        /// The unrecognised `kind` string — carried for diagnostics, never rendered.
+        let kind: String
+    }
 }
 
 extension NextSwapReason: Decodable {
@@ -141,12 +157,13 @@ extension NextSwapReason: Decodable {
         case "roster_order":
             self = .rosterOrder
         default:
-            throw DecodingError.dataCorruptedError(
-                forKey: .kind,
-                in: container,
-                debugDescription:
-                    "unknown next_swap reason '\(kind)' — an incompatible wire contract"
-            )
+            // Forward-compat (issue #412): an unrecognised `kind` is a decoration a NEWER daemon
+            // added that this panel does not know. Throw a DISTINCT `UnknownKind` (not a
+            // `DecodingError`) so `NextSwap.target`'s decoder degrades it to `reason == nil` instead
+            // of losing the frame — while a MALFORMED known `kind` (the `decode` calls above, e.g. a
+            // `soonest_reset` missing `resets_at`) still throws a `DecodingError` that propagates as
+            // the hard error corruption deserves.
+            throw UnknownKind(kind: kind)
         }
     }
 }
@@ -179,7 +196,9 @@ enum NoTargetCause: String, Decodable, Equatable {
 /// The whole `next_swap` key is optional (`null` when there is no active anchor), handled at
 /// `VersionedStatus`. The target's `reason` (issue #393) is ADDITIVE and optional — a current
 /// daemon always sends it, but a pre-#393 daemon omits it → `nil`, tolerated via `decodeIfPresent`
-/// (the same additive-minor forward-compat the whole contract rests on). `no_viable_target`'s
+/// (the same additive-minor forward-compat the whole contract rests on); an UNRECOGNISED
+/// `reason.kind` from a NEWER daemon likewise degrades to `nil` here rather than losing the frame
+/// (issue #412 — `reason` is a decoration, not state). `no_viable_target`'s
 /// `cause` + `resets_at` (issue #405) are ADDITIVE the same way — a current daemon carries the
 /// fleet-capacity relief, a pre-#405 daemon omits both → `nil`, tolerated identically.
 enum NextSwap: Equatable {
@@ -202,10 +221,22 @@ extension NextSwap: Decodable {
         let state = try container.decode(String.self, forKey: .state)
         switch state {
         case "target":
-            self = .target(
-                to: try container.decode(String.self, forKey: .to),
-                reason: try container.decodeIfPresent(NextSwapReason.self, forKey: .reason)
-            )
+            let to = try container.decode(String.self, forKey: .to)
+            // `reason` (issue #393) is an ADDITIVE, optional DECORATION, and two forward-compat
+            // degradations collapse to the SAME `nil` (the bare target label): an OMITTED reason (a
+            // pre-#393 daemon — `decodeIfPresent` → nil) and an UNRECOGNISED `reason.kind` (a newer
+            // daemon's future variant — `NextSwapReason.UnknownKind` caught here → nil, issue #412).
+            // A MALFORMED KNOWN kind throws a `DecodingError` instead, which is NOT caught and
+            // propagates as the hard error corruption deserves. Tolerating an unknown kind here keeps
+            // ONE unrenderable rationale from silently killing every row, meter and frame
+            // (`WatchStatusStore` drops an undecodable line, so the whole panel would freeze).
+            let reason: NextSwapReason?
+            do {
+                reason = try container.decodeIfPresent(NextSwapReason.self, forKey: .reason)
+            } catch is NextSwapReason.UnknownKind {
+                reason = nil
+            }
+            self = .target(to: to, reason: reason)
         case "no_viable_target":
             self = .noViableTarget(
                 cause: try container.decodeIfPresent(NoTargetCause.self, forKey: .cause),
