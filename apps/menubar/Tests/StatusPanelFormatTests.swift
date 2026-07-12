@@ -152,6 +152,63 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.usageTextTint(.red),    StatusPanelFormat.healthTint(.red))
     }
 
+    // MARK: - Chrome fidelity tokens (#388 — theme-aware accent emphasis + neutral fills)
+    //
+    // These assert the EXACT mock values (`apps/menubar/design/menubar-preview.html`) the SwiftUI view is a
+    // thin `@Environment(\.colorScheme)` consumer of. This layer IS the fidelity gate: the real popover can't
+    // be screenshot-verified in CI, so a wrong number here (a typo, a dropped dark bump, a base-hue slip) is
+    // caught ONLY by these assertions — never by an eyeball.
+
+    func testAccentEmphasisOpacityIsThemeAwareAtTheMockValues() {
+        // Light (dark:false) is what already shipped; dark is the bump the panel was MISSING (the dark active
+        // row / swap callout read ~1.5–1.8× too faint when hardcoded to the light values).
+        // LIGHT: --active-bg .08 · --accent-halo .20 · --accent-tint .10 · --accent-tint-border .20
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeRowFill,     dark: false), 0.08)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeDotHalo,     dark: false), 0.20)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutFill,   dark: false), 0.10)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutBorder, dark: false), 0.20)
+        // DARK: --active-bg .15 · --accent-halo .30 · --accent-tint .16 · --accent-tint-border .30
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeRowFill,     dark: true),  0.15)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeDotHalo,     dark: true),  0.30)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutFill,   dark: true),  0.16)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutBorder, dark: true),  0.30)
+    }
+
+    func testEveryAccentEmphasisIsHeavierInDark() {
+        // The point of I3: dark is STRICTLY heavier than light for every accent surface. An equal pair would
+        // mean a site was left theme-invariant — exactly the bug this fixes — so the loop guards all four.
+        for emphasis in [StatusPanelFormat.AccentEmphasis.activeRowFill, .activeDotHalo,
+                         .swapCalloutFill, .swapCalloutBorder] {
+            XCTAssertGreaterThan(StatusPanelFormat.accentOpacity(emphasis, dark: true),
+                                 StatusPanelFormat.accentOpacity(emphasis, dark: false),
+                                 "\(emphasis) must be heavier in dark (the mock raises every accent-emphasis alpha)")
+        }
+    }
+
+    func testNeutralFillMatchesTheMockGrayInLightWhiteInDark() {
+        // Mock neutral FILL family: systemGray (120,120,128) in light, white in dark — replacing the washed
+        // `Color.secondary.opacity(k)` (label base ~60,60,67 already ~0.5 alpha → ≈half the intended fill).
+        let g = 120.0 / 255, b = 128.0 / 255
+        // LIGHT over systemGray: --badge-bg .16 · --track .22 · --card-bg .08
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: false), .init(red: g, green: g, blue: b, alpha: 0.16))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.track, dark: false), .init(red: g, green: g, blue: b, alpha: 0.22))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.card,  dark: false), .init(red: g, green: g, blue: b, alpha: 0.08))
+        // DARK over white: --badge-bg .10 · --track .14 · --card-bg .05
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: true), .init(red: 1, green: 1, blue: 1, alpha: 0.10))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.track, dark: true), .init(red: 1, green: 1, blue: 1, alpha: 0.14))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.card,  dark: true), .init(red: 1, green: 1, blue: 1, alpha: 0.05))
+    }
+
+    func testNeutralFillBaseHueMatchesTheMockNotTheWashedLabelColor() {
+        // The washout wasn't only alpha — the base HUE was wrong too. Guard the base so a regression back to a
+        // label-derived neutral, a flat gray, or a white-in-light slip fails loudly (not just a subtle shade).
+        let light = StatusPanelFormat.neutralFill(.badge, dark: false)
+        XCTAssertEqual(light.red,   120.0 / 255)
+        XCTAssertEqual(light.green, 120.0 / 255)
+        XCTAssertEqual(light.blue,  128.0 / 255)   // a hair bluer than R/G — the mock's systemGray, not flat gray
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: true).red, 1.0)  // dark base is pure white
+    }
+
     // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
 
     func testAuthCellMirrorsHealthCell() {

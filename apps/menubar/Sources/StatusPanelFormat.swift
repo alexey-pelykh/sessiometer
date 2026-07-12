@@ -388,6 +388,100 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Panel chrome fidelity tokens (#388 — theme-aware accent emphasis + neutral fills)
+    //
+    // The design mock (`apps/menubar/design/menubar-preview.html`) hand-tunes its accent-emphasis opacities
+    // and its neutral chrome fills PER THEME; the SwiftUI panel had them hardcoded to the LIGHT values,
+    // theme-invariant. Two washouts fell out of that:
+    //   * DARK accent emphasis (active row / dot halo / swap callout) rendered ~1.5–1.8× too faint — the
+    //     mock bumps these opacities in dark, the panel did not.
+    //   * Neutral fills routed through `Color.secondary.opacity(k)` washed out in BOTH themes: `.secondary`
+    //     is the LABEL family (base ~(60,60,67), already ~0.5 alpha), so `secondary.opacity(k)` renders at
+    //     ≈ half the mock's intended alpha AND over the wrong base hue (the mock's neutral fills are the
+    //     systemGray/white FILL family, base (120,120,128)/white).
+    // These pure, theme-parameterized tokens carry the mock's EXACT values into the testable layer, so the
+    // view stays a thin `@Environment(\.colorScheme)` consumer and every number is unit-asserted against the
+    // oracle (the panel cannot be screenshot-verified in CI; the `StatusPanelFormatTests` assertion is the
+    // gate). The accent HUE itself is NOT here — it stays `Color.accentColor`, pinned to the brand-blue
+    // `AccentColor` asset (#391, #007aff/#0a84ff), which already equals the mock's `--accent`; only the
+    // theme-variant ALPHA lives here.
+    //
+    // GUARDRAIL: never `Color.secondary.opacity(k)` a FILL. `.secondary` is a label-family (text) tint; a
+    // translucent neutral FILL must use `neutralFill` below — that mis-use IS the washout this fixes.
+    // `.secondary` stays correct for secondary TEXT and for the neutral (`.neutral`/unknown) tint role.
+
+    /// An accent-tinted emphasis SURFACE whose opacity the mock raises in dark mode. The accent hue is
+    /// `Color.accentColor` (brand-blue asset, #391); these cases name only the theme-variant alpha.
+    enum AccentEmphasis: Equatable {
+        /// The active row's accent-tint card fill — mock `--active-bg` (.08 light / .15 dark).
+        case activeRowFill
+        /// The active status dot's soft accent halo — mock `--accent-halo` (.20 light / .30 dark).
+        case activeDotHalo
+        /// The swap-callout hero card's accent-tint fill — mock `--accent-tint` (.10 light / .16 dark).
+        case swapCalloutFill
+        /// The swap-callout hero card's accent-tint hairline border — mock `--accent-tint-border`
+        /// (.20 light / .30 dark).
+        case swapCalloutBorder
+    }
+
+    /// The theme-aware opacity for an accent-emphasis surface, applied over `Color.accentColor`. `light` is
+    /// the mock's light-theme value (unchanged from what shipped — the panel was already correct in light);
+    /// `dark` raises it to the mock's dark value so the active row / swap callout read at the mock's intended
+    /// dark emphasis instead of the too-faint light value. Values are the mock's `--active-bg` /
+    /// `--accent-halo` / `--accent-tint` / `--accent-tint-border` alphas
+    /// (`apps/menubar/design/menubar-preview.html`).
+    static func accentOpacity(_ emphasis: AccentEmphasis, dark: Bool) -> Double {
+        switch emphasis {
+        case .activeRowFill:     return dark ? 0.15 : 0.08
+        case .activeDotHalo:     return dark ? 0.30 : 0.20
+        case .swapCalloutFill:   return dark ? 0.16 : 0.10
+        case .swapCalloutBorder: return dark ? 0.30 : 0.20
+        }
+    }
+
+    /// A translucent NEUTRAL fill role — the mock's gray-in-light / white-in-dark chrome fills, formerly
+    /// (mis-)rendered via `Color.secondary.opacity(k)` (the #388 washout). Distinct from the health/usage
+    /// TINT roles (`PanelTint`): those are semantic FOREGROUND tints on contrast-safe asset colorsets
+    /// (#406, Increase-Contrast-adaptive); these are DECORATIVE background fills (no text / WCAG 1.4.11
+    /// role — the glyph or content on top carries meaning), carried as exact sRGB values so they are
+    /// unit-testable in the asset-catalog-free logic-test bundle (`MenubarTests` compiles no `.xcassets`).
+    enum NeutralFillRole: Equatable {
+        /// The monogram badge + the header app-glyph badge — mock `--badge-bg`
+        /// (gray(120,120,128) .16 light / white .10 dark).
+        case badge
+        /// The usage-meter track — mock `--track` (gray(120,120,128) .22 light / white .14 dark).
+        case track
+        /// The capture card's background — mock `--card-bg` (gray(120,120,128) .08 light / white .05 dark).
+        case card
+    }
+
+    /// A resolved sRGB fill as raw components — the Foundation-only handle the SwiftUI view turns into a
+    /// `Color(.sRGB, …)`. Kept as NUMBERS (not a `Color`) so this layer stays AppKit/SwiftUI-free and the
+    /// values are directly unit-assertable against the mock (component-wise `Equatable`).
+    struct FillRGBA: Equatable {
+        let red: Double
+        let green: Double
+        let blue: Double
+        let alpha: Double
+    }
+
+    /// The theme-aware sRGB fill for a neutral role — the mock's exact `--badge-bg` / `--track` /
+    /// `--card-bg` values (`apps/menubar/design/menubar-preview.html`). The base is the mock's neutral FILL
+    /// family: systemGray (120,120,128) in light, white in dark, each at the mock's per-role alpha. The view
+    /// renders this as a PLAIN translucent fill (NOT routed through the panel material), so the source-over
+    /// composite matches the mock's rgba math.
+    static func neutralFill(_ role: NeutralFillRole, dark: Bool) -> FillRGBA {
+        // Mock neutral base: systemGray (120,120,128) in light, white in dark.
+        let base: (r: Double, g: Double, b: Double) = dark ? (1, 1, 1) : (120.0 / 255, 120.0 / 255, 128.0 / 255)
+        let alpha: Double
+        switch role {
+        case .badge: alpha = dark ? 0.10 : 0.16
+        case .track: alpha = dark ? 0.14 : 0.22
+        case .card:  alpha = dark ? 0.05 : 0.08
+        }
+        return FillRGBA(red: base.r, green: base.g, blue: base.b, alpha: alpha)
+    }
+
     /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a
     /// PROVEN-DEAD account's `claude /login` cue and a `degraded` (quarantined-but-refreshable) one's
     /// needs-refresh `degradedCue` (issue #427) — each softened to `recovering` for a healing account
