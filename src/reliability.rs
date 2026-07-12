@@ -3,7 +3,7 @@
 
 //! The `reliability` verb — an OFFLINE reliability-SLO readout over the event log (issue #455).
 //!
-//! `sessiometer reliability [--json]` aggregates the durable event log
+//! `sessiometer reliability [--since <duration>] [--json]` aggregates the durable event log
 //! (`~/Library/Logs/sessiometer/sessiometer.log`, written by [`crate::observability`]) into
 //! four service-level indicators for the reaction-latency / bounded-blindness work (umbrella
 //! #363), each with its documented target, so the swap-out behavior is provably meeting its
@@ -40,8 +40,18 @@
 //! surface for them is premature until they are ratified against production (issues
 //! #451/#484). This verb is a pure READER — it changes no state, adds no event, and does not
 //! build the #452 fix it measures.
+//!
+//! By default the four indicators fold the WHOLE log. `--since <duration>` (issue #494) bounds
+//! them to a recent window — every event whose `ts=` is at/after `now - duration` — so a recent
+//! regression (or recovery) is not diluted by ancient data as the durable log grows. The window
+//! is duration-only (`<int><unit>`, units `s`/`m`/`h`/`d`/`w`), hand-rolled per the
+//! minimal-dependency line (no date crate); the `ts=` parse and the cutoff render reuse the
+//! crate's existing civil-date primitives ([`crate::usage::epoch_from_rfc3339`] and
+//! [`crate::observability::rfc3339`]) rather than a second calendar routine. The default (no
+//! flag) is unchanged and backward-compatible.
 
 use crate::error::{Error, Result};
+use crate::usage::epoch_from_rfc3339;
 use std::collections::BTreeMap;
 
 /// SLO target: swap-out `session_pct` **P100 must be `< 99`** — no `reason=session` swap fires
@@ -64,25 +74,41 @@ const SLO_SWAP_P50_MAX: u8 = 97;
 const PREEMPT_WASTED_MARGIN_PCT: u8 = 20;
 
 /// The stable `--json` schema version. Owned by this readout, independent of `stats`'
-/// schema; additive changes extend it without a bump (the `stats` `schema:1` precedent).
-/// Named to match [`crate::stats`]'s own `JSON_SCHEMA_VERSION`.
-const JSON_SCHEMA_VERSION: u32 = 1;
+/// schema. Named to match [`crate::stats`]'s own `JSON_SCHEMA_VERSION`. Bumped `1 → 2` when
+/// the `--since` window (issue #494) added the top-level `window` object — an ADDITIVE change
+/// (an always-present field, `null` in the whole-log default), so a `--json` consumer of the
+/// #363 acceptance gate that ignores unknown fields still parses every prior field unchanged.
+const JSON_SCHEMA_VERSION: u32 = 2;
 
-/// Parsed `reliability` options (issue #455). A plain comparable value so the CLI parser is
-/// unit-testable by value, like `StatsArgs`.
+/// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
+/// is unit-testable by value, like `StatsArgs`.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReliabilityArgs {
     /// `--json` — print the machine-readable readout (for scripts / the #363 acceptance gate)
     /// instead of the human text.
     pub(crate) json: bool,
+    /// `--since <duration>` — bound all four SLIs to events at/after `now - duration`. The RAW
+    /// value as given (e.g. `"7d"`); parsed and validated in [`run`], where the wall clock is
+    /// read (mirrors `StatsArgs::since`). `None` = the whole-log aggregate (backward-compatible
+    /// default).
+    pub(crate) since: Option<String>,
 }
 
 /// Entry point for the `reliability` verb: read the event log once, aggregate, and render.
-/// The only impure step is reading the log file; everything else is a pure function of its
-/// text. Not `async` — it makes no live call (mirrors the read-only `config` verbs).
+/// The two impure steps are reading the log file and (for `--since`) reading the wall clock;
+/// everything else is a pure function of the text and the resolved cutoff. Not `async` — it
+/// makes no live call (mirrors the read-only `config` verbs).
 pub(crate) fn run(args: ReliabilityArgs) -> Result<()> {
     let text = read_event_log()?;
-    let report = aggregate(&parse_events(&text));
+    // Resolve the optional window against the wall clock BEFORE parsing, so the cutoff is a
+    // plain integer the pure aggregation path can filter by. A malformed `--since` fails here,
+    // before any output, as `Error::ReliabilitySinceInvalid`.
+    let window = match args.since.as_deref() {
+        Some(raw) => Some(Window::resolve(raw, now_epoch())?),
+        None => None,
+    };
+    let cutoff = window.as_ref().map(|w| w.cutoff_epoch);
+    let report = aggregate(&parse_events(&text, cutoff), window);
     let out = if args.json {
         render_json(&report)?
     } else {
@@ -90,6 +116,81 @@ pub(crate) fn run(args: ReliabilityArgs) -> Result<()> {
     };
     print!("{out}");
     Ok(())
+}
+
+/// Current wall clock as epoch seconds (`0` on the pre-1970 impossible case) — the crate's
+/// display-path clock read (mirrors [`crate::stats`]'s `wall_clock_now`). Only reached when
+/// `--since` is given; the default whole-log path reads no clock.
+fn now_epoch() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The active `--since` window (issue #494). Present only when `--since` was given; its
+/// absence is the whole-log default. Carries the raw span (echoed in output exactly as the
+/// operator typed it) plus the absolute cutoff, so both renderers can document the window and
+/// [`parse_events`] can drop pre-cutoff lines.
+#[derive(Debug, PartialEq)]
+struct Window {
+    /// The raw `--since` value, echoed verbatim in the human + JSON output (e.g. `"7d"`).
+    since_arg: String,
+    /// Events whose `ts=` is `<` this epoch-second cutoff are excluded; at/after are kept.
+    /// Clamped to `>= 0`, so a span wider than the log's age simply means "the whole log".
+    cutoff_epoch: i64,
+}
+
+impl Window {
+    /// Resolve a raw `--since` value against `now` (epoch seconds) into a [`Window`]. Malformed
+    /// input is [`Error::ReliabilitySinceInvalid`]. Saturating throughout: an absurd span can
+    /// never overflow into a future cutoff, and a span reaching past the epoch clamps to `0`.
+    fn resolve(raw: &str, now: i64) -> Result<Window> {
+        let secs = parse_duration_secs(raw)?;
+        // i64 `now` − u64 `secs` → `saturating_sub_unsigned`; `.max(0)` then floors a
+        // past-the-epoch result at 0 (the saturating rationale is on the doc comment above).
+        let cutoff_epoch = now.saturating_sub_unsigned(secs).max(0);
+        Ok(Window {
+            since_arg: raw.trim().to_owned(),
+            cutoff_epoch,
+        })
+    }
+
+    /// The cutoff rendered back to the event log's own RFC 3339 UTC shape, for display —
+    /// through the SAME [`crate::observability::rfc3339`] the log writes `ts=` with, so a
+    /// documented window reads in the identical format as the lines it bounds.
+    fn cutoff_rfc3339(&self) -> String {
+        use std::time::{Duration, UNIX_EPOCH};
+        // cutoff_epoch is clamped `>= 0`, so the `as u64` cast is lossless (no wraparound).
+        crate::observability::rfc3339(UNIX_EPOCH + Duration::from_secs(self.cutoff_epoch as u64))
+    }
+}
+
+/// Parse a relative-duration `<non-negative int><unit>` into whole seconds (issue #494). Units:
+/// `s`/`m`/`h`/`d`/`w` (seconds/minutes/hours/days/weeks) — the same vocabulary as the relative
+/// branch of `stats --since`, minus its absolute-date forms (an absolute date is out of this
+/// window's scope; the issue asks a duration). Rejected as [`Error::ReliabilitySinceInvalid`]:
+/// an empty string, a missing or unknown unit, and a non-integer, negative, or empty count.
+/// Saturating multiply, so an absurd count yields `u64::MAX` (→ a clamped cutoff) rather than
+/// overflow. Hand-rolled per the minimal-dependency line — no date crate.
+fn parse_duration_secs(raw: &str) -> Result<u64> {
+    let s = raw.trim();
+    let invalid = || Error::ReliabilitySinceInvalid(s.to_owned());
+    let unit = s.chars().last().ok_or_else(invalid)?;
+    let per_unit: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        'w' => 7 * 86_400,
+        _ => return Err(invalid()),
+    };
+    // The count is everything before the unit char. `parse::<u64>` inherently rejects a
+    // negative sign, an empty string, and any non-digit — no separate sign/empty guard needed.
+    let digits = &s[..s.len() - unit.len_utf8()];
+    let n: u64 = digits.parse().map_err(|_| invalid())?;
+    Ok(n.saturating_mul(per_unit))
 }
 
 /// The event-log text, tolerating an absent file (no daemon has ever run) as empty — the
@@ -127,9 +228,16 @@ struct Inputs {
 /// Tolerant, forward-only, self-contained: it reads the flat `key=val` grammar
 /// ([`crate::observability`]) line by line and folds the four relevant event families into
 /// [`Inputs`], skipping blank lines, other event kinds, and any line missing a field it needs
-/// or carrying an unparseable value (the same tolerant-drop the `stats` swap parser uses). No
-/// timestamps are read — the readout is a whole-log aggregate, not a windowed view.
-fn parse_events(text: &str) -> Inputs {
+/// or carrying an unparseable value (the same tolerant-drop the `stats` swap parser uses).
+///
+/// `cutoff` bounds the window (issue #494): `None` reads every line (the whole-log default,
+/// timestamps ignored exactly as before). `Some(epoch)` keeps only lines whose `ts=` parses to
+/// an instant `>=` the cutoff (at/after — the boundary itself is IN the window); a line whose
+/// `ts=` is missing or unparseable is dropped from a windowed view, since it cannot be placed
+/// in time (the tolerant-drop precedent, mirroring `crate::usage_stats`' swap parser). The
+/// `ts=` parse reuses [`epoch_from_rfc3339`] — the crate's one canonical RFC-3339 reader — so
+/// no second calendar routine is introduced.
+fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
     let mut inputs = Inputs::default();
     for line in text.lines() {
         // Field map from the whitespace-separated `key=val` tokens. Handles/values are
@@ -138,6 +246,20 @@ fn parse_events(text: &str) -> Inputs {
         for token in line.split_whitespace() {
             if let Some((key, val)) = token.split_once('=') {
                 fields.insert(key, val);
+            }
+        }
+
+        // Window gate (only when `--since` is active): drop lines before the cutoff, and drop
+        // any line we cannot timestamp (unplaceable ⇒ not provably in-window). Runs before the
+        // event match so a dropped line feeds no SLI.
+        if let Some(cutoff) = cutoff {
+            let in_window = fields
+                .get("ts")
+                .copied()
+                .and_then(epoch_from_rfc3339)
+                .is_some_and(|ts| ts >= cutoff);
+            if !in_window {
+                continue;
             }
         }
 
@@ -233,17 +355,25 @@ struct RateLimit {
     cleared: u32,
 }
 
-/// The aggregated readout — one whole-log pass folded into the four SLIs.
+/// The aggregated readout — one pass folded into the four SLIs, plus the active window (if
+/// any). With `window: None` this is the whole-log aggregate; with `Some` the four SLIs above
+/// were computed over the windowed subset only, and `window` documents the bound.
 #[derive(Debug, PartialEq)]
 struct Report {
+    /// The active `--since` window, or `None` for the whole-log aggregate. Carried through so
+    /// the renderers document the bound; the SLIs are already windowed by [`parse_events`].
+    window: Option<Window>,
     swap_overshoot: SwapOvershoot,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreempt,
     rate_limit: RateLimit,
 }
 
-/// Fold the parsed [`Inputs`] into a [`Report`]. Pure and total.
-fn aggregate(inputs: &Inputs) -> Report {
+/// Fold the parsed [`Inputs`] into a [`Report`], attaching the active `window` for display.
+/// Pure and total: the windowing already happened in [`parse_events`] (the `inputs` are the
+/// filtered subset); `window` is carried through untouched, only so the renderers can document
+/// the bound.
+fn aggregate(inputs: &Inputs, window: Option<Window>) -> Report {
     let n = inputs.swap_out_pcts.len();
     // percentile() returns one of the input samples, each an integer-valued `f64::from(u8)`,
     // so `as u8` is exact (values are 0..=100). `None` when there is nothing to summarize.
@@ -266,6 +396,7 @@ fn aggregate(inputs: &Inputs) -> Report {
         .count() as u32;
 
     Report {
+        window,
         swap_overshoot,
         time_blind_near_limit_secs: inputs.time_blind_near_limit_secs,
         false_preempt: FalsePreempt {
@@ -297,6 +428,16 @@ fn render_human(r: &Report) -> String {
     out.push_str(
         "sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log)\n\n",
     );
+
+    // Active window (issue #494) — documents the bound so the numbers below are read in
+    // context. Absent for the whole-log default, so that output is byte-for-byte unchanged.
+    if let Some(w) = &r.window {
+        out.push_str(&format!(
+            "window: since {} ({}) — all four SLIs bounded to events at/after the cutoff\n\n",
+            w.cutoff_rfc3339(),
+            w.since_arg,
+        ));
+    }
 
     // SLI 1 — swap-out session_pct percentiles vs targets.
     match (
@@ -348,17 +489,34 @@ fn render_human(r: &Report) -> String {
     out
 }
 
-// --- rendering: JSON wire (schema:1) ----------------------------------------
+// --- rendering: JSON wire (schema:2) ----------------------------------------
 
 /// The stable `--json` document. Field names are OWNED by this wire contract (decoupled from
 /// the internal aggregate types), so an internal refactor cannot silently break the schema.
 #[derive(serde::Serialize)]
 struct ReliabilityWire {
     schema: u32,
+    /// The active `--since` window (issue #494), or `null` for the whole-log aggregate. Added
+    /// in `schema:2` — ADDITIVE (an always-present field), so a consumer that ignores unknown
+    /// keys still parses every prior field. When present, the four SLIs below are bounded to it.
+    window: Option<WindowWire>,
     swap_overshoot: SwapOvershootWire,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreemptWire,
     rate_limit_neutrality: RateLimitWire,
+}
+
+/// The `--since` window bound (issue #494). Carries the operator's raw span plus the resolved
+/// cutoff in BOTH forms — RFC 3339 (the log's own `ts=` shape) and epoch seconds (a machine
+/// consumer can compare it without re-parsing a timestamp).
+#[derive(serde::Serialize)]
+struct WindowWire {
+    /// The `--since` value as given (e.g. `"7d"`).
+    since: String,
+    /// The absolute cutoff instant, RFC 3339 UTC; events at/after it are included.
+    cutoff_ts: String,
+    /// The same cutoff as epoch seconds — the numeric bound `cutoff_ts` mirrors.
+    cutoff_epoch: i64,
 }
 
 /// Swap-out overshoot block. `p50`/`p95`/`p100`/`met.*` are `null` with no data (an empty
@@ -417,6 +575,11 @@ struct RateLimitWire {
 fn reliability_wire(r: &Report) -> ReliabilityWire {
     ReliabilityWire {
         schema: JSON_SCHEMA_VERSION,
+        window: r.window.as_ref().map(|w| WindowWire {
+            since: w.since_arg.clone(),
+            cutoff_ts: w.cutoff_rfc3339(),
+            cutoff_epoch: w.cutoff_epoch,
+        }),
         swap_overshoot: SwapOvershootWire {
             n: r.swap_overshoot.n,
             p50: r.swap_overshoot.p50,
@@ -486,12 +649,12 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
 ";
 
     fn fixture_report() -> Report {
-        aggregate(&parse_events(FIXTURE_LOG))
+        aggregate(&parse_events(FIXTURE_LOG, None), None)
     }
 
     #[test]
     fn parse_folds_only_the_four_relevant_families() {
-        let inputs = parse_events(FIXTURE_LOG);
+        let inputs = parse_events(FIXTURE_LOG, None);
         // reason=session swaps ONLY — weekly (42), manual (0), and emergency all dropped (#455 Finding 1).
         assert_eq!(inputs.swap_out_pcts, vec![96.0, 100.0]);
         // Only near_limit=true windows: 300 + 600 (the near_limit=false 120 is excluded).
@@ -524,7 +687,7 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
 
     #[test]
     fn empty_log_yields_no_swaps_and_zeroed_slis() {
-        let r = aggregate(&parse_events(""));
+        let r = aggregate(&parse_events("", None), None);
         assert_eq!(r.swap_overshoot.n, 0);
         // Cardinality-zero: percentiles are None (not a passing 0), so no target is asserted met.
         assert_eq!(r.swap_overshoot.p50, None);
@@ -543,7 +706,7 @@ ts=2026-07-11T00:00:00Z event=swap from=a to=b reason=session session_pct=95
 ts=2026-07-11T00:01:00Z event=swap from=a to=b reason=session session_pct=96
 ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
 ";
-        let r = aggregate(&parse_events(log));
+        let r = aggregate(&parse_events(log, None), None);
         assert_eq!(r.swap_overshoot.p50, Some(96));
         assert_eq!(r.swap_overshoot.p100, Some(97));
         assert_eq!(r.swap_overshoot.p50_met(), Some(true));
@@ -576,7 +739,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
 
     #[test]
     fn human_render_handles_no_swaps() {
-        let out = render_human(&aggregate(&parse_events("")));
+        let out = render_human(&aggregate(&parse_events("", None), None));
         assert!(
             out.contains("swap-out session_pct (reason=session): no swaps observed"),
             "cardinality-zero must not print a fabricated P100: {out}"
@@ -584,13 +747,17 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     }
 
     #[test]
-    fn json_render_is_stable_schema_1() {
+    fn json_render_is_stable_schema_2() {
+        // The whole-log default: `window` is null and every prior field is byte-identical to
+        // schema:1 — the additive contract (#494). A `--since` document is asserted separately
+        // in `json_documents_the_active_window`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 1,\n",
+                "  \"schema\": 2,\n",
+                "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
                 "    \"p50\": 96,\n",
@@ -627,7 +794,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
 
     #[test]
     fn json_no_data_serializes_nulls_not_a_passing_zero() {
-        let out = render_json(&aggregate(&parse_events(""))).expect("serializes");
+        let out = render_json(&aggregate(&parse_events("", None), None)).expect("serializes");
         assert!(
             out.contains("\"p100\": null"),
             "no-data P100 must be null: {out}"
@@ -637,6 +804,219 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
             "no-data P50 must be null: {out}"
         );
         assert!(out.contains("\"met\": {\n      \"p50\": null,\n      \"p100\": null\n    }"));
+    }
+
+    // --- issue #494: the `--since` window --------------------------------------
+
+    /// A window fixture spanning two clusters days apart, exercising ALL FOUR event families on
+    /// BOTH sides of a mid-fixture cutoff — so a window is provably bounding EVERY SLI, not just
+    /// the swap percentiles. The Jul-5 swap sits exactly on the boundary the tests key off.
+    const WINDOW_LOG: &str = "\
+ts=2026-07-01T00:00:00Z event=swap from=a to=b reason=session session_pct=91
+ts=2026-07-01T01:00:00Z event=blind_window acct=u-A duration_secs=100 session_pct=98 session_at_recovery=50 near_limit=true
+ts=2026-07-01T02:00:00Z event=usage_backoff acct=u-A class=rate_limited
+ts=2026-07-05T00:00:00Z event=swap from=a to=b reason=session session_pct=96
+ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=98
+ts=2026-07-10T01:00:00Z event=blind_window acct=u-B duration_secs=200 session_pct=97 session_at_recovery=60 near_limit=true
+ts=2026-07-10T02:00:00Z event=usage_backoff acct=u-B class=transient
+";
+
+    /// Parse a fixture `ts=` through the SAME canonical reader the production window path uses,
+    /// so a test cutoff is derived exactly as `parse_events` derives each line's instant.
+    fn epoch(ts: &str) -> i64 {
+        epoch_from_rfc3339(ts).expect("valid RFC 3339 fixture")
+    }
+
+    #[test]
+    fn parse_duration_secs_accepts_each_unit() {
+        assert_eq!(parse_duration_secs("45s").unwrap(), 45);
+        assert_eq!(parse_duration_secs("30m").unwrap(), 1_800);
+        assert_eq!(parse_duration_secs("24h").unwrap(), 86_400);
+        assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
+        assert_eq!(parse_duration_secs("2w").unwrap(), 1_209_600);
+        assert_eq!(parse_duration_secs("0d").unwrap(), 0);
+        // Surrounding whitespace is trimmed (lexopt hands the value through verbatim).
+        assert_eq!(parse_duration_secs("  7d  ").unwrap(), 604_800);
+        // Saturating multiply: a u64-representable count whose ×unit overflows yields u64::MAX
+        // (→ a clamped cutoff), never a wrapped value.
+        assert_eq!(
+            parse_duration_secs(&format!("{}w", u64::MAX)).unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn parse_duration_secs_rejects_malformed() {
+        for bad in [
+            "",                      // empty
+            "   ",                   // whitespace only (trims to empty)
+            "7",                     // no unit
+            "d",                     // no count
+            "7x",                    // unknown unit
+            "-3d",                   // negative sign
+            "3.5h",                  // non-integer
+            "abc",                   // gibberish
+            "7dd",                   // trailing junk after the unit
+            "d7",                    // unit before count
+            "7 d",                   // internal whitespace
+            "99999999999999999999s", // count overflows u64 → rejected, not silently saturated
+        ] {
+            let err = parse_duration_secs(bad).unwrap_err();
+            assert!(
+                matches!(err, Error::ReliabilitySinceInvalid(_)),
+                "{bad:?} must be rejected as ReliabilitySinceInvalid, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_resolve_computes_and_clamps_the_cutoff() {
+        let now = epoch("2026-07-12T00:00:00Z");
+        // A normal span: cutoff = now − duration.
+        let w = Window::resolve("7d", now).expect("valid duration");
+        assert_eq!(w.since_arg, "7d");
+        assert_eq!(w.cutoff_epoch, now - 604_800);
+        assert_eq!(w.cutoff_epoch, epoch("2026-07-05T00:00:00Z"));
+        // A span reaching before the epoch clamps to 0 ("whole log"), never negative.
+        let w = Window::resolve("999999w", 1_000).expect("valid duration");
+        assert_eq!(w.cutoff_epoch, 0);
+        // A malformed span surfaces the error rather than a window.
+        assert!(matches!(
+            Window::resolve("nope", now),
+            Err(Error::ReliabilitySinceInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn window_bounds_all_four_slis_to_events_at_or_after_the_cutoff() {
+        let cutoff = epoch("2026-07-05T00:00:00Z");
+        let inputs = parse_events(WINDOW_LOG, Some(cutoff));
+        // Swaps: 91 (Jul 1) dropped; 96 (Jul 5, == cutoff) and 98 (Jul 10) kept.
+        assert_eq!(inputs.swap_out_pcts, vec![96.0, 98.0]);
+        // Blind: the Jul 1 window (100s) dropped; only the Jul 10 window (200s) remains.
+        assert_eq!(inputs.time_blind_near_limit_secs, 200);
+        assert_eq!(inputs.near_limit_reconciliations, vec![(97, 60)]);
+        // 429 neutrality: the Jul 1 rate_limited dropped; the Jul 10 transient kept.
+        assert_eq!(inputs.rate_limited, 0);
+        assert_eq!(inputs.transient, 1);
+    }
+
+    #[test]
+    fn window_boundary_is_inclusive_at_exactly_the_cutoff() {
+        // Exactly AT the cutoff → in the window (the bound is at/after: half-open [cutoff, ∞)).
+        let at = epoch("2026-07-05T00:00:00Z");
+        assert_eq!(
+            parse_events(WINDOW_LOG, Some(at)).swap_out_pcts,
+            vec![96.0, 98.0],
+            "an event whose ts == cutoff is at/after the cutoff, so it is included"
+        );
+        // One second later, the Jul-5 swap now falls just before the cutoff and drops out.
+        assert_eq!(
+            parse_events(WINDOW_LOG, Some(at + 1)).swap_out_pcts,
+            vec![98.0],
+            "one second past the Jul-5 instant excludes it — the boundary is exclusive-below"
+        );
+    }
+
+    #[test]
+    fn window_drops_a_line_it_cannot_timestamp() {
+        // A line with no `ts=` and one with an unparseable `ts=` cannot be placed in time, so a
+        // windowed pass drops both — while the whole-log default still folds them.
+        let log = "\
+event=swap from=a to=b reason=session session_pct=95
+ts=not-a-timestamp event=swap from=a to=b reason=session session_pct=96
+ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
+";
+        let cutoff = epoch("2026-07-01T00:00:00Z");
+        assert_eq!(
+            parse_events(log, Some(cutoff)).swap_out_pcts,
+            vec![97.0],
+            "un-timestamped / unparseable-ts lines are not provably in-window ⇒ dropped"
+        );
+        // Whole-log default is unaffected: every reason=session swap folds in regardless of ts.
+        assert_eq!(
+            parse_events(log, None).swap_out_pcts,
+            vec![95.0, 96.0, 97.0]
+        );
+    }
+
+    #[test]
+    fn default_none_matches_the_whole_log_and_a_wide_window() {
+        // No window folds every line…
+        let whole = parse_events(WINDOW_LOG, None);
+        assert_eq!(whole.swap_out_pcts, vec![91.0, 96.0, 98.0]);
+        assert_eq!(whole.time_blind_near_limit_secs, 300);
+        assert_eq!(whole.rate_limited, 1);
+        assert_eq!(whole.transient, 1);
+        // …and a cutoff at epoch 0 admits every real (post-1970) line — identical to None.
+        assert_eq!(parse_events(WINDOW_LOG, Some(0)), whole);
+    }
+
+    #[test]
+    fn cardinality_zero_within_the_window_is_honest_not_a_fabricated_pass() {
+        // A window AFTER every swap: the windowed subset has no swaps at all. Percentiles must
+        // stay None (no target asserted met), the human line reads "no swaps observed", the JSON
+        // serializes nulls — the #455 degenerate-subject discipline, now on the windowed subset.
+        let window = Window::resolve("1s", epoch("2026-07-11T00:00:00Z") + 1).unwrap();
+        assert_eq!(window.cutoff_epoch, epoch("2026-07-11T00:00:00Z")); // after the Jul-10 swaps
+        let inputs = parse_events(WINDOW_LOG, Some(window.cutoff_epoch));
+        let r = aggregate(&inputs, Some(window));
+        assert_eq!(r.swap_overshoot.n, 0);
+        assert_eq!(r.swap_overshoot.p50, None);
+        assert_eq!(r.swap_overshoot.p100, None);
+        assert_eq!(r.swap_overshoot.p50_met(), None);
+        assert_eq!(r.swap_overshoot.p100_met(), None);
+
+        let human = render_human(&r);
+        assert!(
+            human.contains("swap-out session_pct (reason=session): no swaps observed"),
+            "windowed cardinality-zero must not fabricate a percentile: {human}"
+        );
+        let json = render_json(&r).expect("serializes");
+        assert!(
+            json.contains("\"p100\": null"),
+            "windowed no-data P100 must be null: {json}"
+        );
+        assert!(json.contains("\"met\": {\n      \"p50\": null,\n      \"p100\": null\n    }"));
+    }
+
+    #[test]
+    fn human_documents_the_active_window() {
+        let window = Window::resolve("7d", epoch("2026-07-12T00:00:00Z")).unwrap();
+        let inputs = parse_events(WINDOW_LOG, Some(window.cutoff_epoch));
+        let out = render_human(&aggregate(&inputs, Some(window)));
+        assert!(
+            out.contains(
+                "window: since 2026-07-05T00:00:00Z (7d) — all four SLIs bounded to events at/after the cutoff"
+            ),
+            "human output must document the window bound: {out}"
+        );
+        // The whole-log default emits NO such line (default output is unchanged).
+        assert!(!render_human(&fixture_report()).contains("window: since"));
+    }
+
+    #[test]
+    fn json_documents_the_active_window() {
+        let window = Window::resolve("7d", epoch("2026-07-12T00:00:00Z")).unwrap();
+        let cutoff = window.cutoff_epoch;
+        let out = render_json(&aggregate(
+            &parse_events(WINDOW_LOG, Some(cutoff)),
+            Some(window),
+        ))
+        .expect("serializes");
+        assert!(out.contains("\"schema\": 2,"), "schema bumped to 2: {out}");
+        assert!(
+            out.contains(concat!(
+                "  \"window\": {\n",
+                "    \"since\": \"7d\",\n",
+                "    \"cutoff_ts\": \"2026-07-05T00:00:00Z\",\n",
+            )),
+            "json window block documents since + cutoff_ts: {out}"
+        );
+        assert!(
+            out.contains(&format!("\"cutoff_epoch\": {cutoff}")),
+            "json window carries the epoch cutoff: {out}"
+        );
     }
 
     /// The #15 durable-line guarantee, extended to the readout: neither the human nor the JSON
@@ -650,17 +1030,33 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
             !crate::redaction::meter::unauthored_emails(FIXTURE_LOG, &[]).is_empty(),
             "fixture must contain an email so the leak guard is a real regression catch"
         );
-        let r = fixture_report();
-        for out in [render_human(&r), render_json(&r).expect("serializes")] {
-            assert!(
-                crate::redaction::meter::unauthored_emails(out.as_str(), &[]).is_empty(),
-                "no non-authored email may appear (#15): {out}"
-            );
-            assert!(!out.contains("token"), "no token may appear: {out}");
-            assert!(!out.contains("Bearer"), "no bearer may appear: {out}");
-            assert!(!out.contains("sk-ant"), "no api key may appear: {out}");
-            assert!(!out.contains("label="), "no operator label: {out}");
-            assert!(!out.contains("acct="), "no account uuid: {out}");
+        // Cover BOTH output paths: the whole-log default AND a windowed readout (#494), the
+        // latter built over the same email-bearing fixture so the window line + JSON `window`
+        // block are exercised on real swap data — the window metadata (a duration + a bare
+        // cutoff instant) must itself stay secret-free.
+        let whole = fixture_report();
+        let windowed = aggregate(
+            &parse_events(FIXTURE_LOG, Some(epoch("2026-07-11T00:00:00Z"))),
+            Some(Window::resolve("30m", epoch("2026-07-11T00:30:00Z")).unwrap()),
+        );
+        // Non-degeneracy: the window must retain the fixture's swaps, else the windowed render
+        // is empty and its leak guard proves nothing.
+        assert!(
+            windowed.swap_overshoot.n > 0,
+            "windowed report must fold the fixture swaps"
+        );
+        for r in [&whole, &windowed] {
+            for out in [render_human(r), render_json(r).expect("serializes")] {
+                assert!(
+                    crate::redaction::meter::unauthored_emails(out.as_str(), &[]).is_empty(),
+                    "no non-authored email may appear (#15): {out}"
+                );
+                assert!(!out.contains("token"), "no token may appear: {out}");
+                assert!(!out.contains("Bearer"), "no bearer may appear: {out}");
+                assert!(!out.contains("sk-ant"), "no api key may appear: {out}");
+                assert!(!out.contains("label="), "no operator label: {out}");
+                assert!(!out.contains("acct="), "no account uuid: {out}");
+            }
         }
     }
 }

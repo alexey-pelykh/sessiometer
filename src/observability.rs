@@ -1370,7 +1370,12 @@ fn system_time_from_epoch(secs: i64) -> SystemTime {
 /// is emitted. A pre-1970 clock (a `duration_since` error) renders as the epoch — a
 /// clearly-wrong but safe sentinel, so a skewed clock can never panic a log write
 /// (the daemon's logging is best-effort).
-fn rfc3339(ts: SystemTime) -> String {
+///
+/// `pub(crate)` so the windowed `reliability` readout (#494) can render its `--since`
+/// cutoff back to the log's own `ts=` shape through this SAME renderer — the inverse
+/// of [`crate::usage::epoch_from_rfc3339`], which parses `ts=` the other way — rather
+/// than hand-rolling a second copy of the civil-date arithmetic.
+pub(crate) fn rfc3339(ts: SystemTime) -> String {
     let secs = ts
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

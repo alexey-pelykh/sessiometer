@@ -66,6 +66,15 @@ pub(crate) enum Error {
     #[error("could not render reliability readout as JSON: {0}")]
     ReliabilitySerialize(&'static str),
 
+    /// `reliability --since` got a value that is not a relative duration — a non-negative
+    /// integer with a unit `s`/`m`/`h`/`d`/`w` (e.g. `30m`, `24h`, `7d`, `2w`). Unlike
+    /// `stats --since`, this window is duration-only (issue #494): an absolute date is not
+    /// accepted here.
+    #[error(
+        "invalid --since `{0}`: expected a relative duration (e.g. 30m, 24h, 7d, 2w — units s/m/h/d/w)"
+    )]
+    ReliabilitySinceInvalid(String),
+
     /// The current user's home directory could not be resolved from the
     /// password database (see [`crate::paths`]).
     #[error("could not resolve the home directory for the current user")]
