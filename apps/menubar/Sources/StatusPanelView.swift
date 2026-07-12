@@ -261,6 +261,17 @@ struct StatusPanelView: View {
             // footer recommendation) are live and dead together (#169). No capture bar — capture moved to
             // the status-item menu / empty-roster onboarding (issue #394).
             Divider().padding(.horizontal, 14)
+            if let scrubBanner = StatusPanelFormat.canonicalScrubBanner(store.canonicalScrub) {
+                // The daemon-level shared-canonical scrub (#469): a fleet-wide `claude`-login lockout NO
+                // per-row `auth` reflects (rows can read healthy while the shared item sits emptied), so it
+                // rides as its own honest banner ABOVE the roster — the connected-but-scrubbed panel reads
+                // visibly DEGRADED (never healthy) while the live roster still renders below. The footer
+                // stays the `next_swap` line (R-2: footer = next_swap; degraded daemon-level signals →
+                // honest banner).
+                BannerView(banner: scrubBanner)
+                    .padding(.horizontal, 14).padding(.vertical, 14)
+                Divider().padding(.horizontal, 14)
+            }
             if !store.rows.isEmpty {
                 RosterView(rows: store.rows, now: now, switchable: true)
             }

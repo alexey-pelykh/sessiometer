@@ -2214,7 +2214,7 @@ pub(crate) fn render_status(
     // DATA (unconditional, like the systemic line above — so it survives a pipe / redirect /
     // `status | grep`, an operator's health check must be able to see it), naming the state and, for
     // the un-recoverable residual, the `claude /login` remedy. Content-parity with the menubar
-    // (`StatusPanelFormat.canonicalScrubFooter`): same state + same `claude /login` remedy, each
+    // (`StatusPanelFormat.canonicalScrubBanner`): same state + same `claude /login` remedy, each
     // medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for `ActiveDeadNoTarget`).
     // Printed PLAIN — no color overlay, in the action-first footer register of the `next swap: none
     // — …` footer above (ADR-0016), NOT the systemic line's red SGR. A fleet-wide STATE discriminant
@@ -4253,7 +4253,7 @@ spare  22222222-2222\n\
         };
 
         // Exhausted → names the state AND the actionable `claude /login` remedy (byte-shared with
-        // the menubar's `canonicalScrubFooter` — content-parity, R-2 state-parity).
+        // the menubar's `canonicalScrubBanner` — content-parity, R-2 state-parity).
         let exhausted = render_status(&response(Some(CanonicalScrub::Exhausted)), NOW, None, false);
         let line = exhausted
             .lines()
