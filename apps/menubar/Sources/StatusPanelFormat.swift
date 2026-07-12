@@ -842,6 +842,48 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - `keychain_locked` banner (issue #498 — the fleet-wide unreadable-credential signal)
+
+    /// The honest-state BANNER for the daemon's `keychain_locked` flag (`WireModel.swift`
+    /// `keychainLocked`, wire #521), or `nil` when the login keychain is unlocked (the wire key is absent
+    /// → no banner, same single-cardinality as `canonicalScrubBanner(nil)`). The macOS login keychain is
+    /// LOCKED, so the daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied)
+    /// — the fleet-wide unreadable-credential lockout NO per-account `auth` cell reflects (each row can
+    /// read perfectly healthy while the shared item sits unreadable), so no roster glyph carries it; only
+    /// this daemon-level banner does. The View renders it ABOVE the roster in the `.connected` / `.stale`
+    /// body, so a connected-but-locked panel reads visibly DEGRADED (never healthy) while the live rows
+    /// still show.
+    ///
+    /// The daemon-level SIBLING of `canonicalScrubBanner`, but for an UNREADABLE item rather than a
+    /// readable-but-scrubbed one — so the REMEDY DIFFERS: UNLOCK THE KEYCHAIN, never `claude /login` (a
+    /// re-login cannot help while the keychain that STORES the credential is locked). The design SSOT
+    /// (`design-menubar.md`, the 9-state map) calls this the "actionable shape, waiting for unlock".
+    /// Always an `.error` banner — a bare binary state with no calm/self-heal variant like the scrub's
+    /// `.recovering` (the daemon stays blocked until the operator unlocks). Content-parity with the CLI's
+    /// `shared login: unreadable …` line (`src/cli.rs` `render_status`): the SAME state and the SAME
+    /// unlock remedy, each medium phrasing it its own way (R-2 STATE-parity, as ADR-0016 did for
+    /// `ActiveDeadNoTarget`). A fleet-wide STATE discriminant only — never per-account, never a token or
+    /// email (issue #15).
+    static func keychainLockedBanner(_ locked: Bool) -> Banner? {
+        guard locked else { return nil }
+        return Banner(title: "Keychain locked",
+                      detail: "The login keychain is locked — unlock it to read the shared login.",
+                      kind: .error)
+    }
+
+    /// The single worst-first daemon-level fault banner for the `.connected` / `.stale` body — the panel
+    /// shows ONE banner even when multiple daemon-level faults are set. Priority: keychain-locked (#498)
+    /// OUTRANKS canonical-scrub (#469) — an UNREADABLE shared item (the daemon cannot read it at all) is
+    /// at least as severe as a readable-but-SCRUBBED one, and its remedy (unlock the keychain) must reach
+    /// the operator before the scrub's `claude /login`, which cannot help while the keychain is locked. In
+    /// practice the two are daemon-mutually-exclusive (a locked keychain can't be read to know
+    /// scrubbed-ness), so this is a deterministic tiebreak, not a common composite. `nil` when both are
+    /// healthy (no banner). Keeps the worst-first order a testable pure function rather than a `??` buried
+    /// in the View.
+    static func daemonFaultBanner(keychainLocked: Bool, scrub: CanonicalScrub?) -> Banner? {
+        keychainLockedBanner(keychainLocked) ?? canonicalScrubBanner(scrub)
+    }
+
     // MARK: - Header identity + swap callout (issue #355 — design-reference parity)
 
     /// The header's identity sub-line — the design reference's `app-sub` ("N accounts · {active}

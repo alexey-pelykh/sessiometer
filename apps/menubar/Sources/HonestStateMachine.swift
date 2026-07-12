@@ -385,6 +385,16 @@ struct HonestStateMachine {
     /// omits the wire key (`decodeIfPresent`), so a healthy/legacy daemon never renders a scrub banner.
     private(set) var canonicalScrub: CanonicalScrub?
 
+    /// The daemon-level KEYCHAIN-LOCKED flag (#498, wire #521), carried from the last applied snapshot
+    /// exactly as `canonicalScrub` is: `true` while the macOS login keychain is LOCKED, so the daemon
+    /// cannot READ the shared `Claude Code-credentials` item at ALL — the daemon-LEVEL sibling of
+    /// `canonicalScrub`, but for an UNREADABLE item (access denied), so the remedy is UNLOCK the keychain,
+    /// not `claude /login`. RETAINED across a drop (shown under the dimmed last-known render, like
+    /// `canonicalScrub`) and REFUSED with the other numbers on an unsupported-major frame. `false` when
+    /// the keychain is unlocked — or a pre-#498 daemon omits the wire key (`decodeIfPresent ?? false`), so
+    /// a healthy/legacy daemon never renders a keychain-locked banner.
+    private(set) var keychainLocked: Bool = false
+
     /// The honest connection state — a PURE function of `(liveness, snapshotClass)`. This is where the
     /// never-healthy-when-dead invariant lives: `.connected` is returned on exactly one combination.
     var connectionState: ConnectionState {
@@ -596,6 +606,7 @@ struct HonestStateMachine {
             nextSwap = nil
             refreshEnabled = nil
             canonicalScrub = nil
+            keychainLocked = false
             return .unsupportedSchema
         }
         snapshotClass = status.accounts.isEmpty ? .empty : .healthy
@@ -604,6 +615,7 @@ struct HonestStateMachine {
         refreshEnabled = status.refreshEnabled
         generatedAt = status.generatedAt
         canonicalScrub = status.canonicalScrub
+        keychainLocked = status.keychainLocked
         return .appliedSnapshot
     }
 
@@ -616,6 +628,7 @@ struct HonestStateMachine {
             nextSwap = nil
             refreshEnabled = nil
             canonicalScrub = nil
+            keychainLocked = false
             return .unsupportedSchema
         }
         // Liveness/keepalive ONLY — a heartbeat carries no roster, so it must NOT be treated as a

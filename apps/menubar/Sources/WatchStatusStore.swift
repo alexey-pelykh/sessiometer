@@ -56,6 +56,12 @@ final class WatchStatusStore: ObservableObject {
     /// emptied). The panel renders it as an honest banner above the roster; `nil` when the shared
     /// canonical is healthy (or a pre-#516 daemon omits the wire key).
     @Published private(set) var canonicalScrub: CanonicalScrub?
+    /// The daemon-level KEYCHAIN-LOCKED flag (#498, wire #521) — a fleet-wide unreadable-credential
+    /// lockout NO per-account `auth` cell reflects (each row can read healthy while the shared item sits
+    /// UNREADABLE because the login keychain is locked). The panel renders it as an honest banner above
+    /// the roster (worst-first over `canonicalScrub`); `false` when the keychain is unlocked (or a
+    /// pre-#498 daemon omits the wire key). Its remedy is UNLOCK the keychain, not `claude /login`.
+    @Published private(set) var keychainLocked: Bool = false
 
     // MARK: - The glance presentation stream (the status item consumes this)
 
@@ -185,6 +191,7 @@ final class WatchStatusStore: ObservableObject {
         refreshEnabled = machine.refreshEnabled
         generatedAt = machine.generatedAt
         canonicalScrub = machine.canonicalScrub
+        keychainLocked = machine.keychainLocked
         presentationsContinuation.yield(machine.presentation)
     }
 
@@ -305,13 +312,15 @@ extension WatchStatusStore {
     /// from the wire, never set directly. Same-file so it can set the `private(set)` projection.
     static func preview(state: ConnectionState, rows: [AccountRow],
                         nextSwap: NextSwap?, generatedAt: Int64?,
-                        canonicalScrub: CanonicalScrub? = nil) -> WatchStatusStore {
+                        canonicalScrub: CanonicalScrub? = nil,
+                        keychainLocked: Bool = false) -> WatchStatusStore {
         let store = WatchStatusStore()
         store.connectionState = state
         store.rows = rows
         store.nextSwap = nextSwap
         store.generatedAt = generatedAt
         store.canonicalScrub = canonicalScrub
+        store.keychainLocked = keychainLocked
         return store
     }
 }
