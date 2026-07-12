@@ -18,6 +18,7 @@
 // change drives one `apply(_:)`, updating BOTH the glyph image AND the accessibility label together.
 
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -35,6 +36,13 @@ final class StatusItemController {
     /// outside-click dismiss is GATED on `swapModel.isBusy`, so an in-flight swap — a real write against
     /// the operator's active account — cannot be hidden by a stray click before its outcome is seen.
     private let swapModel: AccountSwapModel
+    /// The Stats-tab model (issue #446): owns the panel's Status|Stats selection + the one-shot `stats`
+    /// query. Owned here so the controller can OBSERVE its changes (a tab switch, or the series loading in)
+    /// and RE-SIZE the panel to the new content — the Stats tab is taller than Status, so a size fixed at
+    /// open-time (`openPanel`) would clip it; switching back to Status must restore the smaller size.
+    private let statsModel: PanelStatsModel
+    /// The subscription that re-sizes the panel whenever the Stats model changes (installed in `init`).
+    private var statsObserver: AnyCancellable?
     private var presentationTask: Task<Void, Never>?
     /// The UX gap between the menu bar and the panel's top edge.
     private let panelGap: CGFloat = 6
@@ -43,12 +51,15 @@ final class StatusItemController {
 
     init(store: WatchStatusStore,
          captureClient: ControlCommandClient?,
-         swapClient: ControlCommandClient?) {
+         swapClient: ControlCommandClient?,
+         statsClient: ControlCommandClient?) {
         self.store = store
         let captureModel = AccountCaptureModel(client: captureClient)
         self.captureModel = captureModel
         let swapModel = AccountSwapModel(client: swapClient)
         self.swapModel = swapModel
+        let statsModel = PanelStatsModel(client: statsClient)
+        self.statsModel = statsModel
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         // #326's status panel reads the store via `@EnvironmentObject` (a thin view over the
@@ -58,7 +69,8 @@ final class StatusItemController {
         let hosting = NSHostingView(rootView: StatusPanelView()
             .environmentObject(store)
             .environmentObject(captureModel)
-            .environmentObject(swapModel))
+            .environmentObject(swapModel)
+            .environmentObject(statsModel))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         self.hostingView = hosting
 
@@ -102,6 +114,15 @@ final class StatusItemController {
         // blank in the gap between attach and the first streamed update.
         configureButton()
         apply(store.currentPresentation)
+
+        // Re-size the panel WHEN OPEN as the Stats model changes (issue #446): a Status↔Stats tab switch, or
+        // the stats series loading in, changes the SwiftUI content height. `objectWillChange` fires BEFORE the
+        // value updates and BEFORE SwiftUI re-lays-out, so defer the re-size to the next run-loop turn — by
+        // then `hostingView.fittingSize` reflects the new content. The Stats model is the ONLY driver here:
+        // the Status tab's own updates come from the store (a different object), so this never fires for them.
+        statsObserver = statsModel.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { self?.resizePanelToContentIfOpen() }
+        }
     }
 
     /// Begin consuming the store's glance stream, mirroring each `PresentationState` onto the button.
@@ -206,20 +227,49 @@ final class StatusItemController {
         NSApp.terminate(nil)
     }
 
-    /// Show the panel a `panelGap` below the status item, centered under the icon and clamped on-screen.
-    /// Positioning is derived from the icon's OWN window frame, so it is correct on any display and any
-    /// menu-bar height (notch or not) without hardcoding — the icon stays visible above the gap.
-    private func openPanel() {
+    /// Size the panel to its CURRENT SwiftUI content and position it a `panelGap` below the icon, clamped
+    /// on-screen on BOTH axes. This is the single sizing seam (issue #446): `openPanel` calls it once at
+    /// open, and `resizePanelToContentIfOpen` re-calls it whenever the hosted content changes height (a
+    /// Status↔Stats tab switch, or the stats series loading in). The prior `openPanel` sized ONCE at
+    /// open-time and clamped X only, so a taller Stats tab appearing after open both clipped and ran off the
+    /// bottom. Placement is derived from the icon's OWN window frame, correct on any display / menu-bar
+    /// height without hardcoding.
+    private func setPanelFrameToContent() {
         guard let button = statusItem.button, let iconWindow = button.window else { return }
         hostingView.layoutSubtreeIfNeeded()
         var size = hostingView.fittingSize
         if size.width < 1 || size.height < 1 { size = NSSize(width: 360, height: 240) }
         let iconFrame = iconWindow.frame
-        let screenFrame = (iconWindow.screen ?? NSScreen.main)?.frame ?? iconFrame
+        // The VISIBLE frame (excludes the menu bar + Dock) is the correct bound for on-screen clamping — a
+        // physical-frame clamp would still let a tall panel slide under the Dock.
+        let visible = (iconWindow.screen ?? NSScreen.main)?.visibleFrame ?? iconFrame
         var x = iconFrame.midX - size.width / 2
-        x = min(max(x, screenFrame.minX + 8), screenFrame.maxX - size.width - 8)
-        let y = iconFrame.minY - panelGap - size.height   // hang below the icon's bottom edge, with the gap
+        x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
+        // Hang below the icon's bottom edge with the gap; then Y-CLAMP so a tall panel keeps its bottom
+        // on-screen instead of clipping off the bottom (the #446 bug: X was clamped, Y was not). When the
+        // full height fits below the icon, `y` is unchanged and the panel hangs normally under the gap;
+        // switching back to the shorter Status tab recomputes a higher `y`, restoring the original look.
+        var y = iconFrame.minY - panelGap - size.height
+        if y < visible.minY + 8 { y = visible.minY + 8 }
         panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+    }
+
+    /// Re-fit the panel to its content, but ONLY while it is open (issue #446). The Stats model's observer
+    /// (see `init`) calls this after a tab switch or the series loading in; a change while the panel is
+    /// closed is a no-op — the next `openPanel` sizes fresh.
+    private func resizePanelToContentIfOpen() {
+        guard panel.isVisible else { return }
+        setPanelFrameToContent()
+    }
+
+    /// Show the panel a `panelGap` below the status item, centered under the icon and clamped on-screen.
+    /// Positioning is derived from the icon's OWN window frame, so it is correct on any display and any
+    /// menu-bar height (notch or not) without hardcoding — the icon stays visible above the gap.
+    private func openPanel() {
+        // Bail before showing if the icon has no window yet: `setPanelFrameToContent` would then no-op,
+        // so `orderFrontRegardless` below would flash the panel at a stale, unpositioned frame.
+        guard statusItem.button?.window != nil else { return }
+        setPanelFrameToContent()
         panel.orderFrontRegardless()
         // Make the panel key so VoiceOver focus moves INTO it (the borderless-panel regression: a
         // non-key window is not in VoiceOver's navigation, leaving the well-labelled rows unreachable).
@@ -256,6 +306,10 @@ final class StatusItemController {
         // normal roster. A no-op when the surface was not requested; releases the outside-click retain
         // predicate (a no-op while a capture is in flight, which runs to completion).
         captureModel.dismissCaptureSurface()
+        // Reset the Stats tab to the Status glance (issue #446): each fresh open starts on Status, and the
+        // Stats tab re-queries live on the next selection rather than flashing a stale window from a prior
+        // open. A no-op resize while closed (the observer guards on `panel.isVisible`).
+        statsModel.reset()
         if let monitor = dismissMonitor {
             NSEvent.removeMonitor(monitor)
             dismissMonitor = nil
