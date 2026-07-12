@@ -617,16 +617,10 @@ fn max_of(xs: &[f64]) -> f64 {
 }
 
 /// 95th-percentile by the nearest-rank method (`0.0` for empty), matching the store's
-/// daily tier so the two agree on the same samples.
+/// daily tier so the two agree on the same samples. Delegates to the shared
+/// [`crate::percentile::percentile`] (issue #455) — the single copy of the nearest-rank math.
 fn p95_of(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = xs.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    // Nearest-rank: the ceil(0.95·n)-th value (1-indexed), clamped into range.
-    let rank = ((0.95 * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
-    sorted[rank - 1]
+    crate::percentile::percentile(xs, 0.95)
 }
 
 #[cfg(test)]

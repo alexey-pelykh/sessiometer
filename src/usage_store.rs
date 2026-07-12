@@ -816,16 +816,11 @@ fn mean_of(xs: &[f64]) -> f64 {
     }
 }
 
-/// The 95th-percentile value of `xs` by the nearest-rank method (`0.0` for empty).
+/// The 95th-percentile value of `xs` by the nearest-rank method (`0.0` for empty). Delegates
+/// to the shared [`crate::percentile::percentile`] (issue #455) — the single copy of the
+/// nearest-rank math.
 fn p95_of(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = xs.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    // Nearest-rank: the ceil(p·n)-th value (1-indexed), clamped into range.
-    let rank = ((P95 * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
-    sorted[rank - 1]
+    crate::percentile::percentile(xs, P95)
 }
 
 /// The daily per-dimension summary over a day's `xs`.

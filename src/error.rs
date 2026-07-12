@@ -61,6 +61,11 @@ pub(crate) enum Error {
     #[error("could not render stats as JSON: {0}")]
     StatsSerialize(&'static str),
 
+    /// The `reliability --json` readout could not be serialized. Unreachable — the wire is
+    /// bare integers / bools / nulls (issue #455); mapped, never panicked.
+    #[error("could not render reliability readout as JSON: {0}")]
+    ReliabilitySerialize(&'static str),
+
     /// The current user's home directory could not be resolved from the
     /// password database (see [`crate::paths`]).
     #[error("could not resolve the home directory for the current user")]

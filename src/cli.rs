@@ -114,6 +114,8 @@ enum Command {
     Poke { target: Option<String> },
     /// `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`.
     Stats(crate::stats::StatsArgs),
+    /// `reliability [--json]` — the OFFLINE reliability-SLO readout over the event log (#455).
+    Reliability(crate::reliability::ReliabilityArgs),
     /// `export [PATH] …`. The raw flags are carried and resolved to an `Encryption` in
     /// `execute`, so this variant stays a plain comparable value for the parser tests.
     Export {
@@ -209,6 +211,7 @@ enum HelpTopic {
     Remove,
     Poke,
     Stats,
+    Reliability,
     Export,
     Import,
 }
@@ -232,6 +235,7 @@ impl HelpTopic {
             HelpTopic::Remove => "sessiometer remove --help",
             HelpTopic::Poke => "sessiometer poke --help",
             HelpTopic::Stats => "sessiometer stats --help",
+            HelpTopic::Reliability => "sessiometer reliability --help",
             HelpTopic::Export => "sessiometer export --help",
             HelpTopic::Import => "sessiometer import --help",
         }
@@ -257,6 +261,7 @@ impl HelpTopic {
             HelpTopic::Remove => REMOVE_USAGE,
             HelpTopic::Poke => POKE_USAGE,
             HelpTopic::Stats => STATS_USAGE,
+            HelpTopic::Reliability => RELIABILITY_USAGE,
             HelpTopic::Export => EXPORT_USAGE,
             HelpTopic::Import => IMPORT_USAGE,
         }
@@ -540,6 +545,22 @@ fn parse_stats(parser: &mut lexopt::Parser) -> Result<Command> {
     }))
 }
 
+/// Parse `reliability [--json]` (issue #455) — the offline reliability-SLO readout. Only
+/// `--json` is accepted; there are no positionals. Aggregation lives in `reliability::run`.
+fn parse_reliability(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut json = false;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Reliability)),
+            Long("json") => json = true,
+            other => return Err(unexpected(other, HelpTopic::Reliability)),
+        }
+    }
+    Ok(Command::Reliability(crate::reliability::ReliabilityArgs {
+        json,
+    }))
+}
+
 /// Parse `export [PATH] [--plaintext] [--no-secrets] [--passphrase-file <path> |
 /// --passphrase-stdin]` (issue #148) — the first non-flag token is the PATH, extras
 /// ignored. The passphrase source is NEVER an argv value (#39): `--passphrase-file` takes
@@ -659,6 +680,7 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         "remove" => parse_positional(parser, HelpTopic::Remove, |label| Command::Remove { label }),
         "poke" => parse_positional(parser, HelpTopic::Poke, |target| Command::Poke { target }),
         "stats" => parse_stats(parser),
+        "reliability" => parse_reliability(parser),
         "export" => parse_export(parser),
         "import" => parse_import(parser),
         other => Err(Error::UnknownCommand(other.to_owned())),
@@ -712,6 +734,7 @@ async fn execute(command: Command) -> Result<()> {
         Command::Remove { label } => remove_account(label).await,
         Command::Poke { target } => crate::poke::poke(target).await,
         Command::Stats(args) => crate::stats::run(args).await,
+        Command::Reliability(args) => crate::reliability::run(args),
         Command::Export {
             path,
             no_secrets,
@@ -774,6 +797,7 @@ COMMANDS:
     remove <label>       Delete an account: drop it from the rotation and erase its stash
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
+    reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
     export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout
     import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite
 
@@ -981,6 +1005,22 @@ USAGE:
     --no-color      force the chart colour overlay off
     --ascii         force the ASCII glyph ramp
     -h, --help      print this help
+";
+
+const RELIABILITY_USAGE: &str = "sessiometer reliability — swap-out overshoot SLO readout, offline (reads the event log directly)
+
+USAGE:
+    sessiometer reliability [--json]
+
+    --json      print the readout as JSON (schema:1, for scripts) instead of the text view
+    -h, --help  print this help
+
+READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
+works when the daemon is down. It reports four indicators over the whole log, each with its
+target: swap-out session_pct P50/P95/P100 (targets P50 <= 97, P100 < 99); time spent blind while
+near the limit; a false-preempt proxy from the blind-window recovery reconciliation; and the
+usage-poll 429 vs transient counts. The readout is roster-wide numbers only — no per-account
+breakdown, no identifiers.
 ";
 
 const EXPORT_USAGE: &str = "sessiometer export — serialize state to an (encrypted by default) migration artifact
@@ -7818,6 +7858,30 @@ spare  22222222-2222\n\
                 ascii: false,
             })
         );
+    }
+
+    #[test]
+    fn reliability_parses_bare_and_with_json() {
+        // The readout takes only `--json`; bare defaults to the human view.
+        assert_eq!(
+            parse_argv(&["reliability"]).unwrap(),
+            Command::Reliability(crate::reliability::ReliabilityArgs { json: false })
+        );
+        assert_eq!(
+            parse_argv(&["reliability", "--json"]).unwrap(),
+            Command::Reliability(crate::reliability::ReliabilityArgs { json: true })
+        );
+    }
+
+    #[test]
+    fn reliability_help_routes_and_an_unknown_flag_is_a_clear_error() {
+        assert_eq!(
+            parse_argv(&["reliability", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Reliability)
+        );
+        // A stray positional or flag the readout does not accept → strict-usage error.
+        let err = parse_argv(&["reliability", "--period"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
     }
 
     #[test]
