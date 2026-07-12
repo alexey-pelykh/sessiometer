@@ -27,9 +27,12 @@
 // `ObservableObject` shell that pumps this machine from the injected event stream and mirrors its
 // derived state into `@Published` properties + the presentation stream.
 //
-// SCOPE (#324): the MINIMAL honest-state baseline only — connecting / connected / empty-roster /
-// stale / disconnected / unsupported. The FULL degraded-state map (crash-loop debounce,
-// keychain-locked, stale-snapshot detail, the rich version-skew upgrade UX) is #169.
+// SCOPE: the #324 MINIMAL honest-state baseline — connecting / connected / empty-roster / stale /
+// disconnected / unsupported — PLUS the #169 crash-loop healthy-flash debounce (the crown-jewel
+// anti-#137 mitigation: a crash-looping daemon is held in `.crashLooping`, never flickered healthy).
+// The REMAINING degraded-state-map facets are tracked siblings, NOT this file: keychain-locked (needs
+// a daemon-side wire signal — the watch stream carries none), the not-running / daemon-starting split
+// (needs transport connect-refused enrichment), and the rich version-skew upgrade UX.
 //
 // STORE-SIDE STALENESS WATCHDOG (#344): staleness must NOT depend solely on the transport's
 // byte-level liveness timer. The transport re-arms that timer on ANY non-empty line — garbage,
@@ -72,8 +75,16 @@ enum ConnectionState: Equatable, Sendable {
 
     /// The daemon speaks a wire contract this client cannot safely read (`schema_version.major`
     /// mismatch — `!WireContract.isSupported`). Numbers are refused rather than mis-rendered. Minimal
-    /// only; the rich version-skew UX is #169.
+    /// only; the rich version-skew UX is a #169 sibling.
     case unsupported
+
+    /// The daemon is crash-looping (issue #169): it (re)connected and served a fresh snapshot but keeps
+    /// DROPPING before the connection survives the stability window — the repeated-launchd-restart
+    /// fault. A DISTINCT state that persists a fault shape and NEVER renders healthy — the crown-jewel
+    /// anti-#137 "debounce the healthy-flash between launchd restarts" (design-menubar D-UX-state). The
+    /// held snapshot's numbers are refused until the daemon stays up. Distinct from `.disconnected` (a
+    /// single drop) and `.connecting` (a benign first/single (re)connect still awaiting stabilization).
+    case crashLooping
 
     /// Whether this is the one healthy state. The never-healthy-when-dead invariant is exactly
     /// "`isHealthy` is false on every degraded or absent path".
@@ -97,6 +108,9 @@ enum StatusGlyph: Equatable, Sendable {
     case stale
     case disconnected
     case unsupported
+    /// The crash-loop FAULT glyph (issue #169) — a persistent fault shape, emitted for
+    /// `ConnectionState.crashLooping`; never the healthy glyph.
+    case crashLooping
 }
 
 /// What the status item renders: the glance `glyph` plus a VoiceOver `accessibilityLabel`. The label
@@ -128,6 +142,9 @@ struct PresentationState: Equatable, Sendable {
         case .unsupported:
             return PresentationState(glyph: .unsupported,
                                      accessibilityLabel: "Sessiometer: daemon version unsupported — update required")
+        case .crashLooping:
+            return PresentationState(glyph: .crashLooping,
+                                     accessibilityLabel: "Sessiometer: the daemon is restarting repeatedly — holding status until it stays up")
         }
     }
 }
@@ -259,6 +276,44 @@ struct HonestStateMachine {
     /// non-live, so the shell cancels (not re-arms) its timer when this is `false`.
     var isWatchingForValidFrames: Bool { liveness == .live }
 
+    // MARK: - Crash-loop healthy-flash debounce (#169)
+
+    /// At/above this many consecutive UNSTABLE reconnects (a held snapshot that dropped BEFORE surviving
+    /// the stability window), a held snapshot reads as `.crashLooping` rather than a benign `.connecting`.
+    /// 2 = "dropped-before-stable twice running" — past a single clean restart, which must NOT cry
+    /// crash-loop. The honest floor is "> 1 unstable reconnect"; tunable.
+    static let crashLoopThreshold = 2
+
+    /// Whether the connection has dropped at least once this session. The debounce is ARMED only after
+    /// the first drop: a cold clean first connect promotes to healthy IMMEDIATELY (the happy path — and
+    /// every existing immediate-healthy test — is unchanged), and only a RECONNECT (a "launchd restart"
+    /// in the design's words) must earn healthy by surviving the stability window.
+    private var hasEverDisconnected = false
+
+    /// Whether the CURRENT live connection has survived the stability window since it (re)connected.
+    /// Reset to `false` on every `.connected` (a (re)connect must re-earn stability); set `true` by
+    /// `stabilityElapsed`. Only load-bearing post-reconnect (once `hasEverDisconnected`).
+    private var stabilizedThisConnection = false
+
+    /// Consecutive reconnects whose held healthy snapshot DROPPED before surviving the stability window
+    /// — the clock-free crash-loop signal ("restarted N× … holding until it stays up"). Reset to 0 once
+    /// a connection stabilizes (the daemon stayed up). At/above `crashLoopThreshold` a held snapshot is
+    /// `.crashLooping`; below it, a benign `.connecting`.
+    private(set) var consecutiveUnstableReconnects = 0
+
+    /// The stability-window timer token (#169), mirroring `watchdogGeneration`: bumped whenever the
+    /// stabilizing condition is ENTERED (arm), invalidated by a drop / stale (cancel), or consumed by
+    /// `stabilityElapsed`. A fired `stabilityElapsed` whose `generation` ≠ this is superseded → ignored.
+    /// The shell re-arms its real stability timer whenever this value changes across a mutation.
+    private(set) var stabilityGeneration = 0
+
+    /// Whether a held healthy snapshot is currently awaiting the stability window (the post-reconnect
+    /// debounce is active). The shell runs the real stability `Task.sleep` exactly while this is `true`.
+    /// FALSE on the first connect (`!hasEverDisconnected`) — so the clean-start happy path is immediate.
+    var isStabilizing: Bool {
+        liveness == .live && snapshotClass == .healthy && hasEverDisconnected && !stabilizedThisConnection
+    }
+
     /// The derived view outputs (mirrored into the store's `@Published` surface).
     private(set) var rows: [AccountRow] = []
     private(set) var nextSwap: NextSwap?
@@ -280,7 +335,16 @@ struct HonestStateMachine {
             case .none:        return .connecting     // connected, but no fresh snapshot yet
             case .unsupported: return .unsupported
             case .empty:       return .emptyRoster
-            case .healthy:     return .connected      // ← the sole healthy path
+            case .healthy:
+                // The crash-loop healthy-flash debounce (#169): a post-reconnect snapshot is HELD until
+                // its connection survives the stability window (`isStabilizing`). During the hold it is
+                // NEVER healthy — repeated unstable reconnects read as the `.crashLooping` fault shape,
+                // a first/single restart as a benign `.connecting`. A cold first connect (or a
+                // stabilized reconnect) is not stabilizing → the sole healthy path.
+                guard !isStabilizing else {
+                    return consecutiveUnstableReconnects >= Self.crashLoopThreshold ? .crashLooping : .connecting
+                }
+                return .connected      // ← the sole healthy path
             }
         }
     }
@@ -293,17 +357,27 @@ struct HonestStateMachine {
     /// Fold one transport event into the state. Returns the `LineOutcome` for a `.line` event (so the
     /// shell can log it), `nil` otherwise.
     mutating func apply(_ event: TransportEvent) -> LineOutcome? {
+        // Capture the pre-event stabilizing state so we can (a) count an UNSTABLE reconnect when a held
+        // snapshot drops and (b) arm/invalidate the stability timer on a TRANSITION only — never on a
+        // repeat frame within one hold, which must not reset the window (#169).
+        let wasStabilizing = isStabilizing
+        let outcome: LineOutcome?
         switch event {
         case .connected:
             // Socket up + subscribed, but no FRESH snapshot yet. Reset the snapshot classification so
             // a reconnect re-enters `.connecting` and can never resurrect a healthy glyph from the
             // pre-drop roster — the roster rows are RETAINED (shown dimmed under `.connecting`, not
-            // blanked) until a fresh snapshot confirms them.
+            // blanked) until a fresh snapshot confirms them. A (re)connect must also RE-EARN stability
+            // (#169): clear `stabilizedThisConnection` so a post-drop connection is debounced afresh.
             liveness = .live
             snapshotClass = .none
+            stabilizedThisConnection = false
             watchdogGeneration += 1        // ARM: expect a valid frame within the window (#344)
-            return nil
+            outcome = nil
         case .disconnected(let reason):
+            // A drop while a held snapshot was still stabilizing = an UNSTABLE reconnect: the clock-free
+            // crash-loop signal (#169). Count it BEFORE mutating liveness (which flips `isStabilizing`).
+            if wasStabilizing { consecutiveUnstableReconnects += 1 }
             // Socket dropped: last-good rows/nextSwap/generatedAt are RETAINED but the state is now
             // `.disconnected` (never live). The transport reconnects with backoff on its own. Also
             // reset the snapshot classification: the roster is no longer confirmed, so healthy must be
@@ -312,21 +386,27 @@ struct HonestStateMachine {
             // transport orders `.connected` first, but the invariant must not depend on that).
             liveness = .disconnected(reason: reason)
             snapshotClass = .none
+            hasEverDisconnected = true     // ARM the debounce for every subsequent reconnect (#169)
             watchdogGeneration += 1        // INVALIDATE: already non-live, no watchdog needed (#344)
-            return nil
+            outcome = nil
         case .stale:
             // Connection still open, daemon silent: last-good data retained but MARKED stale.
             liveness = .stale
             watchdogGeneration += 1        // INVALIDATE: transport already declared stale (#344)
-            return nil
+            outcome = nil
         case .line(let line):
-            let outcome = applyLine(line)
+            let lineOutcome = applyLine(line)
             // RE-ARM the watchdog ONLY for a valid decodable frame; an undecodable/unknown line does
             // not advance the token, so the timer armed by the last valid frame keeps counting down —
             // that is how continuous garbage after a healthy snapshot still trips `.stale` (#344).
-            if outcome.resetsValidFrameWatchdog { watchdogGeneration += 1 }
-            return outcome
+            if lineOutcome.resetsValidFrameWatchdog { watchdogGeneration += 1 }
+            outcome = lineOutcome
         }
+        // Arm (false→true) or invalidate (true→false) the stability timer ONLY on a transition of the
+        // stabilizing condition — mirroring the watchdog's generation bump. Staying stabilizing (a
+        // repeat snapshot/heartbeat within one hold) does NOT bump, so the window keeps counting (#169).
+        if isStabilizing != wasStabilizing { stabilityGeneration += 1 }
+        return outcome
     }
 
     /// Fold in an elapsed store-side valid-frame watchdog (#344): "no VALID decodable frame in the
@@ -341,7 +421,26 @@ struct HonestStateMachine {
     mutating func watchdogElapsed(generation: Int) {
         guard generation == watchdogGeneration else { return }  // superseded by a later frame → ignore
         guard liveness == .live else { return }                 // only a live connection can go stale
+        let wasStabilizing = isStabilizing
         liveness = .stale
+        // Going stale ENDS any in-flight stabilization hold — invalidate its timer so the shell cancels
+        // it, mirroring the transitions in `apply` (#169).
+        if isStabilizing != wasStabilizing { stabilityGeneration += 1 }
+    }
+
+    /// Fold in an elapsed stability window (#169): the held snapshot's connection SURVIVED the window,
+    /// so the daemon stayed up — promote it. Mark this connection stabilized (`connectionState` →
+    /// `.connected`) and clear the crash-loop churn. Generation-guarded exactly like `watchdogElapsed`
+    /// (a token superseded by a later drop / re-arm is ignored) and gated on actually stabilizing, so it
+    /// can never manufacture a healthy view from a dropped / stale / already-stabilized state, nor fire
+    /// twice. The clock lives in the `WatchStatusStore` shell, which performs the real `Task.sleep` and
+    /// feeds the elapse back — the pure core stays clock-free (mirroring `watchdogElapsed`).
+    mutating func stabilityElapsed(generation: Int) {
+        guard generation == stabilityGeneration else { return }  // superseded → ignore
+        guard isStabilizing else { return }                      // only a held snapshot can stabilize
+        stabilizedThisConnection = true
+        consecutiveUnstableReconnects = 0
+        stabilityGeneration += 1     // consume: the hold is over (`isStabilizing` is now false)
     }
 
     // MARK: - Line handling (decode-defensive)

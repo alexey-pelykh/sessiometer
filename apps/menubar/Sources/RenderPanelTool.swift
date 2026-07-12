@@ -54,9 +54,11 @@ enum RenderPanelTool {
                        weeklyExhausted: false, isNextSwapTarget: true),
         ]
 
-        // The six D2 states the panel actually renders (the fuller 9-state fidelity is #169). `stale` and
-        // `disconnected` retain the last-good roster (disconnected dims it); the three account-less states
-        // show a banner / onboarding card. Ages chosen so the footer reads live / stale as intended.
+        // The panel-rendered states (the fuller 9-state fidelity's remaining facets are #169 siblings).
+        // `stale` and `disconnected` retain the last-good roster (disconnected dims it); the account-less
+        // states — including `crashLooping` (#169), which refuses the held snapshot's numbers behind an
+        // honest message card — show a banner / onboarding card. Ages chosen so the footer reads live /
+        // stale as intended.
         let fixtures = [
             Fixture(name: "healthy", state: .connected, rows: rows,
                     nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
@@ -67,6 +69,7 @@ enum RenderPanelTool {
             Fixture(name: "disconnected", state: .disconnected(reason: "the daemon is not responding"),
                     rows: rows, nextSwap: nil, generatedAt: now - 240),
             Fixture(name: "connecting", state: .connecting, rows: [], nextSwap: nil, generatedAt: nil),
+            Fixture(name: "crash-looping", state: .crashLooping, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "unsupported", state: .unsupported, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "empty-roster", state: .emptyRoster, rows: [], nextSwap: nil, generatedAt: nil),
         ]

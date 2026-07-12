@@ -176,6 +176,43 @@ final class WatchStatusStoreTests: XCTestCase {
         XCTAssertGreaterThan(window, .seconds(30), "in the same ballpark as the transport's 32 s window")
     }
 
+    // MARK: - AC (#169): the store drives the crash-loop stability debounce end-to-end
+
+    // The store-level proof of the crash-loop debounce: after a RECONNECT (a prior drop armed it), a
+    // fresh snapshot is HELD — the store does NOT flash healthy as it does on the first connect — until
+    // the injected stability window elapses. The window is the "clock" the test advances (real
+    // `Task.sleep`), mirroring the watchdog test; the first connect stays immediate, proving the
+    // debounce is reconnect-scoped. Before it, a crash-looping daemon flickered healthy here.
+    func testReconnectSnapshotIsDebouncedThenGoesHealthy() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(stabilityWindow: .milliseconds(300))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
+        // First connect → healthy immediately (no debounce on a cold start).
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotBasic))
+        try await waitForGlyph(recorder, .healthy)
+
+        // Drop, then reconnect + a fresh snapshot: the debounce holds it (never an immediate flash).
+        continuation.yield(.disconnected(reason: "EOF"))
+        try await waitForGlyph(recorder, .disconnected)
+        let armed = ContinuousClock.now
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotBasic))
+
+        // The held snapshot goes healthy only AFTER the stability window — measurably delayed, never
+        // the immediate flash the first connect showed.
+        try await waitForGlyph(recorder, .healthy)
+        let elapsed = ContinuousClock.now - armed
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(150),
+                                    "the reconnect's healthy was debounced past the window, not flashed")
+        XCTAssertEqual(store.connectionState, .connected)
+
+        continuation.finish()
+    }
+
     // MARK: - Event-stream awaiting helpers (mirror of the transport suite's)
 
     private enum WaitError: Error { case timeout }

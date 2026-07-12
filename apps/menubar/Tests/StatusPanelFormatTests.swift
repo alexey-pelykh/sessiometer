@@ -225,6 +225,12 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2).kind, .error)
         XCTAssertEqual(StatusPanelFormat.banner(for: .unsupported, accountCount: 0).kind, .error)
 
+        // Crash-looping (#169): a fault banner, never healthy; the held snapshot's numbers are refused.
+        let crash = StatusPanelFormat.banner(for: .crashLooping, accountCount: 3)
+        XCTAssertEqual(crash.kind, .error)
+        XCTAssertEqual(crash.title, "Daemon crash-looping")
+        XCTAssertEqual(crash.detail, "Restarting repeatedly; holding status until it stays up.")
+
         // Only `.connected` is ever the healthy kind (the never-healthy-when-dead invariant).
         for state in Self.allNonConnectedStates {
             XCTAssertNotEqual(StatusPanelFormat.banner(for: state, accountCount: 1).kind, .healthy,
@@ -482,6 +488,10 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .unsupported, accountCount: 3,
                                                         activeLabel: "work", ageStale: false),
                        "Version mismatch")
+        // Crash-looping (#169): a fault sub-line, never a false "N accounts · active" roster claim.
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .crashLooping, accountCount: 3,
+                                                        activeLabel: "work", ageStale: false),
+                       "Daemon fault")
     }
 
     // MARK: - Swap callout (issue #355 — design-reference parity)
@@ -536,7 +546,7 @@ final class StatusPanelFormatTests: XCTestCase {
     }
 
     private static let allNonConnectedStates: [ConnectionState] = [
-        .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported,
+        .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported, .crashLooping,
     ]
 
     /// A DEAD account that is mid-recovery (#109) — the current daemon's `snapshotAwaitingDead` golden

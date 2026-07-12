@@ -528,6 +528,14 @@ enum StatusPanelFormat {
             return Banner(title: "Update required",
                           detail: "The daemon speaks a newer version this app can't read.",
                           kind: .error)
+        case .crashLooping:
+            // The crash-loop FAULT banner (#169): a persistent fault shape that never renders healthy —
+            // the held snapshot's numbers are refused until the daemon stays up (the healthy-flash is
+            // debounced). Clock-free copy ("repeatedly", not "5× in the last minute") — the machine
+            // counts consecutive unstable reconnects, not wall-clock restarts.
+            return Banner(title: "Daemon crash-looping",
+                          detail: "Restarting repeatedly; holding status until it stays up.",
+                          kind: .error)
         }
     }
 
@@ -657,6 +665,7 @@ enum StatusPanelFormat {
         case .connecting:   return "Connecting to the daemon…"
         case .emptyRoster:  return "Welcome"
         case .unsupported:  return "Version mismatch"
+        case .crashLooping: return "Daemon fault"
         case .disconnected: return "\(count) · last-known"
         case .connected, .stale:
             let base = activeLabel.map { "\(count) · \($0) active" } ?? count
