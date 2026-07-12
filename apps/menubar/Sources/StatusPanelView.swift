@@ -261,14 +261,17 @@ struct StatusPanelView: View {
             // footer recommendation) are live and dead together (#169). No capture bar — capture moved to
             // the status-item menu / empty-roster onboarding (issue #394).
             Divider().padding(.horizontal, 14)
-            if let scrubBanner = StatusPanelFormat.canonicalScrubBanner(store.canonicalScrub) {
-                // The daemon-level shared-canonical scrub (#469): a fleet-wide `claude`-login lockout NO
-                // per-row `auth` reflects (rows can read healthy while the shared item sits emptied), so it
-                // rides as its own honest banner ABOVE the roster — the connected-but-scrubbed panel reads
-                // visibly DEGRADED (never healthy) while the live roster still renders below. The footer
-                // stays the `next_swap` line (R-2: footer = next_swap; degraded daemon-level signals →
-                // honest banner).
-                BannerView(banner: scrubBanner)
+            if let faultBanner = StatusPanelFormat.daemonFaultBanner(keychainLocked: store.keychainLocked,
+                                                                     scrub: store.canonicalScrub) {
+                // The single daemon-level fault banner (worst-first): a fleet-wide unreadable/scrubbed
+                // shared-login lockout NO per-row `auth` reflects (rows can read healthy while the shared
+                // item sits locked or emptied), so it rides as its own honest banner ABOVE the roster — the
+                // connected-but-degraded panel reads visibly DEGRADED (never healthy) while the live roster
+                // still renders below. The footer stays the `next_swap` line (R-2: footer = next_swap;
+                // degraded daemon-level signals → honest banner). Priority (see `daemonFaultBanner`):
+                // keychain-locked (#498) OUTRANKS canonical-scrub (#469) — the panel shows ONE banner, and
+                // an UNREADABLE keychain (unlock it) wins over a readable-but-scrubbed item (`claude /login`).
+                BannerView(banner: faultBanner)
                     .padding(.horizontal, 14).padding(.vertical, 14)
                 Divider().padding(.horizontal, 14)
             }

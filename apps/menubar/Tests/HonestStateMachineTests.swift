@@ -92,6 +92,31 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertEqual(staleScrub.canonicalScrub, .exhausted, "scrub retained into stale, like the roster")
     }
 
+    // #498 / #521: the daemon-level `keychain_locked` rollup projects from the snapshot exactly as
+    // `canonicalScrub`/`nextSwap` do — a fleet-wide fault that rides ALONGSIDE a healthy roster (each row
+    // reads healthy while the LOCKED login keychain makes the shared `Claude Code-credentials` item
+    // unreadable). The View surfaces it as an honest banner; here we assert the pure core carries the
+    // discriminant so the store can publish it.
+    func testProjectsKeychainLockedAlongsideAHealthyRoster() throws {
+        let locked = machine([.connected, .line(Fixtures.snapshotKeychainLocked)])
+        XCTAssertTrue(locked.keychainLocked)
+        // The lock is a SEPARATE daemon-level signal, not a connection degradation: the roster still reads
+        // healthy/connected (the crown-jewel case the banner exists to surface honestly).
+        XCTAssertEqual(locked.connectionState, .connected)
+        XCTAssertEqual(locked.rows.count, 1)
+        XCTAssertEqual(try XCTUnwrap(locked.rows.first).auth, .healthy)
+
+        // A healthy daemon (the wire key omitted → false) carries no lock → no banner ever renders.
+        let healthy = machine([.connected, .line(Fixtures.snapshotBasic)])
+        XCTAssertFalse(healthy.keychainLocked)
+
+        // Retained across a transition to `.stale` (like `rows`/`canonicalScrub`) — the View renders the
+        // lock banner in `.stale` too, off the last-known value, so a quiet-then-locked daemon still warns.
+        let staleLocked = machine([.connected, .line(Fixtures.snapshotKeychainLocked), .stale])
+        XCTAssertEqual(staleLocked.connectionState, .stale)
+        XCTAssertTrue(staleLocked.keychainLocked, "lock retained into stale, like the roster")
+    }
+
     // MARK: - AC: empty accounts → empty-roster (DISTINCT from daemon-down)
 
     func testEmptyAccountsGoesEmptyRosterNotDisconnectedNotHealthy() {

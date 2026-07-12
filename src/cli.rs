@@ -2207,6 +2207,27 @@ pub(crate) fn render_status(
         }
     }
 
+    // The daemon-level KEYCHAIN-LOCKED rollup (issue #498): the macOS login keychain is LOCKED, so the
+    // daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied). The
+    // daemon-LEVEL sibling of the `canonical_scrub` line below, but for an UNREADABLE item rather than a
+    // readable-but-emptied one — so the remedy DIFFERS: UNLOCK THE KEYCHAIN, never `claude /login` (a
+    // re-login cannot help while the keychain that stores the credential is locked). Surfaced as DATA
+    // (unconditional, like the scrub + systemic lines — so it survives a pipe / redirect / `status |
+    // grep`, an operator's health check must see it), naming the state AND the unlock remedy.
+    // Content-parity with the menubar (`StatusPanelFormat.keychainLockedBanner`): same state + same
+    // unlock remedy, each medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for
+    // `ActiveDeadNoTarget`). Printed PLAIN — the action-first footer register of the `shared login:
+    // scrubbed …` sibling (ADR-0016), NOT the systemic line's red SGR. Rendered ABOVE `canonical_scrub`
+    // (worst-first: an unreadable item is at least as severe as a readable-but-scrubbed one), though the
+    // two are daemon-mutually-exclusive in practice (a locked keychain can't be read to know
+    // scrubbed-ness). A bare BINARY state discriminant — never a token or email (#15). `false` (a
+    // healthy / pre-#498 daemon that omits the field) prints nothing.
+    if response.keychain_locked {
+        out.push_str(
+            "shared login: unreadable — the login keychain is locked; unlock it to restore access\n",
+        );
+    }
+
     // The daemon-level CANONICAL-SCRUB rollup (issue #469, umbrella #463): the shared
     // `Claude Code-credentials` canonical item has been SCRUBBED (its token cleared), so every
     // `claude` session is logged out — the fleet-wide lockout NO per-account `AUTH` column reflects
@@ -4310,6 +4331,62 @@ spare  22222222-2222\n\
                 "no secret reaches the canonical-scrub surface (#15/#444): {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn render_status_surfaces_the_keychain_locked_rollup_with_the_unlock_remedy() {
+        // Issue #498: when the daemon reports the login keychain is LOCKED (so the shared canonical is
+        // UNREADABLE — access denied, distinct from #469's readable-but-scrubbed item), `status` shows a
+        // dedicated footer line naming the state AND the UNLOCK remedy (NOT `claude /login` — a re-login
+        // cannot help while the keychain is locked). The account rows can read perfectly healthy (60/25)
+        // while the shared item sits unreadable. #15-clean: a bare state discriminant, never a token or
+        // email.
+        let response = |locked| StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: locked,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+
+        // Locked → names the state (keychain locked) AND the unlock remedy — content-parity with the
+        // menubar's `keychainLockedBanner` (same state + same UNLOCK remedy, R-2 state-parity).
+        let locked = render_status(&response(true), NOW, None, false);
+        let line = locked
+            .lines()
+            .find(|l| l.contains("shared login: unreadable"))
+            .expect("the keychain-locked line is present");
+        assert!(
+            line.contains("keychain is locked") && line.contains("unlock"),
+            "locked names the state + the unlock remedy: {line}"
+        );
+        // NEVER the `claude /login` remedy — that is #469's (a readable-but-scrubbed item); a re-login
+        // cannot help while the keychain that STORES the credential is locked (the #498-vs-#469 point).
+        assert!(
+            !locked.contains("claude /login"),
+            "keychain-locked carries the UNLOCK remedy, never the re-login one: {locked:?}"
+        );
+
+        // Unlocked (false) prints no keychain line at all.
+        assert!(
+            !render_status(&response(false), NOW, None, false).contains("shared login: unreadable"),
+            "no keychain-locked line when the keychain is unlocked"
+        );
+
+        // The keychain-locked line is DATA — it survives with the color gate CLOSED (--no-color) exactly
+        // as it does open, so a piped `status | grep` health check sees it (like the scrub line).
+        assert!(
+            render_status(&response(true), NOW, None, true).contains("shared login: unreadable"),
+            "the keychain-locked line is unconditional data, present under --color too"
+        );
+
+        // #15/#444: no secret reaches the rendered state (a bare state discriminant only).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&locked, &[]).is_empty()
+                && !locked.to_lowercase().contains("token"),
+            "no secret reaches the keychain-locked surface (#15/#444): {locked:?}"
+        );
     }
 
     #[test]

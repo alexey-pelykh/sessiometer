@@ -536,6 +536,76 @@ final class StatusPanelFormatTests: XCTestCase {
         }
     }
 
+    // MARK: - keychainLockedBanner (issue #498 — the fleet-wide unreadable-credential signal)
+
+    // #498: the daemon's `keychain_locked` rollup renders a distinct HONEST BANNER (title + detail + kind)
+    // naming the state and the UNLOCK-THE-KEYCHAIN remedy. The View renders it ABOVE the roster in
+    // `.connected` / `.stale`, so a connected-but-locked panel reads visibly degraded (never healthy).
+    // Absent (nil) when the login keychain is unlocked.
+    func testKeychainLockedBannerNamesTheStateAndRemedy() throws {
+        // Locked → an `.error` banner: the state (title) + the actionable unlock remedy (detail).
+        let locked = try XCTUnwrap(StatusPanelFormat.keychainLockedBanner(true))
+        XCTAssertEqual(locked.title, "Keychain locked")
+        XCTAssertEqual(locked.kind, .error, "a locked keychain is an unresolved error until the operator unlocks")
+        XCTAssertTrue(locked.detail.lowercased().contains("unlock"), "detail names the remedy: \(locked.detail)")
+
+        // The unlock remedy is DISTINCT from the scrub's `claude /login` (#498-vs-#469): a re-login cannot
+        // help while the keychain that STORES the credential is locked.
+        XCTAssertFalse(locked.detail.contains("claude /login"),
+                       "keychain-locked never prompts re-login — unlock the keychain: \(locked.detail)")
+
+        // Unlocked (false) → no banner (same single-cardinality as `canonicalScrubBanner(nil)`).
+        XCTAssertNil(StatusPanelFormat.keychainLockedBanner(false))
+    }
+
+    // #498 content-parity with the CLI (`src/cli.rs` `render_status` — the `shared login: unreadable …`
+    // line): both surfaces name the SAME state (keychain "locked") and the SAME "unlock" remedy, and
+    // NEITHER names `claude /login` (R-2 STATE-parity — the same facts, each medium phrasing its own way,
+    // so the panel checks its own rendered title + detail).
+    func testKeychainLockedBannerIsContentParityWithTheCLI() throws {
+        let locked = try XCTUnwrap(StatusPanelFormat.keychainLockedBanner(true))
+        let text = "\(locked.title) \(locked.detail)".lowercased()
+        XCTAssertTrue(text.contains("keychain"), "names the subject: \(text)")
+        XCTAssertTrue(text.contains("locked"), "names the state: \(text)")
+        XCTAssertTrue(text.contains("unlock"), "names the shared remedy: \(text)")
+        XCTAssertFalse(text.contains("claude /login"),
+                       "keychain-locked carries no re-login remedy — parity with the CLI: \(text)")
+    }
+
+    // #498 / #15: no secret in the keychain-locked banner — a bare fleet-wide state discriminant, never a
+    // token or email. The wire flag is a bare `Bool` carrying no handle at all, so the banner is trivially
+    // redaction-clean.
+    func testKeychainLockedBannerCarriesNoSecret() throws {
+        let banner = try XCTUnwrap(StatusPanelFormat.keychainLockedBanner(true))
+        let text = "\(banner.title) \(banner.detail)"
+        XCTAssertFalse(text.lowercased().contains("token"), "no token in the keychain-locked banner: \(text)")
+        XCTAssertFalse(text.contains("@"), "no email in the keychain-locked banner: \(text)")
+    }
+
+    // MARK: - daemonFaultBanner (issue #498 — worst-first single daemon-level fault banner)
+
+    // The panel shows ONE daemon-level fault banner even when multiple faults are set. Worst-first:
+    // keychain-locked (#498) OUTRANKS canonical-scrub (#469) — an UNREADABLE shared item is at least as
+    // severe as a readable-but-scrubbed one, and its unlock remedy must reach the operator before the
+    // scrub's `claude /login` (which cannot help while the keychain is locked). In practice the two are
+    // daemon-mutually-exclusive; this pins the deterministic tiebreak as a tested invariant.
+    func testDaemonFaultBannerIsWorstFirstKeychainOverScrub() throws {
+        // BOTH present → keychain-locked wins (the sole banner names the keychain state, not the scrub).
+        let both = try XCTUnwrap(StatusPanelFormat.daemonFaultBanner(keychainLocked: true, scrub: .exhausted))
+        XCTAssertEqual(both.title, "Keychain locked", "keychain-locked outranks canonical-scrub: \(both.title)")
+
+        // Keychain-only → the keychain banner.
+        let keychainOnly = try XCTUnwrap(StatusPanelFormat.daemonFaultBanner(keychainLocked: true, scrub: nil))
+        XCTAssertEqual(keychainOnly.title, "Keychain locked")
+
+        // Scrub-only → the scrub banner (keychain healthy, so it falls through to the scrub).
+        let scrubOnly = try XCTUnwrap(StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .exhausted))
+        XCTAssertEqual(scrubOnly.title, "Shared login scrubbed")
+
+        // Neither → no banner.
+        XCTAssertNil(StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil))
+    }
+
     // MARK: - captureCommand (the CLI-equivalent subcommand; in-app capture affordance is #360)
 
     func testCaptureCommandIsTheExactSubcommand() {
