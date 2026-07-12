@@ -481,6 +481,51 @@ final class StatusPanelFormatTests: XCTestCase {
             "Every account over its session limit")
     }
 
+    // MARK: - canonicalScrubFooter (issue #469 — the fleet-wide scrubbed-canonical signal)
+
+    // #469: the daemon's `canonical_scrub` rollup renders a distinct footer naming the state and, for
+    // the un-recoverable residual, the `claude /login` remedy — content-parity with the CLI's
+    // `shared login: scrubbed …` footer (same state + same byte-shared remedy, R-2 state-parity per
+    // medium). Absent (nil) when the shared canonical is healthy.
+    func testCanonicalScrubFooterNamesTheStateAndRemedy() {
+        // Exhausted → the state + the actionable re-login remedy.
+        XCTAssertEqual(
+            StatusPanelFormat.canonicalScrubFooter(.exhausted),
+            "Shared login scrubbed · run claude /login")
+        // Recovering → the calm, no-action cue; the fleet may self-heal, so NO re-login prompt.
+        XCTAssertEqual(
+            StatusPanelFormat.canonicalScrubFooter(.recovering),
+            "Shared login scrubbed · recovering automatically")
+        // Healthy (nil) → no footer (same single-cardinality as `nextSwapFooter(nil)`).
+        XCTAssertNil(StatusPanelFormat.canonicalScrubFooter(nil))
+    }
+
+    // #469 content-parity with the CLI (`src/cli.rs` `render_status`): both surfaces name the SAME
+    // state ("scrubbed") and, on the exhausted case, the SAME byte-shared `claude /login` remedy; the
+    // recovering case names "recovering automatically" and carries NO re-login remedy on BOTH surfaces.
+    func testCanonicalScrubFooterIsContentParityWithTheCLI() {
+        let exhausted = try! XCTUnwrap(StatusPanelFormat.canonicalScrubFooter(.exhausted))
+        XCTAssertTrue(exhausted.contains("scrubbed"), "names the state: \(exhausted)")
+        XCTAssertTrue(exhausted.contains("claude /login"), "names the byte-shared remedy: \(exhausted)")
+
+        let recovering = try! XCTUnwrap(StatusPanelFormat.canonicalScrubFooter(.recovering))
+        XCTAssertTrue(recovering.contains("scrubbed"), "names the state: \(recovering)")
+        XCTAssertTrue(recovering.contains("recovering automatically"), "names the calm cue: \(recovering)")
+        XCTAssertFalse(recovering.contains("claude /login"),
+                       "recovering carries no re-login remedy — parity with the CLI")
+    }
+
+    // #469 / #15: no secret in EITHER surface's canonical-scrub output — a bare state discriminant,
+    // never a token or email. The wire rollup carries no handle at all today (even a future additive
+    // handle would be a non-secret roster label, #516), so the footer is trivially redaction-clean.
+    func testCanonicalScrubFooterCarriesNoSecret() {
+        for scrub in [CanonicalScrub.exhausted, .recovering] {
+            let footer = try! XCTUnwrap(StatusPanelFormat.canonicalScrubFooter(scrub))
+            XCTAssertFalse(footer.lowercased().contains("token"), "no token in the scrub footer: \(footer)")
+            XCTAssertFalse(footer.contains("@"), "no email in the scrub footer: \(footer)")
+        }
+    }
+
     // MARK: - captureCommand (the CLI-equivalent subcommand; in-app capture affordance is #360)
 
     func testCaptureCommandIsTheExactSubcommand() {
