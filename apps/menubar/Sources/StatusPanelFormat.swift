@@ -807,6 +807,31 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - `canonical_scrub` footer (issue #469 — the fleet-wide scrubbed-canonical signal)
+
+    /// The footer line for the daemon's `canonical_scrub` rollup (`WireModel.swift` `CanonicalScrub`,
+    /// issue #516), or `nil` when the shared canonical is healthy (the wire key is absent → the footer
+    /// is then absent, same single-cardinality as `nextSwapFooter`). The shared `Claude Code-credentials`
+    /// canonical item has been SCRUBBED — every `claude` session is logged out — the fleet-wide lockout
+    /// NO per-account `auth` cell reflects (each row can read perfectly healthy while the shared item
+    /// sits emptied), so no roster glyph carries it; only this daemon-level footer does.
+    ///
+    /// Content-parity with the CLI's `shared login: scrubbed …` footer (`src/cli.rs`): the SAME state
+    /// and the SAME byte-shared `claude /login` remedy, each medium phrasing it its own way (R-2
+    /// STATE-parity, as ADR-0016 did for `ActiveDeadNoTarget` / `nextSwapFooter`). `.exhausted` names
+    /// the state AND the actionable remedy — the un-recoverable residual that needs a re-login;
+    /// `.recovering` is the calm, no-action cue (the daemon may self-heal by adopting a live account,
+    /// so a re-login prompt would cry wolf). A fleet-wide STATE discriminant only — never per-account,
+    /// never a token or email (issue #15). The remedy string is the established `claude /login` cue the
+    /// dead-credential `authCell` already uses — deliberately, so the operator meets ONE re-login verb.
+    static func canonicalScrubFooter(_ scrub: CanonicalScrub?) -> String? {
+        switch scrub {
+        case .exhausted:  return "Shared login scrubbed · run claude /login"
+        case .recovering: return "Shared login scrubbed · recovering automatically"
+        case nil:         return nil
+        }
+    }
+
     // MARK: - Header identity + swap callout (issue #355 — design-reference parity)
 
     /// The header's identity sub-line — the design reference's `app-sub` ("N accounts · {active}

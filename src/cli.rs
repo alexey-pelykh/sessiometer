@@ -22,9 +22,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
-    run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap,
-    NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown,
-    SchemaVersion, StatusResponse, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
+    run_loop, AccountStatusLine, CanonicalScrub, Daemon, ExternalLoginWatcher, InstanceLock,
+    NextSwap, NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller,
+    RealShutdown, SchemaVersion, StatusResponse, UnixControl, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -2206,6 +2207,36 @@ pub(crate) fn render_status(
         }
     }
 
+    // The daemon-level CANONICAL-SCRUB rollup (issue #469, umbrella #463): the shared
+    // `Claude Code-credentials` canonical item has been SCRUBBED (its token cleared), so every
+    // `claude` session is logged out — the fleet-wide lockout NO per-account `AUTH` column reflects
+    // (each account row can read perfectly healthy while the shared item sits emptied). Surfaced as
+    // DATA (unconditional, like the systemic line above — so it survives a pipe / redirect /
+    // `status | grep`, an operator's health check must be able to see it), naming the state and, for
+    // the un-recoverable residual, the `claude /login` remedy. Content-parity with the menubar
+    // (`StatusPanelFormat.canonicalScrubFooter`): same state + same `claude /login` remedy, each
+    // medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for `ActiveDeadNoTarget`).
+    // Printed PLAIN — no color overlay, in the action-first footer register of the `next swap: none
+    // — …` footer above (ADR-0016), NOT the systemic line's red SGR. A fleet-wide STATE discriminant
+    // only — never per-account, never a token or email (#15). `None` (a healthy / pre-#516 daemon
+    // that omits the field) prints nothing.
+    match response.canonical_scrub {
+        // Exhausted — recovery backed off (the bounded adopt churn hit its cap, or no viable adopt
+        // target exists), so the canonical stays empty until a re-login. Name the state AND the
+        // actionable remedy; `claude /login` is the byte-shared remedy the menubar names too.
+        Some(CanonicalScrub::Exhausted) => out.push_str(
+            "shared login: scrubbed — every session is logged out and auto-recovery is exhausted; \
+             run claude /login to restore it\n",
+        ),
+        // Recovering — the daemon is autonomously adopting a live account back into the canonical, so
+        // the fleet may self-heal with NO operator action. The calm, no-remedy cue (lower severity).
+        Some(CanonicalScrub::Recovering) => out.push_str(
+            "shared login: scrubbed — recovering automatically (adopting a live account); \
+             no action needed\n",
+        ),
+        None => {}
+    }
+
     // The isolated-refresh discoverability advisory (issue #138): when the periodic refresh
     // tick is OFF (`[refresh].enabled = false`) AND ≥1 NON-ACTIVE account is unverified / stale
     // / at-risk / dead, that account's stored credential is going unmaintained — the operator
@@ -4204,6 +4235,78 @@ spare  22222222-2222\n\
             !render_status(&response(None), NOW, None, false).contains("refresh mechanism"),
             "no DOWN line when the mechanism is healthy"
         );
+    }
+
+    #[test]
+    fn render_status_surfaces_the_canonical_scrub_rollup_with_the_relogin_remedy() {
+        // Issue #469: when the daemon reports the shared canonical is SCRUBBED, `status` shows a
+        // dedicated footer line — the fleet-wide lockout no per-account `AUTH` column reflects —
+        // naming the state and, for the un-recoverable residual, the `claude /login` remedy. The
+        // account rows can read perfectly healthy (60/25) while the shared item sits emptied.
+        // #15-clean: a bare state discriminant, never a token or email.
+        let response = |scrub| StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: scrub,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+
+        // Exhausted → names the state AND the actionable `claude /login` remedy (byte-shared with
+        // the menubar's `canonicalScrubFooter` — content-parity, R-2 state-parity).
+        let exhausted = render_status(&response(Some(CanonicalScrub::Exhausted)), NOW, None, false);
+        let line = exhausted
+            .lines()
+            .find(|l| l.contains("shared login: scrubbed"))
+            .expect("the scrubbed line is present");
+        assert!(
+            line.contains("auto-recovery is exhausted") && line.contains("claude /login"),
+            "exhausted names the state + the re-login remedy: {line}"
+        );
+
+        // Recovering → the calm, no-action cue; NEVER the `claude /login` remedy (the daemon may
+        // self-heal by adopting a live account — surfacing a re-login would cry wolf).
+        let recovering = render_status(
+            &response(Some(CanonicalScrub::Recovering)),
+            NOW,
+            None,
+            false,
+        );
+        let line = recovering
+            .lines()
+            .find(|l| l.contains("shared login: scrubbed"))
+            .expect("the scrubbed line is present");
+        assert!(
+            line.contains("recovering automatically") && line.contains("no action needed"),
+            "recovering is a calm no-action cue: {line}"
+        );
+        assert!(
+            !recovering.contains("claude /login"),
+            "recovering carries no re-login remedy: {recovering:?}"
+        );
+
+        // Healthy (None) prints no scrubbed line at all.
+        assert!(
+            !render_status(&response(None), NOW, None, false).contains("shared login"),
+            "no scrubbed line when the canonical is healthy"
+        );
+
+        // The scrubbed line is DATA — it survives with the color gate CLOSED (--no-color) exactly as
+        // it does open, so a piped `status | grep` health check sees it (like the systemic line).
+        assert!(
+            render_status(&response(Some(CanonicalScrub::Exhausted)), NOW, None, true)
+                .contains("shared login: scrubbed"),
+            "the scrubbed line is unconditional data, present under --color too"
+        );
+
+        // #15/#444: no secret reaches EITHER rendered state (a state discriminant only).
+        for out in [&exhausted, &recovering] {
+            assert!(
+                crate::redaction::meter::unauthored_emails(out, &[]).is_empty()
+                    && !out.to_lowercase().contains("token"),
+                "no secret reaches the canonical-scrub surface (#15/#444): {out:?}"
+            );
+        }
     }
 
     #[test]
