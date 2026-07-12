@@ -61,7 +61,6 @@ which is the mock). Light shown here:
   hover/focus), which the mock now specs (the resting chip on every switchable row); at rest the row
   keeps a trailing action slot for it, which is why the auth glyph sits ~37 pt further left than in the
   mock (the #448-widened 28 pt slot + its 9 pt spacing)
-- no Status/Stats segmented control — Stats has no socket data path (spike #356)
 
 (Capture placement is now reconciled with the mock, not a difference: the **populated** panel carries
 no capture bar — capture is **empty-roster / first-run only**, and Add account lives off-panel in the
