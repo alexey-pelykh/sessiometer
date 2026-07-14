@@ -142,13 +142,16 @@ SVG
 #     (the lock's one geometry tweak: r1.35→1.5, "→ 4 px @2x"); their 16 px survival is the
 #     convergent falsifier all three council lenses named.
 #   .attention "!": bar (12,7.8)→(12,13.0) w=2.4, + dot r=1.4 at (12,16.1).
-#   .noRunway slash "⊘": (8.6,8.6)→(15.4,15.4) w=2.6.
+#   .noRunway slash "⊘": (8.6,15.4)→(15.4,8.6) w=2.6 — a FORWARD slash. The lock names the mark
+#     "⊘" (U+2298 CIRCLED DIVISION SLASH), which is a forward slash; the first cut drew the
+#     centreline (8.6,8.6)→(15.4,15.4), i.e. a BACKslash, so this is a fidelity fix to the locked
+#     glyph, not a divergence from it. (Operator-confirmed on-device 2026-07-14.)
 emit_status_symbolset() {
   echo "==> status-item bar glyphs (bespoke Cycle-Gauge .symbolset — #437)"
   emit_gauge_symbol GaugeHealthy    gauge-healthy.svg    '<path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/>'
   emit_gauge_symbol GaugeConnecting gauge-connecting.svg '<path d="M 6 12 A 1.5 1.5 0 1 0 9 12 A 1.5 1.5 0 1 0 6 12 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/><path d="M 15 12 A 1.5 1.5 0 1 0 18 12 A 1.5 1.5 0 1 0 15 12 Z"/>'
   emit_gauge_symbol GaugeAttention  gauge-attention.svg  '<path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/>'
-  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 7.68 9.52 L 14.48 16.32 A 1.3 1.3 0 0 0 16.32 14.48 L 9.52 7.68 A 1.3 1.3 0 0 0 7.68 9.52 Z"/>'
+  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/>'
 }
 
 # `generate.sh symbolset` emits ONLY the bar-glyph set and exits — the one path that needs NO
