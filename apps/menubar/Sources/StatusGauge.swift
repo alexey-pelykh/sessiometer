@@ -13,11 +13,22 @@
 // image — shape, not color"). Because the images are `isTemplate = true`, they tint correctly in
 // light AND dark menu bars for free.
 //
-// D4 (functional placeholder): the shapes are generic SF Symbols — a coherent circle-gauge family, one
-// per attention state — NOT any provider's mark (AC: "a generic gauge, not any provider's mark"). Each
-// placeholder is chosen to ECHO its ratified interior mark (✓ / … / ! / ⊘) so it telegraphs the eventual
-// bespoke design; the bespoke arc+arrowhead `.symbolset` is issue #437, which replaces these — this item
-// (#524) owns only WHICH states exist, not the artwork.
+// BESPOKE artwork (issue #437): the four shapes are now the Sessiometer "Cycle Gauge" mark redrawn at
+// bar size — a custom SF Symbol `.symbolset` per state, NOT a generic system symbol (and NOT any
+// provider's mark: our own gauge, satisfying #173). Each glyph is a SHARED CHASSIS (the open gauge arc +
+// rotation arrowhead from `brand/src/icon.svg`, untransformed; the thin needle + pivot dot are DROPPED —
+// they vanish at 16 pt) plus ONE bold interior mark that carries the state: a low check `✓` (healthy), a
+// three-dot ellipsis `…` (connecting), an exclamation `!` (attention), a slash `⊘` (no-runway). The
+// symbolsets are authored + emitted by `brand/generate.sh` (the asset SSOT — never hand-edit the
+// generated files) into `Assets.xcassets`, and loaded here by name via `NSImage(named:)`.
+//
+// KNOWN + ACCEPTED (issue #437): because the chassis is shared, the four glyphs differ only in the small
+// interior mark, so they are close in silhouette at bar size — the shared chassis owns most of the ink.
+// Whether that is legible enough is an ON-DEVICE, real-`NSStatusItem` question (light + dark, Increase
+// Contrast, over a bright wallpaper, beside system icons) that a raster proxy cannot settle; #437's
+// PRIORITY-1 falsifier is exactly that on-device shape-distinctness check. This file ships the faithful
+// locked artwork; the definitive distinctness verdict is captured separately (see the debug glyph gallery
+// in `main.swift`, `SESSIOMETER_GLYPH_GALLERY`).
 
 import AppKit
 
@@ -25,42 +36,43 @@ import AppKit
 /// namespace of pure functions, like `SocketPathResolver`), so there is nothing to instantiate.
 enum StatusGauge {
 
-    /// The SF Symbol whose SHAPE encodes each attention state (issue #524) — one DISTINCT silhouette per
-    /// glyph so the state is legible from shape alone under monochrome template tinting. Each placeholder
-    /// echoes the ratified interior mark it stands in for:
+    /// The bespoke custom-symbol ASSET NAME whose SHAPE encodes each attention state (issue #437/#524) — one
+    /// DISTINCT silhouette per glyph so the state is legible from shape alone under monochrome template
+    /// tinting. Each is the shared Cycle-Gauge chassis plus one bold interior mark:
     ///
-    ///   * `.healthy`    → `checkmark.circle`      — a low check `✓` in a ring: alive ∧ fresh, ignore me
-    ///   * `.connecting` → `ellipsis.circle`       — an ellipsis `…` in a ring: can't vouch yet, self-resolving
-    ///   * `.attention`  → `exclamationmark.circle` — an exclamation `!` in a ring: act at your next break
-    ///   * `.noRunway`   → `nosign`                 — a slash `⊘`: the tool can't keep you working, act now
+    ///   * `.healthy`    → `GaugeHealthy`    — chassis + a low check `✓`: alive ∧ fresh, ignore me
+    ///   * `.connecting` → `GaugeConnecting` — chassis + a three-dot ellipsis `…`: can't vouch yet, self-resolving
+    ///   * `.attention`  → `GaugeAttention`  — chassis + an exclamation `!`: act at your next break
+    ///   * `.noRunway`   → `GaugeNoRunway`   — chassis + a slash `⊘`: the tool can't keep you working, act now
     ///
-    /// All are generic geometric system symbols (provider-neutral) shipped since macOS 11, so they resolve
-    /// on the app's macOS 13 floor. Pure and total — every `StatusGlyph` maps (checked exhaustively in
-    /// tests). `.noRunway`'s complete slashed ring (`nosign`) is the boldest, most unambiguous "blocked"
-    /// silhouette and the one least confusable with the `.healthy` check at ~16 pt (the ✓/⊘ diagonal-stroke
-    /// collision the design record flags for the bespoke chassis — a #437 on-device falsifier).
-    static func symbolName(for glyph: StatusGlyph) -> String {
+    /// These name custom `.symbolset`s in `Assets.xcassets`, emitted by `brand/generate.sh` from the 24-grid
+    /// master (never hand-edited). The app's macOS 13 floor clears custom-symbol availability (needs 11+), so
+    /// no PNG/PDF fallback ships — an unresolved name is the broken-environment `fallbackRing` path below.
+    /// Pure and total — every `StatusGlyph` maps (checked exhaustively in tests).
+    static func assetName(for glyph: StatusGlyph) -> String {
         switch glyph {
-        case .healthy:    return "checkmark.circle"
-        case .connecting: return "ellipsis.circle"
-        case .attention:  return "exclamationmark.circle"
-        case .noRunway:   return "nosign"
+        case .healthy:    return "GaugeHealthy"
+        case .connecting: return "GaugeConnecting"
+        case .attention:  return "GaugeAttention"
+        case .noRunway:   return "GaugeNoRunway"
         }
     }
 
-    /// The template gauge image for a glance state: a system-tinted (`isTemplate`) SF Symbol, so it
-    /// reads correctly in light AND dark menu bars. Carries an `accessibilityDescription` for the icon
-    /// layer; the full spoken status sentence is set separately on the status-item button
-    /// (`PresentationState.accessibilityLabel`), updated on every state change.
+    /// The template gauge image for a glance state: the bespoke custom symbol, forced to a template
+    /// (`isTemplate = true`) so macOS re-tints it correctly in light AND dark menu bars — a NAMED image is
+    /// NOT template-tinted by default, so we set it explicitly (issue #437). Carries an
+    /// `accessibilityDescription` for the icon layer; the full spoken status sentence is set separately on
+    /// the status-item button (`PresentationState.accessibilityLabel`), updated on every state change.
     ///
-    /// Defensive fallback: if a symbol somehow does not resolve (it will, on macOS 13+ — pinned by a
-    /// unit test), draw a generic ring rather than hand the status bar a `nil` image (a blank menu-bar
-    /// item is a worse failure than a plain shape). The primary path is always the SF Symbol.
+    /// Defensive fallback: if the custom symbol somehow does not resolve — it will, the `.symbolset`s ship
+    /// in the app's `Assets.xcassets` (name↔asset match pinned by a unit test) — draw a generic ring rather
+    /// than hand the status bar a `nil` image (a blank menu-bar item is a worse failure than a plain shape).
+    /// The primary path is always the bespoke symbol.
     static func image(for glyph: StatusGlyph) -> NSImage {
         let description = accessibilityDescription(for: glyph)
-        if let symbol = NSImage(systemSymbolName: symbolName(for: glyph),
-                                accessibilityDescription: description) {
+        if let symbol = NSImage(named: assetName(for: glyph)) {
             symbol.isTemplate = true
+            symbol.accessibilityDescription = description
             return symbol
         }
         return fallbackRing(accessibilityDescription: description)

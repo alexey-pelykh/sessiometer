@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sessiometer — bespoke status-item glyphs (#437)</title>
+<!--
+  Sessiometer — the four BESPOKE menu-bar status-item glyphs (issue #437), redrawn at bar size from the
+  "Cycle Gauge" mark (brand/src/icon.svg). A SHARED CHASSIS (open gauge arc + rotation arrowhead; the thin
+  needle + pivot dot are DROPPED — they vanish at ~16 px) carries identity; ONE bold interior mark carries
+  the #524 attention state: a low check (healthy) · a three-dot ellipsis (connecting) · an exclamation
+  (attention) · a slash (no-runway).
+
+  These SVGs are the SAME 24-grid artwork the `.symbolset`s ship (emitted by brand/generate.sh into
+  apps/menubar/Sources/Assets.xcassets, loaded by StatusGauge.swift via NSImage(named:) as monochrome
+  TEMPLATE images). `currentColor` here simulates the menu bar's template tint — near-black on a light bar,
+  near-white on a dark bar.
+
+  ⚠ ARTWORK REFERENCE, NOT THE DISTINCTNESS GATE. This is a browser raster. #437's PRIORITY-1 acceptance
+  test is shape-distinctness on an ACTUAL menu bar (real NSStatusItem, light + dark, Increase Contrast,
+  over a bright wallpaper, beside system icons) — which a raster proxy cannot settle. Capture that from the
+  app's DEBUG gallery: `SESSIOMETER_GLYPH_GALLERY=1 open Sessiometer.app` installs the four real glyphs
+  side by side to screenshot. A known concern (measured): the shared chassis owns most of the ink, so the
+  four are close in silhouette at bar size — that is the operator's on-device call to make, by design.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; font: 13px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; background: #8a8f98; color: #1d1d1f; }
+  header { padding: 20px 26px 8px; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  header p { margin: 4px 0; max-width: 60em; font-size: 12px; }
+  .caveat { color: #8a3b00; font-weight: 600; }
+  .panes { display: flex; flex-wrap: wrap; gap: 0; }
+  .pane { flex: 1 1 480px; padding: 18px 26px 26px; }
+  .light { background: #e7e7e9; color: #1d1d1f; }
+  .dark  { background: #29292b; color: #e9e9ec; }
+  h2 { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .55; margin: 0 0 14px; }
+  table { border-collapse: collapse; }
+  th { font-size: 10px; font-weight: 600; opacity: .5; text-transform: uppercase; letter-spacing: .05em; padding: 0 10px 10px; text-align: center; }
+  th.state { text-align: left; }
+  td { padding: 9px 10px; text-align: center; vertical-align: middle; }
+  td.state { text-align: left; font-size: 12px; opacity: .8; white-space: nowrap; }
+  td.state small { display: block; opacity: .6; font-size: 10px; }
+  svg { display: block; margin: 0 auto; }
+  .barsim { margin-top: 10px; display: inline-flex; align-items: center; gap: 2px; padding: 2px 6px; border-radius: 5px; }
+  .barsim.light { background: #f3f3f4; }
+  .barsim.dark  { background: #1c1c1e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sessiometer — bespoke status-item glyphs <span style="opacity:.5">· issue #437</span></h1>
+  <p>The four #524 attention states, each the shared <strong>Cycle-Gauge chassis</strong> (open arc + rotation
+     arrowhead) plus one bold interior mark. Shipped as custom SF Symbol <code>.symbolset</code>s
+     (monochrome templates); <code>currentColor</code> below simulates the menu bar's template tint.</p>
+  <p class="caveat">⚠ Artwork reference, not the distinctness gate. The PRIORITY-1 test is an on-device 16&nbsp;px
+     <code>NSStatusItem</code> capture (see <code>SESSIOMETER_GLYPH_GALLERY</code> in main.swift) — a raster proxy
+     can't settle it. The shared chassis owns most of the ink by design; on-device legibility is the operator's call.</p>
+</header>
+<div class="panes">
+  <div class="pane light" id="pane-light"></div>
+  <div class="pane dark" id="pane-dark"></div>
+</div>
+<script>
+const CHASSIS = `
+  <path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/>
+  <path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor" stroke-width="0.6"/>`;
+const GLYPHS = [
+  { name: "GaugeHealthy",    state: "Healthy",    mark: "low check ✓",   art: `<path d="M 8.8 12.2 L 10.8 14.4 L 15.2 9.4" stroke-width="2.4"/>` },
+  { name: "GaugeConnecting", state: "Connecting", mark: "ellipsis …",    art: `<circle cx="7.5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="16.5" cy="12" r="1.5" fill="currentColor" stroke="none"/>` },
+  { name: "GaugeAttention",  state: "Attention",  mark: "exclamation !", art: `<path d="M 12 7.8 L 12 13.0" stroke-width="2.4"/><circle cx="12" cy="16.1" r="1.4" fill="currentColor" stroke="none"/>` },
+  { name: "GaugeNoRunway",   state: "No-runway",  mark: "slash ⊘",       art: `<path d="M 8.6 8.6 L 15.4 15.4" stroke-width="2.6"/>` },
+];
+const SIZES = [16, 18, 22, 44];
+function svg(g, px) {
+  return `<svg width="${px}" height="${px}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="${g.state}">${CHASSIS}${g.art}</svg>`;
+}
+function render(paneId, theme) {
+  let h = `<h2>${theme} menu bar — template tint</h2><table><thead><tr><th class="state">state</th>`;
+  SIZES.forEach(s => h += `<th>${s} px</th>`);
+  h += `<th>bar sim</th></tr></thead><tbody>`;
+  GLYPHS.forEach(g => {
+    h += `<tr><td class="state">${g.state}<small>${g.name} · ${g.mark}</small></td>`;
+    SIZES.forEach(s => h += `<td>${svg(g, s)}</td>`);
+    h += `<td><span class="barsim ${theme}">${svg(g, 18)}<span style="font-size:11px;opacity:.7">12:04</span></span></td>`;
+    h += `</tr>`;
+  });
+  h += `</tbody></table>`;
+  document.getElementById(paneId).innerHTML += h;
+}
+render("pane-light", "light");
+render("pane-dark", "dark");
+</script>
+</body>
+</html>

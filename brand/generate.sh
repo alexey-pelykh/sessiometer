@@ -15,6 +15,7 @@ REPO_ROOT="$(cd "${BRAND_DIR}/.." && pwd)"
 SRC="${BRAND_DIR}/src"
 DIST="${BRAND_DIR}/dist"
 APPICON="${REPO_ROOT}/apps/menubar/Sources/Assets.xcassets/AppIcon.appiconset"
+ASSETS="${REPO_ROOT}/apps/menubar/Sources/Assets.xcassets"
 
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
@@ -31,6 +32,80 @@ NEEDLE_CRITICAL="M12 12 15.82 8.18"   # redline
 V_HEALTHY="#30D158"; V_WARNING="#FF9F0A"; V_CRITICAL="#FF453A"; V_SWAP="#0A84FF"
 # Contrast-darkened set — free-standing menu-bar glyph (clears 3:1 on any bar)
 D_HEALTHY="#248A3D"; D_WARNING="#9A6A00"; D_CRITICAL="#FF3B30"; D_SWAP="#007AFF"
+
+# --- Bespoke bar-glyph .symbolset set (issue #437) --------------------------
+# The menu-bar status item's four attention-state glyphs (#524: healthy / connecting /
+# attention / no-runway), shipped as CUSTOM SF SYMBOL `.symbolset`s (NOT raster) so Apple's
+# SF-Symbols engine optically-sizes + pixel-aligns the strokes at bar size. Each glyph is the
+# SHARED Cycle-Gauge chassis (open arc + rotation arrowhead — the needle + pivot dot from
+# icon.svg are DROPPED; a thin needle vanishes at 16 px) PLUS one bold interior mark. Authored
+# straight into Assets.xcassets as a generated artifact (like AppIcon.appiconset) — PURE bash,
+# no rsvg (a .symbolset is SVG + Contents.json, never rasterized), so the `symbolset` subcommand
+# below runs on ANY machine. Never hand-edit an emitted file — edit here and re-run.
+#
+# The structure below is the MINIMUM actool accepts (empirically verified): a Guides layer with
+# Capline/Baseline at all three optical scales S/M/L, plus a Symbols layer carrying Regular-{S,M,L}.
+# The design is fixed-weight (no Ultralight/Black anchors — a menu-bar item renders one weight),
+# so the same artwork fills all three scales. The 2.4 arc stroke is the shared app-icon master
+# weight (src/icon.svg) and must NOT be re-weighted here.
+GAUGE_CHASSIS='<path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#000000" stroke-width="0.6"/>'
+
+# emit_gauge_symbol <AssetName> <svg-filename> <interior-mark-svg>: write one bespoke .symbolset
+# (shared chassis + the given interior mark) into Assets.xcassets. Idempotent — rewrites the dir.
+emit_gauge_symbol() {
+  local name="$1" file="$2" mark="$3"
+  local dir="${ASSETS}/${name}.symbolset"
+  local art="${GAUGE_CHASSIS}${mark}"
+  rm -rf "${dir}"; mkdir -p "${dir}"
+  cat > "${dir}/Contents.json" <<JSON
+{
+  "info" : { "author" : "xcode", "version" : 1 },
+  "symbols" : [ { "idiom" : "universal", "filename" : "${file}" } ]
+}
+JSON
+  cat > "${dir}/${file}" <<SVG
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+ <g id="Notes"/>
+ <g id="Guides">
+  <line id="Capline-S" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Baseline-S" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Capline-M" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Baseline-M" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Capline-L" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Baseline-L" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
+ </g>
+ <g id="Symbols" fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
+  <g id="Regular-S">${art}</g>
+  <g id="Regular-M">${art}</g>
+  <g id="Regular-L">${art}</g>
+ </g>
+</svg>
+SVG
+}
+
+# The four #524 attention states. Each interior mark is drawn bold and kept within ~r5 of centre
+# (12,12) so it clears the arc (interior clearance ≈ r6.8):
+#   .healthy    → low check "✓"          .attention → exclamation "!"
+#   .connecting → three mid-line dots "…" .noRunway  → slash "⊘"
+# The ellipsis dots are r1.5 with a gap ≥ radius (centres 7.5/12/16.5) so they never merge at the
+# Small optical size — the ratified bar tuning (a "?" was rejected: it collides with .attention).
+emit_status_symbolset() {
+  echo "==> status-item bar glyphs (bespoke Cycle-Gauge .symbolset — #437)"
+  emit_gauge_symbol GaugeHealthy    gauge-healthy.svg    '<path d="M 8.8 12.2 L 10.8 14.4 L 15.2 9.4" stroke-width="2.4"/>'
+  emit_gauge_symbol GaugeConnecting gauge-connecting.svg '<circle cx="7.5" cy="12" r="1.5" fill="#000000" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="#000000" stroke="none"/><circle cx="16.5" cy="12" r="1.5" fill="#000000" stroke="none"/>'
+  emit_gauge_symbol GaugeAttention  gauge-attention.svg  '<path d="M 12 7.8 L 12 13.0" stroke-width="2.4"/><circle cx="12" cy="16.1" r="1.4" fill="#000000" stroke="none"/>'
+  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 8.6 8.6 L 15.4 15.4" stroke-width="2.6"/>'
+}
+
+# `generate.sh symbolset` emits ONLY the bar-glyph set and exits — the one path that needs NO
+# rsvg-convert (it authors SVG + Contents.json directly), so it runs anywhere (incl. this repo's
+# CI / a Linux box). A bare `generate.sh` (below) still emits it as part of the full brand regen.
+if [[ "${1:-}" == "symbolset" ]]; then
+  emit_status_symbolset
+  echo "done → 4 status-item .symbolset(s) in ${ASSETS}"
+  exit 0
+fi
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
 need rsvg-convert
@@ -77,6 +152,8 @@ cat > "${APPICON}/Contents.json" <<'JSON'
   "info" : { "author" : "xcode", "version" : 1 }
 }
 JSON
+
+emit_status_symbolset
 
 echo "==> .icns (DMG / Finder)"
 if command -v iconutil >/dev/null 2>&1; then
