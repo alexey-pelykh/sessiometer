@@ -122,7 +122,9 @@ final class HonestStateMachineTests: XCTestCase {
     func testEmptyAccountsGoesEmptyRosterNotDisconnectedNotHealthy() {
         let m = machine([.connected, .line(Fixtures.snapshotEmptyRoster)])
         XCTAssertEqual(m.connectionState, .emptyRoster)
-        XCTAssertEqual(m.presentation.glyph, .empty)
+        // #524: empty-roster is alive ∧ fresh but NOT healthy (vacuous "zero accounts are fine") and NOT
+        // no-runway (same vacuity) — it needs the operator to add an account, so it collapses to attention.
+        XCTAssertEqual(m.presentation.glyph, .attention)
         XCTAssertFalse(m.connectionState.isHealthy, "zero accounts is NOT the healthy state")
         XCTAssertNotEqual(m.connectionState, .connected)
         // Distinct from a daemon-down state: the daemon is present and answering.
@@ -136,7 +138,9 @@ final class HonestStateMachineTests: XCTestCase {
         let m = machine([.connected, .line(Fixtures.snapshotBasic),
                          .disconnected(reason: "connection closed (EOF)")])
         XCTAssertEqual(m.connectionState, .disconnected(reason: "connection closed (EOF)"))
-        XCTAssertEqual(m.presentation.glyph, .disconnected)
+        // #524: a warm drop that may never recover cannot self-resolve, so it is not the "…" connecting
+        // glyph — it collapses to attention (loud, not a silently-reassuring "hold on"). See issue #526.
+        XCTAssertEqual(m.presentation.glyph, .attention)
         XCTAssertFalse(m.connectionState.isHealthy, "a dropped daemon is never healthy")
         // Last-good roster is RETAINED (not blanked) — the panel dims it; the STATE says not-live.
         XCTAssertEqual(m.rows.count, 1, "last-good rows retained for a dimmed render")
@@ -148,7 +152,9 @@ final class HonestStateMachineTests: XCTestCase {
     func testStaleAfterSnapshotGoesStaleNeverLive() {
         let m = machine([.connected, .line(Fixtures.snapshotBasic), .stale])
         XCTAssertEqual(m.connectionState, .stale)
-        XCTAssertEqual(m.presentation.glyph, .stale)
+        // #524: `.stale` is reached only AFTER the liveness window elapsed — a verdict, not a wait — so it
+        // is not the pre-verdict "…" connecting glyph; the operator is needed → attention.
+        XCTAssertEqual(m.presentation.glyph, .attention)
         XCTAssertFalse(m.connectionState.isHealthy)
         XCTAssertEqual(m.rows.count, 1, "last-good rows retained, marked stale")
     }
@@ -158,7 +164,8 @@ final class HonestStateMachineTests: XCTestCase {
     func testUnsupportedMajorSnapshotRefusesNumbers() {
         let m = machine([.connected, .line(Fixtures.snapshotUnsupportedMajor)])
         XCTAssertEqual(m.connectionState, .unsupported)
-        XCTAssertEqual(m.presentation.glyph, .unsupported)
+        // #524: version-skew is a ratified attention member (numbers refused; update required).
+        XCTAssertEqual(m.presentation.glyph, .attention)
         XCTAssertFalse(m.connectionState.isHealthy)
         XCTAssertTrue(m.rows.isEmpty, "numbers refused — no roster from an unreadable contract")
         XCTAssertNil(m.nextSwap)
@@ -175,7 +182,7 @@ final class HonestStateMachineTests: XCTestCase {
     func testUnsupportedHeartbeatIsUnsupported() {
         let m = machine([.connected, .line(Fixtures.heartbeatPreFreeze)])
         XCTAssertEqual(m.connectionState, .unsupported)
-        XCTAssertEqual(m.presentation.glyph, .unsupported)
+        XCTAssertEqual(m.presentation.glyph, .attention)   // #524: version-skew → attention
     }
 
     // MARK: - THE load-bearing invariant: never healthy on a degraded or absent daemon
@@ -381,7 +388,7 @@ final class HonestStateMachineTests: XCTestCase {
         m.watchdogElapsed(generation: armed)
         XCTAssertEqual(m.connectionState, .stale, "no valid frame in the window → the store goes stale")
         XCTAssertFalse(m.connectionState.isHealthy, "MUST NOT render healthy on a garbage-emitting daemon")
-        XCTAssertEqual(m.presentation.glyph, .stale)
+        XCTAssertEqual(m.presentation.glyph, .attention)   // #524: stale is a post-verdict fault → attention
     }
 
     // The general never-healthy case: a daemon that connects and then streams ONLY garbage — never a
@@ -571,7 +578,7 @@ final class HonestStateMachineTests: XCTestCase {
         _ = m.apply(.connected)
         _ = m.apply(.line(Fixtures.snapshotBasic))
         XCTAssertEqual(m.connectionState, .crashLooping)
-        XCTAssertEqual(m.presentation.glyph, .crashLooping)
+        XCTAssertEqual(m.presentation.glyph, .attention)   // #524: crash-loop is a ratified attention member
         XCTAssertFalse(m.connectionState.isHealthy)
     }
 
@@ -633,10 +640,12 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertFalse(m.connectionState.isHealthy)
     }
 
-    // The crash-loop presentation: a distinct fault glyph + a plain spoken label, never the healthy glyph.
+    // The crash-loop presentation (#524): collapses to the `.attention` glyph (a ratified member), while
+    // the spoken label KEEPS the crash-loop-specific sentence — the two channels carry different
+    // resolutions (glyph collapses; VoiceOver stays specific). Never the healthy glyph.
     func testCrashLoopingPresentation() {
         let presentation = PresentationState.make(for: .crashLooping, accountCount: 2)
-        XCTAssertEqual(presentation.glyph, .crashLooping)
+        XCTAssertEqual(presentation.glyph, .attention)
         XCTAssertNotEqual(presentation.glyph, .healthy)
         XCTAssertFalse(ConnectionState.crashLooping.isHealthy)
         XCTAssertEqual(presentation.accessibilityLabel,
@@ -653,16 +662,18 @@ final class HonestStateMachineTests: XCTestCase {
         var m = HonestStateMachine()
         _ = m.apply(.disconnected(reason: "connect refused"))
         XCTAssertEqual(m.connectionState, .starting)
-        XCTAssertEqual(m.presentation.glyph, .starting)
+        // #524: `.starting` is bounded self-resolution (the grace escalates it), so it is the honest-unknown
+        // "…" connecting glyph — never healthy.
+        XCTAssertEqual(m.presentation.glyph, .connecting)
         XCTAssertFalse(m.connectionState.isHealthy)
         XCTAssertTrue(m.isAwaitingStartGrace)
         if case .disconnected = m.connectionState { XCTFail("a cold refusal must not read as socket-dropped") }
 
         // The grace elapses with the connect still refused → the durable not-running state (the one that
-        // WOULD host a Start-daemon affordance, #170).
+        // WOULD host a Start-daemon affordance, #170). #524: not-running cannot self-resolve → attention.
         m.graceElapsed(generation: m.graceGeneration)
         XCTAssertEqual(m.connectionState, .notRunning)
-        XCTAssertEqual(m.presentation.glyph, .notRunning)
+        XCTAssertEqual(m.presentation.glyph, .attention)
         XCTAssertFalse(m.connectionState.isHealthy)
         XCTAssertFalse(m.isAwaitingStartGrace, "not-running is durable — the grace is done")
     }
@@ -673,15 +684,18 @@ final class HonestStateMachineTests: XCTestCase {
     func testWarmDropIsSocketDroppedNotStartingOrNotRunning() {
         let warm = machine([.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: "EOF")])
         XCTAssertEqual(warm.connectionState, .disconnected(reason: "EOF"))
-        XCTAssertEqual(warm.presentation.glyph, .disconnected)
+        // #524: a warm drop (may never recover) is not self-resolving → attention.
+        XCTAssertEqual(warm.presentation.glyph, .attention)
 
         let cold = machine([.disconnected(reason: "connect refused")])
         XCTAssertEqual(cold.connectionState, .starting)
-        XCTAssertEqual(cold.presentation.glyph, .starting)
+        // #524: a cold refusal within the grace is bounded self-resolution → connecting.
+        XCTAssertEqual(cold.presentation.glyph, .connecting)
 
         XCTAssertNotEqual(warm.connectionState, cold.connectionState,
                           "a warm drop and a cold refusal must NOT collapse to the same state (#499)")
-        XCTAssertNotEqual(warm.presentation.glyph, cold.presentation.glyph)
+        XCTAssertNotEqual(warm.presentation.glyph, cold.presentation.glyph,
+                          "#524: attention (durable, act) vs connecting (transient, wait) stay distinct glyphs")
     }
 
     // The backoff loop retries and is refused again several times: the state stays `.starting` and the grace
@@ -756,23 +770,97 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertEqual(p.connectionState, .notRunning, "a second elapse is a no-op")
     }
 
-    // The presentation surface: starting and not-running are distinct glances from each other and — the
-    // load-bearing pair — from the socket-dropped and stale glances, and neither is ever healthy.
+    // The presentation surface under the #524 attention axis: the #499 pair stays distinguishable, but the
+    // channel that distinguishes them shifts. `.starting` (bounded self-resolution) and `.notRunning`
+    // (durable fault) now project onto DIFFERENT glyphs — connecting "…" vs attention "!" — so the #499
+    // "must not collapse to one presentation" invariant holds at the glyph layer for this pair. The other
+    // daemon-liveness faults (`.disconnected`, `.stale`) deliberately SHARE the attention glyph with
+    // `.notRunning` — that is what a collapse bucket IS (#524) — so per-state legibility across them lives
+    // in the VoiceOver label channel, which stays specific. Neither is ever healthy.
     func testStartingAndNotRunningPresentationAreDistinctAndNeverHealthy() {
         let starting = PresentationState.make(for: .starting, accountCount: 0)
         let notRunning = PresentationState.make(for: .notRunning, accountCount: 0)
-        XCTAssertEqual(starting.glyph, .starting)
-        XCTAssertEqual(notRunning.glyph, .notRunning)
-        XCTAssertNotEqual(starting.glyph, notRunning.glyph)
+        XCTAssertEqual(starting.glyph, .connecting, "#524: starting is bounded self-resolution → connecting")
+        XCTAssertEqual(notRunning.glyph, .attention, "#524: not-running is a durable fault → attention")
+        XCTAssertNotEqual(starting.glyph, notRunning.glyph,
+                          "#499 invariant survives #524: the two must not collapse to one glyph")
         XCTAssertNotEqual(starting.accessibilityLabel, notRunning.accessibilityLabel)
+        // The collapse bucket: not-running / disconnected / stale share the attention GLYPH by design, but
+        // the spoken LABEL stays per-state — that is where their honest distinction now lives.
         for other: ConnectionState in [.disconnected(reason: "EOF"), .stale] {
             let o = PresentationState.make(for: other, accountCount: 0)
-            XCTAssertNotEqual(starting.glyph, o.glyph, "starting must be distinct from \(other)")
-            XCTAssertNotEqual(notRunning.glyph, o.glyph, "not-running must be distinct from \(other)")
+            XCTAssertEqual(o.glyph, .attention, "#524: \(other) collapses into the attention bucket")
+            XCTAssertNotEqual(starting.glyph, o.glyph, "starting (connecting) stays distinct from \(other)")
+            XCTAssertNotEqual(notRunning.accessibilityLabel, o.accessibilityLabel,
+                              "not-running label must stay distinct from \(other) despite the shared glyph")
             XCTAssertNotEqual(starting.accessibilityLabel, o.accessibilityLabel, "starting label must be distinct from \(other)")
-            XCTAssertNotEqual(notRunning.accessibilityLabel, o.accessibilityLabel, "not-running label must be distinct from \(other)")
         }
         XCTAssertFalse(ConnectionState.starting.isHealthy)
         XCTAssertFalse(ConnectionState.notRunning.isHealthy)
+    }
+
+    // MARK: - AC (#524): the 9 connection inputs project onto the 4-state attention axis
+
+    // The core #524 decision, locked as one exhaustive table: every `ConnectionState` → its ratified
+    // glyph. This is the single source of truth for the 9→4 mapping the bespoke artwork (#437) draws for
+    // and the parity harness (#525) baselines. `accountCount: 1` so `.connected` clears the ≥1 gate.
+    func testEveryConnectionStateProjectsOntoTheRatifiedAttentionGlyph() {
+        let expected: [(state: ConnectionState, glyph: StatusGlyph, note: String)] = [
+            (.connected,                    .healthy,    "alive ∧ fresh ∧ ≥1 account, no exhaustion → the sole healthy path"),
+            (.connecting,                   .connecting, "pre-verdict, self-resolving → honest unknown"),
+            (.starting,                     .connecting, "bounded self-resolution (grace escalates) → honest unknown"),
+            (.emptyRoster,                  .attention,  "alive but doing nothing; needs an account → attention (not vacuous-healthy)"),
+            (.stale,                        .attention,  "post-liveness-window verdict, not a wait → attention"),
+            (.disconnected(reason: "EOF"),  .attention,  "warm drop that may never recover → attention (loud, not silent '…')"),
+            (.notRunning,                   .attention,  "durable no-daemon → attention (sibling of crash-loop)"),
+            (.unsupported,                  .attention,  "version-skew, a ratified attention member"),
+            (.crashLooping,                 .attention,  "crash-loop, a ratified attention member"),
+        ]
+        // Each row pins a specific glyph — and none of the expected values is `.noRunway`, so this table
+        // is also the proof that no CONNECTION input alone reaches No-runway (a quota verdict, gated
+        // separately in `testNoRunwayIsGatedOnAFreshConnectedSnapshotExactlyLikeHealthy`).
+        for row in expected {
+            XCTAssertEqual(PresentationState.make(for: row.state, accountCount: 1).glyph, row.glyph,
+                           "\(row.state) → \(row.glyph): \(row.note)")
+        }
+    }
+
+    // AC (#524): No-runway is GATED exactly as Healthy is — it reaches the bar ONLY on a vouched
+    // `.connected` snapshot. On the same fresh snapshot, exhaustion outranks healthy (worst-first among
+    // vouched facts); on any non-vouched state, a RETAINED `noViableTarget` must NOT reach the bar (the
+    // fleet verdict is unverifiable, and quota only rises while we are not looking).
+    func testNoRunwayIsGatedOnAFreshConnectedSnapshotExactlyLikeHealthy() {
+        // Vouched + exhausted → No-runway (outranks healthy).
+        let exhausted = PresentationState.make(for: .connected, accountCount: 2, hasNoViableTarget: true)
+        XCTAssertEqual(exhausted.glyph, .noRunway)
+        // Vouched + has a target → healthy (the exhaustion flag is the only difference).
+        let healthy = PresentationState.make(for: .connected, accountCount: 2, hasNoViableTarget: false)
+        XCTAssertEqual(healthy.glyph, .healthy)
+        // Retained exhaustion on a NON-vouched state must NOT surface No-runway — the connection fault wins.
+        // ALL eight non-`.connected` states (the gate's whole complement), so the exhaustiveness is explicit,
+        // not just structurally implied by the single emission point.
+        let nonVouched: [ConnectionState] = [
+            .connecting, .starting, .stale, .disconnected(reason: "EOF"),
+            .notRunning, .emptyRoster, .unsupported, .crashLooping,
+        ]
+        for state in nonVouched {
+            let g = PresentationState.make(for: state, accountCount: 2, hasNoViableTarget: true).glyph
+            XCTAssertNotEqual(g, .noRunway,
+                              "\(state): a retained no-viable-target is unverifiable → must not reach the No-runway glyph")
+        }
+    }
+
+    // The end-to-end #524 path through the machine: a snapshot whose `next_swap` is no-viable-target,
+    // applied on a live connection, drives the glyph to No-runway (not healthy) — proving the existing wire
+    // input (`NextSwap.noViableTarget`) reaches the glyph with no new field or schema bump.
+    func testNoViableTargetSnapshotDrivesTheNoRunwayGlyph() {
+        // `snapshotNoViable` is a live, fresh, 1-account frame whose `next_swap` = no_viable_target — so
+        // the connection is `.connected` (≥1 account clears the healthy-gate cardinality) yet the fleet is
+        // exhausted. The existing wire input reaches the glyph with no new field or schema bump (#524 C).
+        let m = machine([.connected, .line(Fixtures.snapshotNoViable)])
+        XCTAssertEqual(m.connectionState, .connected, "the daemon is live and fresh — only the fleet is exhausted")
+        XCTAssertEqual(m.presentation.glyph, .noRunway, "#524: aggregate no-viable-target → No-runway glyph")
+        XCTAssertNotEqual(m.presentation.glyph, .healthy, "an exhausted fleet must not read healthy")
+        if case .noViableTarget = m.nextSwap {} else { XCTFail("fixture must carry next_swap = no_viable_target") }
     }
 }
