@@ -58,11 +58,18 @@ enum StatusGauge {
         }
     }
 
-    /// The template gauge image for a glance state: the bespoke custom symbol, forced to a template
-    /// (`isTemplate = true`) so macOS re-tints it correctly in light AND dark menu bars — a NAMED image is
-    /// NOT template-tinted by default, so we set it explicitly (issue #437). Carries an
-    /// `accessibilityDescription` for the icon layer; the full spoken status sentence is set separately on
-    /// the status-item button (`PresentationState.accessibilityLabel`), updated on every state change.
+    /// The bar-size symbol configuration. A custom symbol carries no intrinsic pixel size — it is scaled
+    /// from the `Capline`/`Baseline` guides against a POINT SIZE, and an unconfigured `NSImage(named:)`
+    /// renders at the 13 pt system default, which put ~8 px of ink in a 24 px bar (half the intended
+    /// glyph, every interior mark mushed away). The gauge fills its cap band, so the point size that
+    /// lands ~16 px of ink is larger than a typical symbol's: measured on-device, NOT guessed.
+    private static let barPointSize: CGFloat = 22
+
+    /// The template gauge image for a glance state: the bespoke custom symbol scaled to bar size and
+    /// forced to a template (`isTemplate = true`) so macOS re-tints it correctly in light AND dark menu
+    /// bars — a NAMED image is NOT template-tinted by default, so we set it explicitly (issue #437).
+    /// Carries an `accessibilityDescription` for the icon layer; the full spoken status sentence is set
+    /// separately on the status-item button (`PresentationState.accessibilityLabel`).
     ///
     /// Defensive fallback: if the custom symbol somehow does not resolve — it will, the `.symbolset`s ship
     /// in the app's `Assets.xcassets` (name↔asset match pinned by a unit test) — draw a generic ring rather
@@ -71,9 +78,11 @@ enum StatusGauge {
     static func image(for glyph: StatusGlyph) -> NSImage {
         let description = accessibilityDescription(for: glyph)
         if let symbol = NSImage(named: assetName(for: glyph)) {
-            symbol.isTemplate = true
-            symbol.accessibilityDescription = description
-            return symbol
+            let configuration = NSImage.SymbolConfiguration(pointSize: barPointSize, weight: .regular)
+            let sized = symbol.withSymbolConfiguration(configuration) ?? symbol
+            sized.isTemplate = true
+            sized.accessibilityDescription = description
+            return sized
         }
         return fallbackRing(accessibilityDescription: description)
     }

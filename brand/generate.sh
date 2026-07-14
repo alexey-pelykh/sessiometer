@@ -36,26 +36,44 @@ D_HEALTHY="#248A3D"; D_WARNING="#9A6A00"; D_CRITICAL="#FF3B30"; D_SWAP="#007AFF"
 # --- Bespoke bar-glyph .symbolset set (issue #437) --------------------------
 # The menu-bar status item's four attention-state glyphs (#524: healthy / connecting /
 # attention / no-runway), shipped as CUSTOM SF SYMBOL `.symbolset`s (NOT raster) so Apple's
-# SF-Symbols engine optically-sizes + pixel-aligns the strokes at bar size. Each glyph is the
-# SHARED Cycle-Gauge chassis (open arc + rotation arrowhead — the needle + pivot dot from
-# icon.svg are DROPPED; a thin needle vanishes at 16 px) PLUS one bold interior mark. Authored
-# straight into Assets.xcassets as a generated artifact (like AppIcon.appiconset) — PURE bash,
-# no rsvg (a .symbolset is SVG + Contents.json, never rasterized), so the `symbolset` subcommand
-# below runs on ANY machine. Never hand-edit an emitted file — edit here and re-run.
+# SF-Symbols engine optically-sizes + pixel-aligns them at bar size. Each glyph is the SHARED
+# Cycle-Gauge chassis (open arc; + the rotation arrowhead on healthy only — the arrowhead reads
+# as "actively cycling", so it is wrong on the states that are NOT cycling) PLUS one mark.
+# Authored straight into Assets.xcassets as a generated artifact (like AppIcon.appiconset) —
+# PURE bash, no rsvg (a .symbolset is SVG + Contents.json, never rasterized), so the `symbolset`
+# subcommand below runs on ANY machine. Never hand-edit an emitted file — edit here and re-run.
+#
+# ⚠ SF SYMBOLS FILLS ARTWORK — IT NEVER STROKES IT. This bit the project hard: the first cut of
+# this emitter authored the glyphs as STROKES (`fill="none" stroke-width="2.4"`), which actool
+# silently reinterprets as FILLED paths. The open arc filled into a solid DISC, and every open
+# stroked line (needle, X, "!") enclosed zero area and vanished outright — so all four states
+# rendered as one identical white blob. That artifact was then measured on-device and misread as
+# "the glyph DESIGN fails shape-distinctness", nearly costing a re-ratification of a locked brand
+# mark. Every shape below is therefore authored as a FILLED OUTLINE — the stroke already expanded
+# — using exact SVG arc commands (not polygonized): `fill`, never `stroke`. If you add a mark
+# here, expand it to an outline yourself; a bare `stroke-width` will silently render as a blob.
 #
 # The structure below is the MINIMUM actool accepts (empirically verified): a Guides layer with
 # Capline/Baseline at all three optical scales S/M/L, plus a Symbols layer carrying Regular-{S,M,L}.
 # The design is fixed-weight (no Ultralight/Black anchors — a menu-bar item renders one weight),
-# so the same artwork fills all three scales. The 2.4 arc stroke is the shared app-icon master
+# so the same artwork fills all three scales. The 2.4 arc weight is the shared app-icon master
 # weight (src/icon.svg) and must NOT be re-weighted here.
-GAUGE_CHASSIS='<path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#000000" stroke-width="0.6"/>'
+#
+# GAUGE_ARC — the invariant carrier (brand-identity.md: "the invariant carrier is the open gauge
+# arc"). Centreline r=8 about (12,12), 2.4 wide → outer r=9.2 / inner r=6.8, round caps of r=1.2
+# centred on the mouth edges (7.76,18.78)=122.03° and (16.24,18.78)=57.97°. Outline order: outer
+# arc the long way round → end cap → inner arc back → start cap. The mouth (57.97°..122.03°, at
+# the bottom) is what keeps this an OPEN arc, so the outline is one simple closed contour.
+GAUGE_ARC='<path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/>'
+# The rotation arrowhead — already a filled triangle in the master, so it needs no expansion.
+GAUGE_ARROWHEAD='<path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z"/>'
 
 # emit_gauge_symbol <AssetName> <svg-filename> <interior-mark-svg>: write one bespoke .symbolset
 # (shared chassis + the given interior mark) into Assets.xcassets. Idempotent — rewrites the dir.
 emit_gauge_symbol() {
   local name="$1" file="$2" mark="$3"
   local dir="${ASSETS}/${name}.symbolset"
-  local art="${GAUGE_CHASSIS}${mark}"
+  local art="${GAUGE_ARC}${mark}"
   rm -rf "${dir}"; mkdir -p "${dir}"
   cat > "${dir}/Contents.json" <<JSON
 {
@@ -75,7 +93,7 @@ JSON
   <line id="Capline-L" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
   <line id="Baseline-L" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
  </g>
- <g id="Symbols" fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
+ <g id="Symbols" fill="#000000">
   <g id="Regular-S">${art}</g>
   <g id="Regular-M">${art}</g>
   <g id="Regular-L">${art}</g>
@@ -84,18 +102,38 @@ JSON
 SVG
 }
 
-# The four #524 attention states. Each interior mark is drawn bold and kept within ~r5 of centre
-# (12,12) so it clears the arc (interior clearance ≈ r6.8):
-#   .healthy    → low check "✓"          .attention → exclamation "!"
-#   .connecting → three mid-line dots "…" .noRunway  → slash "⊘"
-# The ellipsis dots are r1.5 with a gap ≥ radius (centres 7.5/12/16.5) so they never merge at the
-# Small optical size — the ratified bar tuning (a "?" was rejected: it collides with .attention).
+# The four #524 attention states, each = GAUGE_ARC + the mark below. All marks are FILLED OUTLINES
+# (see the SF-Symbols-fills warning above). Operator-ratified 2026-07-14, on-device:
+#   .healthy    → arrowhead + needle + pivot   .attention  → exclamation "!"
+#   .connecting → three mid-line dots "…"      .noRunway   → an X, vertices on the ring
+# Only .healthy carries the arrowhead (= actively cycling); the rest are a bare arc + mark.
+#
+# Capsule outlines below are expanded stroke centrelines: two offset edges + a round cap (r = half
+# the weight) at each end. Given centreline p1→p2 of weight w, the four corners are p{1,2} ± (w/2)·n
+# where n is the unit normal — the literals are those corners, so re-deriving a mark means
+# re-deriving its corners (the stroke centreline is named in each comment so that stays possible).
+#
+# ⚠ AND actool HONOURS ONLY <path> — IT SILENTLY DROPS <circle>. The second half of the same trap:
+# an earlier cut drew the dots/pivot as <circle fill=...>, which renders correctly in every browser
+# but vanishes entirely on-device (connecting came out a BARE RING). So every dot below is a <path>
+# of two half-arcs: a circle (cx,cy,r) is `M cx-r cy A r r 0 1 0 cx+r cy A r r 0 1 0 cx-r cy Z`.
+# Corollary for anyone verifying a change: rendering the SVG in a browser CANNOT catch either trap
+# (browsers stroke, and browsers draw <circle>) — only the on-device SESSIOMETER_GLYPH_GALLERY
+# capture is a valid check. See apps/menubar/Sources/main.swift.
+#
+#   .healthy needle: (12,12)→(14.75,7.24) w=2.2 — the resting pose from src/icon.svg. NOTE: this
+#   contradicts brand-identity.md "Drop the thin needle" (predicted to die at bar size); the
+#   operator picked the needle mark on-device 2026-07-14 and it renders. Flagged, not silently kept.
+#   .connecting dots: r=1.5, centres 7.5/12/16.5 — gap ≥ radius so they never merge at Small.
+#   .attention bar: (12,5.2)→(12,13.0) w=2.7, + dot r=1.6 at (12,16.6) — gap holds the "!" apart.
+#   .noRunway X: (6.34,6.34)→(17.66,17.66) and (17.66,6.34)→(6.34,17.66), w=2.4 — the four vertices
+#   sit on the arc's r=8 centreline (the 45° diagonals), so the X reads ring-to-ring, not centred.
 emit_status_symbolset() {
   echo "==> status-item bar glyphs (bespoke Cycle-Gauge .symbolset — #437)"
-  emit_gauge_symbol GaugeHealthy    gauge-healthy.svg    '<path d="M 8.8 12.2 L 10.8 14.4 L 15.2 9.4" stroke-width="2.4"/>'
-  emit_gauge_symbol GaugeConnecting gauge-connecting.svg '<circle cx="7.5" cy="12" r="1.5" fill="#000000" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="#000000" stroke="none"/><circle cx="16.5" cy="12" r="1.5" fill="#000000" stroke="none"/>'
-  emit_gauge_symbol GaugeAttention  gauge-attention.svg  '<path d="M 12 7.8 L 12 13.0" stroke-width="2.4"/><circle cx="12" cy="16.1" r="1.4" fill="#000000" stroke="none"/>'
-  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 8.6 8.6 L 15.4 15.4" stroke-width="2.6"/>'
+  emit_gauge_symbol GaugeHealthy    gauge-healthy.svg    "${GAUGE_ARROWHEAD}"'<path d="M 12.95 12.55 L 15.70 7.79 A 1.1 1.1 0 0 0 13.80 6.69 L 11.05 11.45 A 1.1 1.1 0 0 0 12.95 12.55 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/>'
+  emit_gauge_symbol GaugeConnecting gauge-connecting.svg '<path d="M 6 12 A 1.5 1.5 0 1 0 9 12 A 1.5 1.5 0 1 0 6 12 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/><path d="M 15 12 A 1.5 1.5 0 1 0 18 12 A 1.5 1.5 0 1 0 15 12 Z"/>'
+  emit_gauge_symbol GaugeAttention  gauge-attention.svg  '<path d="M 10.65 5.20 L 10.65 13.00 A 1.35 1.35 0 0 0 13.35 13.00 L 13.35 5.20 A 1.35 1.35 0 0 0 10.65 5.20 Z"/><path d="M 10.4 16.6 A 1.6 1.6 0 1 0 13.6 16.6 A 1.6 1.6 0 1 0 10.4 16.6 Z"/>'
+  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 5.49 7.19 L 16.81 18.51 A 1.2 1.2 0 0 0 18.51 16.81 L 7.19 5.49 A 1.2 1.2 0 0 0 5.49 7.19 Z"/><path d="M 16.81 5.49 L 5.49 16.81 A 1.2 1.2 0 0 0 7.19 18.51 L 18.51 7.19 A 1.2 1.2 0 0 0 16.81 5.49 Z"/>'
 }
 
 # `generate.sh symbolset` emits ONLY the bar-glyph set and exits — the one path that needs NO

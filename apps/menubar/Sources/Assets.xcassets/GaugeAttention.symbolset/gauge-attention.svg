@@ -9,9 +9,9 @@
   <line id="Capline-L" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
   <line id="Baseline-L" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
  </g>
- <g id="Symbols" fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round">
-  <g id="Regular-S"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#000000" stroke-width="0.6"/><path d="M 12 7.8 L 12 13.0" stroke-width="2.4"/><circle cx="12" cy="16.1" r="1.4" fill="#000000" stroke="none"/></g>
-  <g id="Regular-M"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#000000" stroke-width="0.6"/><path d="M 12 7.8 L 12 13.0" stroke-width="2.4"/><circle cx="12" cy="16.1" r="1.4" fill="#000000" stroke="none"/></g>
-  <g id="Regular-L"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke-width="2.4"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="#000000" stroke-width="0.6"/><path d="M 12 7.8 L 12 13.0" stroke-width="2.4"/><circle cx="12" cy="16.1" r="1.4" fill="#000000" stroke="none"/></g>
+ <g id="Symbols" fill="#000000">
+  <g id="Regular-S"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M 10.65 5.20 L 10.65 13.00 A 1.35 1.35 0 0 0 13.35 13.00 L 13.35 5.20 A 1.35 1.35 0 0 0 10.65 5.20 Z"/><path d="M 10.4 16.6 A 1.6 1.6 0 1 0 13.6 16.6 A 1.6 1.6 0 1 0 10.4 16.6 Z"/></g>
+  <g id="Regular-M"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M 10.65 5.20 L 10.65 13.00 A 1.35 1.35 0 0 0 13.35 13.00 L 13.35 5.20 A 1.35 1.35 0 0 0 10.65 5.20 Z"/><path d="M 10.4 16.6 A 1.6 1.6 0 1 0 13.6 16.6 A 1.6 1.6 0 1 0 10.4 16.6 Z"/></g>
+  <g id="Regular-L"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M 10.65 5.20 L 10.65 13.00 A 1.35 1.35 0 0 0 13.35 13.00 L 13.35 5.20 A 1.35 1.35 0 0 0 10.65 5.20 Z"/><path d="M 10.4 16.6 A 1.6 1.6 0 1 0 13.6 16.6 A 1.6 1.6 0 1 0 10.4 16.6 Z"/></g>
  </g>
 </svg>
