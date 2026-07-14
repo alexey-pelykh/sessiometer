@@ -34,37 +34,30 @@ Status is therefore **doubly encoded**: hue *and* needle position.
 mark in bone `#EDE8DF`. The warmth is deliberate: a cold black + pure white
 would read as clinical AI-lab monochrome.
 
-> **Superseded — menu-bar status item.** The menu-bar status item now ships as a
+> **The menu bar is monochrome — not colour.** The menu-bar status item ships as a
 > **monochrome template**: state is carried by the glyph **shape**, not colour (a
-> menu-bar image is system-tinted, so colour cannot encode health — see #325). The
-> free-standing *colour* menu-bar glyph sets described below are being retired — #437
-> draws the bespoke monochrome bar glyphs, #439 removes the colour sets from
-> `generate.sh`. The colour "living instrument" still governs the **app icon, Dock,
-> and in-panel** surfaces; only the **menu bar** is monochrome.
+> menu-bar image is system-tinted, so colour cannot encode health there at all — see
+> #325). Its four bespoke attention-state glyphs are the `.symbolset` family — #437
+> artwork, #524 taxonomy — which `generate.sh` writes straight into
+> `apps/menubar/Sources/Assets.xcassets/`. The free-standing *colour* menu-bar glyph
+> sets (two contrast sets, needle tracking the reading) were **retired in #439**: they
+> targeted a colour bar the app does not — and cannot — use. `src/glyph.svg` is kept
+> only as the **archived** colour-glyph master: no longer emitted, no longer consumed.
+> The colour "living instrument" below still governs the **app icon, Dock, and
+> in-panel** surfaces; only the **menu bar** is monochrome.
 
-**Status.** The menu-bar glyph is a free-standing *colored* (non-template) image,
-so it must clear contrast against the bar it sits on:
+**Living icon states.** The colour icon sits on a *controlled tile* (app icon, Dock,
+DMG, Homebrew, docs & screenshots), which removes wallpaper bleed — so it always uses
+the **vivid** set. No contrast-darkened companion set exists any more; that set had
+exactly one consumer, the free-standing colour bar glyph retired above.
 
-| State | Needle | Dark bar (vivid) | Light bar (darkened) |
-|---|---|---|---|
-| Healthy | full, up-left | `#30D158` | `#248A3D` |
-| Warning | half, straight up | `#FF9F0A` | `#9A6A00` |
-| Critical | redline, up-right | `#FF453A` | `#FF3B30` |
-| Swapping *(transient)* | resting pose | `#0A84FF` | `#007AFF` |
-| Resting *(no reading)* | resting pose | template image — macOS tints it | |
-
-Raw system green/amber measure ~2.0–2.2:1 on a **light** bar and visually
-dissolve, so light bars get the darkened set. On a **dark** bar the darkened
-amber reads muddy-brown, so dark bars get the vivid set. If bar appearance
-can't be detected (wallpaper bleed through a translucent bar), ship the
-**light-bar set universally** — it clears 3:1 at *both* luminance extremes.
-
-Large surfaces (Dock, README, DMG, Homebrew) sit on a controlled tile, which
-removes wallpaper bleed — they always use the **vivid** set.
-
-The **resting** menu-bar glyph ships as a template image (`isTemplate = true`);
-macOS tints it to the system label colour. The rendered `-lightbar`/`-darkbar`
-resting variants exist only for mockups and screenshots.
+| State | Needle | Vivid |
+|---|---|---|
+| Healthy | full, up-left | `#30D158` |
+| Warning | half, straight up | `#FF9F0A` |
+| Critical | redline, up-right | `#FF453A` |
+| Swapping *(transient)* | resting pose | `#0A84FF` |
+| Resting *(no reading)* | resting pose | bone mark `#EDE8DF` on the graphite body |
 
 ## Outputs
 
@@ -76,14 +69,8 @@ resting variants exist only for mockups and screenshots.
 | `social-preview.png` (1200×630) | GitHub social preview + `profile/assets/` |
 | `og-image.png` (1200×630) | `sessiometer.github.io` → `public/` |
 | `favicon.svg`, `favicon-32.png`, `apple-touch-icon.png` | `sessiometer.github.io` → `public/` |
-| `glyph-<state>-<lightbar\|darkbar>.png` (@1x/@2x) | menu-bar status glyphs |
+| `Gauge{Healthy,Connecting,Attention,NoRunway}.symbolset/` | written straight into `apps/menubar/Sources/Assets.xcassets/` (monochrome bar glyphs — #437) |
 | `icon-<state>_512.png` | the living icon, for docs & screenshots |
-
-## Known open item
-
-`#9A6A00` (light-bar warning) is a dark goldenrod. It clears contrast and is
-clearly distinct from red and green, but it wants a taste pass on a real display
-to confirm it still reads "amber" and not "brown".
 
 ## Guardrails
 
