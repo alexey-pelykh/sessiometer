@@ -37,8 +37,8 @@ D_HEALTHY="#248A3D"; D_WARNING="#9A6A00"; D_CRITICAL="#FF3B30"; D_SWAP="#007AFF"
 # The menu-bar status item's four attention-state glyphs (#524: healthy / connecting /
 # attention / no-runway), shipped as CUSTOM SF SYMBOL `.symbolset`s (NOT raster) so Apple's
 # SF-Symbols engine optically-sizes + pixel-aligns them at bar size. Each glyph is the SHARED
-# Cycle-Gauge chassis (open arc; + the rotation arrowhead on healthy only — the arrowhead reads
-# as "actively cycling", so it is wrong on the states that are NOT cycling) PLUS one mark.
+# Cycle-Gauge chassis (open arc + rotation arrowhead; the needle + pivot dot from icon.svg are
+# DROPPED) PLUS one bold interior mark — the family LOCKED in hq brand-identity.md (2588c9ea).
 # Authored straight into Assets.xcassets as a generated artifact (like AppIcon.appiconset) —
 # PURE bash, no rsvg (a .symbolset is SVG + Contents.json, never rasterized), so the `symbolset`
 # subcommand below runs on ANY machine. Never hand-edit an emitted file — edit here and re-run.
@@ -65,15 +65,20 @@ D_HEALTHY="#248A3D"; D_WARNING="#9A6A00"; D_CRITICAL="#FF3B30"; D_SWAP="#007AFF"
 # arc the long way round → end cap → inner arc back → start cap. The mouth (57.97°..122.03°, at
 # the bottom) is what keeps this an OPEN arc, so the outline is one simple closed contour.
 GAUGE_ARC='<path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/>'
-# The rotation arrowhead — already a filled triangle in the master, so it needs no expansion.
+# The rotation arrowhead — already a filled triangle in the master, so it needs no expansion. Part
+# of the SHARED chassis (all four states): brand-identity.md calls it "the invariant 'cycle' cue".
 GAUGE_ARROWHEAD='<path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z"/>'
+
+# The shared chassis every state is built on: open arc + rotation arrowhead. Per the lock, the
+# needle + pivot dot from src/icon.svg are DROPPED here (they stay in the colour app-icon master).
+GAUGE_CHASSIS="${GAUGE_ARC}${GAUGE_ARROWHEAD}"
 
 # emit_gauge_symbol <AssetName> <svg-filename> <interior-mark-svg>: write one bespoke .symbolset
 # (shared chassis + the given interior mark) into Assets.xcassets. Idempotent — rewrites the dir.
 emit_gauge_symbol() {
   local name="$1" file="$2" mark="$3"
   local dir="${ASSETS}/${name}.symbolset"
-  local art="${GAUGE_ARC}${mark}"
+  local art="${GAUGE_CHASSIS}${mark}"
   rm -rf "${dir}"; mkdir -p "${dir}"
   cat > "${dir}/Contents.json" <<JSON
 {
@@ -102,16 +107,27 @@ JSON
 SVG
 }
 
-# The four #524 attention states, each = GAUGE_ARC + the mark below. All marks are FILLED OUTLINES
-# (see the SF-Symbols-fills warning above). Operator-ratified 2026-07-14, on-device:
-#   .healthy    → arrowhead + needle + pivot   .attention  → exclamation "!"
-#   .connecting → three mid-line dots "…"      .noRunway   → an X, vertices on the ring
-# Only .healthy carries the arrowhead (= actively cycling); the rest are a bare arc + mark.
+# The four #524 attention states = the LOCKED family from hq brand-identity.md (commit 2588c9ea,
+# "Second refinement (2026-07-14) — the 4-glyph family + render pipeline are LOCKED"; creative
+# council Direction B, operator-chosen):
+#
+#   "Locked family (shared arc+arrowhead chassis, each + one interior mark):
+#    Healthy ✓ · Connecting … · Attention ! · No-runway ⊘"
+#
+# So the arrowhead is part of the SHARED chassis on ALL FOUR ("the arrowhead is the invariant
+# 'cycle' cue"), and the needle stays DROPPED ("Drop the thin needle" — the hairline was predicted
+# to die at bar size). Both were briefly violated in this branch (arrowhead demoted to healthy-only,
+# healthy re-drawn as a needle) while the glyphs were mis-diagnosed as failing their distinctness
+# falsifier — that verdict was a RENDER bug (see the fills-never-strokes warning above), not a
+# design failure, so the deviation had no basis and is reverted here. Any future divergence from the
+# family above must amend the hq lock FIRST, judged against a real on-device render — not a blob.
 #
 # Capsule outlines below are expanded stroke centrelines: two offset edges + a round cap (r = half
 # the weight) at each end. Given centreline p1→p2 of weight w, the four corners are p{1,2} ± (w/2)·n
 # where n is the unit normal — the literals are those corners, so re-deriving a mark means
 # re-deriving its corners (the stroke centreline is named in each comment so that stays possible).
+# A multi-segment stroke (the check) is its per-segment capsules PLUS a round-join disc at the
+# vertex — overlapping filled paths simply union, since every path is the same ink.
 #
 # ⚠ AND actool HONOURS ONLY <path> — IT SILENTLY DROPS <circle>. The second half of the same trap:
 # an earlier cut drew the dots/pivot as <circle fill=...>, which renders correctly in every browser
@@ -121,19 +137,18 @@ SVG
 # (browsers stroke, and browsers draw <circle>) — only the on-device SESSIOMETER_GLYPH_GALLERY
 # capture is a valid check. See apps/menubar/Sources/main.swift.
 #
-#   .healthy needle: (12,12)→(14.75,7.24) w=2.2 — the resting pose from src/icon.svg. NOTE: this
-#   contradicts brand-identity.md "Drop the thin needle" (predicted to die at bar size); the
-#   operator picked the needle mark on-device 2026-07-14 and it renders. Flagged, not silently kept.
-#   .connecting dots: r=1.5, centres 7.5/12/16.5 — gap ≥ radius so they never merge at Small.
-#   .attention bar: (12,5.2)→(12,13.0) w=2.7, + dot r=1.6 at (12,16.6) — gap holds the "!" apart.
-#   .noRunway X: (6.34,6.34)→(17.66,17.66) and (17.66,6.34)→(6.34,17.66), w=2.4 — the four vertices
-#   sit on the arc's r=8 centreline (the 45° diagonals), so the X reads ring-to-ring, not centred.
+#   .healthy check "✓": (8.8,12.2)→(10.8,14.4)→(15.2,9.4) w=2.4, round join at the vertex.
+#   .connecting dots "…": r=1.5, centres 7.5/12/16.5 — gap ≥ radius so they never merge at Small
+#     (the lock's one geometry tweak: r1.35→1.5, "→ 4 px @2x"); their 16 px survival is the
+#     convergent falsifier all three council lenses named.
+#   .attention "!": bar (12,7.8)→(12,13.0) w=2.4, + dot r=1.4 at (12,16.1).
+#   .noRunway slash "⊘": (8.6,8.6)→(15.4,15.4) w=2.6.
 emit_status_symbolset() {
   echo "==> status-item bar glyphs (bespoke Cycle-Gauge .symbolset — #437)"
-  emit_gauge_symbol GaugeHealthy    gauge-healthy.svg    "${GAUGE_ARROWHEAD}"'<path d="M 12.95 12.55 L 15.70 7.79 A 1.1 1.1 0 0 0 13.80 6.69 L 11.05 11.45 A 1.1 1.1 0 0 0 12.95 12.55 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/>'
+  emit_gauge_symbol GaugeHealthy    gauge-healthy.svg    '<path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/>'
   emit_gauge_symbol GaugeConnecting gauge-connecting.svg '<path d="M 6 12 A 1.5 1.5 0 1 0 9 12 A 1.5 1.5 0 1 0 6 12 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/><path d="M 15 12 A 1.5 1.5 0 1 0 18 12 A 1.5 1.5 0 1 0 15 12 Z"/>'
-  emit_gauge_symbol GaugeAttention  gauge-attention.svg  '<path d="M 10.65 5.20 L 10.65 13.00 A 1.35 1.35 0 0 0 13.35 13.00 L 13.35 5.20 A 1.35 1.35 0 0 0 10.65 5.20 Z"/><path d="M 10.4 16.6 A 1.6 1.6 0 1 0 13.6 16.6 A 1.6 1.6 0 1 0 10.4 16.6 Z"/>'
-  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 5.49 7.19 L 16.81 18.51 A 1.2 1.2 0 0 0 18.51 16.81 L 7.19 5.49 A 1.2 1.2 0 0 0 5.49 7.19 Z"/><path d="M 16.81 5.49 L 5.49 16.81 A 1.2 1.2 0 0 0 7.19 18.51 L 18.51 7.19 A 1.2 1.2 0 0 0 16.81 5.49 Z"/>'
+  emit_gauge_symbol GaugeAttention  gauge-attention.svg  '<path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/>'
+  emit_gauge_symbol GaugeNoRunway   gauge-norunway.svg   '<path d="M 7.68 9.52 L 14.48 16.32 A 1.3 1.3 0 0 0 16.32 14.48 L 9.52 7.68 A 1.3 1.3 0 0 0 7.68 9.52 Z"/>'
 }
 
 # `generate.sh symbolset` emits ONLY the bar-glyph set and exits — the one path that needs NO
