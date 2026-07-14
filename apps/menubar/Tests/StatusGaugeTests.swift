@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-// Pure tests for the status-item gauge (issue #325): the SHAPE-encoded template `NSImage` set the
-// menu-bar `NSStatusItem` renders. They pin the load-bearing gauge contract WITHOUT any AppKit UI (no
-// `NSStatusItem`, no window) so they run headless under `xcodebuild test`, exactly like the honest-
-// state / store suites:
+// Pure tests for the status-item gauge (issue #325, re-mapped to the #524 attention axis): the SHAPE-
+// encoded template `NSImage` set the menu-bar `NSStatusItem` renders. They pin the load-bearing gauge
+// contract WITHOUT any AppKit UI (no `NSStatusItem`, no window) so they run headless under `xcodebuild
+// test`, exactly like the honest-state / store suites:
 //
 //   * SHAPE encodes state — every `StatusGlyph` maps to a DISTINCT symbol (shape is the only channel a
 //     monochrome template image has; two states sharing a silhouette would be indistinguishable).
@@ -12,16 +12,27 @@
 //   * RESOLVES — every symbol actually loads on this macOS (a typo'd / unavailable name would ship a
 //     blank menu bar; pinning it here turns that into a red test and guards the macOS-13 floor).
 //   * PROVIDER-NEUTRAL — the symbols are generic geometric shapes, not any provider's mark (AC).
+//
+// The domain is now the 4-state attention axis (#524), not the pre-#524 nine connection glyphs. The
+// placeholder SF Symbols each ECHO their ratified interior mark (✓ / … / ! / ⊘); the bespoke arc-chassis
+// artwork is #437, which replaces them — so these tests assert the STATE contract (distinct, template,
+// resolves, neutral) and the placeholder→mark mapping, not the eventual bespoke silhouettes.
 
 import AppKit
 import XCTest
 
 final class StatusGaugeTests: XCTestCase {
 
-    /// Every glance state the store can emit — the domain the gauge must total over.
-    private let allGlyphs: [StatusGlyph] =
-        [.connecting, .healthy, .empty, .stale, .disconnected, .unsupported, .crashLooping,
-         .starting, .notRunning]
+    /// Every attention state the gauge must total over — the whole locked family (`CaseIterable`, so a
+    /// future 5th state, if the operator ever ratifies one, auto-joins this coverage).
+    private let allGlyphs = StatusGlyph.allCases
+
+    // MARK: - The domain is exactly the ratified 4-state attention axis (#524)
+
+    func testTheGlyphSetIsExactlyTheFourAttentionStates() {
+        XCTAssertEqual(Set(allGlyphs), Set<StatusGlyph>([.healthy, .connecting, .attention, .noRunway]),
+                       "the locked family is exactly 4 (#524) — a 5th needs operator escalation, not a code add")
+    }
 
     // MARK: - AC: shape (not color) encodes state → one distinct silhouette per glyph
 
@@ -53,11 +64,11 @@ final class StatusGaugeTests: XCTestCase {
     // MARK: - AC: no provider-specific artwork → generic geometric symbols only
 
     func testSymbolsAreProviderNeutralGeometry() {
-        // The gauge is a generic circle-family shape set; assert every symbol is one of that neutral
-        // vocabulary. A provider mark (a brand glyph / logo symbol) would not match — this fails if a
-        // future edit swaps in anything but neutral geometry. `power` (#499, not-running) is the universal
-        // IEC power glyph — generic system geometry, not any provider's mark — so it joins the vocabulary.
-        let neutralPrefixes = ["circle", "exclamationmark", "power"]
+        // The placeholder gauge is generic system geometry (a ring + interior mark, or the universal
+        // prohibition sign) — NOT any provider's brand mark. This fails if a future edit swaps in anything
+        // outside that neutral vocabulary. `nosign` is the universal ⊘ prohibition glyph (generic system
+        // geometry, like `power` was for the pre-#524 not-running), so it joins the vocabulary.
+        let neutralPrefixes = ["checkmark", "ellipsis", "exclamationmark", "nosign"]
         for glyph in allGlyphs {
             let name = StatusGauge.symbolName(for: glyph)
             XCTAssertTrue(neutralPrefixes.contains { name == $0 || name.hasPrefix($0 + ".") },
@@ -65,49 +76,40 @@ final class StatusGaugeTests: XCTestCase {
         }
     }
 
-    // MARK: - Healthy is the ONE full/solid shape; the states not to confuse with it differ
+    // MARK: - Each placeholder echoes its ratified interior mark (✓ / … / ! / ⊘)
 
-    func testHealthyIsTheSolidShapeAndDegradedStatesDiffer() {
-        // The one healthy glyph is the filled disc; connecting (forming) and disconnected (slashed) —
-        // the states most important not to mistake for healthy — are distinct silhouettes.
-        XCTAssertEqual(StatusGauge.symbolName(for: .healthy), "circle.fill")
-        XCTAssertNotEqual(StatusGauge.symbolName(for: .healthy),
-                          StatusGauge.symbolName(for: .connecting))
-        XCTAssertNotEqual(StatusGauge.symbolName(for: .healthy),
-                          StatusGauge.symbolName(for: .disconnected))
+    // Pins the placeholder→ratified-mark mapping so a #437 hand-off starts from the intended shapes, and a
+    // stray edit that swaps a mark reddens here. (These specific SF Symbol names are the D4 placeholder;
+    // #437 replaces them with the bespoke arc+arrowhead `.symbolset` — the STATE contract above is what
+    // survives that swap, this test is the placeholder pin.)
+    func testEachPlaceholderEchoesItsRatifiedMark() {
+        XCTAssertEqual(StatusGauge.symbolName(for: .healthy), "checkmark.circle", "Healthy → low check ✓")
+        XCTAssertEqual(StatusGauge.symbolName(for: .connecting), "ellipsis.circle", "Connecting → ellipsis …")
+        XCTAssertEqual(StatusGauge.symbolName(for: .attention), "exclamationmark.circle", "Attention → exclamation !")
+        XCTAssertEqual(StatusGauge.symbolName(for: .noRunway), "nosign", "No-runway → slash ⊘")
     }
 
-    // MARK: - Crash-looping (#169): a distinct fault TRIANGLE, never confused with the circle family
+    // MARK: - The load-bearing pairs must never share a silhouette
 
-    func testCrashLoopingIsADistinctFaultShape() {
-        let crash = StatusGauge.symbolName(for: .crashLooping)
-        XCTAssertEqual(crash, "exclamationmark.triangle")
-        // Distinct from healthy, and from `.unsupported` — the other marked/degraded shape.
-        XCTAssertNotEqual(crash, StatusGauge.symbolName(for: .healthy))
-        XCTAssertNotEqual(crash, StatusGauge.symbolName(for: .unsupported),
-                          "crash-looping (triangle) must not read as version-skew (circle)")
-        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .crashLooping), "crash-looping")
+    // The states most consequential not to confuse: Healthy (ignore me) vs No-runway (act now) — the two
+    // poles of the fleet verdict, and the ✓/⊘ diagonal-stroke pair the design record flags — and Healthy
+    // vs Attention (a fault). A shared shape on any of these would be a glance-surface honesty failure.
+    func testTheConsequentialPairsAreDistinctShapes() {
+        let healthy = StatusGauge.symbolName(for: .healthy)
+        XCTAssertNotEqual(healthy, StatusGauge.symbolName(for: .noRunway),
+                          "Healthy and No-runway are opposite verdicts — they must not share a shape")
+        XCTAssertNotEqual(healthy, StatusGauge.symbolName(for: .attention),
+                          "Healthy and Attention must not share a shape")
+        XCTAssertNotEqual(healthy, StatusGauge.symbolName(for: .connecting),
+                          "Healthy and Connecting must not share a shape")
     }
 
-    // MARK: - #499: starting and not-running are distinct daemon-absent shapes
+    // MARK: - The icon-layer a11y description names the attention state
 
-    // The AC's visual-distinctness requirement at the glyph layer: starting (forming) and not-running
-    // (power) are distinct from EACH OTHER and — the load-bearing pair — from the socket-dropped
-    // (`.disconnected`) and stale silhouettes, so a not-running daemon never reads as a dropped socket.
-    func testStartingAndNotRunningAreDistinctFromEachOtherAndFromDroppedAndStale() {
-        let starting = StatusGauge.symbolName(for: .starting)
-        let notRunning = StatusGauge.symbolName(for: .notRunning)
-        let dropped = StatusGauge.symbolName(for: .disconnected)
-        let stale = StatusGauge.symbolName(for: .stale)
-        XCTAssertNotEqual(starting, notRunning, "starting and not-running need distinct shapes")
-        for other in [dropped, stale] {
-            XCTAssertNotEqual(starting, other, "starting must not read as socket-dropped / stale")
-            XCTAssertNotEqual(notRunning, other, "not-running must not read as socket-dropped / stale")
-        }
-        // Neither is the healthy disc.
-        XCTAssertNotEqual(starting, StatusGauge.symbolName(for: .healthy))
-        XCTAssertNotEqual(notRunning, StatusGauge.symbolName(for: .healthy))
-        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .starting), "starting")
-        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .notRunning), "not running")
+    func testAccessibilityDescriptionsNameTheAttentionState() {
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .healthy), "healthy")
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .connecting), "connecting")
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .attention), "attention")
+        XCTAssertEqual(StatusGauge.accessibilityDescription(for: .noRunway), "no runway")
     }
 }

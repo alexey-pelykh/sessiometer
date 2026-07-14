@@ -114,68 +114,140 @@ enum ConnectionState: Equatable, Sendable {
 
 // MARK: - Presentation (the glance surface the status item consumes)
 
-/// The abstract glance glyph — a SHAPE-coded health signal, decoupled from any concrete SF Symbol
-/// (that mapping is status-item rendering, later UI). One-to-one with `ConnectionState` for the D2
-/// baseline; kept a separate type so #169 can grow per-account health/attention glyphs without
-/// touching the connection semantics.
-enum StatusGlyph: Equatable, Sendable {
-    case connecting
-    /// The ONE healthy glyph — emitted only for `ConnectionState.connected`.
+/// The abstract glance glyph — the menu bar's **4-state ATTENTION axis** (issue #524), SHAPE-coded and
+/// decoupled from any concrete SF Symbol (that mapping is `StatusGauge`; the bespoke artwork is #437).
+///
+/// This is deliberately NOT one-to-one with `ConnectionState`. The pre-#524 set was — and was therefore
+/// **mis-axed**: it answered *"what is the socket doing?"*, enumerating nine connection topologies onto
+/// nine silhouettes, when the only question a ~16 pt monochrome glance can afford to answer is the
+/// operator's — **"do I need to act, and can I trust what it shows?"**. The nine `ConnectionState` cases
+/// are now INPUTS to this axis, not glyphs of their own (#524 AC).
+///
+/// | Case | Meaning | Ratified interior mark |
+/// |---|---|---|
+/// | `.healthy` | alive ∧ fresh — ignore me | a low check `✓` |
+/// | `.connecting` | can't vouch yet — self-resolving | an ellipsis `…` |
+/// | `.attention` | act at your next break | an exclamation `!` |
+/// | `.noRunway` | the tool can't keep you working — act now | a slash `⊘` |
+///
+/// The taxonomy is operator-ratified and LOCKED (two design councils, 2026-07-14): a FIFTH state is an
+/// operator call, not a code call. `.attention` is a deliberate COLLAPSE BUCKET — the glyph does not
+/// disambiguate *which* fault; that is one click away in the panel (and, for VoiceOver, not even that:
+/// `PresentationState.accessibilityLabel` keeps the per-input sentence the glyph collapses).
+enum StatusGlyph: Equatable, Sendable, CaseIterable {
+    /// The ONE healthy glyph. GATED: emitted only when BOTH "alive" AND "fresh" are positively verified
+    /// AND the fleet has runway — i.e. `ConnectionState.connected` (which structurally already implies a
+    /// live connection, a fresh schema-supported snapshot, and ≥ 1 account) with no `noViableTarget`.
+    /// Never a default, never a fallback — the glance-surface analogue of the anti-#137 discipline.
     case healthy
-    case empty
-    case stale
-    case disconnected
-    case unsupported
-    /// The crash-loop FAULT glyph (issue #169) — a persistent fault shape, emitted for
-    /// `ConnectionState.crashLooping`; never the healthy glyph.
-    case crashLooping
-    /// The daemon-starting forming glyph (issue #499) — a STATIC "coming up" shape emitted for
-    /// `ConnectionState.starting` (never a fake spinner; the app fakes no progress). A benign forming
-    /// glance, never healthy.
-    case starting
-    /// The daemon-not-running glyph (issue #499) — a distinct "no daemon" shape emitted for
-    /// `ConnectionState.notRunning`; never healthy, and distinct from `.disconnected` (a dropped socket).
-    case notRunning
+    /// Honest uncertainty: we cannot vouch for the data YET, and the state is expected to resolve with no
+    /// operator action. Load-bearing property: only states whose self-resolution is BOUNDED belong here
+    /// (`.connecting` is superseded by the next frame; `.starting` is bounded by the start grace, which
+    /// escalates to `.notRunning`). An UNBOUNDED "…" would be a promise the app cannot keep.
+    case connecting
+    /// The collapse bucket: the tool needs something from the operator, and it is not urgent. Ratified
+    /// members reachable from this axis: version-skew (`.unsupported`) and crash-loop (`.crashLooping`),
+    /// plus the daemon-liveness faults that cannot self-resolve (`.stale`, `.disconnected`, `.notRunning`)
+    /// and the un-configured tool (`.emptyRoster`). The other two ratified members — relogin and
+    /// keychain-locked — are daemon-level PAYLOAD faults that do not flow through `ConnectionState`; they
+    /// are issue #520's, not this axis's.
+    case attention
+    /// The no-runway state (issue #524, new — no prior model carried it): the fleet has NO viable swap
+    /// target left, so the tool cannot keep the operator working. GATED exactly as `.healthy` is — it is
+    /// the other pole of the same fleet verdict, so it requires the same fresh, vouched evidence. (Quota
+    /// reaches the bar at exactly this one point; a resting quota level is the daemon's job, never a glyph.)
+    case noRunway
 }
 
 /// What the status item renders: the glance `glyph` plus a VoiceOver `accessibilityLabel`. The label
 /// is a plain, factual sentence (design-menubar a11y: shape-coded glyph + a spoken label per state).
+///
+/// The two channels carry DIFFERENT resolutions, by design: the `glyph` collapses to the ratified 4
+/// (a ~16 pt monochrome silhouette can carry no more), while the `accessibilityLabel` stays specific to
+/// the originating `ConnectionState` — VoiceOver is not shape-constrained, so collapsing it too would
+/// discard honesty the surface can afford to keep.
 struct PresentationState: Equatable, Sendable {
     let glyph: StatusGlyph
     let accessibilityLabel: String
 
-    /// Derive the glance from a connection state (+ the account count, which the `.connected` label
-    /// speaks). Pure — the same input always yields the same presentation.
-    static func make(for state: ConnectionState, accountCount: Int) -> PresentationState {
+    /// Project a connection state onto the attention axis (issue #524).
+    ///
+    /// The rule is two-tier, and it is what makes gated-Healthy STRUCTURAL rather than conventional:
+    ///
+    ///   1. **Vouched?** (`.connected` — live ∧ fresh ∧ schema-supported ∧ ≥ 1 account) → the FLEET
+    ///      speaks: `.noRunway` when it has no viable target left, else `.healthy`. These are the two
+    ///      poles of one verdict, so they share one evidence bar.
+    ///   2. **Not vouched?** → the CONNECTION speaks, and it may only claim what it can observe:
+    ///      `.connecting` while self-resolution is BOUNDED, `.attention` otherwise.
+    ///
+    /// Two consequences worth naming, because they are the reason the rule is shaped this way:
+    ///
+    ///   * A fleet verdict is never rendered off data we cannot vouch for. Retained `noViableTarget` on
+    ///     a `.stale` / `.disconnected` roster does NOT reach the bar: quota is the one thing that moves
+    ///     while we are not looking, and (absent a swap) it moves UP — so `⊘` off a retained bit would
+    ///     shout "act now" about a problem that has most likely already resolved, and would misdirect the
+    ///     remedy (on a dropped socket the actionable problem is always the socket). The panel still shows
+    ///     the retained value, marked stale — bar = vouched verdict, panel = attributed record. This
+    ///     mirrors `AccountEventNotifier`, which likewise derives `.allExhausted` ONLY from `.connected`.
+    ///   * `.emptyRoster` cannot be `.healthy`, even though it IS alive ∧ fresh. "Zero accounts are fine"
+    ///     is a gate passing on a degenerate subject — vacuously true, not meaningfully true — and
+    ///     `.healthy` means "ignore me", which is false for a tool that is doing nothing. It fails tier 1
+    ///     on cardinality (structurally: `.connected` requires a non-empty roster) and falls to tier 2,
+    ///     where it cannot self-resolve without the operator → `.attention` ("add your first account" is
+    ///     precisely a next-break task). The same cardinality argument kills a vacuous `.noRunway` there.
+    ///
+    /// Pure and total — the same input always yields the same presentation, and the exhaustive `switch`
+    /// (no `default:`) makes the compiler, not a reviewer, the check that every input has a home.
+    static func make(for state: ConnectionState,
+                     accountCount: Int,
+                     hasNoViableTarget: Bool = false) -> PresentationState {
         switch state {
-        case .connecting:
-            return PresentationState(glyph: .connecting,
-                                     accessibilityLabel: "Sessiometer: connecting to the daemon…")
         case .connected:
+            // TIER 1 — vouched: the fleet speaks. The sole healthy path, and the sole no-runway path.
+            if hasNoViableTarget {
+                return PresentationState(glyph: .noRunway,
+                                         accessibilityLabel: "Sessiometer: no account has capacity right now — action needed")
+            }
             let plural = accountCount == 1 ? "" : "s"
             return PresentationState(glyph: .healthy,
                                      accessibilityLabel: "Sessiometer: live — \(accountCount) account\(plural)")
-        case .emptyRoster:
-            return PresentationState(glyph: .empty,
-                                     accessibilityLabel: "Sessiometer: connected — no accounts configured")
+
+        // TIER 2 — not vouched: the connection speaks. BOUNDED self-resolution → the honest-unknown "…".
+        case .connecting:
+            return PresentationState(glyph: .connecting,
+                                     accessibilityLabel: "Sessiometer: connecting to the daemon…")
+        case .starting:
+            return PresentationState(glyph: .connecting,
+                                     accessibilityLabel: "Sessiometer: the daemon is starting…")
+
+        // TIER 2 — not vouched, and NOT self-resolving: the operator is needed → the collapse bucket.
+        // `.stale` and `.disconnected` land here rather than under "…" because neither is pre-verdict:
+        // `.stale` is reached only AFTER the 32 s liveness window has already elapsed with no valid frame
+        // (the debounce has run — it is a verdict, not a wait), and a `.disconnected` daemon that never
+        // returns parks here indefinitely (a warm drop does not escalate — `hasEverConnected` is set once
+        // and never cleared), which an unbounded "…" would misreport as "hold on, self-resolving" forever.
+        // Since this daemon is launched by hand (no launchd relaunch), that dead-forever case is ordinary,
+        // not exotic — so the honest failure mode here is LOUD, not silent. See issue #526: adding a warm
+        // dwell escalation would let a routine restart ride under "…" and reserve "!" for the durable
+        // case; it is gated on a sleep/wake falsifier and is deliberately NOT this item's scope.
         case .stale:
-            return PresentationState(glyph: .stale,
+            return PresentationState(glyph: .attention,
                                      accessibilityLabel: "Sessiometer: data may be stale — the daemon has gone quiet")
         case .disconnected:
-            return PresentationState(glyph: .disconnected,
+            return PresentationState(glyph: .attention,
                                      accessibilityLabel: "Sessiometer: disconnected — the daemon is not responding")
+        case .notRunning:
+            return PresentationState(glyph: .attention,
+                                     accessibilityLabel: "Sessiometer: the daemon is not running")
+        case .emptyRoster:
+            return PresentationState(glyph: .attention,
+                                     accessibilityLabel: "Sessiometer: connected — no accounts configured")
         case .unsupported:
-            return PresentationState(glyph: .unsupported,
+            return PresentationState(glyph: .attention,
                                      accessibilityLabel: "Sessiometer: daemon version unsupported — update required")
         case .crashLooping:
-            return PresentationState(glyph: .crashLooping,
+            return PresentationState(glyph: .attention,
                                      accessibilityLabel: "Sessiometer: the daemon is restarting repeatedly — holding status until it stays up")
-        case .starting:
-            return PresentationState(glyph: .starting,
-                                     accessibilityLabel: "Sessiometer: the daemon is starting…")
-        case .notRunning:
-            return PresentationState(glyph: .notRunning,
-                                     accessibilityLabel: "Sessiometer: the daemon is not running")
         }
     }
 }
@@ -428,9 +500,23 @@ struct HonestStateMachine {
         }
     }
 
-    /// The glance presentation derived from the current state.
+    /// The glance presentation derived from the current state (issue #524). `hasNoViableTarget` is read
+    /// from the retained `nextSwap`, but `PresentationState.make` only lets it reach the `.noRunway` glyph
+    /// on a vouched `.connected` snapshot — so a `noViableTarget` retained under a `.stale` / `.disconnected`
+    /// render is carried here yet correctly ignored by the projection (the panel still shows it, marked
+    /// stale). Mirrors `AccountEventNotifier.isNoViableTarget`.
     var presentation: PresentationState {
-        PresentationState.make(for: connectionState, accountCount: rows.count)
+        PresentationState.make(for: connectionState,
+                               accountCount: rows.count,
+                               hasNoViableTarget: hasNoViableTarget)
+    }
+
+    /// Whether the retained `nextSwap` reports the fleet has no viable swap target left — the
+    /// `.noRunway` input (issue #524). A pure read of the last applied snapshot's `nextSwap`; the
+    /// vouched-data gate lives in `PresentationState.make`, not here.
+    private var hasNoViableTarget: Bool {
+        if case .noViableTarget = nextSwap { return true }
+        return false
     }
 
     /// Fold one transport event into the state. Returns the `LineOutcome` for a `.line` event (so the

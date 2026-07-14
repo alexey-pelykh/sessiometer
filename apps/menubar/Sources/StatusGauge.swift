@@ -13,9 +13,11 @@
 // image — shape, not color"). Because the images are `isTemplate = true`, they tint correctly in
 // light AND dark menu bars for free.
 //
-// D4 (functional placeholder): the shapes are generic SF Symbols — a coherent circle-gauge family
-// plus a marked / slashed variant per degraded state — NOT any provider's mark (AC: "a generic gauge,
-// not any provider's mark"). Bespoke artwork is a follow-up; these are correct, distinct, and neutral.
+// D4 (functional placeholder): the shapes are generic SF Symbols — a coherent circle-gauge family, one
+// per attention state — NOT any provider's mark (AC: "a generic gauge, not any provider's mark"). Each
+// placeholder is chosen to ECHO its ratified interior mark (✓ / … / ! / ⊘) so it telegraphs the eventual
+// bespoke design; the bespoke arc+arrowhead `.symbolset` is issue #437, which replaces these — this item
+// (#524) owns only WHICH states exist, not the artwork.
 
 import AppKit
 
@@ -23,39 +25,26 @@ import AppKit
 /// namespace of pure functions, like `SocketPathResolver`), so there is nothing to instantiate.
 enum StatusGauge {
 
-    /// The SF Symbol whose SHAPE encodes each glance state — one DISTINCT silhouette per glyph so the
-    /// state is legible from shape alone under monochrome template tinting:
+    /// The SF Symbol whose SHAPE encodes each attention state (issue #524) — one DISTINCT silhouette per
+    /// glyph so the state is legible from shape alone under monochrome template tinting. Each placeholder
+    /// echoes the ratified interior mark it stands in for:
     ///
-    ///   * `.connecting`   → `circle.dashed`            — a forming / indeterminate ring (hollow, dashed)
-    ///   * `.healthy`      → `circle.fill`              — a full, solid disc (the ONE healthy shape)
-    ///   * `.empty`        → `circle`                   — a hollow ring: present, but zero accounts
-    ///   * `.stale`        → `circle.bottomhalf.filled` — a half-filled disc: data fading / may be frozen
-    ///   * `.disconnected` → `circle.slash`             — a slashed ring: the daemon is absent
-    ///   * `.unsupported`  → `exclamationmark.circle`   — a marked ring: numbers refused (version skew)
-    ///   * `.crashLooping` → `exclamationmark.triangle` — a fault TRIANGLE (distinct from the circle
-    ///                                                     family): the daemon keeps restarting (#169)
+    ///   * `.healthy`    → `checkmark.circle`      — a low check `✓` in a ring: alive ∧ fresh, ignore me
+    ///   * `.connecting` → `ellipsis.circle`       — an ellipsis `…` in a ring: can't vouch yet, self-resolving
+    ///   * `.attention`  → `exclamationmark.circle` — an exclamation `!` in a ring: act at your next break
+    ///   * `.noRunway`   → `nosign`                 — a slash `⊘`: the tool can't keep you working, act now
     ///
-    /// All are generic geometric system symbols (provider-neutral) shipped since macOS ≤ 12, so they
-    /// resolve on the app's macOS 13 floor. Pure and total — every `StatusGlyph` maps (checked in tests).
-    ///
-    /// D4 legibility trade-off (deferred): `.connecting` (dashed ring) and `.empty` (thin ring) read
-    /// similarly at ~16 pt — acceptable here because both are benign non-alarming states (neither is
-    /// healthy nor broken); the load-bearing distinctions (full disc = healthy, slash = disconnected,
-    /// marked = degraded) stay strong. Sharper bespoke silhouettes are the artwork follow-up.
+    /// All are generic geometric system symbols (provider-neutral) shipped since macOS 11, so they resolve
+    /// on the app's macOS 13 floor. Pure and total — every `StatusGlyph` maps (checked exhaustively in
+    /// tests). `.noRunway`'s complete slashed ring (`nosign`) is the boldest, most unambiguous "blocked"
+    /// silhouette and the one least confusable with the `.healthy` check at ~16 pt (the ✓/⊘ diagonal-stroke
+    /// collision the design record flags for the bespoke chassis — a #437 on-device falsifier).
     static func symbolName(for glyph: StatusGlyph) -> String {
         switch glyph {
-        case .connecting:   return "circle.dashed"
-        case .healthy:      return "circle.fill"
-        case .empty:        return "circle"
-        case .stale:        return "circle.bottomhalf.filled"
-        case .disconnected: return "circle.slash"
-        case .unsupported:  return "exclamationmark.circle"
-        case .crashLooping: return "exclamationmark.triangle"
-        // #499: a STATIC forming ring for daemon-starting (distinct from connecting's dashed ring — both
-        // benign "coming up" shapes) and the universal power glyph for not-running (a distinct silhouette
-        // from the slashed disconnected ring — "the daemon is off; start it").
-        case .starting:     return "circle.dotted"
-        case .notRunning:   return "power"
+        case .healthy:    return "checkmark.circle"
+        case .connecting: return "ellipsis.circle"
+        case .attention:  return "exclamationmark.circle"
+        case .noRunway:   return "nosign"
         }
     }
 
@@ -77,19 +66,15 @@ enum StatusGauge {
         return fallbackRing(accessibilityDescription: description)
     }
 
-    /// A terse icon-layer description (VoiceOver reads the button's full label; this labels the image
-    /// itself for any tooling that inspects it). Provider-neutral by construction.
+    /// A terse icon-layer description naming the ATTENTION state (issue #524) — VoiceOver reads the
+    /// button's full per-input label (`PresentationState.accessibilityLabel`), so this labels only the
+    /// image itself for tooling that inspects it. Provider-neutral by construction.
     static func accessibilityDescription(for glyph: StatusGlyph) -> String {
         switch glyph {
-        case .connecting:   return "connecting"
-        case .healthy:      return "healthy"
-        case .empty:        return "no accounts"
-        case .stale:        return "stale"
-        case .disconnected: return "disconnected"
-        case .unsupported:  return "unsupported"
-        case .crashLooping: return "crash-looping"
-        case .starting:     return "starting"
-        case .notRunning:   return "not running"
+        case .healthy:    return "healthy"
+        case .connecting: return "connecting"
+        case .attention:  return "attention"
+        case .noRunway:   return "no runway"
         }
     }
 

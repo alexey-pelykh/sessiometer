@@ -66,8 +66,9 @@ final class WatchStatusStoreTests: XCTestCase {
         try await waitForGlyph(recorder, .healthy)
 
         continuation.yield(.disconnected(reason: "connection closed (EOF)"))
-        try await waitForGlyph(recorder, .disconnected)
+        try await waitForGlyph(recorder, .attention)   // #524: a warm drop collapses to the attention glyph
 
+        XCTAssertEqual(store.connectionState, .disconnected(reason: "connection closed (EOF)"))
         XCTAssertFalse(store.connectionState.isHealthy)
         XCTAssertEqual(store.rows.count, 1, "last-good rows retained for a dimmed render")
 
@@ -82,7 +83,7 @@ final class WatchStatusStoreTests: XCTestCase {
         continuation.yield(.line(#"{"error":"unknown command"}"#))  // pre-#164 daemon, no snapshot
         continuation.yield(.stale)
 
-        try await waitForGlyph(recorder, .stale)
+        try await waitForGlyph(recorder, .attention)   // #524: stale collapses to the attention glyph
         XCTAssertEqual(store.connectionState, .stale)
         XCTAssertFalse(store.connectionState.isHealthy)
         XCTAssertTrue(store.rows.isEmpty)
@@ -134,7 +135,7 @@ final class WatchStatusStoreTests: XCTestCase {
         }
 
         // The store's valid-frame watchdog trips ~one window after the snapshot, DESPITE the garbage.
-        try await waitForGlyph(recorder, .stale)
+        try await waitForGlyph(recorder, .attention)   // #524: stale collapses to the attention glyph
         XCTAssertEqual(store.connectionState, .stale)
         XCTAssertFalse(store.connectionState.isHealthy, "never healthy on a garbage-emitting daemon")
 
@@ -156,11 +157,11 @@ final class WatchStatusStoreTests: XCTestCase {
         continuation.yield(.connected)
         continuation.yield(.line(Fixtures.snapshotBasic))
         try await waitForGlyph(recorder, .healthy)
-        try await waitForGlyph(recorder, .stale)           // watchdog trips on the now-silent connection
+        try await waitForGlyph(recorder, .attention)       // watchdog trips (stale → attention, #524)
 
         continuation.yield(.line(Fixtures.heartbeatBasic)) // a valid beat un-stales AND re-arms
         try await waitForGlyph(recorder, .healthy)
-        try await waitForGlyph(recorder, .stale)           // the re-armed watchdog trips again
+        try await waitForGlyph(recorder, .attention)       // the re-armed watchdog trips again (#524)
 
         continuation.finish()
     }
@@ -197,7 +198,7 @@ final class WatchStatusStoreTests: XCTestCase {
 
         // Drop, then reconnect + a fresh snapshot: the debounce holds it (never an immediate flash).
         continuation.yield(.disconnected(reason: "EOF"))
-        try await waitForGlyph(recorder, .disconnected)
+        try await waitForGlyph(recorder, .attention)   // #524: a warm drop collapses to the attention glyph
         let armed = ContinuousClock.now
         continuation.yield(.connected)
         continuation.yield(.line(Fixtures.snapshotBasic))
@@ -230,13 +231,17 @@ final class WatchStatusStoreTests: XCTestCase {
         // Daemon absent at launch: the transport refuses the connect and emits `.disconnected` with no
         // prior `.connected`. The store shows the transient starting glance first…
         continuation.yield(.disconnected(reason: "connect refused"))
-        try await waitForGlyph(recorder, .starting)
-        XCTAssertEqual(store.connectionState, .starting)
+        // #524: `.starting` now shares the `.connecting` glyph with the initial state, so a glyph barrier
+        // would race the initial `.connecting`; wait on the precise connection-state axis instead.
+        try await waitForConnectionState(store, .starting)
+        XCTAssertEqual(store.currentPresentation.glyph, .connecting,
+                       "#524: starting projects onto the connecting '…' glyph")
         XCTAssertFalse(store.connectionState.isHealthy)
 
         // …then the start grace elapses still refused → the store escalates itself to not-running.
-        try await waitForGlyph(recorder, .notRunning)
-        XCTAssertEqual(store.connectionState, .notRunning)
+        try await waitForConnectionState(store, .notRunning)
+        XCTAssertEqual(store.currentPresentation.glyph, .attention,
+                       "#524: not-running collapses to the attention glyph")
         XCTAssertFalse(store.connectionState.isHealthy, "an absent daemon is never healthy")
 
         continuation.finish()
@@ -252,7 +257,7 @@ final class WatchStatusStoreTests: XCTestCase {
         store.start(consuming: events)
 
         continuation.yield(.disconnected(reason: "connect refused"))
-        try await waitForGlyph(recorder, .starting)
+        try await waitForConnectionState(store, .starting)   // #524: starting shares connecting's glyph
         // The daemon comes up well within the grace → connect + snapshot → healthy.
         continuation.yield(.connected)
         continuation.yield(.line(Fixtures.snapshotBasic))
@@ -297,6 +302,20 @@ final class WatchStatusStoreTests: XCTestCase {
             if presentation.glyph == glyph { return }
         }
         XCTFail("timed out waiting for glyph \(glyph)", file: file, line: line)
+    }
+
+    /// Await until the store reaches `state` on the precise CONNECTION axis (issue #524). Needed where the
+    /// 4-state glyph projection is lossy — `.starting` shares the `.connecting` "…" glyph with the initial
+    /// state, so a glyph barrier would race the initial glance; polling the connection state disambiguates.
+    /// The store is `@MainActor` (as is this test class), so the read is main-actor-isolated by inheritance.
+    private func waitForConnectionState(_ store: WatchStatusStore, _ state: ConnectionState,
+                                        file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while ContinuousClock.now < deadline {
+            if store.connectionState == state { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("timed out waiting for connection state \(state)", file: file, line: line)
     }
 }
 
