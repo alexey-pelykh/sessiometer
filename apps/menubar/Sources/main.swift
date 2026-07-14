@@ -47,6 +47,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             exit(0)
         }
 
+        // Bar-glyph render-parity tooling (issue #525): `--render-bar-glyphs <dir>` renders every status-
+        // item glyph — template-tinted, per appearance, @1x + @2x, plus the menu-open inverted state — to
+        // committable PNGs the parity gate diffs against, then exits. Like `--render-panel` it never wires
+        // the status item; unlike the panel it exists because `NSStatusItem` template tinting is applied by
+        // the system and is invisible to SwiftUI `ImageRenderer`.
+        if let idx = CommandLine.arguments.firstIndex(of: "--render-bar-glyphs"),
+           idx + 1 < CommandLine.arguments.count {
+            RenderBarGlyphTool.run(outputDir: CommandLine.arguments[idx + 1])
+            exit(0)
+        }
+
         // Glyph-gallery harness (issue #437): `SESSIOMETER_GLYPH_GALLERY=1` installs one real menu-bar
         // status item per StatusGlyph — the four bespoke template gauges side by side — and wires nothing
         // else (no daemon, no transport). It exists so #437's PRIORITY-1 falsifier — shape-distinctness at

@@ -185,3 +185,40 @@ SESSIOMETER_GLYPH_GALLERY=1 "$BIN"        # then screenshot the menu bar; needs 
 
 By design the shared chassis owns most of the ink, so the four glyphs are close in silhouette at bar size —
 whether that is legible enough is the operator's on-device call, not something this proxy decides.
+
+### Bar-glyph render-parity (#525)
+
+The preview above is an artwork reference; the **render-parity pass** below is the automated gate. It
+renders each bar glyph as it actually appears in the menu bar — the AppKit **template tinting** that the
+system applies and that `RenderPanelTool` / SwiftUI `ImageRenderer` cannot capture — and diffs the fresh
+renders against committed references so the set stays green as the mark / geometry evolves.
+
+Three tint **contexts** × four glyphs × {@1x, @2x} = **24** references under `renders/bar-glyphs/`
+(`bar-<glyph>-<context>@<scale>x.png`):
+
+- **light** — `labelColor` (near-black) on a light bar;
+- **dark** — `labelColor` (near-white) on a dark bar;
+- **menuOpen** — the inverted highlight: `selectedMenuItemTextColor` (white) over the pinned accent.
+
+<img src="renders/bar-glyphs/bar-healthy-light@2x.png" width="48"> <img src="renders/bar-glyphs/bar-healthy-dark@2x.png" width="48"> <img src="renders/bar-glyphs/bar-healthy-menuOpen@2x.png" width="48"> — healthy, the three contexts @2x (the other three glyphs mirror this).
+
+Regenerate the references with a DEBUG-only tool (`RenderBarGlyphTool`, wired in `AppDelegate` beside
+`--render-panel`). Unlike the panel renderer it needs no windowserver — `NSBitmapImageRep` + `NSImage.draw`
+rasterize a custom symbol headless — but it runs inside the app so `Bundle.main` carries the compiled
+catalog:
+
+```sh
+# from apps/menubar, after a Debug build (xcodegen generate && xcodebuild build -scheme Menubar …)
+BIN=".build/xcode/Build/Products/Debug/Sessiometer.app/Contents/MacOS/Sessiometer"
+"$BIN" --render-bar-glyphs "$PWD/design/renders/bar-glyphs"
+```
+
+These renders carry **no account data** (they are bare glyphs), so — unlike the status *panel* captures,
+which show real account emails and must never be committed — they are safe to commit, and are.
+
+The drift gate is `Tests/BarGlyphParityTests` (CI-enforced under the `swift` job, headless): it re-renders
+every cell and asserts each matches its reference, that the four glyphs stay pairwise distinct in every
+context (the inherited #437 shape-distinctness check, now automated — including the risky **light** /
+black-ink case), and that a deliberately perturbed render trips the gate (a golden test that cannot fail is
+not evidence). If a shape change is intentional, regenerate the references with the command above and
+re-eyeball them before committing — a reference you have not looked at is not a reference.

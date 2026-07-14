@@ -90,6 +90,16 @@ targets:
       # StatusItemController/StatusPanelView/main.swift — those touch NSStatusBar/AppKit UI that a
       # headless logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
       - path: Sources/StatusGauge.swift
+      # Bar-glyph render-parity renderer (#525): the pure template-tint + explicit-pixel-size raster factory
+      # `BarGlyphParityTests` drives (NOT RenderBarGlyphTool.swift — that touches CommandLine/exit app-tool
+      # surface; the renderer itself is pure AppKit drawing that runs headless). Compiled here so the drift
+      # gate re-renders the glyphs in-process and diffs against the committed references.
+      - path: Sources/BarGlyphRenderer.swift
+      # The compiled asset catalog (#525): the bar-glyph parity gate resolves the REAL bespoke `.symbolset`s
+      # via `StatusGauge.image(for:in:)` against THIS bundle — `NSImage(named:)` would swallow them into the
+      # fallbackRing here (the logic-test bundle's `Bundle.main` is the xctest runner, not the catalog).
+      # actool compiles it into `MenubarTests.xctest/Contents/Resources/Assets.car`.
+      - path: Sources/Assets.xcassets
       # Status-panel format (#326): the pure, `src/cli.rs`-mirroring presentation layer (health/reset/pct).
       # Added here (NOT StatusPanelView.swift/main.swift — SwiftUI/AppKit the headless bundle can't drive)
       # so the byte-parity contract with the Rust `status` verb is tested in isolation.
