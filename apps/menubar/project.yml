@@ -35,6 +35,11 @@ targets:
         # resolve to `Assets.xcassets/AccentColor` (#007aff light / #0a84ff dark) instead of the user's
         # macOS system accent, so a non-blue system accent can't drift the panel hue off the design mock.
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # Ship the bespoke full-color app icon (#438): the asset compiler resolves `Assets.xcassets/AppIcon`
+        # (the 10-size mac AppIcon set generated from the brand SSOT `brand/generate.sh`, #442) and sets
+        # `CFBundleIconName`, so the app shows the Cycle-Gauge icon in Dock / Finder / About. Full color is
+        # correct on these surfaces — unlike the monochrome menu-bar status-item template glyphs (#325/#437).
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
   # Wire-decoder (#322) + socket-transport (#323) + status-store (#324) unit tests. A STANDALONE
   # logic-test bundle: no TEST_HOST, so it never launches the app — it compiles the pure production
   # sources directly alongside the tests (NOT the whole Sources dir: main.swift is the app's
