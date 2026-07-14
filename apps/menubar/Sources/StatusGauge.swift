@@ -75,9 +75,24 @@ enum StatusGauge {
     /// in the app's `Assets.xcassets` (name↔asset match pinned by a unit test) — draw a generic ring rather
     /// than hand the status bar a `nil` image (a blank menu-bar item is a worse failure than a plain shape).
     /// The primary path is always the bespoke symbol.
-    static func image(for glyph: StatusGlyph) -> NSImage {
+    ///
+    /// `bundle`: the asset catalog to resolve the custom symbol from. The app passes `nil` (the default) →
+    /// `NSImage(named:)`, which searches `Bundle.main` (the running app, whose compiled catalog carries the
+    /// symbols) — the production path, byte-identical to before this parameter existed. The render-parity
+    /// gate (issue #525, `BarGlyphParityTests`) passes its OWN test bundle so the SAME configuration path
+    /// (point size, `isTemplate`) resolves the real symbols in the standalone logic-test bundle, whose
+    /// `Bundle.main` is the xctest runner (not the catalog); `NSImage(named:)` there would swallow every
+    /// symbol into the `fallbackRing`. `imageForResource:` reads the catalog compiled into the given bundle.
+    static func image(for glyph: StatusGlyph, in bundle: Bundle? = nil) -> NSImage {
         let description = accessibilityDescription(for: glyph)
-        if let symbol = NSImage(named: assetName(for: glyph)) {
+        let name = assetName(for: glyph)
+        let resolved: NSImage?
+        if let bundle {
+            resolved = bundle.image(forResource: NSImage.Name(name))
+        } else {
+            resolved = NSImage(named: name)
+        }
+        if let symbol = resolved {
             let configuration = NSImage.SymbolConfiguration(pointSize: barPointSize, weight: .regular)
             let sized = symbol.withSymbolConfiguration(configuration) ?? symbol
             sized.isTemplate = true
