@@ -21,17 +21,18 @@ CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 # --- Locked design tokens (see brand/README.md) -----------------------------
 MARK_BONE="#EDE8DF"          # resting mark on the warm-graphite body
-GLYPH_INK="#1D1D1F"          # resting menu-bar glyph (template; macOS tints it)
 
 NEEDLE_RESTING="M12 12 14.75 7.24"
 NEEDLE_HEALTHY="M12 12 8.18 8.18"     # full
 NEEDLE_WARNING="M12 12 12 6.6"        # half
 NEEDLE_CRITICAL="M12 12 15.82 8.18"   # redline
 
-# Vivid set — controlled tile (Dock, README, DMG, Homebrew)
+# Vivid set — controlled tile (Dock, README, DMG, Homebrew) + the colour app icon.
+# There is no contrast-darkened companion set any more: it existed SOLELY for the
+# free-standing COLOUR menu-bar glyph, retired in #439. The bar is a monochrome
+# template now (the bespoke `.symbolset` family below, #437/#524), and a template
+# is system-tinted — so it needs no contrast set of its own.
 V_HEALTHY="#30D158"; V_WARNING="#FF9F0A"; V_CRITICAL="#FF453A"; V_SWAP="#0A84FF"
-# Contrast-darkened set — free-standing menu-bar glyph (clears 3:1 on any bar)
-D_HEALTHY="#248A3D"; D_WARNING="#9A6A00"; D_CRITICAL="#FF3B30"; D_SWAP="#007AFF"
 
 # --- Bespoke bar-glyph .symbolset set (issue #437) --------------------------
 # The menu-bar status item's four attention-state glyphs (#524: healthy / connecting /
@@ -235,37 +236,20 @@ for pair in "_ih:icon-healthy" "_iw:icon-warning" "_ic:icon-critical" "_is:icon-
 done
 cp "${DIST}/icon_512.png" "${DIST}/icon-resting_512.png"
 
-echo "==> menu-bar glyphs (appearance-aware; needle tracks the reading)"
-# The glyph is a free-standing colored (non-template) image, so it must clear
-# contrast on the bar it sits on. Raw system green/amber measure ~2.0-2.2:1 on a
-# LIGHT bar and dissolve, so light bars get the contrast-darkened set. On a DARK
-# bar the darkened amber reads muddy-brown, so dark bars get the vivid set.
-#   -lightbar  = darkened set   -darkbar = vivid set
-# Fallback: if menu-bar appearance can't be detected (wallpaper bleed on a
-# translucent bar), ship the -lightbar set universally — it clears 3:1 at BOTH
-# luminance extremes. The RESTING glyph ships as a template image instead
-# (isTemplate = true) and macOS tints it; the two rendered variants below exist
-# for mockups/screenshots only.
-R_LIGHTBAR="${GLYPH_INK}"   # macOS renders the template near-black on a light bar
-R_DARKBAR="#E9E9EC"         #             ...and near-white on a dark bar
-
-emit_glyph() { # emit_glyph <suffix> <color> <needle>
-  derive "${SRC}/glyph.svg" "${DIST}/_g.svg" "$2" "$3" "${GLYPH_INK}"
-  rsvg-convert -w 18 -h 18 "${DIST}/_g.svg" -o "${DIST}/glyph-$1.png"
-  rsvg-convert -w 36 -h 36 "${DIST}/_g.svg" -o "${DIST}/glyph-$1@2x.png"
-}
-emit_glyph "resting-lightbar"  "${R_LIGHTBAR}" "${NEEDLE_RESTING}"
-emit_glyph "resting-darkbar"   "${R_DARKBAR}"  "${NEEDLE_RESTING}"
-emit_glyph "healthy-lightbar"  "${D_HEALTHY}"  "${NEEDLE_HEALTHY}"
-emit_glyph "healthy-darkbar"   "${V_HEALTHY}"  "${NEEDLE_HEALTHY}"
-emit_glyph "warning-lightbar"  "${D_WARNING}"  "${NEEDLE_WARNING}"
-emit_glyph "warning-darkbar"   "${V_WARNING}"  "${NEEDLE_WARNING}"
-emit_glyph "critical-lightbar" "${D_CRITICAL}" "${NEEDLE_CRITICAL}"
-emit_glyph "critical-darkbar"  "${V_CRITICAL}" "${NEEDLE_CRITICAL}"
-emit_glyph "swap-lightbar"     "${D_SWAP}"     "${NEEDLE_RESTING}"
-emit_glyph "swap-darkbar"      "${V_SWAP}"     "${NEEDLE_RESTING}"
-# resting template master (ship this one; macOS tints it)
-cp "${SRC}/glyph.svg" "${DIST}/glyph-resting-template.svg"
+# --- No colour menu-bar glyph emission (issue #439) -------------------------
+# The menu-bar status item is a MONOCHROME TEMPLATE: state is carried by the glyph
+# SHAPE, not colour — a menu-bar image is system-tinted, so colour cannot encode
+# health there at all (#325). Its four bespoke attention-state glyphs are the
+# `.symbolset` family emitted above (#437 artwork / #524 taxonomy).
+#
+# This block previously emitted a free-standing COLOUR bar glyph in two contrast
+# sets (`-lightbar` darkened / `-darkbar` vivid, needle tracking the reading). That
+# targeted a colour bar the app does not — and cannot — use, so it is retired here.
+# The colour "living instrument" still governs the app icon, Dock, and in-panel
+# surfaces (emitted above); only the MENU BAR is monochrome.
+#
+# `src/glyph.svg` is kept as the archived colour-glyph master — no longer emitted by
+# this pipeline, and no longer consumed by the app.
 
 echo "==> favicon"
 cp "${SRC}/favicon.svg" "${DIST}/favicon.svg"
