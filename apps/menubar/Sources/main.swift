@@ -30,6 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var transport: WatchTransport?
     private var accountEventNotifier: AccountEventNotifier?
+    #if DEBUG
+    /// Retains the debug glyph-gallery status items (the issue #437 `SESSIOMETER_GLYPH_GALLERY` harness) so
+    /// they are not deallocated while the gallery-only app runs; empty in normal operation.
+    private var galleryItems: [NSStatusItem] = []
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
@@ -40,6 +45,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            idx + 1 < CommandLine.arguments.count {
             RenderPanelTool.run(outputDir: CommandLine.arguments[idx + 1])
             exit(0)
+        }
+
+        // Glyph-gallery harness (issue #437): `SESSIOMETER_GLYPH_GALLERY=1` installs one real menu-bar
+        // status item per StatusGlyph — the four bespoke template gauges side by side — and wires nothing
+        // else (no daemon, no transport). It exists so #437's PRIORITY-1 falsifier — shape-distinctness at
+        // real bar size (light + dark, Increase Contrast, over a bright wallpaper, beside system icons) —
+        // can be captured from ACTUAL NSStatusItems, which a headless raster proxy cannot settle. Opt-in and
+        // inert in normal operation; it never JUDGES distinctness, it only makes the on-device capture
+        // possible. The app keeps running afterwards (no exit) so the items stay live to screenshot.
+        if ProcessInfo.processInfo.environment["SESSIOMETER_GLYPH_GALLERY"] == "1" {
+            galleryItems = StatusGlyph.allCases.map { glyph in
+                let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+                item.button?.image = StatusGauge.image(for: glyph)
+                item.button?.setAccessibilityLabel(
+                    "Sessiometer glyph gallery: \(StatusGauge.accessibilityDescription(for: glyph))")
+                return item
+            }
+            appLog.info("glyph gallery installed: \(self.galleryItems.count, privacy: .public) items (SESSIOMETER_GLYPH_GALLERY)")
+            return
         }
         #endif
 

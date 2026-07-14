@@ -150,3 +150,38 @@ healthy on a degraded daemon.
   Version-skew still offers a `brew upgrade sessiometer` **copy-command** (the app can't self-update), and
   daemon-starting shows a static "forming" glyph — the app fakes no progress it isn't doing.
 - **Honest state** — disconnected rows are dimmed + "stale", never frozen-as-live.
+
+## The status-item glyphs (#437)
+
+Distinct from the panel above: the four **menu-bar status-item** glyphs (the #524 attention axis —
+healthy / connecting / attention / no-runway) are the bespoke **Cycle-Gauge** mark redrawn at bar size, a
+shared open-arc + arrowhead **chassis** plus one bold interior mark (`✓` / `…` / `!` / `⊘`). They ship as
+custom SF Symbol `.symbolset`s — emitted by `brand/generate.sh` into `Sources/Assets.xcassets`, loaded by
+`StatusGauge.swift` via `NSImage(named:)` as monochrome **template** images.
+
+`status-glyph-preview.html` renders that artwork (the same 24-grid SVG the `.symbolset`s ship), light +
+dark, at bar-relevant sizes:
+
+```sh
+open status-glyph-preview.html            # interactive
+# committed raster (GPU headless Chrome, per the render note above):
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --headless=new --hide-scrollbars --force-device-scale-factor=2 \
+  --window-size=1080,560 --screenshot=renders/status-glyphs.png status-glyph-preview.html
+```
+
+![Bespoke status-item glyphs, light + dark](renders/status-glyphs.png)
+
+**⚠ The preview is an artwork reference, NOT the distinctness gate.** A browser raster can't settle bar-size
+legibility; #437's PRIORITY-1 acceptance test is an on-device **16 px `NSStatusItem`** capture (light + dark,
+Increase Contrast, over a bright wallpaper, beside system icons). Capture it from the app's DEBUG gallery —
+`SESSIOMETER_GLYPH_GALLERY=1` installs the four real glyphs side by side in the menu bar to screenshot:
+
+```sh
+# from apps/menubar, after a Debug build:
+BIN=".build/xcode/Build/Products/Debug/Sessiometer.app/Contents/MacOS/Sessiometer"
+SESSIOMETER_GLYPH_GALLERY=1 "$BIN"        # then screenshot the menu bar; needs a GUI session
+```
+
+By design the shared chassis owns most of the ink, so the four glyphs are close in silhouette at bar size —
+whether that is legible enough is the operator's on-device call, not something this proxy decides.
