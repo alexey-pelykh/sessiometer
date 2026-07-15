@@ -30,6 +30,15 @@ interim 65%. It **supersedes nothing**: it *affirms* [ADR-0012](0012-active-reob
 No existing swap-eligibility predicate moves; the reactive and emergency paths are
 untouched.
 
+**Amended 2026-07-15 (#539)**: the velocity-projection arm this ADR had carried as a
+deferred Future note is now **shipped** — the OBSERVED-overshoot peer of the reactive
+session trigger (`observed + rate_ema × H >= trigger` off a FRESH reading + retained
+per-account EMA velocity), closing the reaction-latency residual of **#363** that the
+blind-window arm does not reach. Parameters validated by the **#538** spike; the
+covered/poll-gap residual split with **#540** and the shipped mechanism are recorded in
+Consequences and Related below. The core **#452** decision and the header-observation
+rejection are unchanged.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active by rotating across a
@@ -163,8 +172,8 @@ The path honours the **#369** cautions on a reactive fast-path:
      deliberate trade, since the fresh reading is provably unavailable. A **static**
      `risk_band` may over- or under-trigger; mitigated by the now-confirmed constants
      (validated on two weeks of real telemetry — **#451**, with **#484** ratifying
-     the 60% band) and by the deferred velocity-projection arm (a **#452** Future
-     note, gated on **#455**'s SLIs).
+     the 60% band) and by the velocity-projection arm (now shipped as **#539**, the
+     OBSERVED-overshoot peer — see Consequences).
 
 ## Consequences
 
@@ -185,6 +194,17 @@ The path honours the **#369** cautions on a reactive fast-path:
   exemption; disabled by a single config value.
 - **The rejected header path is recorded**, so "just read the headers" is not
   re-proposed each time the blindness recurs.
+- **The preemptive principle extends to the observed overshoot (#539).** The same
+  "spend the swap lever, not the observation lever" choice now also fires on a FRESH
+  reading whose retained per-account EMA velocity projects over the trigger within the
+  horizon — a strict early-fire of the reactive swap (same jittered triggers, same
+  reserve), closing the reaction-latency residual the blind-window arm does not reach
+  (there the reading is present, the trigger merely latent between polls). Same
+  discipline as the blind arm: config-gated + kill-switchable ([ADR-0005](0005-config-parsed-by-crate-emitted-by-hand.md)),
+  honours cooldown and the swap-target reserve ([ADR-0013](0013-session-floor-default-on-reserve-emergency-exempt.md),
+  **not** emergency), routes through no-torn-swap ([ADR-0003](0003-no-torn-swap-invariant.md)),
+  and NEVER fires on a missing or single-sample velocity (holds on the fresh reading
+  rather than swap on a guess).
 
 ### Negative / trade-offs
 
@@ -193,17 +213,41 @@ The path honours the **#369** cautions on a reactive fast-path:
   `risk_band` (only near-band anchors qualify) and by requiring a viable target.
 - **A static `risk_band` can still over- or under-trigger.** `T=300s` /
   `risk_band=60%` are now empirically confirmed (validated on two weeks of real
-  telemetry — **#451**; the conservative 60% band ratified by **#484**), but a
-  static band cannot track per-account velocity; the velocity-projection arm
-  (`last_good + rate_preblind × blind_elapsed >= trigger`) remains deferred as a
-  **#452** Future note, gated on **#455**'s SLI evidence. The kill-switch
-  (`session_blind_swap_secs` set high) is the escape hatch.
+  telemetry — **#451**; the conservative 60% band ratified by **#484**). A static band
+  cannot track per-account velocity — so the **velocity-projection arm has now shipped
+  (#539)**, promoted from the deferred Future note this ADR carried. It is the OBSERVED
+  peer of the blind-window path: where the active still reads live but the reactive
+  session trigger is latent between the ~cadence polls, it projects `observed + rate_ema
+  × H >= trigger` off the FRESH reading (not the stale anchor the blind arm keys off) and
+  swaps early, closing the observed reactive-overshoot residual of **#363**. Parameters
+  (validated by the **#538** spike): the horizon `H` tracks the active poll cadence
+  (`session_velocity_horizon_secs`, default 120s; safe band `H ≤ 150s`); it projects only
+  from a reading already at/over `session_velocity_min_project_above` (default 85%, the
+  free guard, since the max reach `≤ ~14pp` at `H ≤ 150s` cannot cross from below it); and
+  the rate is an EMA (`session_velocity_ema_alpha_pct`, default α≈0.5) over `≥ 2` blended
+  intervals, so a single-interval spike never fires. The **#363** umbrella now splits by
+  residual: **#539** owns the covered observed-overshoot swap (projected swap-out
+  `P100 ≤ 98 / P50 ≤ 94`, measured by the **#455** reliability readout), while **#540**
+  owns the residual near-limit poll-gap coverage (the full-trace `P100 < 99`) the
+  projection is blind to across a near-limit poll gap. The kill-switch is per-arm:
+  `session_blind_swap_secs` set high disables the blind arm; `session_velocity_horizon_secs
+  = 0` disables the projective arm (the projection reduces to the observed reading, which
+  the reactive path already held below the trigger).
 
 ## Related
 
 - Issues: **#454** (this ADR). **#452** (the design recorded here — the
-  bounded-blindness preemptive swap; implemented there, and the home of
-  the deferred velocity-projection arm note). **#451** (the
+  bounded-blindness preemptive swap; implemented there, and the original home of the
+  velocity-projection arm note, now shipped as **#539**). **#539** (the shipped
+  velocity-projection preemptive trigger — the OBSERVED-overshoot peer of the reactive
+  session trigger: `observed + rate_ema × H >= trigger` off a FRESH reading + retained
+  per-account EMA velocity; horizon `H` ≈ active poll cadence, only-project-above-85%
+  guard, `≥ 2`-sample EMA, all validated by the **#538** spike; adds the
+  `session_velocity_*` tunables and the projected-swap-out-overshoot + false-projection
+  SLIs). **#540** (the residual near-limit poll-gap coverage — the full-trace
+  `P100 < 99` the projection is blind to across a near-limit poll gap; jointly owns the
+  **#363** residual with **#539**, which owns the covered swap). **#538** (the spike
+  that validated the projection parameters). **#451** (the
   premise-confirmation + constants finalisation gate for `T` / `risk_band`, now
   satisfied on two weeks of real telemetry). **#484** (ratified the conservative 60%
   `risk_band` over the interim 65%). **#453** (the active-account back-off cap —
@@ -214,8 +258,9 @@ The path honours the **#369** cautions on a reactive fast-path:
   (the reaction-latency umbrella). **#369** (the reactive fast-path open question
   whose cautions this honours). **#42** (the dead-vs-exhausted model the separate
   availability path preserves). **#455** (the reliability SLO readout for
-  swap-out overshoot; its SLIs gate the deferred **#452** velocity-projection
-  arm). **#80** (the burst-`429` exposure that rules out harder polling).
+  swap-out overshoot; its SLIs gated the velocity-projection arm, now shipped as
+  **#539** with its own projected-swap-out-overshoot + false-projection readout at
+  schema 3). **#80** (the burst-`429` exposure that rules out harder polling).
   [anthropics/claude-code#55333](https://github.com/anthropics/claude-code/issues/55333)
   (upstream FR: Claude Code does not persist its usage headers). **#15**
   (diagnostics stay secret-free — the swap keys off the account's own usage and
@@ -226,6 +271,18 @@ The path honours the **#369** cautions on a reactive fast-path:
   (`target_max_session_usage <= effective session trigger`) per
   [ADR-0005](0005-config-parsed-by-crate-emitted-by-hand.md). `/oauth/usage` remains
   the **only** usage source — no header probe is added.
+- Code (**#539**): the gated `velocity_swap` path in `src/daemon.rs`, called from
+  `decide_action` exactly where the reactive path would HOLD (observed below the trigger),
+  keying off the retained per-account `session_velocity` EMA (`note_session_velocity`
+  folds each poll interval; the EMA is re-keyed in lockstep across a roster reconcile, and
+  reset on a session-window drop). The tunables `session_velocity_horizon_secs` /
+  `session_velocity_min_project_above` / `session_velocity_ema_alpha_pct` in
+  `src/config.rs`, hand-emitted + range-validated per
+  [ADR-0005](0005-config-parsed-by-crate-emitted-by-hand.md) (`horizon 0..=600` with `0`
+  the kill-switch). The swap logs `reason=velocity_preempt` carrying the FRESH observed
+  swap-out pct; `src/reliability.rs` folds it into the projected-swap-out-overshoot
+  percentiles (`P100 ≤ 98 / P50 ≤ 94`) + the false-projection count (schema `2 → 3`). Same
+  single `/oauth/usage` source — no header probe.
 - ADRs: [ADR-0009](0009-rate-limit-backoff-per-account.md) (per-account `429`
   back-off — **extended** here: the same per-account scoping that correctly bounds a
   throttle is what leaves the *active* account carrying a stale reading = bounded

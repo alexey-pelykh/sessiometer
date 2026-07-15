@@ -78,6 +78,16 @@ pub(crate) enum SwapReason {
     /// could self-exhaust unobserved. `session_pct` carries the STALE pre-blind anchor —
     /// the only session signal available while blind — not a fresh reading.
     BlindPreempt,
+    /// The #539 velocity-projection preemptive gate fired (ADR-0017): the active account's
+    /// OBSERVED reading was below the trigger, but its projected session usage
+    /// (`last + velocity × session_velocity_horizon_secs`, keyed off the #399 velocity signal)
+    /// crossed it, so it swapped away before the observed reading would trip the reactive
+    /// trigger — closing the OBSERVED reactive overshoot (#363). Unlike `BlindPreempt`,
+    /// `session_pct` carries the FRESH observed reading at swap-out (the projection is off a live
+    /// reading, never a stale anchor). Distinct from `Session` so the false-projection SLI and the
+    /// projected swap-out overshoot readout (`sessiometer reliability`) can separate the projective
+    /// swaps from the reactive residual.
+    VelocityPreempt,
 }
 
 impl SwapReason {
@@ -89,6 +99,7 @@ impl SwapReason {
             SwapReason::Manual => "manual",
             SwapReason::Forced => "forced",
             SwapReason::BlindPreempt => "blind_preempt",
+            SwapReason::VelocityPreempt => "velocity_preempt",
         }
     }
 }
@@ -1640,6 +1651,11 @@ pub(crate) enum DecisionClass {
     /// Preemptively swapped away from a BLIND active account before it could
     /// self-exhaust unobserved (issue #452, ADR-0017) — the bounded-blindness gate fired.
     PreemptiveSwap,
+    /// Preemptively swapped away from an OBSERVED active account whose PROJECTED session usage
+    /// crossed the trigger before the observed reading did (issue #539, ADR-0017) — the
+    /// velocity-projection gate fired. Distinct from `PreemptiveSwap` (blind, stale anchor):
+    /// this fires on a fresh reading + its velocity.
+    VelocityPreemptiveSwap,
     /// Over the trigger but no viable target — the all-exhausted hold (issue #11).
     AllExhausted,
     /// The active credential is dead and no target is viable — held, unable to
@@ -1669,6 +1685,7 @@ impl DecisionClass {
             DecisionClass::Swap => "swap",
             DecisionClass::EmergencySwap => "emergency_swap",
             DecisionClass::PreemptiveSwap => "preemptive_swap",
+            DecisionClass::VelocityPreemptiveSwap => "velocity_preemptive_swap",
             DecisionClass::AllExhausted => "all_exhausted",
             DecisionClass::ActiveDeadNoTarget => "active_dead_no_target",
             DecisionClass::CanonicalAdopted => "canonical_adopted",
@@ -2018,6 +2035,31 @@ mod tests {
         }
         .to_log_line(at_epoch(0));
         assert!(line.contains("reason=weekly"), "got: {line}");
+    }
+
+    #[test]
+    fn swap_line_renders_the_velocity_preempt_reason_redaction_clean() {
+        // Issue #539: the projective swap renders `reason=velocity_preempt` with `session_pct`
+        // carrying the FRESH observed reading at swap-out — the exact wire token the reliability
+        // parser greps to fold the projected-swap-out-overshoot SLI. Below the ceiling it carries no
+        // `late=` marker (a projective swap fires while observed < trigger ≤ 99, so it is never late).
+        // The line is redaction-clean (#15): only the operator HANDLES + a percent, never the email
+        // or token — the same single-surface discipline every other swap reason rides.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::VelocityPreempt,
+            session_pct: 92,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=swap from=work to=spare reason=velocity_preempt session_pct=92")
+        );
+        assert!(
+            !line.contains("late"),
+            "a projective swap is never late: {line}"
+        );
     }
 
     #[test]

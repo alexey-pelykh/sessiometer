@@ -65,6 +65,22 @@ const SLO_SWAP_P100_MAX: u8 = 99;
 /// finalization gate. Note the comparator differs from P100 — inclusive here, strict there.
 const SLO_SWAP_P50_MAX: u8 = 97;
 
+/// SLO target: PROJECTED swap-out `session_pct` **P100 must be `<= 98`** — the #539 velocity-
+/// projection preemptive trigger's acceptance on COVERED swaps (an active account with a usable
+/// near-limit reading to project from). Measured over `reason=velocity_preempt` swaps ONLY —
+/// separate from the reactive `reason=session` distribution above, which post-#539 is the poll-gap
+/// RESIDUAL the sibling #540 (near-limit poll coverage) owns; the full-trace `P100 < 99` is met by
+/// #539 + #540 together. INTERIM: the #538 spike's measured result (P100=98 on 67/76 covered swaps),
+/// the source of truth until the #451/#484 production gate finalizes it — the same interim-const
+/// stance as [`SLO_SWAP_P100_MAX`]. Note the comparator is INCLUSIVE (`<=`), unlike the strict
+/// full-trace P100.
+const SLO_PROJECTED_SWAP_P100_MAX: u8 = 98;
+
+/// SLO target: PROJECTED swap-out `session_pct` **P50 must be `<= 94`** (the #538-measured median
+/// projected swap-out on covered swaps — ~5 pp more runway than the θ=88 stopgap, adaptively).
+/// INTERIM per issue #539/#538; see [`SLO_PROJECTED_SWAP_P100_MAX`] for the finalization gate.
+const SLO_PROJECTED_SWAP_P50_MAX: u8 = 94;
+
 /// Proxy margin (percentage points) for the #452-pending false-preempt SLI: a hypothetical
 /// anchor-keyed preemptive swap is classed "would-be wasted" when the fresh recovery reading
 /// had dropped more than this far below the stale pre-blind anchor. INTERIM (issue #455); the
@@ -75,10 +91,11 @@ const PREEMPT_WASTED_MARGIN_PCT: u8 = 20;
 
 /// The stable `--json` schema version. Owned by this readout, independent of `stats`'
 /// schema. Named to match [`crate::stats`]'s own `JSON_SCHEMA_VERSION`. Bumped `1 → 2` when
-/// the `--since` window (issue #494) added the top-level `window` object — an ADDITIVE change
-/// (an always-present field, `null` in the whole-log default), so a `--json` consumer of the
-/// #363 acceptance gate that ignores unknown fields still parses every prior field unchanged.
-const JSON_SCHEMA_VERSION: u32 = 2;
+/// the `--since` window (issue #494) added the top-level `window` object; bumped `2 → 3` when
+/// the #539 velocity-projection trigger added the `projected_swap_overshoot` + `false_projection`
+/// objects — both ADDITIVE (always-present new fields), so a `--json` consumer of the #363
+/// acceptance gate that ignores unknown fields still parses every prior field unchanged.
+const JSON_SCHEMA_VERSION: u32 = 3;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -224,6 +241,14 @@ struct Inputs {
     /// `event=swap reason=blind_preempt` count — the #452 bounded-blindness preemptive swaps
     /// (ADR-0017) actually observed; the REAL false-preempt numerator, superseding the proxy.
     preemptive_swaps: u32,
+    /// `session_pct` of every `reason=velocity_preempt` swap (issue #539, ADR-0017) — the PROJECTED
+    /// swap-out overshoot distribution on COVERED swaps, kept SEPARATE from `swap_out_pcts` (the
+    /// reactive `reason=session` residual). Its P50/P100 are the #539 acceptance (`<= 94` / `<= 98`).
+    projected_swap_out_pcts: Vec<f64>,
+    /// `event=swap reason=velocity_preempt` count — the #539 velocity-projection preemptive swaps
+    /// actually observed; the false-projection SLI's real numerator (counted by the `reason` field,
+    /// so a malformed-`session_pct` line still counts even if it is dropped from the distribution).
+    velocity_preempt_swaps: u32,
 }
 
 /// Parse the SLI ingredients out of the structured event-log `text`.
@@ -274,6 +299,20 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 // so its session_pct is not a swap-out overshoot sample.
                 if fields.get("reason").copied() == Some("blind_preempt") {
                     inputs.preemptive_swaps = inputs.preemptive_swaps.saturating_add(1);
+                    continue;
+                }
+                // #539 velocity-projection swaps (reason=velocity_preempt, ADR-0017): count each for
+                // the false-projection SLI, and fold its FRESH `session_pct` into the PROJECTED
+                // swap-out overshoot distribution (the #539 covered-swap acceptance) — SEPARATE from
+                // the reactive `reason=session` distribution below (which is now the poll-gap residual
+                // #540 owns). A projective swap fires on a live reading, so — unlike blind_preempt —
+                // its session_pct IS a real swap-out sample.
+                if fields.get("reason").copied() == Some("velocity_preempt") {
+                    inputs.velocity_preempt_swaps = inputs.velocity_preempt_swaps.saturating_add(1);
+                    if let Some(pct) = fields.get("session_pct").and_then(|v| v.parse::<u8>().ok())
+                    {
+                        inputs.projected_swap_out_pcts.push(f64::from(pct));
+                    }
                     continue;
                 }
                 // SESSION-triggered swaps only. A weekly swap fires while session is BELOW its
@@ -344,6 +383,33 @@ impl SwapOvershoot {
     }
 }
 
+/// The PROJECTED swap-out overshoot distribution (issue #539, ADR-0017): the `session_pct`
+/// percentiles over `reason=velocity_preempt` swaps — the COVERED-swap acceptance for the velocity-
+/// projection trigger, distinct from the reactive [`SwapOvershoot`] (the poll-gap residual #540
+/// owns). `None` percentiles when no projective swap was observed, so the readout never asserts a
+/// target PASS on an empty subject (the same cardinality-zero discipline as [`SwapOvershoot`]).
+#[derive(Debug, PartialEq)]
+struct ProjectedSwapOvershoot {
+    n: usize,
+    p50: Option<u8>,
+    p95: Option<u8>,
+    p100: Option<u8>,
+}
+
+impl ProjectedSwapOvershoot {
+    /// Whether P50 meets its `<= SLO_PROJECTED_SWAP_P50_MAX` target (`None` with no data).
+    fn p50_met(&self) -> Option<bool> {
+        self.p50.map(|v| v <= SLO_PROJECTED_SWAP_P50_MAX)
+    }
+
+    /// Whether P100 meets its `<= SLO_PROJECTED_SWAP_P100_MAX` target (`None` with no data). Note the
+    /// INCLUSIVE comparator (`<=`) — the #538 acceptance is P100 = 98, unlike the strict full-trace
+    /// P100 `< 99` of [`SwapOvershoot::p100_met`].
+    fn p100_met(&self) -> Option<bool> {
+        self.p100.map(|v| v <= SLO_PROJECTED_SWAP_P100_MAX)
+    }
+}
+
 /// The false-preempt SLI: the real (still-pending) rate plus the interim blind-window proxy.
 #[derive(Debug, PartialEq)]
 struct FalsePreempt {
@@ -356,6 +422,28 @@ struct FalsePreempt {
     /// Proxy numerator: near-limit windows whose fresh recovery reading had fallen more than
     /// [`PREEMPT_WASTED_MARGIN_PCT`] below the stale anchor — a would-be-wasted swap.
     would_be_wasted: u32,
+}
+
+/// The false-projection SLI (issue #539, ADR-0017): velocity-projection preemptive swaps that fired
+/// on a projection the observed reading had not yet reached. Every `reason=velocity_preempt` swap is
+/// one by construction (the projective path only fires when the reactive path HELD — observed below
+/// the trigger), so the observed COUNT directly measures "swaps the projection fired [ahead of the
+/// observed overshoot]". The true WASTED fraction (would the account actually have overshot?) needs a
+/// post-swap reconciliation of the swapped-away account — not available from the swap event alone —
+/// so `rate` stays `None`, exactly as [`FalsePreempt`]'s real rate is still pending. The #538 spike
+/// bounds it: 0 truly-wasted swaps at H ≤ 150 s. The companion projected swap-out overshoot
+/// distribution ([`ProjectedSwapOvershoot`]) shows these swaps land at P50 = 94 (barely ahead of the
+/// trigger, so low-waste by construction), the primary evidence the projection is not over-firing.
+#[derive(Debug, PartialEq)]
+struct FalseProjection {
+    /// Real velocity-projection preemptive swaps observed (`event=swap reason=velocity_preempt`) —
+    /// the false-projection SLI's numerator. Folded in from [`parse_events`].
+    velocity_preempt_swaps_observed: u32,
+    /// The real false-projection rate (wasted ÷ observed). Always `None` today — the wasted count
+    /// needs a post-swap reconciliation of the swapped-away account (out of scope for #539; the
+    /// poll-coverage sibling #540 and the umbrella #363 own the full-trace picture). Mirrors
+    /// [`FalsePreempt`]'s still-`None` real rate.
+    rate: Option<f64>,
 }
 
 /// 429-rate neutrality counts.
@@ -375,8 +463,12 @@ struct Report {
     /// the renderers document the bound; the SLIs are already windowed by [`parse_events`].
     window: Option<Window>,
     swap_overshoot: SwapOvershoot,
+    /// The #539 velocity-projection covered-swap overshoot (`reason=velocity_preempt` percentiles).
+    projected_swap_overshoot: ProjectedSwapOvershoot,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreempt,
+    /// The #539 false-projection SLI (velocity-projection swaps observed; real rate pending).
+    false_projection: FalseProjection,
     rate_limit: RateLimit,
 }
 
@@ -398,6 +490,21 @@ fn aggregate(inputs: &Inputs, window: Option<Window>) -> Report {
         p100: pct(1.0),
     };
 
+    // The #539 PROJECTED swap-out overshoot — the same percentile discipline over the
+    // `reason=velocity_preempt` distribution (its own cardinality gate, so a target is never PASSED
+    // on zero projective swaps).
+    let projected_n = inputs.projected_swap_out_pcts.len();
+    let projected_pct = |p: f64| -> Option<u8> {
+        (projected_n > 0)
+            .then(|| crate::percentile::percentile(&inputs.projected_swap_out_pcts, p) as u8)
+    };
+    let projected_swap_overshoot = ProjectedSwapOvershoot {
+        n: projected_n,
+        p50: projected_pct(0.50),
+        p95: projected_pct(0.95),
+        p100: projected_pct(1.0),
+    };
+
     let near_limit_windows = inputs.near_limit_reconciliations.len() as u32;
     let would_be_wasted = inputs
         .near_limit_reconciliations
@@ -409,11 +516,16 @@ fn aggregate(inputs: &Inputs, window: Option<Window>) -> Report {
     Report {
         window,
         swap_overshoot,
+        projected_swap_overshoot,
         time_blind_near_limit_secs: inputs.time_blind_near_limit_secs,
         false_preempt: FalsePreempt {
             preemptive_swaps_observed: inputs.preemptive_swaps,
             near_limit_windows,
             would_be_wasted,
+        },
+        false_projection: FalseProjection {
+            velocity_preempt_swaps_observed: inputs.velocity_preempt_swaps,
+            rate: None,
         },
         rate_limit: RateLimit {
             rate_limited: inputs.rate_limited,
@@ -444,7 +556,7 @@ fn render_human(r: &Report) -> String {
     // context. Absent for the whole-log default, so that output is byte-for-byte unchanged.
     if let Some(w) = &r.window {
         out.push_str(&format!(
-            "window: since {} ({}) — all four SLIs bounded to events at/after the cutoff\n\n",
+            "window: since {} ({}) — all SLIs bounded to events at/after the cutoff\n\n",
             w.cutoff_rfc3339(),
             w.since_arg,
         ));
@@ -475,6 +587,35 @@ fn render_human(r: &Report) -> String {
     }
     out.push('\n');
 
+    // SLI 1b — PROJECTED swap-out session_pct percentiles (issue #539): the covered-swap acceptance
+    // for the velocity-projection trigger, vs its own targets. Separate from the reactive block above
+    // (now the poll-gap residual #540 owns); the full-trace P100 < 99 is #539 + #540 together.
+    match (
+        r.projected_swap_overshoot.p50,
+        r.projected_swap_overshoot.p95,
+        r.projected_swap_overshoot.p100,
+    ) {
+        (Some(p50), Some(p95), Some(p100)) => {
+            out.push_str(&format!(
+                "projected swap-out session_pct (reason=velocity_preempt), n={}\n",
+                r.projected_swap_overshoot.n
+            ));
+            out.push_str(&format!(
+                "  P50  = {p50}  target <= {SLO_PROJECTED_SWAP_P50_MAX}  {}\n",
+                ok_flag(p50 <= SLO_PROJECTED_SWAP_P50_MAX)
+            ));
+            out.push_str(&format!("  P95  = {p95}\n"));
+            out.push_str(&format!(
+                "  P100 = {p100}  target <= {SLO_PROJECTED_SWAP_P100_MAX}  {}\n",
+                ok_flag(p100 <= SLO_PROJECTED_SWAP_P100_MAX)
+            ));
+        }
+        _ => out.push_str(
+            "projected swap-out session_pct (reason=velocity_preempt): no projective swaps observed\n",
+        ),
+    }
+    out.push('\n');
+
     // SLI 2 — time blind & near-limit.
     out.push_str(&format!(
         "time blind & near-limit: {}s (sum of blind_window duration_secs where near_limit=true)\n\n",
@@ -491,6 +632,17 @@ fn render_human(r: &Report) -> String {
     out.push_str(&format!(
         "  proxy (blind-window reconciliation, interim margin {PREEMPT_WASTED_MARGIN_PCT}pp): {} of {} near-limit windows would-be-wasted\n\n",
         r.false_preempt.would_be_wasted, r.false_preempt.near_limit_windows
+    ));
+
+    // SLI 3b — false-projection (issue #539): velocity-projection swaps that fired on a projection
+    // the observed reading had not yet reached. Real count; the wasted FRACTION needs a post-swap
+    // reconciliation, still pending (see the projected swap-out P50 above for the low-waste evidence).
+    out.push_str(
+        "false-projection (velocity-projection swap fired ahead of the observed overshoot)\n",
+    );
+    out.push_str(&format!(
+        "  velocity-projection swaps observed: {}\n\n",
+        r.false_projection.velocity_preempt_swaps_observed
     ));
 
     // SLI 4 — 429-rate neutrality (roster-wide counts; active attribution is a follow-up).
@@ -513,8 +665,12 @@ struct ReliabilityWire {
     /// keys still parses every prior field. When present, the four SLIs below are bounded to it.
     window: Option<WindowWire>,
     swap_overshoot: SwapOvershootWire,
+    /// The #539 velocity-projection covered-swap overshoot (schema:3, additive).
+    projected_swap_overshoot: ProjectedSwapOvershootWire,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreemptWire,
+    /// The #539 false-projection SLI (schema:3, additive).
+    false_projection: FalseProjectionWire,
     rate_limit_neutrality: RateLimitWire,
 }
 
@@ -557,6 +713,25 @@ struct SwapMetWire {
     p100: Option<bool>,
 }
 
+/// PROJECTED swap-out overshoot block (issue #539): the covered-swap acceptance for the velocity-
+/// projection trigger, `null` percentiles / flags when no projective swap was observed.
+#[derive(serde::Serialize)]
+struct ProjectedSwapOvershootWire {
+    n: usize,
+    p50: Option<u8>,
+    p95: Option<u8>,
+    p100: Option<u8>,
+    targets: ProjectedSwapTargetsWire,
+    met: SwapMetWire,
+}
+
+/// The documented projected swap-out targets (the #539/#538 covered-swap acceptance).
+#[derive(serde::Serialize)]
+struct ProjectedSwapTargetsWire {
+    p50_max: u8,
+    p100_max: u8,
+}
+
 /// False-preempt block: the real (pending) rate plus the labeled interim proxy.
 #[derive(serde::Serialize)]
 struct FalsePreemptWire {
@@ -573,6 +748,15 @@ struct FalsePreemptProxyWire {
     near_limit_windows: u32,
     would_be_wasted: u32,
     interim_margin_pct: u8,
+}
+
+/// False-projection block (issue #539): the real velocity-projection swap count; `rate` is the
+/// wasted fraction, always `null` today (needs a post-swap reconciliation, pending — like
+/// [`FalsePreemptWire::rate`]).
+#[derive(serde::Serialize)]
+struct FalseProjectionWire {
+    velocity_preempt_swaps_observed: u32,
+    rate: Option<f64>,
 }
 
 /// 429-rate neutrality counts.
@@ -606,6 +790,20 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 p100: r.swap_overshoot.p100_met(),
             },
         },
+        projected_swap_overshoot: ProjectedSwapOvershootWire {
+            n: r.projected_swap_overshoot.n,
+            p50: r.projected_swap_overshoot.p50,
+            p95: r.projected_swap_overshoot.p95,
+            p100: r.projected_swap_overshoot.p100,
+            targets: ProjectedSwapTargetsWire {
+                p50_max: SLO_PROJECTED_SWAP_P50_MAX,
+                p100_max: SLO_PROJECTED_SWAP_P100_MAX,
+            },
+            met: SwapMetWire {
+                p50: r.projected_swap_overshoot.p50_met(),
+                p100: r.projected_swap_overshoot.p100_met(),
+            },
+        },
         time_blind_near_limit_secs: r.time_blind_near_limit_secs,
         false_preempt: FalsePreemptWire {
             preemptive_swaps_observed: r.false_preempt.preemptive_swaps_observed,
@@ -615,6 +813,10 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 would_be_wasted: r.false_preempt.would_be_wasted,
                 interim_margin_pct: PREEMPT_WASTED_MARGIN_PCT,
             },
+        },
+        false_projection: FalseProjectionWire {
+            velocity_preempt_swaps_observed: r.false_projection.velocity_preempt_swaps_observed,
+            rate: r.false_projection.rate,
         },
         rate_limit_neutrality: RateLimitWire {
             rate_limited: r.rate_limit.rate_limited,
@@ -738,11 +940,16 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "  P95  = 100\n",
                 "  P100 = 100  target < 99   [OVER]\n",
                 "\n",
+                "projected swap-out session_pct (reason=velocity_preempt): no projective swaps observed\n",
+                "\n",
                 "time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)\n",
                 "\n",
                 "false-preempt (preemptive swap whose target turned out unnecessary)\n",
                 "  preemptive swaps observed: 0\n",
                 "  proxy (blind-window reconciliation, interim margin 20pp): 1 of 2 near-limit windows would-be-wasted\n",
+                "\n",
+                "false-projection (velocity-projection swap fired ahead of the observed overshoot)\n",
+                "  velocity-projection swaps observed: 0\n",
                 "\n",
                 "usage-poll 429 neutrality (roster-wide): rate_limited=2 transient=1 cleared=1\n",
             )
@@ -759,16 +966,18 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     }
 
     #[test]
-    fn json_render_is_stable_schema_2() {
-        // The whole-log default: `window` is null and every prior field is byte-identical to
-        // schema:1 — the additive contract (#494). A `--since` document is asserted separately
-        // in `json_documents_the_active_window`.
+    fn json_render_is_stable_schema_3() {
+        // The whole-log default: `window` is null and every PRIOR field is byte-identical to
+        // schema:1/2 — the additive contract (#494/#539). The #539 `projected_swap_overshoot` +
+        // `false_projection` objects are new-but-always-present (null percentiles here — the fixture
+        // has no `reason=velocity_preempt` swap). A `--since` document is asserted separately in
+        // `json_documents_the_active_window`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 2,\n",
+                "  \"schema\": 3,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -784,6 +993,20 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "      \"p100\": false\n",
                 "    }\n",
                 "  },\n",
+                "  \"projected_swap_overshoot\": {\n",
+                "    \"n\": 0,\n",
+                "    \"p50\": null,\n",
+                "    \"p95\": null,\n",
+                "    \"p100\": null,\n",
+                "    \"targets\": {\n",
+                "      \"p50_max\": 94,\n",
+                "      \"p100_max\": 98\n",
+                "    },\n",
+                "    \"met\": {\n",
+                "      \"p50\": null,\n",
+                "      \"p100\": null\n",
+                "    }\n",
+                "  },\n",
                 "  \"time_blind_near_limit_secs\": 900,\n",
                 "  \"false_preempt\": {\n",
                 "    \"preemptive_swaps_observed\": 0,\n",
@@ -793,6 +1016,10 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "      \"would_be_wasted\": 1,\n",
                 "      \"interim_margin_pct\": 20\n",
                 "    }\n",
+                "  },\n",
+                "  \"false_projection\": {\n",
+                "    \"velocity_preempt_swaps_observed\": 0,\n",
+                "    \"rate\": null\n",
                 "  },\n",
                 "  \"rate_limit_neutrality\": {\n",
                 "    \"rate_limited\": 2,\n",
@@ -999,7 +1226,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         let out = render_human(&aggregate(&inputs, Some(window)));
         assert!(
             out.contains(
-                "window: since 2026-07-05T00:00:00Z (7d) — all four SLIs bounded to events at/after the cutoff"
+                "window: since 2026-07-05T00:00:00Z (7d) — all SLIs bounded to events at/after the cutoff"
             ),
             "human output must document the window bound: {out}"
         );
@@ -1016,7 +1243,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 2,"), "schema bumped to 2: {out}");
+        assert!(out.contains("\"schema\": 3,"), "schema bumped to 3: {out}");
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",
