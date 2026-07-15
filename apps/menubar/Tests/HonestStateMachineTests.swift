@@ -117,6 +117,82 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertTrue(staleLocked.keychainLocked, "lock retained into stale, like the roster")
     }
 
+    // MARK: - AC (#520): daemon-payload vault faults → the ⊘ no-runway glyph, GATED on a vouched snapshot
+
+    // A locked keychain rides ALONGSIDE a `.connected` healthy roster (the crown-jewel false-healthy case):
+    // the glance must read ⊘ ("act now — unlock"), NOT the healthy ✓ it showed before #520 wired it in.
+    func testKeychainLockedProjectsNoRunwayGlyphOnVouchedSnapshot() {
+        let m = machine([.connected, .line(Fixtures.snapshotKeychainLocked)])
+        XCTAssertEqual(m.connectionState, .connected, "the lock does not degrade the connection")
+        XCTAssertEqual(m.presentation.glyph, .noRunway, "#520: a locked keychain is a no-runway ⊘, never healthy")
+        XCTAssertEqual(m.presentation.accessibilityLabel,
+                       "Sessiometer: keychain locked — unlock it to keep working")
+    }
+
+    // The canonical-scrub `exhausted` residual (un-recoverable → `claude /login`) is keychain-locked's
+    // sibling: same ride-alongside-healthy shape, same ⊘ verdict.
+    func testCanonicalScrubExhaustedProjectsNoRunwayGlyph() {
+        let m = machine([.connected, .line(Fixtures.snapshotCanonicalScrubExhausted)])
+        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertEqual(m.presentation.glyph, .noRunway, "#520: scrub-exhausted is a no-runway ⊘")
+        XCTAssertEqual(m.presentation.accessibilityLabel,
+                       "Sessiometer: signed out of the shared login — run claude /login")
+    }
+
+    // The DELIBERATE asymmetry: scrub `recovering` MAY self-heal with no operator action, so it does NOT
+    // meet the act-now ⊘ bar — alarming a self-healing transient would cry wolf. It stays the healthy ✓
+    // glance (the panel still shows the calm recovering banner); #520 defers the recovering-glyph call.
+    func testCanonicalScrubRecoveringStaysHealthyGlyphNotNoRunway() {
+        let m = machine([.connected, .line(Fixtures.snapshotCanonicalScrubRecovering)])
+        XCTAssertEqual(m.canonicalScrub, .recovering)
+        XCTAssertEqual(m.presentation.glyph, .healthy,
+                       "scrub-recovering self-heals with no operator action → not an act-now ⊘ (#520 defers it)")
+    }
+
+    // The vouched-only GATE — the load-bearing #520 correctness property. Both vault bits are RETAINED
+    // across a drop / stale (like the roster), but `make` reads them ONLY in the `.connected` arm: on a
+    // dropped or gone-quiet socket the actionable problem is the SOCKET (`.attention`), so a stale vault
+    // bit must never shout ⊘ off data we can no longer vouch for (mirrors the `noViableTarget` gate).
+    func testRetainedVaultFaultUnderDropOrStaleDoesNotReachNoRunway() {
+        let lockedThenDropped = machine([.connected, .line(Fixtures.snapshotKeychainLocked),
+                                         .disconnected(reason: "EOF")])
+        XCTAssertTrue(lockedThenDropped.keychainLocked, "the lock bit is retained across the drop")
+        XCTAssertEqual(lockedThenDropped.presentation.glyph, .attention,
+                       "a retained lock under a dropped socket shows the socket fault (!), not ⊘")
+
+        let scrubThenStale = machine([.connected, .line(Fixtures.snapshotCanonicalScrubExhausted), .stale])
+        XCTAssertEqual(scrubThenStale.canonicalScrub, .exhausted, "the scrub bit is retained into stale")
+        XCTAssertEqual(scrubThenStale.presentation.glyph, .attention,
+                       "a retained scrub under a stale socket shows the staleness (!), not ⊘")
+    }
+
+    // When several vouched no-runway inputs coincide, the glyph is one ⊘ regardless; the a11y LABEL names
+    // the most-actionable root cause, worst-first in the panel's `daemonFaultBanner` rank
+    // (keychain-locked ▸ scrub-`exhausted` ▸ no-viable-target). Exercised on `make` directly — no single
+    // wire fixture carries all three.
+    func testVouchedNoRunwayRanksKeychainOverScrubOverQuota() {
+        let allThree = PresentationState.make(for: .connected, accountCount: 2,
+                                              hasNoViableTarget: true, keychainLocked: true,
+                                              canonicalScrub: .exhausted)
+        XCTAssertEqual(allThree.glyph, .noRunway)
+        XCTAssertEqual(allThree.accessibilityLabel,
+                       "Sessiometer: keychain locked — unlock it to keep working",
+                       "keychain-locked outranks scrub and quota for the label")
+
+        let scrubAndQuota = PresentationState.make(for: .connected, accountCount: 2,
+                                                   hasNoViableTarget: true, canonicalScrub: .exhausted)
+        XCTAssertEqual(scrubAndQuota.accessibilityLabel,
+                       "Sessiometer: signed out of the shared login — run claude /login",
+                       "scrub-exhausted outranks quota for the label")
+
+        // scrub-`recovering` is NOT a no-runway input, so quota wins both the ⊘ and the label.
+        let recoveringAndQuota = PresentationState.make(for: .connected, accountCount: 2,
+                                                        hasNoViableTarget: true, canonicalScrub: .recovering)
+        XCTAssertEqual(recoveringAndQuota.glyph, .noRunway)
+        XCTAssertEqual(recoveringAndQuota.accessibilityLabel,
+                       "Sessiometer: no account has capacity right now — action needed")
+    }
+
     // MARK: - AC: empty accounts → empty-roster (DISTINCT from daemon-down)
 
     func testEmptyAccountsGoesEmptyRosterNotDisconnectedNotHealthy() {
