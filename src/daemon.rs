@@ -9159,25 +9159,12 @@ mod tests {
         // been blended (samples ≥ MIN_VELOCITY_SAMPLES), the projection `last + rate × H` crosses the
         // trigger within the horizon and the active swaps AWAY — ahead of the observed reading
         // tripping the reactive trigger — closing the observed reactive overshoot (#363).
-        let mut daemon = three_account_daemon(
-            FakeRosterPoller::new()
-                .ok("u-A", 0.86, 0.20)
-                .ok("u-B", 0.10, 0.10)
-                .ok("u-C", 0.10, 0.10),
-        )
-        .await;
+        // Warmed on a frozen clock (u-A at 86 %, schedule A, B, A, C): the helper asserts warmed-up,
+        // u-A active, and — since no interval elapsed — an unseeded (`None`) EMA. Same fixture the
+        // five direct-call velocity_swap tests route through.
+        let mut daemon = warmed_velocity_daemon(0.86).await;
         // Arm the projective gate at 150 s — the TOP of the #538-validated safe band (H ≤ 150 s).
         daemon.session_velocity_horizon_secs = 150;
-        // Warm up on a frozen clock (schedule A, B, A, C): no interval elapses, so no velocity yet.
-        for _ in 0..4 {
-            daemon.tick().await;
-        }
-        assert!(daemon.state.warmed_up);
-        assert_eq!(daemon.state.active, Some(0), "u-A active before the swap");
-        assert!(
-            daemon.state.session_velocity[0].is_none(),
-            "no velocity accrues while the clock is frozen",
-        );
 
         // First climbing interval (86 % → 90 % over 60 s): the next active poll is tick 5 (A). This
         // SEEDS the EMA (samples = 1) — a single interval, still below MIN_VELOCITY_SAMPLES.
