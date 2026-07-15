@@ -2091,6 +2091,35 @@ mod tests {
     }
 
     #[test]
+    fn swap_line_renders_the_blind_preempt_reason_redaction_clean() {
+        // Issue #479 (surface 2, LOG medium): the #452 bounded-blindness preemptive swap renders
+        // `reason=blind_preempt` with `session_pct` carrying the STALE pre-blind anchor (the only
+        // session signal available while blind) — the durable event-log narration of the same swap the
+        // `status` wire reflects as prose (`recent_blind_preempt_swap`) and the daemon retains for the
+        // `use <label>` undo. Each medium in its own idiom (R-2 STATE-parity): the log carries the
+        // machine-greppable `reason=`/`from=`/`to=` tuple, `status` carries the operator prose. Below
+        // the ceiling (a blind-preempt fires on an anchor at/over the risk band but under the reactive
+        // trigger ≤ 99) it carries no `late=` marker. Redaction-clean (#15): only the operator HANDLES
+        // + a percent ride the line, never the email or token — the single-surface discipline every
+        // other swap reason rides.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::BlindPreempt,
+            session_pct: 68,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=swap from=work to=spare reason=blind_preempt session_pct=68")
+        );
+        assert!(
+            !line.contains("late"),
+            "a blind-preempt swap fires under the reactive trigger, never late: {line}"
+        );
+    }
+
+    #[test]
     fn all_exhausted_renders_cause_and_resets_at_when_known_and_omits_reset_otherwise() {
         // No reset reported (#11 fallback) → resets_at is simply absent and the line
         // stays well-formed; cause (#398) is always present.
