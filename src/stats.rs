@@ -281,6 +281,39 @@ struct Report {
     /// unknown (no config loaded) — see [`split_orphans`] — so a pre-`capture` `stats` reads
     /// exactly as before. Summary-window stats only (the series need not re-carry them).
     orphans: BTreeMap<String, AccountStats>,
+    /// The per-account velocity + runway readout (issue #543), keyed by the SAME handle as
+    /// `summary.per_account` — one entry per summary account, overlaid by [`with_velocity`]
+    /// AFTER [`build_report`] (so the base report stays a pure aggregate). Empty until that
+    /// overlay runs (a bare `build_report` result — every hermetic aggregate test — carries no
+    /// velocity), so the readout is presentation-additive: a report built without it renders
+    /// and serializes exactly as it did pre-#543. Summary-window only, like `orphans`.
+    velocity: BTreeMap<String, AccountVelocity>,
+}
+
+/// One account's velocity + runway readout (issue #543) — the recent per-account usage RATE
+/// and the approximate head-room to its swap trigger, computed stats-side by replaying #539's
+/// session-velocity EMA over the stored sample series (same α, same reset guard, same
+/// [`MIN_VELOCITY_SAMPLES`] gate) so the shown rate matches the daemon's own projection rather
+/// than a second, divergent one. Every field is `Option` — an unknown / zero / stale velocity
+/// yields `None` (honest degradation), NEVER a fabricated or infinite number.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AccountVelocity {
+    /// Smoothed session-usage rate in usage-FRACTION per second (the EMA's native unit; the
+    /// human/wire views scale it to `%/min`). `None` when the account has < 2 usable sample
+    /// intervals, a window reset cleared the EMA, or the last reading is stale. Non-negative.
+    session_rate: Option<f64>,
+    /// Smoothed weekly-usage rate (fraction/second) — the SAME smoothing recipe applied to the
+    /// weekly dimension (#539 retains only the session EMA; the weekly runway `#541` wants
+    /// reuses the identical definition, not a divergent one). `None` on the same cases.
+    weekly_rate: Option<f64>,
+    /// Approximate whole seconds until the session reading reaches `session_trigger` at the
+    /// smoothed rate: `(trigger − current) / rate`. `None` when the rate is unknown or `0`, or
+    /// the reading is already at/over the trigger (no positive head-room to state as a fact).
+    session_runway_secs: Option<i64>,
+    /// Approximate whole seconds until the weekly reading reaches `weekly_trigger`. `None` on
+    /// the same cases (commonly `None` — the weekly window moves slowly, so a flat weekly
+    /// dimension has no measurable rate).
+    weekly_runway_secs: Option<i64>,
 }
 
 /// Entry point for the `stats` verb: read the store once, resolve the window, aggregate,
@@ -299,14 +332,20 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     // orphan partition (every handle renders as before), so `stats` still works pre-`capture`.
     let config = Config::load().ok();
     let params = params_from(config.as_ref());
+    let vparams = velocity_params_from(config.as_ref());
     let roster = config.as_ref().map(roster_handles);
-    let report = build_report(
-        &data,
-        window,
-        args.accounts,
-        roster.as_ref(),
+    let report = with_velocity(
+        build_report(
+            &data,
+            window,
+            args.accounts,
+            roster.as_ref(),
+            &params,
+            offset,
+        ),
+        &data.samples,
         &params,
-        offset,
+        &vparams,
     );
 
     let out = if args.json {
@@ -368,10 +407,17 @@ fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&st
     // series stays byte-parity with `stats --json`.
     let config = Config::load().ok();
     let params = params_from(config.as_ref());
+    let vparams = velocity_params_from(config.as_ref());
     let roster = config.as_ref().map(roster_handles);
     // No account filter over the socket — the whole roster (matches `stats --period <p> --json` with
-    // no `--account`).
-    let report = build_report(data, window, Vec::new(), roster.as_ref(), &params, offset);
+    // no `--account`). Overlay the velocity + runway readout from the SAME params the CLI uses, so a
+    // socket read stays byte-parity with `stats --period <p> --json` (issue #543 keeps R-2).
+    let report = with_velocity(
+        build_report(data, window, Vec::new(), roster.as_ref(), &params, offset),
+        &data.samples,
+        &params,
+        &vparams,
+    );
     serde_json::to_string(&stats_wire(&report))
         .unwrap_or_else(|_| r#"{"error":"stats unavailable"}"#.to_owned())
 }
@@ -557,6 +603,174 @@ fn roster_handles(config: &Config) -> BTreeSet<String> {
     config.roster.iter().map(|a| a.label.clone()).collect()
 }
 
+/// The #539 SUSTAINED-motion gate, mirrored stats-side (issue #543): a velocity is usable only
+/// once its EMA has blended at least this many intervals, so a single-interval spike is never
+/// reported as a trend. Kept in lockstep with `crate::daemon`'s own `MIN_VELOCITY_SAMPLES` (both
+/// `2`) — deliberately duplicated rather than shared, to keep this readout a stats-local change
+/// (no daemon edit); the provenance is cited here so the two cannot silently drift.
+const MIN_VELOCITY_SAMPLES: u32 = 2;
+
+/// The velocity + runway knobs (issue #543), derived from config ONCE — mirroring
+/// [`params_from`] so the two read the same [`crate::config`]. All in the sample's own units
+/// (usage fractions), so [`account_velocity`] never reasons about the percent/fraction mismatch.
+/// A missing / malformed config falls back to built-in [`Tunables`] defaults, so the read-only
+/// view still works pre-`capture` (the same tolerance the aggregator params have).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VelocityParams {
+    /// The #539 session-velocity EMA smoothing weight α (`session_velocity_ema_alpha_pct / 100`)
+    /// — REUSED verbatim so the stats-shown rate matches the daemon's own projection, never a
+    /// second, divergent rate. `1.0` = no smoothing (the raw last-interval rate).
+    session_ema_alpha: f64,
+    /// The session swap trigger as a fraction — the neutral head-room reference for the session
+    /// runway (`(trigger − current) / rate`): the point the daemon acts, stated as a fact.
+    session_trigger: f64,
+    /// The weekly swap trigger as a fraction — the weekly-runway reference.
+    weekly_trigger: f64,
+}
+
+fn velocity_params_from(config: Option<&Config>) -> VelocityParams {
+    let (alpha_pct, session, weekly) = match config {
+        Some(c) => (
+            c.tunables.session_velocity_ema_alpha_pct,
+            c.tunables.session_trigger,
+            c.tunables.weekly_trigger,
+        ),
+        None => {
+            let t = Tunables::default();
+            (
+                t.session_velocity_ema_alpha_pct,
+                t.session_trigger,
+                t.weekly_trigger,
+            )
+        }
+    };
+    VelocityParams {
+        session_ema_alpha: f64::from(alpha_pct) / 100.0,
+        session_trigger: f64::from(session) / 100.0,
+        weekly_trigger: f64::from(weekly) / 100.0,
+    }
+}
+
+/// Replay #539's velocity EMA over one dimension's `(ts, fraction)` samples in ASCENDING ts
+/// order — the SAME smoothing the daemon applies live (`Daemon::note_session_velocity`): the
+/// per-interval instant rate `(next − prev) / elapsed` in fraction-per-second, blended `α·instant
+/// + (1 − α)·prev`, SEEDED with the raw rate on the first interval (not zero — a zero seed biases
+/// the EMA below the true rate), and CLEARED whenever an interval has non-positive elapsed OR the
+/// reading DROPS (a window reset), so a post-reset climb re-seeds from the drop. Returns the
+/// smoothed rate ONLY once ≥ [`MIN_VELOCITY_SAMPLES`] intervals have blended since the last reset
+/// (#539's sustained gate); fewer → `None`. Non-negative by construction (a drop resets).
+fn replay_velocity_ema(series: &[(i64, f64)], alpha: f64) -> Option<f64> {
+    let mut ema: Option<(f64, u32)> = None; // (rate, intervals blended since the last reset)
+    for pair in series.windows(2) {
+        let (prev_ts, prev_v) = pair[0];
+        let (next_ts, next_v) = pair[1];
+        let elapsed = next_ts - prev_ts;
+        if elapsed <= 0 || next_v < prev_v {
+            ema = None; // reset — mirrors `note_session_velocity` clearing the slot
+            continue;
+        }
+        let instant = (next_v - prev_v) / elapsed as f64;
+        ema = Some(match ema {
+            Some((prev_rate, n)) => (
+                alpha * instant + (1.0 - alpha) * prev_rate,
+                n.saturating_add(1),
+            ),
+            None => (instant, 1),
+        });
+    }
+    match ema {
+        Some((rate, blended)) if blended >= MIN_VELOCITY_SAMPLES => Some(rate),
+        _ => None,
+    }
+}
+
+/// Approximate whole seconds until `current` reaches `trigger` at `rate` (fraction/second):
+/// `(trigger − current) / rate`. `None` — NEVER a sentinel — when the rate is unknown or
+/// non-positive (an idle / flat dimension has no finite runway) or the reading is already at/over
+/// the trigger (no positive head-room left to state as a neutral fact).
+fn runway_secs(rate: Option<f64>, current: f64, trigger: f64) -> Option<i64> {
+    let rate = rate?;
+    if rate <= 0.0 || current >= trigger {
+        return None;
+    }
+    Some(((trigger - current) / rate).round() as i64)
+}
+
+/// The per-account velocity + runway readout (issue #543) for `handle`, computed over its
+/// in-window samples. Both dimensions' rates come from [`replay_velocity_ema`] (the #539 recipe);
+/// each runway is [`runway_secs`] from the account's LATEST in-window reading to its trigger.
+/// Returns the all-`None` default (honest degradation) when the account has no in-window reading,
+/// or its latest reading is STALE — older than the aggregator's forward-coverage horizon before
+/// the window end (the daemon stopped polling / an idle or blind account) — so a no-longer-current
+/// reading never backs a velocity or a fabricated runway.
+///
+/// This is a faithful re-application of #539's rate DEFINITION over the STORED series, NOT a
+/// reconstruction of the daemon's transient in-memory EMA (an offline reader cannot see that). The
+/// two agree on a steadily-polled account; they can differ slightly across a polling GAP (a
+/// throttle / failure writes no sample), where the live daemon FREEZES its EMA and skips the gap
+/// interval while this replay blends one long spanning interval — a bounded, CONSERVATIVE
+/// approximation (a large elapsed damps the instant rate, so it under- rather than over-states
+/// velocity) that still resets on a drop and never yields a wrong-sign / infinite / sentinel value.
+fn account_velocity(
+    samples: &[Sample],
+    handle: &str,
+    window: &Window,
+    params: &AggregateParams,
+    vparams: &VelocityParams,
+) -> AccountVelocity {
+    // This account's in-window readings, ascending by ts. The store appends chronologically, but
+    // sort defensively — the aggregator does too, and the EMA replay depends on the order.
+    let mut rows: Vec<&Sample> = samples
+        .iter()
+        .filter(|s| s.acct == handle && s.ts >= window.start && s.ts < window.end)
+        .collect();
+    rows.sort_by_key(|s| s.ts);
+    let Some(last) = rows.last() else {
+        return AccountVelocity::default(); // no reading — everything unknown
+    };
+    // STALE: the latest reading no longer covers the window end (gap honesty — a reading is valid
+    // only over `[ts, ts + stale_after)`), so there is no CURRENT velocity to state.
+    if window.end - last.ts > params.stale_after_secs {
+        return AccountVelocity::default();
+    }
+    let session_series: Vec<(i64, f64)> = rows.iter().map(|s| (s.ts, s.session)).collect();
+    let weekly_series: Vec<(i64, f64)> = rows.iter().map(|s| (s.ts, s.weekly)).collect();
+    let session_rate = replay_velocity_ema(&session_series, vparams.session_ema_alpha);
+    let weekly_rate = replay_velocity_ema(&weekly_series, vparams.session_ema_alpha);
+    AccountVelocity {
+        session_rate,
+        weekly_rate,
+        session_runway_secs: runway_secs(session_rate, last.session, vparams.session_trigger),
+        weekly_runway_secs: runway_secs(weekly_rate, last.weekly, vparams.weekly_trigger),
+    }
+}
+
+/// Overlay the per-account velocity + runway readout (issue #543) onto a built [`Report`],
+/// computing one [`AccountVelocity`] per SUMMARY account from `samples`. Applied AFTER
+/// [`build_report`] (which leaves `report.velocity` empty) by BOTH the CLI reader ([`run`]) and
+/// the daemon `stats` socket verb ([`stats_socket_json`]), from the SAME `params` / `vparams`, so
+/// the two stay byte-parity (R-2). Series buckets and orphans carry no velocity — this is a
+/// CURRENT-rate readout, not a per-bucket or non-roster metric.
+fn with_velocity(
+    mut report: Report,
+    samples: &[Sample],
+    params: &AggregateParams,
+    vparams: &VelocityParams,
+) -> Report {
+    report.velocity = report
+        .summary
+        .per_account
+        .keys()
+        .map(|handle| {
+            (
+                handle.clone(),
+                account_velocity(samples, handle, &report.window, params, vparams),
+            )
+        })
+        .collect();
+    report
+}
+
 /// Aggregate the window's samples into a filtered summary + series.
 ///
 /// The summary is one whole-window `aggregate`; the series is one `aggregate` per bucket.
@@ -604,6 +818,10 @@ fn build_report(
         series,
         offset,
         orphans,
+        // Empty here — the velocity + runway readout (issue #543) is an overlay applied AFTER
+        // this pure aggregate, by [`with_velocity`], so a bare `build_report` (every hermetic
+        // aggregate test) renders/serializes exactly as it did pre-#543.
+        velocity: BTreeMap::new(),
     }
 }
 
@@ -945,7 +1163,101 @@ fn render_summary(report: &Report, color: bool) -> String {
     if let Some(lowest) = lowest {
         out.push_str(&format!("        {lowest}\n"));
     }
+
+    // Velocity + runway readout (issue #543), footing the band beneath the signal: a NEUTRAL
+    // per-account rate and the APPROXIMATE head-room to the swap trigger — facts only (a `%/min`
+    // rate, `~Xh to trigger`), never advice, so the render passes the amended framing guard
+    // (#542). Each line renders ONLY when at least one observed account HAS the datum; within it,
+    // an unknown / zero / stale value is `—` (honest degradation), never a fabricated number. A
+    // report without the velocity overlay (a bare aggregate) carries an empty map, so BOTH lines
+    // are absent and the band foots exactly as it did pre-#543.
+    let vel = |handle: &str| report.velocity.get(handle);
+    let has_velocity = observed
+        .iter()
+        .any(|(h, _)| vel(h).and_then(|v| v.session_rate).is_some());
+    if has_velocity {
+        // The velocity line (session `%/min` per account) and — PAIRED beneath it — the runway
+        // line (session `~Xh to trigger`, plus weekly `~Yd` where meaningful). An account whose
+        // rate / head-room is unknown renders `—` on both, so the degradation is EXPLICIT rather
+        // than a silently missing figure.
+        let rates: Vec<String> = observed
+            .iter()
+            .map(|(h, _)| match vel(h).and_then(|v| v.session_rate) {
+                Some(rate) => format!("{h} {}", fmt_pct_per_min(rate)),
+                None => format!("{h} —"),
+            })
+            .collect();
+        out.push_str(&format!("velocity  {}\n", rates.join(" · ")));
+        let runways: Vec<String> = observed
+            .iter()
+            .map(|(h, _)| format!("{h} {}", fmt_runway(vel(h).copied().unwrap_or_default())))
+            .collect();
+        out.push_str(&format!("runway  {}\n", runways.join(" · ")));
+    }
     out
+}
+
+/// A usage rate in the sample's native fraction-per-SECOND, scaled to percent-per-minute
+/// (`× 60 × 100`) — the neutral unit BOTH the human (`fmt_pct_per_min`) and wire
+/// (`round_pct_per_min`) views present, so the two scale the EMA's native rate identically
+/// (the `pct` sibling for the plain fraction → percent conversion).
+fn pct_per_min(rate_frac_per_sec: f64) -> f64 {
+    rate_frac_per_sec * 60.0 * 100.0
+}
+
+/// A smoothed usage rate (usage-fraction per SECOND — the EMA's native unit) as a neutral
+/// `%/min` string, to one decimal. `0.0%/min` for an idle (flat) account is an honest
+/// reading, not a gap.
+fn fmt_pct_per_min(rate_frac_per_sec: f64) -> String {
+    format!("{:.1}%/min", pct_per_min(rate_frac_per_sec))
+}
+
+/// This account's runway entry for the human band: the session head-room `~Xh to trigger`, and
+/// the weekly head-room `weekly ~Yd` where meaningful (issue #543). `—` when neither is known
+/// (unknown / zero / stale velocity, or already at/over the trigger) — never a fabricated or
+/// infinite number. The `~` marks every figure APPROXIMATE; the trigger is the neutral reference
+/// (the point the daemon acts), stated as a fact, not advice — so the entry clears the #542 guard.
+fn fmt_runway(v: AccountVelocity) -> String {
+    match (v.session_runway_secs, v.weekly_runway_secs) {
+        (Some(s), Some(w)) => format!(
+            "{} to trigger, weekly {}",
+            fmt_runway_hours(s),
+            fmt_runway_days(w)
+        ),
+        (Some(s), None) => format!("{} to trigger", fmt_runway_hours(s)),
+        (None, Some(w)) => format!("weekly {}", fmt_runway_days(w)),
+        (None, None) => "—".to_owned(),
+    }
+}
+
+/// An APPROXIMATE hours-scale runway, e.g. `~4h`, `~45m`, `~30s` — rounded to the coarsest
+/// non-zero unit so a glance reads the scale, not false precision. The session window is hours-
+/// scale, so this is the session runway's natural unit.
+fn fmt_runway_hours(secs: i64) -> String {
+    if secs >= HOUR_SECS {
+        format!("~{}h", (secs as f64 / HOUR_SECS as f64).round() as i64)
+    } else if secs >= 60 {
+        // Round to minutes — but a rounded-up 60 m IS an hour, so promote it to the coarser
+        // `~1h` rather than emit a boundary `~60m` (the coarsest non-zero unit, not false
+        // precision at the top of the minutes range).
+        match (secs as f64 / 60.0).round() as i64 {
+            60 => "~1h".to_owned(),
+            mins => format!("~{mins}m"),
+        }
+    } else {
+        format!("~{}s", secs.max(0))
+    }
+}
+
+/// An APPROXIMATE days-scale runway, e.g. `~5 days`, `~1 day`, falling back to `~Xh` under a day
+/// — days is the weekly window's natural scale, so this is the weekly runway's unit.
+fn fmt_runway_days(secs: i64) -> String {
+    if secs >= DAY_SECS {
+        let d = (secs as f64 / DAY_SECS as f64).round() as i64;
+        format!("~{} {}", d, if d == 1 { "day" } else { "days" })
+    } else {
+        fmt_runway_hours(secs)
+    }
 }
 
 // --- rendering: local-time window echo --------------------------------------
@@ -1085,6 +1397,33 @@ struct AccountWire {
     contribution_share: f64,
     /// Neutral utilisation-level descriptor from the session peak (issue #160 consumes it).
     band: Band,
+    /// The velocity + runway readout (issue #543): PRESENT on a summary account with a KNOWN
+    /// session velocity, OMITTED otherwise (insufficient / stale data — the reader reads that as
+    /// an absent field) and on every series bucket + orphan (a current-rate readout is neither
+    /// per-bucket nor a non-roster metric). Additive to `schema:1` (the `#159`/`#160`
+    /// extend-without-bumping precedent); does NOT bump `schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    velocity: Option<VelocityWire>,
+}
+
+/// The per-account velocity + runway readout on the `--json` wire (issue #543) — the machine peer
+/// of the human band's `velocity` / `runway` lines. A KNOWN object carries the session rate as a
+/// real number; an individually-unknown figure (a zero-rate or at/over-trigger runway, a flat
+/// weekly) is explicit `null`, NEVER a sentinel like `0` or `999`. Rates are `%/min`; runways are
+/// whole seconds (the reader scales to whatever unit it renders).
+#[derive(Serialize)]
+struct VelocityWire {
+    /// Smoothed session-usage rate in percent-per-minute (#539's EMA, replayed stats-side over
+    /// the stored series). Always a real number — the object is present only when it is known.
+    session_pct_per_min: f64,
+    /// Smoothed weekly-usage rate in percent-per-minute, or `null` when the weekly dimension has
+    /// no measurable rate (flat / reset / fewer than two sample intervals).
+    weekly_pct_per_min: Option<f64>,
+    /// Approximate whole seconds until the session reading reaches `session_trigger`, or `null`
+    /// when the rate is `0` or the reading is already at/over the trigger (no positive head-room).
+    session_runway_secs: Option<i64>,
+    /// Approximate whole seconds until the weekly reading reaches `weekly_trigger`, or `null`.
+    weekly_runway_secs: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1196,14 +1535,16 @@ fn stats_wire(report: &Report) -> StatsWire<'_> {
                 start: r.period.start,
                 end: r.period.end,
                 roster: roster_wire(&r.roster),
-                accounts: accounts_wire(&r.per_account),
+                // Series buckets carry no velocity — it is a CURRENT-rate readout, not per-bucket.
+                accounts: accounts_wire(&r.per_account, None),
             })
             .collect(),
         summary: PeriodWire {
             roster: roster_wire(&report.summary.roster),
-            accounts: accounts_wire(&report.summary.per_account),
+            accounts: accounts_wire(&report.summary.per_account, Some(&report.velocity)),
         },
-        orphans: accounts_wire(&report.orphans),
+        // Orphans carry no velocity either (a non-roster readout is out of scope, issue #543).
+        orphans: accounts_wire(&report.orphans, None),
     }
 }
 
@@ -1217,14 +1558,23 @@ fn render_json(report: &Report) -> Result<String> {
     Ok(json)
 }
 
-fn accounts_wire(per_account: &BTreeMap<String, AccountStats>) -> BTreeMap<String, AccountWire> {
+/// Map a per-account aggregate map to its wire form, attaching each account's velocity readout
+/// from `velocity` when supplied (the summary; `None` for series buckets and orphans, which carry
+/// no velocity — issue #543).
+fn accounts_wire(
+    per_account: &BTreeMap<String, AccountStats>,
+    velocity: Option<&BTreeMap<String, AccountVelocity>>,
+) -> BTreeMap<String, AccountWire> {
     per_account
         .iter()
-        .map(|(handle, a)| (handle.clone(), account_wire(a)))
+        .map(|(handle, a)| {
+            let v = velocity.and_then(|m| m.get(handle));
+            (handle.clone(), account_wire(a, v))
+        })
         .collect()
 }
 
-fn account_wire(a: &AccountStats) -> AccountWire {
+fn account_wire(a: &AccountStats, velocity: Option<&AccountVelocity>) -> AccountWire {
     AccountWire {
         seen: a.seen,
         coverage: a.coverage,
@@ -1235,7 +1585,29 @@ fn account_wire(a: &AccountStats) -> AccountWire {
         time_at_cap_secs: a.time_at_cap_secs,
         contribution_share: a.contribution_share,
         band: Band::of(a.session.peak),
+        velocity: velocity.and_then(velocity_wire),
     }
+}
+
+/// The wire form of an [`AccountVelocity`] — `Some` only when the SESSION velocity is known (the
+/// discriminator between "figures present" and "object absent"); the session rate is then a real
+/// number and the weekly rate / both runways are explicit `null` when individually unknown. Rates
+/// are rounded to `%/min` (3 decimals) so the wire is stable — no float-tail noise — while keeping
+/// the weekly dimension's small figures; runways stay whole seconds.
+fn velocity_wire(v: &AccountVelocity) -> Option<VelocityWire> {
+    let session = v.session_rate?; // absent field when the session velocity is unknown
+    Some(VelocityWire {
+        session_pct_per_min: round_pct_per_min(session),
+        weekly_pct_per_min: v.weekly_rate.map(round_pct_per_min),
+        session_runway_secs: v.session_runway_secs,
+        weekly_runway_secs: v.weekly_runway_secs,
+    })
+}
+
+/// A usage rate (fraction/second) as percent-per-minute, rounded to 3 decimals so the `--json`
+/// wire is stable across runs yet keeps the weekly dimension's small values.
+fn round_pct_per_min(rate_frac_per_sec: f64) -> f64 {
+    (pct_per_min(rate_frac_per_sec) * 1000.0).round() / 1000.0
 }
 
 fn dim_wire(d: &crate::usage_stats::DimStats) -> DimWire {
@@ -1757,6 +2129,7 @@ mod tests {
             series: series.iter().map(|b| ureport(b)).collect(),
             offset: 0,
             orphans: BTreeMap::new(),
+            velocity: BTreeMap::new(),
         }
     }
 
@@ -2168,6 +2541,30 @@ mod tests {
 
     fn params() -> AggregateParams {
         AggregateParams::new(300, 0.80, 0.80)
+    }
+
+    /// Velocity knobs for the hermetic velocity + runway tests (issue #543): EMA α 0.5 (the #539
+    /// default), session trigger 0.80 (matching `params`' session cap), weekly trigger 0.95.
+    fn vparams() -> VelocityParams {
+        VelocityParams {
+            session_ema_alpha: 0.5,
+            session_trigger: 0.80,
+            weekly_trigger: 0.95,
+        }
+    }
+
+    /// Build a `--period day` report from `samples` (window ending at `now`) and overlay the
+    /// velocity + runway readout — the SAME `build_report` → `with_velocity` pairing `run` and the
+    /// daemon socket verb apply in production.
+    fn velocity_report(samples: Vec<Sample>, now: i64) -> Report {
+        let store = data(samples, "");
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        with_velocity(
+            build_report(&store, window, vec![], None, &params(), 0),
+            &store.samples,
+            &params(),
+            &vparams(),
+        )
     }
 
     /// Resolve an RFC 3339 instant to epoch seconds via the crate's canonical parser.
@@ -2749,6 +3146,7 @@ mod tests {
             series: vec![bucket(0, 6 * HOUR_SECS)],
             offset: 0,
             orphans: BTreeMap::new(),
+            velocity: BTreeMap::new(),
         }
     }
 
@@ -3079,6 +3477,243 @@ mod tests {
         // neutral observation, and fails the instant a purchase call is appended.
         assert_eq!(scan_banned("work runs out in ~4h"), None);
         assert_eq!(scan_banned("work runs out in ~4h — top up"), Some("top up"));
+    }
+
+    // --- AC (issue #543): per-account velocity + runway readout (summary + --json) ----
+
+    #[test]
+    fn known_velocity_yields_the_expected_rate_and_runway_in_both_views() {
+        // Three readings 300 s apart, session climbing a steady +0.01/interval → a constant instant
+        // rate the EMA reproduces exactly: 0.01/300 frac/s = 0.2 %/min. From the last reading 0.52
+        // toward the 0.80 session trigger, head-room 0.28 → 0.28 ÷ (0.01/300) = 8400 s ≈ ~2h. The
+        // weekly dimension is FLAT (a known ZERO rate), so its runway is unknown — an explicit null.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.30),
+                sample(now - 600, "work", 0.51, 0.30),
+                sample(now - 300, "work", 0.52, 0.30),
+            ],
+            now,
+        );
+
+        // Human: the numeric text foots with a neutral velocity + runway line — facts, no advice.
+        let text = render_text(&report);
+        assert!(
+            text.contains("velocity  work 0.2%/min"),
+            "velocity line: {text}"
+        );
+        assert!(
+            text.contains("runway  work ~2h to trigger"),
+            "runway line: {text}"
+        );
+        assert_eq!(scan_banned(&text), None, "the real render is neutral");
+
+        // Wire: the velocity object carries %/min + whole-second runway; the flat weekly is a
+        // KNOWN 0.0 rate with an EXPLICIT null runway (honest degradation, never a sentinel).
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let vel = &v["summary"]["accounts"]["work"]["velocity"];
+        assert!((vel["session_pct_per_min"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert_eq!(vel["session_runway_secs"].as_i64().unwrap(), 8400);
+        assert_eq!(vel["weekly_pct_per_min"].as_f64().unwrap(), 0.0);
+        assert!(
+            vel["weekly_runway_secs"].is_null(),
+            "a flat weekly is a null runway, not a 0 / 999 sentinel: {vel}"
+        );
+    }
+
+    #[test]
+    fn weekly_runway_renders_in_days_when_it_is_meaningful() {
+        // Session climbs (as above → ~2h), weekly climbs slowly +0.001/interval → 0.001/300 frac/s;
+        // from 0.302 toward the 0.95 weekly trigger, head-room 0.648 → 0.648 ÷ (0.001/300) = 194 400
+        // s ≈ 2.25 d → "~2 days". Proves the weekly head-room renders on its natural day scale.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.300),
+                sample(now - 600, "work", 0.51, 0.301),
+                sample(now - 300, "work", 0.52, 0.302),
+            ],
+            now,
+        );
+        let text = render_text(&report);
+        assert!(
+            text.contains("runway  work ~2h to trigger, weekly ~2 days"),
+            "session hours + weekly days on one entry: {text}"
+        );
+        assert_eq!(scan_banned(&text), None, "the days render is neutral");
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let secs = v["summary"]["accounts"]["work"]["velocity"]["weekly_runway_secs"]
+            .as_i64()
+            .unwrap();
+        assert!(
+            (secs - 194_400).abs() <= 2,
+            "weekly runway ≈ 194 400 s: {secs}"
+        );
+    }
+
+    #[test]
+    fn zero_velocity_reports_a_known_rate_but_an_unknown_runway() {
+        // A flat account (three identical readings) has a KNOWN velocity of 0.0 %/min but NO finite
+        // runway — the AC's "zero velocity → runway unknown". The wire carries 0.0 with an explicit
+        // null runway; the human pairs "0.0%/min" with a "—".
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.30),
+                sample(now - 600, "work", 0.60, 0.30),
+                sample(now - 300, "work", 0.60, 0.30),
+            ],
+            now,
+        );
+        let text = render_text(&report);
+        assert!(
+            text.contains("velocity  work 0.0%/min"),
+            "known zero rate: {text}"
+        );
+        assert!(
+            text.contains("runway  work —"),
+            "unknown runway shown as —: {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let vel = &v["summary"]["accounts"]["work"]["velocity"];
+        assert_eq!(vel["session_pct_per_min"].as_f64().unwrap(), 0.0);
+        assert!(
+            vel["session_runway_secs"].is_null(),
+            "zero velocity → null runway, not a sentinel: {vel}"
+        );
+    }
+
+    #[test]
+    fn too_few_samples_leave_the_velocity_unknown_and_the_wire_field_absent() {
+        // A single reading cannot form even one interval → the velocity is unknown. The human band
+        // carries no velocity line, and the wire OMITS the velocity object (an absent field, the
+        // AC's permitted "null / absent" — never a fabricated rate).
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(vec![sample(now - 300, "work", 0.60, 0.30)], now);
+        let text = render_text(&report);
+        assert!(
+            text.contains("work"),
+            "the account still appears in the table"
+        );
+        assert!(
+            !text.contains("velocity  "),
+            "no velocity line without a rate: {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let work = &v["summary"]["accounts"]["work"];
+        assert_eq!(
+            work["seen"].as_i64().unwrap(),
+            1,
+            "the reading was still counted"
+        );
+        assert!(
+            work.get("velocity").is_none(),
+            "an unknown velocity omits the wire object: {work}"
+        );
+    }
+
+    #[test]
+    fn a_stale_last_reading_leaves_the_velocity_unknown() {
+        // Three climbing readings that WOULD yield a velocity (cf. the known-velocity test) but whose
+        // latest is far older than the aggregator's forward-coverage horizon (300 s) before now — the
+        // daemon stopped polling / an idle window. No CURRENT velocity → unknown, though the readings
+        // are still aggregated (seen == 3). Isolates STALENESS from insufficiency.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 7800, "work", 0.50, 0.30),
+                sample(now - 7500, "work", 0.51, 0.30),
+                sample(now - 7200, "work", 0.52, 0.30),
+            ],
+            now,
+        );
+        let text = render_text(&report);
+        assert!(
+            !text.contains("velocity  "),
+            "a stale reading shows no velocity: {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let work = &v["summary"]["accounts"]["work"];
+        assert_eq!(
+            work["seen"].as_i64().unwrap(),
+            3,
+            "the readings were still counted"
+        );
+        assert!(
+            work.get("velocity").is_none(),
+            "a stale velocity omits the wire object: {work}"
+        );
+    }
+
+    #[test]
+    fn the_velocity_readout_is_neutral_across_every_surface_and_the_wire_keys() {
+        // The #542 guard AC for the LIVE readout: a mixed roster — one account climbing (session +
+        // weekly runway), one flat (zero rate), one under-sampled (unknown) — rendered on BOTH human
+        // surfaces, with and without colour, contains no banned vocabulary; and the `--json` keys the
+        // readout adds are neutral too. This is what unblocks #543 on top of #542.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.300),
+                sample(now - 600, "work", 0.51, 0.301),
+                sample(now - 300, "work", 0.52, 0.302),
+                sample(now - 900, "home", 0.40, 0.20),
+                sample(now - 600, "home", 0.40, 0.20),
+                sample(now - 300, "home", 0.40, 0.20),
+                sample(now - 300, "spare", 0.10, 0.05),
+            ],
+            now,
+        );
+        for surface in [
+            render_summary(&report, false),
+            render_summary(&report, true),
+            render_text(&report),
+            render_charts(&report, 80, true, false),
+        ] {
+            assert!(
+                surface.contains("velocity  "),
+                "the readout is present on the surface under test: {surface:?}"
+            );
+            assert_eq!(
+                scan_banned(&surface),
+                None,
+                "the velocity + runway readout must contain no banned token: {surface:?}"
+            );
+        }
+
+        // The `--json` keys the readout adds are neutral (the wire carries figures, no verb).
+        let json = render_json(&report).unwrap();
+        let mut wire_keys = Vec::new();
+        json_keys(&serde_json::from_str(&json).unwrap(), &mut wire_keys);
+        assert!(
+            wire_keys.iter().any(|k| k == "velocity"),
+            "the velocity object reached the wire"
+        );
+        assert_eq!(
+            scan_banned(&wire_keys.join(" ")),
+            None,
+            "the velocity wire keys are neutral (issue #542 guard)"
+        );
+    }
+
+    #[test]
+    fn velocity_and_runway_formatters_are_approximate_and_scale_aware() {
+        // The rate scales fraction/second → %/min; runways round to the coarsest non-zero unit with
+        // an explicit `~`, hours for the session scale and days for the weekly scale.
+        assert_eq!(fmt_pct_per_min(0.01 / 300.0), "0.2%/min");
+        assert_eq!(fmt_pct_per_min(0.0), "0.0%/min");
+        assert_eq!(fmt_runway_hours(8400), "~2h");
+        assert_eq!(fmt_runway_hours(1200), "~20m");
+        assert_eq!(fmt_runway_hours(3585), "~1h"); // 59.75 m rounds up → promoted to ~1h, not a boundary ~60m
+        assert_eq!(fmt_runway_days(432_000), "~5 days");
+        assert_eq!(fmt_runway_days(86_400), "~1 day");
+        assert_eq!(fmt_runway_days(18_000), "~5h"); // under a day falls back to hours
+        assert_eq!(fmt_runway(AccountVelocity::default()), "—"); // all-unknown → em dash
     }
 
     // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
