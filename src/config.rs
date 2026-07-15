@@ -86,6 +86,22 @@ const DEFAULT_MONITOR_401_N: u8 = 3;
 /// Default consecutive recovery-probe successes before a quarantined (dead)
 /// account is restored to the rotation (issue #42).
 const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
+/// Default `session_blind_swap_secs` (issue #452, ADR-0017): the interim `T` for the
+/// bounded-blindness preemptive-swap gate — the active account's retained pre-blind
+/// anchor must be stale beyond this before the gate turns eligible. 300 s is roughly
+/// three consecutive active 429s under the #453 active-poll backoff cap (120 s), i.e.
+/// genuinely stuck (confirmed by the #451 replay). Setting the tunable to its 86400 s
+/// ceiling (24 h, far beyond any real blind window) disables the path — the kill-switch.
+const DEFAULT_SESSION_BLIND_SWAP_SECS: u64 = 300;
+/// Default `session_blind_risk_band` percent (issue #452, ADR-0017): the retained
+/// pre-blind anchor (`last_good`, #450) must be at/over this for the preemptive gate to
+/// arm. Deliberately LOWER than `session_trigger` — the gate acts preemptively on a
+/// stale anchor, before the account would trip the reactive trigger. 60 is the low end
+/// of the conservative 60-to-65 band #484 ratified: the #451 replay is flat from 68 %
+/// down to 50 %, so the data bounds only the ceiling and the fire-early-is-cheaper
+/// asymmetry (a late swap hits the wall on an unattended run; an early one only spends a
+/// recoverable-target swap) picks the low end.
+const DEFAULT_SESSION_BLIND_RISK_BAND: u8 = 60;
 
 /// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
 /// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
@@ -259,6 +275,18 @@ pub(crate) struct Tunables {
     /// Separate from `session_trigger` (no cross-field constraint), typically set
     /// higher; the daemon swaps when EITHER dimension reaches its own trigger.
     pub(crate) weekly_trigger: u8,
+    /// Bounded-blindness preemptive-swap gate threshold `T` (issue #452, ADR-0017), in
+    /// seconds: the active account's retained pre-blind anchor (`last_good`, #450) must
+    /// be stale beyond this before the gate arms. Promoted from the interim
+    /// `BLIND_GATE_SECS` daemon constant (SLI-only until #452). A value at the validated
+    /// 86400 ceiling disables the path (no blind window runs that long) — the kill-switch.
+    pub(crate) session_blind_swap_secs: u64,
+    /// Bounded-blindness preemptive-swap `risk_band` (issue #452, ADR-0017), as a
+    /// session-usage percent: the pre-blind anchor must be at/over this for the gate to
+    /// arm. Promoted from the interim `BLIND_GATE_RISK_BAND` daemon constant; DISTINCT
+    /// from and biased below `session_trigger` (the gate acts preemptively on a stale
+    /// anchor). Conservative 60 by default (#484).
+    pub(crate) session_blind_risk_band: u8,
     /// Consecutive non-scope 401s before an account is treated as DEAD (`1..=20`).
     /// Consumed by the daemon's per-account health state (issue #42): the Nth
     /// consecutive 401 on an account's stored token quarantines it (stop polling /
@@ -301,6 +329,8 @@ impl Default for Tunables {
             target_max_session_usage: DEFAULT_TARGET_MAX_SESSION_USAGE,
             session_trigger: DEFAULT_SESSION_TRIGGER,
             weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
+            session_blind_swap_secs: DEFAULT_SESSION_BLIND_SWAP_SECS,
+            session_blind_risk_band: DEFAULT_SESSION_BLIND_RISK_BAND,
             monitor_401_n: DEFAULT_MONITOR_401_N,
             monitor_recovery_m: DEFAULT_MONITOR_RECOVERY_M,
             poll_strategy: Strategy {
@@ -815,6 +845,16 @@ impl Config {
                     present("tunables", "weekly_trigger"),
                 ),
                 entry(
+                    "session_blind_swap_secs",
+                    t.session_blind_swap_secs.to_string(),
+                    present("tunables", "session_blind_swap_secs"),
+                ),
+                entry(
+                    "session_blind_risk_band",
+                    t.session_blind_risk_band.to_string(),
+                    present("tunables", "session_blind_risk_band"),
+                ),
+                entry(
                     "monitor_401_n",
                     t.monitor_401_n.to_string(),
                     present("tunables", "monitor_401_n"),
@@ -1057,6 +1097,21 @@ impl Config {
         // session (an unusual but valid operator choice), so both are configurable
         // independently (AC #3).
         range("weekly_trigger", t.weekly_trigger, 50, 99)?;
+        // Issue #452 (ADR-0017) bounded-blindness preemptive-swap gate. `session_blind_swap_secs`
+        // is `T` in seconds: floored at 60 (at least one poll cycle blind) and capped at 86400 — a
+        // 24 h ceiling far beyond any real blind window, so setting it there disables the path (the
+        // config kill-switch). `session_blind_risk_band` is a session percent, 50..=99 like the
+        // triggers but conventionally set BELOW `session_trigger` (the gate fires preemptively on a
+        // stale anchor). No NEW cross-field: ADR-0017's `target_max_session_usage <= session_trigger`
+        // is the existing reserve invariant enforced below — the blind path's target still needs
+        // runway below its own reactive trigger, which that invariant already guarantees.
+        range(
+            "session_blind_swap_secs",
+            t.session_blind_swap_secs,
+            60,
+            86_400,
+        )?;
+        range("session_blind_risk_band", t.session_blind_risk_band, 50, 99)?;
         // target_max_session_usage is default-on (#398): absent → DEFAULT_TARGET_MAX_SESSION_USAGE, clamped
         // down to session_trigger so the default honors the SAME
         // `target_max_session_usage <= session_trigger` invariant the present-value arm enforces
@@ -1131,6 +1186,8 @@ impl Config {
             target_max_session_usage,
             session_trigger: t.session_trigger as u8,
             weekly_trigger: t.weekly_trigger as u8,
+            session_blind_swap_secs: t.session_blind_swap_secs as u64,
+            session_blind_risk_band: t.session_blind_risk_band as u8,
             monitor_401_n: t.monitor_401_n as u8,
             monitor_recovery_m: t.monitor_recovery_m as u8,
             poll_strategy: Strategy {
@@ -1355,6 +1412,25 @@ impl Config {
              # dimension reaches its own trigger.\n",
         );
         out.push_str(&format!("weekly_trigger = {}\n", t.weekly_trigger));
+        out.push_str(
+            "# Bounded-blindness preemptive swap (issue #452, ADR-0017): when the active\n\
+             # account's usage poll stays blind (429/5xx) longer than this many seconds AND\n\
+             # its last good reading was at/over session_blind_risk_band, swap it away before\n\
+             # it can self-exhaust unobserved. Floor 60; set to the 86400 ceiling to disable.\n",
+        );
+        out.push_str(&format!(
+            "session_blind_swap_secs = {}\n",
+            t.session_blind_swap_secs
+        ));
+        out.push_str(
+            "# The last-known session percent (50..=99) at/over which a blind active account\n\
+             # is eligible for the preemptive swap above. Set BELOW session_trigger — it acts\n\
+             # on the stale pre-blind reading, before the reactive trigger would fire.\n",
+        );
+        out.push_str(&format!(
+            "session_blind_risk_band = {}\n",
+            t.session_blind_risk_band
+        ));
         out.push_str(
             "# Consecutive non-scope 401s before an account is treated as DEAD and\n\
              # quarantined (1..=20).\n",
@@ -1776,6 +1852,10 @@ struct RawTunables {
     session_trigger: i64,
     #[serde(default = "default_weekly_trigger")]
     weekly_trigger: i64,
+    #[serde(default = "default_session_blind_swap_secs")]
+    session_blind_swap_secs: i64,
+    #[serde(default = "default_session_blind_risk_band")]
+    session_blind_risk_band: i64,
     #[serde(default = "default_monitor_401_n")]
     monitor_401_n: i64,
     #[serde(default = "default_monitor_recovery_m")]
@@ -1790,6 +1870,8 @@ impl Default for RawTunables {
             target_max_session_usage: None,
             session_trigger: default_session_trigger(),
             weekly_trigger: default_weekly_trigger(),
+            session_blind_swap_secs: default_session_blind_swap_secs(),
+            session_blind_risk_band: default_session_blind_risk_band(),
             monitor_401_n: default_monitor_401_n(),
             monitor_recovery_m: default_monitor_recovery_m(),
         }
@@ -1807,6 +1889,12 @@ fn default_session_trigger() -> i64 {
 }
 fn default_weekly_trigger() -> i64 {
     i64::from(DEFAULT_WEEKLY_TRIGGER)
+}
+fn default_session_blind_swap_secs() -> i64 {
+    DEFAULT_SESSION_BLIND_SWAP_SECS as i64
+}
+fn default_session_blind_risk_band() -> i64 {
+    i64::from(DEFAULT_SESSION_BLIND_RISK_BAND)
 }
 fn default_monitor_401_n() -> i64 {
     i64::from(DEFAULT_MONITOR_401_N)
@@ -2059,6 +2147,9 @@ label = "personal"
                 target_max_session_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 97,
+                // VALID sets no blind-swap keys → the compiled-in defaults (issue #452).
+                session_blind_swap_secs: 300,
+                session_blind_risk_band: 60,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
                 // No [jitter] table in VALID → default strategies: poll jitters

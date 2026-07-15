@@ -221,6 +221,9 @@ struct Inputs {
     transient: u32,
     /// `usage_backoff_cleared` count (back-off episodes that ended).
     cleared: u32,
+    /// `event=swap reason=blind_preempt` count — the #452 bounded-blindness preemptive swaps
+    /// (ADR-0017) actually observed; the REAL false-preempt numerator, superseding the proxy.
+    preemptive_swaps: u32,
 }
 
 /// Parse the SLI ingredients out of the structured event-log `text`.
@@ -265,6 +268,14 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
 
         match fields.get("event").copied() {
             Some("swap") => {
+                // #452 preemptive swaps (reason=blind_preempt, ADR-0017): count each observed one
+                // for the false-preempt SLI's REAL numerator, then skip the session-overshoot
+                // accounting below — a preemptive swap fires on a STALE anchor, not a fresh reading,
+                // so its session_pct is not a swap-out overshoot sample.
+                if fields.get("reason").copied() == Some("blind_preempt") {
+                    inputs.preemptive_swaps = inputs.preemptive_swaps.saturating_add(1);
+                    continue;
+                }
                 // SESSION-triggered swaps only. A weekly swap fires while session is BELOW its
                 // trigger, so its session_pct is a low, incidental value — not a session
                 // overshoot — and weekly cadence is out of scope for this session-limit-latency
@@ -336,9 +347,9 @@ impl SwapOvershoot {
 /// The false-preempt SLI: the real (still-pending) rate plus the interim blind-window proxy.
 #[derive(Debug, PartialEq)]
 struct FalsePreempt {
-    /// Real preemptive swaps observed. Always `0` today — the #452 preemptive-swap path is
-    /// not built, so there is no such event to count; this populates once #452 lands and its
-    /// swap-outcome event is folded into [`parse_events`].
+    /// Real preemptive swaps observed (issue #452, ADR-0017): the `event=swap reason=blind_preempt`
+    /// count — the false-preempt SLI's real numerator, superseding the blind-window proxy as the
+    /// data accrues. Folded in from [`parse_events`].
     preemptive_swaps_observed: u32,
     /// Proxy denominator: near-limit blind windows (a hypothetical preemptive swap's chance).
     near_limit_windows: u32,
@@ -400,7 +411,7 @@ fn aggregate(inputs: &Inputs, window: Option<Window>) -> Report {
         swap_overshoot,
         time_blind_near_limit_secs: inputs.time_blind_near_limit_secs,
         false_preempt: FalsePreempt {
-            preemptive_swaps_observed: 0,
+            preemptive_swaps_observed: inputs.preemptive_swaps,
             near_limit_windows,
             would_be_wasted,
         },
@@ -470,10 +481,11 @@ fn render_human(r: &Report) -> String {
         r.time_blind_near_limit_secs
     ));
 
-    // SLI 3 — false-preempt (real rate pending #452; blind-window proxy today).
+    // SLI 3 — false-preempt: the real preemptive-swap count (issue #452, ADR-0017) plus the
+    // interim blind-window proxy.
     out.push_str("false-preempt (preemptive swap whose target turned out unnecessary)\n");
     out.push_str(&format!(
-        "  preemptive swaps observed: {} (#452 pending — real rate not yet measurable)\n",
+        "  preemptive swaps observed: {}\n",
         r.false_preempt.preemptive_swaps_observed
     ));
     out.push_str(&format!(
@@ -729,7 +741,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)\n",
                 "\n",
                 "false-preempt (preemptive swap whose target turned out unnecessary)\n",
-                "  preemptive swaps observed: 0 (#452 pending — real rate not yet measurable)\n",
+                "  preemptive swaps observed: 0\n",
                 "  proxy (blind-window reconciliation, interim margin 20pp): 1 of 2 near-limit windows would-be-wasted\n",
                 "\n",
                 "usage-poll 429 neutrality (roster-wide): rate_limited=2 transient=1 cleared=1\n",

@@ -235,12 +235,13 @@ const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
 const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
 /// Interim `T` for the #452 bounded-blindness preemptive-swap gate (ADR-0017): the active
 /// account's retained pre-blind anchor must be stale beyond this before the gate turns eligible.
-/// Used HERE only to instrument the gate-premise SLI (issue #482, the
-/// [`Event::BlindGateEligible`] no-viable-target
-/// falsifier) BEFORE #452's swap path is built — #452 replaces this constant with the
-/// `session_blind_swap_secs` CONFIG tunable (ADR-0017 assigns the tunables to #452, not here). The
-/// interim value (300 s) is the one ADR-0017 names; measuring the SLI at exactly it is what lets
-/// #484 confirm-or-refute the constant against production.
+/// The always-on measurement band for the gate-premise SLI (issue #482, the
+/// [`Event::BlindGateEligible`] no-viable-target falsifier) and the [`blind_active_view`] status
+/// projection (#479). #452's SWAP action keys off the `session_blind_swap_secs` CONFIG tunable
+/// instead (default-equal to this, so the two align out of the box); this const stays the SLI /
+/// status band DELIBERATELY, so the config kill-switch disables the swap without blinding #484's
+/// ratification SLIs. The interim value (300 s) is the one ADR-0017 names; measuring the SLI at
+/// exactly it is what lets #484 confirm-or-refute the constant against production.
 ///
 /// INTERIM / REVERSIBLE — stays so until the production ratification bar (issue #484, documented on
 /// [`BLIND_GATE_RISK_BAND`] and shared by both constants) is met; promotion reads PRODUCTION SLIs
@@ -250,8 +251,10 @@ const BLIND_GATE_SECS: u64 = 300;
 /// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) must be at/over this for the gate to
 /// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_trigger`
 /// ([`Daemon::session_trigger_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
-/// stale anchor, before the account would have tripped the reactive band. SLI-only (issue #482)
-/// until #452's `session_blind_risk_band` config tunable supersedes it.
+/// stale anchor, before the account would have tripped the reactive band. The always-on SLI
+/// (#482) / status (#479) measurement band; #452's swap keys off the `session_blind_risk_band`
+/// CONFIG tunable (default-equal), so the action threshold and this measurement band align out of
+/// the box, but a config kill-switch disables only the action — the SLI keeps measuring.
 ///
 /// INTERIM / REVERSIBLE, biased CONSERVATIVE (issue #484). ADR-0017 named the interim at 65 %; #484
 /// biases it to the low end of a conservative **[60, 65] band** — the interim evolution the ADR
@@ -1051,6 +1054,15 @@ pub(crate) enum TickAction {
     /// the cooldown. Distinct from [`Swapped`](Self::Swapped) so a forced
     /// dead-credential escape is visible in tests and outcomes.
     EmergencySwapped { from: usize, to: usize },
+    /// PREEMPTIVELY-swapped away from a BLIND (not dead) active account `from` to `to`
+    /// before it could self-exhaust unobserved (issue #452, ADR-0017): the bounded-blindness
+    /// gate fired — the active was blind past `session_blind_swap_secs`, its retained
+    /// pre-blind anchor (`last_good`, #450) sat at/over `session_blind_risk_band`, and a
+    /// viable target existed. Distinct from [`Swapped`](Self::Swapped) (reactive, on a fresh
+    /// reading) and [`EmergencySwapped`](Self::EmergencySwapped) (dead active, gates
+    /// bypassed): this path HONORS cooldown and the target reserve, and keys off the STALE
+    /// anchor — never the missing reading — so a genuinely-unknown active makes no swap.
+    PreemptivelySwapped { from: usize, to: usize },
     /// The active account's credential is DEAD (quarantined, #42) but no other
     /// account is a viable swap target — the daemon holds on the dead active, unable
     /// to escape. The `credential_dead` signal already fired on the death transition,
@@ -1098,6 +1110,7 @@ impl TickAction {
             TickAction::Held => DecisionClass::Hold,
             TickAction::Swapped { .. } => DecisionClass::Swap,
             TickAction::EmergencySwapped { .. } => DecisionClass::EmergencySwap,
+            TickAction::PreemptivelySwapped { .. } => DecisionClass::PreemptiveSwap,
             TickAction::ActiveDeadNoTarget => DecisionClass::ActiveDeadNoTarget,
             TickAction::CanonicalAdopted { .. } => DecisionClass::CanonicalAdopted,
             TickAction::NoViableTarget => DecisionClass::AllExhausted,
@@ -1504,6 +1517,21 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// credential is DEAD, liveness beats the reserve. Supersedes #10's opt-in `None`
     /// default — the config `target_max_session_usage` is now always set.
     target_max_session_usage: f64,
+    /// The #452 bounded-blindness preemptive-swap gate `T` (ADR-0017), in seconds:
+    /// [`Self::blind_swap`] fires only after the active account has been blind LONGER than
+    /// this (config `session_blind_swap_secs`, strict `>`). Set to the config ceiling it
+    /// disables the path — the kill-switch. DELIBERATELY DISTINCT from the interim
+    /// [`BLIND_GATE_SECS`] const that keys the always-on gate-premise SLI (#482) and the
+    /// [`blind_active_view`] status projection (#479): those keep measuring at the interim
+    /// band for #484 ratification even when this operator kill-switch is set, so disabling
+    /// the SWAP never blinds the ratification SLIs. Equal to the const by default (both 300),
+    /// so the measurement band and the action threshold align out of the box.
+    session_blind_swap_secs: u64,
+    /// The #452 preemptive-swap `risk_band` (ADR-0017) as a session fraction (config
+    /// `session_blind_risk_band / 100`): [`Self::blind_swap`] fires only when the retained
+    /// pre-blind anchor (`last_good`, #450) sat at/over this. Sibling of
+    /// `session_blind_swap_secs`; likewise distinct from the SLI/status [`BLIND_GATE_RISK_BAND`].
+    session_blind_risk_band: f64,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
@@ -1662,6 +1690,8 @@ where
             weekly_trigger_base: f64::from(tunables.weekly_trigger) / 100.0,
             session_trigger_base: f64::from(tunables.session_trigger) / 100.0,
             target_max_session_usage: f64::from(tunables.target_max_session_usage) / 100.0,
+            session_blind_swap_secs: tunables.session_blind_swap_secs,
+            session_blind_risk_band: f64::from(tunables.session_blind_risk_band) / 100.0,
             cooldown_strategy: tunables.cooldown_strategy,
             // The un-jittered cooldown window the socket `swap` command gates a manual
             // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
@@ -3202,10 +3232,15 @@ where
                 Some(_) => return TickAction::Held,
             }
         }
-        // The active account's own reading is unavailable (transient / a 401 below the
-        // dead threshold / unreadable) → skip; never swap on missing data.
+        // The active account's own reading is unavailable this cycle (transient / a 401
+        // below the dead threshold / a 429|5xx blind window / unreadable). Before skipping,
+        // consult the #452 bounded-blindness preemptive gate (ADR-0017): a HEALTHY (non-dead;
+        // the dead case took the emergency path above) active that has been blind too long,
+        // with a retained pre-blind anchor already near the band and a viable target, swaps
+        // away NOW rather than burning to exhaustion behind the blindness. Not eligible →
+        // the historical skip; never a swap on missing data (the gate keys off the anchor).
         let Some(active_usage) = readings[active_idx] else {
-            return TickAction::SkippedActiveUnavailable;
+            return self.blind_swap(at, active_idx, readings, events).await;
         };
         // Draw this cycle's swap-away triggers (issues #38, #41): each jittered +
         // clamped to 50..=99 percent, then to a fraction for the decision. The
@@ -3975,6 +4010,112 @@ where
         }
     }
 
+    /// The #452 bounded-blindness preemptive swap-away (ADR-0017) — the AVAILABILITY-path peer
+    /// of [`emergency_swap`](Self::emergency_swap). Fires for a HEALTHY (non-quarantined) active
+    /// that has gone BLIND (its live reading cleared to `None` on a 429/5xx) and stayed blind
+    /// too long to keep trusting the last reactive verdict. It keys off the RETAINED pre-blind
+    /// anchor (`last_good`, #450), NEVER the missing reading, and swaps only when ALL hold:
+    ///
+    /// - blind past the config `session_blind_swap_secs` (strict `>`), AND
+    /// - the anchor sat at/over the config `session_blind_risk_band`, AND
+    /// - a viable target exists — a peer under `target_max_session_usage` (ADR-0013), chosen via
+    ///   [`pick_target`] with the BASE (un-jittered) triggers, exactly as
+    ///   [`note_blind_gate_eligibility`](Self::note_blind_gate_eligibility)'s premise SLI (#482)
+    ///   previews it, so the swap fires where the SLI recorded the gate eligible.
+    ///
+    /// Unlike [`emergency_swap`](Self::emergency_swap) (dead active, #42) this does NOT drop the
+    /// target reserve to `f64::INFINITY` and does NOT bypass cooldown — ADR-0017 keeps the
+    /// availability path separate from the liveness one, so it takes no ADR-0013 emergency
+    /// exemption. No anchor / not-yet-armed / not warmed up / no viable target all fall THROUGH
+    /// to the historical [`TickAction::SkippedActiveUnavailable`] (the SLI already recorded the
+    /// no-viable-target episode where relevant); within cooldown yields
+    /// [`TickAction::SkippedCooldown`]. On a swap-engine error the state stays coherent (#6
+    /// no-half-swap) and the anchor is untouched, so the gate re-arms and retries next cycle.
+    async fn blind_swap(
+        &mut self,
+        at: Instant,
+        active_idx: usize,
+        readings: &[Option<Usage>],
+        events: &mut Vec<Event>,
+    ) -> TickAction {
+        // Key off the retained pre-blind anchor (#450) — NOT the missing reading. No anchor (a
+        // genuinely-unknown active, or one whose anchor a prior swap-away / active-loss dropped)
+        // → no episode, historical skip; never a spurious swap on absent data (#369's caution).
+        let Some(anchor) = self.state.last_good else {
+            return TickAction::SkippedActiveUnavailable;
+        };
+        // Gate conditions 1+2 (ADR-0017), on the CONFIG thresholds — the operator-tunable,
+        // kill-switchable ACTION band, deliberately distinct from the interim const the
+        // gate-premise SLI / status projection measure at (so a kill-switch disables the swap
+        // without blinding #484's ratification SLIs): blind past `session_blind_swap_secs` AND
+        // the anchor at/over `session_blind_risk_band`.
+        let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
+        if !(blind_elapsed > self.session_blind_swap_secs
+            && anchor.session >= self.session_blind_risk_band)
+        {
+            return TickAction::SkippedActiveUnavailable;
+        }
+        // #80 warm-up: until the staggered loop has polled every rotation account once, the
+        // carried readings are partial — a viable-target verdict off them could be spurious, so
+        // hold (skip) until the first cycle completes. Mirrors the reactive path + the SLI guard.
+        if !self.state.warmed_up {
+            return TickAction::SkippedActiveUnavailable;
+        }
+        // Cooldown (#10) is HONORED — this is not the emergency path (ADR-0017). Draw the
+        // per-cycle (jittered) cooldown exactly as the reactive path does; within it, defer.
+        let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
+            &mut self.rng,
+            COOLDOWN_SECS_LO,
+            COOLDOWN_SECS_HI,
+        ));
+        if let Some(last) = &self.state.last_swap {
+            if at.saturating_duration_since(last.at) < cooldown {
+                return TickAction::SkippedCooldown;
+            }
+        }
+        // Gate condition 3 (ADR-0017): a viable target — a peer under `target_max_session_usage`
+        // (ADR-0013), the reserve HONORED (NOT the emergency `None` / `f64::INFINITY` bypass).
+        // BASE (un-jittered) triggers, the same preview `note_blind_gate_eligibility` /
+        // `next_swap` use, so the fired swap matches the recorded premise. None → the SLI
+        // already logged a no-viable-target episode; fall through to the historical skip (never
+        // swap among saturated / exhausted peers).
+        let Some(target_idx) = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            Some(self.target_max_session_usage),
+            self.session_trigger_base,
+            self.weekly_trigger_base,
+        ) else {
+            return TickAction::SkippedActiveUnavailable;
+        };
+        // Run the swap through the SAME single-writer, no-torn-swap primitive (#6 / #64,
+        // ADR-0003) the reactive + emergency paths use — an error (incl. a fail-closed
+        // contended lock) leaves the canonical + both stashes coherent and the anchor intact
+        // (`record_swap` drops it only on success), so the gate re-arms and retries next cycle.
+        let outgoing = self.roster[active_idx].stash();
+        let incoming = self.roster[target_idx].stash();
+        match self.locked_swap(&outgoing, &incoming).await {
+            Ok(_report) => {
+                self.record_swap(target_idx, &incoming, at).await;
+                events.push(Event::Swap {
+                    from: self.roster[active_idx].label.clone(),
+                    to: self.roster[target_idx].label.clone(),
+                    reason: SwapReason::BlindPreempt,
+                    // The active is BLIND, so the stale pre-blind anchor is the only session
+                    // signal — log it (as a percent, like every swap line) so the `swap` line
+                    // agrees with the value the gate keyed off. Never a token / email (#15).
+                    session_pct: to_pct(anchor.session),
+                });
+                TickAction::PreemptivelySwapped {
+                    from: active_idx,
+                    to: target_idx,
+                }
+            }
+            Err(_) => TickAction::SwapFailed,
+        }
+    }
+
     /// Autonomously recover a SCRUBBED / empty shared canonical (issue #467) — the ADR-0018
     /// decision-1 mitigation. When Claude Code empties the shared `Claude Code-credentials` item on
     /// its first `invalid_grant` (the fleet-wide "Not logged in" lockout, ADR-0018), the daemon
@@ -4173,8 +4314,9 @@ where
                 SwapReason::Session => Some(NoTargetCause::Session),
                 SwapReason::Weekly => Some(NoTargetCause::Weekly),
                 // `all_exhausted_relief` only ever classifies Session|Weekly; the operator-swap
-                // reasons (Manual / Forced) cannot arise from a no-target verdict.
-                SwapReason::Manual | SwapReason::Forced => None,
+                // reasons (Manual / Forced) and the #452 preemptive reason (BlindPreempt) cannot
+                // arise from a no-target verdict.
+                SwapReason::Manual | SwapReason::Forced | SwapReason::BlindPreempt => None,
             };
             NextSwap::NoViableTarget { cause, resets_at }
         })
@@ -5921,6 +6063,11 @@ mod tests {
             target_max_session_usage: floor,
             session_trigger: trigger,
             weekly_trigger: WEEKLY_TRIGGER,
+            // Issue #452 bounded-blindness preemptive swap: INERT by default (T parked at
+            // the kill-switch ceiling) so baseline daemon tests are unperturbed by the new
+            // gate; the blind-swap tests override `session_blind_swap_secs` to arm it.
+            session_blind_swap_secs: 86_400,
+            session_blind_risk_band: 60,
             monitor_401_n: 3,
             monitor_recovery_m: 2,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
@@ -8192,6 +8339,258 @@ mod tests {
             )),
             "eligible but no peer has reserve → the no-viable-target falsifier fires: {:?}",
             eligible.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_fires_past_t_with_a_viable_target() {
+        // Issue #452 (ADR-0017): the S1 replay. u-A `429`'d with its retained pre-blind anchor at
+        // 68 % — inside the risk band (≥ 60 %), below the 95 % reactive trigger — and a peer (u-B /
+        // u-C at 10 %) has reserve under the 80 % target_max. Under the reactive path alone u-A would
+        // burn to exhaustion behind the blindness (S1: to 98 %); the bounded-blindness gate swaps it
+        // AWAY once blind past T, keying off the stale anchor, before it self-exhausts.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.68, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        // Arm the #452 SWAP at the interim T. The `tunables()` helper parks `session_blind_swap_secs`
+        // at the kill-switch ceiling so baseline tests stay inert; here we exercise the gate. The
+        // risk band is already 0.60 (the config default the helper carries).
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A active before the blind swap"
+        );
+
+        // Blind the active — its reading clears, the 68 % anchor (#450) is retained. The clock is
+        // frozen through this loop, so blind_elapsed stays 0 and the gate never arms yet.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            let out = daemon.tick().await;
+            assert!(
+                !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
+                "no preemptive swap before the interim T elapses: {:?}",
+                out.action,
+            );
+        }
+
+        // Cross the interim T — the gate arms (blind_elapsed > T, anchor ≥ risk band) and a viable
+        // target exists, so the preemptive swap fires.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the bounded-blindness gate swaps the blind active away before it self-exhausts: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the blind u-A"
+        );
+        // The swap logged a `blind_preempt` reason carrying the STALE anchor pct (68) as session_pct
+        // — the only session signal available while blind — and record_swap dropped the anchor so it
+        // cannot re-fire.
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    session_pct: 68,
+                    ..
+                }
+            )),
+            "a blind_preempt swap event carrying the stale anchor pct: {:?}",
+            swapped.events,
+        );
+        assert!(
+            daemon.state.last_good.is_none(),
+            "the swap dropped the departed active's anchor (no re-fire)",
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_does_not_fire_without_an_anchor() {
+        // Issue #452 / #369: the gate keys off the retained `last_good` anchor (#450), NEVER the
+        // missing reading. An active that never got a good reading has no anchor, so a genuinely-
+        // unknown account produces NO spurious swap however long it is blind.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .rate_limited("u-A", None)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(
+            daemon.state.last_good.is_none(),
+            "u-A never read good → no pre-blind anchor",
+        );
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
+            "no anchor → no preemptive swap, only the historical skip: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — nothing to key off"
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_does_not_fire_without_a_viable_target() {
+        // Issue #452 / ADR-0013: eligible active (anchor 70 %, blind past T) but every peer is over
+        // the 80 % target_max reserve (u-B 85 %, u-C 90 %) — session-viable readings, no reserve to
+        // catch a swap. The reserve is HONORED (not the emergency bypass), so `pick_target` finds
+        // none and the gate falls through to the historical skip — never a swap onto a saturated peer.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.85, 0.10)
+                .ok("u-C", 0.90, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.85, 0.10)
+            .ok("u-C", 0.90, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "eligible but no viable target → the historical skip, no swap: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A stays active — no target to swap to"
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_kill_switch_disables_the_path_but_the_sli_keeps_measuring() {
+        // Issue #452 (ADR-0017): the config kill-switch. `session_blind_swap_secs` parked high (the
+        // `tunables()` helper's 86400 ceiling) disables the SWAP even long past the interim T — yet
+        // the gate-premise SLI (#482), which keys off the interim const, keeps firing, so #484's
+        // ratification data keeps flowing while the action is disabled (the deliberate const/config split).
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        assert!(
+            daemon.session_blind_swap_secs >= 86_400,
+            "the helper parks the gate at the kill-switch ceiling (swap disabled by default)",
+        );
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        // Advance FAR past the interim T (but nowhere near the 24 h kill-switch ceiling).
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS * 10));
+        let out = daemon.tick().await;
+        assert!(
+            !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
+            "the config kill-switch disables the swap even long past the interim T: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no swap fired — active unchanged"
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "the gate-premise SLI keeps measuring at the interim const even with the swap disabled: {:?}",
+            out.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_below_the_risk_band_does_not_fire() {
+        // Issue #452 / #484: an anchor BELOW the risk band (50 % < the 60 % band) never arms the
+        // gate, however long the active is blind — the preemptive swap acts only near the band, where
+        // self-exhaustion is a real risk. Below it, the historical skip stands.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "an anchor below the risk band never arms the gate, however long blind: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — below the band"
         );
     }
 
