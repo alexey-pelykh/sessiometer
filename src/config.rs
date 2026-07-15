@@ -112,6 +112,26 @@ const DEFAULT_SESSION_BLIND_SWAP_SECS: u64 = 300;
 /// asymmetry (a late swap hits the wall on an unattended run; an early one only spends a
 /// recoverable-target swap) picks the low end.
 const DEFAULT_SESSION_BLIND_RISK_BAND: u8 = 60;
+/// Default `session_velocity_horizon_secs` (issue #539, ADR-0017): the projection horizon `H`
+/// (seconds) for the velocity-projection preemptive trigger — the active account swaps away when
+/// its PROJECTED session usage (`last + velocity × H`) crosses the trigger, before the observed
+/// reading does. 120 s ≈ one active poll interval (the post-#366 interleave cadence, NOT the
+/// `poll_secs=300` peer cadence), the horizon the #538 spike validated on 22,022 real samples
+/// (P50=94 / P100=98 covered-swap, 0 over-fire at H ≤ 150 s). Setting it to `0` disables the path
+/// — the projection reduces to `last`, which never crosses (the reactive path already held) — the
+/// kill-switch.
+const DEFAULT_SESSION_VELOCITY_HORIZON_SECS: u64 = 120;
+/// Default `session_velocity_min_project_above` percent (issue #539, ADR-0017): the projective
+/// trigger only projects when the observed session reading is at/over this. The #538 spike's FREE
+/// guard — projection can't reach below it anyway (max reach ≤ 14 pp at H ≤ 150 s) — so it costs no
+/// benefit while excluding spurious low-usage projections. Conventionally BELOW `session_trigger`
+/// (the projection fires in the band beneath the reactive trigger).
+const DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE: u8 = 85;
+/// Default `session_velocity_ema_alpha_pct` (issue #539, ADR-0017): the EMA smoothing weight α
+/// (percent) applied to the per-account session-velocity signal (#399) — `ema = α·instant +
+/// (1-α)·prev` — to damp a single-interval velocity spike so the projection keys off SUSTAINED
+/// motion. α ≈ 0.5 (the #538-validated value); 100 means no smoothing (raw last-interval velocity).
+const DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT: u8 = 50;
 
 /// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
 /// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
@@ -309,6 +329,21 @@ pub(crate) struct Tunables {
     /// from and biased below `session_trigger` (the gate acts preemptively on a stale
     /// anchor). Conservative 60 by default (#484).
     pub(crate) session_blind_risk_band: u8,
+    /// Velocity-projection preemptive-trigger horizon `H` (issue #539, ADR-0017), in seconds:
+    /// the active account swaps away when its PROJECTED session usage (`last + velocity × H`,
+    /// keyed off the #399 usage-velocity signal) crosses the trigger, before the observed reading
+    /// does — closing the OBSERVED reactive overshoot (#363) #452's blind-window path does not.
+    /// `0` disables the path (projection reduces to `last`, never crosses) — the kill-switch.
+    pub(crate) session_velocity_horizon_secs: u64,
+    /// Velocity-projection guard (issue #539, ADR-0017), as a session-usage percent: the projective
+    /// trigger only projects when the observed reading is at/over this. The #538 spike's FREE guard
+    /// (projection can't reach lower anyway); conventionally BELOW `session_trigger`, like
+    /// `session_blind_risk_band`.
+    pub(crate) session_velocity_min_project_above: u8,
+    /// Velocity-projection EMA smoothing weight α (issue #539, ADR-0017), as a percent: the per-poll
+    /// blend `ema = α·instant + (1-α)·prev` damps a single-interval velocity spike so the projection
+    /// keys off SUSTAINED motion. `100` = no smoothing (raw last-interval velocity).
+    pub(crate) session_velocity_ema_alpha_pct: u8,
     /// Consecutive non-scope 401s before an account is treated as DEAD (`1..=20`).
     /// Consumed by the daemon's per-account health state (issue #42): the Nth
     /// consecutive 401 on an account's stored token quarantines it (stop polling /
@@ -354,6 +389,9 @@ impl Default for Tunables {
             weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
             session_blind_swap_secs: DEFAULT_SESSION_BLIND_SWAP_SECS,
             session_blind_risk_band: DEFAULT_SESSION_BLIND_RISK_BAND,
+            session_velocity_horizon_secs: DEFAULT_SESSION_VELOCITY_HORIZON_SECS,
+            session_velocity_min_project_above: DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE,
+            session_velocity_ema_alpha_pct: DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT,
             monitor_401_n: DEFAULT_MONITOR_401_N,
             monitor_recovery_m: DEFAULT_MONITOR_RECOVERY_M,
             poll_strategy: Strategy {
@@ -883,6 +921,21 @@ impl Config {
                     present("tunables", "session_blind_risk_band"),
                 ),
                 entry(
+                    "session_velocity_horizon_secs",
+                    t.session_velocity_horizon_secs.to_string(),
+                    present("tunables", "session_velocity_horizon_secs"),
+                ),
+                entry(
+                    "session_velocity_min_project_above",
+                    t.session_velocity_min_project_above.to_string(),
+                    present("tunables", "session_velocity_min_project_above"),
+                ),
+                entry(
+                    "session_velocity_ema_alpha_pct",
+                    t.session_velocity_ema_alpha_pct.to_string(),
+                    present("tunables", "session_velocity_ema_alpha_pct"),
+                ),
+                entry(
                     "monitor_401_n",
                     t.monitor_401_n.to_string(),
                     present("tunables", "monitor_401_n"),
@@ -1140,6 +1193,35 @@ impl Config {
             86_400,
         )?;
         range("session_blind_risk_band", t.session_blind_risk_band, 50, 99)?;
+        // Issue #539 (ADR-0017) velocity-projection preemptive trigger. `session_velocity_horizon_secs`
+        // is the projection horizon `H` in seconds: `0..=600`, where `0` disables the path (the
+        // projection reduces to `last`, which — the reactive path having already held — never crosses,
+        // the config kill-switch), and 600 is a sanity ceiling (the #538 spike validated H ≈ 120 and
+        // showed over-fire creeping in above ~150, so a large H is a foot-gun the false-projection SLI
+        // surfaces; the ceiling just bounds the absurd). `session_velocity_min_project_above` is a
+        // session percent (`50..=99`) conventionally set BELOW `session_trigger` — the projective peer
+        // fires in the band beneath the reactive trigger — exactly like `session_blind_risk_band`, so no
+        // NEW cross-field. `session_velocity_ema_alpha_pct` is the EMA weight α (`1..=100`); the `0`
+        // floor is excluded because α=0 would freeze the EMA (never integrate a new sample), a
+        // degenerate value, while 100 is the valid "no smoothing" (raw last-interval) end.
+        range(
+            "session_velocity_horizon_secs",
+            t.session_velocity_horizon_secs,
+            0,
+            600,
+        )?;
+        range(
+            "session_velocity_min_project_above",
+            t.session_velocity_min_project_above,
+            50,
+            99,
+        )?;
+        range(
+            "session_velocity_ema_alpha_pct",
+            t.session_velocity_ema_alpha_pct,
+            1,
+            100,
+        )?;
         // target_max_session_usage is default-on (#398): absent → DEFAULT_TARGET_MAX_SESSION_USAGE, clamped
         // down to session_trigger so the default honors the SAME
         // `target_max_session_usage <= session_trigger` invariant the present-value arm enforces
@@ -1231,6 +1313,9 @@ impl Config {
             weekly_trigger: t.weekly_trigger as u8,
             session_blind_swap_secs: t.session_blind_swap_secs as u64,
             session_blind_risk_band: t.session_blind_risk_band as u8,
+            session_velocity_horizon_secs: t.session_velocity_horizon_secs as u64,
+            session_velocity_min_project_above: t.session_velocity_min_project_above as u8,
+            session_velocity_ema_alpha_pct: t.session_velocity_ema_alpha_pct as u8,
             monitor_401_n: t.monitor_401_n as u8,
             monitor_recovery_m: t.monitor_recovery_m as u8,
             poll_strategy: Strategy {
@@ -1485,6 +1570,34 @@ impl Config {
         out.push_str(&format!(
             "session_blind_risk_band = {}\n",
             t.session_blind_risk_band
+        ));
+        out.push_str(
+            "# Velocity-projection preemptive swap (issue #539, ADR-0017): swap the active\n\
+             # account away when its PROJECTED session usage (last + velocity * H) crosses the\n\
+             # trigger before the observed reading does — H is this horizon in seconds\n\
+             # (~ the active poll cadence; 120 validated by #538). Set to 0 to disable.\n",
+        );
+        out.push_str(&format!(
+            "session_velocity_horizon_secs = {}\n",
+            t.session_velocity_horizon_secs
+        ));
+        out.push_str(
+            "# Only project when the observed session percent (50..=99) is at/over this — the\n\
+             # projection can't reach lower anyway, so it is a free guard. Set BELOW\n\
+             # session_trigger (the projective peer fires in the band beneath it).\n",
+        );
+        out.push_str(&format!(
+            "session_velocity_min_project_above = {}\n",
+            t.session_velocity_min_project_above
+        ));
+        out.push_str(
+            "# EMA smoothing weight alpha (1..=100 percent) for the session-velocity signal,\n\
+             # to damp a single-interval spike so the projection keys off sustained motion.\n\
+             # ~50 validated by #538; 100 means no smoothing (raw last-interval velocity).\n",
+        );
+        out.push_str(&format!(
+            "session_velocity_ema_alpha_pct = {}\n",
+            t.session_velocity_ema_alpha_pct
         ));
         out.push_str(
             "# Consecutive non-scope 401s before an account is treated as DEAD and\n\
@@ -1913,6 +2026,12 @@ struct RawTunables {
     session_blind_swap_secs: i64,
     #[serde(default = "default_session_blind_risk_band")]
     session_blind_risk_band: i64,
+    #[serde(default = "default_session_velocity_horizon_secs")]
+    session_velocity_horizon_secs: i64,
+    #[serde(default = "default_session_velocity_min_project_above")]
+    session_velocity_min_project_above: i64,
+    #[serde(default = "default_session_velocity_ema_alpha_pct")]
+    session_velocity_ema_alpha_pct: i64,
     #[serde(default = "default_monitor_401_n")]
     monitor_401_n: i64,
     #[serde(default = "default_monitor_recovery_m")]
@@ -1930,6 +2049,9 @@ impl Default for RawTunables {
             weekly_trigger: default_weekly_trigger(),
             session_blind_swap_secs: default_session_blind_swap_secs(),
             session_blind_risk_band: default_session_blind_risk_band(),
+            session_velocity_horizon_secs: default_session_velocity_horizon_secs(),
+            session_velocity_min_project_above: default_session_velocity_min_project_above(),
+            session_velocity_ema_alpha_pct: default_session_velocity_ema_alpha_pct(),
             monitor_401_n: default_monitor_401_n(),
             monitor_recovery_m: default_monitor_recovery_m(),
         }
@@ -1956,6 +2078,15 @@ fn default_session_blind_swap_secs() -> i64 {
 }
 fn default_session_blind_risk_band() -> i64 {
     i64::from(DEFAULT_SESSION_BLIND_RISK_BAND)
+}
+fn default_session_velocity_horizon_secs() -> i64 {
+    DEFAULT_SESSION_VELOCITY_HORIZON_SECS as i64
+}
+fn default_session_velocity_min_project_above() -> i64 {
+    i64::from(DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE)
+}
+fn default_session_velocity_ema_alpha_pct() -> i64 {
+    i64::from(DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT)
 }
 fn default_monitor_401_n() -> i64 {
     i64::from(DEFAULT_MONITOR_401_N)
@@ -2213,6 +2344,10 @@ label = "personal"
                 // VALID sets no blind-swap keys → the compiled-in defaults (issue #452).
                 session_blind_swap_secs: 300,
                 session_blind_risk_band: 60,
+                // VALID sets no velocity-projection keys → the compiled-in defaults (issue #539).
+                session_velocity_horizon_secs: 120,
+                session_velocity_min_project_above: 85,
+                session_velocity_ema_alpha_pct: 50,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
                 // No [jitter] table in VALID → default strategies: poll jitters
@@ -2516,6 +2651,11 @@ label = "personal"
             ("poll_secs", "4"),
             ("poll_secs", "3601"),
             ("exhausted_poll_secs", "86401"), // above the 24 h ceiling (#537)
+            ("session_velocity_horizon_secs", "601"), // above the 600 s sanity ceiling (#539)
+            ("session_velocity_min_project_above", "49"), // below the 50 % floor (#539)
+            ("session_velocity_min_project_above", "100"), // above the 99 % ceiling (#539)
+            ("session_velocity_ema_alpha_pct", "0"), // alpha=0 freezes the EMA — degenerate (#539)
+            ("session_velocity_ema_alpha_pct", "101"), // above 100 % (#539)
             ("cooldown_secs", "0"),           // below the non-zero floor (#272)
             ("cooldown_secs", "4"),           // still below the floor (#272)
             ("cooldown_secs", "3601"),
@@ -3259,6 +3399,9 @@ label = "personal"
             "target_max_session_usage",
             "session_trigger",
             "weekly_trigger",
+            "session_velocity_horizon_secs",
+            "session_velocity_min_project_above",
+            "session_velocity_ema_alpha_pct",
             "monitor_401_n",
             "monitor_recovery_m",
         ] {

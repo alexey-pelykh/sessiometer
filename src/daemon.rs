@@ -278,6 +278,15 @@ const BLIND_GATE_SECS: u64 = 300;
 /// promotion commit cites those readings; absent them the band holds at 60 %.
 const BLIND_GATE_RISK_BAND: f64 = 0.60;
 
+/// Minimum velocity samples the #539 EMA must have blended before its rate is trusted for a
+/// projective swap (ADR-0017). At `1` the EMA is a SINGLE freshly-seeded interval — an isolated
+/// spike would project and fire on it, defeating the "damp single-interval spikes" purpose of the
+/// smoothing; requiring `>= 2` means ≥ 2 intervals have blended, so a spike that did not persist has
+/// already decayed back below the crossing (the "no-fire without SUSTAINED velocity" invariant).
+/// A small compile-time interim (like [`BLIND_GATE_SECS`]): the operator-facing tunables are the
+/// horizon / guard / α; this floor is an internal soundness bound on the smoothing, not a policy dial.
+const MIN_VELOCITY_SAMPLES: u32 = 2;
+
 /// The ADR-0017 preemptive-gate ARMING predicate on the retained pre-blind anchor: blind past the
 /// interim [`BLIND_GATE_SECS`] (strict `>`) AND the anchor at/over the interim [`BLIND_GATE_RISK_BAND`]
 /// (`>=`). The SINGLE source of truth for "the gate is armed", so [`blind_active_view`]'s
@@ -1063,6 +1072,16 @@ pub(crate) enum TickAction {
     /// bypassed): this path HONORS cooldown and the target reserve, and keys off the STALE
     /// anchor — never the missing reading — so a genuinely-unknown active makes no swap.
     PreemptivelySwapped { from: usize, to: usize },
+    /// PREEMPTIVELY-swapped away from an OBSERVED active account `from` to `to` whose PROJECTED
+    /// session usage crossed the trigger before the observed reading did (issue #539, ADR-0017):
+    /// the velocity-projection gate fired — the observed reading was at/over
+    /// `session_velocity_min_project_above` but below the trigger, its retained EMA velocity
+    /// (≥ [`MIN_VELOCITY_SAMPLES`] samples) projected `last + rate × session_velocity_horizon_secs`
+    /// at/over the trigger, and a viable target existed. Distinct from
+    /// [`PreemptivelySwapped`](Self::PreemptivelySwapped) (BLIND, stale anchor): this fires on a
+    /// FRESH reading + its velocity. Like it, HONORS cooldown and the target reserve, and never
+    /// fires on a missing reading or an unwarmed velocity.
+    VelocityPreemptivelySwapped { from: usize, to: usize },
     /// The active account's credential is DEAD (quarantined, #42) but no other
     /// account is a viable swap target — the daemon holds on the dead active, unable
     /// to escape. The `credential_dead` signal already fired on the death transition,
@@ -1111,6 +1130,7 @@ impl TickAction {
             TickAction::Swapped { .. } => DecisionClass::Swap,
             TickAction::EmergencySwapped { .. } => DecisionClass::EmergencySwap,
             TickAction::PreemptivelySwapped { .. } => DecisionClass::PreemptiveSwap,
+            TickAction::VelocityPreemptivelySwapped { .. } => DecisionClass::VelocityPreemptiveSwap,
             TickAction::ActiveDeadNoTarget => DecisionClass::ActiveDeadNoTarget,
             TickAction::CanonicalAdopted { .. } => DecisionClass::CanonicalAdopted,
             TickAction::NoViableTarget => DecisionClass::AllExhausted,
@@ -1187,6 +1207,29 @@ struct LastGood {
     /// `blind_elapsed` against the SAME clock as the swap cooldown ([`LastSwap::at`]).
     /// Process-local: never serialized (an [`Instant`] is meaningless across the socket).
     at: Instant,
+}
+
+/// The retained per-account SESSION-velocity signal (issue #399), EMA-smoothed, for the #539
+/// velocity-projection preemptive trigger (ADR-0017). The transient [`usage_velocity`] the poll
+/// fold logs is discarded, so the projective path — which runs at decision time, a step AFTER the
+/// fold that would recompute it — has nothing to project from; this carries a smoothed rate ACROSS
+/// polls instead. Held in [`DecisionState::session_velocity`], one slot per roster account (only the
+/// ACTIVE slot is projected, but every account accrues its own so the signal is warm the moment it
+/// becomes active), reset to `None` on a session-usage DROP (a 5 h window reset / recovery — the
+/// prior climbing trend is then stale) so a post-reset projection never keys off a pre-reset rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VelocityEma {
+    /// EMA-smoothed session-usage rate as a FRACTION per second (`[0.0, 1.0]`-domain usage /
+    /// second), NOT the integer `%/min` the durable [`Event::UsageVelocity`] renders — kept in the
+    /// same fraction units as the `session` reading + the trigger so the projection
+    /// `last + rate × horizon_secs` needs no unit conversion. Non-negative while climbing (a drop
+    /// resets the slot to `None`, so a stored rate is never negative).
+    rate: f64,
+    /// Velocity samples folded into `rate` since the last reset. The SUSTAINED-velocity gate: a
+    /// single seeded sample (`samples == 1`) is one interval's spike, so the projective path fires
+    /// only at [`MIN_VELOCITY_SAMPLES`] (≥ 2) — the EMA has then blended ≥ 2 intervals, so an
+    /// isolated spike that did not persist has already been damped back down.
+    samples: u32,
 }
 
 /// Per-account health carried ACROSS ticks — the dead-credential lifecycle state
@@ -1434,6 +1477,15 @@ struct DecisionState {
     /// decision [`Usage`]) leaves the swap-decision type lean and every reader of `last_readings`
     /// unchanged. Process-local: never serialized (an [`Instant`] is meaningless across the socket).
     last_reading_at: Vec<Option<Instant>>,
+    /// The retained per-account SESSION-velocity EMA (issue #539, ADR-0017), indexed in lockstep
+    /// with [`last_readings`](Self::last_readings) — the smoothed rate the #539 velocity-projection
+    /// preemptive trigger ([`Daemon::velocity_swap`]) projects from. `None` until an account has a
+    /// usable two-reading interval, and RESET to `None` on a session-usage DROP (a 5 h reset /
+    /// recovery). Updated in the poll fold by [`note_session_velocity`](Daemon::note_session_velocity)
+    /// from the SAME `(prev, next, elapsed)` the durable [`Event::UsageVelocity`] uses, and rebuilt
+    /// in lockstep by [`reconcile_roster`](Daemon::reconcile_roster). Sized to the roster in
+    /// [`Daemon::new`]. See [`VelocityEma`].
+    session_velocity: Vec<Option<VelocityEma>>,
     /// The ACTIVE account's retained pre-blind anchor (issue #450): its last
     /// SUCCESSFUL reading (`session` / `weekly` fractions) plus the monotonic time it
     /// was observed, kept ACROSS a `429` / `5xx` blindness window that clears
@@ -1559,6 +1611,24 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// The ACTIVE account is exempt. See [`exhausted_poll_window`] and
     /// [`note_exhausted_poll`](Self::note_exhausted_poll).
     exhausted_poll_secs: u64,
+    /// The #539 velocity-projection horizon `H` (ADR-0017), in seconds (config
+    /// `session_velocity_horizon_secs`): [`Self::velocity_swap`] projects
+    /// `observed + session_velocity[active].rate × H` and fires when it crosses the trigger. `0`
+    /// disables the path (the projection reduces to `observed`, which the reactive path already
+    /// held below the trigger, so it never crosses) — the kill-switch. Kept as `u64` seconds (not a
+    /// pre-divided `f64`) so the projection reads `rate` (fraction/sec) × `H` in the SAME units the
+    /// EMA stores.
+    session_velocity_horizon_secs: u64,
+    /// The #539 velocity-projection guard (ADR-0017) as a session FRACTION (config
+    /// `session_velocity_min_project_above / 100`): [`Self::velocity_swap`] projects only when the
+    /// observed reading is at/over this. The #538 spike's free guard (the projection cannot reach
+    /// below it), biased below `session_trigger` like [`Self::session_blind_risk_band`].
+    session_velocity_min_project_above: f64,
+    /// The #539 velocity-projection EMA weight α (ADR-0017) as a FRACTION (config
+    /// `session_velocity_ema_alpha_pct / 100`): [`Self::note_session_velocity`] blends
+    /// `ema = α·instant + (1-α)·prev` to damp a single-interval spike. `1.0` = no smoothing (raw
+    /// last-interval velocity).
+    session_velocity_ema_alpha: f64,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
@@ -1701,6 +1771,9 @@ where
         // Reading timestamps parallel to `last_readings` (issue #449), for the %/min velocity
         // interval — sized to the roster like `last_readings`, `None` until each account is polled.
         let last_reading_at = vec![None; roster.len()];
+        // Per-account session-velocity EMA (issue #539), parallel to `last_readings` — `None` until
+        // each account has a usable two-reading interval, so no projection off an unwarmed signal.
+        let session_velocity = vec![None; roster.len()];
         let polled_once = vec![false; roster.len()];
         Self {
             roster,
@@ -1722,6 +1795,14 @@ where
             // The widened exhausted-peer cadence ceiling (issue #537); the floor is `poll_secs`,
             // read from `poll_strategy.base` at use so no second raw copy of it is stored.
             exhausted_poll_secs: tunables.exhausted_poll_secs,
+            // The velocity-projection horizon / guard / EMA weight (issue #539); the guard + weight
+            // are stored as fractions (like `session_blind_risk_band` / the triggers), the horizon
+            // as seconds so the projection multiplies the fraction/sec EMA rate by it directly.
+            session_velocity_horizon_secs: tunables.session_velocity_horizon_secs,
+            session_velocity_min_project_above: f64::from(
+                tunables.session_velocity_min_project_above,
+            ) / 100.0,
+            session_velocity_ema_alpha: f64::from(tunables.session_velocity_ema_alpha_pct) / 100.0,
             cooldown_strategy: tunables.cooldown_strategy,
             // The un-jittered cooldown window the socket `swap` command gates a manual
             // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
@@ -1771,6 +1852,7 @@ where
                 health,
                 last_readings,
                 last_reading_at,
+                session_velocity,
                 polled_once,
                 ..DecisionState::default()
             },
@@ -2182,6 +2264,9 @@ where
             ) {
                 let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
                 let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
+                // Copy the fraction readings out (issue #539) — `Usage` is `Copy`, so this ends the
+                // `prev`/`next` borrows and frees `self` for the `&mut self` EMA update below.
+                let (prev_session, next_session) = (prev.session, next.session);
                 if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
                     events.push(Event::UsageVelocity {
                         account: self.roster[i].account_uuid.clone(),
@@ -2190,6 +2275,12 @@ where
                         elapsed_secs,
                     });
                 }
+                // Issue #539: fold THIS interval into the account's session-velocity EMA (the
+                // projective trigger's signal), from the SAME `(prev, next, elapsed)` the durable
+                // velocity event uses. Folded on EVERY interval, including a flat/zero one (which
+                // correctly decays the EMA toward "not climbing"), unlike the event above whose
+                // non-zero-delta gate keeps the log quiet for an idle account.
+                self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
             }
             // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
             // the active had gone blind (a `429` / `5xx` cleared `last_readings[active]` so
@@ -3304,7 +3395,24 @@ where
             WEEKLY_TRIGGER_PCT_HI,
         ) / 100.0;
         if swap::decide(&active_usage, session_trigger, weekly_trigger) == SwapDecision::Hold {
-            return TickAction::Held;
+            // Reactive says HOLD — the observed reading is below both triggers. Before holding,
+            // consult the #539 velocity-projection peer (ADR-0017): if the active account's PROJECTED
+            // session usage (last + retained velocity × horizon) crosses the session trigger within
+            // the horizon, swap it away NOW — ahead of the observed reading tripping the reactive
+            // trigger — closing the observed reactive overshoot (#363) that #452's blind-window path
+            // does not address. Not eligible (kill-switch off, no sustained velocity, below the guard,
+            // projection short, or no viable target) → the historical Held. This is the ONLY new call
+            // into the reactive decision; every other branch below is byte-for-byte unchanged.
+            return self
+                .velocity_swap(
+                    at,
+                    active_idx,
+                    session_trigger,
+                    weekly_trigger,
+                    readings,
+                    events,
+                )
+                .await;
         }
         // Over the trigger — but until the staggered loop has polled every account in
         // the rotation at least once (issue #80 warm-up), the carried readings are
@@ -3905,6 +4013,11 @@ where
         let mut health = Vec::with_capacity(new_roster.len());
         let mut last_readings = Vec::with_capacity(new_roster.len());
         let mut last_reading_at = Vec::with_capacity(new_roster.len());
+        // Issue #539: the session-velocity EMA is re-keyed in lockstep with `last_readings` — kept
+        // for a persisting account (merely re-indexed), started fresh (`None`) for a new one, so the
+        // vec never drifts out of length/index sync with the roster (a projective read would
+        // otherwise index the wrong account or panic out of bounds).
+        let mut session_velocity = Vec::with_capacity(new_roster.len());
         let mut polled_once = Vec::with_capacity(new_roster.len());
         for account in &new_roster {
             match self
@@ -3916,12 +4029,14 @@ where
                     health.push(self.state.health[old_idx].clone());
                     last_readings.push(self.state.last_readings[old_idx]);
                     last_reading_at.push(self.state.last_reading_at[old_idx]);
+                    session_velocity.push(self.state.session_velocity[old_idx]);
                     polled_once.push(self.state.polled_once[old_idx]);
                 }
                 None => {
                     health.push(AccountHealth::default());
                     last_readings.push(None);
                     last_reading_at.push(None);
+                    session_velocity.push(None);
                     polled_once.push(false);
                 }
             }
@@ -3940,6 +4055,7 @@ where
         self.state.health = health;
         self.state.last_readings = last_readings;
         self.state.last_reading_at = last_reading_at;
+        self.state.session_velocity = session_velocity;
         self.state.polled_once = polled_once;
         self.state.active = active;
         // Issue #450: `last_good` belongs to the active account by identity; reconcile
@@ -4163,6 +4279,175 @@ where
         }
     }
 
+    /// Fold one poll interval into account `i`'s retained session-velocity EMA (issue #539,
+    /// ADR-0017) — the signal [`velocity_swap`](Self::velocity_swap) projects from. Called from the
+    /// poll fold with the SAME `(prev, next, elapsed_secs)` the durable [`Event::UsageVelocity`]
+    /// uses (fraction readings copied out so `self` is free to mutate). Pure state update, no event.
+    ///
+    /// - A session-usage DROP (`next < prev`) means the 5 h window reset (usage is monotonic within a
+    ///   window) or a recovery — the prior climbing trend is stale, so the slot is reset to `None`;
+    ///   a zero/degenerate interval likewise resets (nothing to integrate). Either way the projective
+    ///   path then needs a fresh pair of readings (≥ [`MIN_VELOCITY_SAMPLES`]) before it can fire.
+    /// - Otherwise the instantaneous rate `(next - prev) / elapsed` (session fraction per second,
+    ///   `>= 0`) is blended into the EMA at weight `session_velocity_ema_alpha`, seeded with the raw
+    ///   rate on the first sample (NOT zero — a zero seed biases the EMA to asymptote BELOW the true
+    ///   rate and would miss real overshoots; the single-spike case is instead gated by
+    ///   [`MIN_VELOCITY_SAMPLES`], not by seed choice), and the sample count is advanced.
+    fn note_session_velocity(
+        &mut self,
+        i: usize,
+        prev_session: f64,
+        next_session: f64,
+        elapsed_secs: u64,
+    ) {
+        if elapsed_secs == 0 || next_session < prev_session {
+            self.state.session_velocity[i] = None;
+            return;
+        }
+        let instant = (next_session - prev_session) / elapsed_secs as f64;
+        let alpha = self.session_velocity_ema_alpha;
+        self.state.session_velocity[i] = Some(match self.state.session_velocity[i] {
+            Some(prev) => VelocityEma {
+                rate: alpha * instant + (1.0 - alpha) * prev.rate,
+                samples: prev.samples.saturating_add(1),
+            },
+            None => VelocityEma {
+                rate: instant,
+                samples: 1,
+            },
+        });
+    }
+
+    /// The #539 velocity-projection preemptive swap (ADR-0017) — the OBSERVED-overshoot peer of the
+    /// reactive session trigger, called from [`decide_action`](Self::decide_action) exactly where the
+    /// reactive path would HOLD (observed below the trigger). It swaps the active account away when
+    /// its PROJECTED session usage crosses the trigger within the horizon, closing the residual
+    /// reactive overshoot (#363) that fires because `usage_velocity` (#399) peaks between the ~cadence
+    /// observations. Unlike [`blind_swap`](Self::blind_swap) it keys off a FRESH reading + its
+    /// retained velocity, never a stale anchor; like it, it is NOT emergency — HONORS cooldown and the
+    /// swap-target reserve ([`target_max_session_usage`](Self::target_max_session_usage), ADR-0013),
+    /// and routes through the no-torn-swap primitive ([`locked_swap`](Self::locked_swap), ADR-0003).
+    ///
+    /// Fires only when ALL hold (else `Held` — the reading is present and below the trigger, so the
+    /// non-fire outcome is a genuine hold, not the "unavailable" skip `blind_swap` returns):
+    /// - the horizon is non-zero (`0` is the config kill-switch — the projection would reduce to the
+    ///   observed reading, which already held below the trigger), **and**
+    /// - a retained velocity EMA exists with `>= MIN_VELOCITY_SAMPLES` samples (SUSTAINED — never a
+    ///   single-interval spike, and never a missing/`None` signal), **and**
+    /// - the observed reading is at/over `session_velocity_min_project_above` (the free guard), **and**
+    /// - `observed + rate × horizon >= session_trigger` (the projection crosses), **and**
+    /// - the roster is warmed up, the cooldown has elapsed (else `SkippedCooldown`), and a viable
+    ///   target exists (a peer under the reserve).
+    ///
+    /// `session_trigger` / `weekly_trigger` are the SAME per-cycle jittered draws the reactive path
+    /// used this tick, so the projection crosses the very trigger the reactive path just held below
+    /// and `pick_target` sees the same reserve — the projective peer is a strict early-fire of the
+    /// reactive decision, not a differently-calibrated one.
+    async fn velocity_swap(
+        &mut self,
+        at: Instant,
+        active_idx: usize,
+        session_trigger: f64,
+        weekly_trigger: f64,
+        readings: &[Option<Usage>],
+        events: &mut Vec<Event>,
+    ) -> TickAction {
+        // Kill-switch: horizon 0 → the projection is just the observed reading, which the reactive
+        // path already held below the trigger, so it can never cross. Cheap early exit.
+        let horizon = self.session_velocity_horizon_secs;
+        if horizon == 0 {
+            return TickAction::Held;
+        }
+        // The active's own FRESH reading (issue #539) — re-read from `readings[active_idx]` rather
+        // than threaded in as a separate arg (the `Copy` reading is already carried here, and the
+        // caller only reaches this path with it present). A missing slot cannot occur on the reactive
+        // Hold path that calls this, but hold defensively rather than project on absent data.
+        let Some(active_usage) = readings[active_idx] else {
+            return TickAction::Held;
+        };
+        // The retained velocity signal must exist AND be SUSTAINED (≥ MIN_VELOCITY_SAMPLES blended
+        // intervals). Absent (a first/failed poll, or reset by a window drop — the poll-gap case #540
+        // owns) or single-sample → never project (the "no-fire on a missing/unwarmed velocity"
+        // invariant): hold on the fresh reading rather than swap on a guess.
+        let Some(vel) = self.state.session_velocity[active_idx] else {
+            return TickAction::Held;
+        };
+        if vel.samples < MIN_VELOCITY_SAMPLES {
+            return TickAction::Held;
+        }
+        // The free guard (#538): only project from a reading already at/over the band. The
+        // projection cannot reach below it (max reach ≤ ~14 pp at H ≤ 150 s), so a lower reading can
+        // never cross anyway — the guard just excludes spurious low-usage projections cheaply.
+        if active_usage.session < self.session_velocity_min_project_above {
+            return TickAction::Held;
+        }
+        // Project `last + velocity × H` and require it to reach the trigger (the SAME jittered draw
+        // the reactive path held below this tick). Below → the velocity is not steep enough to
+        // overshoot within the horizon → hold and let the reactive path catch it if it climbs.
+        let projected = active_usage.session + vel.rate * horizon as f64;
+        if projected < session_trigger {
+            return TickAction::Held;
+        }
+        // #80 warm-up: the carried readings are partial until the staggered loop has polled every
+        // rotation account once — a viable-target verdict off them could be spurious, so hold. Mirrors
+        // the reactive + blind paths.
+        if !self.state.warmed_up {
+            return TickAction::Held;
+        }
+        // Cooldown (#10) is HONORED — this is not the emergency path (ADR-0017). Draw the per-cycle
+        // (jittered) cooldown exactly as the reactive + blind paths do; within it, defer. Reported as
+        // SkippedCooldown (the projection WANTED to fire) rather than a silent Held.
+        let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
+            &mut self.rng,
+            COOLDOWN_SECS_LO,
+            COOLDOWN_SECS_HI,
+        ));
+        if let Some(last) = &self.state.last_swap {
+            if at.saturating_duration_since(last.at) < cooldown {
+                return TickAction::SkippedCooldown;
+            }
+        }
+        // A viable target — a peer under `target_max_session_usage` (ADR-0013), the reserve HONORED
+        // (NOT the emergency `None` bypass). The SAME jittered triggers the reactive path used, so the
+        // projective peer selects exactly as the reactive swap it front-runs would. None → hold (never
+        // swap among saturated / exhausted peers; the reactive path owns the all-exhausted signal).
+        let Some(target_idx) = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            Some(self.target_max_session_usage),
+            session_trigger,
+            weekly_trigger,
+        ) else {
+            return TickAction::Held;
+        };
+        // Run the swap through the SAME single-writer, no-torn-swap primitive (#6 / #64, ADR-0003) the
+        // reactive + blind + emergency paths use — an error (incl. a fail-closed contended lock) leaves
+        // the canonical + both stashes coherent, so we retry next cycle.
+        let outgoing = self.roster[active_idx].stash();
+        let incoming = self.roster[target_idx].stash();
+        match self.locked_swap(&outgoing, &incoming).await {
+            Ok(_report) => {
+                self.record_swap(target_idx, &incoming, at).await;
+                events.push(Event::Swap {
+                    from: self.roster[active_idx].label.clone(),
+                    to: self.roster[target_idx].label.clone(),
+                    reason: SwapReason::VelocityPreempt,
+                    // The FRESH observed reading at swap-out (issue #539) — the projection fired off a
+                    // live reading, so `session_pct` is the real swap-out point (the projected
+                    // swap-out overshoot SLI's #363-acceptance sample), never a stale anchor. A
+                    // percent, like every swap line; never a token / email (#15).
+                    session_pct: to_pct(active_usage.session),
+                });
+                TickAction::VelocityPreemptivelySwapped {
+                    from: active_idx,
+                    to: target_idx,
+                }
+            }
+            Err(_) => TickAction::SwapFailed,
+        }
+    }
+
     /// Autonomously recover a SCRUBBED / empty shared canonical (issue #467) — the ADR-0018
     /// decision-1 mitigation. When Claude Code empties the shared `Claude Code-credentials` item on
     /// its first `invalid_grant` (the fleet-wide "Not logged in" lockout, ADR-0018), the daemon
@@ -4361,9 +4646,12 @@ where
                 SwapReason::Session => Some(NoTargetCause::Session),
                 SwapReason::Weekly => Some(NoTargetCause::Weekly),
                 // `all_exhausted_relief` only ever classifies Session|Weekly; the operator-swap
-                // reasons (Manual / Forced) and the #452 preemptive reason (BlindPreempt) cannot
-                // arise from a no-target verdict.
-                SwapReason::Manual | SwapReason::Forced | SwapReason::BlindPreempt => None,
+                // reasons (Manual / Forced) and the preemptive reasons (#452 BlindPreempt / #539
+                // VelocityPreempt) cannot arise from a no-target verdict.
+                SwapReason::Manual
+                | SwapReason::Forced
+                | SwapReason::BlindPreempt
+                | SwapReason::VelocityPreempt => None,
             };
             NextSwap::NoViableTarget { cause, resets_at }
         })
@@ -6296,6 +6584,12 @@ mod tests {
             // gate; the blind-swap tests override `session_blind_swap_secs` to arm it.
             session_blind_swap_secs: 86_400,
             session_blind_risk_band: 60,
+            // Issue #539 velocity-projection preemptive trigger: INERT by default (horizon parked
+            // at 0, the kill-switch) so baseline daemon tests are unperturbed by the new projective
+            // gate; the velocity-swap tests override `session_velocity_horizon_secs` to arm it.
+            session_velocity_horizon_secs: 0,
+            session_velocity_min_project_above: 85,
+            session_velocity_ema_alpha_pct: 50,
             monitor_401_n: 3,
             monitor_recovery_m: 2,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
@@ -8819,6 +9113,391 @@ mod tests {
             daemon.state.active,
             Some(0),
             "u-A unchanged — below the band"
+        );
+    }
+
+    // --- #539 velocity-projection preemptive swap (ADR-0017) ---------------------------------
+
+    /// A warmed three-account daemon with u-A active at `active_session` (kept below the 95 %
+    /// reactive trigger so the reactive path HOLDS and the projective peer is the only thing that
+    /// can fire) and u-B / u-C viable targets at 10 % (under the 80 % reserve). The velocity gate is
+    /// left INERT (`session_velocity_horizon_secs == 0`, the `tunables()` default) and the EMA slot
+    /// is `None` — each direct-call test arms the horizon and seeds `state.session_velocity[0]` to
+    /// the exact signal it exercises, then calls [`Daemon::velocity_swap`] with a cloned reading set
+    /// (so `self` is free for the `&mut` swap path). Peer readings default to viable targets.
+    async fn warmed_velocity_daemon(active_session: f64) -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", active_session, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A active before the projective swap"
+        );
+        // Frozen clock through the warm-up → every re-poll of the active saw a zero interval, so the
+        // EMA reset to `None`: the seed each test installs is the ONLY velocity signal in play.
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "the warm-up leaves the EMA unseeded (zero-interval resets)",
+        );
+        daemon
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_fires_past_the_projected_trigger() {
+        // Issue #539 (ADR-0017): the headline acceptance, end-to-end through the real `decide_action`
+        // hook. u-A climbs inside the guard band (86 % → 90 % → 92 %, all below the 95 % reactive
+        // trigger so the reactive path HOLDS every tick) at a SUSTAINED rate. Once two intervals have
+        // been blended (samples ≥ MIN_VELOCITY_SAMPLES), the projection `last + rate × H` crosses the
+        // trigger within the horizon and the active swaps AWAY — ahead of the observed reading
+        // tripping the reactive trigger — closing the observed reactive overshoot (#363).
+        // Warmed on a frozen clock (u-A at 86 %, schedule A, B, A, C): the helper asserts warmed-up,
+        // u-A active, and — since no interval elapsed — an unseeded (`None`) EMA. Same fixture the
+        // five direct-call velocity_swap tests route through.
+        let mut daemon = warmed_velocity_daemon(0.86).await;
+        // Arm the projective gate at 150 s — the TOP of the #538-validated safe band (H ≤ 150 s).
+        daemon.session_velocity_horizon_secs = 150;
+
+        // First climbing interval (86 % → 90 % over 60 s): the next active poll is tick 5 (A). This
+        // SEEDS the EMA (samples = 1) — a single interval, still below MIN_VELOCITY_SAMPLES.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.90, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(60));
+        let seeded = daemon.tick().await;
+        assert!(
+            matches!(seeded.action, TickAction::Held),
+            "one interval (samples = 1) is not yet SUSTAINED — the projection holds: {:?}",
+            seeded.action,
+        );
+        assert_eq!(
+            daemon.state.session_velocity[0].map(|v| v.samples),
+            Some(1),
+            "the first climbing interval seeds the EMA at one sample",
+        );
+
+        // Second climbing interval (90 % → 92 % over 60 s): tick 6 polls the peer u-B (no active
+        // update), tick 7 re-polls u-A and blends the second interval (samples = 2 → SUSTAINED). The
+        // projection 0.92 + rate × 150 now clears the 0.95 trigger, so the projective swap fires.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.92, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(60));
+        let peer = daemon.tick().await; // tick 6 = u-B, no active poll
+        assert!(
+            matches!(peer.action, TickAction::Held),
+            "the peer poll does not advance the active's velocity: {:?}",
+            peer.action,
+        );
+        let swapped = daemon.tick().await; // tick 7 = u-A → samples = 2, projection crosses
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::VelocityPreemptivelySwapped { from: 0, .. }
+            ),
+            "the projected usage crosses the trigger within the horizon → preemptive swap: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the climbing u-A"
+        );
+        // The swap logged a `velocity_preempt` reason carrying the FRESH observed reading (92 %, the
+        // live swap-out point — the projected-swap-out-overshoot SLI sample), never a stale anchor.
+        // The projective peer runs ONLY where the reactive path HELD (observed strictly below the
+        // session trigger in fraction space), so a swap-out is always below the trigger — here 92 <
+        // the 95 % trigger. In the default/validated trigger regime that keeps the ROUNDED swap-out
+        // pct under the P100 ≤ 98 acceptance; the ≤ 98 is an empirically-measured SLO (the #538 spike,
+        // not a hard invariant): a trigger set above ~98.5 % could round an in-band swap-out up to 99,
+        // which the reliability readout then surfaces honestly rather than silently masks.
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::VelocityPreempt,
+                    session_pct: 92,
+                    ..
+                }
+            )),
+            "a velocity_preempt swap event carrying the fresh observed pct: {:?}",
+            swapped.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_below_the_project_above_guard() {
+        // Issue #539 / #538: the free guard. A reading BELOW `session_velocity_min_project_above`
+        // (80 % < 85 %) never projects, even with a steep, well-sustained velocity — the guard
+        // short-circuits BEFORE the projection, excluding spurious low-usage projections cheaply.
+        let mut daemon = warmed_velocity_daemon(0.80).await;
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "a reading below the guard band holds regardless of velocity: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap — below the guard");
+        assert!(events.is_empty(), "no swap event emitted");
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_without_sustained_velocity() {
+        // Issue #539: SUSTAINED means ≥ MIN_VELOCITY_SAMPLES blended intervals. A single-interval
+        // spike (samples = 1) and a MISSING signal (`None`, the poll-gap case #540 owns) both HOLD on
+        // the fresh reading — the projection never fires on a one-off spike or an unwarmed velocity.
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.session_velocity_horizon_secs = 150;
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+
+        // A single-interval spike steep enough to cross IF it counted — but samples = 1 holds.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 1,
+        });
+        let mut events = Vec::new();
+        let spike = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(spike, TickAction::Held),
+            "a single-interval spike is not SUSTAINED → hold: {spike:?}",
+        );
+        assert!(events.is_empty());
+
+        // No retained signal at all → hold (never project on a missing velocity).
+        daemon.state.session_velocity[0] = None;
+        let mut events = Vec::new();
+        let missing = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(missing, TickAction::Held),
+            "a missing velocity signal → hold: {missing:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap either way");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_when_the_projection_falls_short() {
+        // Issue #539: an in-band, SUSTAINED, but SHALLOW velocity whose `rate × H` reach stays under
+        // the gap to the trigger does NOT fire — the projection is short, so hold and let the reactive
+        // path catch it if it keeps climbing. (0.90 + 0.0001 × 150 = 0.915 < 0.95.)
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.0001,
+            samples: 3,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "a shallow projection that stays under the trigger holds: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_kill_switch_horizon_zero_never_fires() {
+        // Issue #539 (ADR-0005): the config kill-switch. `session_velocity_horizon_secs == 0` reduces
+        // the projection to the observed reading — which the reactive path already held below the
+        // trigger — so even a steep, sustained, in-band velocity (94 %, one point under the trigger)
+        // can never cross. The disabled projective path is a plain `Held`.
+        let mut daemon = warmed_velocity_daemon(0.94).await;
+        daemon.session_velocity_horizon_secs = 0;
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "the horizon-0 kill-switch disables the projective swap: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap — kill-switch");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_without_a_viable_target() {
+        // Issue #539 / ADR-0013: an otherwise-eligible projection (in-band, sustained, crossing) but
+        // every peer is over the 80 % `target_max_session_usage` reserve (u-B 85 %, u-C 90 %). The
+        // reserve is HONORED — NOT the emergency `None` bypass — so `pick_target` finds none and the
+        // projective peer HOLDS rather than swap onto a saturated peer.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.90, 0.20)
+                .ok("u-B", 0.85, 0.10)
+                .ok("u-C", 0.90, 0.10),
+        )
+        .await;
+        daemon.session_velocity_horizon_secs = 150;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.001,
+            samples: 3,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "no peer under the reserve → the projective swap holds: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "u-A stays active — no target");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_honors_cooldown_not_emergency() {
+        // Issue #539 (ADR-0017): the projective peer is NOT the emergency path — it HONORS the swap
+        // cooldown (#10). With an otherwise-eligible projection but a swap inside the (jittered)
+        // cooldown window, it defers as `SkippedCooldown` (the projection WANTED to fire) rather than
+        // a silent hold — distinguishing it from the reserve-bypassing emergency swap.
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.session_velocity_horizon_secs = 150;
+        // A 600 s cooldown with a swap that JUST happened (frozen clock → zero elapsed since).
+        daemon.cooldown_strategy = Strategy::fixed(600.0);
+        daemon.state.last_swap = Some(LastSwap {
+            at: daemon.clock.now(),
+        });
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.001,
+            samples: 3,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::SkippedCooldown),
+            "an eligible projection inside the cooldown defers, not swaps: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap — cooldown honored");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn note_session_velocity_seeds_blends_and_resets() {
+        // Issue #539: the retained-EMA update seam. First interval SEEDS at the raw instant rate (NOT
+        // zero — a zero seed biases the EMA to asymptote BELOW the true rate and would miss real
+        // overshoots); the second BLENDS at α = 0.5; a session DROP (window reset / recovery) and a
+        // ZERO interval each RESET the slot to `None` (the climbing trend is stale / nothing to
+        // integrate), forcing a fresh pair of samples before the projection can fire again.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // First sample: seed at the raw instant rate (0.06 / 60 s = 0.001 /s), samples = 1.
+        daemon.note_session_velocity(0, 0.80, 0.86, 60);
+        let seeded = daemon.state.session_velocity[0].expect("seeded on the first interval");
+        assert!(
+            (seeded.rate - 0.001).abs() < 1e-9,
+            "seeded at the raw instant rate, not zero: {}",
+            seeded.rate,
+        );
+        assert_eq!(seeded.samples, 1);
+
+        // Second sample: blend at α (0.12 / 60 s = 0.002 /s), rate = 0.5·0.002 + 0.5·0.001, samples = 2.
+        daemon.note_session_velocity(0, 0.86, 0.98, 60);
+        let blended = daemon.state.session_velocity[0].expect("still present after the blend");
+        assert!(
+            (blended.rate - (0.5 * 0.002 + 0.5 * 0.001)).abs() < 1e-9,
+            "EMA blend at α = 0.5: {}",
+            blended.rate,
+        );
+        assert_eq!(blended.samples, 2);
+
+        // A session-usage DROP (next < prev — a 5 h window reset) resets the slot.
+        daemon.note_session_velocity(0, 0.98, 0.10, 60);
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "a usage drop resets the EMA (the climbing trend is stale)",
+        );
+
+        // Re-seed, then a ZERO interval (degenerate — nothing to integrate) resets it too.
+        daemon.note_session_velocity(0, 0.10, 0.20, 60);
+        assert!(daemon.state.session_velocity[0].is_some(), "re-seeded");
+        daemon.note_session_velocity(0, 0.20, 0.30, 0);
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "a zero interval resets the EMA",
+        );
+    }
+
+    #[test]
+    fn reconcile_roster_preserves_session_velocity_in_lockstep() {
+        // Issue #539: the per-account EMA is a parallel vec (like `last_readings`), so a roster
+        // reconcile MUST re-key it by uuid — preserved for a persisting account (merely re-indexed),
+        // `None` for a newly-onboarded one — or a projective read would index the wrong account or
+        // panic out of bounds. Here u-A is REMOVED (index shift) and u-C is ONBOARDED.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.003,
+            samples: 4,
+        });
+        daemon.state.session_velocity[1] = Some(VelocityEma {
+            rate: 0.007,
+            samples: 2,
+        });
+
+        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+
+        // The vec stays length- and index-aligned with the new roster.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
+        assert_eq!(daemon.state.session_velocity.len(), 2);
+        // u-B's EMA is preserved, re-indexed from slot 1 to slot 0.
+        let preserved = daemon.state.session_velocity[0].expect("u-B's EMA survives the reconcile");
+        assert_eq!(preserved.samples, 2);
+        assert!((preserved.rate - 0.007).abs() < 1e-9);
+        // u-C onboards with a fresh (`None`) EMA — no stale velocity leaks in from the removed u-A.
+        assert!(
+            daemon.state.session_velocity[1].is_none(),
+            "the onboarded account starts with no velocity",
         );
     }
 
