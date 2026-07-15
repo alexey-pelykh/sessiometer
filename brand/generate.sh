@@ -68,7 +68,12 @@ V_HEALTHY="#30D158"; V_WARNING="#FF9F0A"; V_CRITICAL="#FF453A"; V_SWAP="#0A84FF"
 GAUGE_ARC='<path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/>'
 # The rotation arrowhead — already a filled triangle in the master, so it needs no expansion. Part
 # of the SHARED chassis (all four states): brand-identity.md calls it "the invariant 'cycle' cue".
-GAUGE_ARROWHEAD='<path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z"/>'
+# ⚠ VERTEX ORDER IS LOAD-BEARING (issue #532). The arrowhead overlaps GAUGE_ARC's outer edge at the
+# arc mouth, and actool unions the two into ONE compound path under NONZERO winding — so the triangle
+# must wind the SAME way as the arc's outer contour, or the overlap cancels to a WHITE HOLE. The
+# vertices below run A→C→B (matching the arc); swapping the last two back to A→B→C reintroduces the
+# notch. A browser can't catch this — it unions regardless of winding — see the "simply union" note below.
+GAUGE_ARROWHEAD='<path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/>'
 
 # The shared chassis every state is built on: open arc + rotation arrowhead. Per the lock, the
 # needle + pivot dot from src/icon.svg are DROPPED here (they stay in the colour app-icon master).
@@ -128,7 +133,11 @@ SVG
 # where n is the unit normal — the literals are those corners, so re-deriving a mark means
 # re-deriving its corners (the stroke centreline is named in each comment so that stays possible).
 # A multi-segment stroke (the check) is its per-segment capsules PLUS a round-join disc at the
-# vertex — overlapping filled paths simply union, since every path is the same ink.
+# vertex — overlapping filled paths union ONLY when they wind the SAME way. actool merges every
+# subpath into one NONZERO-winding compound path, so two overlapping fills wound OPPOSITE ways CANCEL
+# to a hole (issue #532 — the arrowhead-vs-arc white notch). Same ink is necessary, not sufficient:
+# author every solid mark to wind like GAUGE_ARC's outer edge. (The check's capsules happen to agree,
+# so they union fine; the arrowhead did not, and holed.)
 #
 # ⚠ AND actool HONOURS ONLY <path> — IT SILENTLY DROPS <circle>. The second half of the same trap:
 # an earlier cut drew the dots/pivot as <circle fill=...>, which renders correctly in every browser
