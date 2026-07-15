@@ -18,10 +18,12 @@ fresh near-limit active usage is provably unavailable — and, importantly, to
 so the "just read the rate-limit headers" idea is not re-litigated each time the
 blindness bites.
 
-Unlike ADR-0009 and ADR-0012 — which record **shipped** behaviour — this ADR
-records a decision whose **implementation is pending** (tracked in **#452**), with
-interim constants `T=300s` / `risk_band=65%` to be finalised by the **#451**
-confirmation gate. It **supersedes nothing**: it *affirms* [ADR-0012](0012-active-reobservation-via-schedule-interleave.md)
+Like ADR-0009 and ADR-0012, this ADR records a **shipped** behaviour change, now
+enforced in `src/daemon.rs` (**#452**), with constants `T=300s` / `risk_band=60%`
+confirmed on two weeks of real telemetry — the **#451** premise-confirmation spike
+validated the premise and the interim `T`, and **#484** ratified the conservative
+60% band (the "fire-early-is-cheaper" asymmetry for unattended runs) over the
+interim 65%. It **supersedes nothing**: it *affirms* [ADR-0012](0012-active-reobservation-via-schedule-interleave.md)
 (active-observation stays favoured), *extends the consequence* of
 [ADR-0009](0009-rate-limit-backoff-per-account.md) for the active account, and
 *cross-references* [ADR-0013](0013-session-floor-default-on-reserve-emergency-exempt.md).
@@ -40,8 +42,10 @@ latency matters.
 
 **The bounded-blindness gap (S1 spike, 2026-07-10→11).** The active account `429`'d
 on its `/oauth/usage` poll at session usage `0.68`, went **blind for 755s**
-(`Retry-After`-dominated), and Claude Code burned it to `0.98` before any fresh
-reading returned. The reactive `session_trigger=95` swap **never fired** — it keys
+(daemon-back-off-dominated: all 181 observed `429`s carried `retry_after_secs=0`,
+so the blind window is the daemon's *own* back-off — per-poll-capped at 120s by
+**#453** — not a server-dictated `Retry-After`), and Claude Code burned it to `0.98`
+before any fresh reading returned. The reactive `session_trigger=95` swap **never fired** — it keys
 off an *observation*, and no observation crossed the trigger because the account was
 blind across the entire swap-away band.
 
@@ -50,15 +54,17 @@ more observation:
 
 - **Per-account back-off ([ADR-0009](0009-rate-limit-backoff-per-account.md)).** A
   `429` on the active account's usage poll — correctly — backs off **only its own**
-  next poll (`poll_backoff_until`, never below the server `Retry-After`), and the
+  next poll (`poll_backoff_until`, floored at the server `Retry-After`), and the
   account **carries its last reading**. That per-account scoping is right and
   unchanged; its *consequence for the active account* is a blindness window whose
-  length the server dictates.
+  length is set by the daemon's own back-off — the S1 `429`s all carried
+  `retry_after_secs=0`, so that floor contributed nothing and the window was the
+  back-off policy's (capped at 120s per poll by **#453**), not the server's.
 - **Interleave, not harder polling ([ADR-0012](0012-active-reobservation-via-schedule-interleave.md)).**
   Interleaving re-reads the active account more often, but it cannot re-read a
   *backing-off* account — and lowering `poll_secs` to poll harder was already
   rejected there (it re-opens the **#80** burst-`429` exposure). More observation
-  budget does not pierce a `Retry-After` wall.
+  budget does not pierce a back-off wall.
 
 **Fresh near-limit active usage is provably unavailable by any safe local means:**
 
@@ -91,9 +97,11 @@ The path fires when **all** hold:
 - **a viable swap target exists** — a peer below `target_max_session_usage`
   ([ADR-0013](0013-session-floor-default-on-reserve-emergency-exempt.md)).
 
-Interim constants `T=300s`, `risk_band=65%` (to be finalised by **#451**). New
-tunables `session_blind_swap_secs` (`=T`, default `300`) and
-`session_blind_risk_band` (default `65`), hand-emitted and cross-field-validated
+Confirmed constants `T=300s`, `risk_band=60%` — the **#451** premise-confirmation
+spike validated the premise and the interim `T` on two weeks of real telemetry, and
+**#484** ratified the conservative 60% band over the interim 65%. New tunables
+`session_blind_swap_secs` (`=T`, default `300`) and `session_blind_risk_band`
+(default `60`), hand-emitted and cross-field-validated
 (`target_max_session_usage <= effective session trigger`) per
 [ADR-0005](0005-config-parsed-by-crate-emitted-by-hand.md). Setting
 `session_blind_swap_secs` arbitrarily high **disables** the path — a config
@@ -116,7 +124,7 @@ The path honours the **#369** cautions on a reactive fast-path:
    account** (status quo, rejected).
    - **Why rejected**: the S1 spike proved the reactive trigger cannot fire through
      a blindness window. The reading that would trip `session_trigger=95` never
-     arrives in time — the account `429`s, goes `Retry-After`-blind, and Claude Code
+     arrives in time — the account `429`s, goes back-off-blind, and Claude Code
      burns it to exhaustion before any observation returns. Reacting to an
      observation that will not come is a guaranteed late swap.
 
@@ -153,9 +161,10 @@ The path honours the **#369** cautions on a reactive fast-path:
      the retained `last_good` anchor, so no spurious swap on a missing reading.
    - **Cons**: acts on a **stale** pre-blind anchor rather than fresh truth — a
      deliberate trade, since the fresh reading is provably unavailable. A **static**
-     `risk_band` may over- or under-trigger; mitigated by treating the constants as
-     interim (finalised by **#451**) and by the deferred velocity-projection arm
-     (a **#452** Future note, gated on **#455**'s SLIs).
+     `risk_band` may over- or under-trigger; mitigated by the now-confirmed constants
+     (validated on two weeks of real telemetry — **#451**, with **#484** ratifying
+     the 60% band) and by the deferred velocity-projection arm (a **#452** Future
+     note, gated on **#455**'s SLIs).
 
 ## Consequences
 
@@ -164,7 +173,7 @@ The path honours the **#369** cautions on a reactive fast-path:
 - **The active account swaps away before it self-exhausts**, closing the
   reaction-latency gap (**#363**) that
   [ADR-0012](0012-active-reobservation-via-schedule-interleave.md)'s interleave
-  alone cannot close through a `Retry-After` blindness window.
+  alone cannot close through a back-off blindness window.
 - **No account-ban risk.** The tool never impersonates Claude Code: it reads only
   `/oauth/usage` (the account's own endpoint) and acts on the retained anchor. This
   is the load-bearing reason header-observation is rejected, not merely deferred.
@@ -182,23 +191,26 @@ The path honours the **#369** cautions on a reactive fast-path:
 - **Acts on a stale pre-blind anchor, not fresh truth.** It can swap away an account
   that (unobserved) recovered, spending a swap it did not strictly need. Bounded by
   `risk_band` (only near-band anchors qualify) and by requiring a viable target.
-- **Interim constants are not yet empirically tuned.** `T=300s` / `risk_band=65%`
-  await **#451**; a velocity-projection arm (`last_good + rate_preblind ×
-  blind_elapsed >= trigger`) is deferred as a **#452** Future note, gated on
-  **#455**'s SLI evidence. Wrong constants over- or under-trigger; the
-  kill-switch (`session_blind_swap_secs` set high) is the escape hatch.
-- **Implementation is pending (#452).** This ADR records the decision ahead of the
-  code, so until #452 lands the daemon still exhibits the S1 blindness. The record
-  exists to lock the rationale — especially the header-path rejection — before the
-  build, not to claim it is shipped.
+- **A static `risk_band` can still over- or under-trigger.** `T=300s` /
+  `risk_band=60%` are now empirically confirmed (validated on two weeks of real
+  telemetry — **#451**; the conservative 60% band ratified by **#484**), but a
+  static band cannot track per-account velocity; the velocity-projection arm
+  (`last_good + rate_preblind × blind_elapsed >= trigger`) remains deferred as a
+  **#452** Future note, gated on **#455**'s SLI evidence. The kill-switch
+  (`session_blind_swap_secs` set high) is the escape hatch.
 
 ## Related
 
 - Issues: **#454** (this ADR). **#452** (the design recorded here — the
-  bounded-blindness preemptive swap; implementation tracked there, and the home of
+  bounded-blindness preemptive swap; implemented there, and the home of
   the deferred velocity-projection arm note). **#451** (the
-  premise-confirmation + constants finalisation gate for `T` / `risk_band`).
-  **#450** (the retained `last_good` pre-blind anchor the path keys off). **#363**
+  premise-confirmation + constants finalisation gate for `T` / `risk_band`, now
+  satisfied on two weeks of real telemetry). **#484** (ratified the conservative 60%
+  `risk_band` over the interim 65%). **#453** (the active-account back-off cap —
+  120s per poll — that bounds the blind window; all S1 `429`s carried
+  `retry_after_secs=0`, so the window is the daemon's own back-off, not a server
+  `Retry-After`). **#450** (the retained `last_good` pre-blind anchor the path keys
+  off). **#363**
   (the reaction-latency umbrella). **#369** (the reactive fast-path open question
   whose cautions this honours). **#42** (the dead-vs-exhausted model the separate
   availability path preserves). **#455** (the reliability SLO readout for
@@ -208,8 +220,8 @@ The path honours the **#369** cautions on a reactive fast-path:
   (upstream FR: Claude Code does not persist its usage headers). **#15**
   (diagnostics stay secret-free — the swap keys off the account's own usage and
   label handles, never a token or email).
-- Code (pending **#452**): the new gated path lands as a peer of `emergency_swap` in
-  `src/daemon.rs`; the new tunables `session_blind_swap_secs` /
+- Code (**#452**): the gated `blind_swap` path is a peer of `emergency_swap` in
+  `src/daemon.rs`; the tunables `session_blind_swap_secs` /
   `session_blind_risk_band` in `src/config.rs`, hand-emitted and cross-field-validated
   (`target_max_session_usage <= effective session trigger`) per
   [ADR-0005](0005-config-parsed-by-crate-emitted-by-hand.md). `/oauth/usage` remains

@@ -132,6 +132,9 @@ pub(crate) enum SwapKind {
     Forced,
     /// `event=emergency_swap` — a bypass swap away from a dead/quarantined credential.
     Emergency,
+    /// `event=swap reason=blind_preempt` — the #452 bounded-blindness preemptive swap
+    /// (ADR-0017): a BLIND active swapped away before it could self-exhaust unobserved.
+    Preempt,
 }
 
 /// One swap parsed out of the event log: WHO the active credential moved from/to, WHEN
@@ -290,6 +293,7 @@ pub(crate) fn parse_swap_events(text: &str) -> Vec<SwapEvent> {
                 Some("weekly") => SwapKind::Weekly,
                 Some("manual") => SwapKind::Manual,
                 Some("forced") => SwapKind::Forced,
+                Some("blind_preempt") => SwapKind::Preempt,
                 // A swap with a missing/unknown reason is malformed for our purposes —
                 // skip it rather than guess a reason (tolerant-drop).
                 _ => continue,
@@ -404,7 +408,14 @@ pub(crate) fn aggregate(
 
     let (all_high_episodes, all_high_secs) = all_high(&by_acct, period, params);
     let roster = RosterStats {
-        swap_count: swaps.iter().filter(|e| period.contains(e.ts)).count() as u32,
+        // Excludes #452 preemptive swaps (`SwapKind::Preempt`) so the count stays the SUM of the
+        // itemized `swap_breakdown` reasons (which likewise omits them — see there). Preemptive
+        // swaps are a reliability-SLI concern (`sessiometer reliability`), not a usage-frequency
+        // reason; they still bound the contribution timeline below via the full `swaps` list.
+        swap_count: swaps
+            .iter()
+            .filter(|e| period.contains(e.ts) && e.kind != SwapKind::Preempt)
+            .count() as u32,
         swaps: swap_breakdown(swaps, period),
         all_high_episodes,
         all_high_secs,
@@ -478,6 +489,13 @@ fn swap_breakdown(swaps: &[SwapEvent], period: Period) -> SwapBreakdown {
             SwapKind::Manual => bd.manual += 1,
             SwapKind::Forced => bd.forced += 1,
             SwapKind::Emergency => bd.emergency += 1,
+            // #452 preemptive swaps (reason=blind_preempt) are a RELIABILITY concern — surfaced by
+            // `sessiometer reliability`'s false-preempt SLI (ADR-0017), NOT a usage-frequency reason
+            // (they are a rare tail-risk guard, not a rotation pattern). They still bound the
+            // contribution timeline (`parse_swap_events` keeps them); `swap_count` excludes them in
+            // lockstep so it stays the SUM of the reasons itemized here. Surfacing them in the stats
+            // wire is a deliberate future schema step (with the cross-language fixture lockstep).
+            SwapKind::Preempt => {}
         }
     }
     bd

@@ -72,6 +72,12 @@ pub(crate) enum SwapReason {
     /// An operator `sessiometer use <account> --force` whose policy gate was
     /// BYPASSED (#63). Safety behavior is never bypassed — only policy.
     Forced,
+    /// The #452 bounded-blindness preemptive gate fired (ADR-0017): the active account
+    /// was blind past `session_blind_swap_secs` with a retained pre-blind anchor at/over
+    /// `session_blind_risk_band` and a viable target existed, so it swapped away before it
+    /// could self-exhaust unobserved. `session_pct` carries the STALE pre-blind anchor —
+    /// the only session signal available while blind — not a fresh reading.
+    BlindPreempt,
 }
 
 impl SwapReason {
@@ -82,6 +88,7 @@ impl SwapReason {
             SwapReason::Weekly => "weekly",
             SwapReason::Manual => "manual",
             SwapReason::Forced => "forced",
+            SwapReason::BlindPreempt => "blind_preempt",
         }
     }
 }
@@ -1594,6 +1601,9 @@ pub(crate) enum DecisionClass {
     Swap,
     /// Emergency-swapped away from a dead active account (issue #42).
     EmergencySwap,
+    /// Preemptively swapped away from a BLIND active account before it could
+    /// self-exhaust unobserved (issue #452, ADR-0017) — the bounded-blindness gate fired.
+    PreemptiveSwap,
     /// Over the trigger but no viable target — the all-exhausted hold (issue #11).
     AllExhausted,
     /// The active credential is dead and no target is viable — held, unable to
@@ -1622,6 +1632,7 @@ impl DecisionClass {
             DecisionClass::Hold => "hold",
             DecisionClass::Swap => "swap",
             DecisionClass::EmergencySwap => "emergency_swap",
+            DecisionClass::PreemptiveSwap => "preemptive_swap",
             DecisionClass::AllExhausted => "all_exhausted",
             DecisionClass::ActiveDeadNoTarget => "active_dead_no_target",
             DecisionClass::CanonicalAdopted => "canonical_adopted",
