@@ -132,8 +132,12 @@ pub(crate) enum SwapKind {
     Forced,
     /// `event=emergency_swap` — a bypass swap away from a dead/quarantined credential.
     Emergency,
-    /// `event=swap reason=blind_preempt` — the #452 bounded-blindness preemptive swap
-    /// (ADR-0017): a BLIND active swapped away before it could self-exhaust unobserved.
+    /// `event=swap reason=blind_preempt` (#452) OR `reason=velocity_preempt` (#539) — a
+    /// preemptive swap-away (ADR-0017), the two folded onto ONE kind: both are reliability
+    /// tail-risk guards (excluded from `swap_count`/`swap_breakdown`, surfaced instead by
+    /// `sessiometer reliability`) that still bound the contribution timeline. #452 swaps a
+    /// BLIND active before it self-exhausts unobserved; #539 swaps a still-observed active
+    /// whose PROJECTED usage would cross the trigger within the horizon.
     Preempt,
 }
 
@@ -294,6 +298,14 @@ pub(crate) fn parse_swap_events(text: &str) -> Vec<SwapEvent> {
                 Some("manual") => SwapKind::Manual,
                 Some("forced") => SwapKind::Forced,
                 Some("blind_preempt") => SwapKind::Preempt,
+                // The #539 velocity-projection preemptive swap is folded onto the SAME `Preempt`
+                // kind as the #452 blind-preempt: both are reliability-concern tail-risk guards
+                // (surfaced by `sessiometer reliability`, not a usage-frequency reason), both
+                // excluded from `swap_count`/`swap_breakdown`, and — the load-bearing reason NOT to
+                // drop it — both must stay in the `swaps` list so they bound the contribution
+                // timeline (`active_at`). Dropping it would misattribute every post-swap sample to
+                // the departed account. Default-reachable (horizon default 120s ⇒ path ON).
+                Some("velocity_preempt") => SwapKind::Preempt,
                 // A swap with a missing/unknown reason is malformed for our purposes —
                 // skip it rather than guess a reason (tolerant-drop).
                 _ => continue,
@@ -696,6 +708,54 @@ garbage line with no fields
         // The emergency swap carries from/to but no reason.
         assert_eq!(events[4].from, "work");
         assert_eq!(events[4].to, "play");
+    }
+
+    #[test]
+    fn velocity_preempt_swap_parses_as_preempt_bounds_the_timeline_and_is_excluded_from_count() {
+        // Issue #539 regression, two halves. PARSER: a `reason=velocity_preempt` line must fold onto
+        // SwapKind::Preempt (like #452's blind_preempt), NEVER the `_ => continue` drop — dropping it
+        // would misattribute every post-swap sample to the departed account. Default-reachable (the
+        // horizon defaults to 120s, so the projective swap path is ON in a stock daemon).
+        let parsed = parse_swap_events(
+            "ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=velocity_preempt session_pct=92\n",
+        );
+        assert_eq!(
+            parsed.len(),
+            1,
+            "the velocity_preempt swap is parsed, not dropped"
+        );
+        assert_eq!(parsed[0].kind, SwapKind::Preempt);
+        assert_eq!(parsed[0].to, "play");
+
+        // AGGREGATE: a Preempt swap BOUNDS the contribution timeline (a sample after it credits the
+        // swap TARGET) yet is EXCLUDED from swap_count/breakdown (a reliability tail-risk guard, not a
+        // rotation reason). `work` active at the start (prior swap), a session swap work→play at
+        // t=1500 (counts), a velocity-preempt swap play→work at t=2500 (excluded, but bounds).
+        let period = Period::new(1_000, 4_000);
+        let swaps = vec![
+            mk_swap_ab(500, "play", "work", SwapKind::Session),
+            mk_swap_ab(1_500, "work", "play", SwapKind::Session),
+            mk_swap_ab(2_500, "play", "work", SwapKind::Preempt),
+        ];
+        let samples = vec![
+            sample(1_200, "work", 0.4, 0.3), // work active (before the t=1500 swap)
+            sample(2_000, "play", 0.5, 0.3), // play active (t=1500 swap → play, before the preempt)
+            sample(3_000, "work", 0.6, 0.3), // work active AGAIN — only if the preempt swap bounded
+        ];
+        let report = aggregate(&samples, &swaps, period, &params());
+        assert!(
+            (report.per_account["work"].contribution_share - 2.0 / 3.0).abs() < 1e-9,
+            "work credited for the pre-swap AND the post-preempt obs (timeline bounded)",
+        );
+        assert!(
+            (report.per_account["play"].contribution_share - 1.0 / 3.0).abs() < 1e-9,
+            "play credited only for the middle obs",
+        );
+        assert_eq!(
+            report.roster.swap_count, 1,
+            "only the in-period Session swap counts; the Preempt swap is excluded",
+        );
+        assert_eq!(report.roster.swaps.session, 1);
     }
 
     #[test]

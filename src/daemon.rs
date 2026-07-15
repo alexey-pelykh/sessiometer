@@ -9228,8 +9228,12 @@ mod tests {
         );
         // The swap logged a `velocity_preempt` reason carrying the FRESH observed reading (92 %, the
         // live swap-out point — the projected-swap-out-overshoot SLI sample), never a stale anchor.
-        // 92 ≤ 98 is not a coincidence: the projective peer runs only where the reactive path HELD
-        // (observed < trigger ≤ 99 %), so every projected swap-out is structurally below the trigger.
+        // The projective peer runs ONLY where the reactive path HELD (observed strictly below the
+        // session trigger in fraction space), so a swap-out is always below the trigger — here 92 <
+        // the 95 % trigger. In the default/validated trigger regime that keeps the ROUNDED swap-out
+        // pct under the P100 ≤ 98 acceptance; the ≤ 98 is an empirically-measured SLO (the #538 spike,
+        // not a hard invariant): a trigger set above ~98.5 % could round an in-band swap-out up to 99,
+        // which the reliability readout then surfaces honestly rather than silently masks.
         assert!(
             swapped.events.iter().any(|e| matches!(
                 e,
