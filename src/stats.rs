@@ -314,6 +314,15 @@ struct AccountVelocity {
     /// the same cases (commonly `None` — the weekly window moves slowly, so a flat weekly
     /// dimension has no measurable rate).
     weekly_runway_secs: Option<i64>,
+    /// The account's remaining WEEKLY head-room as a usage fraction — `max(0, weekly_trigger −
+    /// latest weekly reading)` — the pool contribution the fleet aggregate (issue #544) sums. `Some`
+    /// EXACTLY when [`Self::weekly_rate`] is `Some` (a KNOWN weekly velocity), so head-room is
+    /// recorded only for an account whose burn is also known: a KNOWN-zero (flat, measured) account
+    /// keeps a `Some` head-room (real spare capacity, `0` burn), while an unknown / stale account is
+    /// `None` and excluded from the aggregate — [`fleet_runway`] owns why. Distinct from
+    /// [`Self::weekly_runway_secs`], which is `None` for a flat account even though its head-room is
+    /// positive — this field is the raw head-room the pool needs, not the per-account time-to-trigger.
+    weekly_headroom: Option<f64>,
 }
 
 /// Entry point for the `stats` verb: read the store once, resolve the window, aggregate,
@@ -742,6 +751,11 @@ fn account_velocity(
         weekly_rate,
         session_runway_secs: runway_secs(session_rate, last.session, vparams.session_trigger),
         weekly_runway_secs: runway_secs(weekly_rate, last.weekly, vparams.weekly_trigger),
+        // The pool contribution for the fleet aggregate (issue #544): raw weekly head-room from the
+        // SAME latest reading and trigger the weekly runway uses, recorded ONLY when the weekly
+        // velocity is known (so an unknown / stale account contributes neither head-room nor burn).
+        // Clamped at `0` — an over-trigger account is exhausted (no spare capacity), never negative.
+        weekly_headroom: weekly_rate.map(|_| (vparams.weekly_trigger - last.weekly).max(0.0)),
     }
 }
 
@@ -769,6 +783,101 @@ fn with_velocity(
         })
         .collect();
     report
+}
+
+/// The fleet/roster weekly runway aggregate (issue #544) — the single approximate figure that
+/// answers the operator's fleet-level question, "across all my accounts, how long do I last?"
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FleetRunway {
+    /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
+    /// combined weekly burn — `Σ head-room ÷ Σ rate` over the counted accounts. `None` when no
+    /// counted account has a measurable burn (`Σ rate == 0`): honest degradation, never an infinite
+    /// or sentinel figure. Days-scale in practice — the weekly window is the days horizon (the
+    /// session dimension resets every few hours, so it is not the "how long do I last" figure).
+    runway_secs: Option<i64>,
+    /// Accounts that CONTRIBUTED to the aggregate — those with a KNOWN weekly velocity (the
+    /// honest-degradation gate). The `n` of the surfaced `n of m`.
+    counted: usize,
+    /// Accounts OBSERVED in the window (`seen > 0`) — the `m` of `n of m`. `observed − counted` were
+    /// EXCLUDED for an unknown / stale weekly velocity: surfaced as a fact, never silently dropped.
+    observed: usize,
+}
+
+/// Aggregate the per-account weekly velocity + head-room (the issue #543 overlay) into ONE fleet
+/// runway (issue #544), a pure function of the already-built [`Report`] — it reuses the #157 window
+/// machinery and the #543 per-account readout VERBATIM, adding NO parallel aggregation path and no
+/// second rate/sample walk (`report.velocity` is the single source).
+///
+/// AGGREGATION METHOD (the design choice the issue delegates, settled here): the roster is a shared
+/// POOL of weekly head-room drained at the combined observed rate —
+///
+/// ```text
+///   fleet runway ≈  Σ_counted max(0, weekly_trigger − weekly_now)  ÷  Σ_counted weekly_rate
+/// ```
+///
+/// — summed over the accounts with a known weekly velocity. This is what honestly answers "how long
+/// until I am FORCED TO STOP":
+///
+/// - NOT the soonest single-account exhaustion (`min` runway): the daemon SWAPS to the next account
+///   at a trigger, it does not stop — so the first exhaustion is a swap, not the end. `min` answers
+///   the wrong question and drastically understates the fleet.
+/// - NOT an average of per-account runways: that gives equal weight to an idle spare account's long
+///   runway and an active account's short one, and for identical accounts collapses to a single
+///   account's runway — it is not a pool.
+/// - The pool form is honest because only ONE account burns at a time (a single active credential):
+///   an idle peer reads a flat, ~0 weekly rate, so `Σ rate` is dominated by whichever account is
+///   actually climbing, and `Σ head-room / Σ rate` is the pool's true remaining time. When several
+///   accounts genuinely burned across the window it stays a faithful, CONSERVATIVE reading of the
+///   observed combined rate — it never OVER-states runway.
+///
+/// HONEST DEGRADATION (the load-bearing AC): an account with an unknown / stale weekly velocity is
+/// EXCLUDED ENTIRELY — neither its head-room (numerator) nor its burn (denominator) enters. Treating
+/// such an account as zero-burn would add head-room WITHOUT burn and inflate the runway; excluding it
+/// avoids that and is surfaced as `observed − counted` in the `n of m` cardinality. A KNOWN-zero
+/// (flat, measured) account DOES count — it is real spare capacity contributing head-room at `0`
+/// burn, which correctly EXTENDS the runway rather than fabricating it.
+///
+/// Returns `None` (no fleet figure at all) when the per-account overlay never ran (a bare
+/// [`build_report`], so the wire stays byte-identical to pre-#544), when no account was observed, or
+/// when no account could be counted. A `Some` with `runway_secs == None` is the counted-but-not-
+/// burning case (every counted account is flat): the cardinality is still surfaced, the runway is an
+/// explicit unknown.
+fn fleet_runway(report: &Report) -> Option<FleetRunway> {
+    if report.velocity.is_empty() {
+        return None; // the per-account overlay never ran — a bare aggregate carries no fleet
+    }
+    let mut observed = 0usize;
+    let mut counted = 0usize;
+    let mut total_headroom = 0.0_f64;
+    let mut total_rate = 0.0_f64;
+    for (handle, a) in &report.summary.per_account {
+        if a.seen == 0 {
+            continue; // gap honesty: an unmeasured account is not a fleet member (matches the band)
+        }
+        observed += 1;
+        let Some(v) = report.velocity.get(handle) else {
+            continue;
+        };
+        // Count an account ONLY with a KNOWN weekly velocity (both fields are `Some` together): the
+        // honest-degradation gate. An unknown / stale account is skipped ENTIRELY — never zero-burned.
+        let (Some(headroom), Some(rate)) = (v.weekly_headroom, v.weekly_rate) else {
+            continue;
+        };
+        total_headroom += headroom;
+        total_rate += rate;
+        counted += 1;
+    }
+    if counted == 0 {
+        return None; // nothing to aggregate — no fleet figure to state
+    }
+    // `None` when the combined burn is zero (every counted account is flat) — no measurable drain, so
+    // no finite runway to state (honest degradation, never an infinite / sentinel figure).
+    let runway_secs = (total_rate > 0.0).then(|| (total_headroom / total_rate).round() as i64);
+    Some(FleetRunway {
+        runway_secs,
+        counted,
+        observed,
+    })
 }
 
 /// Aggregate the window's samples into a filtered summary + series.
@@ -1194,6 +1303,25 @@ fn render_summary(report: &Report, color: bool) -> String {
             .collect();
         out.push_str(&format!("runway  {}\n", runways.join(" · ")));
     }
+
+    // The FLEET/roster runway aggregate (issue #544), footing the band: ONE approximate figure for
+    // "across all my accounts, how long do I last?" — the roster's combined weekly head-room drained
+    // at its combined weekly burn, days-scale (`fmt_runway_days`). NEUTRAL and APPROXIMATE (a `~`
+    // figure, framed "at the current combined rate"), so it clears the amended #542 guard. Rendered
+    // ONLY when the pool has a finite runway; the counted-account cardinality `(n of m counted)` is
+    // ALWAYS shown alongside it, so an excluded (unknown / stale) account is surfaced as a fact, not
+    // silently folded in as zero-burn.
+    if let Some(FleetRunway {
+        runway_secs: Some(secs),
+        counted,
+        observed,
+    }) = fleet_runway(report)
+    {
+        out.push_str(&format!(
+            "fleet  accounts last {} at the current combined rate ({counted} of {observed} counted)\n",
+            fmt_runway_days(secs),
+        ));
+    }
     out
 }
 
@@ -1377,11 +1505,37 @@ struct BucketWire {
     accounts: BTreeMap<String, AccountWire>,
 }
 
-/// The per-account + roster body shared by the summary and each series bucket.
+/// The per-account + roster body for the summary. Mirrors the shape of a series [`BucketWire`] (a
+/// distinct type) but additionally carries the summary-only [`FleetWire`] roster aggregate.
 #[derive(Serialize)]
 struct PeriodWire {
     roster: RosterWire,
     accounts: BTreeMap<String, AccountWire>,
+    /// The fleet/roster weekly runway aggregate (issue #544): PRESENT when ≥ 1 summary account has a
+    /// KNOWN weekly velocity (so the pool can be aggregated), OMITTED otherwise (no countable account,
+    /// or a bare aggregate that never ran the velocity overlay — the wire then stays byte-identical to
+    /// pre-#544). Summary-only — a series [`BucketWire`] never carries it, exactly as it carries no
+    /// per-account velocity. Additive to `schema:1` (the `#159`/`#160`/`#543` extend-without-bumping
+    /// precedent); does NOT bump `schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fleet: Option<FleetWire>,
+}
+
+/// The fleet/roster weekly runway aggregate on the `--json` wire (issue #544) — the machine peer of
+/// the human band's `fleet` line. `runway_secs` is explicit `null` (NEVER a sentinel like `0` /
+/// `999`) when the counted accounts have no combined burn; `counted` / `observed` carry the `n of m`
+/// cardinality so a reader sees exactly how many accounts the figure rests on — and that
+/// `observed − counted` accounts were EXCLUDED for an unknown / stale velocity (honest degradation,
+/// never silently zero-burned).
+#[derive(Serialize)]
+struct FleetWire {
+    /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
+    /// combined weekly burn, or `null` when no counted account has a measurable burn.
+    runway_secs: Option<i64>,
+    /// Accounts that CONTRIBUTED to the aggregate (a known weekly velocity) — the `n` of `n of m`.
+    counted: usize,
+    /// Accounts OBSERVED in the window (`seen > 0`) — the `m`; `observed − counted` were excluded.
+    observed: usize,
 }
 
 #[derive(Serialize)]
@@ -1542,6 +1696,10 @@ fn stats_wire(report: &Report) -> StatsWire<'_> {
         summary: PeriodWire {
             roster: roster_wire(&report.summary.roster),
             accounts: accounts_wire(&report.summary.per_account, Some(&report.velocity)),
+            // The fleet/roster runway aggregate (issue #544) — summary-only, from the SAME built
+            // report the CLI and daemon socket both serialize, so the fleet figure keeps R-2 parity
+            // structurally (one `stats_wire` builder). Absent on a bare aggregate (no overlay).
+            fleet: fleet_runway(report).map(fleet_wire),
         },
         // Orphans carry no velocity either (a non-roster readout is out of scope, issue #543).
         orphans: accounts_wire(&report.orphans, None),
@@ -1602,6 +1760,17 @@ fn velocity_wire(v: &AccountVelocity) -> Option<VelocityWire> {
         session_runway_secs: v.session_runway_secs,
         weekly_runway_secs: v.weekly_runway_secs,
     })
+}
+
+/// The wire form of the fleet/roster runway aggregate (issue #544). A plain field copy — the honest
+/// degradation (unknown runway → `null`, the `n of m` cardinality) is already resolved in
+/// [`fleet_runway`]; this only reshapes it for `serde`.
+fn fleet_wire(f: FleetRunway) -> FleetWire {
+    FleetWire {
+        runway_secs: f.runway_secs,
+        counted: f.counted,
+        observed: f.observed,
+    }
 }
 
 /// A usage rate (fraction/second) as percent-per-minute, rounded to 3 decimals so the `--json`
@@ -3714,6 +3883,187 @@ mod tests {
         assert_eq!(fmt_runway_days(86_400), "~1 day");
         assert_eq!(fmt_runway_days(18_000), "~5h"); // under a day falls back to hours
         assert_eq!(fmt_runway(AccountVelocity::default()), "—"); // all-unknown → em dash
+    }
+
+    // --- AC (issue #544): fleet/roster runway aggregate ("accounts last ~X days") ------
+
+    #[test]
+    fn fleet_runway_pools_weekly_headroom_and_surfaces_the_counted_cardinality() {
+        // A three-account roster: `work` and `home` climb their weekly dimension at a steady, KNOWN
+        // rate; `stale` climbs too but its latest reading is far older than the coverage horizon, so
+        // it has no CURRENT velocity and is EXCLUDED. The fleet pools the counted accounts' weekly
+        // head-room over their combined burn (the design choice, settled in `fleet_runway`):
+        //   work: last weekly 0.302 → head-room 0.95 − 0.302 = 0.648, rate 0.001/300 frac/s
+        //   home: last weekly 0.502 → head-room 0.95 − 0.502 = 0.448, rate 0.001/300 frac/s
+        //   Σ head-room 1.096 ÷ Σ rate (0.002/300) = 164 400 s ≈ 1.9 d → "~2 days".
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.300),
+                sample(now - 600, "work", 0.51, 0.301),
+                sample(now - 300, "work", 0.52, 0.302),
+                sample(now - 900, "home", 0.40, 0.500),
+                sample(now - 600, "home", 0.41, 0.501),
+                sample(now - 300, "home", 0.42, 0.502),
+                // `stale`: three climbing readings whose latest is > the stale horizon before `now`.
+                sample(now - 7800, "stale", 0.50, 0.30),
+                sample(now - 7500, "stale", 0.51, 0.31),
+                sample(now - 7200, "stale", 0.52, 0.32),
+            ],
+            now,
+        );
+
+        // The pure aggregate: 2 of 3 counted (stale excluded), pooled runway ≈ 164 400 s.
+        let fleet = fleet_runway(&report).expect("a countable fleet");
+        assert_eq!(
+            (fleet.counted, fleet.observed),
+            (2, 3),
+            "stale is observed but not counted"
+        );
+        let secs = fleet.runway_secs.expect("a finite pooled runway");
+        assert!(
+            (secs - 164_400).abs() <= 2,
+            "pooled runway ≈ 164 400 s: {secs}"
+        );
+
+        // Human: the band foots with ONE approximate, neutral fleet figure + the n-of-m cardinality.
+        let text = render_text(&report);
+        assert!(
+            text.contains(
+                "fleet  accounts last ~2 days at the current combined rate (2 of 3 counted)"
+            ),
+            "fleet line: {text}"
+        );
+        assert_eq!(
+            scan_banned(&text),
+            None,
+            "the fleet render is neutral (issue #542 guard)"
+        );
+
+        // Wire: a `fleet` object on the SUMMARY, carrying the whole-second runway + the cardinality.
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let fleet_obj = &v["summary"]["fleet"];
+        assert!(
+            (fleet_obj["runway_secs"].as_i64().unwrap() - 164_400).abs() <= 2,
+            "{fleet_obj}"
+        );
+        assert_eq!(fleet_obj["counted"].as_i64().unwrap(), 2);
+        assert_eq!(fleet_obj["observed"].as_i64().unwrap(), 3);
+
+        // The `--json` keys the aggregate adds are neutral too (facts only, no verb — #542 guard).
+        let mut keys = Vec::new();
+        json_keys(&v, &mut keys);
+        assert!(
+            keys.iter().any(|k| k == "fleet"),
+            "the fleet object reached the wire"
+        );
+        assert_eq!(
+            scan_banned(&keys.join(" ")),
+            None,
+            "the fleet wire keys are neutral (issue #542 guard)"
+        );
+    }
+
+    #[test]
+    fn fleet_runway_excludes_a_stale_account_instead_of_zero_burning_it() {
+        // Honest degradation (the load-bearing AC): an unknown / stale account is dropped ENTIRELY —
+        // neither its head-room nor its burn enters. Proven by INVARIANCE: adding a stale account to a
+        // healthy roster leaves the pooled runway UNCHANGED (only the `observed` denominator grows).
+        // Zero-burning it instead — adding its head-room with no burn — would INFLATE the runway.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let two = vec![
+            sample(now - 900, "work", 0.50, 0.300),
+            sample(now - 600, "work", 0.51, 0.301),
+            sample(now - 300, "work", 0.52, 0.302),
+            sample(now - 900, "home", 0.40, 0.500),
+            sample(now - 600, "home", 0.41, 0.501),
+            sample(now - 300, "home", 0.42, 0.502),
+        ];
+        let mut with_stale = two.clone();
+        with_stale.extend([
+            // A LARGE-head-room stale account (weekly ~0.10) — if it were zero-burned, its ~0.85
+            // head-room would balloon the numerator and stretch the runway well past the true value.
+            sample(now - 7800, "stale", 0.50, 0.08),
+            sample(now - 7500, "stale", 0.51, 0.09),
+            sample(now - 7200, "stale", 0.52, 0.10),
+        ]);
+
+        let clean = fleet_runway(&velocity_report(two, now)).expect("countable");
+        let mixed = fleet_runway(&velocity_report(with_stale, now)).expect("countable");
+        assert_eq!(
+            clean.runway_secs, mixed.runway_secs,
+            "a stale account must not change the pooled runway (excluded, not zero-burned)"
+        );
+        assert_eq!((clean.counted, clean.observed), (2, 2));
+        assert_eq!(
+            (mixed.counted, mixed.observed),
+            (2, 3),
+            "the stale account is surfaced in `observed` (m) but not `counted` (n)"
+        );
+    }
+
+    #[test]
+    fn fleet_runway_degrades_honestly_without_a_finite_pool_or_an_overlay() {
+        let now = epoch("2026-07-01T12:00:00Z");
+
+        // (a) Every counted account is FLAT (a known ZERO burn) → no combined drain → the runway is an
+        // explicit unknown, but the cardinality is still surfaced (counted > 0). The human omits the
+        // line (no figure to state); the wire carries the object with a `null` runway (never a
+        // sentinel), so a machine reader still learns "2 accounts, no measurable burn".
+        let flat = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.60),
+                sample(now - 600, "work", 0.60, 0.60),
+                sample(now - 300, "work", 0.60, 0.60),
+                sample(now - 900, "home", 0.40, 0.40),
+                sample(now - 600, "home", 0.40, 0.40),
+                sample(now - 300, "home", 0.40, 0.40),
+            ],
+            now,
+        );
+        let fleet = fleet_runway(&flat).expect("counted-but-not-burning is still a fleet");
+        assert_eq!((fleet.counted, fleet.observed), (2, 2));
+        assert!(
+            fleet.runway_secs.is_none(),
+            "no combined burn → unknown runway"
+        );
+        assert!(
+            !render_text(&flat).contains("fleet  "),
+            "no fleet line without a figure"
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_json(&flat).unwrap()).unwrap();
+        assert!(
+            v["summary"]["fleet"]["runway_secs"].is_null(),
+            "an unknown fleet runway is an explicit null, not a sentinel: {}",
+            v["summary"]["fleet"]
+        );
+        assert_eq!(v["summary"]["fleet"]["counted"].as_i64().unwrap(), 2);
+        assert_eq!(
+            scan_banned(&render_json(&flat).unwrap()),
+            None,
+            "the null-runway fleet object is neutral too"
+        );
+
+        // (b) Every account is UNDER-SAMPLED (a single reading → no interval → no velocity) → NOTHING
+        // is countable → no fleet at all, on either surface (the wire OMITS the object).
+        let thin = velocity_report(
+            vec![
+                sample(now - 300, "work", 0.60, 0.30),
+                sample(now - 300, "home", 0.40, 0.20),
+            ],
+            now,
+        );
+        assert!(
+            fleet_runway(&thin).is_none(),
+            "nothing countable → no fleet"
+        );
+        assert!(!render_text(&thin).contains("fleet  "));
+        let v2: serde_json::Value = serde_json::from_str(&render_json(&thin).unwrap()).unwrap();
+        assert!(
+            v2["summary"].get("fleet").is_none(),
+            "the wire omits an empty fleet: {}",
+            v2["summary"]
+        );
     }
 
     // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
