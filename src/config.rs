@@ -46,6 +46,16 @@ const DEFAULT_POLL_SECS: u64 = 300;
 /// (and successive cycles) decorrelate over a ~1–3 min spread rather than clustering
 /// within ~±30 s of the 5 min mark.
 const DEFAULT_POLL_JITTER_STDDEV: f64 = 60.0;
+/// Default `exhausted_poll_secs` (issue #537): the WIDENED poll cadence applied to an
+/// out-of-rotation (weekly- or session-exhausted) NON-active peer. Such a peer's usage
+/// number can only change when its server-side window resets (a time the daemon already
+/// knows — `weekly_resets_at` / `session_resets_at`) or on a RARE out-of-band server reset,
+/// so re-polling it every `poll_secs` is a wasted request each cycle. One hour is the
+/// worst-case blindness ceiling for the rare early reset; the daemon pulls the next poll
+/// EARLIER when a known `resets_at` lands sooner (see [`crate::daemon`]'s exhaustion window).
+/// Deliberately the same 3600 s as [`DEFAULT_REFRESH_CADENCE_SECS`] — an hour is the crate's
+/// standard "slow background" cadence.
+const DEFAULT_EXHAUSTED_POLL_SECS: u64 = 3600;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// The NON-ZERO floor for `cooldown_secs` (issue #272): the smallest interval, in
@@ -252,6 +262,18 @@ pub(crate) struct Tunables {
     /// per `poll_secs / N` sub-interval (issue #80), so a roster of N accounts is swept
     /// once per `poll_secs` without bursting all N requests at once.
     pub(crate) poll_secs: u64,
+    /// Widened re-poll cadence, in seconds, for an out-of-rotation (weekly- or
+    /// session-exhausted) NON-active peer (issue #537): `poll_secs..=86400`, default 3600
+    /// (one hour). Such a peer's usage can only change on a server-side window reset (a
+    /// time the daemon already knows via `resets_at`) or a RARE out-of-band reset, so
+    /// re-polling it every `poll_secs` wastes a request each cycle. This is the CEILING of
+    /// its slow-poll window; a known `resets_at` sooner than this pulls the next poll
+    /// earlier (see [`crate::daemon`]). The lower bound is `poll_secs` (a slow-polled peer
+    /// must never re-poll FASTER than the normal cadence); the ACTIVE account is EXEMPT (its
+    /// swap-away trigger must stay observable). Distinct from the rate-limit back-off
+    /// (`poll_backoff_until`, ADR-0009), which is armed by 429/5xx and cleared on any
+    /// success — an exhausted account is an HTTP-200 success, so it needs its own window.
+    pub(crate) exhausted_poll_secs: u64,
     /// Seconds to wait after a swap before another is allowed
     /// (`COOLDOWN_SECS_FLOOR..=3600` — a non-zero floor, #272). Consumed by the
     /// cooldown logic (#10 / #11).
@@ -325,6 +347,7 @@ impl Default for Tunables {
     fn default() -> Self {
         Self {
             poll_secs: DEFAULT_POLL_SECS,
+            exhausted_poll_secs: DEFAULT_EXHAUSTED_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
             target_max_session_usage: DEFAULT_TARGET_MAX_SESSION_USAGE,
             session_trigger: DEFAULT_SESSION_TRIGGER,
@@ -825,6 +848,11 @@ impl Config {
                     present("tunables", "poll_secs"),
                 ),
                 entry(
+                    "exhausted_poll_secs",
+                    t.exhausted_poll_secs.to_string(),
+                    present("tunables", "exhausted_poll_secs"),
+                ),
+                entry(
                     "cooldown_secs",
                     t.cooldown_secs.to_string(),
                     present("tunables", "cooldown_secs"),
@@ -1155,6 +1183,20 @@ impl Config {
             }
         };
         range("poll_secs", t.poll_secs, 5, 3600)?;
+        // The widened exhausted-peer cadence (issue #537) is bounded BELOW by `poll_secs` (a
+        // cross-field rule, checked after `poll_secs` above so the bound is the validated
+        // value): a slow-polled peer must never re-poll FASTER than the normal cadence — an
+        // `exhausted_poll_secs < poll_secs` would defeat the whole point (poll MORE often, not
+        // less). The 86400 s (24 h) ceiling is a sanity bound far beyond any real quota window.
+        // The lower bound is dynamic, so `range` cannot express it — spell the cross-field
+        // remedy out, mirroring `target_max_session_usage`'s message.
+        if !(t.poll_secs..=86_400).contains(&t.exhausted_poll_secs) {
+            return Err(Error::ConfigInvalid(format!(
+                "exhausted_poll_secs must be in {}..=86400 (>= poll_secs so a slow-polled \
+                 exhausted peer never re-polls faster than the normal cadence), got {}",
+                t.poll_secs, t.exhausted_poll_secs
+            )));
+        }
         // cooldown_secs has a NON-ZERO floor (issue #272): it is configurable ABOVE
         // COOLDOWN_SECS_FLOOR but not below it, so swap pacing can never be tuned down
         // to zero. The daemon's per-cycle draw clamps to the same floor, so a jitter
@@ -1182,6 +1224,7 @@ impl Config {
         // draws + clamps from the strategy each cycle.
         let tunables = Tunables {
             poll_secs: t.poll_secs as u64,
+            exhausted_poll_secs: t.exhausted_poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
             target_max_session_usage,
             session_trigger: t.session_trigger as u8,
@@ -1387,6 +1430,18 @@ impl Config {
              # honouring any Retry-After — instead of re-polling at the fixed interval.\n",
         );
         out.push_str(&format!("poll_secs = {}\n", t.poll_secs));
+        out.push_str(
+            "# Widened re-poll cadence (poll_secs..=86400) for an out-of-rotation peer — one\n\
+             # that is weekly- or session-exhausted (issue #537). Its usage can only change\n\
+             # when its server-side window resets (a time the daemon already knows) or on a\n\
+             # rare out-of-band reset, so re-polling it every poll_secs wastes a request. The\n\
+             # default 3600 (1 h) is the ceiling; a known resets_at sooner than this polls\n\
+             # earlier. The ACTIVE account is never slow-polled. Must be >= poll_secs.\n",
+        );
+        out.push_str(&format!(
+            "exhausted_poll_secs = {}\n",
+            t.exhausted_poll_secs
+        ));
         out.push_str(&format!(
             "# Seconds to wait after a swap before another swap is allowed \
              ({COOLDOWN_SECS_FLOOR}..=3600; a non-zero floor — pacing can't be disabled to zero).\n"
@@ -1836,6 +1891,8 @@ fn default_account_enabled() -> bool {
 struct RawTunables {
     #[serde(default = "default_poll_secs")]
     poll_secs: i64,
+    #[serde(default = "default_exhausted_poll_secs")]
+    exhausted_poll_secs: i64,
     #[serde(default = "default_cooldown_secs")]
     cooldown_secs: i64,
     /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_TARGET_MAX_SESSION_USAGE`
@@ -1866,6 +1923,7 @@ impl Default for RawTunables {
     fn default() -> Self {
         Self {
             poll_secs: default_poll_secs(),
+            exhausted_poll_secs: default_exhausted_poll_secs(),
             cooldown_secs: default_cooldown_secs(),
             target_max_session_usage: None,
             session_trigger: default_session_trigger(),
@@ -1880,6 +1938,9 @@ impl Default for RawTunables {
 
 fn default_poll_secs() -> i64 {
     DEFAULT_POLL_SECS as i64
+}
+fn default_exhausted_poll_secs() -> i64 {
+    DEFAULT_EXHAUSTED_POLL_SECS as i64
 }
 fn default_cooldown_secs() -> i64 {
     DEFAULT_COOLDOWN_SECS as i64
@@ -2143,6 +2204,8 @@ label = "personal"
             config.tunables,
             Tunables {
                 poll_secs: 30,
+                // VALID omits exhausted_poll_secs → the compiled-in default (issue #537).
+                exhausted_poll_secs: 3600,
                 cooldown_secs: 45,
                 target_max_session_usage: 70,
                 session_trigger: 90,
@@ -2452,8 +2515,9 @@ label = "personal"
         for (key, value) in [
             ("poll_secs", "4"),
             ("poll_secs", "3601"),
-            ("cooldown_secs", "0"), // below the non-zero floor (#272)
-            ("cooldown_secs", "4"), // still below the floor (#272)
+            ("exhausted_poll_secs", "86401"), // above the 24 h ceiling (#537)
+            ("cooldown_secs", "0"),           // below the non-zero floor (#272)
+            ("cooldown_secs", "4"),           // still below the floor (#272)
             ("cooldown_secs", "3601"),
             ("monitor_401_n", "0"),
             ("monitor_401_n", "21"),
@@ -2466,6 +2530,52 @@ label = "personal"
                 "{key} = {value} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn exhausted_poll_secs_defaults_to_one_hour() {
+        // Issue #537: an absent `exhausted_poll_secs` defaults to the compiled-in 3600 s (1 h)
+        // ceiling — the slow-poll cadence is on by default without an operator opting in.
+        let config = Config::parse(&with_tunables("poll_secs = 300")).unwrap();
+        assert_eq!(config.tunables.exhausted_poll_secs, 3600);
+    }
+
+    #[test]
+    fn exhausted_poll_secs_must_be_at_least_poll_secs_and_below_the_ceiling() {
+        // Issue #537: the widened cadence is bounded BELOW by `poll_secs` (a slow-polled peer
+        // must never re-poll FASTER than the normal cadence — that would defeat the point) and
+        // ABOVE by 86400 s. The lower bound is a CROSS-FIELD rule, so the rejection names both
+        // the field and `poll_secs`, mirroring `target_max_session_usage`'s message.
+        let below = with_tunables("poll_secs = 600\nexhausted_poll_secs = 599");
+        match Config::parse(&below) {
+            Err(Error::ConfigInvalid(msg)) => assert!(
+                msg.contains("exhausted_poll_secs") && msg.contains("600"),
+                "rejection must name the field and poll_secs, got: {msg}"
+            ),
+            other => panic!("exhausted_poll_secs < poll_secs must be rejected, got: {other:?}"),
+        }
+
+        // The lower edge (== poll_secs) LOADS — an equal cadence is the inert boundary, not a
+        // slow-down, but it is a valid operator choice and threads through to the tunable.
+        let at_floor = Config::parse(&with_tunables("poll_secs = 600\nexhausted_poll_secs = 600"))
+            .expect("exhausted_poll_secs == poll_secs is the valid lower edge");
+        assert_eq!(at_floor.tunables.exhausted_poll_secs, 600);
+
+        // The upper edge (the 24 h ceiling) loads; one over is rejected.
+        let at_ceiling = Config::parse(&with_tunables("exhausted_poll_secs = 86400"))
+            .expect("the 86400 s ceiling is valid");
+        assert_eq!(at_ceiling.tunables.exhausted_poll_secs, 86_400);
+        assert!(matches!(
+            Config::parse(&with_tunables("exhausted_poll_secs = 86401")),
+            Err(Error::ConfigInvalid(_))
+        ));
+
+        // A mid-range value >= poll_secs loads and threads through verbatim.
+        let mid = Config::parse(&with_tunables(
+            "poll_secs = 300\nexhausted_poll_secs = 7200",
+        ))
+        .expect("a value in poll_secs..=86400 loads");
+        assert_eq!(mid.tunables.exhausted_poll_secs, 7200);
     }
 
     #[test]
@@ -3144,6 +3254,7 @@ label = "personal"
         assert!(text.contains("The most-full an account may be to receive"));
         for key in [
             "poll_secs",
+            "exhausted_poll_secs",
             "cooldown_secs",
             "target_max_session_usage",
             "session_trigger",

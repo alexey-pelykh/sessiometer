@@ -666,6 +666,7 @@ The primary hand-editable block — the poll cadence and the swap thresholds.
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `poll_secs` | Seconds between re-polling a given account — the per-account cadence and the base of the rate-limit back-off. | `5..=3600` | `300` |
+| `exhausted_poll_secs` | Widened re-poll cadence for an **out-of-rotation** peer — one that is weekly- or session-exhausted. Its usage can only change when its server-side window resets (a time the daemon already knows) or on a rare out-of-band reset, so re-polling it every `poll_secs` wastes a request; this is the **ceiling** of its slow-poll window, pulled **earlier** when a known reset lands sooner. The **active** account is never slow-polled. | `poll_secs..=86400` | `3600` |
 | `cooldown_secs` | Seconds to wait after a swap before another is allowed — the swap-pacing floor. Tunable **above** a non-zero minimum but never down to zero, so rapid-fire account flapping can't be configured on. | `5..=3600` | `60` |
 | `session_trigger` | Swap **away** from the active account at or above this session-usage percent. | `50..=99` | `95` |
 | `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
