@@ -613,6 +613,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: lines,
             next_swap: None,

@@ -1468,6 +1468,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),
@@ -1488,6 +1489,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("dup", false, false, Some(10)),
@@ -1805,6 +1807,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),

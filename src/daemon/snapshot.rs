@@ -65,6 +65,13 @@ pub(crate) struct StatusSnapshot {
     /// (the #15 discipline). The remedy the operator sees (unlock the keychain) is the surfacing
     /// consumer's concern (the menubar #498 card), NOT this wire increment's.
     pub(crate) keychain_locked: bool,
+    /// A just-fired #452 bounded-blindness preemptive swap to NARRATE (issue #479), or `None` when
+    /// no such swap is recent-and-still-current. Resolved daemon-side in [`Daemon::snapshot`] from the
+    /// retained `last_blind_preempt_swap` record, projected `Some` only within the
+    /// `BLIND_PREEMPT_NOTICE_SECS` window AND while the swap's target is still the active account (a
+    /// superseding swap self-invalidates it); [`status_response`] copies it straight onto the wire.
+    /// `None` by `Default`.
+    pub(crate) recent_blind_preempt_swap: Option<BlindPreemptSwap>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -117,6 +124,33 @@ pub(crate) struct BlindActive {
     /// exactly). `false` = OK: the account is blind, but not yet past the gate threshold, or the
     /// anchor sat below the risk band — auto-protection is nominally intact.
     pub(crate) auto_protection_degraded: bool,
+}
+
+/// A just-fired #452 bounded-blindness PREEMPTIVE swap (issue #479, umbrella #363 Path B), retained
+/// so `status` can NARRATE it — present only for a bounded window after the daemon swapped a BLIND
+/// active account away on its stale pre-blind anchor (ADR-0017), and only while that swap's TARGET is
+/// still the active account (a superseding swap self-invalidates it, projected daemon-side in
+/// [`Daemon::snapshot`]). A swap off a blind account on a stale reading is exactly the event an
+/// operator most needs narrated — so they can UNDO it (`use <from_label>`) if the swapped-away account
+/// turns out to have recovered. Carried on the wire so `status` renders the SAME information the durable
+/// `event=swap … reason=blind_preempt` log line already holds — source, last-known session %, target —
+/// each medium in its own idiom (R-2 STATE-parity, as `canonical_scrub` / `next_swap` do). The undo
+/// verb is DERIVED (`use <from_label>`), never stored — the surface only REFLECTS this daemon-pushed
+/// state, it never self-swaps (the #169 UI-never-acts invariant). Non-secret — two operator handles
+/// and a small number, never a token or email (issue #15).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BlindPreemptSwap {
+    /// The operator handle (label) the daemon swapped AWAY FROM — the blind account. The undo the
+    /// surface names is `use <from_label>` (derived, not stored). Never the email (issue #15).
+    pub(crate) from_label: String,
+    /// The operator handle (label) the daemon swapped TO — the account now active. Never the email
+    /// (issue #15).
+    pub(crate) to_label: String,
+    /// The stale pre-blind SESSION-window usage percent (`0..=100`) the gate FIRED on — the same
+    /// `to_pct(anchor.session)` the `event=swap … session_pct=` log line records and the Part-1
+    /// [`BlindActive::last_known_session_pct`] shows, captured at swap-time (by projection time the
+    /// anchor `last_good` has been reset to `None`). Gives R-2 content-parity across all three surfaces.
+    pub(crate) last_known_session_pct: u8,
 }
 
 /// The daemon-level CANONICAL-SCRUB rollup (issue #516, umbrella #463) — present only while the
@@ -232,8 +266,15 @@ pub(crate) struct SchemaVersion {
 /// "the login keychain is LOCKED so the shared credential is unreadable" signal, a bare `bool`
 /// (via `skip_serializing_if`) omitted entirely when unlocked, so a non-locked frame's bytes are
 /// unchanged. The daemon-level sibling of `canonical_scrub`, but for an UNREADABLE item rather than
-/// a readable-but-scrubbed one; the wire prerequisite for the menubar #498 surface.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 6 };
+/// a readable-but-scrubbed one; the wire prerequisite for the menubar #498 surface. `1.7` ADDED the
+/// daemon-level [`StatusResponse::recent_blind_preempt_swap`] narrated-swap notice ([`BlindPreemptSwap`],
+/// issue #479): a just-fired #452 bounded-blindness preemptive swap (source + last-known % + target),
+/// so `status` can narrate the swap-away and its `use <from>` undo — likewise optional and (via
+/// `skip_serializing_if`) omitted entirely except in the bounded window after such a swap, so a
+/// no-recent-preempt-swap frame's bytes are unchanged. Takes `blind_active`'s / `canonical_scrub`'s
+/// omit-when-absent pattern; a pre-#479 client ignores the unknown key (the minor-bump
+/// tolerate-by-ignoring convention).
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 7 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -294,6 +335,21 @@ pub(crate) struct StatusResponse {
     /// (issue #15).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) keychain_locked: bool,
+    /// The daemon-level NARRATED bounded-blindness preemptive-swap notice (issue #479): `Some` for a
+    /// bounded window after #452 swapped a BLIND active account away on its stale anchor (ADR-0017),
+    /// carrying source + last-known session % + target so `sessiometer status` can narrate the
+    /// swap-away and its `use <from>` undo — the SAME information the durable `event=swap …
+    /// reason=blind_preempt` log line holds, reflected in `status` (the surface has no other way to see
+    /// a just-happened swap — `render_status` reads only this wire, never the event log). Absent when
+    /// no such swap is recent-and-still-current. `Option` + `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]` per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump
+    /// 1.6 → 1.7, mirroring `blind_active` / `canonical_scrub`): a pre-#479 daemon omits the field →
+    /// `None`, AND a no-recent-swap snapshot omits it entirely, so an unaffected frame's bytes are
+    /// byte-for-byte unchanged (a pre-#479 client ignores the unknown key). The surface only REFLECTS
+    /// this daemon-pushed state; it never self-swaps (the #169 UI-never-acts invariant). Non-secret —
+    /// two handles and a `u8`, never a token or email (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_blind_preempt_swap: Option<BlindPreemptSwap>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -572,6 +628,10 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // while the login keychain is locked (the shared credential is unreadable), `false` when
         // unlocked (and then omitted from the wire via `skip_serializing_if`).
         keychain_locked: snapshot.keychain_locked,
+        // The daemon-level narrated preemptive-swap notice (issue #479), already resolved daemon-side
+        // in `Daemon::snapshot` (windowed + target-still-active): `Some` for a bounded window after a
+        // #452 blind-preempt swap, `None` otherwise (and then omitted via `skip_serializing_if`).
+        recent_blind_preempt_swap: snapshot.recent_blind_preempt_swap.clone(),
     }
 }
 

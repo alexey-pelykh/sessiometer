@@ -137,8 +137,9 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, BlindActive, CanonicalScrub, NextSwap, NextSwapReason, NoTargetCause,
-    SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
+    AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub, NextSwap, NextSwapReason,
+    NoTargetCause, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -297,6 +298,22 @@ fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
     blind_secs > BLIND_GATE_SECS && anchor_session >= BLIND_GATE_RISK_BAND
 }
 
+/// How long (seconds) `status` NARRATES a #452 bounded-blindness preemptive swap (issue #479) after
+/// it fires — the bounded window the retained [`BlindPreemptSwap`] notice is projected onto the wire
+/// (`recent_blind_preempt_swap`). The notice is a transient, high-signal "the daemon just swapped you
+/// off a blind account on a stale reading — undo with `use <from>` if it recovered" prompt, so it is
+/// deliberately short: long enough for an operator glancing at `status` shortly after a swap to catch
+/// it, short enough not to nag as stale chrome once the moment has passed (and any superseding swap
+/// clears it sooner, via the target-still-active projection gate). Scaled at the gate window
+/// [`BLIND_GATE_SECS`] — the same order of time the blindness episode that triggered the swap unfolds
+/// over.
+///
+/// INTERIM — the display window is a UX dial, not a correctness bound, and no production evidence yet
+/// fixes it; 300 s is a defensible starting scale (ratification-pending, issue #479). Distinct from
+/// the swap gate's own thresholds; changing it only widens/narrows the narration window, never
+/// whether a swap fires.
+const BLIND_PREEMPT_NOTICE_SECS: u64 = 300;
+
 /// Project the active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) for the
 /// `status` wire, or `None` when the account is not in bounded blindness. PURE — a function of the
 /// retained pre-blind anchor (`last_good`, #450), the blind predicate, the quarantine flag, and the
@@ -331,6 +348,39 @@ fn blind_active_view(
         blind_secs,
         last_known_session_pct: to_pct(anchor.session),
         auto_protection_degraded: blind_gate_armed(blind_secs, anchor.session),
+    })
+}
+
+/// Project the retained #452 preemptive-swap record into the `status` wire narration (issue #479), or
+/// `None` when there is no swap to narrate. PURE — a function of the record, the CURRENT active
+/// account's label, and the monotonic clock — so it is unit-tested directly. `Some` only when BOTH:
+/// - **still current** — the swap's TARGET (`to`) is STILL the active account. Any later swap (reactive
+///   / emergency / manual `use` / external-login reconcile) moves the active away from `to`, so the
+///   "swapped off X → Y" narration is stale and self-invalidates here — no scattered clear at every
+///   swap site needed (the one clear in [`record_swap`](Daemon::record_swap) only covers same-active
+///   supersession within the window; this covers the rest). A manual `use <from>` — the very undo the
+///   notice names — moves active back to `from`, so it clears the hint at its most natural moment; AND
+/// - **recent** — within the [`BLIND_PREEMPT_NOTICE_SECS`] window since the swap fired, measured on the
+///   SAME monotonic clock the anchor / cooldown use.
+///
+/// Keeps `render_status` a pure function of the wire (the window + supersession are decided daemon-side
+/// here), honoring the #169 UI-never-acts invariant.
+fn recent_blind_preempt_swap_view(
+    record: Option<&BlindPreemptSwapRecord>,
+    active_label: Option<&str>,
+    at: Instant,
+) -> Option<BlindPreemptSwap> {
+    let record = record?;
+    if active_label != Some(record.to.as_str()) {
+        return None;
+    }
+    if at.saturating_duration_since(record.at).as_secs() >= BLIND_PREEMPT_NOTICE_SECS {
+        return None;
+    }
+    Some(BlindPreemptSwap {
+        from_label: record.from.clone(),
+        to_label: record.to.clone(),
+        last_known_session_pct: record.last_known_session_pct,
     })
 }
 
@@ -1209,6 +1259,30 @@ struct LastGood {
     at: Instant,
 }
 
+/// The most recent #452 bounded-blindness PREEMPTIVE swap, retained so `status` can NARRATE it
+/// (issue #479). Set in [`Daemon::blind_swap`] on a successful swap-away from a BLIND active account;
+/// projected onto the wire ([`BlindPreemptSwap`]) by [`recent_blind_preempt_swap_view`] only while
+/// still-current (the swap's `to` is still active) AND recent (within [`BLIND_PREEMPT_NOTICE_SECS`]).
+/// Cleared in [`Daemon::record_swap`] (so a later same-active swap supersedes it before
+/// [`blind_swap`](Daemon::blind_swap) re-sets its own); a differently-targeted swap self-invalidates
+/// it at projection time instead. DEDICATED — kept SEPARATE from the cooldown-bearing [`LastSwap`]
+/// (read on every swap path) exactly as [`LastGood`] is kept separate from `last_readings`, so the
+/// narration state never burdens the cooldown primitive. Non-secret — two operator handles + a `u8`
+/// + a process-local [`Instant`] (never serialized), never a token or email (issue #15).
+#[derive(Debug, Clone, PartialEq)]
+struct BlindPreemptSwapRecord {
+    /// The label swapped AWAY FROM (the blind account) — the undo the surface names is `use <from>`.
+    from: String,
+    /// The label swapped TO (now active) — the target-still-active projection gate compares against it.
+    to: String,
+    /// The stale pre-blind session % the gate fired on (`to_pct(anchor.session)`), captured at
+    /// swap-time (by projection time the anchor `last_good` is `None`).
+    last_known_session_pct: u8,
+    /// When the swap fired — monotonic ([`Instant`]), so the [`BLIND_PREEMPT_NOTICE_SECS`] window is
+    /// measured against the SAME clock as the anchor / cooldown. Process-local: never serialized.
+    at: Instant,
+}
+
 /// The retained per-account SESSION-velocity signal (issue #399), EMA-smoothed, for the #539
 /// velocity-projection preemptive trigger (ADR-0017). The transient [`usage_velocity`] the poll
 /// fold logs is discarded, so the projective path — which runs at decision time, a step AFTER the
@@ -1383,6 +1457,11 @@ struct DecisionState {
     /// `status` candidate is #88's `next_swap`,
     /// computed fresh from readings — not this record.)
     last_swap: Option<LastSwap>,
+    /// The most recent #452 preemptive swap-away, retained so `status` can narrate it (issue #479):
+    /// `Some` from a successful [`Daemon::blind_swap`] until superseded / aged out. See
+    /// [`BlindPreemptSwapRecord`]. `None` by default (no preemptive swap yet). DEDICATED, kept off the
+    /// cooldown-bearing `last_swap` above.
+    last_blind_preempt_swap: Option<BlindPreemptSwapRecord>,
     /// Per-account health carried across ticks (issue #42), indexed by roster
     /// position: the consecutive-401 streak (feeding the `monitor_401` log event and
     /// the dead-credential threshold), the quarantine flag, and the recovery-probe
@@ -3581,6 +3660,11 @@ where
         // and the path could re-fire on it once the cooldown lapses.
         self.state.last_good = None;
         self.state.last_swap = Some(LastSwap { at });
+        // Issue #479: any swap supersedes an earlier #452 preemptive-swap narration — the active
+        // account is changing, so the "swapped off X → Y" notice is now stale. Clear it here (the
+        // shared swap path); a blind-preempt swap re-sets its OWN notice right after this call, and a
+        // differently-targeted swap self-invalidates the notice at projection time anyway.
+        self.state.last_blind_preempt_swap = None;
         if let Ok(incoming_stashed) = self.stash.read(incoming).await {
             self.state
                 .canonical_watch
@@ -4305,15 +4389,29 @@ where
         let incoming = self.roster[target_idx].stash();
         match self.locked_swap(&outgoing, &incoming).await {
             Ok(_report) => {
+                let from_label = self.roster[active_idx].label.clone();
+                let to_label = self.roster[target_idx].label.clone();
+                // The active is BLIND, so the stale pre-blind anchor is the only session signal — the
+                // same value the `swap` log line records and the narration surfaces (#479).
+                let last_known_session_pct = to_pct(anchor.session);
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::Swap {
-                    from: self.roster[active_idx].label.clone(),
-                    to: self.roster[target_idx].label.clone(),
+                    from: from_label.clone(),
+                    to: to_label.clone(),
                     reason: SwapReason::BlindPreempt,
-                    // The active is BLIND, so the stale pre-blind anchor is the only session
-                    // signal — log it (as a percent, like every swap line) so the `swap` line
-                    // agrees with the value the gate keyed off. Never a token / email (#15).
-                    session_pct: to_pct(anchor.session),
+                    // Log it (as a percent, like every swap line) so the `swap` line agrees with the
+                    // value the gate keyed off. Never a token / email (#15).
+                    session_pct: last_known_session_pct,
+                });
+                // Retain the swap for `status` to NARRATE (issue #479): `record_swap` above cleared any
+                // prior notice (superseding a same-active one), so set THIS swap's as the current one.
+                // `recent_blind_preempt_swap_view` projects it onto the wire only while still-current +
+                // recent; the narration names the `use <from>` undo (derived from `from`, not stored).
+                self.state.last_blind_preempt_swap = Some(BlindPreemptSwapRecord {
+                    from: from_label,
+                    to: to_label,
+                    last_known_session_pct,
+                    at,
                 });
                 TickAction::PreemptivelySwapped {
                     from: active_idx,
@@ -5167,6 +5265,16 @@ where
             // duration of a lock episode — set in `locked_tick` before this snapshot is built, cleared
             // on the first readable cycle — so a direct read is a faithful "currently locked" indicator.
             keychain_locked: self.state.signaled_keychain_locked,
+            // The daemon-level narrated preemptive-swap notice (issue #479): project the retained
+            // `last_blind_preempt_swap` record onto the wire, but only while STILL-CURRENT (the swap's
+            // target is still the active account) AND RECENT (within `BLIND_PREEMPT_NOTICE_SECS`) — both
+            // decided here (`recent_blind_preempt_swap_view`), on the same monotonic `blind_at` the
+            // #479 blind projection uses, so `render_status` stays a pure function of the wire (#169).
+            recent_blind_preempt_swap: recent_blind_preempt_swap_view(
+                self.state.last_blind_preempt_swap.as_ref(),
+                active.map(|i| self.roster[i].label.as_str()),
+                blind_at,
+            ),
         }
     }
 
@@ -9073,6 +9181,41 @@ mod tests {
             daemon.state.last_good.is_none(),
             "the swap dropped the departed active's anchor (no re-fire)",
         );
+
+        // Issue #479 (surface 2): the swap is RETAINED for `status` to NARRATE — source (the departed
+        // active's LABEL "work", the operator-facing identifier the `use <label>` undo keys off, NOT
+        // the internal account id u-A), the stale pct it fired on (68), and the target (the new
+        // active) — the undo derivable as `use work`. Captured at swap-time, since `record_swap` has
+        // already dropped the anchor above.
+        let new_active = daemon.state.active.expect("a new active after the swap");
+        let record = daemon
+            .state
+            .last_blind_preempt_swap
+            .as_ref()
+            .expect("the preemptive swap is retained for narration (#479)");
+        assert_eq!(
+            record.from, "work",
+            "narrates the LABEL of the account swapped away from (the `use <label>` undo target)",
+        );
+        assert_eq!(
+            record.to, daemon.roster[new_active].label,
+            "narrates the target the swap landed on",
+        );
+        assert_eq!(
+            record.last_known_session_pct, 68,
+            "carries the stale anchor pct"
+        );
+
+        // And the wire snapshot PROJECTS it (still-current: the target is still active; recent: the
+        // clock has not advanced past the notice window since the swap), so `status` can render it.
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snap = daemon.snapshot(daemon.state.active, &readings, 0);
+        let narrated = snap
+            .recent_blind_preempt_swap
+            .expect("the wire narrates the recent preemptive swap (#479)");
+        assert_eq!(narrated.from_label, "work");
+        assert_eq!(narrated.to_label, daemon.roster[new_active].label);
+        assert_eq!(narrated.last_known_session_pct, 68);
     }
 
     #[tokio::test]
@@ -9707,6 +9850,59 @@ mod tests {
         // Blind WITH an anchor but QUARANTINED (dead, #42) → the emergency_swap path owns it, not
         // bounded blindness (ADR-0017 keeps the two separate).
         assert!(blind_active_view(Some(anchor), true, true, past_t).is_none());
+    }
+
+    #[test]
+    fn recent_blind_preempt_swap_view_projects_only_while_current_and_recent() {
+        // Issue #479 (surface 2): the narration projects a retained #452 preemptive swap ONLY while
+        // the swap's target is STILL the active account (still-current) AND within the
+        // `BLIND_PREEMPT_NOTICE_SECS` window (recent). A pure function of the record, the current
+        // active label, and the monotonic clock.
+        let base = Instant::now();
+        let record = BlindPreemptSwapRecord {
+            from: "spare".to_owned(),
+            to: "work".to_owned(),
+            last_known_session_pct: 68,
+            at: base,
+        };
+
+        // Still-current (active is still the target `work`) + recent (mid-window) → narrated, carrying
+        // source + stale pct + target; the undo `use spare` is derived by the renderer, not stored.
+        let shown = recent_blind_preempt_swap_view(
+            Some(&record),
+            Some("work"),
+            base + Duration::from_secs(BLIND_PREEMPT_NOTICE_SECS - 1),
+        )
+        .expect("a current, recent preemptive swap is narrated");
+        assert_eq!(shown.from_label, "spare");
+        assert_eq!(shown.to_label, "work");
+        assert_eq!(shown.last_known_session_pct, 68);
+
+        // Superseded — the active account is NO LONGER the swap target (a later swap / manual `use` /
+        // external login moved it away): the narration is stale → dropped, even well within the window.
+        assert!(
+            recent_blind_preempt_swap_view(Some(&record), Some("personal"), base).is_none(),
+            "a swap whose target is no longer active self-invalidates",
+        );
+        // The undo itself — a manual `use spare` moves active back to the swapped-AWAY account, which
+        // is neither `to` → also dropped (the hint vanishes once acted on).
+        assert!(recent_blind_preempt_swap_view(Some(&record), Some("spare"), base).is_none());
+        // No active account resolved → nothing to narrate a swap TO.
+        assert!(recent_blind_preempt_swap_view(Some(&record), None, base).is_none());
+
+        // Aged out — at/after the window boundary the notice expires even while its target is active.
+        assert!(
+            recent_blind_preempt_swap_view(
+                Some(&record),
+                Some("work"),
+                base + Duration::from_secs(BLIND_PREEMPT_NOTICE_SECS),
+            )
+            .is_none(),
+            "at the window boundary the notice has aged out",
+        );
+
+        // No record at all → nothing to narrate.
+        assert!(recent_blind_preempt_swap_view(None, Some("work"), base).is_none());
     }
 
     #[tokio::test]
@@ -12064,6 +12260,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -12838,6 +13035,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -13480,6 +13678,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -13655,6 +13854,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at,
             refresh_enabled: false,
             next_swap: None,
@@ -14166,6 +14366,42 @@ mod tests {
             "the committed wire-snapshot-canonical-scrub golden drifted from the canonical_scrub \
              rollup encoder (issue #516) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, \
              then update the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn snapshot_frame_encodes_recent_blind_preempt_swap_only_when_present() {
+        // Issue #479 (surface 2): the ADDITIVE `recent_blind_preempt_swap` wire field (schema 1.7).
+        // The 4 committed goldens all carry it as `None` (it is
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`), so THEY prove the omit-when-
+        // absent half — an older client and every unaffected frame stay byte-identical — but NONE of
+        // them exercise the POPULATED shape. This locks the wire bytes the field emits when a recent
+        // preemptive swap IS present, so a later `#[serde(rename)]` / reorder / retype of
+        // `BlindPreemptSwap`'s fields (which the CLI render test would NOT catch — it constructs the
+        // struct in Rust, never round-trips the JSON keys) drifts this test. The menubar mirror is out
+        // of scope for #479 (#169/#485 own it), so this stays a Rust-side byte-lock rather than a fifth
+        // cross-language golden; the Swift decoder's forward-compatible tolerance of the new unknown
+        // top-level key is already covered by the `future_top` fixture (apps/menubar Fixtures.swift).
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.recent_blind_preempt_swap = Some(BlindPreemptSwap {
+            from_label: "work".to_owned(),
+            to_label: "spare".to_owned(),
+            last_known_session_pct: 68,
+        });
+        let frame = encode_snapshot_frame(&versioned_status_response(&snapshot));
+        assert!(
+            frame.contains(
+                r#""recent_blind_preempt_swap":{"from_label":"work","to_label":"spare","last_known_session_pct":68}"#
+            ),
+            "the populated preemptive-swap narration serializes its exact wire shape: {frame}"
+        );
+
+        // Absent → the key is omitted entirely (the additive-minor discipline the goldens rely on).
+        let healthy = watch_snapshot("work", 42, 0.60);
+        let frame = encode_snapshot_frame(&versioned_status_response(&healthy));
+        assert!(
+            !frame.contains("recent_blind_preempt_swap"),
+            "the field is omitted when there is no recent preemptive swap: {frame}"
         );
     }
 
@@ -15532,7 +15768,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":6}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":7}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -15571,6 +15807,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 1_782_777_600,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -15761,6 +15998,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![

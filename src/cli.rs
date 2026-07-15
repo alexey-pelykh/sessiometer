@@ -2095,26 +2095,73 @@ pub(crate) fn render_status(
     }
 
     out.push('\n');
-    // The bounded-blindness active-state line (issue #479, umbrella #363 Path B): when the daemon
-    // holds a retained pre-blind anchor for a BLIND active account, narrate the REAL state — how
-    // long it has been blind, its last-known session %, and whether ADR-0017 auto-protection is OK
-    // or DEGRADED — instead of leaving the active row a content-free `n/a … 🟡`. Printed as DATA
-    // (unconditional, so it survives a pipe / redirect / `status | grep` — an operator's health
-    // check must be able to see it), like the systemic-refresh line below; only the DEGRADED
-    // emphasis is color-gated. The surface only REFLECTS daemon-pushed state — it never self-polls
-    // the usage API and never self-swaps (the #169 UI-never-acts invariant). `blind_active` is set
-    // only on the active account and only while blind (a pre-#479 daemon omits it → no line).
-    if let Some((label, blind)) = response
+    // The blind ACTIVE account's retained-anchor projection (issue #479, umbrella #363 Path B), or
+    // `None` when the active account is not in bounded blindness. Resolved ONCE so the per-account
+    // blind line AND the cornered-state detection below read the SAME value. `blind_active` is set
+    // only on the active account and only while blind (a pre-#479 daemon omits it → `None`).
+    let active_blind = response
         .accounts
         .iter()
         .find(|account| account.active)
-        .and_then(|account| account.blind_active.map(|blind| (&account.label, blind)))
-    {
+        .and_then(|account| account.blind_active.map(|blind| (&account.label, blind)));
+
+    // CORNERED (issue #479, surface 3): the active account is blind, ADR-0017 auto-protection is
+    // DEGRADED (the preemptive gate is armed but acting on a STALE anchor), AND there is no viable
+    // target to swap to — the one bounded-blindness state the daemon CANNOT resolve itself, so the
+    // operator must act. Keying off `auto_protection_degraded` (blind PAST the interim gate window,
+    // anchor at/over the risk band) rather than the raw last-known % is deliberate: before the gate
+    // window the daemon is still self-resolving by waiting out a transient blind blip, so a loudest
+    // alarm THEN would cry wolf — DEGRADED is exactly "auto-protection WOULD swap now but can't".
+    // Composes two daemon verdicts (`blind_active` + `next_swap == no_viable_target`) already on the
+    // wire, so it needs no new field. `active_blind` is `Copy`, so this leaves it usable below.
+    let cornered = match (active_blind, &response.next_swap) {
+        (Some((label, blind)), Some(NextSwap::NoViableTarget { cause, resets_at }))
+            if blind.auto_protection_degraded =>
+        {
+            Some((label, blind, cause, resets_at))
+        }
+        _ => None,
+    };
+
+    if let Some((label, blind, cause, resets_at)) = cornered {
+        // The loudest, distinct state: blind + DEGRADED + nowhere to swap. Name the source, how long
+        // blind, the stale last-known %, WHY the fleet is blocked (the relief cause/reset FOLDED IN
+        // from `next_swap`, so the remedy is not lost when this alarm replaces that footer), and the
+        // ONE remedy only the operator can apply — add or free an account. Printed as DATA
+        // (unconditional, survives a pipe / redirect), red-emphasized when the color gate is open
+        // (the SAME SGR the DEGRADED / systemic lines use); the plain text conveys it under
+        // --no-color. The surface only REFLECTS this daemon-pushed state; it never self-swaps (#169).
         let dur = humanize_until(blind.blind_secs as i64);
         let last_known = blind.last_known_session_pct;
-        // DEGRADED is a fault: the ADR-0017 preemptive gate is armed but acting on a STALE anchor.
-        // Red emphasis when the color gate is open AND degraded — the SAME SGR overlay the
-        // systemic-refresh line uses — while the plain text still conveys it under --no-color.
+        let relief = match resets_at {
+            Some(at) => format!(", resets in {}", humanize_until(at - now)),
+            None => String::new(),
+        };
+        let blocked = match cause {
+            Some(NoTargetCause::Weekly) => format!("every account is weekly-exhausted{relief}"),
+            Some(NoTargetCause::Session) => {
+                format!("every account is over its session limit{relief}")
+            }
+            None => "no viable target".to_owned(),
+        };
+        let body = format!(
+            "CORNERED: active {label} blind for {dur} at last-known session {last_known}% and \
+             auto-protection cannot act — {blocked}; add or free an account"
+        );
+        if color {
+            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
+        } else {
+            out.push_str(&body);
+            out.push('\n');
+        }
+    } else if let Some((label, blind)) = active_blind {
+        // Not cornered — the normal per-account blind-active line (issue #479 surface 1, shipped in
+        // #496): narrate the REAL state — how long blind, last-known session %, and whether ADR-0017
+        // auto-protection is OK or DEGRADED — instead of the content-free `n/a … 🟡`. Printed as DATA
+        // (unconditional), like the systemic-refresh line below; only the DEGRADED emphasis is
+        // color-gated. DEGRADED is a fault: the gate is armed but acting on a STALE anchor.
+        let dur = humanize_until(blind.blind_secs as i64);
+        let last_known = blind.last_known_session_pct;
         let verdict = if blind.auto_protection_degraded {
             "DEGRADED (acting on a stale anchor)"
         } else {
@@ -2131,53 +2178,78 @@ pub(crate) fn render_status(
             out.push('\n');
         }
     }
+
+    // The #452 preemptive-swap NARRATION (issue #479, surface 2): when the daemon swapped a BLIND
+    // active account away on its stale pre-blind anchor, `status` narrates it — the source, the
+    // last-known % the gate FIRED on, the target, and the `use <from>` undo — so an operator can
+    // reverse it if the swapped-away account has since recovered. The SAME information the durable
+    // `event=swap … reason=blind_preempt` log line holds, reflected HERE because `render_status`
+    // reads only this wire, never the event log — each medium in its own idiom (R-2 STATE-parity, as
+    // the `canonical_scrub` footer is). Daemon-side windowed + target-still-active
+    // (`recent_blind_preempt_swap`, projected only within a bounded window while its target is still
+    // active), so this stays a pure render — the surface REFLECTS, never self-swaps (#169). Omitted
+    // from the wire (no line) when there is no recent-and-still-current preemptive swap.
+    if let Some(swap) = &response.recent_blind_preempt_swap {
+        let from = &swap.from_label;
+        let to = &swap.to_label;
+        let pct = swap.last_known_session_pct;
+        out.push_str(&format!(
+            "swapped off {from} (blind @ last-known {pct}%) → {to}; \
+             undo with 'use {from}' if it recovered\n"
+        ));
+    }
+
     // The forward-looking next-swap candidate (issue #88), computed daemon-side
     // ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like
     // the table footer it replaces (per-cell health coloring is #84, orthogonal). A
     // `None` field means the daemon sent no candidate — either a current daemon with no
     // active account to anchor a swap from, or (via `#[serde(default)]`) a pre-#88 daemon
-    // that omits the field — and renders a bare `none` either way.
-    match &response.next_swap {
-        // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
-        // so the CLI operator sees WHY this account — the identical "why this target?" the panel
-        // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
-        // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
-        Some(NextSwap::Target { to, reason }) => {
-            let why = match reason {
-                Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
-                Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
-                Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
-                None => "",
-            };
-            out.push_str(&format!("next swap: {to}{why}\n"));
-        }
-        // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
-        // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
-        // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
-        // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
-        // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
-        // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
-        Some(NextSwap::NoViableTarget { cause, resets_at }) => {
-            let relief = match resets_at {
-                Some(at) => format!("; resets in {}", humanize_until(at - now)),
-                None => String::new(),
-            };
-            match cause {
-                // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
-                // the meaningful escape is more accounts.
-                Some(NoTargetCause::Weekly) => out.push_str(&format!(
+    // that omits the field — and renders a bare `none` either way. SUPPRESSED when cornered
+    // (issue #479): the cornered alarm above already folded in this exact `no_viable_target` relief,
+    // so re-printing `next swap: none — …` would be redundant (cornered fires only on that arm).
+    if cornered.is_none() {
+        match &response.next_swap {
+            // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
+            // so the CLI operator sees WHY this account — the identical "why this target?" the panel
+            // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
+            // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
+            Some(NextSwap::Target { to, reason }) => {
+                let why = match reason {
+                    Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+                    Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
+                    Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
+                    None => "",
+                };
+                out.push_str(&format!("next swap: {to}{why}\n"));
+            }
+            // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
+            // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
+            // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
+            // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
+            // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
+            // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
+            Some(NextSwap::NoViableTarget { cause, resets_at }) => {
+                let relief = match resets_at {
+                    Some(at) => format!("; resets in {}", humanize_until(at - now)),
+                    None => String::new(),
+                };
+                match cause {
+                    // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
+                    // the meaningful escape is more accounts.
+                    Some(NoTargetCause::Weekly) => out.push_str(&format!(
                     "next swap: none — every account is weekly-exhausted{relief} — add an account\n"
                 )),
-                // A session-wide block lifts at the sooner session reset (minutes/hours), so the
-                // reset time itself is the remedy.
-                Some(NoTargetCause::Session) => out.push_str(&format!(
-                    "next swap: none — every account is over its session limit{relief}\n"
-                )),
-                None => out.push_str("next swap: none (no viable target)\n"),
+                    // A session-wide block lifts at the sooner session reset (minutes/hours), so the
+                    // reset time itself is the remedy.
+                    Some(NoTargetCause::Session) => out.push_str(&format!(
+                        "next swap: none — every account is over its session limit{relief}\n"
+                    )),
+                    None => out.push_str("next swap: none (no viable target)\n"),
+                }
             }
+            Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
+            None => out.push_str("next swap: none\n"),
         }
-        Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
-        None => out.push_str("next swap: none\n"),
     }
 
     // The systemic refresh-failure indicator (issue #378): the daemon reports the refresh
@@ -3933,7 +4005,9 @@ fn remove_confirmation(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Tunables;
-    use crate::daemon::{AccountStatusLine, BlindActive, NextSwap, NoTargetCause};
+    use crate::daemon::{
+        AccountStatusLine, BlindActive, BlindPreemptSwap, NextSwap, NoTargetCause,
+    };
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -4198,6 +4272,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4226,6 +4301,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: systemic,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: None,
@@ -4271,6 +4347,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: scrub,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(60), Some(25))],
             next_swap: None,
@@ -4345,6 +4422,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: locked,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(60), Some(25))],
             next_swap: None,
@@ -4407,6 +4485,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![degraded],
             next_swap: None,
@@ -4443,6 +4522,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![ok],
                 next_swap: None,
@@ -4462,6 +4542,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, None, None)],
                 next_swap: None,
@@ -4485,6 +4566,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
@@ -4510,6 +4592,199 @@ spare  22222222-2222\n\
         );
     }
 
+    /// A cornered response: the active account is blind + DEGRADED, and `next_swap` is
+    /// `NoViableTarget` with the given cause/reset — the composition that fires the surface-3 alarm.
+    fn cornered_response(cause: Option<NoTargetCause>, resets_at: Option<i64>) -> StatusResponse {
+        StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            refresh_enabled: None,
+            accounts: vec![AccountStatusLine {
+                blind_active: Some(BlindActive {
+                    blind_secs: 480,
+                    last_known_session_pct: 87,
+                    auto_protection_degraded: true,
+                }),
+                ..status_line("work", true, None, None)
+            }],
+            next_swap: Some(NextSwap::NoViableTarget { cause, resets_at }),
+        }
+    }
+
+    #[test]
+    fn render_status_cornered_is_the_loudest_state_and_names_the_remedy() {
+        // Issue #479 (surface 3): active blind + DEGRADED + no viable target = the one bounded-
+        // blindness state the daemon cannot resolve itself. It renders ONE loud, distinct alarm that
+        // names the source, the stale last-known %, WHY the fleet is blocked (folded in from the
+        // no-target relief), and the operator remedy — and SUPPRESSES both the separate blind-DEGRADED
+        // line and the `next swap: none — …` footer, which split read as two unrelated observations.
+        let out = render_status(
+            &cornered_response(
+                Some(NoTargetCause::Weekly),
+                Some(NOW + 2 * 86_400 + 4 * 3_600),
+            ),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            out.contains("CORNERED: active work blind for")
+                && out.contains("last-known session 87%")
+                && out.contains("auto-protection cannot act")
+                && out.contains("every account is weekly-exhausted, resets in 2d4h")
+                && out.contains("add or free an account"),
+            "the cornered alarm names source + stale pct + blocker + remedy: {out}",
+        );
+        // The two constituent lines are FOLDED INTO the alarm, not printed separately.
+        assert!(
+            !out.contains("auto-protection DEGRADED"),
+            "the separate blind-DEGRADED line is suppressed when cornered: {out}",
+        );
+        assert!(
+            !out.contains("next swap:"),
+            "the next-swap footer is suppressed when cornered (folded into the alarm): {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_cornered_folds_each_no_target_cause() {
+        // The remedy relief is folded from `next_swap`'s cause, so the operator still sees WHY. A
+        // SESSION-wide block names the sooner reset; an absent cause (pre-#405 daemon) falls back to
+        // the bare "no viable target" — each still carrying the "add or free an account" remedy.
+        let session = render_status(
+            &cornered_response(Some(NoTargetCause::Session), Some(NOW + 47 * 60)),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            session.contains("every account is over its session limit, resets in 47m")
+                && session.contains("add or free an account"),
+            "session-cause cornered folds the session relief: {session}",
+        );
+        let bare = render_status(&cornered_response(None, None), NOW, None, false);
+        assert!(
+            bare.contains("CORNERED: active work")
+                && bare.contains("no viable target")
+                && bare.contains("add or free an account"),
+            "a causeless cornered still alarms with the remedy: {bare}",
+        );
+    }
+
+    #[test]
+    fn render_status_is_not_cornered_without_both_degraded_and_no_target() {
+        // Cornered requires BOTH auto-protection DEGRADED AND no viable target. Either alone renders
+        // the ordinary (non-alarming) surfaces — the two guards that keep the loudest state rare.
+
+        // (a) Blind + DEGRADED but a VIABLE target exists → the daemon WILL swap; the normal
+        //     blind-DEGRADED line + the ordinary `next swap: <target>` footer, NOT the cornered alarm.
+        let has_target = StatusResponse {
+            next_swap: Some(NextSwap::Target {
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::OnlyCandidate),
+            }),
+            ..cornered_response(None, None)
+        };
+        let out = render_status(&has_target, NOW, None, false);
+        assert!(
+            !out.contains("CORNERED")
+                && out.contains("auto-protection DEGRADED")
+                && out.contains("next swap: spare (only viable target)"),
+            "degraded + a viable target is NOT cornered — the daemon will swap: {out}",
+        );
+
+        // (b) Blind but auto-protection OK (not yet past the gate) + no viable target → the daemon is
+        //     still self-resolving by waiting out the blip; the normal blind-OK line + the ordinary
+        //     no-target footer, NOT the loudest alarm (the anti-cry-wolf guard).
+        let ok_no_target = StatusResponse {
+            accounts: vec![AccountStatusLine {
+                blind_active: Some(BlindActive {
+                    blind_secs: 30,
+                    last_known_session_pct: 62,
+                    auto_protection_degraded: false,
+                }),
+                ..status_line("work", true, None, None)
+            }],
+            ..cornered_response(Some(NoTargetCause::Weekly), None)
+        };
+        let out = render_status(&ok_no_target, NOW, None, false);
+        assert!(
+            !out.contains("CORNERED")
+                && out.contains("auto-protection OK")
+                && out.contains("next swap: none — every account is weekly-exhausted"),
+            "blind-OK (pre-gate) + no target is NOT cornered — cry-wolf guard: {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_cornered_is_red_under_color() {
+        // The cornered alarm is unconditionally red-emphasized under the color gate (the loudest
+        // state) — the SAME SGR the DEGRADED / systemic lines use — while the plain text conveys the
+        // crisis under --no-color / a pipe.
+        let colored = render_status(
+            &cornered_response(Some(NoTargetCause::Weekly), None),
+            NOW,
+            None,
+            true,
+        );
+        assert!(
+            colored.contains("add or free an account\x1b[0m"),
+            "the cornered alarm is red-wrapped under --color: {colored:?}",
+        );
+        let plain = render_status(
+            &cornered_response(Some(NoTargetCause::Weekly), None),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            plain.contains("add or free an account\n") && !plain.contains("\x1b["),
+            "the cornered alarm is plain under --no-color: {plain:?}",
+        );
+    }
+
+    #[test]
+    fn render_status_narrates_a_recent_preemptive_swap_with_the_undo() {
+        // Issue #479 (surface 2): a daemon-pushed `recent_blind_preempt_swap` renders a narration line
+        // naming the source, the last-known % the gate fired on, the target, and the `use <from>` undo
+        // — reflected in `status` (the same information the `event=swap … reason=blind_preempt` log
+        // line holds). Absent from the wire → no line.
+        let narrated = StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: Some(BlindPreemptSwap {
+                from_label: "spare".to_owned(),
+                to_label: "work".to_owned(),
+                last_known_session_pct: 68,
+            }),
+            refresh_enabled: None,
+            accounts: vec![status_line("work", true, Some(20), Some(15))],
+            next_swap: None,
+        };
+        let out = render_status(&narrated, NOW, None, false);
+        assert!(
+            out.contains(
+                "swapped off spare (blind @ last-known 68%) → work; \
+                 undo with 'use spare' if it recovered"
+            ),
+            "the preemptive swap is narrated with source + stale pct + target + undo: {out}",
+        );
+
+        // No recent preemptive swap on the wire → no narration line.
+        let quiet = StatusResponse {
+            recent_blind_preempt_swap: None,
+            ..narrated
+        };
+        let out = render_status(&quiet, NOW, None, false);
+        assert!(
+            !out.contains("swapped off") && !out.contains("undo with"),
+            "no line when there is no recent preemptive swap: {out}",
+        );
+    }
+
     #[test]
     fn render_status_marks_a_quarantined_account_needs_relogin() {
         // Issue #42: a dead-credential account carries the durable `needs re-login`
@@ -4521,6 +4796,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4559,6 +4835,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
             next_swap: None,
@@ -4660,6 +4937,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![healthy_but_spent, dead],
             next_swap: None,
@@ -4703,6 +4981,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 health: Some(CredentialHealth::Healthy),
@@ -4733,6 +5012,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 line("healthy", Healthy),
@@ -4801,6 +5081,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 AccountStatusLine {
@@ -4861,6 +5142,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![],
             next_swap: None,
@@ -5054,6 +5336,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 work,
@@ -5096,6 +5379,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5151,6 +5435,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 // healthy: session 12m, weekly 5d — both appear.
@@ -5239,6 +5524,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             next_swap: None,
@@ -5266,6 +5552,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![{
                 let mut a = status_line_resets(
@@ -5355,6 +5642,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap,
@@ -5455,6 +5743,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
@@ -5493,6 +5782,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5528,6 +5818,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: Some(false),
                 accounts: vec![
                     health_line("account-a", true, Healthy),
@@ -5551,6 +5842,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(true),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5572,6 +5864,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5596,6 +5889,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Dead),
@@ -5620,6 +5914,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5647,6 +5942,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5671,6 +5967,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5697,6 +5994,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6011,6 +6309,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "hot",
@@ -6035,6 +6334,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 // green: low utilization.
@@ -6097,6 +6397,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -6136,6 +6437,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -6181,6 +6483,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "half",
@@ -6218,6 +6521,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6274,6 +6578,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6362,6 +6667,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 line_for("ascii", Some(NOW + 4 * 3_600)),
@@ -6397,6 +6703,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6502,6 +6809,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6708,6 +7016,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: Some(NextSwap::Target {
@@ -6770,6 +7079,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: None,
