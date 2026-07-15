@@ -34,9 +34,11 @@
 // held this session — discriminated by `hasEverConnected`, NOT by transport enrichment) reads as the
 // transient `.starting` within a short start grace, then escalates to the durable `.notRunning` once
 // the grace elapses still refused — both distinct from a WARM `.disconnected` drop (a live connection
-// held, then lost). The REMAINING degraded-state-map facets are tracked siblings, NOT this file:
-// keychain-locked (needs a daemon-side wire signal — the watch stream carries none) and the rich
-// version-skew upgrade UX.
+// held, then lost). The REMAINING degraded-state-map facets are tracked siblings, NOT this file: the
+// rich version-skew upgrade UX, plus the daemon-level PAYLOAD faults that ride alongside a `.connected`
+// roster — of which the two "act now" ones (keychain-locked, canonical-scrub-`exhausted`) now project
+// to the `.noRunway` glyph via `PresentationState.make` (issue #520); relogin, scrub-`recovering`, and
+// `systemic_refresh_failure` (#523) stay unmapped on the glyph.
 //
 // STORE-SIDE STALENESS WATCHDOG (#344): staleness must NOT depend solely on the transport's
 // byte-level liveness timer. The transport re-arms that timer on ANY non-empty line — garbage,
@@ -148,14 +150,19 @@ enum StatusGlyph: Equatable, Sendable, CaseIterable {
     /// The collapse bucket: the tool needs something from the operator, and it is not urgent. Ratified
     /// members reachable from this axis: version-skew (`.unsupported`) and crash-loop (`.crashLooping`),
     /// plus the daemon-liveness faults that cannot self-resolve (`.stale`, `.disconnected`, `.notRunning`)
-    /// and the un-configured tool (`.emptyRoster`). The other two ratified members — relogin and
-    /// keychain-locked — are daemon-level PAYLOAD faults that do not flow through `ConnectionState`; they
-    /// are issue #520's, not this axis's.
+    /// and the un-configured tool (`.emptyRoster`). Daemon-level PAYLOAD faults do NOT flow through
+    /// `ConnectionState` — they ride alongside a `.connected` roster — so the two that mean "act now"
+    /// (keychain-locked and canonical-scrub-`exhausted`) map to `.noRunway`, NOT here (issue #520,
+    /// projected in `make` off the vouched snapshot). The still-unmapped payload faults — relogin,
+    /// canonical-scrub-`recovering`, `systemic_refresh_failure` — remain #520's / #523's, not this axis's.
     case attention
-    /// The no-runway state (issue #524, new — no prior model carried it): the fleet has NO viable swap
-    /// target left, so the tool cannot keep the operator working. GATED exactly as `.healthy` is — it is
-    /// the other pole of the same fleet verdict, so it requires the same fresh, vouched evidence. (Quota
-    /// reaches the bar at exactly this one point; a resting quota level is the daemon's job, never a glyph.)
+    /// The no-runway state (issue #524): the tool cannot keep the operator working, so act now. THREE
+    /// vouched inputs converge here — issue #520 added the daemon-level vault pair to #524's fleet verdict:
+    /// the fleet has no viable swap target left (quota), the login keychain is LOCKED (the shared
+    /// credential is unreadable → unlock it), or the shared canonical is scrubbed-`exhausted` (→ `claude
+    /// /login`). All three are GATED exactly as `.healthy` is — read only off a fresh, vouched `.connected`
+    /// snapshot, so a retained fault under a `.stale` / `.disconnected` render never shouts here (see `make`).
+    /// (Quota reaches the bar at exactly this one point; a resting quota level is the daemon's job, never a glyph.)
     case noRunway
 }
 
@@ -174,21 +181,24 @@ struct PresentationState: Equatable, Sendable {
     ///
     /// The rule is two-tier, and it is what makes gated-Healthy STRUCTURAL rather than conventional:
     ///
-    ///   1. **Vouched?** (`.connected` — live ∧ fresh ∧ schema-supported ∧ ≥ 1 account) → the FLEET
-    ///      speaks: `.noRunway` when it has no viable target left, else `.healthy`. These are the two
-    ///      poles of one verdict, so they share one evidence bar.
+    ///   1. **Vouched?** (`.connected` — live ∧ fresh ∧ schema-supported ∧ ≥ 1 account) → the FLEET/VAULT
+    ///      speaks: `.noRunway` when the operator must act now — keychain LOCKED, shared canonical
+    ///      scrubbed-`exhausted`, or no viable swap target left (checked worst-first in that order, the
+    ///      panel's `daemonFaultBanner` rank; the glyph is one `⊘` regardless — the order only picks which
+    ///      root cause the a11y label names) — else `.healthy`. Healthy and every `⊘` share one evidence bar.
     ///   2. **Not vouched?** → the CONNECTION speaks, and it may only claim what it can observe:
     ///      `.connecting` while self-resolution is BOUNDED, `.attention` otherwise.
     ///
     /// Two consequences worth naming, because they are the reason the rule is shaped this way:
     ///
-    ///   * A fleet verdict is never rendered off data we cannot vouch for. Retained `noViableTarget` on
-    ///     a `.stale` / `.disconnected` roster does NOT reach the bar: quota is the one thing that moves
-    ///     while we are not looking, and (absent a swap) it moves UP — so `⊘` off a retained bit would
-    ///     shout "act now" about a problem that has most likely already resolved, and would misdirect the
-    ///     remedy (on a dropped socket the actionable problem is always the socket). The panel still shows
-    ///     the retained value, marked stale — bar = vouched verdict, panel = attributed record. This
-    ///     mirrors `AccountEventNotifier`, which likewise derives `.allExhausted` ONLY from `.connected`.
+    ///   * A fleet/vault verdict is never rendered off data we cannot vouch for. Retained `noViableTarget`
+    ///     — and, identically, a retained `keychainLocked` / `canonicalScrub` — on a `.stale` /
+    ///     `.disconnected` roster does NOT reach the bar: these bits ride alongside the roster and are
+    ///     retained across a drop, so `make` reads them ONLY in the `.connected` arm; on a dropped socket
+    ///     the actionable problem is always the socket, not a stale vault bit (quota, moreover, moves UP
+    ///     while we are not looking — so `⊘` off it would shout about a problem most likely already
+    ///     resolved). The panel still shows the retained value, marked stale — bar = vouched verdict, panel
+    ///     = attributed record. This mirrors `AccountEventNotifier`, which derives `.allExhausted` ONLY from `.connected`.
     ///   * `.emptyRoster` cannot be `.healthy`, even though it IS alive ∧ fresh. "Zero accounts are fine"
     ///     is a gate passing on a degenerate subject — vacuously true, not meaningfully true — and
     ///     `.healthy` means "ignore me", which is false for a tool that is doing nothing. It fails tier 1
@@ -200,10 +210,24 @@ struct PresentationState: Equatable, Sendable {
     /// (no `default:`) makes the compiler, not a reviewer, the check that every input has a home.
     static func make(for state: ConnectionState,
                      accountCount: Int,
-                     hasNoViableTarget: Bool = false) -> PresentationState {
+                     hasNoViableTarget: Bool = false,
+                     keychainLocked: Bool = false,
+                     canonicalScrub: CanonicalScrub? = nil) -> PresentationState {
         switch state {
         case .connected:
-            // TIER 1 — vouched: the fleet speaks. The sole healthy path, and the sole no-runway path.
+            // TIER 1 — vouched: the fleet/vault speaks. Every `⊘` no-runway path first (worst-first, the
+            // panel's `daemonFaultBanner` rank: keychain-locked ▸ scrub-`exhausted` ▸ no-viable-target —
+            // one `⊘` glyph regardless, the order only picks which root cause the label names), then the
+            // sole healthy path. `.recovering` scrub is NOT here: it may self-heal with no operator action,
+            // so alarming would cry wolf (issue #520 defers the recovering-glyph call).
+            if keychainLocked {
+                return PresentationState(glyph: .noRunway,
+                                         accessibilityLabel: "Sessiometer: keychain locked — unlock it to keep working")
+            }
+            if case .exhausted = canonicalScrub {
+                return PresentationState(glyph: .noRunway,
+                                         accessibilityLabel: "Sessiometer: signed out of the shared login — run claude /login")
+            }
             if hasNoViableTarget {
                 return PresentationState(glyph: .noRunway,
                                          accessibilityLabel: "Sessiometer: no account has capacity right now — action needed")
@@ -500,15 +524,17 @@ struct HonestStateMachine {
         }
     }
 
-    /// The glance presentation derived from the current state (issue #524). `hasNoViableTarget` is read
-    /// from the retained `nextSwap`, but `PresentationState.make` only lets it reach the `.noRunway` glyph
-    /// on a vouched `.connected` snapshot — so a `noViableTarget` retained under a `.stale` / `.disconnected`
-    /// render is carried here yet correctly ignored by the projection (the panel still shows it, marked
-    /// stale). Mirrors `AccountEventNotifier.isNoViableTarget`.
+    /// The glance presentation derived from the current state (issue #524 + #520). `hasNoViableTarget`,
+    /// `keychainLocked`, and `canonicalScrub` are read from the retained snapshot, but `PresentationState.make`
+    /// only lets them reach the `.noRunway` glyph on a vouched `.connected` snapshot — so a fault retained
+    /// under a `.stale` / `.disconnected` render is carried here yet correctly ignored by the projection
+    /// (the panel still shows it, marked stale). Mirrors `AccountEventNotifier.isNoViableTarget`.
     var presentation: PresentationState {
         PresentationState.make(for: connectionState,
                                accountCount: rows.count,
-                               hasNoViableTarget: hasNoViableTarget)
+                               hasNoViableTarget: hasNoViableTarget,
+                               keychainLocked: keychainLocked,
+                               canonicalScrub: canonicalScrub)
     }
 
     /// Whether the retained `nextSwap` reports the fleet has no viable swap target left — the
