@@ -32,6 +32,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0017](0017-bounded-blindness-preemptive-swap-not-header-observation.md) | Bounded-blindness preemptive swap-away, not header-based active-observation | Accepted |
 | [0018](0018-shared-credential-scrub-multi-writer-lockout.md) | Shared-credential scrub on the first `invalid_grant`: the multi-writer "Not logged in" lockout | Accepted |
 | [0019](0019-slow-poll-out-of-rotation-peers.md) | Out-of-rotation (exhausted) peers are slow-polled on a widened, reset-aware cadence | Accepted |
+| [0020](0020-stats-framing-guard-permits-neutral-runway.md) | The `stats` framing guard permits a neutral runway, bans the acquisitive call | Accepted |
 
 ## Conventions
 
