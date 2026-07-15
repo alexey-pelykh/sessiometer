@@ -849,7 +849,7 @@ private struct UsageBar: View {
 /// The app-identity header — a neutral gauge glyph, the product name, and the honest identity sub-line
 /// (`StatusPanelFormat.headerSubtitle`). Always present; the SUB-LINE — never the glyph — carries the
 /// connection state, so a degraded daemon reads "last-known" / "· stale", never a false "active".
-/// Provider-neutral (issue #15): a generic gauge, no brand mark or color.
+/// Provider-neutral (issue #173): a generic gauge, no brand mark or color.
 private struct PanelHeader: View {
     let subtitle: String
     /// Whether to show the Status|Stats seg control (issue #446). Only where the Stats tab can deliver (a
@@ -1347,7 +1347,7 @@ private struct StatsMessage: View {
 
 /// The loaded Stats view: the per-account rows (ordered to match the Status roster), then the aggregate
 /// callout + signal legend. Identity (name + monogram + active marker) joins the stats handles with the
-/// live roster the panel already holds — provider-neutral (#15), exactly like the Status roster.
+/// live roster the panel already holds — provider-neutral (#173), exactly like the Status roster.
 private struct StatsContent: View {
     let wire: StatsWire
     /// The active account's handle (from the watch snapshot the panel already renders) — marks the active

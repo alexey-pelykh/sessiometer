@@ -488,7 +488,7 @@
     <p class="lede">
       The macOS status-bar popover across <b>every launch-or-attach state</b>, at true <b>380&nbsp;px</b> width, in the
       native macOS language &mdash; vibrancy, meters, drawn sparklines, label-primary identity. Each state is a
-      <b>distinct icon-shape + panel message + affordance</b>; the menubar never renders healthy on a degraded daemon.
+      <b>distinct panel message + affordance</b> under the shared <b>4-state glance glyph</b> (#524); the menubar never renders healthy on a degraded daemon.
       A visual build-reference for the SwiftUI panel (#168/#169) &mdash; it does not port to code.
     </p>
   </header>
@@ -503,10 +503,10 @@
           <svg width="16" height="13" viewBox="0 0 16 13" fill="none"><rect x="1" y="1.5" width="8" height="3.2" rx="1.6" stroke="currentColor" stroke-width="1.1"/><circle cx="3" cy="3.1" r="1" fill="currentColor"/><rect x="1" y="7.8" width="8" height="3.2" rx="1.6" stroke="currentColor" stroke-width="1.1"/><circle cx="7" cy="9.4" r="1" fill="currentColor"/></svg>
         </span>
         <span class="mb-sess" title="Sessiometer — icon-only glance, shape-coded per state (no live %)">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <circle cx="12" cy="15.6" r="1.7" fill="currentColor"/>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/>
+            <path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/>
+            <path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/>
           </svg>
         </span>
         <span class="mb-clock">9:41</span>
@@ -516,7 +516,7 @@
     <div class="stage-cap">
       <span>The glance is <b>icon-only</b>, shape-coded &mdash; click the gauge and the popover renders the <b>same detail as the <code style="font-family:ui-monospace,'SF Mono',Menlo,monospace">status</code> verb</b></span>
       <span class="dotsep">&middot;</span>
-      <span>each frame&rsquo;s caption glyph is that state&rsquo;s menubar shape</span>
+      <span>each frame&rsquo;s caption glyph is that state&rsquo;s menu-bar shape &mdash; the <b>4-state attention axis</b> (#524: &#10003; healthy &middot; &hellip; connecting &middot; ! attention &middot; &#8709; no-runway), so several panel states share one glance glyph</span>
       <span class="dotsep">&middot;</span>
       <span>healthy shown in both themes; degraded states in Light with Dark spot-checks &mdash; the theme tokens apply <b>uniformly</b> to every state</span>
     </div>
@@ -534,13 +534,13 @@
       <!-- STATUS · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Status &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
               <span class="seg"><button class="on">Status</button><button>Stats</button></span>
             </div>
@@ -602,13 +602,13 @@
       <!-- STATUS · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Status &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
               <span class="seg"><button class="on">Status</button><button>Stats</button></span>
             </div>
@@ -667,13 +667,13 @@
       <!-- STATS · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Stats &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Usage stats &middot; last 7 days</span></span>
               <span class="seg"><button>Status</button><button class="on">Stats</button></span>
             </div>
@@ -740,13 +740,13 @@
       <!-- STATS · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Stats &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Usage stats &middot; last 7 days</span></span>
               <span class="seg"><button>Status</button><button class="on">Stats</button></span>
             </div>
@@ -821,13 +821,13 @@
       <!-- 2 · DAEMON-STARTING · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="2.4 3.2"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 6 12 A 1.5 1.5 0 1 0 9 12 A 1.5 1.5 0 1 0 6 12 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/><path d="M 15 12 A 1.5 1.5 0 1 0 18 12 A 1.5 1.5 0 1 0 15 12 Z"/></svg>
           Daemon-starting &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Connecting to the daemon&hellip;</span></span>
             </div>
             <div class="div"></div>
@@ -847,13 +847,13 @@
       <!-- 3 · NOT-RUNNING · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Not-running &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon offline</span></span>
             </div>
             <div class="div"></div>
@@ -873,13 +873,13 @@
       <!-- 3 · NOT-RUNNING · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Not-running &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon offline</span></span>
             </div>
             <div class="div"></div>
@@ -899,13 +899,13 @@
       <!-- 4 · CRASH-LOOPING · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 4.2L21 19.8a1.3 1.3 0 0 1-1.1 2H4.1a1.3 1.3 0 0 1-1.1-2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17.7" r="1.15" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Crash-looping &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon fault</span></span>
             </div>
             <div class="div"></div>
@@ -934,13 +934,13 @@
       <!-- 5 · UDS-DROP / DISCONNECTED · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="5" cy="12" r="2.6" stroke="currentColor" stroke-width="2"/><circle cx="19" cy="12" r="2.6" stroke="currentColor" stroke-width="2"/><path d="M8 12h2.4M13.6 12H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Disconnected &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; last-known</span></span>
             </div>
             <div class="pop-strip disconnected">
@@ -997,13 +997,13 @@
       <!-- 7 · STALE-SNAPSHOT · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.8" stroke="currentColor" stroke-width="2"/><path d="M12 6.8V12l3.4 2.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Stale-snapshot &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active &middot; <span class="sub-stale">stale 6m</span></span></span>
               <span class="seg"><button class="on">Status</button><button>Stats</button></span>
             </div>
@@ -1070,13 +1070,13 @@
       <!-- 6 · KEYCHAIN-LOCKED · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.3" r="1.5" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></svg>
           Keychain-locked &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
             </div>
             <div class="pop-strip paused">
@@ -1137,13 +1137,13 @@
       <!-- 6 · KEYCHAIN-LOCKED · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.3" r="1.5" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></svg>
           Keychain-locked &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
             </div>
             <div class="pop-strip paused">
@@ -1204,13 +1204,13 @@
       <!-- 8 · VERSION-SKEW · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M5 4.5h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 21V9.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6.8 14.2L12 9l5.2 5.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Version-skew &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Version mismatch</span></span>
             </div>
             <div class="div"></div>
@@ -1242,13 +1242,13 @@
       <!-- 9 · EMPTY-ROSTER / FIRST-RUN · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Empty-roster &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Welcome</span></span>
             </div>
             <div class="div"></div>
@@ -1274,13 +1274,13 @@
       <!-- 9 · EMPTY-ROSTER / FIRST-RUN · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Empty-roster &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Welcome</span></span>
             </div>
             <div class="div"></div>
@@ -1312,7 +1312,7 @@
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Capture affordance &middot; states</span></span>
             </div>
             <div class="div"></div>
