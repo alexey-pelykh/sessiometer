@@ -131,8 +131,9 @@ it is a monochrome **template** image (shape-encoded, `StatusGauge`), never heal
 
 Healthy (status + stats, both themes), daemon-starting, not-running, crash-looping,
 disconnected (stale), stale-snapshot, keychain-locked, version-skew, empty-roster/first-run.
-Each state is a **distinct icon shape + panel message + affordance**; the panel never renders
-healthy on a degraded daemon.
+Each state has a **distinct panel message + affordance** under the shared **4-state glance
+glyph** (#524: ✓ healthy · … connecting · ! attention · ∅ no-runway) — several panel states
+share one glyph; the panel never renders healthy on a degraded daemon.
 
 ## Design constraints the mock honors
 
