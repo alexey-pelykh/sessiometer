@@ -3407,7 +3407,6 @@ where
                 .velocity_swap(
                     at,
                     active_idx,
-                    &active_usage,
                     session_trigger,
                     weekly_trigger,
                     readings,
@@ -4348,7 +4347,6 @@ where
         &mut self,
         at: Instant,
         active_idx: usize,
-        active_usage: &Usage,
         session_trigger: f64,
         weekly_trigger: f64,
         readings: &[Option<Usage>],
@@ -4360,6 +4358,13 @@ where
         if horizon == 0 {
             return TickAction::Held;
         }
+        // The active's own FRESH reading (issue #539) — re-read from `readings[active_idx]` rather
+        // than threaded in as a separate arg (the `Copy` reading is already carried here, and the
+        // caller only reaches this path with it present). A missing slot cannot occur on the reactive
+        // Hold path that calls this, but hold defensively rather than project on absent data.
+        let Some(active_usage) = readings[active_idx] else {
+            return TickAction::Held;
+        };
         // The retained velocity signal must exist AND be SUSTAINED (≥ MIN_VELOCITY_SAMPLES blended
         // intervals). Absent (a first/failed poll, or reset by a window drop — the poll-gap case #540
         // owns) or single-sample → never project (the "no-fire on a missing/unwarmed velocity"
@@ -9251,11 +9256,10 @@ mod tests {
             samples: 5,
         });
         let at = daemon.clock.now();
-        let active_usage = daemon.state.last_readings[0].unwrap();
         let readings = daemon.state.last_readings.clone();
         let mut events = Vec::new();
         let action = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(action, TickAction::Held),
@@ -9273,7 +9277,6 @@ mod tests {
         let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.session_velocity_horizon_secs = 150;
         let at = daemon.clock.now();
-        let active_usage = daemon.state.last_readings[0].unwrap();
         let readings = daemon.state.last_readings.clone();
 
         // A single-interval spike steep enough to cross IF it counted — but samples = 1 holds.
@@ -9283,7 +9286,7 @@ mod tests {
         });
         let mut events = Vec::new();
         let spike = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(spike, TickAction::Held),
@@ -9295,7 +9298,7 @@ mod tests {
         daemon.state.session_velocity[0] = None;
         let mut events = Vec::new();
         let missing = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(missing, TickAction::Held),
@@ -9317,11 +9320,10 @@ mod tests {
             samples: 3,
         });
         let at = daemon.clock.now();
-        let active_usage = daemon.state.last_readings[0].unwrap();
         let readings = daemon.state.last_readings.clone();
         let mut events = Vec::new();
         let action = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(action, TickAction::Held),
@@ -9344,11 +9346,10 @@ mod tests {
             samples: 5,
         });
         let at = daemon.clock.now();
-        let active_usage = daemon.state.last_readings[0].unwrap();
         let readings = daemon.state.last_readings.clone();
         let mut events = Vec::new();
         let action = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(action, TickAction::Held),
@@ -9381,11 +9382,10 @@ mod tests {
             samples: 3,
         });
         let at = daemon.clock.now();
-        let active_usage = daemon.state.last_readings[0].unwrap();
         let readings = daemon.state.last_readings.clone();
         let mut events = Vec::new();
         let action = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(action, TickAction::Held),
@@ -9413,11 +9413,10 @@ mod tests {
             samples: 3,
         });
         let at = daemon.clock.now();
-        let active_usage = daemon.state.last_readings[0].unwrap();
         let readings = daemon.state.last_readings.clone();
         let mut events = Vec::new();
         let action = daemon
-            .velocity_swap(at, 0, &active_usage, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(action, TickAction::SkippedCooldown),
