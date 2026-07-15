@@ -2754,13 +2754,20 @@ mod tests {
 
     // --- the framing guard: a CENTRAL banned vocabulary + its scanner ----------------
 
-    /// The editorialising / recommendation / forecast vocabulary the neutral summary band
-    /// (issue #160) must NEVER contain — a value judgement (`healthy`, `danger`), an
-    /// imperative (`add`, `upgrade`), a recommendation (`should`, `recommend`), or a
-    /// projection (`forecast`, `predict`). CENTRAL + explicit so the guard stays
-    /// maintainable: one list, one scanner, extended in a single place. Neutral MAGNITUDE
-    /// words the wire legitimately uses (`idle`/`low`/`moderate`/`high`/`at_cap`) are
-    /// deliberately absent — they describe, they do not editorialise.
+    /// The editorialising vocabulary the neutral summary band (issue #160) — and every
+    /// surface this guard scans — must NEVER contain: a value judgement (`healthy`, `danger`),
+    /// an acquisitive imperative (`add`, `upgrade`, `buy`), a recommendation (`should`,
+    /// `recommend`), or ALARMIST projection FRAMING (`forecast`, `imminent`, `soon`). CENTRAL +
+    /// explicit so the guard stays maintainable: one list, one scanner, extended in a single
+    /// place.
+    ///
+    /// Boundary (issue #542, ADR-0020) — these ban the FRAMING, not the FACT. A neutrally
+    /// framed velocity + runway readout — a `%/min` rate, an approximate time-to-trigger or
+    /// days-of-runway phrased as an observation (`~4h to trigger`, `~3 days at current rate`) —
+    /// is PERMITTED: it uses none of this vocabulary. What stays banned is the acquisitive CALL
+    /// (a purchase prompt) and the alarmist projection words, never a head-room number. Neutral
+    /// MAGNITUDE words the wire legitimately uses (`idle`/`low`/`moderate`/`high`/`at_cap`) are
+    /// likewise absent — they describe, they do not editorialise.
     const BANNED_TOKENS: &[&str] = &[
         // Imperatives / recommended actions (issue #160: "add / buy / upgrade / cancel /
         // bypass / need more").
@@ -2809,7 +2816,9 @@ mod tests {
         "consider",
         "advise",
         "advice",
-        // Projections / forecasts (issue #160: "no projections / forecasts").
+        // Alarmist / editorialising projection FRAMING. A neutral numeric runway is a
+        // permitted FACT (issue #542, ADR-0020); these ban the ALARM ("forecast", "imminent",
+        // "soon"), not the head-room number ("~4h to trigger").
         "forecast",
         "predict",
         "prediction",
@@ -2820,10 +2829,20 @@ mod tests {
         "soon",
     ];
 
-    /// The first banned token appearing in `text`, or `None` when it is clean. Strips ANSI
-    /// SGR runs first (so a colour-wrapped word tokenises intact), then matches whole
-    /// lowercase WORDS on non-alphanumeric boundaries — so `at-risk`, `At Risk`, and
-    /// `risk!` all trip `risk`, while `saturated` or an account handle never false-trips.
+    /// Acquisitive purchase-CALLS that span two adjacent words, so the single-token scan above
+    /// misses them (issue #542): the imperative-free `top up` / `get more` a purchase prompt
+    /// reaches for once `buy`/`add`/`upgrade` are gone. The discriminator the guard draws is the
+    /// CALL to acquire, never the head-room fact — `runs out in ~4h` is permitted, `runs out —
+    /// top up` is not. Kept SHORT and matched on WORD boundaries (adjacent tokens, not a raw
+    /// substring) so a neutral render never false-trips (`laptop update` is not `top up`).
+    const BANNED_PHRASES: &[&str] = &["top up", "get more"];
+
+    /// The first banned token OR acquisitive phrase appearing in `text`, or `None` when it is
+    /// clean. Strips ANSI SGR runs first (so a colour-wrapped word tokenises intact), then
+    /// matches whole lowercase WORDS on non-alphanumeric boundaries — so `at-risk`, `At Risk`,
+    /// and `risk!` all trip `risk`, while `saturated` or an account handle never false-trips —
+    /// and finally adjacent-word purchase-calls (`top up`), so a neutral head-room fact passes
+    /// while an acquisitive call does not (issue #542).
     fn scan_banned(text: &str) -> Option<&'static str> {
         let mut plain = String::with_capacity(text.len());
         let mut chars = text.chars();
@@ -2839,12 +2858,28 @@ mod tests {
                 plain.push(c);
             }
         }
-        let words: std::collections::HashSet<String> = plain
+        // Lowercase words in READING ORDER (a Vec, not a set) — the order lets the phrase scan
+        // below match an adjacent-word purchase-call without a fragile substring test.
+        let words: Vec<String> = plain
             .split(|c: char| !c.is_ascii_alphanumeric())
             .filter(|w| !w.is_empty())
             .map(str::to_ascii_lowercase)
             .collect();
-        BANNED_TOKENS.iter().copied().find(|b| words.contains(*b))
+        // A single editorialising / acquisitive WORD (issue #160).
+        if let Some(hit) = BANNED_TOKENS
+            .iter()
+            .copied()
+            .find(|b| words.iter().any(|w| w == b))
+        {
+            return Some(hit);
+        }
+        // A purchase-CALL spanning adjacent words (issue #542): `top up` / `get more`.
+        BANNED_PHRASES.iter().copied().find(|phrase| {
+            let parts: Vec<&str> = phrase.split(' ').collect();
+            words
+                .windows(parts.len())
+                .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
+        })
     }
 
     /// Every object key in `v`, recursively — the surface the `--json` banned-token scan
@@ -2997,6 +3032,53 @@ mod tests {
             scan_banned("signal aa underused bb balanced cc saturated"),
             None
         );
+    }
+
+    // --- AC (issue #542): PERMIT a neutral runway, still BAN the acquisitive call ----
+
+    #[test]
+    fn framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call() {
+        // PERMIT — a neutrally framed velocity + runway readout is descriptive head-room, not
+        // advice: a `%/min` rate, an approximate time-to-trigger, days-of-runway "at current
+        // rate", and the bare "runs out in ~Xh" fact all read as an observation and pass clean.
+        // (Unblocks issue #541's per-account + fleet runway surfaces, issues #543 / #544, which
+        // can render these without tripping the guard.)
+        for permitted in [
+            "runway  work ~4h to trigger · 1.4%/min",
+            "runway  fleet ~3 days at current rate",
+            "velocity  work 0.8%/min · weekly 0.20%/min",
+            "work runs out in ~4h at current rate",
+            "~12h to trigger · ~5 days of runway",
+        ] {
+            assert_eq!(
+                scan_banned(permitted),
+                None,
+                "a neutral velocity/runway readout is permitted: {permitted:?}"
+            );
+        }
+
+        // BAN — the acquisitive / purchase-timeline framing stays caught: a call to acquire,
+        // whether a single imperative ("buy" / "add" / "upgrade") OR an imperative-free purchase
+        // phrase ("top up" / "get more"). The intent-leak concern is the PURCHASE PROMPT, never
+        // the head-room number.
+        for (acquisitive, caught) in [
+            ("running low — top up / buy more", "buy"),
+            ("you'll run out — top up", "top up"),
+            ("add credits before you run out", "add"),
+            ("get more before it resets", "get more"),
+            ("almost out — upgrade to keep going", "upgrade"),
+        ] {
+            assert_eq!(
+                scan_banned(acquisitive),
+                Some(caught),
+                "an acquisitive purchase-prompt still fails the guard: {acquisitive:?}"
+            );
+        }
+
+        // The boundary is the CALL, not the fact: the SAME "runs out" head-room passes as a
+        // neutral observation, and fails the instant a purchase call is appended.
+        assert_eq!(scan_banned("work runs out in ~4h"), None);
+        assert_eq!(scan_banned("work runs out in ~4h — top up"), Some("top up"));
     }
 
     // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
