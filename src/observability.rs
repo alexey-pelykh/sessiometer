@@ -884,6 +884,22 @@ pub(crate) enum Event {
     /// with no prior slow-poll stays silent, mirroring [`Event::UsageBackoffCleared`].
     /// `account` is the account UUID — never the operator `label` (issue #15).
     ExhaustedSlowPollCleared { account: String },
+    /// The ACTIVE account entered the near-limit poll-coverage fast-poll (issue #540): its reading —
+    /// or the #539 velocity projection — reached the near-limit band, so the daemon TIGHTENED its
+    /// poll sub-interval to `sub_interval_secs` (the `near_limit_poll_secs` cap) so no long poll gap
+    /// opens on the final climb to the limit. The near-limit-scoped MIRROR of
+    /// [`Event::ExhaustedSlowPoll`] (#537), which WIDENS an idle peer — same edge-triggered idiom,
+    /// opposite direction. Emitted ONCE on the below-band → near-limit transition (NOT re-emitted on
+    /// each held near-limit tick while the active stays in the band), and UNPAIRED: the band ends at
+    /// a swap (its own [`Event::Swap`], `session_pct` at swap-out) or a below-band / blind reading,
+    /// so no CLEARED partner is needed to bracket the span. A quota-poll-cadence policy, distinct
+    /// from the 429/5xx `usage_backoff` rate-limit (ADR-0009), like its `ExhaustedSlowPoll` sibling.
+    /// `account` is the account UUID — a non-PII identifier secret-free BY CONSTRUCTION, never the
+    /// operator `label` (issue #15); `sub_interval_secs` is a bare duration, never a token.
+    NearLimitPollCoverage {
+        account: String,
+        sub_interval_secs: u64,
+    },
     /// The per-account usage VELOCITY between the last two readings (issue #399, normalized to
     /// %/min by issue #449): the SIGNED change in each rounded-percent dimension since the account's
     /// previous reading (`to_pct(next) - to_pct(prev)`), carried alongside the `elapsed_secs`
@@ -1343,6 +1359,18 @@ impl Event {
             }
             Event::ExhaustedSlowPollCleared { account } => {
                 format!("ts={ts} event=exhausted_slow_poll_cleared acct={account}")
+            }
+            Event::NearLimitPollCoverage {
+                account,
+                sub_interval_secs,
+            } => {
+                // `acct=` carries the account UUID (never the free-form `label`, #15), matching the
+                // sibling `exhausted_slow_poll` line; `sub_interval_secs` is the tightened near-limit
+                // poll cadence (a bare duration, never a token). Redacted to uuid + cadence ONLY
+                // (issue #540 / #15).
+                format!(
+                    "ts={ts} event=near_limit_poll_coverage acct={account} sub_interval_secs={sub_interval_secs}"
+                )
             }
             Event::UsageVelocity {
                 account,
@@ -3309,6 +3337,29 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             line,
             format!("{TS0} event=exhausted_slow_poll_cleared acct=u-A")
         );
+    }
+
+    #[test]
+    fn near_limit_poll_coverage_line_carries_the_uuid_and_cadence() {
+        // The durable band-ENTER line (issue #540): the active account UUID (not a label, #15) and
+        // the tightened near-limit poll cadence — redacted to uuid + cadence ONLY, the same
+        // single-surface discipline as its `exhausted_slow_poll` sibling. No token/email surface
+        // exists (the mirror-image sibling of `exhausted_slow_poll_line_carries_the_uuid_and_window`).
+        let line = Event::NearLimitPollCoverage {
+            account: "u-A".to_owned(),
+            sub_interval_secs: 60,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=near_limit_poll_coverage acct=u-A sub_interval_secs=60")
+        );
+        // #15: no non-authored email, no token/bearer/api-key, and the identity is the UUID.
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no non-authored email may appear (#15): {line}"
+        );
+        assert!(!line.contains("token") && !line.contains("Bearer") && !line.contains("sk-ant"));
     }
 
     #[test]

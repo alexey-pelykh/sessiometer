@@ -56,6 +56,20 @@ const DEFAULT_POLL_JITTER_STDDEV: f64 = 60.0;
 /// Deliberately the same 3600 s as [`DEFAULT_REFRESH_CADENCE_SECS`] — an hour is the crate's
 /// standard "slow background" cadence.
 const DEFAULT_EXHAUSTED_POLL_SECS: u64 = 3600;
+/// Default `near_limit_poll_secs` (issue #540): the TIGHTENED poll sub-interval (the per-tick
+/// spacing) applied to the ACTIVE account while its reading — or the #539 projection — is in the
+/// near-limit band. The OPPOSITE direction of [`DEFAULT_EXHAUSTED_POLL_SECS`] (which WIDENS an
+/// exhausted peer): near-limit, the active is the one account that can climb to its limit WHILE
+/// active, so its poll cadence is tightened so no long gap opens on the final stretch (the poll-gap
+/// residual #363/#538 named). Applied as `min(poll_secs / N, near_limit_poll_secs)`, so via the
+/// #366 active-interleave (which re-observes the active every ~2 sub-intervals) the active is
+/// re-polled within ~`2 × near_limit_poll_secs` = ~120 s near-limit — inside the ratified 60-150 s
+/// active band. Bounded BELOW the band: it only engages when the active is in/approaching the band,
+/// so the steady-state (below-band) cadence — and the source-scoped 429 footprint the fixed
+/// `poll_secs` protects — is unchanged. 60 s keeps the tightened tick at/above the ~50 s
+/// observed-safe spacing (the D-LAT-2 finding); `0` disables the path (the kill-switch, like
+/// `session_velocity_horizon_secs`).
+const DEFAULT_NEAR_LIMIT_POLL_SECS: u64 = 60;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// The NON-ZERO floor for `cooldown_secs` (issue #272): the smallest interval, in
@@ -294,6 +308,20 @@ pub(crate) struct Tunables {
     /// (`poll_backoff_until`, ADR-0009), which is armed by 429/5xx and cleared on any
     /// success — an exhausted account is an HTTP-200 success, so it needs its own window.
     pub(crate) exhausted_poll_secs: u64,
+    /// Tightened re-poll sub-interval, in seconds, for the ACTIVE account while its reading (or the
+    /// #539 velocity projection) is in the near-limit band (issue #540): `0` or `5..=3600`, default
+    /// 60. The near-limit-scoped MIRROR of `exhausted_poll_secs` — where that WIDENS an exhausted
+    /// peer's cadence, this TIGHTENS the active account's on its final climb to the limit, so no
+    /// long poll gap opens while it is near the limit (the poll-gap half of #363's residual, split
+    /// from #539's projection per the #538 spike). Applied as `min(poll_secs / N, near_limit_poll_secs)`,
+    /// so with the #366 active-interleave the active is re-observed within ~`2 ×` this near-limit.
+    /// It ONLY engages while the active is in/approaching the band (keyed off the SAME signals #539
+    /// uses — last reading + `usage_velocity`); BELOW the band the sub-interval is the unchanged
+    /// `poll_secs / N`, so the steady-state 429 footprint stays flat. ACTIVE-account only (the
+    /// #453 active-vs-peer asymmetry); a peer being near-limit does nothing. `0` disables the path
+    /// (the kill-switch). A value above the base sub-interval is inert (the `min` never binds), not
+    /// an error, so no cross-field bound to `poll_secs`.
+    pub(crate) near_limit_poll_secs: u64,
     /// Seconds to wait after a swap before another is allowed
     /// (`COOLDOWN_SECS_FLOOR..=3600` — a non-zero floor, #272). Consumed by the
     /// cooldown logic (#10 / #11).
@@ -383,6 +411,7 @@ impl Default for Tunables {
         Self {
             poll_secs: DEFAULT_POLL_SECS,
             exhausted_poll_secs: DEFAULT_EXHAUSTED_POLL_SECS,
+            near_limit_poll_secs: DEFAULT_NEAR_LIMIT_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
             target_max_session_usage: DEFAULT_TARGET_MAX_SESSION_USAGE,
             session_trigger: DEFAULT_SESSION_TRIGGER,
@@ -891,6 +920,11 @@ impl Config {
                     present("tunables", "exhausted_poll_secs"),
                 ),
                 entry(
+                    "near_limit_poll_secs",
+                    t.near_limit_poll_secs.to_string(),
+                    present("tunables", "near_limit_poll_secs"),
+                ),
+                entry(
                     "cooldown_secs",
                     t.cooldown_secs.to_string(),
                     present("tunables", "cooldown_secs"),
@@ -1279,6 +1313,21 @@ impl Config {
                 t.poll_secs, t.exhausted_poll_secs
             )));
         }
+        // The near-limit active-poll sub-interval cap (issue #540). `0` disables the path (the
+        // kill-switch, like `session_velocity_horizon_secs` below); a non-zero value is a poll
+        // cadence in the SAME `5..=3600` s band as `poll_secs` (a sub-5 s cadence sits below the
+        // daemon's own poll floor). Deliberately NOT cross-fielded to `poll_secs`: the daemon
+        // applies it as `min(poll_secs / N, near_limit_poll_secs)`, so a value ABOVE the base
+        // sub-interval is simply inert (the `min` never binds) rather than an error — a lowered
+        // `poll_secs` whose base already sits below this cap just leaves #540 inert, which is
+        // correct (the steady cadence is already tight). `range` cannot express the `0`-or-band
+        // shape, so spell it out, mirroring the `exhausted_poll_secs` message above.
+        if t.near_limit_poll_secs != 0 && !(5..=3600).contains(&t.near_limit_poll_secs) {
+            return Err(Error::ConfigInvalid(format!(
+                "near_limit_poll_secs must be 0 (disabled) or in 5..=3600, got {}",
+                t.near_limit_poll_secs
+            )));
+        }
         // cooldown_secs has a NON-ZERO floor (issue #272): it is configurable ABOVE
         // COOLDOWN_SECS_FLOOR but not below it, so swap pacing can never be tuned down
         // to zero. The daemon's per-cycle draw clamps to the same floor, so a jitter
@@ -1307,6 +1356,7 @@ impl Config {
         let tunables = Tunables {
             poll_secs: t.poll_secs as u64,
             exhausted_poll_secs: t.exhausted_poll_secs as u64,
+            near_limit_poll_secs: t.near_limit_poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
             target_max_session_usage,
             session_trigger: t.session_trigger as u8,
@@ -1526,6 +1576,18 @@ impl Config {
         out.push_str(&format!(
             "exhausted_poll_secs = {}\n",
             t.exhausted_poll_secs
+        ));
+        out.push_str(
+            "# Tightened poll sub-interval (0 to disable, else 5..=3600) for the ACTIVE account\n\
+             # while it is near its limit (issue #540) — the mirror of exhausted_poll_secs, which\n\
+             # WIDENS an idle peer. On the active account's final climb its cadence tightens to\n\
+             # this so no long poll gap opens near the limit; below the near-limit band the cadence\n\
+             # is the unchanged poll_secs/N, so the steady rate is flat. Default 60. Applied as\n\
+             # min(poll_secs/N, this), so a value above the base sub-interval is inert.\n",
+        );
+        out.push_str(&format!(
+            "near_limit_poll_secs = {}\n",
+            t.near_limit_poll_secs
         ));
         out.push_str(&format!(
             "# Seconds to wait after a swap before another swap is allowed \
@@ -2006,6 +2068,8 @@ struct RawTunables {
     poll_secs: i64,
     #[serde(default = "default_exhausted_poll_secs")]
     exhausted_poll_secs: i64,
+    #[serde(default = "default_near_limit_poll_secs")]
+    near_limit_poll_secs: i64,
     #[serde(default = "default_cooldown_secs")]
     cooldown_secs: i64,
     /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_TARGET_MAX_SESSION_USAGE`
@@ -2043,6 +2107,7 @@ impl Default for RawTunables {
         Self {
             poll_secs: default_poll_secs(),
             exhausted_poll_secs: default_exhausted_poll_secs(),
+            near_limit_poll_secs: default_near_limit_poll_secs(),
             cooldown_secs: default_cooldown_secs(),
             target_max_session_usage: None,
             session_trigger: default_session_trigger(),
@@ -2063,6 +2128,9 @@ fn default_poll_secs() -> i64 {
 }
 fn default_exhausted_poll_secs() -> i64 {
     DEFAULT_EXHAUSTED_POLL_SECS as i64
+}
+fn default_near_limit_poll_secs() -> i64 {
+    DEFAULT_NEAR_LIMIT_POLL_SECS as i64
 }
 fn default_cooldown_secs() -> i64 {
     DEFAULT_COOLDOWN_SECS as i64
@@ -2337,6 +2405,10 @@ label = "personal"
                 poll_secs: 30,
                 // VALID omits exhausted_poll_secs → the compiled-in default (issue #537).
                 exhausted_poll_secs: 3600,
+                // VALID omits near_limit_poll_secs → the compiled-in default (issue #540). 60 > the
+                // configured poll_secs (30) here, so it is inert for this config (min never binds) —
+                // valid, not an error (no cross-field bound to poll_secs).
+                near_limit_poll_secs: 60,
                 cooldown_secs: 45,
                 target_max_session_usage: 70,
                 session_trigger: 90,
@@ -2651,13 +2723,15 @@ label = "personal"
             ("poll_secs", "4"),
             ("poll_secs", "3601"),
             ("exhausted_poll_secs", "86401"), // above the 24 h ceiling (#537)
+            ("near_limit_poll_secs", "4"), // below the 5 s floor, yet not the 0 kill-switch (#540)
+            ("near_limit_poll_secs", "3601"), // above the 3600 s ceiling (#540)
             ("session_velocity_horizon_secs", "601"), // above the 600 s sanity ceiling (#539)
             ("session_velocity_min_project_above", "49"), // below the 50 % floor (#539)
             ("session_velocity_min_project_above", "100"), // above the 99 % ceiling (#539)
             ("session_velocity_ema_alpha_pct", "0"), // alpha=0 freezes the EMA — degenerate (#539)
             ("session_velocity_ema_alpha_pct", "101"), // above 100 % (#539)
-            ("cooldown_secs", "0"),           // below the non-zero floor (#272)
-            ("cooldown_secs", "4"),           // still below the floor (#272)
+            ("cooldown_secs", "0"),        // below the non-zero floor (#272)
+            ("cooldown_secs", "4"),        // still below the floor (#272)
             ("cooldown_secs", "3601"),
             ("monitor_401_n", "0"),
             ("monitor_401_n", "21"),
@@ -2716,6 +2790,38 @@ label = "personal"
         ))
         .expect("a value in poll_secs..=86400 loads");
         assert_eq!(mid.tunables.exhausted_poll_secs, 7200);
+    }
+
+    #[test]
+    fn near_limit_poll_secs_accepts_zero_disabled_or_the_5_to_3600_band() {
+        // Issue #540: the near-limit fast-poll cap is `0` (disabled — the kill-switch) OR in the
+        // 5..=3600 s band. The `0`-OR-band shape is the load-bearing subtlety: a naive
+        // `(5..=3600).contains()` WITHOUT the `!= 0` guard would reject the documented kill-switch.
+        // There is deliberately NO cross-field bound against `poll_secs` (unlike #537's
+        // `exhausted_poll_secs`): an above-base value is INERT via the `min(poll_secs / N, cap)` in
+        // `next_subinterval`, not a load-time error — so no default-vs-configured footgun.
+
+        // Absent → the compiled-in 60 s default.
+        let default = Config::parse(&with_tunables("poll_secs = 300")).unwrap();
+        assert_eq!(default.tunables.near_limit_poll_secs, 60);
+
+        // 0 is the disabled kill-switch and MUST load — it is NOT a sub-floor rejection.
+        let disabled = Config::parse(&with_tunables("near_limit_poll_secs = 0"))
+            .expect("0 is the valid disabled kill-switch, not a sub-floor rejection");
+        assert_eq!(disabled.tunables.near_limit_poll_secs, 0);
+
+        // Both band edges load and thread through verbatim.
+        for edge in [5u64, 3600] {
+            let cfg = Config::parse(&with_tunables(&format!("near_limit_poll_secs = {edge}")))
+                .unwrap_or_else(|e| panic!("near_limit_poll_secs = {edge} is a valid edge: {e:?}"));
+            assert_eq!(cfg.tunables.near_limit_poll_secs, edge);
+        }
+
+        // An above-base cap LOADS (no cross-field bound): with poll_secs = 30 the base sub-interval
+        // is already < 60, so a 60 s cap can never bind — but it is inert, not a rejection.
+        let inert = Config::parse(&with_tunables("poll_secs = 30\nnear_limit_poll_secs = 60"))
+            .expect("an above-base cap is inert, not an error (no cross-field bound)");
+        assert_eq!(inert.tunables.near_limit_poll_secs, 60);
     }
 
     #[test]
@@ -3395,6 +3501,7 @@ label = "personal"
         for key in [
             "poll_secs",
             "exhausted_poll_secs",
+            "near_limit_poll_secs",
             "cooldown_secs",
             "target_max_session_usage",
             "session_trigger",

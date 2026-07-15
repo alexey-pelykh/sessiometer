@@ -1505,6 +1505,18 @@ struct DecisionState {
     /// lifecycle, so [`note_blind_gate_eligibility`](Daemon::note_blind_gate_eligibility) manages both
     /// clears in one place and no `last_good` reset site has to touch it.
     blind_gate_signaled: bool,
+    /// Whether the ACTIVE account's near-limit poll-coverage fast-poll is engaged (issue #540):
+    /// the active's last reading — or the #539 velocity projection — is in the near-limit band, so
+    /// [`next_subinterval`](Daemon::next_subinterval) tightens the poll sub-interval to
+    /// [`near_limit_poll_secs`](Daemon::near_limit_poll_secs). Recomputed every tick from the
+    /// post-decision state ([`near_limit_fast_poll_engaged`](Daemon::near_limit_fast_poll_engaged))
+    /// so it always reflects the CURRENT active account and its freshest reading; the wait path
+    /// reads this cached verdict rather than re-deriving it, and its `false → true` transition is
+    /// the edge that emits the durable [`Event::NearLimitPollCoverage`] exactly once per band
+    /// entry (its `true → false` transition clears silently — the band ends at a swap, which emits
+    /// its own [`Event::Swap`], or at a below-band reading). Defaults `false` (below-band / not yet
+    /// warmed / kill-switch), so a fresh daemon and every baseline test start on the normal cadence.
+    near_limit_fast_poll: bool,
     /// The staggered poll schedule for the CURRENT cycle (issues #80, #366): the roster
     /// indices to poll, in order — the active account INTERLEAVED before each enabled,
     /// non-quarantined non-active peer (`[active, p1, active, p2, …]`, issue #366), so
@@ -1611,6 +1623,16 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// The ACTIVE account is exempt. See [`exhausted_poll_window`] and
     /// [`note_exhausted_poll`](Self::note_exhausted_poll).
     exhausted_poll_secs: u64,
+    /// The TIGHTENED poll sub-interval CAP, in seconds, for the ACTIVE account while its reading (or
+    /// the #539 projection) is in the near-limit band (issue #540, config `near_limit_poll_secs`):
+    /// the near-limit-scoped MIRROR of [`exhausted_poll_secs`](Self::exhausted_poll_secs) — that
+    /// WIDENS an exhausted peer, this TIGHTENS the active account on its final climb. Applied by
+    /// [`next_subinterval`](Self::next_subinterval) as `min(poll_secs / N, near_limit_poll_secs)`
+    /// ONLY while [`near_limit_fast_poll`](DecisionState::near_limit_fast_poll) is set, so with the
+    /// #366 active-interleave the active is re-observed within ~`2 ×` this near-limit; below the
+    /// band the sub-interval is the unchanged `poll_secs / N`. `0` disables the path — the
+    /// kill-switch, like [`session_velocity_horizon_secs`](Self::session_velocity_horizon_secs).
+    near_limit_poll_secs: u64,
     /// The #539 velocity-projection horizon `H` (ADR-0017), in seconds (config
     /// `session_velocity_horizon_secs`): [`Self::velocity_swap`] projects
     /// `observed + session_velocity[active].rate × H` and fires when it crosses the trigger. `0`
@@ -1795,6 +1817,10 @@ where
             // The widened exhausted-peer cadence ceiling (issue #537); the floor is `poll_secs`,
             // read from `poll_strategy.base` at use so no second raw copy of it is stored.
             exhausted_poll_secs: tunables.exhausted_poll_secs,
+            // The tightened near-limit active-poll sub-interval cap (issue #540), in seconds; `0`
+            // disables the path. Read as-is (a plain Duration cap in `next_subinterval`), not a
+            // fraction, so no conversion here.
+            near_limit_poll_secs: tunables.near_limit_poll_secs,
             // The velocity-projection horizon / guard / EMA weight (issue #539); the guard + weight
             // are stored as fractions (like `session_blind_risk_band` / the triggers), the horizon
             // as seconds so the projection multiplies the fraction/sec EMA rate by it directly.
@@ -2413,12 +2439,31 @@ where
             }
             self.state.signaled_active_dead_no_target = false;
         }
+        // Issue #540: refresh the near-limit poll-coverage verdict from the POST-decision state
+        // (`self.state.active` is the post-swap active — the same index the snapshot below reads),
+        // so `next_subinterval` tightens the wait against the CURRENT active's freshest reading. Its
+        // `false → true` transition is the band-entry edge — emit the durable `NearLimitPollCoverage`
+        // ONCE here (not every held near-limit tick), mirroring the edge-triggered `ExhaustedSlowPoll`
+        // (#537) / `UsageBackoff` (#399) idiom. The `true → false` band-exit clears the latch
+        // silently: the band ends either at a swap (which emits its own `Swap`) or at a below-band /
+        // blind reading, so no paired CLEARED event is needed to bracket the span.
+        let near_limit_engaged = self.near_limit_fast_poll_engaged();
+        if near_limit_engaged && !self.state.near_limit_fast_poll {
+            if let Some(active_idx) = self.state.active {
+                events.push(Event::NearLimitPollCoverage {
+                    account: self.roster[active_idx].account_uuid.clone(),
+                    sub_interval_secs: self.near_limit_poll_secs,
+                });
+            }
+        }
+        self.state.near_limit_fast_poll = near_limit_engaged;
         // The rate-limit / transient back-off is PER-ACCOUNT now (issue #293): it is
         // applied by skipping the throttled account's own poll above (`account_backing_off`
         // / `note_account_backoff`), NOT by widening the WHOLE loop's wait — so the active
         // account and every other account keep polling on their normal cadence. `next_wait`
-        // therefore stays `None` in the normal tick path; only the locked-keychain tick
-        // (#13, `locked_tick`) still returns a whole-loop wait.
+        // therefore stays `None` in the normal tick path (the near-limit tightening rides
+        // `next_subinterval` via the cached `near_limit_fast_poll` above, not a whole-loop wait);
+        // only the locked-keychain tick (#13, `locked_tick`) still returns a whole-loop wait.
         let next_wait: Option<Duration> = None;
         // The per-tick decision diagnostic (issue #77), with any back-off this tick
         // imposed — the decision class names what the loop did (swap / hold / skip /
@@ -5152,7 +5197,86 @@ where
     fn next_subinterval(&mut self) -> Duration {
         let interval = self.next_poll_interval();
         let len = self.rotation_len().max(1) as u32;
-        interval / len
+        let base = interval / len;
+        // Issue #540: while the active account is near its limit, cap the sub-interval to
+        // `near_limit_poll_secs` so the active — re-observed every ~2 sub-intervals by the #366
+        // interleave — is re-polled within ~2× that near-limit, closing the poll gap. A `min`, never
+        // a replacement: a roster whose base sub-interval is already tighter than the cap keeps its
+        // faster cadence, so the tightening only ever SHORTENS the wait. Below the band
+        // `near_limit_fast_poll` is clear and the base is returned unchanged — the steady-state
+        // cadence the source-scoped 429 footprint depends on stays flat. The cached bool can only be
+        // `true` when `near_limit_poll_secs != 0` (its sole writer,
+        // `near_limit_fast_poll_engaged`, gates on the kill-switch), so the cap is never `0`.
+        //
+        // This caps the SHARED per-tick spacing, so peer ticks in the #366 interleave tighten
+        // transiently WITH the active while it is in-band — a deliberate, accepted consequence, not
+        // a leak of the active-only TRIGGER (which keys off the active reading alone, never a peer's):
+        // capping only the active-position ticks would leave the active re-poll gap at `base + cap`
+        // (the wait after the interposed peer stays uncapped) and fail to close it, while a full
+        // active-priority takeover would deadlock #537's exhausted-peer observation. The peer
+        // transient is in-band-only (the steady-state above the band stays flat) and within the
+        // #538-validated envelope (active re-poll ≈ 2× cap, inside the ratified 60–150 s band).
+        if self.state.near_limit_fast_poll {
+            base.min(Duration::from_secs(self.near_limit_poll_secs))
+        } else {
+            base
+        }
+    }
+
+    /// Whether the ACTIVE account `active_idx` is in — or the #539 velocity projection places it
+    /// into — the near-limit band (issue #540): the trigger for the near-limit poll-coverage
+    /// fast-poll. Keyed off the SAME signals #539's [`velocity_swap`](Self::velocity_swap) uses (the
+    /// active's fresh reading plus its retained session-velocity EMA), so #540 keeps the very
+    /// reading + velocity #539 projects from warm through the final climb — the poll-gap
+    /// `velocity_swap` explicitly holds on (a velocity reset by a window drop). Requires a PRESENT
+    /// reading: a blind active (its slot cleared by a 429/5xx) carries no OBSERVED near-limit signal
+    /// and belongs to the #452 bounded-blindness path, not this one. Fires when EITHER the observed
+    /// reading is at/over the band floor
+    /// ([`session_velocity_min_project_above`](Self::session_velocity_min_project_above) — reused so
+    /// #540 and #539 share ONE band, no drift) OR, for a still-below-band reading, the sustained
+    /// projection `last + rate × H` reaches that floor within the horizon (the "approaching the
+    /// band" arm, so the fast-poll engages BEFORE a fast burst is even observed in-band). A pure
+    /// read of `self.state`; `active_idx` is a resolved roster index, so the slot always exists.
+    fn active_near_limit(&self, active_idx: usize) -> bool {
+        let Some(active_usage) = self.state.last_readings[active_idx] else {
+            return false;
+        };
+        let floor = self.session_velocity_min_project_above;
+        // In-band by the observed reading.
+        if active_usage.session >= floor {
+            return true;
+        }
+        // Approaching the band: the #539 projection reaches the floor within the horizon. Requires a
+        // SUSTAINED velocity EMA (≥ `MIN_VELOCITY_SAMPLES`), exactly as `velocity_swap` does — never
+        // a single-interval spike; a `0` horizon (the #539 kill-switch) collapses the projection to
+        // the observed reading, which is below the floor here, so it cannot reach.
+        let horizon = self.session_velocity_horizon_secs;
+        if horizon == 0 {
+            return false;
+        }
+        let Some(vel) = self.state.session_velocity[active_idx] else {
+            return false;
+        };
+        if vel.samples < MIN_VELOCITY_SAMPLES {
+            return false;
+        }
+        active_usage.session + vel.rate * horizon as f64 >= floor
+    }
+
+    /// Whether the near-limit poll-coverage fast-poll (issue #540) is engaged THIS tick: the path is
+    /// enabled (`near_limit_poll_secs != 0`, the kill-switch), the roster is warmed up (#80 — before
+    /// the first full cycle the carried readings are partial, and tightening the shared tick before
+    /// warm-up could starve peers of their first poll and stall the warm-up latch), an active
+    /// account is resolved, and it is [`active_near_limit`](Self::active_near_limit). The cached
+    /// verdict [`near_limit_fast_poll`](DecisionState::near_limit_fast_poll) is refreshed from this
+    /// every tick, so the wait path and the edge-triggered event read ONE consistent decision.
+    fn near_limit_fast_poll_engaged(&self) -> bool {
+        self.near_limit_poll_secs != 0
+            && self.state.warmed_up
+            && self
+                .state
+                .active
+                .is_some_and(|active_idx| self.active_near_limit(active_idx))
     }
 
     /// Sleep until the next single-account poll is due — a freshly drawn, jittered
@@ -6573,6 +6697,10 @@ mod tests {
             // tests never let a peer stay exhausted across ticks, so this is inert for them; the
             // slow-poll tests drive it explicitly.
             exhausted_poll_secs: 3600,
+            // The near-limit fast-poll (issue #540) is OFF by default here (the `0` kill-switch), so
+            // baseline daemon tests keep their exact `poll_secs/N` cadence and emit no
+            // `NearLimitPollCoverage` event; the #540 timing-seam tests set it explicitly to arm it.
+            near_limit_poll_secs: 0,
             cooldown_secs: cooldown,
             // Most daemon tests set an explicit floor; `tunables_floor_off` sets it
             // inert (== trigger) for the tests that pin the always-on gate instead.
@@ -10472,6 +10600,186 @@ mod tests {
             &tun,
         );
         assert_eq!(solo.next_subinterval(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn near_limit_fast_poll_engages_only_on_an_in_band_active_reading_or_projection() {
+        // Issue #540: the engage predicate for the near-limit poll-coverage fast-poll. It fires
+        // ONLY when the ACTIVE account's OBSERVED reading is in the #539 band (≥ the shared
+        // `session_velocity_min_project_above` floor, 0.85) OR the #539 velocity projection
+        // `last + rate × H` reaches that floor from a still-below reading — reusing the very signals
+        // #539 projects from, so #540 keeps them warm through the final climb (the poll-gap
+        // `velocity_swap` explicitly holds on). Every other arm holds it OFF, so the steady-state
+        // (below-band) cadence is never tightened (AC 3).
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.near_limit_poll_secs = 60; // enable the path (the `tunables` fixture ships it at 0)
+        daemon.session_velocity_horizon_secs = 150; // arm the #539 projection horizon
+        let usage = |session: f64| Usage {
+            session,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+
+        // In-band by the OBSERVED reading (0.90 ≥ 0.85): engaged, no projection needed.
+        assert!(
+            daemon.near_limit_fast_poll_engaged(),
+            "an in-band observed reading engages the fast-poll",
+        );
+
+        // Below the band with NO velocity signal (the poll-gap case #540 owns): NOT engaged.
+        daemon.state.last_readings[0] = Some(usage(0.80));
+        daemon.state.session_velocity[0] = None;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "below the band with no velocity → not engaged",
+        );
+
+        // Below the band, but a SUSTAINED projection reaches the floor (0.80 + 0.01 × 150 = 2.3 ≥
+        // 0.85): the "approaching the band" arm engages BEFORE the fast burst is observed in-band.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 3,
+        });
+        assert!(
+            daemon.near_limit_fast_poll_engaged(),
+            "a sustained projection into the band engages the fast-poll",
+        );
+
+        // A SHORT projection (0.80 + 0.0001 × 150 = 0.815 < 0.85) stays below the floor → NOT
+        // engaged; the reactive path catches it if it keeps climbing.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.0001,
+            samples: 3,
+        });
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "a projection that falls short of the floor → not engaged",
+        );
+
+        // A single-interval spike (samples < MIN_VELOCITY_SAMPLES) is not SUSTAINED → NOT engaged,
+        // exactly as #539's projection guards — never fire on a one-off spike.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 1,
+        });
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "a single-sample spike is not sustained → not engaged",
+        );
+
+        // The #539 horizon kill-switch (0) collapses the projection to the observed (below-band)
+        // reading → NOT engaged, even with a steep, well-sustained velocity.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        daemon.session_velocity_horizon_secs = 0;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "horizon 0 disables the projection arm → not engaged below-band",
+        );
+        daemon.session_velocity_horizon_secs = 150; // restore for the arms below
+
+        // A BLIND active (its slot cleared by a 429/5xx) carries no OBSERVED near-limit signal —
+        // that is the #452 bounded-blindness path, not #540's — so a None reading holds it OFF.
+        daemon.state.last_readings[0] = None;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "a blind active (None reading) → not engaged (#452's domain, not #540's)",
+        );
+
+        // Re-arm an in-band reading, then verify the three GATE guards each independently hold off.
+        daemon.state.last_readings[0] = Some(usage(0.90));
+        assert!(daemon.near_limit_fast_poll_engaged(), "re-armed in-band");
+
+        // Kill-switch: near_limit_poll_secs == 0 disables the whole path.
+        daemon.near_limit_poll_secs = 0;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "the near_limit_poll_secs kill-switch (0) disables the path",
+        );
+        daemon.near_limit_poll_secs = 60;
+
+        // Not warmed up: tightening the shared tick before the first full cycle could starve peers
+        // of their first poll and stall the warm-up latch (#80).
+        daemon.state.warmed_up = false;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "an un-warmed roster never engages (peers must complete their first poll)",
+        );
+        daemon.state.warmed_up = true;
+
+        // No active resolved: there is nothing to keep warm.
+        daemon.state.active = None;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "no active account → not engaged",
+        );
+    }
+
+    #[tokio::test]
+    async fn near_limit_fast_poll_caps_the_active_sub_interval_in_band_only() {
+        // Issue #540 (AC 2 + AC 3): the near-limit poll-coverage TIMING seam. While the active's
+        // reading is in the band, the per-tick sub-interval is capped to `near_limit_poll_secs`
+        // (60 s) — so the active, re-observed every ~2 sub-intervals by the #366 interleave, never
+        // opens a near-limit poll gap. BELOW the band the cap is inert and the sub-interval is the
+        // un-capped base, so the steady-state poll footprint the source-scoped 429 budget depends on
+        // stays flat.
+        //
+        // A `fixed(600 s)` interval over the 3-account rotation gives a base sub-interval of
+        // 600 / 3 = 200 s — deliberately ABOVE the 60 s cap so the cap actually BINDS (the small-N /
+        // high-poll_secs regime #540 targets, the ≥ 400–900 s poll-gap residual; where the base is
+        // already tighter than the cap the `min` leaves it untouched). The FakeClock is frozen, so
+        // the seam is exercised via a direct `next_subinterval()` call — no real clock, no network.
+
+        // --- BELOW the band: the cap is inert, the base cadence is unchanged, no edge event ---
+        let mut below = warmed_velocity_daemon(0.80).await; // active reading below the 0.85 floor
+        below.poll_strategy = Strategy::fixed(600.0);
+        below.near_limit_poll_secs = 60;
+        let out = below.tick().await;
+        assert!(
+            !below.state.near_limit_fast_poll,
+            "0.80 < 0.85 floor → the fast-poll stays disengaged",
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::NearLimitPollCoverage { .. })),
+            "no band-entry event below the band: {:?}",
+            out.events,
+        );
+        assert_eq!(
+            below.next_subinterval(),
+            Duration::from_secs(200),
+            "below the band the sub-interval is the un-capped base (600 / 3) — footprint flat",
+        );
+
+        // --- IN the band: the cap binds, the active re-polls within it, the edge event emits once
+        let mut inband = warmed_velocity_daemon(0.90).await; // active reading at/over the floor
+        inband.poll_strategy = Strategy::fixed(600.0);
+        inband.near_limit_poll_secs = 60;
+        let out = inband.tick().await;
+        assert!(
+            inband.state.near_limit_fast_poll,
+            "0.90 ≥ 0.85 floor → the fast-poll engages",
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                Event::NearLimitPollCoverage {
+                    sub_interval_secs: 60,
+                    ..
+                }
+            )),
+            "band entry emits the durable near_limit_poll_coverage event carrying the cap: {:?}",
+            out.events,
+        );
+        assert_eq!(
+            inband.next_subinterval(),
+            Duration::from_secs(60),
+            "in the band the sub-interval is capped to near_limit_poll_secs — no poll gap ≥ the cap",
+        );
     }
 
     #[tokio::test]
