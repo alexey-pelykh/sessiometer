@@ -851,6 +851,28 @@ pub(crate) enum Event {
     /// [`Event::UsageRollup`]'s no-op silence. `account` is the account UUID — never the operator
     /// `label` (#15), matching [`Event::UsageBackoff`].
     UsageBackoffCleared { account: String },
+    /// A NON-active peer entered the WIDENED, reset-aware slow-poll cadence (issue #537): a
+    /// successful poll read it out of rotation (weekly- or session-exhausted), so the daemon
+    /// arms a per-account `exhausted_poll_until` window and SKIPS its poll until the window
+    /// elapses — bounded by `exhausted_poll_secs` (the hourly ceiling) and pulled earlier by a
+    /// known `resets_at`. The `window_secs` is that armed window. Edge-triggered: emitted ONCE
+    /// on the normal→slow transition (NOT re-emitted on each re-arm while the peer stays
+    /// exhausted — it never LEFT the widened cadence in between), the entry partner of
+    /// [`Event::ExhaustedSlowPollCleared`]. The sibling idiom of [`Event::UsageBackoff`], but a
+    /// DISTINCT signal: this is a quota-exhaustion poll-cadence policy, not a 429/5xx rate-limit
+    /// back-off — overloading `usage_backoff` would fire spurious rate-limit events on an
+    /// HTTP-200 success (ADR-0009 / ADR-0019). `account` is the account UUID — a non-PII
+    /// identifier secret-free BY CONSTRUCTION, never the operator `label` (issue #15).
+    ExhaustedSlowPoll { account: String, window_secs: u64 },
+    /// A peer LEFT the widened slow-poll cadence (issue #537): a later poll read it viable
+    /// again (below both triggers) OR it was promoted to the active account (which is exempt
+    /// and polled at full cadence), so its `exhausted_poll_until` window is cleared and it
+    /// returns to the normal cadence. The edge-triggered EXIT partner of
+    /// [`Event::ExhaustedSlowPoll`]'s ENTER, so the slow-poll episode's SPAN is bracketed in
+    /// the durable log. Emitted ONLY when a window was actually armed — a plain viable poll
+    /// with no prior slow-poll stays silent, mirroring [`Event::UsageBackoffCleared`].
+    /// `account` is the account UUID — never the operator `label` (issue #15).
+    ExhaustedSlowPollCleared { account: String },
     /// The per-account usage VELOCITY between the last two readings (issue #399, normalized to
     /// %/min by issue #449): the SIGNED change in each rounded-percent dimension since the account's
     /// previous reading (`to_pct(next) - to_pct(prev)`), carried alongside the `elapsed_secs`
@@ -1296,6 +1318,20 @@ impl Event {
             }
             Event::UsageBackoffCleared { account } => {
                 format!("ts={ts} event=usage_backoff_cleared acct={account}")
+            }
+            Event::ExhaustedSlowPoll {
+                account,
+                window_secs,
+            } => {
+                // `acct=` carries the account UUID (never the free-form `label`, #15), matching
+                // the sibling `usage_backoff` line; `window_secs` is the armed slow-poll window
+                // (a bare duration, never a token). Redacted to uuid + window ONLY (issue #537).
+                format!(
+                    "ts={ts} event=exhausted_slow_poll acct={account} window_secs={window_secs}"
+                )
+            }
+            Event::ExhaustedSlowPollCleared { account } => {
+                format!("ts={ts} event=exhausted_slow_poll_cleared acct={account}")
             }
             Event::UsageVelocity {
                 account,
@@ -3196,6 +3232,41 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         }
         .to_log_line(at_epoch(0));
         assert_eq!(line, format!("{TS0} event=usage_backoff_cleared acct=u-A"));
+    }
+
+    #[test]
+    fn exhausted_slow_poll_line_carries_the_uuid_and_window() {
+        // The durable ENTER line (issue #537): the account UUID (not a label, #15) and the armed
+        // slow-poll window — redacted to uuid + window ONLY. No token/email surface exists.
+        let line = Event::ExhaustedSlowPoll {
+            account: "u-A".to_owned(),
+            window_secs: 3600,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=exhausted_slow_poll acct=u-A window_secs=3600")
+        );
+        // #15: no non-authored email, no token/bearer/api-key, and the identity is the UUID.
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no non-authored email may appear (#15): {line}"
+        );
+        assert!(!line.contains("token") && !line.contains("Bearer") && !line.contains("sk-ant"));
+    }
+
+    #[test]
+    fn exhausted_slow_poll_cleared_line_carries_the_uuid() {
+        // The edge-triggered EXIT partner (issue #537): just the account UUID — the slow-poll
+        // episode's span is bracketed by pairing this with the last ENTER line.
+        let line = Event::ExhaustedSlowPollCleared {
+            account: "u-A".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=exhausted_slow_poll_cleared acct=u-A")
+        );
     }
 
     #[test]

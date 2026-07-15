@@ -1303,6 +1303,25 @@ pub(crate) struct AccountHealth {
     /// first throttle; on the same monotonic clock as
     /// [`last_keep_warm_attempt`](Self::last_keep_warm_attempt).
     poll_backoff_until: Option<Instant>,
+    /// The monotonic-[`Clock`] instant before which this NON-active account's poll is SKIPPED
+    /// because it is OUT OF ROTATION — weekly- or session-exhausted (issue #537). Armed by a
+    /// SUCCESSFUL poll whose reading is out of rotation
+    /// ([`note_exhausted_poll`](Daemon::note_exhausted_poll)) to
+    /// `now + min(exhausted_poll_secs, max(soonest_applicable_resets_at - now, poll_secs))`,
+    /// and cleared when a later poll reads the account viable again OR when it becomes the
+    /// active account (which is exempt). While [`Daemon::tick`] sees `now < exhausted_poll_until`
+    /// (and the account is NOT active) it skips this account's poll — an exhausted peer's usage
+    /// number cannot change until its server-side window resets, so re-polling it every
+    /// `poll_secs` is a wasted request (see
+    /// [`exhausted_slow_polling`](Daemon::exhausted_slow_polling)).
+    ///
+    /// DELIBERATELY SEPARATE from [`poll_backoff_until`](Self::poll_backoff_until) (ADR-0019):
+    /// that back-off is armed by a 429/5xx and CLEARED on any success, but an exhausted account
+    /// is an HTTP-200 SUCCESS — the very poll that reads exhaustion would clear a shared window —
+    /// and it drives the 429 `UsageBackoff` events + streak, so overloading it would fire
+    /// spurious rate-limit signals. `None` until the first out-of-rotation reading; on the same
+    /// monotonic clock as `poll_backoff_until`.
+    exhausted_poll_until: Option<Instant>,
 }
 
 /// Per-loop decision state carried across polls.
@@ -1532,6 +1551,14 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// pre-blind anchor (`last_good`, #450) sat at/over this. Sibling of
     /// `session_blind_swap_secs`; likewise distinct from the SLI/status [`BLIND_GATE_RISK_BAND`].
     session_blind_risk_band: f64,
+    /// The widened re-poll cadence CEILING, in seconds, for an out-of-rotation (weekly- or
+    /// session-exhausted) NON-active peer (issue #537, config `exhausted_poll_secs`): the most
+    /// an exhausted peer's poll is deferred. A known `resets_at` sooner than this pulls the next
+    /// poll earlier; the FLOOR of the window is `poll_secs` (a slow-polled peer never re-polls
+    /// faster than the normal cadence), read from [`poll_strategy`](Self::poll_strategy)`.base`.
+    /// The ACTIVE account is exempt. See [`exhausted_poll_window`] and
+    /// [`note_exhausted_poll`](Self::note_exhausted_poll).
+    exhausted_poll_secs: u64,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
@@ -1692,6 +1719,9 @@ where
             target_max_session_usage: f64::from(tunables.target_max_session_usage) / 100.0,
             session_blind_swap_secs: tunables.session_blind_swap_secs,
             session_blind_risk_band: f64::from(tunables.session_blind_risk_band) / 100.0,
+            // The widened exhausted-peer cadence ceiling (issue #537); the floor is `poll_secs`,
+            // read from `poll_strategy.base` at use so no second raw copy of it is stored.
+            exhausted_poll_secs: tunables.exhausted_poll_secs,
             cooldown_strategy: tunables.cooldown_strategy,
             // The un-jittered cooldown window the socket `swap` command gates a manual
             // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
@@ -2064,7 +2094,16 @@ where
         // cursor already advanced in `next_poll_index`, so the slot is consumed and the
         // account is re-attempted once the window elapses. Transient (`5xx` / network) is
         // scoped the same way — see `note_account_backoff`.
-        if let Some(i) = poll_idx.filter(|&i| !self.account_backing_off(i)) {
+        //
+        // The SECOND skip predicate is the out-of-rotation slow-poll (issue #537): a NON-active
+        // peer read weekly- or session-exhausted is skipped until its `exhausted_poll_until`
+        // window elapses — its usage cannot change until its server-side window resets, so
+        // re-polling it every `poll_secs` wastes a request. Same skip mechanics as the back-off
+        // (slot consumed, `last_readings` carried, no usage request); the ACTIVE account is
+        // exempt inside `exhausted_slow_polling` so its swap-away trigger stays observable.
+        if let Some(i) = poll_idx
+            .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
+        {
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
@@ -2182,6 +2221,14 @@ where
             // `now` on a live reading, cleared on a failed poll — so the velocity interval above
             // spans only two real consecutive readings (never a gap).
             self.state.last_reading_at[i] = self.state.last_readings[i].as_ref().map(|_| now);
+            // Fold this poll into the account's out-of-rotation slow-poll window (issue #537):
+            // arm/refresh it on a NON-active peer read exhausted (skip its poll until its
+            // server-side window resets), or clear it when the account reads viable again / is
+            // the active account. Reads the reading just stored above; `now` is the shared
+            // monotonic instant (the window deadline), `wall_clock_now_secs()` the wall epoch
+            // (the `resets_at` delta). Off the swap-decision path — a pure widening of THIS
+            // account's own poll cadence, like the per-account back-off (`note_account_backoff`).
+            self.note_exhausted_poll(i, active, now, wall_clock_now_secs(), &mut events);
             // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
             // anchor, SEPARATE from `last_readings` (which the assignment above clears to
             // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
@@ -4853,6 +4900,26 @@ where
             .is_some_and(|until| self.clock.now() < until)
     }
 
+    /// Whether NON-active account `i` is being SLOW-POLLED because it is out of rotation —
+    /// weekly- or session-exhausted (issue #537): it has an armed `exhausted_poll_until`
+    /// window that has not yet elapsed on the monotonic [`Clock`]. While `true`,
+    /// [`tick`](Self::tick) SKIPS that account's poll this cycle — an exhausted peer's usage
+    /// number cannot change until its server-side window resets, so re-polling every
+    /// `poll_secs` wastes a request. The ACTIVE account is EXEMPT (`active != Some(i)`): its
+    /// swap-away trigger must stay observable at full cadence (the #453 active-vs-peer
+    /// asymmetry), so even a stale armed window on an account just promoted to active (via
+    /// `use`) never skips it — the belt-and-suspenders partner of
+    /// [`note_exhausted_poll`](Self::note_exhausted_poll) never arming the active account.
+    /// `false` once the window elapses, when the account reads viable again, or when it is the
+    /// active account. The quota-exhaustion sibling of
+    /// [`account_backing_off`](Self::account_backing_off)'s rate-limit skip (ADR-0019).
+    fn exhausted_slow_polling(&self, i: usize, active: Option<usize>) -> bool {
+        active != Some(i)
+            && self.state.health[i]
+                .exhausted_poll_until
+                .is_some_and(|until| self.clock.now() < until)
+    }
+
     /// Fold account `i`'s poll outcome into its OWN rate-limit / transient back-off (issue
     /// #293, the per-account revision of #76's endpoint-global model). A `429`
     /// (rate-limited) or a `5xx` / network transient advances the account's exponential
@@ -4975,6 +5042,84 @@ where
             wait: armed,
             retry_after: signal.retry_after,
         })
+    }
+
+    /// Fold account `i`'s poll into its out-of-rotation slow-poll window (issue #537), the
+    /// quota-exhaustion sibling of [`note_account_backoff`](Self::note_account_backoff)'s
+    /// rate-limit back-off. Reads the account's freshly-stored reading
+    /// ([`last_readings`](DecisionState::last_readings)`[i]`):
+    ///
+    /// - **NON-active peer, reading out of rotation** (`weekly >= weekly_trigger_base ||
+    ///   session >= session_trigger_base`): arm `exhausted_poll_until = now + <window>` (the
+    ///   reset-aware [`exhausted_poll_window`]) so the peer's poll is skipped until the window
+    ///   elapses. Edge-triggered ENTER — a durable [`Event::ExhaustedSlowPoll`] fires ONLY on
+    ///   the normal→slow transition; a re-arm while the peer stays exhausted is not a new entry
+    ///   (it never left the widened cadence), mirroring `note_account_backoff`'s
+    ///   `was_backing_off` idiom.
+    /// - **Viable again, OR the ACTIVE account** (exempt — full cadence): clear the window.
+    ///   Edge-triggered EXIT — a durable [`Event::ExhaustedSlowPollCleared`] fires ONLY when a
+    ///   window was actually armed, bracketing the episode; a plain viable poll stays silent.
+    ///
+    /// A FAILED poll (`last_readings[i]` is `None`) carries NO exhaustion signal, so the window
+    /// is left untouched — the peer keeps whatever window it had (exactly as a throttle carries
+    /// the prior reading). `now` is the tick's monotonic [`Clock`] instant (the armed window's
+    /// deadline); `now_secs` is the tick's wall-clock epoch (the `resets_at` delta) — both read
+    /// once per tick and passed in, keeping the arithmetic on the pure [`exhausted_poll_window`]
+    /// (the same read-at-tick-pass-into-a-pure-fn idiom as `keep_active_warm`'s `now_ms`).
+    fn note_exhausted_poll(
+        &mut self,
+        i: usize,
+        active: Option<usize>,
+        now: Instant,
+        now_secs: i64,
+        events: &mut Vec<Event>,
+    ) {
+        // A failed poll carries no exhaustion signal — leave any window as-is.
+        let Some(reading) = self.state.last_readings[i] else {
+            return;
+        };
+        // The ACTIVE account is EXEMPT (peers only): polled at full cadence, so by definition
+        // NOT in the widened cadence. Treat it as "viable" so any armed window (e.g. a peer just
+        // promoted to active via `use`) is cleared with the EXIT edge, and it is never armed.
+        // Otherwise, out of rotation = at/above EITHER base trigger (the same thresholds the
+        // snapshot's `weekly_exhausted` verdict and the swap gate key off).
+        let out_of_rotation = active != Some(i)
+            && (reading.weekly >= self.weekly_trigger_base
+                || reading.session >= self.session_trigger_base);
+        let account_uuid = self.roster[i].account_uuid.clone();
+        if out_of_rotation {
+            let window = exhausted_poll_window(
+                &reading,
+                self.weekly_trigger_base,
+                self.session_trigger_base,
+                now_secs,
+                self.exhausted_poll_secs,
+                // The floor is `poll_secs` — the un-jittered base of the poll strategy (the same
+                // value `config.tunables.poll_secs` seeds it with); a slow-polled peer must never
+                // re-poll faster than the normal cadence.
+                self.poll_strategy.base as u64,
+            );
+            let health = &mut self.state.health[i];
+            let was_slow_polling = health.exhausted_poll_until.is_some();
+            // `window <= exhausted_poll_secs <= 86400 s`, so this bounded add cannot overflow the
+            // monotonic instant (unlike `note_account_backoff`'s un-clamped active `Retry-After`).
+            health.exhausted_poll_until = Some(now + window);
+            if !was_slow_polling {
+                events.push(Event::ExhaustedSlowPoll {
+                    account: account_uuid,
+                    window_secs: window.as_secs(),
+                });
+            }
+        } else {
+            let health = &mut self.state.health[i];
+            let was_slow_polling = health.exhausted_poll_until.is_some();
+            health.exhausted_poll_until = None;
+            if was_slow_polling {
+                events.push(Event::ExhaustedSlowPollCleared {
+                    account: account_uuid,
+                });
+            }
+        }
     }
 
     /// Draw the jittered start-up delay (issue #76): a uniform `[0,
@@ -5114,6 +5259,64 @@ fn usage_velocity(prev: &Usage, next: &Usage) -> (i16, i16) {
     let session = i16::from(to_pct(next.session)) - i16::from(to_pct(prev.session));
     let weekly = i16::from(to_pct(next.weekly)) - i16::from(to_pct(prev.weekly));
     (session, weekly)
+}
+
+/// The widened slow-poll window for an out-of-rotation reading (issue #537): how long a
+/// weekly- or session-exhausted NON-active peer's poll is deferred.
+///
+/// `min(exhausted_poll_secs, max(soonest_applicable_resets_at - now, floor))`, where the
+/// "applicable" reset is the SOONEST `resets_at` among the dimensions that are actually
+/// exhausted (weekly's when weekly-exhausted, session's when session-exhausted; the sooner
+/// of the two when both are), and `floor` = `poll_secs`. When no applicable `resets_at` is
+/// known (absent / unparseable), it falls back to the full `exhausted_poll_secs` hourly
+/// ceiling. Rationale (issue #537): the hourly ceiling bounds worst-case blindness for the
+/// RARE server-side early reset; a known `resets_at` (which the daemon already retains) pulls
+/// the next poll EARLIER so a window that elapses sooner than an hour is caught promptly. The
+/// floor guards the degenerate `resets_at <= now` case (a server that is late resetting) from
+/// a busy re-poll every tick, and keeps a slow-polled peer from ever re-polling FASTER than a
+/// normal account's `poll_secs` cadence.
+///
+/// Pure — a function of the reading, the two base triggers, an explicit wall-clock `now_secs`
+/// (for the reset delta), and the two config bounds — so the arithmetic is unit-tested without
+/// a daemon or a real clock; the caller arms `exhausted_poll_until = monotonic_now + <this>`.
+/// With the validated `exhausted_poll_secs >= poll_secs` the result lands in
+/// `poll_secs..=exhausted_poll_secs` (both positive), so the caller's `Instant + Duration`
+/// cannot underflow.
+fn exhausted_poll_window(
+    reading: &Usage,
+    weekly_trigger: f64,
+    session_trigger: f64,
+    now_secs: i64,
+    exhausted_poll_secs: u64,
+    poll_secs: u64,
+) -> Duration {
+    // The soonest reset among the EXHAUSTED dimensions only — the window is keyed off a reset
+    // that actually gates this peer's return to rotation. A dimension below its trigger does
+    // not contribute its reset (it is not why the peer is out of rotation).
+    let mut soonest: Option<i64> = None;
+    let mut consider = |resets_at: Option<i64>| {
+        if let Some(at) = resets_at {
+            soonest = Some(soonest.map_or(at, |cur: i64| cur.min(at)));
+        }
+    };
+    if reading.weekly >= weekly_trigger {
+        consider(reading.weekly_resets_at);
+    }
+    if reading.session >= session_trigger {
+        consider(reading.session_resets_at);
+    }
+    let ceiling = exhausted_poll_secs as i64;
+    let floor = poll_secs as i64;
+    let secs = match soonest {
+        // Reset-aware: poll again by the known reset, but never sooner than the floor and
+        // never later than the hourly ceiling. A reset at/behind `now` collapses to the floor.
+        Some(resets_at) => (resets_at - now_secs).max(floor).min(ceiling),
+        // No applicable reset known → the plain hourly ceiling (issue #537 fallback).
+        None => ceiling,
+    };
+    // `secs` lands in `floor..=ceiling` (with the validated `poll_secs <= exhausted_poll_secs`);
+    // the `max(0)` is a belt-and-suspenders non-negativity guard for the cast.
+    Duration::from_secs(secs.max(0) as u64)
 }
 
 /// Pick the viable swap target whose weekly window resets SOONEST (issue #37):
@@ -5548,6 +5751,27 @@ mod tests {
                     weekly,
                     weekly_resets_at: Some(weekly_resets_at),
                     session_resets_at: None,
+                }),
+            );
+            self
+        }
+        /// Like [`ok`](Self::ok) but with a known SESSION `resets_at` (epoch seconds) —
+        /// the out-of-rotation slow-poll tests (issue #537) script a session-exhausted
+        /// peer's session-window reset through this.
+        fn ok_resets_session(
+            mut self,
+            uuid: &str,
+            session: f64,
+            weekly: f64,
+            session_resets_at: i64,
+        ) -> Self {
+            self.readings.insert(
+                uuid.to_owned(),
+                Scripted::Ok(Usage {
+                    session,
+                    weekly,
+                    weekly_resets_at: None,
+                    session_resets_at: Some(session_resets_at),
                 }),
             );
             self
@@ -6057,6 +6281,10 @@ mod tests {
         const WEEKLY_TRIGGER: u8 = 98;
         Tunables {
             poll_secs: 60,
+            // The out-of-rotation slow-poll cadence (issue #537), default 3600. Baseline daemon
+            // tests never let a peer stay exhausted across ticks, so this is inert for them; the
+            // slow-poll tests drive it explicitly.
+            exhausted_poll_secs: 3600,
             cooldown_secs: cooldown,
             // Most daemon tests set an explicit floor; `tunables_floor_off` sets it
             // inert (== trigger) for the tests that pin the always-on gate instead.
@@ -8930,6 +9158,379 @@ mod tests {
         );
     }
 
+    /// Whether the tick POLLED the account with operator `label` (a `Diagnostic::Poll` for it)
+    /// — the observable that a slow-poll / back-off window did NOT suppress its poll this tick.
+    fn peer_polled(outcome: &TickOutcome, label: &str) -> bool {
+        outcome
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::Poll { account, .. } if account == label))
+    }
+
+    // --- Out-of-rotation slow-poll cadence (issue #537) ---
+
+    #[test]
+    fn exhausted_poll_window_caps_at_the_hourly_ceiling_when_the_reset_is_far() {
+        // A weekly-exhausted reading whose weekly window resets 2 h out (> the 1 h ceiling):
+        // the window is the ceiling — the hourly cap bounds worst-case blindness for the rare
+        // early reset. (Base triggers: weekly 0.98, session 0.95.)
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 7_200),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(3600),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_pulls_earlier_to_a_known_soon_reset() {
+        // The known reset lands in 30 min (< the 1 h ceiling) → poll again AT the reset, earlier
+        // than the ceiling: a window that elapses sooner than an hour is caught promptly.
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 1_800),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(1_800),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_floors_at_poll_secs_when_the_reset_is_imminent_or_past() {
+        let now = 1_000_000;
+        // Reset 10 s away (< the 60 s floor) → floored to poll_secs, not a sub-cadence re-poll.
+        let imminent = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 10),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&imminent, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(60),
+        );
+        // Reset already PAST but the account still reads exhausted (rare server lateness) →
+        // floored to poll_secs, so a persistently-late reset never busy-polls every tick.
+        let past = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now - 500),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&past, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(60),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_falls_back_to_the_ceiling_when_the_reset_is_unknown() {
+        // No parseable reset for the exhausted dimension → the plain hourly ceiling (#537).
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(3600),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_keys_the_session_reset_when_only_session_is_exhausted() {
+        // session-exhausted (0.96 >= 0.95), weekly VIABLE (0.10 < 0.98): only session_resets_at
+        // is applicable — a weekly reset would NOT be why this peer is out of rotation, so a
+        // (here absent, but even if present) weekly reset does not key the window.
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.96,
+            weekly: 0.10,
+            weekly_resets_at: Some(now + 100), // must be IGNORED — weekly is not exhausted
+            session_resets_at: Some(now + 1_200),
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(1_200),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_uses_the_sooner_reset_when_both_dimensions_are_exhausted() {
+        // Both exhausted; the weekly window resets sooner (15 min) than the session (40 min) →
+        // the SOONER applicable reset governs, catching relief at the earliest opportunity.
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.96,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 900),
+            session_resets_at: Some(now + 2_400),
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(900),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_weekly_exhausted_peer_is_slow_polled_until_its_window_elapses() {
+        // AC: a NON-active peer polled weekly-exhausted is SKIPPED on subsequent ticks until the
+        // widened window elapses, rather than re-polled every poll_secs. The reset is far out, so
+        // the window is the hourly ceiling (3600).
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10) // active: viable → holds
+                .ok_resets("u-B", 0.10, 0.99, now + 999_999), // peer: weekly-exhausted, reset far
+        )
+        .await;
+        // The peer's first poll reads it exhausted → arms the window + emits the ENTER edge.
+        let armed = next_peer_tick(&mut daemon).await;
+        assert!(
+            armed.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, window_secs }
+                    if account == "u-B" && *window_secs == 3600
+            )),
+            "the first exhausted poll arms the hourly window + emits ENTER: {:?}",
+            armed.events,
+        );
+        // Now the peer is SKIPPED on its subsequent turns (no clock advance): a full two cycles'
+        // worth of ticks come and go without a `spare` poll.
+        for _ in 0..4 {
+            let tick = daemon.tick().await;
+            assert!(
+                !peer_polled(&tick, "spare"),
+                "an exhausted peer must be skipped inside its slow-poll window",
+            );
+        }
+        // Advancing past the window re-polls it on its next turn (next_peer_tick would panic if
+        // it stayed skipped).
+        daemon.clock.advance(Duration::from_secs(3600));
+        let repoll = next_peer_tick(&mut daemon).await;
+        assert!(
+            peer_polled(&repoll, "spare"),
+            "the window elapsed → re-polled"
+        );
+        // The re-poll still reads u-B weekly-exhausted, so it RE-ARMS the window — but the
+        // edge-triggered ENTER is NOT re-emitted: the account never left the widened cadence (the
+        // window field stayed `Some` across the elapse, so `was_slow_polling` holds). Only a
+        // clear→re-arm re-emits ENTER. Binds AC: the enter/exit events are edge-triggered (once
+        // per transition), mirroring `note_account_backoff`'s was-backing-off idiom.
+        assert!(
+            !repoll
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ExhaustedSlowPoll { .. })),
+            "a re-arm while still exhausted must NOT re-emit the ENTER edge: {:?}",
+            repoll.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_exhausted_peer_is_slow_polled_keyed_off_the_session_reset() {
+        // AC: a session-exhausted (session >= session_trigger) non-active peer is slow-polled the
+        // same way, keyed off its SESSION reset. Here the session resets ~10 min out, so the
+        // window is pulled EARLIER than the hourly ceiling.
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok_resets_session("u-B", 0.96, 0.10, now + 600), // session-exhausted, resets soon
+        )
+        .await;
+        let armed = next_peer_tick(&mut daemon).await;
+        assert!(
+            armed.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, window_secs }
+                    // pulled earlier than the 3600 ceiling, ≈ the 600 s reset delta (± wall drift)
+                    if account == "u-B" && (595..=600).contains(window_secs)
+            )),
+            "session-exhausted peer arms a reset-aware sub-ceiling window: {:?}",
+            armed.events,
+        );
+        // Skipped within the window.
+        for _ in 0..4 {
+            assert!(!peer_polled(&daemon.tick().await, "spare"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_peer_with_no_known_reset_falls_back_to_the_hourly_ceiling() {
+        // AC: an exhausted peer whose reset is unknown/unparseable falls back to the hourly
+        // default (exhausted_poll_secs) — the window is EXACTLY 3600, independent of the wall
+        // clock (the deterministic fallback, distinct from the reset-aware sub-ceiling above).
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.99), // weekly-exhausted, NO resets_at
+        )
+        .await;
+        let armed = next_peer_tick(&mut daemon).await;
+        assert!(
+            armed.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, window_secs }
+                    if account == "u-B" && *window_secs == 3600
+            )),
+            "unknown reset → the plain hourly fallback window: {:?}",
+            armed.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_polled_peer_that_reads_viable_again_clears_and_returns_to_full_cadence() {
+        // AC: a slow-polled peer that next polls viable clears its window (emitting the EXIT
+        // edge) and returns to the full cadence.
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) =
+            two_account_rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.10).ok_resets(
+                "u-B",
+                0.10,
+                0.99,
+                now + 999_999,
+            ))
+            .await;
+        // Arm the peer's slow-poll window.
+        next_peer_tick(&mut daemon).await;
+        // The peer's window resets (it is now viable). Advance past the window so it re-polls.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(3600));
+        let cleared = next_peer_tick(&mut daemon).await;
+        assert!(
+            cleared.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPollCleared { account } if account == "u-B"
+            )),
+            "the viable re-poll emits the EXIT edge, bracketing the episode: {:?}",
+            cleared.events,
+        );
+        // Back to full cadence: the peer polls again on its very next turn, no advance needed.
+        let full = next_peer_tick(&mut daemon).await;
+        assert!(
+            peer_polled(&full, "spare"),
+            "a cleared peer is back on the normal cadence",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_active_account_is_never_slow_polled_even_when_exhausted() {
+        // AC: the ACTIVE account is NEVER slow-polled, even weekly-exhausted — its swap-away
+        // trigger must stay observable at full cadence (the #453 active-vs-peer asymmetry).
+        // Single-account daemon: the active `work` reads weekly-exhausted with nowhere to swap,
+        // so it stays active and must keep polling every tick.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.99)).await;
+        for _ in 0..5 {
+            let tick = daemon.tick().await;
+            assert!(
+                tick_polled(&tick),
+                "the active account must be polled every tick, even exhausted",
+            );
+            assert!(
+                !tick
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::ExhaustedSlowPoll { .. })),
+                "the active account is exempt — it never arms a slow-poll window: {:?}",
+                tick.events,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_promoted_to_active_while_slow_polled_is_polled_at_full_cadence() {
+        // AC (issue #537): a peer armed for slow-polling while NON-active can then be promoted to
+        // active via `use`. Nothing on the promotion path clears its `exhausted_poll_until` (only a
+        // poll does), and the arm-site "never arm the active account" guarantee does not apply to a
+        // window armed legitimately while it WAS a peer — so `exhausted_slow_polling`'s
+        // `active != Some(i)` consult guard is what keeps the now-active account polling at full
+        // cadence despite the stale window (its swap-away trigger must stay observable, the #453
+        // asymmetry). Without the guard it would be SKIPPED until the window elapsed — active AND
+        // never re-polled. The sibling `the_active_account_is_never_slow_polled_even_when_exhausted`
+        // binds the ARM site; this binds the CONSULT site.
+        //
+        // Both accounts read weekly-exhausted so the promoted (still-exhausted) active has no viable
+        // target and simply HOLDS — isolating the exemption from a swap-away that would otherwise
+        // repoint active on the same tick (the all-exhausted-holds setup of the relief test).
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.99) // active: weekly-exhausted → holds (no viable target)
+                .ok_resets("u-B", 0.10, 0.99, now + 999_999), // peer: weekly-exhausted, reset far
+        )
+        .await;
+        // The peer's first poll (still NON-active) reads it exhausted → arms its slow-poll window.
+        next_peer_tick(&mut daemon).await;
+        assert!(
+            daemon.state.health[1].exhausted_poll_until.is_some(),
+            "the peer's slow-poll window is armed before promotion",
+        );
+        // Promote u-B to active — what `use u-B` effects (repoint active) — WITHOUT advancing the
+        // clock, so the window is still armed when the consult site runs on u-B's next slot.
+        daemon.state.active = Some(1);
+        // The now-active u-B polls at full cadence on its next slot: the consult-site exemption, not
+        // the still-armed window, decides. (next_peer_tick panics if it stays skipped.)
+        let promoted = next_peer_tick(&mut daemon).await;
+        assert!(
+            peer_polled(&promoted, "spare"),
+            "a peer promoted to active must poll at full cadence despite a stale armed window",
+        );
+        // That active poll cleared the stale window (active is treated viable) — no dangling
+        // deadline once it is back in rotation as the consumed account.
+        assert!(
+            daemon.state.health[1].exhausted_poll_until.is_none(),
+            "the active poll cleared the stale slow-poll window",
+        );
+    }
+
+    #[tokio::test]
+    async fn all_exhausted_relief_still_computes_from_a_slow_polled_peers_retained_reset() {
+        // AC: all-exhausted relief still computes correctly under slow-polling — it reads the
+        // peer's RETAINED reading (with its resets_at), which the slow-poll skip carries
+        // untouched (the same carry-readings mechanism as the back-off skip).
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.99) // active: weekly-exhausted (stays active — no viable target)
+                .ok_resets("u-B", 0.10, 0.99, now + 999_999), // peer: weekly-exhausted, known reset
+        )
+        .await;
+        // Warm up: poll both (A then B). B reads exhausted → armed for slow-poll.
+        next_peer_tick(&mut daemon).await;
+        // Tick to a B-SKIP tick and assert the all-exhausted decision still stands.
+        let mut saw_skipped_all_exhausted = false;
+        for _ in 0..4 {
+            let tick = daemon.tick().await;
+            if !peer_polled(&tick, "spare") {
+                assert_eq!(
+                    tick.action,
+                    TickAction::NoViableTarget,
+                    "all-exhausted relief must still compute while the peer is slow-polled",
+                );
+                saw_skipped_all_exhausted = true;
+            }
+        }
+        assert!(
+            saw_skipped_all_exhausted,
+            "the peer was skipped at least once"
+        );
+        // The peer's reading — with its weekly reset — is RETAINED across the skips, so the
+        // relief math (soonest_weekly_reset) still has the reset to key off.
+        let retained = daemon.state.last_readings[1].expect("peer reading retained across skips");
+        assert_eq!(retained.weekly_resets_at, Some(now + 999_999));
+    }
+
     #[tokio::test]
     async fn a_non_active_rate_limit_backs_off_only_that_account() {
         // AC (issue #293, replacing the former endpoint-global test): a `429` on a
@@ -9610,8 +10211,24 @@ mod tests {
         // all-exhausted, holds on B (soonest reset), and emits once (issue #80).
         let first = warmed_tick(&mut daemon).await;
         assert_eq!(first.action, TickAction::NoViableTarget);
+        // That last warm-up tick also polls a weekly-exhausted PEER, which arms its
+        // out-of-rotation slow-poll window and emits an ExhaustedSlowPoll (issue #537) — a
+        // concern orthogonal to this all-exhausted HOLD test, and whose window value is
+        // wall-clock-dependent (the fixture resets are fixed historical dates). Filter the
+        // slow-poll events out (they have their own tests) and pin the DECISION event exactly.
+        let decision_events: Vec<_> = first
+            .events
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e,
+                    Event::ExhaustedSlowPoll { .. } | Event::ExhaustedSlowPollCleared { .. }
+                )
+            })
+            .cloned()
+            .collect();
         assert_eq!(
-            first.events,
+            decision_events,
             vec![Event::AllExhausted {
                 hold: "spare".to_owned(),
                 cause: SwapReason::Weekly,
