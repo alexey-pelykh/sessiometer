@@ -350,6 +350,15 @@ final class StatusPanelFormatTests: XCTestCase {
         let dropped = StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 0)
         let staleBanner = StatusPanelFormat.banner(for: .stale, accountCount: 0)
         XCTAssertNotEqual(notRunning.title, dropped.title, "not-running must not read as the socket-dropped banner")
+
+        // #526: the warm-dwell transient banner is CALMER than the escalated drop — a self-resolving
+        // `.warning` "Reconnecting…", not the loud `.error` "Daemon not responding" the escalation shows.
+        // This is the panel-side of the same calm-"…"-then-loud-"!" split the glyph makes.
+        let reconnecting = StatusPanelFormat.banner(for: .reconnecting(reason: "EOF"), accountCount: 2)
+        XCTAssertEqual(reconnecting.kind, .warning, "reconnecting is a calm warning, never the disconnected error")
+        XCTAssertEqual(reconnecting.title, "Reconnecting…")
+        XCTAssertNotEqual(reconnecting.kind, dropped.kind, "the transient must not read as loud as the escalation")
+        XCTAssertNotEqual(reconnecting.title, dropped.title, "reconnecting must not read as the escalated drop")
         XCTAssertNotEqual(starting.title, dropped.title, "starting must not read as the socket-dropped banner")
         XCTAssertNotEqual(starting.title, staleBanner.title, "starting must not read as the stale banner")
         XCTAssertNotEqual(notRunning.title, staleBanner.title, "not-running must not read as the stale banner")
@@ -728,6 +737,12 @@ final class StatusPanelFormatTests: XCTestCase {
             StatusPanelFormat.headerSubtitle(state: .disconnected(reason: "EOF"), accountCount: 3,
                                              activeLabel: "work", ageStale: false),
             "3 accounts · last-known")
+        // #526: a warm drop still WITHIN the dwell shows the SAME retained roster header as the escalation —
+        // the dimmed last-known roster, never a false "active".
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .reconnecting(reason: "EOF"), accountCount: 3,
+                                             activeLabel: "work", ageStale: false),
+            "3 accounts · last-known")
         // Absent / transitional states speak their status, not a roster count.
         XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .connecting, accountCount: 0,
                                                         activeLabel: nil, ageStale: false),
@@ -932,6 +947,7 @@ final class StatusPanelFormatTests: XCTestCase {
     private static let allNonConnectedStates: [ConnectionState] = [
         .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported, .crashLooping,
         .starting, .notRunning,   // #499
+        .reconnecting(reason: "EOF"),   // #526: the transient warm drop must never read healthy either
     ]
 
     /// A DEAD account that is mid-recovery (#109) — the current daemon's `snapshotAwaitingDead` golden

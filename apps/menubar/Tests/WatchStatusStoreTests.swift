@@ -57,17 +57,38 @@ final class WatchStatusStoreTests: XCTestCase {
         continuation.finish()
     }
 
-    // MARK: - AC: `.disconnected` → last-good stale, never live
+    // MARK: - AC (#526): a warm drop reconnects within the dwell, then escalates — never live
 
-    func testDisconnectFlipsToDisconnectedNeverHealthy() async throws {
-        let (store, continuation, recorder) = makeStoreUnderTest()
+    // The store-level proof of the warm-drop split: a WARM drop (a live socket dropped) is shown as the
+    // transient `.reconnecting` (the calm "…") first, then the injected warm-dwell window elapses still
+    // dropped and the store escalates ITSELF to the durable `.disconnected` (the loud "!") — neither ever
+    // healthy, last-good rows retained throughout. The dwell is the "clock" the test advances (real
+    // `Task.sleep`), mirroring the #499 start-grace test. Before #526 this stream flashed straight to the
+    // Attention glyph on the drop.
+    func testWarmDropReconnectsWithinDwellThenEscalatesNeverHealthy() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(warmDwellWindow: .milliseconds(200))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
         continuation.yield(.connected)
         continuation.yield(.line(Fixtures.snapshotBasic))
         try await waitForGlyph(recorder, .healthy)
 
+        // The socket drops on a live connection → the transient reconnecting glance first. #526:
+        // `.reconnecting` shares the `.connecting` "…" glyph with the initial state, so a glyph barrier
+        // would race the initial glance; wait on the precise connection axis (as the #499 test does).
         continuation.yield(.disconnected(reason: "connection closed (EOF)"))
-        try await waitForGlyph(recorder, .attention)   // #524: a warm drop collapses to the attention glyph
+        try await waitForConnectionState(store, .reconnecting(reason: "connection closed (EOF)"))
+        XCTAssertEqual(store.currentPresentation.glyph, .connecting,
+                       "#526: a warm drop reads the calm reconnecting '…' within the dwell")
+        XCTAssertFalse(store.connectionState.isHealthy)
+        XCTAssertEqual(store.rows.count, 1, "last-good rows retained through the reconnecting dwell")
 
+        // …then the warm dwell elapses still dropped → the store escalates itself to the durable
+        // disconnected / Attention state — still last-good, still never healthy.
+        try await waitForGlyph(recorder, .attention)
         XCTAssertEqual(store.connectionState, .disconnected(reason: "connection closed (EOF)"))
         XCTAssertFalse(store.connectionState.isHealthy)
         XCTAssertEqual(store.rows.count, 1, "last-good rows retained for a dimmed render")
@@ -198,7 +219,10 @@ final class WatchStatusStoreTests: XCTestCase {
 
         // Drop, then reconnect + a fresh snapshot: the debounce holds it (never an immediate flash).
         continuation.yield(.disconnected(reason: "EOF"))
-        try await waitForGlyph(recorder, .attention)   // #524: a warm drop collapses to the attention glyph
+        // #526: a warm drop now reads the transient `.reconnecting` first (not the Attention glyph); the
+        // reconnect below supersedes the dwell well within the default window. Wait on the connection axis
+        // (reconnecting shares the "…" glyph) to confirm the drop registered before reconnecting.
+        try await waitForConnectionState(store, .reconnecting(reason: "EOF"))
         let armed = ContinuousClock.now
         continuation.yield(.connected)
         continuation.yield(.line(Fixtures.snapshotBasic))
@@ -275,6 +299,59 @@ final class WatchStatusStoreTests: XCTestCase {
         XCTAssertGreaterThan(grace, .zero, "the grace must be positive — starting is a real transient window")
         XCTAssertLessThanOrEqual(grace, .seconds(10),
                                  "a 'short' grace — a truly-absent daemon must reach not-running promptly")
+    }
+
+    // MARK: - AC (#526): the warm dwell SUSPENDS across system sleep (the blocking falsifier)
+
+    // THE blocking sleep/wake falsifier, end-to-end through the store's REAL dwell timer: a warm drop arms
+    // the dwell, then the system sleeps. The dwell must SUSPEND — so even after several windows' worth of
+    // real wall-clock the drop has NOT escalated to Attention (a lid closed overnight is a long, benign
+    // disconnect; running the dwell through sleep would open the app on a FALSE '!' every morning). On wake
+    // the dwell resumes FRESH, so a genuinely-dead daemon still escalates one dwell after wake. Drives the
+    // store's `systemWillSleep` / `systemDidWake` directly (hermetic — no real sleep/wake); only the two
+    // `NSWorkspace` observers in `main.swift` are the operator's on-device verification step.
+    func testSleepSuspendsTheWarmDwellSoNoFalseEscalationThenWakeResumesIt() async throws {
+        let (events, continuation) = AsyncStream<TransportEvent>.makeStream()
+        let store = WatchStatusStore(warmDwellWindow: .milliseconds(200))
+        let recorder = StreamRecorder<PresentationState>()
+        recorder.consume(store.presentations)
+        store.start(consuming: events)
+
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotBasic))
+        try await waitForGlyph(recorder, .healthy)
+
+        // A warm drop arms the dwell…
+        continuation.yield(.disconnected(reason: "EOF"))
+        try await waitForConnectionState(store, .reconnecting(reason: "EOF"))
+
+        // …then the system sleeps: the dwell must suspend, so after 5× the window of real wall-clock the
+        // drop is STILL the calm reconnecting "…", never escalated. This is the crux — a benign overnight
+        // lid-close must not open on a false Attention.
+        store.systemWillSleep()
+        try await Task.sleep(for: .milliseconds(200 * 5))
+        XCTAssertEqual(store.connectionState, .reconnecting(reason: "EOF"),
+                       "the dwell is suspended across sleep — no escalation while asleep")
+        XCTAssertEqual(store.currentPresentation.glyph, .connecting, "still the calm reconnecting '…'")
+
+        // On wake the dwell resumes FRESH; a genuinely-dead daemon now escalates after one post-wake window.
+        store.systemDidWake()
+        try await waitForGlyph(recorder, .attention)
+        XCTAssertEqual(store.connectionState, .disconnected(reason: "EOF"),
+                       "a truly-dead daemon still escalates — one dwell after wake")
+
+        continuation.finish()
+    }
+
+    // The default warm dwell is a bounded window: positive (a warm drop gets a real settling grace so a
+    // routine restart / wake blip stays calm) and no longer than a small number of seconds (a genuinely-dead
+    // daemon must escalate to the actionable Attention promptly). Pins the "bounded dwell" intent so a future
+    // edit can't quietly stretch it into a state that never escalates.
+    func testDefaultWarmDwellIsAShortBoundedWindow() {
+        let dwell = WatchStatusStore.defaultWarmDwellWindow
+        XCTAssertGreaterThan(dwell, .zero, "the dwell must be positive — a warm drop gets a real settling grace")
+        XCTAssertLessThanOrEqual(dwell, .seconds(15),
+                                 "a bounded dwell — a genuinely-dead daemon must escalate to Attention promptly")
     }
 
     // MARK: - Event-stream awaiting helpers (mirror of the transport suite's)

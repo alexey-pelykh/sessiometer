@@ -159,6 +159,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appLog.error("watch transport unavailable: \(String(describing: error), privacy: .public)")
             store.start(consuming: Self.disconnectedStream(reason: Self.reason(for: error)))
         }
+
+        // Sleep/wake gating of the warm-dwell escalation (issue #526): suspend the store's warm-dwell timer
+        // across system sleep so a benign overnight lid-close — a long disconnect that resolves in ~1 s on
+        // wake — never escalates a warm drop to Attention while asleep (the app would otherwise open on a
+        // FALSE "!" at its most-seen moment every morning). `willSleep` suspends the dwell; `didWake` resets
+        // it to a fresh window. These arrive on `NSWorkspace.shared.notificationCenter` (NOT the default
+        // center) on the main thread; the store's `systemWillSleep` / `systemDidWake` are `@MainActor`, so
+        // hop via `Task { @MainActor in }` (macOS 13 floor rules out `MainActor.assumeIsolated`, 14+). The
+        // store methods are unit-tested directly with synthetic sleep/wake; only THIS OS wiring is the
+        // on-device falsifier the issue asks the operator to verify post-merge.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        _ = workspaceCenter.addObserver(forName: NSWorkspace.willSleepNotification,
+                                        object: nil, queue: .main) { [weak store] _ in
+            Task { @MainActor in store?.systemWillSleep() }
+        }
+        _ = workspaceCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                        object: nil, queue: .main) { [weak store] _ in
+            Task { @MainActor in store?.systemDidWake() }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

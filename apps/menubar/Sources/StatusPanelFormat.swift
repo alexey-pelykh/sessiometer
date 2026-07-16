@@ -663,6 +663,17 @@ enum StatusPanelFormat {
             return Banner(title: "Data may be stale",
                           detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .warning)
+        case .reconnecting:
+            // The warm-dwell transient banner (#526): a routine drop still WITHIN the dwell — calmer than the
+            // escalated `.disconnected` (`.warning`, not `.error`) with self-resolving copy, so the panel matches
+            // the calm "…" glance the glyph shows during the dwell. Retains the last-known reading's age, like
+            // `.disconnected` / `.stale`, so the dimmed roster is honestly dated. The title already carries the
+            // "reconnecting" fact, so the detail complements it with the reading's provenance rather than
+            // echoing it (the sibling banners split title/detail the same way).
+            let base = "Showing last-known"
+            return Banner(title: "Reconnecting…",
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
+                          kind: .warning)
         case .disconnected:
             let base = "Reconnecting; showing last-known"
             return Banner(title: "Daemon not responding",
@@ -903,7 +914,7 @@ enum StatusPanelFormat {
         case .emptyRoster:  return "Welcome"
         case .unsupported:  return "Version mismatch"
         case .crashLooping: return "Daemon fault"
-        case .disconnected: return "\(count) · last-known"
+        case .disconnected, .reconnecting: return "\(count) · last-known"   // #526: both warm drops show the retained roster
         case .connected, .stale:
             let base = activeLabel.map { "\(count) · \($0) active" } ?? count
             let isStale: Bool = { if case .stale = state { return true } else { return ageStale } }()

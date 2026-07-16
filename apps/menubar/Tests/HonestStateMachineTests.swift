@@ -154,11 +154,18 @@ final class HonestStateMachineTests: XCTestCase {
     // dropped or gone-quiet socket the actionable problem is the SOCKET (`.attention`), so a stale vault
     // bit must never shout ⊘ off data we can no longer vouch for (mirrors the `noViableTarget` gate).
     func testRetainedVaultFaultUnderDropOrStaleDoesNotReachNoRunway() {
-        let lockedThenDropped = machine([.connected, .line(Fixtures.snapshotKeychainLocked),
+        var lockedThenDropped = machine([.connected, .line(Fixtures.snapshotKeychainLocked),
                                          .disconnected(reason: "EOF")])
         XCTAssertTrue(lockedThenDropped.keychainLocked, "the lock bit is retained across the drop")
+        // #526: a fresh warm drop rides `.reconnecting` (the calm "…") within the dwell — the retained lock
+        // must NOT shout ⊘ there either (the vouched-only gate holds across the transient AND the escalation).
+        XCTAssertEqual(lockedThenDropped.presentation.glyph, .connecting,
+                       "a retained lock under a just-dropped (reconnecting) socket is not ⊘")
+        XCTAssertNotEqual(lockedThenDropped.presentation.glyph, .noRunway)
+        // Past the dwell it escalates to `.disconnected` — the socket fault (!), still never the vault ⊘.
+        lockedThenDropped.dwellElapsed(generation: lockedThenDropped.dwellGeneration)
         XCTAssertEqual(lockedThenDropped.presentation.glyph, .attention,
-                       "a retained lock under a dropped socket shows the socket fault (!), not ⊘")
+                       "a retained lock under an escalated dropped socket shows the socket fault (!), not ⊘")
 
         let scrubThenStale = machine([.connected, .line(Fixtures.snapshotCanonicalScrubExhausted), .stale])
         XCTAssertEqual(scrubThenStale.canonicalScrub, .exhausted, "the scrub bit is retained into stale")
@@ -208,19 +215,32 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertTrue(m.rows.isEmpty)
     }
 
-    // MARK: - AC: `.disconnected` → last-good marked stale, NEVER shown as live
+    // MARK: - AC (#526): a WARM drop rides `.reconnecting` within the dwell, then escalates to `.disconnected`
 
-    func testDisconnectMarksLastGoodStaleNeverLive() {
-        let m = machine([.connected, .line(Fixtures.snapshotBasic),
+    // The core #526 transition: a single warm drop is the transient `.reconnecting` (the calm "…") within the
+    // dwell, then escalates to the durable `.disconnected` (the loud "!") once the dwell elapses still dropped.
+    // Last-good is RETAINED and NEVER shown as live throughout both phases.
+    func testWarmDropReconnectsWithinDwellThenEscalatesNeverLive() {
+        var m = machine([.connected, .line(Fixtures.snapshotBasic),
                          .disconnected(reason: "connection closed (EOF)")])
-        XCTAssertEqual(m.connectionState, .disconnected(reason: "connection closed (EOF)"))
-        // #524: a warm drop that may never recover cannot self-resolve, so it is not the "…" connecting
-        // glyph — it collapses to attention (loud, not a silently-reassuring "hold on"). See issue #526.
-        XCTAssertEqual(m.presentation.glyph, .attention)
-        XCTAssertFalse(m.connectionState.isHealthy, "a dropped daemon is never healthy")
-        // Last-good roster is RETAINED (not blanked) — the panel dims it; the STATE says not-live.
+        // Within the warm dwell: the transient `.reconnecting` — self-resolving, so a routine restart / wake
+        // blip rides the calm "…" rather than flashing the loud "!".
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "connection closed (EOF)"))
+        XCTAssertEqual(m.presentation.glyph, .connecting, "#526: a fresh warm drop is reconnecting (…), not attention")
+        XCTAssertFalse(m.connectionState.isHealthy, "a dropped daemon is never healthy, even while reconnecting")
+        XCTAssertTrue(m.isAwaitingWarmDwell, "the dwell is armed on the first warm drop")
+        // Last-good roster is RETAINED (not blanked) across the drop — the panel dims it; the STATE says not-live.
         XCTAssertEqual(m.rows.count, 1, "last-good rows retained for a dimmed render")
         XCTAssertEqual(m.generatedAt, 42, "last-known freshness retained so the panel can show age")
+
+        // The dwell elapses still dropped → escalate to the durable `.disconnected` (the loud "!"), reserving
+        // Attention for a genuinely-dead daemon. The drop reason is carried forward; last-good stays retained.
+        m.dwellElapsed(generation: m.dwellGeneration)
+        XCTAssertEqual(m.connectionState, .disconnected(reason: "connection closed (EOF)"))
+        XCTAssertEqual(m.presentation.glyph, .attention, "#526: past the dwell, a warm drop is the durable attention (!)")
+        XCTAssertFalse(m.connectionState.isHealthy)
+        XCTAssertFalse(m.isAwaitingWarmDwell, "the dwell is consumed by the escalation")
+        XCTAssertEqual(m.rows.count, 1, "last-good rows still retained after escalation")
     }
 
     // MARK: - AC: `.stale` → stale
@@ -277,7 +297,7 @@ final class HonestStateMachineTests: XCTestCase {
             ("unsupported major snapshot", [.connected, .line(Fixtures.snapshotUnsupportedMajor)]),
             ("stale after a healthy snapshot",
              [.connected, .line(Fixtures.snapshotBasic), .stale]),
-            ("disconnected after a healthy snapshot",
+            ("warm drop after a healthy snapshot (reconnecting, within the dwell — #526)",
              [.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: "EOF")]),
             ("bare reconnect after a healthy snapshot (no fresh snapshot yet)",
              [.connected, .line(Fixtures.snapshotBasic),
@@ -520,15 +540,21 @@ final class HonestStateMachineTests: XCTestCase {
         m.watchdogElapsed(generation: 0)                   // an old token → ignored
         XCTAssertEqual(m.connectionState, .connected)
 
-        // After a disconnect the connection is not live → an elapse cannot resurrect a `.stale`.
+        // After a drop the connection is not live → an elapse cannot resurrect a `.stale`. #526: a warm
+        // drop lands in `.reconnecting` first, then escalates to `.disconnected`; the watchdog's
+        // `liveness == .live` guard covers BOTH non-live warm states, so neither can be tripped to stale.
         var n = HonestStateMachine()
         _ = n.apply(.connected)
         _ = n.apply(.line(Fixtures.snapshotBasic))
         let tokenBeforeDrop = n.watchdogGeneration
         _ = n.apply(.disconnected(reason: "EOF"))
         n.watchdogElapsed(generation: tokenBeforeDrop)     // token superseded by the drop anyway
+        XCTAssertEqual(n.connectionState, .reconnecting(reason: "EOF"),
+                       "a watchdog elapse over a warm drop stays reconnecting — never stale")
+        n.dwellElapsed(generation: n.dwellGeneration)      // escalate the warm drop to the durable disconnected
+        n.watchdogElapsed(generation: n.watchdogGeneration)  // even the CURRENT token is blocked by live-only
         if case .disconnected = n.connectionState {} else {
-            XCTFail("an elapse after disconnect must stay disconnected, got \(n.connectionState)")
+            XCTFail("an elapse over the escalated drop must stay disconnected, got \(n.connectionState)")
         }
 
         // Idempotent: once stale, a repeat elapse of the same token stays stale (no double-fire).
@@ -571,9 +597,14 @@ final class HonestStateMachineTests: XCTestCase {
                        "Sessiometer: connected — no accounts configured")
         XCTAssertEqual(machine([.line(Fixtures.snapshotBasic), .stale]).presentation.accessibilityLabel,
                        "Sessiometer: data may be stale — the daemon has gone quiet")
-        // A WARM drop — a live connection was HELD (the snapshot) then lost — is the socket-dropped state
-        // (#499: `hasEverConnected` discriminates this from a cold connect-refused).
+        // A WARM drop — a live connection was HELD (the snapshot) then lost — rides the transient
+        // `.reconnecting` within the warm dwell (#526; #499's `hasEverConnected` discriminates this from a
+        // cold connect-refused's `.starting`).
         XCTAssertEqual(machine([.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: "EOF")]).presentation.accessibilityLabel,
+                       "Sessiometer: reconnecting to the daemon…")
+        // …and the escalated durable disconnected label (built directly; the dwell-driven escalation itself is
+        // exercised in the dedicated #526 transition tests below).
+        XCTAssertEqual(PresentationState.make(for: .disconnected(reason: "EOF"), accountCount: 1).accessibilityLabel,
                        "Sessiometer: disconnected — the daemon is not responding")
         XCTAssertEqual(machine([.line(Fixtures.snapshotUnsupportedMajor)]).presentation.accessibilityLabel,
                        "Sessiometer: daemon version unsupported — update required")
@@ -754,24 +785,39 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertFalse(m.isAwaitingStartGrace, "not-running is durable — the grace is done")
     }
 
-    // The SAME `.disconnected` transport event means DIFFERENT states by lineage (#499): a WARM drop (a
-    // live connection was held, then lost) is the socket-dropped state; a COLD refusal (never connected) is
-    // the starting state. They must NOT collapse to one presentation (the pre-#499 bug).
-    func testWarmDropIsSocketDroppedNotStartingOrNotRunning() {
+    // The SAME `.disconnected` transport event means DIFFERENT states by lineage (#499, refined by #526): a
+    // WARM drop (a live connection held, then lost) rides the socket-dropped `.reconnecting` → `.disconnected`
+    // track; a COLD refusal (never connected) rides the daemon-absent `.starting` → `.notRunning` track. Within
+    // their windows BOTH transients share the calm `.connecting` glyph (both self-resolving — the #524 collapse),
+    // so the lineage discrimination now lives in the STATE + the a11y label, not the glyph.
+    func testWarmDropAndColdRefusalRideDistinctTracksNotOneState() {
         let warm = machine([.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: "EOF")])
-        XCTAssertEqual(warm.connectionState, .disconnected(reason: "EOF"))
-        // #524: a warm drop (may never recover) is not self-resolving → attention.
-        XCTAssertEqual(warm.presentation.glyph, .attention)
+        XCTAssertEqual(warm.connectionState, .reconnecting(reason: "EOF"), "#526: a warm drop is the transient reconnecting")
+        XCTAssertEqual(warm.presentation.glyph, .connecting, "within the dwell, a warm drop is self-resolving (…)")
 
         let cold = machine([.disconnected(reason: "connect refused")])
-        XCTAssertEqual(cold.connectionState, .starting)
-        // #524: a cold refusal within the grace is bounded self-resolution → connecting.
-        XCTAssertEqual(cold.presentation.glyph, .connecting)
+        XCTAssertEqual(cold.connectionState, .starting, "#499: a cold refusal is the transient starting")
+        XCTAssertEqual(cold.presentation.glyph, .connecting, "within the grace, a cold refusal is self-resolving (…)")
 
+        // They share the calm glyph but must NOT collapse to the same STATE (the #499 lineage split), and their
+        // spoken labels stay distinct so VoiceOver disambiguates the track.
         XCTAssertNotEqual(warm.connectionState, cold.connectionState,
-                          "a warm drop and a cold refusal must NOT collapse to the same state (#499)")
-        XCTAssertNotEqual(warm.presentation.glyph, cold.presentation.glyph,
-                          "#524: attention (durable, act) vs connecting (transient, wait) stay distinct glyphs")
+                          "a warm drop and a cold refusal must NOT collapse to the same state (#499/#526)")
+        XCTAssertNotEqual(warm.presentation.accessibilityLabel, cold.presentation.accessibilityLabel,
+                          "reconnecting vs starting stay distinct in the spoken label")
+
+        // Escalated, the tracks stay distinct STATES too — warm → `.disconnected`, cold → `.notRunning` — both
+        // the loud attention glyph (the #524 collapse bucket), still distinct in the spoken label.
+        var warmEsc = warm; warmEsc.dwellElapsed(generation: warmEsc.dwellGeneration)
+        var coldEsc = cold; coldEsc.graceElapsed(generation: coldEsc.graceGeneration)
+        XCTAssertEqual(warmEsc.connectionState, .disconnected(reason: "EOF"))
+        XCTAssertEqual(coldEsc.connectionState, .notRunning)
+        XCTAssertEqual(warmEsc.presentation.glyph, .attention)
+        XCTAssertEqual(coldEsc.presentation.glyph, .attention)
+        XCTAssertNotEqual(warmEsc.connectionState, coldEsc.connectionState,
+                          "escalated, the two tracks stay distinct states")
+        XCTAssertNotEqual(warmEsc.presentation.accessibilityLabel, coldEsc.presentation.accessibilityLabel,
+                          "not-running vs disconnected stay distinct in the spoken label")
     }
 
     // The backoff loop retries and is refused again several times: the state stays `.starting` and the grace
@@ -875,19 +921,21 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertFalse(ConnectionState.notRunning.isHealthy)
     }
 
-    // MARK: - AC (#524): the 9 connection inputs project onto the 4-state attention axis
+    // MARK: - AC (#524 + #526): the 10 connection inputs project onto the 4-state attention axis
 
     // The core #524 decision, locked as one exhaustive table: every `ConnectionState` → its ratified
-    // glyph. This is the single source of truth for the 9→4 mapping the bespoke artwork (#437) draws for
-    // and the parity harness (#525) baselines. `accountCount: 1` so `.connected` clears the ≥1 gate.
+    // glyph. This is the single source of truth for the 10→4 mapping the bespoke artwork (#437) draws for
+    // and the parity harness (#525) baselines (#526 added `.reconnecting`). `accountCount: 1` so `.connected`
+    // clears the ≥1 gate.
     func testEveryConnectionStateProjectsOntoTheRatifiedAttentionGlyph() {
         let expected: [(state: ConnectionState, glyph: StatusGlyph, note: String)] = [
             (.connected,                    .healthy,    "alive ∧ fresh ∧ ≥1 account, no exhaustion → the sole healthy path"),
             (.connecting,                   .connecting, "pre-verdict, self-resolving → honest unknown"),
             (.starting,                     .connecting, "bounded self-resolution (grace escalates) → honest unknown"),
+            (.reconnecting(reason: "EOF"),  .connecting, "#526: warm drop within the dwell, bounded self-resolution → honest unknown"),
             (.emptyRoster,                  .attention,  "alive but doing nothing; needs an account → attention (not vacuous-healthy)"),
             (.stale,                        .attention,  "post-liveness-window verdict, not a wait → attention"),
-            (.disconnected(reason: "EOF"),  .attention,  "warm drop that may never recover → attention (loud, not silent '…')"),
+            (.disconnected(reason: "EOF"),  .attention,  "#526: warm drop escalated past the dwell → attention (loud, not silent '…')"),
             (.notRunning,                   .attention,  "durable no-daemon → attention (sibling of crash-loop)"),
             (.unsupported,                  .attention,  "version-skew, a ratified attention member"),
             (.crashLooping,                 .attention,  "crash-loop, a ratified attention member"),
@@ -913,10 +961,10 @@ final class HonestStateMachineTests: XCTestCase {
         let healthy = PresentationState.make(for: .connected, accountCount: 2, hasNoViableTarget: false)
         XCTAssertEqual(healthy.glyph, .healthy)
         // Retained exhaustion on a NON-vouched state must NOT surface No-runway — the connection fault wins.
-        // ALL eight non-`.connected` states (the gate's whole complement), so the exhaustiveness is explicit,
-        // not just structurally implied by the single emission point.
+        // ALL nine non-`.connected` states (the gate's whole complement, incl. #526's `.reconnecting`), so the
+        // exhaustiveness is explicit, not just structurally implied by the single emission point.
         let nonVouched: [ConnectionState] = [
-            .connecting, .starting, .stale, .disconnected(reason: "EOF"),
+            .connecting, .starting, .reconnecting(reason: "EOF"), .stale, .disconnected(reason: "EOF"),
             .notRunning, .emptyRoster, .unsupported, .crashLooping,
         ]
         for state in nonVouched {
@@ -938,5 +986,168 @@ final class HonestStateMachineTests: XCTestCase {
         XCTAssertEqual(m.presentation.glyph, .noRunway, "#524: aggregate no-viable-target → No-runway glyph")
         XCTAssertNotEqual(m.presentation.glyph, .healthy, "an exhausted fleet must not read healthy")
         if case .noViableTarget = m.nextSwap {} else { XCTFail("fixture must carry next_swap = no_viable_target") }
+    }
+
+    // MARK: - AC (#526): the warm-dwell escalation (reconnecting → disconnected), sleep/wake-gated
+
+    /// Fold a healthy snapshot then a warm drop into a fresh machine, leaving it dwelling in `.reconnecting`.
+    private func warmDropped(reason: String = "EOF") -> HonestStateMachine {
+        machine([.connected, .line(Fixtures.snapshotBasic), .disconnected(reason: reason)])
+    }
+
+    // The backoff loop retries and is refused again several times WITHIN the dwell: the state stays
+    // `.reconnecting` and the dwell generation does NOT advance — so the real timer keeps counting toward
+    // `.disconnected` rather than resetting on every retry (which would starve the escalation and never reach
+    // Attention). Mirrors the cold `testRepeatedColdRefusalStaysStartingAndDoesNotResetTheGrace`.
+    func testRepeatedWarmDropStaysReconnectingAndDoesNotResetTheDwell() {
+        var m = warmDropped()
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"))
+        let armed = m.dwellGeneration
+        for _ in 0..<4 {
+            _ = m.apply(.disconnected(reason: "connect refused"))   // the backoff loop fails to reconnect again
+            XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"), "a repeat drop keeps the first reconnecting state")
+            XCTAssertEqual(m.dwellGeneration, armed, "a repeat warm drop must NOT re-arm (reset) the dwell")
+        }
+        m.dwellElapsed(generation: armed)
+        XCTAssertEqual(m.connectionState, .disconnected(reason: "EOF"), "the dwell escalates once, carrying the first drop's reason")
+    }
+
+    // A daemon that reconnects DURING the dwell (the routine-restart case) goes straight back to connected —
+    // the pending dwell timer is superseded by the `.connected`, so it never escalates. The post-reconnect
+    // snapshot is HELD by the crash-loop debounce (#169), as any reconnect is.
+    func testDaemonReconnectingDuringDwellCancelsTheEscalation() {
+        var m = warmDropped()
+        XCTAssertTrue(m.isAwaitingWarmDwell)
+        let staleToken = m.dwellGeneration
+        _ = m.apply(.connected)                                 // the daemon came back within the dwell
+        XCTAssertFalse(m.isAwaitingWarmDwell, "reconnecting cancels the warm dwell")
+        XCTAssertEqual(m.connectionState, .connecting, "socket back, awaiting a fresh snapshot")
+        // The superseded dwell timer firing late is a harmless no-op — it cannot force `.disconnected` onto a
+        // now-reconnecting connection.
+        m.dwellElapsed(generation: staleToken)
+        XCTAssertEqual(m.connectionState, .connecting, "a superseded dwell elapse must not resurrect disconnected")
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        XCTAssertEqual(m.connectionState, .connecting, "post-reconnect snapshot held by the #169 debounce")
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertEqual(m.connectionState, .connected, "survives the stability window → healthy")
+    }
+
+    // `dwellElapsed` is generation-guarded, reconnecting-only, and idempotent — a superseded token, an elapse
+    // after the daemon reconnected, or a repeat elapse can never manufacture `.disconnected` or fire twice
+    // (mirrors the watchdog / stability / grace guard tests).
+    func testDwellElapseIsGenerationGuardedReconnectingOnlyAndIdempotent() {
+        // A superseded token (an old generation) is ignored.
+        var m = warmDropped()
+        m.dwellElapsed(generation: m.dwellGeneration - 1)
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"), "a superseded dwell token must not escalate")
+
+        // Reconnecting-only: once escalated to disconnected, a repeat elapse of the consumed token is a no-op.
+        var p = warmDropped()
+        let t = p.dwellGeneration
+        p.dwellElapsed(generation: t)
+        XCTAssertEqual(p.connectionState, .disconnected(reason: "EOF"))
+        p.dwellElapsed(generation: p.dwellGeneration)
+        XCTAssertEqual(p.connectionState, .disconnected(reason: "EOF"), "a second elapse is a no-op")
+    }
+
+    // THE blocking sleep/wake falsifier (#526): a `willSleep` while dwelling SUSPENDS the dwell (so the shell
+    // cancels its timer), and `didWake` RESUMES it fresh — so a benign overnight lid-close never escalates to
+    // Attention. A dwell token captured BEFORE sleep is superseded (both the suspend and the wake bump the
+    // generation), so a timer that fires across the sleep boundary is a harmless no-op — no false Attention on
+    // wake, the tool's most-seen moment.
+    func testSleepSuspendsTheDwellAndWakeResumesItFreshNoFalseEscalation() {
+        var m = warmDropped()
+        XCTAssertTrue(m.isAwaitingWarmDwell, "the dwell is running before sleep")
+        let tokenBeforeSleep = m.dwellGeneration
+
+        m.systemWillSleep()
+        XCTAssertFalse(m.isAwaitingWarmDwell, "willSleep suspends the dwell — the shell cancels its timer")
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"), "the drop is preserved (paused), not escalated")
+        XCTAssertNotEqual(m.dwellGeneration, tokenBeforeSleep, "suspending bumps the token so the in-flight timer is superseded")
+
+        // A dwell timer armed before sleep, firing across the boundary, is IGNORED — the crux of the falsifier:
+        // the app must NOT open on a false Attention.
+        m.dwellElapsed(generation: tokenBeforeSleep)
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"), "a pre-sleep dwell token must not escalate on wake")
+
+        m.systemDidWake()
+        XCTAssertTrue(m.isAwaitingWarmDwell, "didWake resumes the dwell fresh (still reconnecting)")
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"))
+        // The FRESH post-wake dwell still escalates if the daemon is genuinely dead — one dwell after wake.
+        m.dwellElapsed(generation: m.dwellGeneration)
+        XCTAssertEqual(m.connectionState, .disconnected(reason: "EOF"), "a truly-dead daemon still escalates, one dwell after wake")
+    }
+
+    // The benign wake case: the socket comes back right after wake (a routine wake blip). The reconnect cancels
+    // the resumed dwell, so it never escalates — the whole point of suspending across sleep.
+    func testWakeThenReconnectNeverEscalates() {
+        var m = warmDropped()
+        m.systemWillSleep()
+        m.systemDidWake()
+        XCTAssertTrue(m.isAwaitingWarmDwell, "the dwell resumed on wake")
+        _ = m.apply(.connected)                                 // the socket blip resolves in ~1 s on wake
+        XCTAssertFalse(m.isAwaitingWarmDwell, "the reconnect cancels the resumed dwell — no escalation")
+        _ = m.apply(.line(Fixtures.snapshotBasic))
+        m.stabilityElapsed(generation: m.stabilityGeneration)
+        XCTAssertEqual(m.connectionState, .connected)
+    }
+
+    // Sleep/wake with NO warm drop in flight is a total no-op — it must not perturb a healthy (or any
+    // non-reconnecting) state, nor spuriously arm the dwell (a leaked `dwellSuspended` would silently disable
+    // a LATER warm drop's escalation — the bug the transition-only guard prevents).
+    func testSleepWakeWhileHealthyIsANoOpThenALaterDropStillEscalates() {
+        var m = machine([.connected, .line(Fixtures.snapshotBasic)])
+        XCTAssertEqual(m.connectionState, .connected)
+        let dwellGen = m.dwellGeneration
+        m.systemWillSleep()
+        XCTAssertEqual(m.connectionState, .connected, "sleep must not perturb a healthy connection")
+        XCTAssertFalse(m.isAwaitingWarmDwell)
+        m.systemDidWake()
+        XCTAssertEqual(m.connectionState, .connected, "wake must not perturb a healthy connection")
+        XCTAssertFalse(m.isAwaitingWarmDwell)
+        XCTAssertEqual(m.dwellGeneration, dwellGen, "no dwell transition → the dwell generation never moved")
+        // A warm drop AFTER an awake sleep/wake cycle must still arm + escalate normally (no leaked suspension).
+        _ = m.apply(.disconnected(reason: "EOF"))
+        XCTAssertTrue(m.isAwaitingWarmDwell, "a later warm drop arms the dwell normally")
+        m.dwellElapsed(generation: m.dwellGeneration)
+        XCTAssertEqual(m.connectionState, .disconnected(reason: "EOF"), "…and escalates normally — no leaked suspension")
+    }
+
+    // A warm drop that ARRIVES while the system is asleep (dwellSuspended) does not start the dwell until wake
+    // — the dwell begins fresh from `didWake`, so the escalation clock never runs during sleep.
+    func testWarmDropDuringSleepDefersTheDwellUntilWake() {
+        var m = machine([.connected, .line(Fixtures.snapshotBasic)])
+        m.systemWillSleep()                                     // asleep, healthy
+        _ = m.apply(.disconnected(reason: "EOF"))              // the socket drops during sleep
+        XCTAssertEqual(m.connectionState, .reconnecting(reason: "EOF"), "the drop registers as reconnecting…")
+        XCTAssertFalse(m.isAwaitingWarmDwell, "…but the dwell does NOT run while asleep")
+        m.systemDidWake()
+        XCTAssertTrue(m.isAwaitingWarmDwell, "the dwell begins fresh from wake, never during sleep")
+    }
+
+    // Idempotency of the sleep/wake handlers (#526): a DUPLICATE `systemWillSleep` (or `systemDidWake`) —
+    // which the OS can coalesce/redeliver and a resumed observer could double-post — must NOT re-arm or
+    // reset the dwell. The transition-only generation guard makes each a no-op after the first: two sleeps
+    // bump the token exactly once, two wakes bump it exactly once, so the window is neither reset (which
+    // would starve the escalation) nor double-armed.
+    func testDuplicateSleepAndWakeAreIdempotent() {
+        var m = warmDropped()
+        let armed = m.dwellGeneration
+
+        m.systemWillSleep()
+        let afterFirstSleep = m.dwellGeneration
+        XCTAssertNotEqual(afterFirstSleep, armed, "the first sleep suspends → bumps the token (cancels the timer)")
+        XCTAssertFalse(m.isAwaitingWarmDwell)
+        m.systemWillSleep()                                    // a duplicate sleep while already suspended
+        XCTAssertEqual(m.dwellGeneration, afterFirstSleep, "a duplicate sleep is a no-op — no second bump")
+        XCTAssertFalse(m.isAwaitingWarmDwell)
+
+        m.systemDidWake()
+        let afterFirstWake = m.dwellGeneration
+        XCTAssertNotEqual(afterFirstWake, afterFirstSleep, "the first wake resumes → bumps the token (fresh window)")
+        XCTAssertTrue(m.isAwaitingWarmDwell)
+        m.systemDidWake()                                      // a duplicate wake while already awake
+        XCTAssertEqual(m.dwellGeneration, afterFirstWake, "a duplicate wake is a no-op — the fresh window is not reset")
+        XCTAssertTrue(m.isAwaitingWarmDwell)
     }
 }
