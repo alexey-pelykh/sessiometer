@@ -19,12 +19,12 @@
 //! keychain stash name is derived from `account_uuid`, not stored (issue #70).
 //! Error messages quote only those non-secret fields.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml_writer::{ToTomlValue, TomlStringBuilder};
 
 use crate::error::{Error, Result};
@@ -1154,6 +1154,78 @@ impl Config {
         paths::write_private_file(path, self.render().as_bytes())
     }
 
+    /// Apply a `config-set` control command's edits (issue #268) to the config `text`
+    /// read from disk, re-validating the WHOLE result through the same
+    /// [`validate`](Config::validate) that [`load`](Config::load) runs — so every range
+    /// and cross-field rule (`target_max_session_usage <= session_trigger`,
+    /// `exhausted_poll_secs >= poll_secs`, the `near_limit_poll_secs` 0-or-band shape, …)
+    /// is enforced atomically over the FINAL state. An invalid batch is rejected with
+    /// nothing written; a batch is valid iff its resulting config is (an individually
+    /// out-of-order pair — e.g. raising `poll_secs` past the old `exhausted_poll_secs`
+    /// while also raising the latter — validates because both land before the check).
+    ///
+    /// `tunables` carries only the scalar `[tunables]` edits the settings UI may make
+    /// ([`SetTunables`] is the allow-list — a credential, an `[[account]]`, or any other
+    /// key is unrepresentable there). `labels` maps `account_uuid` → a new label; a uuid
+    /// matching no roster account is [`Error::AccountUuidNotFound`]. ONLY an existing
+    /// account's `label` is touched — the roster is never grown, shrunk, or re-keyed, and
+    /// no credential is reachable (the #268 safety boundary).
+    ///
+    /// Returns the re-validated [`Config`] to persist (via [`save_to`](Config::save_to))
+    /// plus a [`SettingsChange`] recording which classes actually changed, so the daemon
+    /// picks the reload semantics: a tunable change is reload-by-restart (the daemon
+    /// derives its strategy fields once at construction), a label change adopts live.
+    pub(crate) fn apply_settings(
+        text: &str,
+        tunables: &SetTunables,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<(Config, SettingsChange)> {
+        // Baseline: the current on-disk config, fully validated. A currently-invalid file
+        // (hand-broken) fails HERE, so config-set refuses rather than overwrite a file it
+        // cannot understand — the daemon maps this to a `config-unreadable` rejection.
+        let before = Config::parse(text)?;
+        // Overlay the edits onto the raw layer so the SINGLE validate() sees the final
+        // state; the file is re-parsed (tiny) rather than cloning the non-`Clone` raw.
+        let mut raw: RawConfig =
+            toml::from_str(text).map_err(|err| Error::ConfigParse(err.to_string()))?;
+        overlay_tunables(&mut raw.tunables, tunables);
+        overlay_labels(&mut raw.account, labels)?;
+        let after = Config::validate(raw)?;
+        let change = SettingsChange {
+            tunables_changed: after.tunables != before.tunables,
+            labels_changed: after.roster != before.roster,
+        };
+        Ok((after, change))
+    }
+
+    /// A non-secret projection of the effective config for the `config-get` control
+    /// command (issue #268): the scalar tunables the settings UI edits + each roster
+    /// account's non-secret `account_uuid` / `label` / `enabled`. Carries NO credential
+    /// (the roster keys on uuid + label only, issue #15), so it is exactly as safe to
+    /// return over the same-user control socket as the `status` / `watch` snapshots.
+    pub(crate) fn view(&self) -> ConfigView {
+        ConfigView {
+            tunables: TunablesView::from(&self.tunables),
+            accounts: self
+                .roster
+                .iter()
+                .map(|account| AccountView {
+                    account_uuid: account.account_uuid.clone(),
+                    label: account.label.clone(),
+                    enabled: account.enabled,
+                })
+                .collect(),
+        }
+    }
+
+    /// Parse `text` and project it to a [`ConfigView`] (issue #268) — the `config-get` read path's
+    /// one-call text→view seam, keeping [`parse`](Config::parse) private while giving the daemon a
+    /// non-secret projection to serialize. Errors exactly as [`load`](Config::load) would (a parse or
+    /// validation failure), which `config-get` maps to a `config unreadable` envelope.
+    pub(crate) fn view_from_text(text: &str) -> Result<ConfigView> {
+        Ok(Config::parse(text)?.view())
+    }
+
     /// The base poll interval — the un-jittered `poll_secs`. The run loop now
     /// draws a jittered interval each cycle from the poll strategy (issue #38),
     /// so this is a tested accessor for the base rather than the live cadence.
@@ -2013,6 +2085,197 @@ fn basic_string(s: &str) -> String {
     TomlStringBuilder::new(s).as_basic().to_toml_value()
 }
 
+// ── Settings-edit surface (issue #268): the daemon-routed config-get / config-set backend. ──
+//
+// The menubar settings UI (a pure control-socket client) reads the effective config via the
+// `config-get` command → [`ConfigView`] and writes tunable/label edits via `config-set` →
+// [`Config::apply_settings`]. `config.toml` stays the single source of truth (the daemon
+// load→mutate→save's through the SAME tested `render`/`validate` path); tunables are
+// reload-by-restart, labels adopt live. The SAFETY boundary — tunables + existing-account
+// labels ONLY, never a credential or roster STRUCTURE — is enforced STRUCTURALLY: the
+// editable surface IS these types, so a forbidden key is unrepresentable, not merely unshown.
+
+/// The scalar `[tunables]` edits a `config-set` may carry (issue #268), mirroring the
+/// scalar [`RawTunables`] keys 1:1. Every field is `Option` — an omitted key is an
+/// UNEDITED key — and `#[serde(deny_unknown_fields)]` rejects ANY other key (a credential,
+/// an `[[account]]`, a `[jitter]` / `[refresh]` / … block, or a mistyped tunable) as a hard
+/// parse error. This type IS the settable allow-list: the roster structure and every
+/// credential are unrepresentable, so the #268 safety boundary holds by construction, not by
+/// convention. The `[jitter]` strategy specs are deliberately excluded (structured, not
+/// scalar form fields); `enabled` is excluded from v1 (it stays the CLI `enable`/`disable`
+/// verb, mirroring "add/remove routes to CLI").
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetTunables {
+    #[serde(default)]
+    pub(crate) poll_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) exhausted_poll_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) near_limit_poll_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) cooldown_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) target_max_session_usage: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_trigger: Option<i64>,
+    #[serde(default)]
+    pub(crate) weekly_trigger: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_blind_swap_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_blind_risk_band: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_velocity_horizon_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_velocity_min_project_above: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_velocity_ema_alpha_pct: Option<i64>,
+    #[serde(default)]
+    pub(crate) monitor_401_n: Option<i64>,
+    #[serde(default)]
+    pub(crate) monitor_recovery_m: Option<i64>,
+}
+
+/// Which classes of edit a [`Config::apply_settings`] actually changed (issue #268), so the
+/// daemon picks reload semantics: `tunables_changed` ⇒ reload-by-restart (the daemon derives
+/// its strategy fields once at construction, with no re-derivation primitive), `labels_changed`
+/// ⇒ adopt live via the daemon's roster reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingsChange {
+    pub(crate) tunables_changed: bool,
+    pub(crate) labels_changed: bool,
+}
+
+/// The `config-get` control-command reply (issue #268): a non-secret projection of the
+/// effective config — the scalar tunables the settings UI edits + the roster's non-secret
+/// per-account fields. Produced by [`Config::view`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ConfigView {
+    pub(crate) tunables: TunablesView,
+    pub(crate) accounts: Vec<AccountView>,
+}
+
+/// The scalar tunables in a [`ConfigView`] (issue #268) — the effective values the settings
+/// UI displays and edits. Mirrors [`Tunables`]' scalar fields; the `[jitter]` strategy
+/// fields are omitted (not form-editable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TunablesView {
+    pub(crate) poll_secs: u64,
+    pub(crate) exhausted_poll_secs: u64,
+    pub(crate) near_limit_poll_secs: u64,
+    pub(crate) cooldown_secs: u64,
+    pub(crate) target_max_session_usage: u8,
+    pub(crate) session_trigger: u8,
+    pub(crate) weekly_trigger: u8,
+    pub(crate) session_blind_swap_secs: u64,
+    pub(crate) session_blind_risk_band: u8,
+    pub(crate) session_velocity_horizon_secs: u64,
+    pub(crate) session_velocity_min_project_above: u8,
+    pub(crate) session_velocity_ema_alpha_pct: u8,
+    pub(crate) monitor_401_n: u8,
+    pub(crate) monitor_recovery_m: u8,
+}
+
+impl From<&Tunables> for TunablesView {
+    fn from(t: &Tunables) -> Self {
+        Self {
+            poll_secs: t.poll_secs,
+            exhausted_poll_secs: t.exhausted_poll_secs,
+            near_limit_poll_secs: t.near_limit_poll_secs,
+            cooldown_secs: t.cooldown_secs,
+            target_max_session_usage: t.target_max_session_usage,
+            session_trigger: t.session_trigger,
+            weekly_trigger: t.weekly_trigger,
+            session_blind_swap_secs: t.session_blind_swap_secs,
+            session_blind_risk_band: t.session_blind_risk_band,
+            session_velocity_horizon_secs: t.session_velocity_horizon_secs,
+            session_velocity_min_project_above: t.session_velocity_min_project_above,
+            session_velocity_ema_alpha_pct: t.session_velocity_ema_alpha_pct,
+            monitor_401_n: t.monitor_401_n,
+            monitor_recovery_m: t.monitor_recovery_m,
+        }
+    }
+}
+
+/// One roster account in a [`ConfigView`] (issue #268): its non-secret `account_uuid` (the
+/// stable label-edit key), `label`, and `enabled` flag. No credential — the roster holds
+/// none (issue #15).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AccountView {
+    pub(crate) account_uuid: String,
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+}
+
+/// Overlay a `config-set`'s scalar tunable edits (issue #268) onto the raw layer — each
+/// `Some(v)` replaces that key, each `None` leaves it. `target_max_session_usage` maps to
+/// the raw `Option` (its absence sentinel); every other key to its plain scalar. Ranges are
+/// NOT checked here — [`Config::validate`] does that atomically over the overlaid result.
+fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
+    if let Some(v) = edits.poll_secs {
+        raw.poll_secs = v;
+    }
+    if let Some(v) = edits.exhausted_poll_secs {
+        raw.exhausted_poll_secs = v;
+    }
+    if let Some(v) = edits.near_limit_poll_secs {
+        raw.near_limit_poll_secs = v;
+    }
+    if let Some(v) = edits.cooldown_secs {
+        raw.cooldown_secs = v;
+    }
+    if let Some(v) = edits.target_max_session_usage {
+        raw.target_max_session_usage = Some(v);
+    }
+    if let Some(v) = edits.session_trigger {
+        raw.session_trigger = v;
+    }
+    if let Some(v) = edits.weekly_trigger {
+        raw.weekly_trigger = v;
+    }
+    if let Some(v) = edits.session_blind_swap_secs {
+        raw.session_blind_swap_secs = v;
+    }
+    if let Some(v) = edits.session_blind_risk_band {
+        raw.session_blind_risk_band = v;
+    }
+    if let Some(v) = edits.session_velocity_horizon_secs {
+        raw.session_velocity_horizon_secs = v;
+    }
+    if let Some(v) = edits.session_velocity_min_project_above {
+        raw.session_velocity_min_project_above = v;
+    }
+    if let Some(v) = edits.session_velocity_ema_alpha_pct {
+        raw.session_velocity_ema_alpha_pct = v;
+    }
+    if let Some(v) = edits.monitor_401_n {
+        raw.monitor_401_n = v;
+    }
+    if let Some(v) = edits.monitor_recovery_m {
+        raw.monitor_recovery_m = v;
+    }
+}
+
+/// Overlay a `config-set`'s label edits (issue #268): each `account_uuid` → new label is
+/// written onto the MATCHING existing raw account. A uuid matching none is
+/// [`Error::AccountUuidNotFound`]. Never appends/removes an entry — only an existing
+/// account's `label` field is touched, so the roster structure (and every credential keyed
+/// off it) is out of reach (the #268 safety boundary). The new label's non-emptiness is
+/// enforced downstream by [`Config::validate`].
+fn overlay_labels(accounts: &mut [RawAccount], labels: &BTreeMap<String, String>) -> Result<()> {
+    for (account_uuid, new_label) in labels {
+        let account = accounts
+            .iter_mut()
+            .find(|account| &account.account_uuid == account_uuid)
+            .ok_or_else(|| Error::AccountUuidNotFound {
+                account_uuid: account_uuid.clone(),
+            })?;
+        account.label = new_label.clone();
+    }
+    Ok(())
+}
+
 /// Permissive deserialization target: every key optional (documented default),
 /// integers kept wide so out-of-range values reach [`Config::validate`] with a
 /// clear message rather than failing as a `serde` type error.
@@ -2393,6 +2656,219 @@ label = "personal"
              account_uuid = \"u\"\n\
              label = \"l\"\n"
         )
+    }
+
+    // ── config-set / config-get backend (issue #268) ──
+
+    /// A `BTreeMap<uuid, label>` for the `config-set` label edits (fully qualified so the
+    /// test needs no extra `use`).
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(uuid, label)| (uuid.to_string(), label.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn apply_settings_overlays_a_tunable_and_revalidates() {
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(300),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.poll_secs, 300);
+        assert!(change.tunables_changed);
+        assert!(!change.labels_changed);
+        // A tunables-only edit leaves the roster untouched.
+        assert_eq!(after.roster.len(), 2);
+    }
+
+    #[test]
+    fn apply_settings_relabels_an_account_by_uuid() {
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("11111111-1111-1111-1111-111111111111", "day-job")]),
+        )
+        .unwrap();
+        assert!(change.labels_changed);
+        assert!(!change.tunables_changed);
+        let renamed = after
+            .roster
+            .iter()
+            .find(|a| a.account_uuid == "11111111-1111-1111-1111-111111111111")
+            .unwrap();
+        assert_eq!(renamed.label, "day-job");
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_out_of_range_tunable() {
+        // poll_secs floor is 5; 4 is out of range → the whole batch is rejected.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(4),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_validates_the_final_batch_not_intermediate_states() {
+        // Current: poll_secs=30, exhausted_poll_secs=60. Raising poll_secs to 300 AND
+        // exhausted to 7200 is valid as a WHOLE (300 <= 7200), even though applying poll
+        // first would transiently violate `exhausted >= poll` (60 < 300). Atomic validation
+        // over the final state is what lets a settings-form "Apply" move coupled fields.
+        let base = with_tunables("poll_secs = 30\nexhausted_poll_secs = 60");
+        let (after, _) = Config::apply_settings(
+            &base,
+            &SetTunables {
+                poll_secs: Some(300),
+                exhausted_poll_secs: Some(7200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.poll_secs, 300);
+        assert_eq!(after.tunables.exhausted_poll_secs, 7200);
+    }
+
+    #[test]
+    fn apply_settings_rejects_a_cross_field_invalid_batch() {
+        // exhausted_poll_secs must be >= poll_secs; 200 < 300 → rejected as a whole.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(300),
+                exhausted_poll_secs: Some(200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_rejects_target_max_above_session_trigger() {
+        // VALID session_trigger=90; target_max_session_usage=95 > 90 → the distinct cross-field error.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                target_max_session_usage: Some(95),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ConfigTargetMaxSessionAboveTrigger { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_unknown_account_uuid() {
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("no-such-uuid", "x")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::AccountUuidNotFound { .. }));
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_empty_label() {
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("11111111-1111-1111-1111-111111111111", "  ")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_reports_no_change_for_a_noop_edit() {
+        // Submitting the current value + current label changes nothing.
+        let (_, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(30), // VALID's current poll_secs
+                ..SetTunables::default()
+            },
+            &labels(&[("11111111-1111-1111-1111-111111111111", "work")]),
+        )
+        .unwrap();
+        assert!(!change.tunables_changed);
+        assert!(!change.labels_changed);
+    }
+
+    #[test]
+    fn apply_settings_refuses_a_currently_unreadable_config() {
+        // A hand-broken file fails at the baseline parse — config-set never overwrites a
+        // file it cannot understand.
+        let err = Config::apply_settings(
+            "this is not toml [[[",
+            &SetTunables::default(),
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigParse(_)));
+    }
+
+    #[test]
+    fn set_tunables_rejects_a_forbidden_key() {
+        // SAFETY invariant: only the scalar tunable keys are representable. A credential, a
+        // roster field, or any other key is a hard parse error (deny_unknown_fields), so the
+        // credential/roster-structure boundary cannot be crossed through config-set.
+        for forbidden in [
+            r#"{"account_uuid":"x"}"#,
+            r#"{"credential":"secret"}"#,
+            r#"{"label":"x"}"#,
+            r#"{"enabled":true}"#,
+            r#"{"poll_secs":300,"roster":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SetTunables>(forbidden).is_err(),
+                "forbidden key accepted: {forbidden}"
+            );
+        }
+        // A bare scalar tunable parses; unset keys stay None.
+        let ok: SetTunables = serde_json::from_str(r#"{"poll_secs":300}"#).unwrap();
+        assert_eq!(ok.poll_secs, Some(300));
+        assert_eq!(ok.session_trigger, None);
+    }
+
+    #[test]
+    fn config_view_projects_tunables_and_roster() {
+        let view = Config::parse(VALID).unwrap().view();
+        assert_eq!(view.tunables.poll_secs, 30);
+        assert_eq!(view.tunables.session_trigger, 90);
+        assert_eq!(view.accounts.len(), 2);
+        assert_eq!(
+            view.accounts[0].account_uuid,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(view.accounts[0].label, "work");
+        assert!(view.accounts[0].enabled);
+    }
+
+    #[test]
+    fn config_view_serde_round_trips() {
+        let view = Config::parse(VALID).unwrap().view();
+        let json = serde_json::to_string(&view).unwrap();
+        let back: ConfigView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
     }
 
     #[test]

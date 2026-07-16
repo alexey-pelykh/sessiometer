@@ -151,8 +151,9 @@ pub(crate) use snapshot::{status_response, RefreshHealth};
 mod socket;
 
 pub(crate) use socket::{
-    notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_swap_ack,
-    CaptureAck, CaptureCommand, CaptureRejection, Control, ControlSignal, ControlYield, SwapAck,
+    notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_config_set_ack,
+    write_swap_ack, CaptureAck, CaptureCommand, CaptureRejection, ConfigSetAck, ConfigSetCommand,
+    ConfigSetEffect, ConfigSetRejection, Control, ControlSignal, ControlYield, SwapAck,
     SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
@@ -163,8 +164,9 @@ pub(crate) use socket::{
 // `use super::*` resolves them while a non-test build sees no unused re-export.
 #[cfg(test)]
 pub(crate) use socket::{
-    control_reply, encode_heartbeat_frame, encode_snapshot_frame, parse_watch_frame, serve_control,
-    serve_stats, serve_watch, ServeOutcome, StatsRequest, WatchFrame, MAX_CONTROL_LINE_BYTES,
+    config_get_reply, control_reply, encode_heartbeat_frame, encode_snapshot_frame,
+    parse_watch_frame, serve_control, serve_stats, serve_watch, ServeOutcome, StatsRequest,
+    WatchFrame, MAX_CONTROL_LINE_BYTES,
 };
 
 mod run_loop;
@@ -4069,6 +4071,101 @@ where
         (CaptureAck::Rejected { reason }, Some(event))
     }
 
+    /// Apply an authenticated `config-set` control command (issue #268) where `&mut self` is
+    /// available: the tunable + non-credential-label edits the settings UI submitted, applied to
+    /// the authoritative on-disk `config.toml` through the tested Rust writer, and NOTHING else —
+    /// the safety boundary (no credential, no roster add/remove) is STRUCTURAL, enforced by
+    /// [`ConfigSetCommand`]'s [`SetTunables`](crate::config::SetTunables) allow-list + uuid-keyed
+    /// label map, so a forbidden edit is unrepresentable here, not merely unhandled.
+    ///
+    /// Load→overlay→validate→save is the SAME path `capture` uses: read the current file TEXT,
+    /// [`apply_settings`](crate::config::Config::apply_settings) overlays the edits onto the raw
+    /// layer and re-validates the WHOLE edited config atomically (so a cross-field rule — e.g.
+    /// `target_max_session_usage <= session_trigger` — sees the FINAL state, never a transient
+    /// intermediate), then [`save_to`](crate::config::Config::save_to) writes it 0600-atomically
+    /// (temp + rename). Every refusal is a TRUE no-op — ZERO writes — leaving the old file intact:
+    /// no wired `config_path` → `Unavailable`; absent file → `NoConfig`; unreadable / malformed
+    /// baseline → `ConfigUnreadable`; a stale label uuid → `UnknownAccount`; a range / cross-field
+    /// violation → `Invalid` (with the non-secret field-named `detail`); an atomic-write failure →
+    /// `SaveFailed`. On success the `effect` tells the UI what the change requires: a LABEL change
+    /// is adopted LIVE — the in-memory roster is reconciled to the freshly-written file (the SAME
+    /// [`reconcile_roster`](Self::reconcile_roster) core the #139 roster-reload drives) — while a
+    /// TUNABLE change is reload-by-restart (the daemon derives its strategy fields once at
+    /// construction, with no re-derivation primitive), and a no-op edit writes nothing
+    /// (`Unchanged`). A batch that changes both reports `RestartRequired` (the operative action).
+    ///
+    /// The `config.toml` read is small and inline like `capture`'s `load_existing` (not
+    /// `spawn_blocking`): a few KB, well under a tick, and this runs on the run loop's single task
+    /// where `&mut self` lives (ADR-0001). Returns only the redacted [`ConfigSetAck`] — a config
+    /// edit emits no durable [`Event`] in v1 (the event log records swaps + captures; a
+    /// config-change audit line is a clean future addition, not needed for the settings surface).
+    async fn perform_config_set(&mut self, command: &ConfigSetCommand) -> ConfigSetAck {
+        // No wired config path (the hermetic-test default) — config-set is unavailable, exactly as
+        // `capture` fails closed with no path to persist to.
+        let Some(config_path) = self.config_path.clone() else {
+            return ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::Unavailable,
+                detail: None,
+            };
+        };
+        // Read the current on-disk config TEXT: `apply_settings` re-parses + overlays it, and the
+        // save re-renders the canonical commented form (the comments live in the renderer, not the
+        // input). Absent → nothing to edit; unreadable → refuse rather than clobber a file we
+        // cannot read. Read inline like `capture`'s `load_existing` (small file, ADR-0001).
+        let text = match std::fs::read_to_string(&config_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return ConfigSetAck::Rejected {
+                    reason: ConfigSetRejection::NoConfig,
+                    detail: None,
+                };
+            }
+            Err(_) => {
+                return ConfigSetAck::Rejected {
+                    reason: ConfigSetRejection::ConfigUnreadable,
+                    detail: None,
+                };
+            }
+        };
+        // Overlay + atomically re-validate the WHOLE edited config. A rejection writes NOTHING —
+        // the old file is intact.
+        let (config, change) =
+            match Config::apply_settings(&text, &command.tunables, &command.labels) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    let (reason, detail) = classify_config_set_failure(&err);
+                    return ConfigSetAck::Rejected { reason, detail };
+                }
+            };
+        // A no-op edit (the submitted values already equal the current ones) writes nothing.
+        if !change.tunables_changed && !change.labels_changed {
+            return ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Unchanged,
+            };
+        }
+        // Persist the validated config atomically (temp + rename, 0600). A write failure leaves the
+        // OLD file intact — report `SaveFailed`, adopt nothing.
+        if config.save_to(&config_path).is_err() {
+            return ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::SaveFailed,
+                detail: None,
+            };
+        }
+        // A LABEL change is adopted LIVE: reconcile the in-memory roster to the freshly-written
+        // file (the SAME core the #139 roster-reload drives), so `status` reflects the new label
+        // within the poll cadence. A TUNABLE change is reload-by-restart (no hot-reload primitive).
+        if change.labels_changed {
+            self.reconcile_roster(config.roster);
+        }
+        // A tunable change is the operative action even if a label also changed (both persisted).
+        let effect = if change.tunables_changed {
+            ConfigSetEffect::RestartRequired
+        } else {
+            ConfigSetEffect::Live
+        };
+        ConfigSetAck::Applied { effect }
+    }
+
     /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
     ///
     /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
@@ -6138,6 +6235,36 @@ fn classify_capture_failure(err: &Error) -> CaptureRejection {
     }
 }
 
+/// Map an [`apply_settings`](crate::config::Config::apply_settings) failure to the redacted
+/// `(reason, detail)` for a `config-set` ack (issue #268) — the config-set counterpart of
+/// [`classify_capture_failure`]. A malformed / unparseable BASELINE (the existing on-disk file
+/// cannot be understood) is `ConfigUnreadable` — config-set never overwrites a file it cannot
+/// re-render; a label edit naming an unknown roster uuid (a stale settings client) is
+/// `UnknownAccount`; a range or cross-field violation on the FINAL edited config is `Invalid`,
+/// carrying the non-secret field-named message as `detail` so the UI can point at the offending
+/// field. Secret-free by construction: the config file holds no secrets (issue #15) and the reason
+/// is a stable discriminant.
+fn classify_config_set_failure(err: &Error) -> (ConfigSetRejection, Option<String>) {
+    match err {
+        // The baseline on-disk file is malformed — the overlay re-parse failed on the existing
+        // text; refuse rather than clobber a file the daemon cannot re-render.
+        Error::ConfigParse(_) => (ConfigSetRejection::ConfigUnreadable, None),
+        // A label edit named an `account_uuid` no roster account has (a stale client — the account
+        // was `remove`d since its `config-get`).
+        Error::AccountUuidNotFound { .. } => (ConfigSetRejection::UnknownAccount, None),
+        // A range / cross-field rule failed on the FINAL edited config (an out-of-range tunable, an
+        // empty label, `exhausted_poll_secs < poll_secs`, `target_max_session_usage >
+        // session_trigger`); surface the non-secret field-named message as `detail`.
+        Error::ConfigTargetMaxSessionAboveTrigger { .. } => {
+            (ConfigSetRejection::Invalid, Some(err.to_string()))
+        }
+        Error::ConfigInvalid(msg) => (ConfigSetRejection::Invalid, Some(msg.clone())),
+        // `apply_settings` yields only the four above; any other error is a defensive `Invalid`
+        // with its redacted message rather than a silent mismap.
+        other => (ConfigSetRejection::Invalid, Some(other.to_string())),
+    }
+}
+
 /// Fold a captured/refreshed [`CaptureOutcome`](crate::capture::CaptureOutcome) onto the event's
 /// [`CaptureEventOutcome`] axis (issue #359) — the two SUCCESS tokens the durable audit line carries.
 fn capture_event_outcome(outcome: crate::capture::CaptureOutcome) -> CaptureEventOutcome {
@@ -6162,7 +6289,7 @@ fn capture_event_outcome_rejected(reason: CaptureRejection) -> CaptureEventOutco
 mod tests {
     use super::*;
     use crate::claude_state::OauthAccount;
-    use crate::config::Tunables;
+    use crate::config::{SetTunables, Tunables};
     // `SweepOutcome` is named only in test code here (the run loop consumes it by
     // inference); import it test-scoped so a non-test build sees no unused import.
     use crate::contract::SweepOutcome;
@@ -14044,6 +14171,12 @@ mod tests {
             ServeOutcome::Stats(..) => {
                 panic!("a watch command must route to a watch stream, not a stats handoff")
             }
+            ServeOutcome::ConfigGet(_) => {
+                panic!("a watch command must route to a watch stream, not a config-get handoff")
+            }
+            ServeOutcome::ConfigSet(..) => {
+                panic!("a watch command must route to a watch stream, not a config-set handoff")
+            }
         }
     }
 
@@ -15450,6 +15583,435 @@ mod tests {
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
+    }
+
+    // --- socket `config-get` / `config-set` command (issue #268) ------------
+
+    #[tokio::test]
+    async fn perform_config_set_is_unavailable_without_a_wired_config_path() {
+        // A hermetic daemon with NO `config_path` wired cannot persist an edit — config-set is
+        // `Unavailable` (fails closed, exactly like `capture` with no path to persist to), a TRUE
+        // no-op with ZERO writes.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::Unavailable,
+                detail: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_reports_no_config_for_an_absent_file() {
+        // A wired path whose FILE does not exist → `NoConfig` (capture the first account via the CLI
+        // first), never a fabricated empty config — and ZERO writes.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml"); // never written
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::NoConfig,
+                detail: None,
+            }
+        );
+        assert!(
+            !config_path.exists(),
+            "a rejected config-set writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_applies_a_tunable_and_reports_restart_required() {
+        // AC (tunable edit → persisted, reload-by-restart): a tunable change is written to disk and
+        // reported `RestartRequired` (the daemon derives its strategy fields once at construction —
+        // no hot-reload), leaving the in-memory roster untouched (a tunable is not a live adopt).
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]); // default poll_secs = 300
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::RestartRequired,
+            }
+        );
+        // The edit landed on disk (a restart picks it up)…
+        assert_eq!(
+            Config::load_path(&config_path).unwrap().tunables.poll_secs,
+            120
+        );
+        // …but the in-memory roster is untouched — a tunable change is NOT a live reconcile.
+        assert_eq!(daemon.roster[0].label, "work");
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_adopts_a_label_live_and_reconciles_the_roster() {
+        // AC (label edit → adopted LIVE): a non-credential label change is persisted AND reconciled
+        // into the in-memory roster within the same call (the SAME #139 core), so `status` reflects
+        // it without a restart — reported `Live`.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables::default(),
+                labels: BTreeMap::from([("u-A".to_owned(), "day-job".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Live,
+            }
+        );
+        // Adopted LIVE: the in-memory roster carries the new label (reconciled in-process)…
+        assert_eq!(daemon.roster[0].label, "day-job");
+        // …and it is persisted (a restart keeps it), keyed by the immutable uuid.
+        let on_disk = Config::load_path(&config_path).unwrap();
+        assert_eq!(on_disk.roster[0].account_uuid, "u-A");
+        assert_eq!(on_disk.roster[0].label, "day-job");
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_reports_unchanged_for_a_noop() {
+        // Submitting the CURRENT values (poll_secs 300 = the default the file carries, and no label
+        // edit) changes nothing → `Unchanged`, and nothing is rewritten.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(300),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::from([("u-A".to_owned(), "work".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Unchanged,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a no-op config-set rewrites nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_rejects_an_out_of_range_tunable_and_writes_nothing() {
+        // AC (range/cross-field violation → refused, ZERO writes): an out-of-range tunable fails the
+        // WHOLE-config revalidation → `Invalid` carrying the non-secret field-named `detail`, and
+        // the old file is left byte-for-byte intact.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    session_trigger: Some(200), // a usage percent > 100 is out of range
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+
+        match ack {
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::Invalid,
+                detail: Some(msg),
+            } => assert!(
+                !msg.is_empty(),
+                "the invalid reason names the offending field"
+            ),
+            other => panic!("expected an Invalid rejection with detail, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a rejected config-set writes nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_rejects_an_unknown_account_uuid_and_writes_nothing() {
+        // AC (stale label target → refused): a label edit naming a uuid no roster account has (a
+        // stale settings client — the account was `remove`d since its `config-get`) → `UnknownAccount`,
+        // ZERO writes.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables::default(),
+                labels: BTreeMap::from([("u-does-not-exist".to_owned(), "x".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::UnknownAccount,
+                detail: None,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a rejected config-set writes nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_refuses_a_malformed_on_disk_config_and_writes_nothing() {
+        // AC (refuse rather than clobber — the safety half of the read path): if `config.toml` is
+        // hand-broken WHILE the daemon runs, a config-set refuses with `ConfigUnreadable` and leaves
+        // the unreadable file byte-for-byte intact — it never overwrites a file it cannot re-render.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        std::fs::write(&config_path, "this is not toml [[[").unwrap();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::ConfigUnreadable,
+                detail: None,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a malformed config is refused, never clobbered",
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_config_get_to_a_handoff_unauthenticated() {
+        use tokio::io::AsyncWriteExt;
+        // A `config-get` is a non-secret READ (tunables + redacted labels, like `status` / `stats`),
+        // so it is NOT auth-gated: even an unauthenticated peer gets the handoff to the spawned
+        // reader (the blocking `config.toml` read runs off the run loop, ADR-0001).
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"config-get\"}\n")
+            .await
+            .unwrap();
+        let _stream = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap()
+            .config_get();
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_unauthenticated_config_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // AC (peer-credential authN): a `config-set` is STATE-AFFECTING (it writes `config.toml`),
+        // so a non-owner peer is rejected BEFORE any handoff — the edit never reaches the run loop
+        // (`one_shot()` proves there is NO `ConfigSet` handoff) and the peer gets `unauthorized`.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"config-set\",\"tunables\":{\"poll_secs\":120}}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "an unauthenticated config-set must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.contains("unauthorized"), "got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_authenticated_config_set_with_a_forbidden_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // SAFETY (issue #268 structural boundary): even an AUTHENTICATED `config-set` carrying a
+        // forbidden top-level key — here a `credential` — is a hard `malformed request` via
+        // `ConfigSetRequest`'s `deny_unknown_fields`, with NO handoff. The credential/roster-structure
+        // boundary cannot be crossed through config-set: a forbidden key never reaches the run loop,
+        // so the daemon never even attempts to interpret it.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"config-set\",\"credential\":\"secret\"}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "a forbidden-key config-set must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.contains("malformed"), "got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_control_hands_back_an_authenticated_config_set() {
+        use tokio::io::AsyncWriteExt;
+        // An AUTHENTICATED, well-formed `config-set` is NOT answered inline: like `swap` / `capture`,
+        // it hands the OPEN connection back (with the parsed edits) so the run loop applies them
+        // against `&mut Daemon` and writes the redacted ack from the REAL outcome.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(
+                b"{\"cmd\":\"config-set\",\"tunables\":{\"poll_secs\":120},\"labels\":{\"u-A\":\"day-job\"}}\n",
+            )
+            .await
+            .unwrap();
+        let (_stream, command) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .config_set();
+        assert_eq!(
+            command,
+            ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::from([("u-A".to_owned(), "day-job".to_owned())]),
+            }
+        );
+    }
+
+    #[test]
+    fn config_get_reply_maps_read_outcomes_to_non_secret_envelopes() {
+        // The `config-get` read path: a valid file → a serialized `ConfigView` (tunables + redacted
+        // roster), an absent file → `{"error":"no config"}`, a malformed one → `{"error":"config
+        // unreadable"}` — never a leak, never a panic.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+
+        // Absent → a `no config` envelope (nothing captured yet).
+        assert!(config_get_reply(&config_path).contains("no config"));
+
+        // Valid → a `ConfigView` naming the redacted account handle, decodable by the client.
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let reply = config_get_reply(&config_path);
+        let view: crate::config::ConfigView = serde_json::from_str(&reply).unwrap();
+        assert_eq!(view.accounts.len(), 1);
+        assert_eq!(view.accounts[0].account_uuid, "u-A");
+        assert_eq!(view.accounts[0].label, "work");
+
+        // Malformed → a `config unreadable` envelope (refuse rather than guess).
+        std::fs::write(&config_path, "this is not toml [[[").unwrap();
+        assert!(config_get_reply(&config_path).contains("config unreadable"));
+    }
+
+    #[test]
+    fn config_set_ack_serializes_to_the_non_secret_wire_shape() {
+        // The ack the settings client decodes (issue #268): an internally-tagged `result`, a
+        // snake_case `effect` on success, a kebab-case `reason` on refusal, and `detail` OMITTED when
+        // absent — non-secret by construction (#15). Round-trips so the client reads back what the
+        // daemon wrote.
+        let applied = ConfigSetAck::Applied {
+            effect: ConfigSetEffect::RestartRequired,
+        };
+        let wire = serde_json::to_string(&applied).unwrap();
+        assert_eq!(wire, r#"{"result":"applied","effect":"restart_required"}"#);
+        assert_eq!(
+            serde_json::from_str::<ConfigSetAck>(&wire).unwrap(),
+            applied
+        );
+
+        let invalid = ConfigSetAck::Rejected {
+            reason: ConfigSetRejection::Invalid,
+            detail: Some("poll_secs must be in 60..=600".to_owned()),
+        };
+        let wire = serde_json::to_string(&invalid).unwrap();
+        assert!(wire.contains(r#""result":"rejected""#), "got {wire}");
+        assert!(wire.contains(r#""reason":"invalid""#), "got {wire}");
+        assert!(
+            wire.contains(r#""detail":"poll_secs must be in 60..=600""#),
+            "got {wire}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ConfigSetAck>(&wire).unwrap(),
+            invalid
+        );
+
+        // A reason WITHOUT detail omits the key entirely (no `"detail":null` noise).
+        let no_config = ConfigSetAck::Rejected {
+            reason: ConfigSetRejection::NoConfig,
+            detail: None,
+        };
+        let wire = serde_json::to_string(&no_config).unwrap();
+        assert_eq!(wire, r#"{"result":"rejected","reason":"no-config"}"#);
+        assert_eq!(
+            serde_json::from_str::<ConfigSetAck>(&wire).unwrap(),
+            no_config
+        );
     }
 
     // --- next_swap candidate (issue #88) + swap report ---------------------

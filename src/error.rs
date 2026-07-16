@@ -220,6 +220,15 @@ pub(crate) enum Error {
     #[error("no account labelled `{label}` — run `sessiometer list` to see the roster")]
     AccountLabelNotFound { label: String },
 
+    /// A `config-set` (issue #268) label edit named an `account_uuid` that matches no
+    /// roster account — a stale settings client (the account was `remove`d between its
+    /// `config-get` read and the edit) or a client bug. The uuid is a non-secret roster
+    /// key (issue #15), safe to quote. Distinct from [`AccountLabelNotFound`](Error::AccountLabelNotFound)
+    /// (a `<label>` lookup): the settings path keys label edits by the immutable uuid, not
+    /// the mutable label, so a duplicate-label roster stays unambiguous.
+    #[error("no account with account_uuid `{account_uuid}` in the roster")]
+    AccountUuidNotFound { account_uuid: String },
+
     /// A per-account stash is missing one or both of its keychain items
     /// (credential / oauthAccount), so the account cannot be restored. Carries
     /// the `service` (the `Sessiometer/<account_uuid>` stash name — a config value, never
