@@ -988,6 +988,62 @@ final class HonestStateMachineTests: XCTestCase {
         if case .noViableTarget = m.nextSwap {} else { XCTFail("fixture must carry next_swap = no_viable_target") }
     }
 
+    // MARK: - AC (#485): a blind ACTIVE account's DEGRADED auto-protection escalates the glance to Attention
+
+    // The pure projection: blind-DEGRADED (non-cornered) → `.attention`, blind-OK → stays `.healthy`, and a
+    // cornered blind account (also no-viable-target) is `⊘` no-runway (worst-first wins). Ratified 2026-07-16.
+    func testBlindDegradedActiveEscalatesTheGlanceOneRungBelowNoRunway() {
+        let degraded = PresentationState.make(for: .connected, accountCount: 2, activeBlindDegraded: true)
+        XCTAssertEqual(degraded.glyph, .attention)
+        XCTAssertEqual(degraded.accessibilityLabel,
+                       "Sessiometer: auto-protection degraded — acting on a stale anchor")
+
+        // Blind-but-OK is deliberately NOT escalated — the daemon is self-resolving within the bounded window.
+        let ok = PresentationState.make(for: .connected, accountCount: 2, activeBlindDegraded: false)
+        XCTAssertEqual(ok.glyph, .healthy)
+
+        // Cornered (blind + degraded + no viable target) shows `⊘` no-runway — hasNoViableTarget wins worst-first.
+        let cornered = PresentationState.make(for: .connected, accountCount: 2,
+                                              hasNoViableTarget: true, activeBlindDegraded: true)
+        XCTAssertEqual(cornered.glyph, .noRunway)
+    }
+
+    // Like every other fault, the blind-degraded escalation reaches the glyph ONLY on a vouched `.connected`
+    // snapshot — on any non-connected state the flag is inert (the connection's own glyph stands unchanged).
+    func testBlindDegradedIsGatedOnAFreshConnectedSnapshot() {
+        let nonVouched: [ConnectionState] = [
+            .connecting, .starting, .reconnecting(reason: "EOF"), .stale, .disconnected(reason: "EOF"),
+            .notRunning, .emptyRoster, .unsupported, .crashLooping,
+        ]
+        for state in nonVouched {
+            let withFlag = PresentationState.make(for: state, accountCount: 2, activeBlindDegraded: true)
+            let without = PresentationState.make(for: state, accountCount: 2, activeBlindDegraded: false)
+            XCTAssertEqual(withFlag.glyph, without.glyph,
+                           "\(state): blind-degraded must not change a non-connected glyph — the vouched-data gate")
+        }
+    }
+
+    // End-to-end through the machine: the blind-DEGRADED snapshot fixture, applied live, projects the active
+    // row's `blindActive` and drives the glyph to `.attention` — the AccountRow projection +
+    // `activeBlindDegraded` derivation + `make` wiring, proven together off the wire (no new schema).
+    func testBlindDegradedSnapshotDrivesTheAttentionGlyph() {
+        let m = machine([.connected, .line(Fixtures.snapshotBlindActiveDegraded)])
+        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertEqual(m.presentation.glyph, .attention, "#485: blind + auto-protection DEGRADED → the '!' glance")
+        // The projected active row carries the wire field verbatim (it drives the per-row panel treatment).
+        let active = m.rows.first { $0.isActive }
+        XCTAssertEqual(active?.blindActive,
+                       BlindActive(blindSecs: 1380, lastKnownSessionPct: 87, autoProtectionDegraded: true))
+    }
+
+    // Blind-but-OK, end-to-end: the active account is blind but auto-protection is intact, so the glance stays
+    // on the calm healthy path — a bounded, self-resolving blindness must not cry wolf (#485, ratified).
+    func testBlindOkSnapshotStaysHealthy() {
+        let m = machine([.connected, .line(Fixtures.snapshotBlindActiveOK)])
+        XCTAssertEqual(m.presentation.glyph, .healthy)
+        XCTAssertEqual(m.rows.first { $0.isActive }?.blindActive?.autoProtectionDegraded, false)
+    }
+
     // MARK: - AC (#526): the warm-dwell escalation (reconnecting → disconnected), sleep/wake-gated
 
     /// Fold a healthy snapshot then a warm drop into a fresh machine, leaving it dwelling in `.reconnecting`.

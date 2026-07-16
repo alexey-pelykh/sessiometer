@@ -232,7 +232,8 @@ struct PresentationState: Equatable, Sendable {
                      accountCount: Int,
                      hasNoViableTarget: Bool = false,
                      keychainLocked: Bool = false,
-                     canonicalScrub: CanonicalScrub? = nil) -> PresentationState {
+                     canonicalScrub: CanonicalScrub? = nil,
+                     activeBlindDegraded: Bool = false) -> PresentationState {
         switch state {
         case .connected:
             // TIER 1 — vouched: the fleet/vault speaks. Every `⊘` no-runway path first (worst-first, the
@@ -251,6 +252,16 @@ struct PresentationState: Equatable, Sendable {
             if hasNoViableTarget {
                 return PresentationState(glyph: .noRunway,
                                          accessibilityLabel: "Sessiometer: no account has capacity right now — action needed")
+            }
+            // #485: a blind ACTIVE account whose ADR-0017 auto-protection is DEGRADED (armed but acting on a
+            // STALE anchor) is a next-break the operator should see — ratified 2026-07-16 as the honest "!"
+            // attention glance. It rides ONE rung below `⊘` no-runway: a cornered blind account (blind +
+            // degraded + no viable target) already took the `hasNoViableTarget` ⊘ above, so reaching here
+            // means a viable target still exists. A blind-but-OK account is deliberately NOT escalated — the
+            // daemon is self-resolving within the bounded window, so it stays on the calm healthy path below.
+            if activeBlindDegraded {
+                return PresentationState(glyph: .attention,
+                                         accessibilityLabel: "Sessiometer: auto-protection degraded — acting on a stale anchor")
             }
             let plural = accountCount == 1 ? "" : "s"
             return PresentationState(glyph: .healthy,
@@ -328,6 +339,11 @@ struct AccountRow: Identifiable, Equatable, Sendable {
     /// Whether the daemon's `next_swap` names THIS account as the swap candidate — a store-level
     /// cross-field derivation the panel reads to mark the row.
     let isNextSwapTarget: Bool
+    /// The active account's bounded-blindness projection (issues #479/#485) — present ONLY when THIS
+    /// (active) account's usage poll is blind. Drives the per-row blind treatment (a SEMANTIC held-state
+    /// row in place of a false-healthy one, #137) and — when auto-protection is DEGRADED — escalates the
+    /// menu-bar glance to `.attention`. A pass-through of the wire field; the daemon owns the verdict.
+    let blindActive: BlindActive?
 
     /// Project a whole snapshot's accounts into rows, resolving each account's next-swap-target flag
     /// against the snapshot's `next_swap` candidate.
@@ -347,7 +363,8 @@ struct AccountRow: Identifiable, Equatable, Sendable {
                 sessionResetsAt: account.sessionResetsAt,
                 weeklyResetsAt: account.weeklyResetsAt,
                 weeklyExhausted: account.weeklyExhausted,
-                isNextSwapTarget: account.label == targetLabel)
+                isNextSwapTarget: account.label == targetLabel,
+                blindActive: account.blindActive)
         }
     }
 }
@@ -591,7 +608,8 @@ struct HonestStateMachine {
                                accountCount: rows.count,
                                hasNoViableTarget: hasNoViableTarget,
                                keychainLocked: keychainLocked,
-                               canonicalScrub: canonicalScrub)
+                               canonicalScrub: canonicalScrub,
+                               activeBlindDegraded: activeBlindDegraded)
     }
 
     /// Whether the retained `nextSwap` reports the fleet has no viable swap target left — the
@@ -600,6 +618,14 @@ struct HonestStateMachine {
     private var hasNoViableTarget: Bool {
         if case .noViableTarget = nextSwap { return true }
         return false
+    }
+
+    /// Whether the ACTIVE account is blind AND its ADR-0017 auto-protection is DEGRADED (#485) — the
+    /// glance-escalation input. A pure read of the retained snapshot's active row; the vouched-data gate
+    /// (only a `.connected` snapshot lets it reach `.attention`) lives in `PresentationState.make`, exactly
+    /// as it does for `hasNoViableTarget` / `keychainLocked`.
+    private var activeBlindDegraded: Bool {
+        rows.contains { $0.isActive && ($0.blindActive?.autoProtectionDegraded ?? false) }
     }
 
     /// Fold one transport event into the state. Returns the `LineOutcome` for a `.line` event (so the

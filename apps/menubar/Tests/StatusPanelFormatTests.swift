@@ -653,6 +653,90 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(parked, "p, auth healthy, parked, session 1% resets in 1h, weekly 1% resets in 3d")
     }
 
+    // MARK: - Active-account bounded-blindness row (issues #479/#485)
+
+    // The eye-slash blind glyph is DISTINCT from every auth `healthSymbol` shape (so blindness is legible
+    // without color, WCAG 1.4.1); OK is calm neutral, DEGRADED takes the at-risk orange rung.
+    func testBlindSymbolIsAnEyeSlashDistinctFromAuthGlyphs() {
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: false).name, "eye.slash")
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: true).name, "eye.slash")
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: false).tint, .neutral)
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: true).tint, .orange)
+        // The blind glyph must not collide with any auth glyph shape (a distinct state needs a distinct shape).
+        let authGlyphs: [CredentialHealth] = [.healthy, .unknown, .stale, .atRisk, .degraded, .dead]
+        let authNames = Set(authGlyphs.map { StatusPanelFormat.healthSymbol($0).name })
+        XCTAssertFalse(authNames.contains("eye.slash"), "the blind glyph must be shape-distinct from every auth glyph")
+    }
+
+    // The duration chip reuses `humanizeUntil` — the SAME format as the CLI's `blind for {dur}`.
+    func testBlindDurationChipHumanizesTheSeconds() {
+        XCTAssertEqual(StatusPanelFormat.blindDurationChip(240), "blind 4m")
+        XCTAssertEqual(StatusPanelFormat.blindDurationChip(1380), "blind 23m")
+        XCTAssertEqual(StatusPanelFormat.blindDurationChip(3600 + 5 * 60), "blind 1h5m")
+        XCTAssertEqual(StatusPanelFormat.blindDurationChip(30), "blind <1m")
+    }
+
+    // The verdict mirrors the CLI: OK calm (`.neutral`, un-emphasized), DEGRADED the at-risk orange fault, the
+    // "acting on a stale anchor" parenthetical carried verbatim; distinct shield SHAPES per state (not color-alone).
+    func testBlindVerdictMirrorsTheCliOkVsDegraded() {
+        let ok = StatusPanelFormat.blindVerdict(degraded: false)
+        XCTAssertEqual(ok.symbol, "checkmark.shield.fill")
+        XCTAssertEqual(ok.text, "Auto-protection OK — daemon self-resolving")
+        XCTAssertEqual(ok.tint, .neutral)
+
+        let degraded = StatusPanelFormat.blindVerdict(degraded: true)
+        XCTAssertEqual(degraded.symbol, "exclamationmark.shield.fill")
+        XCTAssertEqual(degraded.text, "Auto-protection DEGRADED — acting on a stale anchor")
+        XCTAssertEqual(degraded.tint, .orange)
+        XCTAssertNotEqual(ok.symbol, degraded.symbol, "OK and DEGRADED must be shape-distinct, not color-alone")
+
+        XCTAssertEqual(StatusPanelFormat.blindLastKnownCaption, "LAST-KNOWN · RATE-LIMITED")
+    }
+
+    // A blind row keeps its credential's OWN warning glyph beside the eye-slash when the credential is itself
+    // in a warning state — usage-blindness and credential-health are orthogonal, so a stale/at-risk credential
+    // must NOT be visually suppressed just because the eye-slash took the health slot (#137 honest-state, and
+    // the CLI keeps both). Healthy/unknown/absent add no warning → the eye-slash stands alone.
+    func testBlindCoShowsAuthWarningOnlyForWarningCredentials() {
+        XCTAssertTrue(StatusPanelFormat.blindCoShowsAuthWarning(.stale))
+        XCTAssertTrue(StatusPanelFormat.blindCoShowsAuthWarning(.atRisk))
+        XCTAssertTrue(StatusPanelFormat.blindCoShowsAuthWarning(.degraded))
+        XCTAssertTrue(StatusPanelFormat.blindCoShowsAuthWarning(.dead))
+        XCTAssertFalse(StatusPanelFormat.blindCoShowsAuthWarning(.healthy))
+        XCTAssertFalse(StatusPanelFormat.blindCoShowsAuthWarning(.unknown))
+        XCTAssertFalse(StatusPanelFormat.blindCoShowsAuthWarning(nil))
+    }
+
+    // The a11y label speaks the blind state (duration, last-known %, verdict) IN PLACE of the two meters —
+    // matching what the blind row draws; never a fabricated live reading (#137).
+    func testRowAccessibilityLabelSpeaksTheBlindState() {
+        let degraded = StatusPanelFormat.rowAccessibilityLabel(
+            label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
+            quarantined: false, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a",
+            blind: BlindActive(blindSecs: 1380, lastKnownSessionPct: 87, autoProtectionDegraded: true))
+        XCTAssertEqual(degraded,
+            "work, active, auth healthy, blind for 23m, last-known session 87 percent, auto-protection degraded, acting on a stale anchor")
+
+        let ok = StatusPanelFormat.rowAccessibilityLabel(
+            label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
+            quarantined: false, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a",
+            blind: BlindActive(blindSecs: 240, lastKnownSessionPct: 64, autoProtectionDegraded: false))
+        XCTAssertEqual(ok,
+            "work, active, auth healthy, blind for 4m, last-known session 64 percent, auto-protection okay, daemon self-resolving")
+    }
+
+    // A blind row whose credential is ALSO in a warning state speaks BOTH — the at-risk auth verdict is not
+    // dropped because the poll went blind (the a11y half of #485's orthogonal-axes fix; the visual half rides
+    // `blindCoShowsAuthWarning`). Orthogonal facts, both voiced.
+    func testRowAccessibilityLabelSpeaksAuthWarningAlongsideBlind() {
+        let label = StatusPanelFormat.rowAccessibilityLabel(
+            label: "work", isActive: true, auth: .atRisk, recovering: false, enabled: true,
+            quarantined: false, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a",
+            blind: BlindActive(blindSecs: 240, lastKnownSessionPct: 64, autoProtectionDegraded: false))
+        XCTAssertEqual(label,
+            "work, active, auth at risk, blind for 4m, last-known session 64 percent, auto-protection okay, daemon self-resolving")
+    }
+
     // MARK: - Integration: wire → AccountRow → panel format (recovering distinct from dead)
 
     func testDeadVersusRecoveringSurviveTheStoreProjection() throws {

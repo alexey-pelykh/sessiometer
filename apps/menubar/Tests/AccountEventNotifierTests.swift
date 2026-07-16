@@ -203,7 +203,7 @@ final class AccountEventNotifierTests: XCTestCase {
         AccountRow(label: label, isActive: active, isEnabled: true, isQuarantined: false,
                    isRecovering: false, auth: nil, sessionPct: nil, weeklyPct: nil,
                    sessionResetsAt: nil, weeklyResetsAt: nil, weeklyExhausted: false,
-                   isNextSwapTarget: false)
+                   isNextSwapTarget: false, blindActive: nil)
     }
 
     private func ephemeralPreferences() -> NotificationPreferences {

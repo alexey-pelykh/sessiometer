@@ -304,6 +304,34 @@ extension CanonicalScrub: Decodable {
     }
 }
 
+// MARK: - The active account's bounded-blindness projection
+
+/// The active account's bounded-blindness projection (issues #479/#485) — mirrors the daemon's
+/// `BlindActive` (`src/daemon/snapshot.rs`): how long the active account has been blind, the retained
+/// last-known session %, and whether ADR-0017 preemptive auto-protection is DEGRADED (armed, but acting
+/// on a STALE anchor). Wire key `blind_active`, present ONLY on a blind active account — the daemon OMITS
+/// the key otherwise (`skip_serializing_if`), so a non-blind line's bytes are unchanged (additive minor
+/// 1.3 → 1.4). All three inner fields are required WHEN the object is present (the Rust fields carry no
+/// default), so a malformed `blind_active` missing one throws rather than mis-reads. Non-secret — a
+/// duration and two small numbers, never a token or email (issue #15).
+struct BlindActive: Decodable, Equatable, Sendable {
+    /// Seconds the active account has been blind (`blind_secs`) — a DURATION the client renders verbatim
+    /// against its own clock-free `humanizeUntil`, never an absolute instant.
+    let blindSecs: UInt64
+    /// The retained pre-blind SESSION-window usage percent (`0…100`, `last_known_session_pct`) — the
+    /// last-known reading before the account went blind. Why the row shows a HELD value, not "no data".
+    let lastKnownSessionPct: UInt8
+    /// Whether ADR-0017 auto-protection is DEGRADED — the gate is armed but acting on a STALE anchor.
+    /// `false` = OK (blind, but not yet past the gate threshold, or the anchor sat below the risk band).
+    let autoProtectionDegraded: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case blindSecs = "blind_secs"
+        case lastKnownSessionPct = "last_known_session_pct"
+        case autoProtectionDegraded = "auto_protection_degraded"
+    }
+}
+
 // MARK: - The redacted per-account payload line
 
 /// One account's redacted status line (`src/daemon/snapshot.rs` `AccountStatusLine`) — a
@@ -341,6 +369,12 @@ struct AccountStatusLine: Decodable, Equatable {
     /// The 5+1-state credential-auth rollup (issue #119), wire key `auth`; `nil` for a pre-#119
     /// daemon (the client then falls back to the quarantine flag rather than a defaulted value).
     let auth: CredentialHealth?
+    /// The active account's bounded-blindness projection (issues #479/#485), wire key `blind_active`;
+    /// present ONLY on a blind active account (the daemon omits the key otherwise). The panel renders it
+    /// as a SEMANTIC per-row state — blind duration, last-known session %, and whether ADR-0017
+    /// auto-protection is OK or DEGRADED — in place of a false-healthy row (#137). Reflect-only: the
+    /// surface never self-polls or self-swaps off it (#169).
+    let blindActive: BlindActive?
 
     private enum CodingKeys: String, CodingKey {
         case label
@@ -356,6 +390,7 @@ struct AccountStatusLine: Decodable, Equatable {
         case accessExpiresAt = "access_expires_at"
         case refreshHealth = "refresh_health"
         case auth
+        case blindActive = "blind_active"
     }
 
     init(from decoder: Decoder) throws {
@@ -373,6 +408,7 @@ struct AccountStatusLine: Decodable, Equatable {
         accessExpiresAt = try c.decodeIfPresent(Int64.self, forKey: .accessExpiresAt)
         refreshHealth = try c.decodeIfPresent(RefreshHealth.self, forKey: .refreshHealth)
         auth = try c.decodeIfPresent(CredentialHealth.self, forKey: .auth)
+        blindActive = try c.decodeIfPresent(BlindActive.self, forKey: .blindActive)
     }
 }
 
