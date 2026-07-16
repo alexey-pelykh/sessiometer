@@ -43,15 +43,15 @@ enum RenderPanelTool {
             AccountRow(label: "Work", isActive: true, isEnabled: true, isQuarantined: false,
                        isRecovering: false, auth: .healthy, sessionPct: 42, weeklyPct: 88,
                        sessionResetsAt: now + 2 * 3600 + 14 * 60, weeklyResetsAt: now + 3 * day,
-                       weeklyExhausted: false, isNextSwapTarget: false),
+                       weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil),
             AccountRow(label: "Personal", isActive: false, isEnabled: true, isQuarantined: false,
                        isRecovering: false, auth: .healthy, sessionPct: 31, weeklyPct: 71,
                        sessionResetsAt: now + 3600 + 2 * 60, weeklyResetsAt: now + 3 * day,
-                       weeklyExhausted: false, isNextSwapTarget: false),
+                       weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil),
             AccountRow(label: "Scratch", isActive: false, isEnabled: true, isQuarantined: false,
                        isRecovering: false, auth: .healthy, sessionPct: 4, weeklyPct: 18,
                        sessionResetsAt: now + 5 * 3600 + 20 * 60, weeklyResetsAt: now + 3 * day,
-                       weeklyExhausted: false, isNextSwapTarget: true),
+                       weeklyExhausted: false, isNextSwapTarget: true, blindActive: nil),
         ]
 
         // The panel-rendered states (the fuller 9-state fidelity's remaining facets are #169 siblings).

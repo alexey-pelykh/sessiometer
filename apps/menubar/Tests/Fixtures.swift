@@ -138,6 +138,24 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":7},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"keychain_locked":true}
     """#
 
+    /// The active account's bounded-blindness projection (issues #479/#485) — auto-protection OK. The
+    /// active account's usage poll is blind (429 / ADR-0017): `session_pct` / `weekly_pct` are null (the
+    /// daemon's `usage: None`), and `blind_active` carries the SEMANTIC line — blind duration, the retained
+    /// last-known session %, and `auto_protection_degraded: false`. A viable `spare` exists (non-cornered).
+    /// NOT byte-pinned — the goldens cover non-blind frames that omit the key (`skip_serializing_if`), so a
+    /// non-blind frame stays byte-unchanged; this hand-built frame gives `blind_active` decode coverage.
+    static let snapshotBlindActiveOK = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":7},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":240,"last_known_session_pct":64,"auto_protection_degraded":false}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    """#
+
+    /// The blind projection with ADR-0017 auto-protection DEGRADED (`auto_protection_degraded: true`) — the
+    /// gate is armed but acting on a STALE anchor (blind past the threshold, last-known sat in the risk
+    /// band). Non-cornered (a viable `spare` remains), so the glance escalates to `.attention`, NOT
+    /// `.noRunway`. 23m blind, last-known 87%.
+    static let snapshotBlindActiveDegraded = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":7},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":1380,"last_known_session_pct":87,"auto_protection_degraded":true}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    """#
+
     /// `encode_heartbeat_frame(42)` — the canonical beat the Rust test decodes.
     static let heartbeatBasic = #"""
     {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":7}}

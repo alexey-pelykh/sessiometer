@@ -589,11 +589,18 @@ private struct AccountRowView: View {
                 switchSlot
             }
 
-            VStack(spacing: 6) {
-                UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
-                           reset: sessionReset)
-                UsageMeter(label: "Weekly", pct: row.weeklyPct, severity: weeklySeverity,
-                           reset: weeklyReset)
+            if let blind = row.blindActive {
+                // The active account's poll is blind — replace the two (now `n/a`) live meters with the
+                // SEMANTIC held-state block: a held session bar, blind duration, and the auto-protection
+                // verdict (#485), the panel's render of the CLI's blind line. A healthy row keeps its meters.
+                BlindMeter(blind: blind)
+            } else {
+                VStack(spacing: 6) {
+                    UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
+                               reset: sessionReset)
+                    UsageMeter(label: "Weekly", pct: row.weeklyPct, severity: weeklySeverity,
+                               reset: weeklyReset)
+                }
             }
         }
         .padding(.horizontal, 8)
@@ -611,6 +618,18 @@ private struct AccountRowView: View {
                       ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark)
                       : Color.clear)
         )
+        // #485: a DEGRADED blind active row gets an at-risk orange leading rule — a non-color-redundant
+        // LOCALITY tell (the fault is THIS row's; the header/footer stay fresh, the AC-2 distinction from
+        // #169's whole-snapshot "stale"). Absent on a blind-OK row (calm) and every non-blind row.
+        .overlay(alignment: .leading) {
+            if row.blindActive?.autoProtectionDegraded == true {
+                Capsule()
+                    .fill(Color.panel(StatusPanelFormat.healthTint(.orange)))
+                    .frame(width: 3)
+                    .padding(.vertical, 7)
+                    .accessibilityHidden(true)
+            }
+        }
     }
 
     /// The swap glyph the chip draws — a swap arrow, or a DISTINCT `nosign` on a wire-blocked target
@@ -661,9 +680,31 @@ private struct AccountRowView: View {
     }
 
     /// The auth glyph (modern path) or the legacy tag text (pre-#119), plus the DEAD/`disabled` cue.
+    /// A blind active account (#485) shows the eye-slash blind glyph HERE instead — the credential may be
+    /// fine; what's lost is usage visibility, so the health slot reports that, not a false auth verdict.
     @ViewBuilder
     private var authView: some View {
-        if let auth = row.auth {
+        if let blind = row.blindActive {
+            // Usage visibility lost (#485): an eye-slash, a DISTINCT shape from every auth glyph. OK is
+            // calm secondary; DEGRADED tints it at-risk orange (redundant with the row's rule + verdict).
+            // If the credential is ITSELF in a warning state (stale/at-risk — orthogonal to usage-blindness),
+            // its glyph rides ALONGSIDE the eye-slash so the warning isn't suppressed (the CLI keeps both;
+            // #137 honest-state one axis over). Healthy/unknown → eye-slash alone (the common, ratified case).
+            HStack(spacing: 4) {
+                if let auth = row.auth, StatusPanelFormat.blindCoShowsAuthWarning(auth) {
+                    let authSymbol = StatusPanelFormat.healthSymbol(auth)
+                    Image(systemName: authSymbol.name)
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(healthColor(authSymbol.tint))
+                        .accessibilityHidden(true)
+                }
+                let symbol = StatusPanelFormat.blindSymbol(degraded: blind.autoProtectionDegraded)
+                Image(systemName: symbol.name)
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(healthColor(symbol.tint))
+                    .accessibilityHidden(true)
+            }
+        } else if let auth = row.auth {
             HStack(spacing: 4) {
                 let symbol = StatusPanelFormat.healthSymbol(auth)
                 Image(systemName: symbol.name)
@@ -721,7 +762,8 @@ private struct AccountRowView: View {
             sessionPct: row.sessionPct,
             weeklyPct: row.weeklyPct,
             sessionReset: sessionReset,
-            weeklyReset: weeklyReset)
+            weeklyReset: weeklyReset,
+            blind: row.blindActive)
     }
 }
 
@@ -843,6 +885,110 @@ private struct UsageBar: View {
         let clamped = min(1, max(0, fraction))
         guard clamped > 0 else { return 0 }
         // Mock `.m-fill { min-width: 5px }` — a live-but-tiny percent keeps a visible sliver.
+        return max(5, full * clamped)
+    }
+}
+
+/// The active account's blind-state block (issues #479/#485) — the panel's render of the daemon
+/// `BlindActive`, REPLACING the two live meters a healthy row shows. A HELD session bar (dashed — a frozen
+/// last-known value, never a live fill, #137) at the last-known %, the `blind {dur}` chip, the
+/// LAST-KNOWN·RATE-LIMITED caption, and the auto-protection verdict — every fact from a unit-tested
+/// `StatusPanelFormat` verdict, so this View stays a thin, un-screenshot-tested consumer. The held row
+/// reuses `UsageMeter`'s SESSION-label (52) and percent (40) columns so THOSE align with sibling rows; its
+/// trailing chip is wider (58 vs the reset column's 52) to fit `blind {dur}` un-clipped, so the held bar
+/// itself sits ~6 pt narrower than a live sibling's — an accepted legibility trade, not a lined-up column.
+private struct BlindMeter: View {
+    let blind: BlindActive
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        // The last-known session % carries the SAME severity band a live meter would (green/amber/red) —
+        // the held bar shows "the last reading was at X%", while the blind OK/DEGRADED verdict rides the
+        // eye glyph, the leading rule, and the shield line below (two orthogonal facts, two colour channels).
+        let severity = StatusPanelFormat.utilSeverity(blind.lastKnownSessionPct)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 9) {
+                Text("SESSION")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 52, alignment: .leading)
+
+                HeldUsageBar(fraction: Double(blind.lastKnownSessionPct) / 100.0, color: barColor(severity))
+
+                Text(StatusPanelFormat.pct(blind.lastKnownSessionPct))
+                    .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                    .foregroundStyle(Color.panel(StatusPanelFormat.usageTextTint(severity)))
+                    .frame(width: 40, alignment: .trailing)
+
+                Text(StatusPanelFormat.blindDurationChip(blind.blindSecs))
+                    .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 58, alignment: .trailing)
+                    .lineLimit(1)
+            }
+
+            // WHY the bar is held — the value is last-known and the poll is rate-limited (the #137 tell,
+            // so a held bar is never read as a live one).
+            Text(StatusPanelFormat.blindLastKnownCaption)
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(0.3)
+                .foregroundStyle(.tertiary)
+
+            // The auto-protection verdict — OK calm / DEGRADED orange — mirroring the CLI's blind line.
+            let verdict = StatusPanelFormat.blindVerdict(degraded: blind.autoProtectionDegraded)
+            HStack(spacing: 5) {
+                Image(systemName: verdict.symbol)
+                    .symbolRenderingMode(.hierarchical)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
+                Text(verdict.text)
+                    .font(.caption)
+                    .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
+            }
+            // The row's VoiceOver label already speaks the whole blind state as one element (#485).
+            .accessibilityHidden(true)
+        }
+    }
+
+    /// The held bar's fill hue — the SAME bright severity family `UsageMeter.barColor` uses (a bar is a
+    /// non-text fill, WCAG 3:1), keyed off the last-known session band.
+    private func barColor(_ severity: StatusPanelFormat.UsageSeverity) -> Color {
+        switch severity {
+        case .red:    return .red
+        case .yellow: return .orange
+        case .green:  return .green
+        }
+    }
+}
+
+/// A HELD usage bar (#485) — the last-known fill under a DASHED capsule outline. The dash is the "held /
+/// estimate, not live" tell that reads at the 6 px bar height where diagonal hatching would not, so a
+/// frozen last-known value is never mistaken for a live meter (#137). The fill itself keeps the severity
+/// hue (muted) so the band is still legible.
+private struct HeldUsageBar: View {
+    let fraction: Double
+    let color: Color
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.panelFill(.track, dark: colorScheme == .dark))
+                // Muted fill (0.5α) — a held value reads dimmer than a live meter, never a bright false-now.
+                Capsule().fill(color.opacity(0.5))
+                    .frame(width: fillWidth(geo.size.width))
+                // Dashed outline over the whole track — the legible-at-6px "held" signal.
+                Capsule().strokeBorder(color.opacity(0.9),
+                                       style: StrokeStyle(lineWidth: 1, dash: [2.5, 2]))
+            }
+        }
+        .frame(height: 6)
+        .accessibilityHidden(true)
+    }
+
+    private func fillWidth(_ full: CGFloat) -> CGFloat {
+        let clamped = min(1, max(0, fraction))
+        guard clamped > 0 else { return 0 }
         return max(5, full * clamped)
     }
 }

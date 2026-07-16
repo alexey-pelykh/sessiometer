@@ -425,6 +425,66 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Active-account bounded-blindness row (issues #479/#485)
+    //
+    // The panel's per-medium render of the SAME daemon `BlindActive` the `status` CLI narrates as a line
+    // (`src/cli.rs`: "active {label}: blind for {dur} — last-known session {pct}% — auto-protection {OK |
+    // DEGRADED (acting on a stale anchor)}"). R-2 STATE-parity: the CLI prints one sentence; the panel
+    // composes a held-meter row + verdict from these pure verdicts, each unit-asserted (the panel cannot be
+    // screenshot-verified in CI). The blind row REPLACES the bare `n/a … 🟡` a failed poll would show — a
+    // SEMANTIC held state, never a false-healthy row (#137) — and reflects daemon state only (#169).
+
+    /// The blind row's health-slot glyph — an `eye.slash` ("usage visibility lost"), shown while blind. A
+    /// DISTINCT shape from every `healthSymbol` (an eye, not a check / clock / triangle / octagon), so
+    /// blindness is legible WITHOUT color (WCAG 1.4.1). OK stays calm `.neutral`; DEGRADED takes the at-risk
+    /// `.orange` (`--ut-o`). NOTE: the CLI emphasizes its DEGRADED blind line in RED (`Severity::Red`,
+    /// `src/cli.rs`); the panel deliberately uses ORANGE, not red — the blind-DEGRADED GLANCE is `.attention`
+    /// (one rung below `.noRunway`), so red would over-signal. A per-medium COLOR choice under R-2
+    /// STATE-parity (not color-parity); the shared STATE is "DEGRADED", rendered in each medium's idiom.
+    static func blindSymbol(degraded: Bool) -> (name: String, tint: HealthTint) {
+        ("eye.slash", degraded ? .orange : .neutral)
+    }
+
+    /// Whether a blind row should ALSO show its credential's own auth warning glyph beside the `eye.slash`.
+    /// Usage-blindness and credential-health are ORTHOGONAL axes (a 429'd `/usage` poll says nothing about
+    /// the refresh token), so a blind account whose credential is itself in a WARNING state
+    /// (stale / at-risk / degraded / dead) must not have that warning SUPPRESSED just because the eye-slash
+    /// took the slot — the CLI keeps both (its health cell is untouched by the blind override), and hiding a
+    /// real credential signal is the #137 honest-state failure one axis over. Healthy / unknown add no
+    /// warning, so the eye-slash stands alone (the common, ratified case). Reachable pair today: blind +
+    /// `stale`/`atRisk` (the daemon suppresses `blind_active` only for a QUARANTINED account, and `degraded`/
+    /// `dead` imply quarantined — so those two never co-occur in practice, but are covered defensively).
+    static func blindCoShowsAuthWarning(_ auth: CredentialHealth?) -> Bool {
+        switch auth {
+        case .stale, .atRisk, .degraded, .dead: return true
+        case .healthy, .unknown, nil:           return false
+        }
+    }
+
+    /// The blind row's duration chip — `blind {dur}`, using the SAME `humanizeUntil` the CLI's
+    /// `blind for {dur}` uses (`blind_secs` is a DURATION, rendered against nothing — no client clock).
+    /// Replaces the reset-in cell, which is meaningless while the poll is blind.
+    static func blindDurationChip(_ blindSecs: UInt64) -> String {
+        "blind \(humanizeUntil(Int64(blindSecs)))"
+    }
+
+    /// The blind row's under-bar caption — WHY the meter is HELD: the value is the LAST-KNOWN reading and
+    /// the poll is RATE-LIMITED (ADR-0017 bounded blindness is entered on a 429). A constant, so the held
+    /// bar is never mistaken for a live one (the #137 never-false-healthy tell, carried onto the caption).
+    static let blindLastKnownCaption = "LAST-KNOWN · RATE-LIMITED"
+
+    /// The auto-protection verdict line (issue #479 surface 1) — the panel's render of the CLI's
+    /// `auto-protection {OK | DEGRADED (acting on a stale anchor)}`. Returns the shield glyph, the spoken
+    /// verdict, and the tint: OK is calm (`.neutral` — the CLI leaves OK un-emphasized), DEGRADED is the
+    /// at-risk `.orange` fault (the CLI emphasizes ONLY DEGRADED — in RED; the panel uses ORANGE for the
+    /// per-medium reason in `blindSymbol`). "acting on a stale anchor" mirrors the CLI parenthetical
+    /// verbatim; "daemon self-resolving" is the panel's room-permitting OK gloss.
+    static func blindVerdict(degraded: Bool) -> (symbol: String, text: String, tint: HealthTint) {
+        degraded
+            ? ("exclamationmark.shield.fill", "Auto-protection DEGRADED — acting on a stale anchor", .orange)
+            : ("checkmark.shield.fill", "Auto-protection OK — daemon self-resolving", .neutral)
+    }
+
     // MARK: - Panel chrome fidelity tokens (#388 — theme-aware accent emphasis + neutral fills)
     //
     // The design mock (`apps/menubar/design/menubar-preview.html`) hand-tunes its accent-emphasis opacities
@@ -966,14 +1026,27 @@ enum StatusPanelFormat {
         sessionPct: UInt8?,
         weeklyPct: UInt8?,
         sessionReset: String,
-        weeklyReset: String
+        weeklyReset: String,
+        blind: BlindActive? = nil
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
         parts.append(authSpoken(auth: auth, recovering: recovering, enabled: enabled, quarantined: quarantined))
-        // Both windows, each with its reset — matching the row's two meters and the CLI's two columns.
-        parts.append("session \(pct(sessionPct)) resets in \(sessionReset)")
-        parts.append("weekly \(pct(weeklyPct)) resets in \(weeklyReset)")
+        if let blind = blind {
+            // Blind active row (#485): speak the SEMANTIC held state the row shows — blind duration,
+            // last-known session %, and the auto-protection verdict — in place of the two `n/a` meters the
+            // row no longer draws. Mirrors the CLI's spoken facts (blind for {dur} · last-known {pct} · OK/
+            // DEGRADED); never a fabricated live reading (#137).
+            parts.append("blind for \(humanizeUntil(Int64(blind.blindSecs)))")
+            parts.append("last-known session \(blind.lastKnownSessionPct) percent")
+            parts.append(blind.autoProtectionDegraded
+                         ? "auto-protection degraded, acting on a stale anchor"
+                         : "auto-protection okay, daemon self-resolving")
+        } else {
+            // Both windows, each with its reset — matching the row's two meters and the CLI's two columns.
+            parts.append("session \(pct(sessionPct)) resets in \(sessionReset)")
+            parts.append("weekly \(pct(weeklyPct)) resets in \(weeklyReset)")
+        }
         // Drop any empty auth phrase (a healthy pre-#119 legacy account speaks no auth verdict).
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }

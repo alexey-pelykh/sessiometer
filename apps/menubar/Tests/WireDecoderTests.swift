@@ -152,6 +152,33 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(a.auth, .degraded)
     }
 
+    // AC (#485, MANDATORY schema-bump lockstep): the active account's `blind_active` object decodes —
+    // blind duration + retained last-known session % + the DEGRADED flag — while `session_pct` / `weekly_pct`
+    // stay nil (the daemon's `usage: None` during blindness; the retained value lives ONLY in blind_active).
+    // A non-blind sibling omits the key → decodes to nil (the additive-optional forward-compat path).
+    func testDecodesBlindActiveDegradedOnActiveAccount() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBlindActiveDegraded) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 7))
+        let work = v.accounts[0]
+        XCTAssertTrue(work.active)
+        XCTAssertNil(work.sessionPct)
+        XCTAssertNil(work.weeklyPct)
+        XCTAssertEqual(work.blindActive,
+                       BlindActive(blindSecs: 1380, lastKnownSessionPct: 87, autoProtectionDegraded: true))
+        XCTAssertNil(v.accounts[1].blindActive, "a non-blind account omits the key → nil")
+    }
+
+    // The OK projection decodes with `autoProtectionDegraded == false` (the calm, self-resolving state).
+    func testDecodesBlindActiveOkIsNotDegraded() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBlindActiveOK) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.accounts[0].blindActive,
+                       BlindActive(blindSecs: 240, lastKnownSessionPct: 64, autoProtectionDegraded: false))
+    }
+
     // AC (#516): the daemon-level `canonical_scrub` = `exhausted` rollup decodes — the fleet-wide
     // scrubbed-AND-recovery-exhausted (un-recoverable) state that no per-account `auth` reflects, which
     // #469 renders with the `claude /login` remedy. Byte-pinned to the Rust golden (WireGoldenTests),
