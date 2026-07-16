@@ -22,11 +22,12 @@ use tokio::net::UnixStream;
 
 use super::*;
 
-/// The console line for a swap this cycle, or `None` for any non-swap outcome.
-/// Surfaced to the operator watching the foreground `run` (issue #8) — the file
-/// event log records every cycle separately. Both swap kinds echo: a normal swap
-/// and the #42 emergency swap away from a dead active credential (the latter named
-/// distinctly, since it means a credential just died and the daemon force-rotated).
+/// The console line for a swap or recovery this cycle, or `None` for any other
+/// outcome. Surfaced to the operator watching the foreground `run` (issue #8) — the
+/// file event log records every cycle separately. Three outcomes echo, each named
+/// distinctly: a normal swap; the #42 emergency swap away from a dead active
+/// credential (a credential just died and the daemon force-rotated); and the #467
+/// autonomous recovery that adopts a viable account back into a scrubbed canonical.
 /// Sourced solely from labels, so it can never carry a token or email (issue #15).
 pub(crate) fn swap_report(outcome: &TickOutcome) -> Option<String> {
     match outcome.action {
@@ -44,6 +45,14 @@ pub(crate) fn swap_report(outcome: &TickOutcome) -> Option<String> {
             // cause tells the operator a credential just died and forced this.
             "emergency-swapped off {} onto {} (dead credential)",
             label_at(&outcome.snapshot, from),
+            label_at(&outcome.snapshot, to),
+        )),
+        TickAction::CanonicalAdopted { to } => Some(format!(
+            // The shared canonical was scrubbed/empty (Claude Code's first-`invalid_grant`
+            // scrub, ADR-0018) and the daemon adopted a viable account back into it, healing
+            // every session — issue #467. Named distinctly so the operator sees the autonomous
+            // recovery, with the trailing cause explaining why it fired.
+            "recovered scrubbed canonical onto {} (was Not-logged-in)",
             label_at(&outcome.snapshot, to),
         )),
         _ => None,
@@ -112,6 +121,16 @@ enum Idle {
     /// the poll cadence. Answered INLINE here (not spawned), exactly like `swap`, because the
     /// capture needs the `!Send` daemon seams (ADR-0001).
     CaptureRequested(UnixStream, CaptureCommand),
+    /// A `config-set` control command (#268) asked the daemon to apply tunable + label edits to
+    /// `config.toml`. Carries the still-OPEN connection + the parsed request (moved out of the
+    /// [`ControlYield::ConfigSet`] handoff), so the post-idle applies it where `&mut Daemon` is
+    /// available ([`Daemon::perform_config_set`]) — load→validate→save through the tested
+    /// [`Config::apply_settings`](crate::config::Config::apply_settings), adopting a label change
+    /// live (a tunable change is reload-by-restart) — and writes the redacted ack from the real
+    /// outcome, then re-ticks so `status` reflects a live label change within the poll cadence.
+    /// Answered INLINE here (not spawned), exactly like `swap` / `capture`, because the reconcile
+    /// touches the `!Send` daemon seams (ADR-0001).
+    ConfigSetRequested(UnixStream, Box<ConfigSetCommand>),
     /// The external-login watch (#140) saw the canonical credential change out-of-band
     /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
     /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
@@ -305,6 +324,14 @@ where
                     // reaches here (the label is optional, so there is no malformed-inline case).
                     ControlYield::Capture(stream, command) => {
                         break Idle::CaptureRequested(stream, command)
+                    }
+                    // A `config-set` (#268) breaks the idle to apply the tunable + label edits
+                    // (moving the open stream + parsed request out of the handoff) where `&mut
+                    // daemon` is available, write the redacted ack, then re-tick. The auth +
+                    // malformed rejections were already answered inline in `serve_control`, so only
+                    // an authenticated, well-formed request reaches here.
+                    ControlYield::ConfigSet(stream, command) => {
+                        break Idle::ConfigSetRequested(stream, command)
                     }
                     ControlYield::Signal(None) => continue,
                 },
@@ -644,6 +671,21 @@ where
                 let _ =
                     tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_capture_ack(stream, &ack))
                         .await;
+            }
+            // Perform the authenticated `config-set` control command (#268) where `&mut daemon` is
+            // available: load→validate→save `config.toml` through the tested `Config::apply_settings`,
+            // adopting a label change LIVE (reconcile the in-memory roster, the SAME #139 core) while
+            // a tunable change is reload-by-restart, then write the redacted ack back — BEFORE looping
+            // back to re-tick so `status` reflects a live label change. The ack write is best-effort
+            // and time-boxed (the SAME `SWAP_ACK_WRITE_TIMEOUT`): the ack carries nothing secret, so a
+            // disconnected / wedged client just drops it and can never stall the loop (issue #15).
+            Idle::ConfigSetRequested(stream, command) => {
+                let ack = daemon.perform_config_set(&command).await;
+                let _ = tokio::time::timeout(
+                    SWAP_ACK_WRITE_TIMEOUT,
+                    write_config_set_ack(stream, &ack),
+                )
+                .await;
             }
             // The external-login watch (#140) detected an out-of-band canonical change: just
             // re-tick — the next `tick` reads the canonical and its `reconcile_canonical_change`

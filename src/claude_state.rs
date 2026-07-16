@@ -12,19 +12,25 @@
 //! Only the `oauthAccount` object is read; the rest of the (large) file is
 //! ignored. The object is preserved as its canonical JSON bytes so it can be
 //! written back on restore, and its `accountUuid` (the roster key) is extracted
-//! for the roster. No other field is lifted out: the account is identified by
-//! `accountUuid` plus the operator-chosen label — never `displayName` (which two
-//! distinct accounts can share — `build/version-compat.md`) or `emailAddress`.
+//! for the roster. The account is identified by `accountUuid` plus the
+//! operator-chosen label — never `displayName` (which two distinct accounts can
+//! share — `build/version-compat.md`) or `emailAddress`.
 //!
-//! Nothing here is printed: `oauthAccount` carries the account's email address,
-//! which must never reach an output channel — only the operator-facing *label*
-//! identifies an account (issue #15 redaction). Even the JSON-parse error path
-//! carries only a line/column, never the surrounding bytes.
+//! The account's `emailAddress` is surfaced through exactly one accessor,
+//! [`OauthAccount::email`], for exactly one use: the editable, pre-filled default of
+//! the interactive capture label prompt (#447). It is returned in a `Zeroizing`
+//! buffer and dropped the instant a label is chosen, and the raw address never
+//! reaches an output channel on its own — only a label the operator confirms at that
+//! prompt does, and an authored email label is a provenance-scoped exception (#444)
+//! to the otherwise secret-free surface. Otherwise nothing here is printed: even the
+//! JSON-parse error path carries only a line/column, never the surrounding bytes
+//! (issue #15 redaction).
 
 use std::io::ErrorKind;
 use std::path::Path;
 
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -42,8 +48,8 @@ pub(crate) struct OauthAccount {
     raw: Vec<u8>,
     /// `accountUuid` — the stable per-account identifier and roster key.
     ///
-    /// Deliberately the *only* field extracted: the account is keyed and
-    /// displayed by `accountUuid` + the operator's label, never by `displayName`
+    /// Deliberately the *only* field extracted for the roster: the account is keyed
+    /// and displayed by `accountUuid` + the operator's label, never by `displayName`
     /// (two distinct accounts can share a display name — `build/version-compat.md`)
     /// or `emailAddress` (issue #15 redaction).
     account_uuid: String,
@@ -59,6 +65,34 @@ impl OauthAccount {
     /// The canonical JSON bytes of the `oauthAccount` object, for stashing.
     pub(crate) fn raw_json(&self) -> &[u8] {
         &self.raw
+    }
+
+    /// The account's `emailAddress`, if the identity block carries one — surfaced
+    /// for the SINGLE sanctioned use of the harvested email: the editable,
+    /// pre-filled default of the interactive capture label prompt (issue #447).
+    ///
+    /// Returned in a [`Zeroizing`] buffer so the extracted address is wiped as soon
+    /// as it drops — the capture path holds it only long enough to seed that one
+    /// prompt and drops it once the operator commits a label (#447 AC5). It is never
+    /// printed, logged, or emitted otherwise; the value the operator confirms at the
+    /// prompt is an *operator-authored* label, which the redaction METER permits as a
+    /// provenance-scoped exception (#444) — the raw harvested email itself never
+    /// reaches a channel.
+    ///
+    /// `None` when the block has no non-empty `emailAddress` (only `accountUuid` is
+    /// required); the prompt then has no email default and capture falls back to the
+    /// uuid-derived label ([`crate::capture`]).
+    pub(crate) fn email(&self) -> Option<Zeroizing<String>> {
+        // `raw` is canonical JSON by construction (re-serialized from a parsed
+        // `Value` in `from_object`), so this parse cannot fail in practice; `.ok()?`
+        // degrades to "no email default" rather than panicking on the impossible.
+        let value: Value = serde_json::from_slice(&self.raw).ok()?;
+        value
+            .get("emailAddress")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| Zeroizing::new(s.to_owned()))
     }
 
     /// Build from the bytes of a serialized `oauthAccount` *object* (not the
@@ -232,6 +266,33 @@ mod tests {
         let (_dir, path) = write_temp(json);
         let oauth = read_oauth_account_from(&path).unwrap();
         assert_eq!(oauth.account_uuid(), "u-1");
+    }
+
+    #[test]
+    fn email_surfaces_the_address_for_the_capture_prompt_default() {
+        // #447: the harvested email is offered as the pre-filled label default.
+        let (_dir, path) = write_temp(CLAUDE_JSON);
+        let oauth = read_oauth_account_from(&path).unwrap();
+        assert_eq!(oauth.email().unwrap().as_str(), "person@example.com");
+    }
+
+    #[test]
+    fn email_is_none_when_the_block_carries_no_address() {
+        // `emailAddress` is not required (only `accountUuid` is); no default then,
+        // and capture falls back to the uuid-derived label (#447).
+        let json = r#"{"oauthAccount":{"accountUuid":"u-1"}}"#;
+        let (_dir, path) = write_temp(json);
+        let oauth = read_oauth_account_from(&path).unwrap();
+        assert!(oauth.email().is_none());
+    }
+
+    #[test]
+    fn email_is_none_when_the_address_is_blank() {
+        // A whitespace-only `emailAddress` is not a usable default — treat as absent.
+        let json = r#"{"oauthAccount":{"accountUuid":"u-1","emailAddress":"   "}}"#;
+        let (_dir, path) = write_temp(json);
+        let oauth = read_oauth_account_from(&path).unwrap();
+        assert!(oauth.email().is_none());
     }
 
     #[test]

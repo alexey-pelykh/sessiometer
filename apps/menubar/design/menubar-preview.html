@@ -23,14 +23,21 @@
   term for it, NOT a separate field (the redundant-alias premise is retired: `label` already is the
   operator-chosen name). When an account has no custom label, `label` defaults to its account UUID
   (shown truncated, e.g. a1b2c3… · Claude Code) — still the same field, still on the primary line;
-  there is no separate "handle". The label owns the truncating line; the monogram badge shows its
-  initial (W / P / S). Labels here are ILLUSTRATIVE, not real user data.
+  there is no separate "handle". The label owns the MIDDLE-truncating line (#445: middle, not tail, so a
+  same-local-part label's distinguishing suffix / domain survives the elision); the badge shows a SMART
+  2-char monogram (WO / PE / SC — from the distinguishing token, not `label.first`, so a roster of
+  same-local-part accounts stays legible) over a per-account IDENTITY COLOUR seeded from the label (#445 —
+  in the app a deterministic label→slot hash over a fixed palette; illustrated here for Work/Personal/Scratch).
+  Labels here are ILLUSTRATIVE, not real user data.
 
   Hard invariants honored across ALL 9 states:
     - identifiers minimized — the operator-chosen label leads, provider-only secondary. With no
       custom label the field defaults to the account UUID (e.g. a1b2c3…); the label is never the
       email (the roster stores no email — it lives only in the encrypted credential). No full email renders.
-    - provider-neutral — monochrome monogram badge + plain text label, no brand colour/logo.
+    - provider-neutral — the badge carries a per-account IDENTITY colour + smart 2-char monogram (#445): a
+      generic LOW-CHROMA disambiguation cue (a fixed palette, accent hue excluded), NOT a provider brand
+      colour/logo; plain-text label, and the colour is never colour-alone (always paired with the monogram
+      glyph + the label text — WCAG 1.4.1).
     - capture is a REAL in-app daemon-routed action (#360 — a button + optional label field that sends
       the verb over the #358 control socket and renders an honest pending → done → error from the
       redacted ack; no credential ever reaches the client). `brew upgrade` (version-skew) STAYS a
@@ -152,6 +159,10 @@
     --accent:#007aff; --accent-halo:rgba(0,122,255,.2);
     --accent-tint:rgba(0,122,255,.10); --accent-tint-border:rgba(0,122,255,.2);
     --badge-bg:rgba(120,120,128,.16); --track:rgba(120,120,128,.22);
+    /* #445 per-account identity colours (illustrative Work/Personal/Scratch): low-chroma muted hues, the
+       accent EXCLUDED, monogram glyph a high-contrast neutral ON the fill. A DELIBERATE deviation from the
+       monochrome --badge-bg badge; a generic identity cue, never provider branding (#173). */
+    --id-work-bg:#4e4070; --id-personal-bg:#743a62; --id-scratch-bg:#266058; --id-mono:#f5f5f7;
     --seg-bg:rgba(120,120,128,.12); --seg-border:rgba(0,0,0,.05); --seg-on:#ffffff;
     --btn-bg:rgba(255,255,255,.72); --btn-border:rgba(0,0,0,.14); --code-bg:rgba(120,120,128,.15);
     --ok:#2ba24a; --spark:rgba(60,60,67,.55);
@@ -169,6 +180,9 @@
     --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3);
     --accent-tint:rgba(10,132,255,.16); --accent-tint-border:rgba(10,132,255,.3);
     --badge-bg:rgba(255,255,255,.10); --track:rgba(255,255,255,.14);
+    /* #445 per-account identity colours (dark): the same hues INVERTED to a muted mid-LIGHT tone so a near-
+       black monogram reads on them and they clear the near-black panel (WCAG-AA both themes). */
+    --id-work-bg:#beb0d8; --id-personal-bg:#daa8c8; --id-scratch-bg:#94ccc2; --id-mono:#1c1c1e;
     --seg-bg:rgba(255,255,255,.08); --seg-border:rgba(255,255,255,.06); --seg-on:rgba(255,255,255,.18);
     --btn-bg:rgba(255,255,255,.10); --btn-border:rgba(255,255,255,.16); --code-bg:rgba(255,255,255,.10);
     --ok:#30d158; --spark:rgba(235,235,245,.5);
@@ -208,6 +222,13 @@
     background:var(--badge-bg); color:var(--text-2);
     font-size:13px; font-weight:700; letter-spacing:.03em; font-variant-numeric:tabular-nums;
   }
+  /* #445 per-account identity colour + smart 2-char monogram. Seeded from the account `label` (a fixed
+     low-chroma palette, accent hue excluded); ALWAYS paired with the monogram glyph + the label text, never
+     colour-alone (WCAG 1.4.1). In the app the palette is a deterministic label→slot hash over ~8 hues; these
+     three are the mock's illustrative Work/Personal/Scratch. The base `.badge` neutral stays the fallback. */
+  .badge.id-work{ background:var(--id-work-bg); color:var(--id-mono) }
+  .badge.id-personal{ background:var(--id-personal-bg); color:var(--id-mono) }
+  .badge.id-scratch{ background:var(--id-scratch-bg); color:var(--id-mono) }
   .id-meta{ flex:1 1 auto; min-width:0 }
   .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
@@ -224,6 +245,14 @@
     color:var(--text-2); background:var(--badge-bg); padding:1.5px 7px; border-radius:5px;
   }
   .health{ display:inline-flex; color:var(--ok) }
+  /* per-row manual-switch chip (#448 — persistent quiet, brightens when armed): #169's per-row swap made
+     DISCOVERABLE at rest. Neutral --text-3 at rest (never accent — the one accent action is the footer Swap,
+     Von Restorff), brightening to --text-2 when the row is armed (hover / focus). No wash / cursor at rest,
+     so it reads as a quiet HINT, not a loud control; the active row (not a switch target) omits it. Mirrors
+     SwiftUI `StatusPanelFormat.switchChipEmphasis` → `.tertiary` (rest) / `.secondary` (armed). */
+  .rowact{ flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; color:var(--text-3) }
+  .acct:hover .rowact{ color:var(--text-2) }   /* armed on hover (the steady state is the quiet rest above) */
+  .rowact.armed{ color:var(--text-2) }          /* explicit armed modifier (preview the brighten statically) */
 
   .meters{ margin-top:9px; display:grid; gap:6px }
   .meter{ display:grid; grid-template-columns:52px 1fr 40px 52px; align-items:center; column-gap:9px }
@@ -459,7 +488,7 @@
     <p class="lede">
       The macOS status-bar popover across <b>every launch-or-attach state</b>, at true <b>380&nbsp;px</b> width, in the
       native macOS language &mdash; vibrancy, meters, drawn sparklines, label-primary identity. Each state is a
-      <b>distinct icon-shape + panel message + affordance</b>; the menubar never renders healthy on a degraded daemon.
+      <b>distinct panel message + affordance</b> under the shared <b>4-state glance glyph</b> (#524); the menubar never renders healthy on a degraded daemon.
       A visual build-reference for the SwiftUI panel (#168/#169) &mdash; it does not port to code.
     </p>
   </header>
@@ -474,10 +503,10 @@
           <svg width="16" height="13" viewBox="0 0 16 13" fill="none"><rect x="1" y="1.5" width="8" height="3.2" rx="1.6" stroke="currentColor" stroke-width="1.1"/><circle cx="3" cy="3.1" r="1" fill="currentColor"/><rect x="1" y="7.8" width="8" height="3.2" rx="1.6" stroke="currentColor" stroke-width="1.1"/><circle cx="7" cy="9.4" r="1" fill="currentColor"/></svg>
         </span>
         <span class="mb-sess" title="Sessiometer — icon-only glance, shape-coded per state (no live %)">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <circle cx="12" cy="15.6" r="1.7" fill="currentColor"/>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/>
+            <path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/>
+            <path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/>
           </svg>
         </span>
         <span class="mb-clock">9:41</span>
@@ -487,7 +516,7 @@
     <div class="stage-cap">
       <span>The glance is <b>icon-only</b>, shape-coded &mdash; click the gauge and the popover renders the <b>same detail as the <code style="font-family:ui-monospace,'SF Mono',Menlo,monospace">status</code> verb</b></span>
       <span class="dotsep">&middot;</span>
-      <span>each frame&rsquo;s caption glyph is that state&rsquo;s menubar shape</span>
+      <span>each frame&rsquo;s caption glyph is that state&rsquo;s menu-bar shape &mdash; the <b>4-state attention axis</b> (#524: &#10003; healthy &middot; &hellip; connecting &middot; ! attention &middot; &#8709; no-runway), so several panel states share one glance glyph</span>
       <span class="dotsep">&middot;</span>
       <span>healthy shown in both themes; degraded states in Light with Dark spot-checks &mdash; the theme tokens apply <b>uniformly</b> to every state</span>
     </div>
@@ -505,13 +534,13 @@
       <!-- STATUS · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Status &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
               <span class="seg"><button class="on">Status</button><button>Stats</button></span>
             </div>
@@ -521,7 +550,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -534,9 +563,9 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
@@ -547,9 +576,9 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
@@ -573,13 +602,13 @@
       <!-- STATUS · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Status &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
               <span class="seg"><button class="on">Status</button><button>Stats</button></span>
             </div>
@@ -588,7 +617,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -600,9 +629,9 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
@@ -612,9 +641,9 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
@@ -638,13 +667,13 @@
       <!-- STATS · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Stats &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Usage stats &middot; last 7 days</span></span>
               <span class="seg"><button>Status</button><button class="on">Stats</button></span>
             </div>
@@ -653,7 +682,7 @@
               <div class="stat active">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
                   <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
@@ -667,7 +696,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
                   <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
@@ -681,7 +710,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
                   <span class="signal underused"><span class="sig-dot"></span>underused</span>
@@ -711,13 +740,13 @@
       <!-- STATS · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
           Healthy &middot; Stats &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Usage stats &middot; last 7 days</span></span>
               <span class="seg"><button>Status</button><button class="on">Stats</button></span>
             </div>
@@ -726,7 +755,7 @@
               <div class="stat active">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
                   <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
@@ -740,7 +769,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
                   <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
@@ -754,7 +783,7 @@
               <div class="stat">
                 <div class="stat-head">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
                   <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
                   <span class="signal underused"><span class="sig-dot"></span>underused</span>
@@ -792,13 +821,13 @@
       <!-- 2 · DAEMON-STARTING · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="2.4 3.2"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 6 12 A 1.5 1.5 0 1 0 9 12 A 1.5 1.5 0 1 0 6 12 Z"/><path d="M 10.5 12 A 1.5 1.5 0 1 0 13.5 12 A 1.5 1.5 0 1 0 10.5 12 Z"/><path d="M 15 12 A 1.5 1.5 0 1 0 18 12 A 1.5 1.5 0 1 0 15 12 Z"/></svg>
           Daemon-starting &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Connecting to the daemon&hellip;</span></span>
             </div>
             <div class="div"></div>
@@ -818,13 +847,13 @@
       <!-- 3 · NOT-RUNNING · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Not-running &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon offline</span></span>
             </div>
             <div class="div"></div>
@@ -844,13 +873,13 @@
       <!-- 3 · NOT-RUNNING · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 3.5V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 6.6a7.5 7.5 0 1 0 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Not-running &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon offline</span></span>
             </div>
             <div class="div"></div>
@@ -870,13 +899,13 @@
       <!-- 4 · CRASH-LOOPING · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 4.2L21 19.8a1.3 1.3 0 0 1-1.1 2H4.1a1.3 1.3 0 0 1-1.1-2z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17.7" r="1.15" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Crash-looping &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Daemon fault</span></span>
             </div>
             <div class="div"></div>
@@ -905,13 +934,13 @@
       <!-- 5 · UDS-DROP / DISCONNECTED · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="5" cy="12" r="2.6" stroke="currentColor" stroke-width="2"/><circle cx="19" cy="12" r="2.6" stroke="currentColor" stroke-width="2"/><path d="M8 12h2.4M13.6 12H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Disconnected &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; last-known</span></span>
             </div>
             <div class="pop-strip disconnected">
@@ -923,7 +952,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
@@ -935,7 +964,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
@@ -947,7 +976,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
@@ -968,13 +997,13 @@
       <!-- 7 · STALE-SNAPSHOT · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.8" stroke="currentColor" stroke-width="2"/><path d="M12 6.8V12l3.4 2.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Stale-snapshot &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active &middot; <span class="sub-stale">stale 6m</span></span></span>
               <span class="seg"><button class="on">Status</button><button>Stats</button></span>
             </div>
@@ -983,7 +1012,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -995,9 +1024,9 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
@@ -1007,9 +1036,9 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
@@ -1041,13 +1070,13 @@
       <!-- 6 · KEYCHAIN-LOCKED · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.3" r="1.5" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></svg>
           Keychain-locked &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
             </div>
             <div class="pop-strip paused">
@@ -1058,7 +1087,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health locked"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span></span>
                 </div>
@@ -1070,7 +1099,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1082,7 +1111,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1108,13 +1137,13 @@
       <!-- 6 · KEYCHAIN-LOCKED · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="4.5" y="10.5" width="15" height="10" rx="2.4" stroke="currentColor" stroke-width="2"/><path d="M7.8 10.5V7.8a4.2 4.2 0 0 1 8.4 0v2.7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.3" r="1.5" fill="currentColor"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></svg>
           Keychain-locked &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
             </div>
             <div class="pop-strip paused">
@@ -1125,7 +1154,7 @@
               <div class="acct active">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">W</span>
+                  <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
                   <span class="id-trail"><span class="tag">Active</span><span class="health locked"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span></span>
                 </div>
@@ -1137,7 +1166,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">P</span>
+                  <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1149,7 +1178,7 @@
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
-                  <span class="badge">S</span>
+                  <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
                   <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
@@ -1175,13 +1204,13 @@
       <!-- 8 · VERSION-SKEW · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M5 4.5h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 21V9.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M6.8 14.2L12 9l5.2 5.2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Version-skew &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Version mismatch</span></span>
             </div>
             <div class="div"></div>
@@ -1213,13 +1242,13 @@
       <!-- 9 · EMPTY-ROSTER / FIRST-RUN · LIGHT -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Empty-roster &middot; Light
         </div>
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Welcome</span></span>
             </div>
             <div class="div"></div>
@@ -1245,13 +1274,13 @@
       <!-- 9 · EMPTY-ROSTER / FIRST-RUN · DARK -->
       <div class="frame">
         <div class="fcap">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="3.6" y="3.6" width="16.8" height="16.8" rx="4.6" stroke="currentColor" stroke-width="2"/><path d="M12 8.4v7.2M8.4 12h7.2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
           Empty-roster &middot; Dark
         </div>
         <div class="pop-wrap">
           <div class="pop theme-dark">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Welcome</span></span>
             </div>
             <div class="div"></div>
@@ -1283,7 +1312,7 @@
         <div class="pop-wrap">
           <div class="pop theme-light">
             <div class="pop-head">
-              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4.5 17.5a9 9 0 1 1 15 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 15.6l4-5.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="15.6" r="1.7" fill="currentColor"/></svg></span>
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
               <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">Capture affordance &middot; states</span></span>
             </div>
             <div class="div"></div>
@@ -1310,7 +1339,9 @@
       <li><b>Blocked states are honest and non-intrusive.</b> <b>Keychain-locked</b> keeps the fresh roster but marks the active account with an <i>orange at-risk</i> lock &mdash; the refresh path is broken while the token may still work, so it outranks a mere amber <i>stale</i> mark (🟡&nbsp;&lt;&nbsp;🟠, the CLI&rsquo;s ladder) &mdash; pauses the swap callout, and only <i>waits</i>: the app never prompts or auto-unlocks. <b>Version-skew</b> refuses to render any % and offers a copy-command instead.</li>
       <li><b>Capture is a real action; copy-command only where the app can&rsquo;t act.</b> <b>First-run / empty-roster onboarding</b> <b>captures</b> the active account in-app (#360) &mdash; a button + optional label field that sends the verb over the #358 control socket and renders an honest <i>pending &rarr; done &rarr; error</i> from the redacted ack (no credential ever reaches the client). It is an <i>onboarding</i> affordance: a populated panel carries no capture bar, so the steady state stays a read-only glance and adding an account lives off-panel. The captured row then arrives on its own via the live watch stream &mdash; the affordance never inserts it. To add a <i>different</i> account the operator runs <code>claude /login</code> first, then captures (capture snapshots the active account; it is not a picker). Only where the app genuinely can&rsquo;t act does it still copy a command: version-skew&rsquo;s <b>Copy update command</b> (<code>brew upgrade sessiometer</code>). <b>daemon-starting</b> stays a <i>static</i> forming glyph &mdash; the app fakes no progress it isn&rsquo;t doing.</li>
       <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
-      <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each provider gets the same monochrome monogram badge and a plain text label (no brand colour or logo). The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
+      <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each account gets a per-account IDENTITY colour + smart monogram (a generic, low-chroma disambiguation cue &mdash; #445 below) and a plain text label, never a brand colour or logo. The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
+      <li><b>Same-local-part accounts stay distinguishable (#445).</b> A roster of accounts sharing a local-part (<code>work-alice</code>, <code>work-bob</code>, …) would collapse to one badge letter under <code>label.first</code> + tail-truncation. The disambiguation kit restores legibility with THREE cues, none alone sufficient: a per-account <b>colour</b> (a fixed low-chroma palette, <b>accent hue excluded</b>, seeded client-side from the wire <code>label</code> &mdash; the one identity handle, R-2; there is no <code>account_uuid</code> on the wire), a smart <b>2-char monogram</b> from the label's distinguishing token (collision-escalating, so two similar labels never share a pair), and <b>middle-</b>truncation (not tail) so the distinguishing suffix / domain survives elision. The colour is <b>never colour-alone</b> &mdash; always paired with the monogram glyph + the label text (WCAG 1.4.1) &mdash; and clears WCAG-AA in both themes (badge fill &ge;3:1, monogram &ge;4.5:1). The per-account colour is a <b>deliberate deviation</b> from this mock's former monochrome badge; a faithful real-popover screenshot vs this updated oracle (both themes) + an owner eyeball is the pre-lock check (render re-baseline is #440).</li>
+      <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
       <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges, the orange at-risk lock and the amber stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>
     </ul>

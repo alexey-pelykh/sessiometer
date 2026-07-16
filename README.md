@@ -44,7 +44,9 @@ accounts is permitted under them.
 
 ```sh
 # 1. Capture each account's credential. Sign in to the account in Claude Code,
-#    then stash its current credential:
+#    then stash its current credential. At a terminal, `capture` offers the
+#    account's email as an editable label default — press Enter to keep it, or
+#    type a shorter handle like `work`. Pass `capture <label>` to skip the prompt.
 sessiometer capture
 
 # 2. Run the foreground daemon. It polls usage and swaps the active credential
@@ -205,7 +207,7 @@ next swap: spare
 The **`next swap:`** footer names the account the daemon would rotate to next — the
 viable target whose weekly quota resets soonest. When no other account is a sound swap
 destination — every one is weekly-exhausted, session-saturated (over its swap-away
-session trigger), over the swap-target `target_max_usage` reserve, or quarantined (out
+session trigger), over the swap-target `target_max_session_usage` reserve, or quarantined (out
 of rotation until it recovers) — it names *why*, so a stranded operator sees the real
 blocker and when it lifts rather than a content-free "none": a weekly-exhausted fleet
 reads `none — every account is weekly-exhausted; resets in ⟨when⟩ — add an account` (a
@@ -262,7 +264,8 @@ sessiometer status --json | jq '.accounts[] | {label, session_resets_at}'
 ```
 
 The output is sourced solely from non-secret fields (labels, percentages, reset
-instants, a next-swap candidate label), so it never prints a token or email (issue #15).
+instants, a next-swap candidate label), so it never prints a token or an *unauthored*
+email (issue #15; an operator-authored email label may appear — #444).
 
 For each account's raw **access-token expiry**, pass `-v` (or `--verbose`):
 
@@ -288,7 +291,8 @@ the 🔴 `claude /login` cue in the `AUTH` column. The raw clock is kept out of 
 table (where it would be misread as a deadline); `--verbose` is the opt-in for it in the
 text view, mirroring `--json`, which already carries the raw `access_expires_at` for every
 account. Like the table, the block is content (it survives a pipe), never colored, and
-sourced only from non-secret fields, so it never prints a token or email (issue #15).
+sourced only from non-secret fields, so it never prints a token or an *unauthored* email
+(issue #15; an operator-authored email label may appear — #444).
 
 ## Listing accounts (offline)
 
@@ -321,12 +325,14 @@ keychain) drops the expiry, and an account the refresh tick has never touched dr
 the refresh tag — so a config-only roster reads as the plain `label` + `uuid` view.
 The reads are **daemon-independent and read-only**: no daemon, no `/usage` call, no
 live refresh, and — like `status` — only non-secret fields (a timestamp-derived
-duration and a bare outcome token), never a token or email (issue #15).
+duration and a bare outcome token), never a token or an *unauthored* email (issue #15;
+an operator-authored email label may appear — #444).
 
 ## Watching the daemon (diagnostics)
 
 `run` writes to two operator-facing channels, neither of which ever carries a
-token or email (issue #15):
+token or an *unauthored* email (issue #15; an operator-authored email label may
+appear — see below):
 
 - **The event log** — durable, edge-triggered STATE CHANGES (a swap, a re-stash, a
   dead credential, entering the all-exhausted state, …), one `key=val` line each,
@@ -338,9 +344,13 @@ token or email (issue #15):
 The event log — and the `-v` diagnostic channel — identify accounts by their
 **`label`**, written **verbatim** as the account handle (e.g. `event=swap from=…
 to=…`, `diag=poll account=…`). It is the one operator-chosen, free-form field on
-the durable surface, so keep every label a **non-PII nickname** (`work`, `spare`),
-never an email or username: the secret-free-by-construction guarantee (issue #15)
-extends to the label only while it stays PII-free. Labels are set at
+the durable surface. The label may be the account's **email** — `capture` pre-fills
+the harvested address as an editable default (#447), and an operator-authored email
+is permitted verbatim (a *provenance-scoped* waiver: you chose it, so it is not a
+leak — #444) — or any **nickname** you prefer (`work`, `spare`); a non-PII nickname
+remains a fine choice, no longer a requirement. What still holds unconditionally: no
+token, and no *unauthored* email (a stranger's address, a credential spill) ever
+reaches this surface (issue #15). Labels are set at capture time or
 [`sessiometer login <label>`](#logging-in--re-authenticating).
 
 Pass `-v` (or `--verbose`) to opt into the diagnostic channel:
@@ -355,7 +365,7 @@ per-tick decision and any back-off, plus the daemon's start (with the effective
 config), its stop, and the moment it **leaves** the all-exhausted state:
 
 ```text
-ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 target_max_usage=80 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
+ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 target_max_session_usage=80 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
 ts=2026-06-30T00:00:00Z diag=poll account=work outcome=rate_limited
 ts=2026-06-30T00:00:00Z diag=tick decision=skip_active_unavailable backoff_secs=120
 ts=2026-06-30T00:00:30Z diag=poll account=work outcome=live
@@ -363,7 +373,7 @@ ts=2026-06-30T00:00:30Z diag=tick decision=hold
 ```
 
 When a `429` carries a `Retry-After`, the `tick` line adds `retry_after_secs=<n>`
-— the raw server-advised wait (delta-seconds, **before** the ~1 h cap) — so you
+— the raw server-advised wait (delta-seconds), **before** any daemon cap — so you
 can **place the back-off's source** (issue #295) by comparing it to `backoff_secs`:
 
 - **no `retry_after_secs`** — the server advised nothing; the wait is the daemon's
@@ -371,14 +381,20 @@ can **place the back-off's source** (issue #295) by comparing it to `backoff_sec
 - **`retry_after_secs` == `backoff_secs`** — the **server-advised** wait governed.
 - **`retry_after_secs` < `backoff_secs`** — the server advised a smaller floor, but
   the daemon's larger **self-capped** exponential governed the wait.
-- **`retry_after_secs` > `backoff_secs`** — the server advised more than the wait:
-  the ~1 h cap clamped a pathological value, which a bare `backoff_secs=3600` alone
-  could never tell you:
+- **`retry_after_secs` > `backoff_secs`** — a **non-active** account only: the server
+  advised more than the wait, so the ~1 h cap clamped a pathological value, which a
+  bare `backoff_secs=3600` alone could never tell you:
 
 ```text
-ts=2026-06-30T00:02:00Z diag=poll account=work outcome=rate_limited
-ts=2026-06-30T00:02:00Z diag=tick decision=skip_active_unavailable backoff_secs=3600 retry_after_secs=86400
+ts=2026-06-30T00:02:00Z diag=poll account=spare outcome=rate_limited
+ts=2026-06-30T00:02:00Z diag=tick decision=hold backoff_secs=3600 retry_after_secs=86400
 ```
+
+The **active** account is the exception (issue #453): its `Retry-After` is an
+**un-clamped floor** — the daemon never re-polls before it — and its self-backoff
+caps far tighter (**120 s**, not the ~1 h peer ceiling), recovering observability
+fast after a throttle. So `retry_after_secs > backoff_secs` never appears for the
+active account; a large server value governs it in full (the `==` case above).
 
 Both channels carry handles, enums, percentages, and timestamps only — and a CI
 redaction meter scans every rendered line of each (issues #9, #15, #77).
@@ -495,11 +511,15 @@ sessiometer login spare
 ```
 
 The optional `<label>` names a **new** account — omit it and the label is
-auto-derived from the account's `account_uuid` (exactly as `capture`); a re-login of
-an already-rostered account keeps its existing label unless you pass a new one.
-Pick a **non-PII nickname** (`work`, `spare`), never an email or username — the
-label is written verbatim into the daemon's durable
-[event log](#watching-the-daemon-diagnostics) (issue #15).
+auto-derived from the account's `account_uuid` (exactly as non-interactive
+`capture`); a re-login of an already-rostered account keeps its existing label
+unless you pass a new one. Name it with the account's **email** or any **nickname**
+you prefer (`work`, `spare`): the label is written verbatim into the daemon's durable
+[event log](#watching-the-daemon-diagnostics), so an operator-authored email is
+permitted (a *provenance-scoped* waiver — #444) while an unauthored one never appears
+(issue #15). A non-PII nickname stays a fine option, no longer a requirement.
+(`login` takes the label as an explicit argument; the editable email pre-fill is
+`capture`'s interactive prompt — #447.)
 `login` needs a real terminal and the `claude` binary on your `PATH` (or
 `$CLAUDE_BIN`); tune its timeout in the [`[login]`](#login) block. On success it
 prints one redacted line — `Onboarded` (new) or `Revived` (existing); an unfinished
@@ -557,6 +577,9 @@ accounts = []             # parked accounts by `list` label or account-uuid; [] 
 cadence_secs = 3600       # seconds between ticks AND the near-expiry horizon (60..=86400)
 idle_after_secs = 60      # idle seconds (no poll/swap) required before a refresh fires (0..=3600)
 timeout_secs = 90         # whole-cycle bound for one account's refresh (10..=600)
+proactive_keep_warm = false  # pre-emptively refresh the ACTIVE token before expiry; off by default
+                             # (it rotates the live shared credential each cadence) — the active
+                             # account is instead kept warm reactively on a 401. See below.
 # claude_bin = "/absolute/path/to/claude"   # overrides $CLAUDE_BIN/$PATH; omit to resolve normally
 ```
 
@@ -588,27 +611,38 @@ each account's *stash*, and rotating the active token there would strand the fre
 value where no live session reads it. But an idle machine left overnight can let the
 active token lapse and, on the next poll, a `401` is mistaken for a dead credential —
 starting a false-death logout cascade. To close that gap, whenever `[refresh]` is
-enabled the daemon **also keeps the active account's canonical token warm in place**:
+enabled the daemon **also keeps the active account's canonical token warm in place** —
+**reactively by default, and proactively when you opt in**:
 
-- **Proactively** — before the active token nears expiry, the daemon mints a fresh
-  token (the same isolated spawn the parked sweep uses, on a *copy* of the canonical
-  blob) and **promotes it to the canonical `Claude Code-credentials` item** a live
-  session actually reads — so the token is refreshed *ahead* of any `401`.
-- **As a reactive backstop** — if the active account does return a `401` with a still-
-  live refresh token, the daemon refreshes it in place and re-polls **before** the
+- **As a reactive backstop (default)** — if the active account returns a `401` with a
+  still-live refresh token, the daemon refreshes it in place and re-polls **before** the
   `401` counts toward the dead-credential streak. Only a genuinely dead credential (an
   empty refresh token, or a refresh that reports `dead`) advances the streak — so a
   truly-dead active account still quarantines and the emergency swap to a live spare is
-  preserved.
+  preserved. This is the layer that prevents active-token expiry mid-use.
+- **Proactively (opt-in, `proactive_keep_warm = true`, off by default)** — before the
+  active token nears expiry, the daemon mints a fresh token (the same isolated spawn the
+  parked sweep uses, on a *copy* of the canonical blob) and **promotes it to the canonical
+  `Claude Code-credentials` item** a live session reads — refreshing it *ahead* of any
+  `401`. This is **off by default** because it rotates the live shared credential on every
+  cadence, and that churn is a window for a rare multi-writer credential scrub; the reactive
+  backstop above (plus the daemon's autonomous recovery of a scrubbed credential) covers an
+  actively-used account without it. Enable it if you want the active token refreshed ahead
+  of expiry rather than on the first `401`. (See
+  [`docs/findings/0476`](docs/findings/0476-keep-warm-scrub-risk-tradeoff.md) for the
+  churn-vs-scrub tradeoff behind this default.)
 
 The in-place canonical write is serialized against account swaps (the same single-
 writer lock, an atomic keychain update, re-checked each cycle), so it can never tear a
 swap. Each account's keep-warm timing is **staggered** by a stable per-account offset,
 so a roster that logged in together does not all reach expiry — and refresh — in
-lockstep. This needs no extra configuration: it shares the `[refresh].enabled` switch
-and reuses `cadence_secs` as its near-expiry horizon. Every keep-warm firing is logged
-as a redacted `event=keep_warm` line (`trigger=proactive`/`reactive`, the classified
-outcome, and whether the refresh token rotated), never a token or email.
+lockstep. The reactive backstop needs no extra configuration — it rides the
+`[refresh].enabled` switch; the proactive layer is the one opt-in
+(`proactive_keep_warm = true`) and reuses `cadence_secs` as its near-expiry horizon.
+Every keep-warm firing is logged as a redacted `event=keep_warm` line
+(`trigger=proactive`/`reactive`, the classified outcome, and whether the refresh token
+rotated), never a token or an *unauthored* email (an operator-authored email label may
+appear — #444).
 
 ## Configuration
 
@@ -632,10 +666,11 @@ The primary hand-editable block — the poll cadence and the swap thresholds.
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `poll_secs` | Seconds between re-polling a given account — the per-account cadence and the base of the rate-limit back-off. | `5..=3600` | `300` |
+| `exhausted_poll_secs` | Widened re-poll cadence for an **out-of-rotation** peer — one that is weekly- or session-exhausted. Its usage can only change when its server-side window resets (a time the daemon already knows) or on a rare out-of-band reset, so re-polling it every `poll_secs` wastes a request; this is the **ceiling** of its slow-poll window, pulled **earlier** when a known reset lands sooner. The **active** account is never slow-polled. | `poll_secs..=86400` | `3600` |
 | `cooldown_secs` | Seconds to wait after a swap before another is allowed — the swap-pacing floor. Tunable **above** a non-zero minimum but never down to zero, so rapid-fire account flapping can't be configured on. | `5..=3600` | `60` |
 | `session_trigger` | Swap **away** from the active account at or above this session-usage percent. | `50..=99` | `95` |
 | `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
-| `target_max_usage` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent — the most-full a target may be to receive the active session, so it keeps runway. *Raising* it toward `session_trigger` admits busier targets (equal is inert); `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_trigger`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_trigger` | `80` |
+| `target_max_session_usage` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent — the most-full a target may be to receive the active session, so it keeps runway. *Raising* it toward `session_trigger` admits busier targets (equal is inert); `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_trigger`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_trigger` | `80` |
 | `monitor_401_n` | Consecutive non-scope `401`s before an account is treated as dead and quarantined. | `1..=20` | `3` |
 | `monitor_recovery_m` | Consecutive recovery-probe successes before a quarantined account whose own token recovers (without a re-login) is returned to the rotation. | `1..=20` | `2` |
 
@@ -701,7 +736,7 @@ $ sessiometer config validate
 `config validate` parses and validates the file **without running** — the same checks the
 daemon applies at load. It reports the documented error classes and exits non-zero on any
 of them, so it drops into a pre-flight check: a typo'd/unknown key (e.g. `poll_secss`), an
-out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_usage > session_trigger`.
+out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_session_usage > session_trigger`.
 
 ```console
 $ sessiometer config show --origin
@@ -765,7 +800,7 @@ restores on another Mac.
 An artifact embeds the config **text**, so a tunable that was absent when the artifact
 was written is absent on import, and takes **today's** default — not the default that
 was in force at export time. This is the same absent-key rule the config file follows
-everywhere. It is worth knowing for artifacts exported before `target_max_usage` became a
+everywhere. It is worth knowing for artifacts exported before `target_max_session_usage` became a
 default-on `80` (issue #398): they import with the reserve **on**, where the original
 machine ran with it off.
 
@@ -841,7 +876,7 @@ owned by you:
 |----------|-------|----------|
 | `~/Library/Application Support/sessiometer/config.toml` (or `$XDG_CONFIG_HOME/sessiometer/config.toml`) | The **roster** — `[[account]]` labels and `account_uuid`s pointing at the keychain stashes — plus the tunables | **No** — the roster references stashes; the credential blobs stay in the keychain |
 | `~/Library/Application Support/sessiometer/` | The daemon's runtime files: `daemon.lock`, `daemon.sock` (control socket), `swap.lock`, the usage store (`usage-samples.jsonl`, `usage-rollup.json`), and the ephemeral `refresh/` and `login/` isolation directories | No |
-| `~/Library/Logs/sessiometer/sessiometer.log` | The event log — durable state changes | No — every line passes a CI redaction check; never a token or email |
+| `~/Library/Logs/sessiometer/sessiometer.log` | The event log — durable state changes | No — every line passes a CI redaction check; never a token or an *unauthored* email (an operator-authored email label may appear — #444) |
 
 The config directory is `$XDG_CONFIG_HOME/sessiometer` when `$XDG_CONFIG_HOME` is
 set, otherwise `~/Library/Application Support/sessiometer`; the daemon's runtime
@@ -980,6 +1015,33 @@ raise [`poll_secs`](#configuration) or keep the roster smaller by choice.
 cargo build --release
 ./target/release/sessiometer --help
 ```
+
+### Install with Homebrew (CLI / headless channel)
+
+The [`Formula/sessiometer.rb`](Formula/sessiometer.rb) Homebrew formula builds the
+crate from source and installs the `sessiometer` CLI + daemon — the headless,
+scripting channel for terminal and automation use. It is locally compiled, with no
+notarization or code-signing; those belong to the parallel GUI channel — the notarized
+`.app` (#171: sign + notarize + staple) delivered as a Homebrew cask (#172), not yet
+shipped. This channel is off that critical path.
+
+The crate is still pre-release (no tagged release yet), so install the formula from
+`HEAD` (the `main` branch):
+
+```sh
+brew install --HEAD --build-from-source ./Formula/sessiometer.rb
+```
+
+That compiles the crate at the repo root — with the committed `Cargo.lock`, via
+`--locked`, for a reproducible build — and puts `sessiometer` on your `PATH`. From
+there the swap/monitor loop runs headless: `sessiometer run` for a foreground daemon,
+or `sessiometer service install` to keep one running at login (see
+[Quickstart](#quickstart)). Once a stable release is tagged, the formula gains a
+`url` + `sha256` stanza and also installs without `--HEAD`.
+
+> **Unofficial.** `sessiometer` is not affiliated with or endorsed by Anthropic (see the
+> [notice at the top of this README](#sessiometer)) and is distributed under the
+> [MIT license](LICENSE). "Claude Code" is referenced only nominatively.
 
 The macOS menu-bar app lives in [`apps/menubar/`](apps/menubar/) — a Swift/XcodeGen
 sibling to the Rust crate at the repo root, not a Cargo workspace member (see

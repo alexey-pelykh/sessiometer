@@ -50,6 +50,28 @@ pub(crate) struct StatusSnapshot {
     /// `Default` (an all-defaults snapshot reads as healthy). A COUNT only — never a token,
     /// path, or email (the #15 discipline).
     pub(crate) systemic_refresh: Option<u32>,
+    /// The daemon-level CANONICAL-SCRUB rollup (issue #516): `Some(Recovering | Exhausted)` while the
+    /// shared canonical item is scrubbed, else `None` when healthy. Computed in [`Daemon::snapshot`]
+    /// from the edge-latched scrub signals (`signaled_canonical_scrubbed` / `signaled_scrub_adopt_exhausted`);
+    /// [`status_response`] copies it straight onto the wire. `None` by `Default` (an all-defaults
+    /// snapshot reads as healthy). A STATE discriminant only — never a token or email (the #15 discipline).
+    pub(crate) canonical_scrub: Option<CanonicalScrub>,
+    /// The daemon-level KEYCHAIN-LOCKED rollup (issue #498): `true` while the macOS login keychain is
+    /// LOCKED, so the daemon cannot READ the shared credential item at ALL (access denied) — distinct
+    /// from `canonical_scrub`, where the item IS readable but its token was scrubbed/emptied (#469/#463).
+    /// Computed in [`Daemon::snapshot`] from the edge-latched `signaled_keychain_locked` signal;
+    /// [`status_response`] copies it straight onto the wire. `false` by `Default` (an all-defaults
+    /// snapshot reads as unlocked/healthy). A bare BINARY state discriminant — never a token or email
+    /// (the #15 discipline). The remedy the operator sees (unlock the keychain) is the surfacing
+    /// consumer's concern (the menubar #498 card), NOT this wire increment's.
+    pub(crate) keychain_locked: bool,
+    /// A just-fired #452 bounded-blindness preemptive swap to NARRATE (issue #479), or `None` when
+    /// no such swap is recent-and-still-current. Resolved daemon-side in [`Daemon::snapshot`] from the
+    /// retained `last_blind_preempt_swap` record, projected `Some` only within the
+    /// `BLIND_PREEMPT_NOTICE_SECS` window AND while the swap's target is still the active account (a
+    /// superseding swap self-invalidates it); [`status_response`] copies it straight onto the wire.
+    /// `None` by `Default`.
+    pub(crate) recent_blind_preempt_swap: Option<BlindPreemptSwap>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -74,6 +96,88 @@ pub(crate) struct RefreshHealth {
     /// Consecutive refresh FAILURES (`dead` / `error` outcomes), reset to 0 by the next
     /// alive refresh — the rollup's at-risk input.
     pub(crate) consecutive_failures: u32,
+}
+
+/// The active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) — present only
+/// when the active account has gone blind (its `/oauth/usage` poll is failing / backing off, so its
+/// live reading is cleared) AND the daemon still holds a retained pre-blind anchor (`last_good`,
+/// #450). Surfaced so `status` renders a SEMANTIC line — blind duration, last-known session %, and
+/// whether ADR-0017 auto-protection is OK or DEGRADED — instead of the content-free `n/a … 🟡` a
+/// bare failed-poll row shows. The surface only REFLECTS this daemon-pushed state; it never
+/// self-polls or self-swaps (the #169 UI-never-acts invariant). Non-secret — a duration and two
+/// small numbers, never a token or email (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BlindActive {
+    /// Seconds the active account has been blind — `blind_elapsed`, measured from the retained
+    /// pre-blind anchor's observation instant (`last_good.at`, #450) to snapshot assembly on the
+    /// daemon's MONOTONIC clock (the SAME clock #452's gate and the swap cooldown use). A DURATION
+    /// (not an absolute instant, which an [`std::time::Instant`] cannot cross the socket as), so the
+    /// client renders it verbatim against nothing.
+    pub(crate) blind_secs: u64,
+    /// The retained pre-blind SESSION-window usage percent (`0..=100`) the anchor holds
+    /// (`last_good.session`, #450) — the last-known reading before the account went blind. This is
+    /// why the row stops reporting "no data": the daemon DID retain a reading.
+    pub(crate) last_known_session_pct: u8,
+    /// Whether ADR-0017 preemptive auto-protection is DEGRADED — the gate is armed but acting on a
+    /// STALE anchor: `blind_secs > BLIND_GATE_SECS` AND the anchor sat at/over `BLIND_GATE_RISK_BAND`
+    /// (the gate's first two ADR-0017 conditions, mirroring [`Daemon::note_blind_gate_eligibility`]
+    /// exactly). `false` = OK: the account is blind, but not yet past the gate threshold, or the
+    /// anchor sat below the risk band — auto-protection is nominally intact.
+    pub(crate) auto_protection_degraded: bool,
+}
+
+/// A just-fired #452 bounded-blindness PREEMPTIVE swap (issue #479, umbrella #363 Path B), retained
+/// so `status` can NARRATE it — present only for a bounded window after the daemon swapped a BLIND
+/// active account away on its stale pre-blind anchor (ADR-0017), and only while that swap's TARGET is
+/// still the active account (a superseding swap self-invalidates it, projected daemon-side in
+/// [`Daemon::snapshot`]). A swap off a blind account on a stale reading is exactly the event an
+/// operator most needs narrated — so they can UNDO it (`use <from_label>`) if the swapped-away account
+/// turns out to have recovered. Carried on the wire so `status` renders the SAME information the durable
+/// `event=swap … reason=blind_preempt` log line already holds — source, last-known session %, target —
+/// each medium in its own idiom (R-2 STATE-parity, as `canonical_scrub` / `next_swap` do). The undo
+/// verb is DERIVED (`use <from_label>`), never stored — the surface only REFLECTS this daemon-pushed
+/// state, it never self-swaps (the #169 UI-never-acts invariant). Non-secret — two operator handles
+/// and a small number, never a token or email (issue #15).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BlindPreemptSwap {
+    /// The operator handle (label) the daemon swapped AWAY FROM — the blind account. The undo the
+    /// surface names is `use <from_label>` (derived, not stored). Never the email (issue #15).
+    pub(crate) from_label: String,
+    /// The operator handle (label) the daemon swapped TO — the account now active. Never the email
+    /// (issue #15).
+    pub(crate) to_label: String,
+    /// The stale pre-blind SESSION-window usage percent (`0..=100`) the gate FIRED on — the same
+    /// `to_pct(anchor.session)` the `event=swap … session_pct=` log line records and the Part-1
+    /// [`BlindActive::last_known_session_pct`] shows, captured at swap-time (by projection time the
+    /// anchor `last_good` has been reset to `None`). Gives R-2 content-parity across all three surfaces.
+    pub(crate) last_known_session_pct: u8,
+}
+
+/// The daemon-level CANONICAL-SCRUB rollup (issue #516, umbrella #463) — present only while the
+/// shared `Claude Code-credentials` canonical item is SCRUBBED (its refresh token cleared): the
+/// fleet-wide lockout NO per-account `credential_dead` fires for (the shared item is emptied while
+/// account rows can still read perfectly healthy). Surfaced so `status` + the menubar (issue #469)
+/// can render the scrubbed / un-recoverable state that no per-account `auth` rollup, and no #479
+/// `blind_active`, reflects — a signal only the DAEMON holds (it lives in the durable event log,
+/// #464/#467, never on the frozen wire until this field). Distinct from the ADR-0016
+/// `ActiveDeadNoTarget` case (which IS wire-derivable from `next_swap` + a dead active row).
+///
+/// Internally tagged on `state` (mirroring [`NextSwap`]), so a future per-variant field — e.g. the
+/// roster handle the `canonical_scrubbed` / `canonical_recovery_exhausted` events already carry — is
+/// an ADDITIVE change rather than a breaking `string → object` reshape. A fleet-wide STATE
+/// discriminant only: never per-account, never a token or email (issue #15).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub(crate) enum CanonicalScrub {
+    /// The canonical is scrubbed, but the daemon's autonomous adopt-recovery is still in progress
+    /// (issue #467): a viable spare's known-live token may yet be adopted into the emptied canonical,
+    /// healing the fleet with no operator action. The lower-severity, self-may-heal state.
+    Recovering,
+    /// The canonical is scrubbed AND recovery is EXHAUSTED (issue #467): the bounded adopt churn hit
+    /// its cap (or no viable adopt target exists), so the daemon has BACKED OFF and the canonical
+    /// stays empty until a `claude /login` re-authenticates it. The residual UN-RECOVERABLE state
+    /// #469 renders with that remedy. Ranks above [`Self::Recovering`] (most-severe wins).
+    Exhausted,
 }
 
 /// One account's latest reading.
@@ -116,6 +220,11 @@ pub(crate) struct AccountReading {
     /// thin `status` client projects to a glyph. Computed in [`Daemon::snapshot`] from this
     /// account's health state and the wall clock.
     pub(crate) health: CredentialHealth,
+    /// The active account's bounded-blindness projection (issue #479), or `None` when this is not
+    /// the active account, or the active account is not blind, or there is no retained anchor.
+    /// Computed in [`Daemon::snapshot`] from the retained `last_good` anchor (#450) and the ADR-0017
+    /// gate thresholds; copied straight to the wire ([`status_response`]).
+    pub(crate) blind_active: Option<BlindActive>,
 }
 
 /// The status-snapshot wire contract's version (issue #164): a `major.minor` the daemon stamps
@@ -143,8 +252,29 @@ pub(crate) struct SchemaVersion {
 /// ([`NextSwapReason`], issue #393) — the daemon's own selection rationale, likewise optional and
 /// tolerated-by-ignoring. `1.3` ADDED the [`NextSwap::NoViableTarget`] `cause` + `resets_at`
 /// fleet-capacity relief hint ([`NoTargetCause`], issue #405) — two more optional
-/// tolerated-by-ignoring fields on a variant that was previously payload-free.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 3 };
+/// tolerated-by-ignoring fields on a variant that was previously payload-free. `1.4` ADDED the
+/// per-account [`AccountStatusLine::blind_active`] bounded-blindness projection ([`BlindActive`],
+/// issue #479) — an optional field an older client tolerates by ignoring, and (via
+/// `skip_serializing_if`) omitted entirely except on a blind active account, so a non-blind frame's
+/// per-line bytes are unchanged. `1.5` ADDED the daemon-level
+/// [`StatusResponse::canonical_scrub`] canonical-scrub rollup ([`CanonicalScrub`], issue #516) — a
+/// fleet-wide scrubbed / recovery-exhausted signal, likewise optional and (via `skip_serializing_if`)
+/// omitted entirely when healthy, so a non-scrub frame's bytes are unchanged. Like
+/// `systemic_refresh_failure` it is daemon-level, but it takes `blind_active`'s `skip_serializing_if`
+/// omit-when-healthy pattern rather than `systemic_refresh_failure`'s always-emitted `null`. `1.6`
+/// ADDED the daemon-level [`StatusResponse::keychain_locked`] flag (issue #498) — a fleet-wide
+/// "the login keychain is LOCKED so the shared credential is unreadable" signal, a bare `bool`
+/// (via `skip_serializing_if`) omitted entirely when unlocked, so a non-locked frame's bytes are
+/// unchanged. The daemon-level sibling of `canonical_scrub`, but for an UNREADABLE item rather than
+/// a readable-but-scrubbed one; the wire prerequisite for the menubar #498 surface. `1.7` ADDED the
+/// daemon-level [`StatusResponse::recent_blind_preempt_swap`] narrated-swap notice ([`BlindPreemptSwap`],
+/// issue #479): a just-fired #452 bounded-blindness preemptive swap (source + last-known % + target),
+/// so `status` can narrate the swap-away and its `use <from>` undo — likewise optional and (via
+/// `skip_serializing_if`) omitted entirely except in the bounded window after such a swap, so a
+/// no-recent-preempt-swap frame's bytes are unchanged. Takes `blind_active`'s / `canonical_scrub`'s
+/// omit-when-absent pattern; a pre-#479 client ignores the unknown key (the minor-bump
+/// tolerate-by-ignoring convention).
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 7 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -179,6 +309,47 @@ pub(crate) struct StatusResponse {
     /// path, or email (issue #15).
     #[serde(default)]
     pub(crate) systemic_refresh_failure: Option<u32>,
+    /// The daemon-level CANONICAL-SCRUB rollup (issue #516): `Some(Recovering | Exhausted)` while the
+    /// shared canonical item is scrubbed (recovering vs recovery-exhausted / un-recoverable), else
+    /// absent when healthy. Lets `sessiometer status` + the menubar (#469) surface the fleet-wide
+    /// scrubbed lockout that no per-account `auth` rollup reflects — the daemon-LEVEL sibling of the
+    /// per-account `blind_active`. `Option` + `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump 1.4 → 1.5, mirroring
+    /// `blind_active`): a pre-#516 daemon omits the field → `None`, AND a HEALTHY snapshot omits it
+    /// entirely, so a non-scrub frame's bytes are byte-for-byte unchanged (a pre-#516 client ignores
+    /// the unknown key, the minor-bump tolerate-by-ignoring convention). A STATE discriminant only —
+    /// never a token or email (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) canonical_scrub: Option<CanonicalScrub>,
+    /// The daemon-level KEYCHAIN-LOCKED flag (issue #498): `true` while the macOS login keychain is
+    /// LOCKED, so the daemon cannot READ the shared credential item at ALL — the daemon-LEVEL sibling
+    /// of `canonical_scrub`, but for an UNREADABLE item (access denied) rather than a readable-but-
+    /// scrubbed one, so the operator remedy differs (unlock the keychain, not `claude /login`). Lets
+    /// `sessiometer status` + the menubar (#498) surface a fleet-wide unreadable-credential lockout no
+    /// per-account `auth` rollup reflects. A bare `bool` + `#[serde(default, skip_serializing_if =
+    /// "std::ops::Not::not")]` per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump
+    /// 1.5 → 1.6, taking `canonical_scrub`'s omit-when-healthy pattern): a pre-#498 daemon omits the
+    /// field → `false`, AND an unlocked snapshot omits it entirely, so a non-locked frame's bytes are
+    /// byte-for-byte unchanged (a pre-#498 client ignores the unknown key, the minor-bump
+    /// tolerate-by-ignoring convention). A bare BINARY state discriminant — never a token or email
+    /// (issue #15).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) keychain_locked: bool,
+    /// The daemon-level NARRATED bounded-blindness preemptive-swap notice (issue #479): `Some` for a
+    /// bounded window after #452 swapped a BLIND active account away on its stale anchor (ADR-0017),
+    /// carrying source + last-known session % + target so `sessiometer status` can narrate the
+    /// swap-away and its `use <from>` undo — the SAME information the durable `event=swap …
+    /// reason=blind_preempt` log line holds, reflected in `status` (the surface has no other way to see
+    /// a just-happened swap — `render_status` reads only this wire, never the event log). Absent when
+    /// no such swap is recent-and-still-current. `Option` + `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]` per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump
+    /// 1.6 → 1.7, mirroring `blind_active` / `canonical_scrub`): a pre-#479 daemon omits the field →
+    /// `None`, AND a no-recent-swap snapshot omits it entirely, so an unaffected frame's bytes are
+    /// byte-for-byte unchanged (a pre-#479 client ignores the unknown key). The surface only REFLECTS
+    /// this daemon-pushed state; it never self-swaps (the #169 UI-never-acts invariant). Non-secret —
+    /// two handles and a `u8`, never a token or email (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_blind_preempt_swap: Option<BlindPreemptSwap>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -284,6 +455,16 @@ pub(crate) struct AccountStatusLine {
     /// `healthy` over a dead account.
     #[serde(default, rename = "auth")]
     pub(crate) health: Option<CredentialHealth>,
+    /// The active account's bounded-blindness projection (issue #479, umbrella #363 Path B): blind
+    /// duration + last-known session % + whether ADR-0017 auto-protection is DEGRADED — or absent
+    /// when the active account is not blind (or this is not the active account). The client renders
+    /// it as a SEMANTIC status line in place of the bare `n/a … 🟡` active row. `#[serde(default)]`
+    /// decodes an omitting daemon to `None`; `skip_serializing_if` OMITS it whenever absent, so a
+    /// non-blind account's per-line wire bytes are byte-for-byte unchanged — the additive MINOR
+    /// `1.3 → 1.4` field appears ONLY on a blind active account (a pre-#479 client ignores the
+    /// unknown key, the minor-bump tolerate-by-ignoring convention). Non-secret (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blind_active: Option<BlindActive>,
 }
 
 /// The next swap candidate shown by `status` (issue #88): who the daemon would
@@ -314,7 +495,7 @@ pub(crate) enum NextSwap {
     /// No sound swap destination — [`pick_target`] picked nothing AND this is not the
     /// post-restart all-unpolled moment (`AwaitingData`). Reached when at least one
     /// *live* (enabled, non-quarantined) other account has already been polled and none
-    /// qualifies (weekly-exhausted, or over the `target_max_usage` reserve) — even while other
+    /// qualifies (weekly-exhausted, or over the `target_max_session_usage` reserve) — even while other
     /// live accounts are still unpolled (the staggered-warm-up #80 mixed case) — or when
     /// there is no live other account at all (every other disabled #36 or quarantined #42,
     /// its reading masked away by `decision_readings`, or there is simply no other account).
@@ -393,7 +574,7 @@ pub(crate) enum NextSwapReason {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NoTargetCause {
     /// A weekly-VIABLE account is held out only by session (over the session ceiling
-    /// `min(session_trigger, target_max_usage)`) — relief arrives at the sooner SESSION reset.
+    /// `min(session_trigger, target_max_session_usage)`) — relief arrives at the sooner SESSION reset.
     Session,
     /// Every candidate is weekly-EXHAUSTED (`weekly >= weekly_trigger`) — relief arrives at the
     /// WEEKLY reset (the #11 default, and the ONLY cause reachable on the emergency/dead-active
@@ -425,6 +606,10 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 access_expires_at: account.access_expires_at,
                 refresh_health: account.refresh_health,
                 health: Some(account.health),
+                // The bounded-blindness projection (issue #479), already resolved daemon-side in
+                // `Daemon::snapshot`; copied straight to the wire. `None` for every non-active or
+                // non-blind account, so `skip_serializing_if` omits it there.
+                blind_active: account.blind_active,
             })
             .collect(),
         // Already computed at snapshot build (issue #88); copy it to the wire.
@@ -436,6 +621,17 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // The daemon-level systemic refresh-failure indicator (issue #378), copied straight to the
         // wire: `Some(n)` while the mechanism is down, `None` when healthy.
         systemic_refresh_failure: snapshot.systemic_refresh,
+        // The daemon-level canonical-scrub rollup (issue #516), copied straight to the wire:
+        // `Some(Recovering | Exhausted)` while the shared canonical is scrubbed, `None` when healthy.
+        canonical_scrub: snapshot.canonical_scrub,
+        // The daemon-level keychain-locked flag (issue #498), copied straight to the wire: `true`
+        // while the login keychain is locked (the shared credential is unreadable), `false` when
+        // unlocked (and then omitted from the wire via `skip_serializing_if`).
+        keychain_locked: snapshot.keychain_locked,
+        // The daemon-level narrated preemptive-swap notice (issue #479), already resolved daemon-side
+        // in `Daemon::snapshot` (windowed + target-still-active): `Some` for a bounded window after a
+        // #452 blind-preempt swap, `None` otherwise (and then omitted via `skip_serializing_if`).
+        recent_blind_preempt_swap: snapshot.recent_blind_preempt_swap.clone(),
     }
 }
 

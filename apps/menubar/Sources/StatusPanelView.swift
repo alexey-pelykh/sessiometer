@@ -19,9 +19,10 @@
 //
 // Two swap verbs, read differently (issue #169, Von Restorff): the footer **Swap** button is the
 // panel's ONE accent/primary action — the daemon's own recommendation, sent WYSIWYG as the displayed
-// `next_swap` target. A per-row manual switch is a quiet, neutral-weight, hover-revealed affordance —
-// the operator choosing an arbitrary target. Both send the SAME `swap` command; the daemon re-validates
-// every target from its own state, so the client never sends a viability hint.
+// `next_swap` target. A per-row manual switch is a quiet, neutral-weight affordance — persistent but
+// low-key at rest, arming on hover (#448) — the operator choosing an arbitrary target. Both send the
+// SAME `swap` command; the daemon re-validates every target from its own state, so the client never
+// sends a viability hint.
 //
 // Provider-neutral by construction: the wire carries only the operator-chosen `label` (never an email
 // — issue #15) and no provider field, so a row is plain text with no brand color or logo. Every row is
@@ -41,6 +42,61 @@ fileprivate extension Color {
         case .secondary:       return .secondary
         case .primary:         return .primary
         }
+    }
+
+    /// Build a neutral panel FILL (#388) from the testable `StatusPanelFormat.neutralFill` spec as a PLAIN
+    /// sRGB translucent color — deliberately NOT routed through the panel material, so the source-over
+    /// composite matches the mock's rgba math. This REPLACES `Color.secondary.opacity(k)` for chrome fills:
+    /// `.secondary` is a label-family tint (already ~0.5 alpha over base ~(60,60,67)), so opacity-ing it for
+    /// a fill washed out at ≈half the mock's alpha over the wrong hue (the #388 washout). The theme value is
+    /// chosen by the caller from `@Environment(\.colorScheme)`.
+    static func panelFill(_ role: StatusPanelFormat.NeutralFillRole, dark: Bool) -> Color {
+        let c = StatusPanelFormat.neutralFill(role, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// Build an accent-emphasis fill (#388) — `Color.accentColor` at the role's theme-aware `accentOpacity`.
+    /// The accent counterpart to `panelFill`: it centralises the `accentColor.opacity(accentOpacity(…))`
+    /// composition so each call site names the emphasis SURFACE, not the mechanism. The accent HUE stays the
+    /// brand-blue `AccentColor` asset (#391); only the theme-variant alpha comes from the token.
+    static func accentEmphasis(_ emphasis: StatusPanelFormat.AccentEmphasis, dark: Bool) -> Color {
+        Color.accentColor.opacity(StatusPanelFormat.accentOpacity(emphasis, dark: dark))
+    }
+
+    /// The Stats sparkline stroke / area / dot color (#446) — mock `--spark`, from the testable
+    /// `StatusPanelFormat.sparkColor` spec (a plain sRGB translucent color, like `panelFill`). The area is
+    /// this at a fraction of the alpha (drawn by the view: mock `.sp-area { fill-opacity:.2 }`).
+    static func spark(dark: Bool) -> Color {
+        let c = StatusPanelFormat.sparkColor(dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The Stats signal pill's background fill (#446) — mock `--sig-*-bg`, from `StatusPanelFormat.statsSignalFill`.
+    static func statsSignalFill(_ signal: StatusPanelFormat.StatSignal, dark: Bool) -> Color {
+        let c = StatusPanelFormat.statsSignalFill(signal, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The Stats signal pill's foreground (label + dot) color (#446) — mock `--sig-*-fg`, from
+    /// `StatusPanelFormat.statsSignalText`.
+    static func statsSignalText(_ signal: StatusPanelFormat.StatSignal, dark: Bool) -> Color {
+        let c = StatusPanelFormat.statsSignalText(signal, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The per-account badge FILL (#445) — the `label`-seeded palette hue, as a plain sRGB color (like
+    /// `panelFill`). A LOW-CHROMA muted identity tone, never provider branding (#173); the accent hue is
+    /// excluded. Resolved by the testable `StatusPanelFormat.accountBadgeFill`.
+    static func accountBadge(_ label: String, dark: Bool) -> Color {
+        let c = StatusPanelFormat.accountBadgeFill(for: label, dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
+    }
+
+    /// The account MONOGRAM glyph color (#445) — the high-contrast neutral that reads on the badge fill in
+    /// both themes (asserted ≥ 4.5:1 against every slot). From `StatusPanelFormat.accountMonogramColor`.
+    static func accountMonogram(dark: Bool) -> Color {
+        let c = StatusPanelFormat.accountMonogramColor(dark: dark)
+        return Color(.sRGB, red: c.red, green: c.green, blue: c.blue, opacity: c.alpha)
     }
 }
 
@@ -69,6 +125,10 @@ struct StatusPanelView: View {
     /// the capture surface over whatever state it is in, reusing the panel's own key/first-responder
     /// plumbing. (`CaptureAffordance` reads the same model as its own `@EnvironmentObject`.)
     @EnvironmentObject private var capture: AccountCaptureModel
+    /// The Stats-tab model (issue #446): the panel's Status|Stats tab selection + the one-shot `stats`
+    /// query's phase. Observed here to render the seg control's on-state and to switch the body to the
+    /// Stats view. (`StatsView` and `PanelHeader`'s seg read the same model.)
+    @EnvironmentObject private var stats: PanelStatsModel
 
     /// How often the resting panel re-derives clock-relative text (reset-in). A minute is finer than
     /// the reset-in's own minute granularity, so the displayed value never visibly lags the clock.
@@ -101,18 +161,38 @@ struct StatusPanelView: View {
         } ?? false
         let state = store.connectionState
         let activeLabel = store.rows.first(where: \.isActive)?.label
-        let subtitle = StatusPanelFormat.headerSubtitle(state: state,
+
+        // The Status|Stats switcher (issue #446) is offered ONLY where the Stats tab can deliver: a live
+        // roster (`.connected` / `.stale`) and NOT while the #394 capture surface is up. In every degraded
+        // state the header carries just the honest identity — a Stats affordance that can only fail is not
+        // an honest affordance (matches the mock, which shows the seg only in the healthy Status/Stats states).
+        let showsSwitcher = (state == .connected || state == .stale) && !capture.captureSurfaceRequested
+        let onStatsTab = showsSwitcher && stats.tab == .stats
+
+        // The Stats tab replaces the honest-state sub-line with the mock's "Usage stats · last 7 days" (from
+        // the loaded window when present, else the default phrase for the always-`week` query). Derived in a
+        // closure — a single `let` binding the enclosing `@ViewBuilder` skips as a declaration, where a bare
+        // `if/else` assignment would instead be read as a (non-`View`) conditional branch.
+        let subtitle: String = {
+            if onStatsTab, let window = stats.phase.wire?.window {
+                return StatusPanelFormat.statsHeaderSubtitle(window)
+            } else if onStatsTab {
+                return StatusPanelFormat.statsDefaultHeaderSubtitle
+            } else {
+                return StatusPanelFormat.headerSubtitle(state: state,
                                                         accountCount: store.rows.count,
                                                         activeLabel: activeLabel,
                                                         ageStale: ageStale)
+            }
+        }()
 
         // The design reference's chrome (`apps/menubar/design/menubar-preview.html`): an app-identity
-        // header, a hairline divider, the state's body, and a snapshot-age footer. Sections own their
-        // insets (no uniform padding) so the header/roster/callout/footer spacing matches the reference.
-        // Honest-state is carried by the header sub-line (never a false "active" on a degraded daemon)
-        // plus, on a dropped connection, an explicit strip over a dimmed last-known roster.
+        // header (with the Status|Stats seg when offered), a hairline divider, the state's body, and a
+        // snapshot-age footer. Sections own their insets (no uniform padding) so the spacing matches the
+        // reference. Honest-state is carried by the header sub-line (never a false "active" on a degraded
+        // daemon) plus, on a dropped connection, an explicit strip over a dimmed last-known roster.
         VStack(alignment: .leading, spacing: 0) {
-            PanelHeader(subtitle: subtitle)
+            PanelHeader(subtitle: subtitle, showsSwitcher: showsSwitcher)
 
             if capture.captureSurfaceRequested {
                 // The status-item "Add account…" capture surface (issue #394) — a focused capture card
@@ -123,6 +203,12 @@ struct StatusPanelView: View {
                 Divider().padding(.horizontal, 14)
                 CaptureCard(title: "Add account")
                     .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+            } else if onStatsTab {
+                // The Stats tab (issue #446): the mock's per-account 7-day sparklines + numeric body,
+                // aggregate callout, and signal legend — fed by the socket `stats` verb (never a store read).
+                // A separate view from the Status body; the footer's `next_swap` line stays the Status tab's.
+                Divider().padding(.horizontal, 14)
+                StatsView()
             } else {
                 stateBody(state: state, now: now, ageText: ageText, ageStale: ageStale)
             }
@@ -143,18 +229,28 @@ struct StatusPanelView: View {
             CaptureCard(title: "Capture your first account")
                 .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
 
-        case .connecting, .unsupported:
-            // No retained reading — a plain honest message (the reference's centered message card
-            // for these states, with its distinct per-state glyph, is #169).
+        case .connecting, .starting, .notRunning, .unsupported, .crashLooping:
+            // No trustworthy reading to show — a plain honest message card. `.crashLooping` (#169) holds
+            // here too: the daemon served a snapshot but keeps dropping before it stabilizes, so its
+            // numbers are refused ("holding status until it stays up") rather than flickered as live —
+            // the crown-jewel anti-#137 debounce. `.starting` / `.notRunning` (#499) are the cold-refused
+            // daemon-absent states: neither ever held a reading, so both render the honest banner card. The
+            // not-running state WOULD host a "Start daemon" button — launch-at-login is #170 (deferred,
+            // signing-blocked), so it degrades to the inert explanatory banner (no button yet). (The fuller
+            // per-state message-card fidelity and the lifecycle affordances — View log / Restart / Start —
+            // are #169 / #170 siblings.)
             Divider().padding(.horizontal, 14)
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
                 .padding(.horizontal, 14).padding(.vertical, 14)
 
-        case .disconnected:
-            // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
-            // frozen-as-live (#137). No swap callout (swaps are paused while dropped), and the roster
-            // rows are NOT switchable: a retained last-known row is not a live target, and a click over
-            // a dead socket would be a dead click (#169's honest-affordance rule).
+        case .disconnected, .reconnecting:
+            // A warm drop: an explicit honest strip over the DIMMED last-known roster — never frozen-as-live
+            // (#137). No swap callout (swaps are paused while dropped), and the roster rows are NOT switchable:
+            // a retained last-known row is not a live target, and a click over a dead socket would be a dead
+            // click (#169's honest-affordance rule). `.reconnecting` (#526, still within the warm dwell) shares
+            // this exact treatment — the retained roster stays informative — and the strip's copy auto-derives
+            // from `state`, so the dwell reads calm ("Reconnecting…") while the escalation reads loud ("Daemon
+            // not responding"), both off the single `banner(for:)` switch.
             HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
                                                          ageText: ageText, ageStale: ageStale))
             if !store.rows.isEmpty {
@@ -168,6 +264,20 @@ struct StatusPanelView: View {
             // footer recommendation) are live and dead together (#169). No capture bar — capture moved to
             // the status-item menu / empty-roster onboarding (issue #394).
             Divider().padding(.horizontal, 14)
+            if let faultBanner = StatusPanelFormat.daemonFaultBanner(keychainLocked: store.keychainLocked,
+                                                                     scrub: store.canonicalScrub) {
+                // The single daemon-level fault banner (worst-first): a fleet-wide unreadable/scrubbed
+                // shared-login lockout NO per-row `auth` reflects (rows can read healthy while the shared
+                // item sits locked or emptied), so it rides as its own honest banner ABOVE the roster — the
+                // connected-but-degraded panel reads visibly DEGRADED (never healthy) while the live roster
+                // still renders below. The footer stays the `next_swap` line (R-2: footer = next_swap;
+                // degraded daemon-level signals → honest banner). Priority (see `daemonFaultBanner`):
+                // keychain-locked (#498) OUTRANKS canonical-scrub (#469) — the panel shows ONE banner, and
+                // an UNREADABLE keychain (unlock it) wins over a readable-but-scrubbed item (`claude /login`).
+                BannerView(banner: faultBanner)
+                    .padding(.horizontal, 14).padding(.vertical, 14)
+                Divider().padding(.horizontal, 14)
+            }
             if !store.rows.isEmpty {
                 RosterView(rows: store.rows, now: now, switchable: true)
             }
@@ -237,6 +347,9 @@ private struct RosterView: View {
     let switchable: Bool
 
     var body: some View {
+        // Resolve every row's smart monogram ONCE over the whole roster (issue #445), so collision-escalation
+        // sees all sibling labels — a same-local-part roster gets distinct 2-char monograms, not one letter.
+        let monograms = StatusPanelFormat.accountMonograms(rows.map(\.label))
         VStack(alignment: .leading, spacing: 2) {
             ForEach(rows) { row in
                 // On a dropped connection every row is `notATarget` (non-interactive); otherwise the pure
@@ -249,7 +362,7 @@ private struct RosterView: View {
                                                        weeklyExhausted: row.weeklyExhausted,
                                                        isEnabled: row.isEnabled)
                     : .notATarget
-                AccountRowView(row: row, now: now, switchState: state)
+                AccountRowView(row: row, monogram: monograms[row.label] ?? "?", now: now, switchState: state)
             }
         }
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
@@ -272,13 +385,15 @@ private struct RowSwitchButtonStyle: ButtonStyle {
         configuration.label
             // MIS-CLICK GUARD (issue #169 falsifier b) — resolved deliberately, not by accident. The
             // checklist item forbids "an INVISIBLE whole-row click"; the watch-out phrases it as "not a
-            // whole-row HOT-ZONE". Both are honored by REVEAL, not by shrinking the hit target:
-            //   * At rest the row is pure data — no wash, no glyph, no `pointingHand`: it does not read as
-            //     pressable, so the invisible-click hazard the checklist names cannot occur.
+            // whole-row HOT-ZONE". Both are honored by ARMING, not by shrinking the hit target:
+            //   * At rest the row shows only a QUIET chip (#448) — no wash, no `pointingHand`: the chip
+            //     hints the row is actionable, but WITHOUT the wash + cursor it does not yet read as an
+            //     armed, pressable control, so the invisible-click hazard the checklist names cannot occur
+            //     (the persistent chip aids DISCOVERY; the wash + cursor still gate ARMING).
             //   * The hit rect is the whole row (per the explicit "implement the row as a Button"
-            //     instruction + Fitts's law — an 18 pt glyph-only target would be a worse, error-prone
-            //     mechanism), but it is ARMED only once hover has revealed the glyph + wash + cursor, so
-            //     the operator always SEES the row is live before a press can land.
+            //     instruction + Fitts's law — a glyph-only target would be a worse, error-prone
+            //     mechanism), but it is ARMED only once hover has added the wash + cursor and brightened
+            //     the chip, so the operator always SEES the row is live before a press can land.
             //   * Residual accidental-press risk is bounded by three things the daemon and model already
             //     enforce: the daemon re-validates every target (a stray press can't do something unsafe),
             //     a swap is reversible (undo = switch back), and a sibling swap is `.disabled()` mid-flight.
@@ -287,6 +402,9 @@ private struct RowSwitchButtonStyle: ButtonStyle {
             .contentShape(RoundedRectangle(cornerRadius: 9))
             .background(
                 RoundedRectangle(cornerRadius: 9)
+                    // #388-EXEMPT: a COMPUTED hover/press interaction wash, not one of the mock's absolute
+                    // chrome fills (the static mock has no hover state), so it keeps `Color.secondary.opacity(k)`
+                    // rather than a `panelFill` token — `wash` is 0 at rest, a faint neutral only while live+hovered.
                     .fill(Color.secondary.opacity(wash(pressed: configuration.isPressed)))
             )
     }
@@ -302,15 +420,20 @@ private struct RowSwitchButtonStyle: ButtonStyle {
 /// The whole row is a single VoiceOver element.
 ///
 /// A non-active row is ALSO the manual-switch affordance (issue #169): a `Button` whose trailing swap
-/// glyph is revealed on hover. The resting row stays pure data.
+/// chip is PERSISTENT — quiet at rest, brightening when the row is armed on hover (#448). The resting
+/// row carries the quiet chip; arming still gates the wash + `pointingHand` cursor.
 private struct AccountRowView: View {
     let row: AccountRow
+    /// The roster-resolved 2-char monogram for this row's label (issue #445), computed once by `RosterView`.
+    let monogram: String
     let now: Int64
     /// The row's manual-switch verdict (issue #169). `.notATarget` — the ACTIVE row, or any row on a
     /// dropped connection — stays a plain, non-interactive display row.
     let switchState: StatusPanelFormat.RowSwitchState
 
     @EnvironmentObject private var swap: AccountSwapModel
+    /// The active row's accent-tint fill opacity is theme-aware (#388): the mock raises it in dark mode.
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovering = false
     /// Whether this row currently owns a pushed `pointingHand` cursor — tracked so a push is always
     /// balanced by exactly one pop, even when the row stops being live WHILE the pointer is inside it
@@ -430,27 +553,35 @@ private struct AccountRowView: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
                 StatusDot(isActive: row.isActive)
-                MonogramBadge(label: row.label)
+                MonogramBadge(label: row.label, monogram: monogram)
 
                 Text(row.label)
                     .font(.body)
                     .fontWeight(.semibold)
                     .lineLimit(1)
-                    .truncationMode(.tail)
+                    // MIDDLE-truncation (issue #445): a same-local-part label's distinguishing suffix /
+                    // domain survives when it elides, where tail-truncation hid exactly that part.
+                    .truncationMode(.middle)
 
                 Spacer(minLength: 6)
 
                 if row.isActive {
-                    // The design reference's accent "ACTIVE" tag — one of the row's THREE active cues
-                    // (leading filled dot + this tag + accent-tint row), so active never rides on color
-                    // alone (R-2 / WCAG 1.4.1).
-                    Text("ACTIVE")
-                        .font(.system(size: 9, weight: .bold))
-                        .tracking(0.6)
-                        .foregroundStyle(.tint)
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .overlay(RoundedRectangle(cornerRadius: 4)
-                            .strokeBorder(Color.accentColor.opacity(0.42), lineWidth: 0.5))
+                    // The active tag — one of the row's THREE redundant "active" cues (leading filled dot +
+                    // this tag + accent-tint row fill), so active never rides on colour alone (R-2 / WCAG
+                    // 1.4.1). Treatment matches the perfected mock `.tag` (`menubar-preview.html:243`): a calm
+                    // NEUTRAL sentence-case capsule — the same `--badge-bg` neutral fill as the monogram badge
+                    // (`Color.panelFill(.badge, …)`) + `--text-2` text (`.secondary`), NO accent border, NO
+                    // letter-spaced uppercase. The accent DOT already carries the active colour; a second
+                    // accent element here (the old outlined uppercase "ACTIVE" pill) re-inflated the active
+                    // over-signalling #387 M5 reduced and sank the same-hue label to ~3:1. The neutral label
+                    // stays as the WCAG 1.4.1 non-colour cue (clears 1.4.11 on the capsule — see #501 tests);
+                    // it is `accessibilityHidden` because the row's spoken label already says ", active" (#325).
+                    Text(StatusPanelFormat.activeTagLabel)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7).padding(.vertical, 1.5)
+                        .background(RoundedRectangle(cornerRadius: 5)
+                            .fill(Color.panelFill(.badge, dark: colorScheme == .dark)))
                         .accessibilityHidden(true)
                 }
 
@@ -472,40 +603,57 @@ private struct AccountRowView: View {
         // dropped (#387 M5, ratified) to cut active over-signaling — active stays redundantly encoded by
         // the filled leading dot (shape) + the "ACTIVE" tag + the tint, so color is never the SOLE signal
         // (WCAG 1.4.1 / R-2 state-parity holds). The mock's active-ring is dropped in lockstep
-        // (menubar-preview.html `.acct.active` / `.stat.active`).
+        // (menubar-preview.html `.acct.active` / `.stat.active`). The fill OPACITY is theme-aware (#388,
+        // mock `--active-bg`): .08 light / .15 dark — the dark active row was ~1.5× too faint when hardcoded.
         .background(
             RoundedRectangle(cornerRadius: 9)
-                .fill(row.isActive ? Color.accentColor.opacity(0.08) : Color.clear)
+                .fill(row.isActive
+                      ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark)
+                      : Color.clear)
         )
     }
 
-    /// The trailing manual-switch slot (issue #169) — HOVER-REVEALED, never a resting affordance.
+    /// The swap glyph the chip draws — a swap arrow, or a DISTINCT `nosign` on a wire-blocked target
+    /// ("you cannot switch here" is a different fact from "switch here", and shape carries it without
+    /// color). The tint is applied by `switchSlot` per emphasis level, so this stays tint-free.
+    private var chipGlyph: some View {
+        Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
+            .font(.system(size: 11, weight: .semibold))
+    }
+
+    /// The trailing manual-switch chip (issue #169, made PERSISTENT by #448) — a quiet affordance shown at
+    /// rest on every switch target, that BRIGHTENS when the row is armed (hover / focus). #169 revealed it
+    /// only on hover, so on a transient popover a first-time operator never saw a row was actionable; the
+    /// persistent-quiet chip makes the row discoverable without an always-loud control.
     ///
-    /// The slot's WIDTH is laid out on every roster row, always, even where the glyph is invisible or the
-    /// row is not switchable at all. Two things fall out of that, both load-bearing:
-    ///   * revealing the glyph on hover can never REFLOW the row, so the label's truncation is identical
-    ///     hovered and at rest — the affordance can never truncate the label into something uninformative
-    ///     (the issue's row-width watch-out); and
-    ///   * the auth column stays aligned across active and non-active rows.
-    /// The why-text itself never truncates: it is a native `.help` tooltip, not an inline label.
+    /// The slot's WIDTH is laid out on every roster row, always — even where the chip is hidden (the active
+    /// row) — so NEITHER the chip's resting presence NOR its hover-brighten can REFLOW the row: the label's
+    /// available width is identical hidden / resting / armed, and so is its truncation (the issue's
+    /// row-width watch-out). The auth column also stays aligned across active and non-active rows. The
+    /// why-text never truncates: it is a native `.help` tooltip, not an inline label.
     ///
-    /// This hover-reveal is itself the mis-click guard — the full rationale lives on `RowSwitchButtonStyle`.
+    /// The emphasis (hidden / resting / armed) is a pure `StatusPanelFormat.switchChipEmphasis` verdict, so
+    /// the resting-visible-vs-armed-brighten distinction is unit-asserted; the view only maps it to a
+    /// neutral system tint. ARMING (not the resting presence) is the mis-click guard — the full rationale
+    /// lives on `RowSwitchButtonStyle`.
     @ViewBuilder
     private var switchSlot: some View {
         Group {
             if isSwitching {
                 ProgressView().controlSize(.small)
-            } else if offersSwitch, isHovering {
-                // A blocked row reveals a DISTINCT glyph (`nosign`), not a dimmer swap arrow: "you cannot
-                // switch here" is a different fact from "switch here", and shape carries it without color.
-                Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
-                    .font(.system(size: 11, weight: .semibold))
-                    // Neutral / secondary-text weight — never `.tint`. The accent belongs to the footer
-                    // Swap button alone (Von Restorff: one accent action per panel).
-                    .foregroundStyle(.secondary)
-                    .opacity(blockReason == nil ? 1 : 0.55)
             } else {
-                Color.clear
+                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, armed: isHovering) {
+                case .hidden:
+                    Color.clear
+                case .resting:
+                    // Quiet at rest — `.tertiary` ≈ the mock's `--text-3` decorative token. Never `.tint`:
+                    // the one accent action is the footer Swap (Von Restorff, one accent per panel).
+                    chipGlyph.foregroundStyle(.tertiary)
+                case .armed:
+                    // Brightened once armed — `.secondary` ≈ the mock's `--text-2`. A SEMANTIC tint step,
+                    // not a hardcoded opacity (#388 / #448).
+                    chipGlyph.foregroundStyle(.secondary)
+                }
             }
         }
         .frame(width: CGFloat(StatusPanelFormat.switchAffordanceSlotWidth), alignment: .trailing)
@@ -579,29 +727,34 @@ private struct AccountRowView: View {
 
 // MARK: - Row building blocks (per the design reference)
 
-/// The account's monogram — provider-neutral by construction (issue #15: the label's initial, never a
-/// brand mark or color). Accessibility-hidden; the row's VoiceOver label already speaks the identity.
+/// The account's monogram badge — a smart 2-char MONOGRAM over a per-account identity COLOR (issue #445),
+/// both seeded from the operator `label` (never a provider brand mark or logo — #15/#173: the color is a
+/// LOW-CHROMA generic identity hue with the accent EXCLUDED, and it is only ever a REDUNDANT cue beside the
+/// monogram glyph + the row's label text, never color-alone — WCAG 1.4.1). The monogram is PRE-RESOLVED by
+/// the parent (`RosterView` / `StatsContent`) so its collision-escalation sees every sibling label.
+/// Accessibility-hidden; the row's VoiceOver label already speaks the identity.
 private struct MonogramBadge: View {
     let label: String
+    /// The roster-resolved 2-char monogram (issue #445) — derived from the label's distinguishing token, so
+    /// a same-local-part roster does not collapse to one letter. Computed once per roster by the parent.
+    let monogram: String
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
+        let dark = colorScheme == .dark
         RoundedRectangle(cornerRadius: 8)
-            .fill(Color.secondary.opacity(0.16))
+            // Per-account identity color (issue #445), seeded from `label` — the deliberate deviation from the
+            // mock's neutral `--badge-bg` monochrome badge. A low-chroma muted hue, never provider branding.
+            .fill(Color.accountBadge(label, dark: dark))
             .frame(width: 30, height: 30)
             .overlay(
-                Text(initial)
+                Text(monogram)
                     .font(.system(size: 13, weight: .bold))
                     .tracking(0.4)
-                    .foregroundStyle(.secondary)
+                    // High-contrast neutral glyph ON the fill (asserted ≥ 4.5:1 per slot, both themes).
+                    .foregroundStyle(Color.accountMonogram(dark: dark))
             )
             .accessibilityHidden(true)
-    }
-
-    /// The first character of the operator label, uppercased — `?` for an empty/whitespace label.
-    private var initial: String {
-        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return "?" }
-        return String(first).uppercased()
     }
 }
 
@@ -649,6 +802,9 @@ private struct UsageMeter: View {
         case .red:    return .red
         case .yellow: return .orange
         case .green:  return .green
+        // #388-EXEMPT: reached only when `severity == nil` ⇒ `pct == nil` ⇒ `fraction == 0` ⇒ the `UsageBar`
+        // fill has ZERO width (a failed poll shows a BARE track, matching the mock), so this muted color never
+        // actually paints. No absolute mock fill exists for the failed-poll bar → keeps `secondary.opacity`.
         case .none:   return Color.secondary.opacity(0.45)
         }
     }
@@ -668,11 +824,13 @@ private struct UsageMeter: View {
 private struct UsageBar: View {
     let fraction: Double
     let color: Color
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.secondary.opacity(0.20))
+                // Track = mock `--track` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.20)`.
+                Capsule().fill(Color.panelFill(.track, dark: colorScheme == .dark))
                 Capsule().fill(color)
                     .frame(width: fillWidth(geo.size.width))
             }
@@ -694,35 +852,111 @@ private struct UsageBar: View {
 /// The app-identity header — a neutral gauge glyph, the product name, and the honest identity sub-line
 /// (`StatusPanelFormat.headerSubtitle`). Always present; the SUB-LINE — never the glyph — carries the
 /// connection state, so a degraded daemon reads "last-known" / "· stale", never a false "active".
-/// Provider-neutral (issue #15): a generic gauge, no brand mark or color.
+/// Provider-neutral (issue #173): a generic gauge, no brand mark or color.
 private struct PanelHeader: View {
     let subtitle: String
+    /// Whether to show the Status|Stats seg control (issue #446). Only where the Stats tab can deliver (a
+    /// live roster, not the capture surface; gated in `content`). Defaults off, so every degraded-state
+    /// header is byte-unchanged from before #446.
+    var showsSwitcher: Bool = false
+    @EnvironmentObject private var stats: PanelStatsModel
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(Color.secondary.opacity(0.16))
-                .frame(width: 27, height: 27)
-                .overlay(
-                    Image(systemName: "gauge.medium")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
-                )
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Sessiometer")
-                    .font(.system(size: 13.5, weight: .semibold))
-                Text(subtitle)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+            // The identity block (glyph + name + sub-line) combines into ONE accessibility element; the seg
+            // control keeps its own button traits alongside it, so VoiceOver reads "Sessiometer, …" then the
+            // two tab buttons rather than one merged blob.
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 7)
+                    // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
+                    .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
+                    .frame(width: 27, height: 27)
+                    .overlay(
+                        Image(systemName: "gauge.medium")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+                    )
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Sessiometer")
+                        .font(.system(size: 13.5, weight: .semibold))
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Sessiometer. \(subtitle)")
+
             Spacer(minLength: 0)
+
+            if showsSwitcher {
+                // Mock `.seg` — right-aligned Status|Stats switcher (issue #446). Drives the stats model's
+                // tab selection; switching TO Stats triggers the one-shot socket query.
+                PanelTabSwitcher(tab: stats.tab) { stats.select($0) }
+            }
         }
         .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 11)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Sessiometer. \(subtitle)")
+    }
+}
+
+/// The mock's `.seg` Status|Stats control (issue #446): a rounded two-button switcher, right-aligned in the
+/// header. The active tab carries the raised `--seg-on` chip; the inactive is a quiet transparent button.
+/// Provider-neutral, read-only chrome — selecting Stats only QUERIES (UI never acts). The seg colors are the
+/// mock's exact `--seg-*` chrome values inline (decorative control chrome, not a data-bearing tint — the
+/// data colors, `--spark` / `--sig-*`, live in the testable `StatusPanelFormat` layer).
+private struct PanelTabSwitcher: View {
+    let tab: PanelStatsModel.Tab
+    let select: (PanelStatsModel.Tab) -> Void
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(spacing: 2) {
+            segButton("Status", target: .status)
+            segButton("Stats", target: .stats)
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(segBackground)
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(segBorder, lineWidth: 0.5))
+        )
+    }
+
+    private func segButton(_ title: String, target: PanelStatsModel.Tab) -> some View {
+        let on = tab == target
+        return Button { select(target) } label: {
+            Text(title)
+                .font(.system(size: 11, weight: on ? .semibold : .medium))
+                .foregroundStyle(on ? Color.primary : Color.secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 2.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(on ? segOnFill : Color.clear)
+                        .shadow(color: on ? Color.black.opacity(0.18) : .clear, radius: 0.75, y: 0.5)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(on ? [.isButton, .isSelected] : .isButton)
+    }
+
+    // Mock `--seg-bg` / `--seg-border` / `--seg-on` (light / dark), inline as exact sRGB chrome values.
+    private var dark: Bool { colorScheme == .dark }
+    private var segBackground: Color {
+        dark ? Color(.sRGB, white: 1, opacity: 0.08)
+             : Color(.sRGB, red: 120.0 / 255, green: 120.0 / 255, blue: 128.0 / 255, opacity: 0.12)
+    }
+    private var segBorder: Color {
+        dark ? Color(.sRGB, white: 1, opacity: 0.06) : Color(.sRGB, white: 0, opacity: 0.05)
+    }
+    private var segOnFill: Color {
+        dark ? Color(.sRGB, white: 1, opacity: 0.18) : Color(.sRGB, white: 1, opacity: 1)
     }
 }
 
@@ -732,19 +966,29 @@ private struct PanelHeader: View {
 /// VoiceOver label state it in words.
 private struct StatusDot: View {
     let isActive: Bool
+    /// The active halo opacity is theme-aware (#388, mock `--accent-halo`); the inactive ring takes the
+    /// mock's `--text-3` (a tertiary-label neutral), not a washed `secondary.opacity`.
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Circle()
             .fill(isActive ? Color.accentColor : Color.clear)
             .overlay(
-                Circle().strokeBorder(Color.secondary.opacity(0.55), lineWidth: isActive ? 0 : 1.5)
+                // Inactive ring = mock `--text-3` (`.acct:not(.active) .dot { inset 0 0 0 1.5px var(--text-3) }`).
+                // `.tertiaryLabelColor` is the label-family neutral the footer freshness line also uses for
+                // `--text-3` (one token, one impl); it REPLACES `Color.secondary.opacity(0.55)`, which
+                // rendered ≈half the mock's neutral (the #388 washout).
+                Circle().strokeBorder(Color(nsColor: .tertiaryLabelColor), lineWidth: isActive ? 0 : 1.5)
             )
             .frame(width: 8, height: 8)
             // The design reference rings the active disc with a soft accent halo (`box-shadow 0 0 0 3px`) —
-            // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue.
+            // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue. Its
+            // opacity is theme-aware (#388, mock `--accent-halo`): .20 light / .30 dark.
             .background {
                 if isActive {
-                    Circle().fill(Color.accentColor.opacity(0.20)).frame(width: 14, height: 14)
+                    Circle()
+                        .fill(Color.accentEmphasis(.activeDotHalo, dark: colorScheme == .dark))
+                        .frame(width: 14, height: 14)
                 }
             }
             .accessibilityHidden(true)
@@ -805,6 +1049,8 @@ private struct SwapCalloutCard: View {
     let reason: String?
 
     @EnvironmentObject private var swap: AccountSwapModel
+    /// The callout's accent-tint fill + border opacities are theme-aware (#388): the mock raises them in dark.
+    @Environment(\.colorScheme) private var colorScheme
 
     /// The in-flight swap is this card's own target (as opposed to a per-row switch elsewhere).
     private var isSwitchingToTarget: Bool { swap.phase.pendingTarget == target }
@@ -819,10 +1065,17 @@ private struct SwapCalloutCard: View {
             // (Combining the whole card, as this did while the button was dead, would now swallow a live
             // control and leave it unreachable.)
             VStack(alignment: .leading, spacing: 1) {
-                (Text("Next swap → ") + Text(target).fontWeight(.semibold))
-                    .font(.system(size: 12))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                // MIDDLE-truncate the TARGET label (issue #445), keeping the "Next swap →" prefix whole, so a
+                // same-local-part target's distinguishing suffix survives the elision (the earlier "clunky"
+                // read was a tail-truncated target). The prefix is `.fixedSize`d; the target absorbs the
+                // squeeze. The spoken label (`accessibilityText`) is unchanged — it carries the full target.
+                HStack(spacing: 0) {
+                    Text("Next swap → ").fixedSize()
+                    Text(target).fontWeight(.semibold)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(.system(size: 12))
                 if let reason {
                     Text(reason)
                         .font(.system(size: 10.5))
@@ -858,11 +1111,13 @@ private struct SwapCalloutCard: View {
                                 : StatusPanelFormat.switchHelpText(label: target))
         }
         .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
+        // Fill + border opacities are theme-aware (#388, mock `--accent-tint` / `--accent-tint-border`):
+        // .10/.20 light, .16/.30 dark — the dark callout was too faint hardcoded to the light values.
         .background(
             RoundedRectangle(cornerRadius: 9)
-                .fill(Color.accentColor.opacity(0.10))
+                .fill(Color.accentEmphasis(.swapCalloutFill, dark: colorScheme == .dark))
                 .overlay(RoundedRectangle(cornerRadius: 9)
-                    .strokeBorder(Color.accentColor.opacity(0.20), lineWidth: 0.5))
+                    .strokeBorder(Color.accentEmphasis(.swapCalloutBorder, dark: colorScheme == .dark), lineWidth: 0.5))
         )
         .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
     }
@@ -1032,6 +1287,7 @@ private struct CaptureAffordance: View {
 /// ack back).
 private struct CaptureCard: View {
     let title: String
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -1046,7 +1302,288 @@ private struct CaptureCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+        // Mock `--card-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.08)`.
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
+    }
+}
+
+// MARK: - Stats tab (issue #446 — the mock's `.stats` view over the socket `stats` verb)
+
+/// The Stats tab body (issue #446): the mock's per-account 7-day sparklines + numeric body, aggregate
+/// callout, and signal legend — fed by the socket `stats` verb (never a store read). Renders the stats
+/// model's phase honestly: a loading placeholder, a failure message (never a blank tab), or the loaded
+/// content. READ-ONLY — it queries and renders, it never acts (the crown-jewel + footer-`next_swap`
+/// invariants belong to the Status tab).
+private struct StatsView: View {
+    @EnvironmentObject private var store: WatchStatusStore
+    @EnvironmentObject private var stats: PanelStatsModel
+
+    var body: some View {
+        switch stats.phase {
+        case .idle, .loading:
+            StatsMessage(text: "Loading usage stats…")
+        case .failed(let failure):
+            StatsMessage(text: StatusPanelFormat.statsFailureText(failure))
+        case .loaded(let wire):
+            StatsContent(wire: wire,
+                         activeLabel: store.rows.first(where: \.isActive)?.label,
+                         rosterOrder: store.rows.map(\.label))
+        }
+    }
+}
+
+/// A centered one-line Stats-tab message — the loading placeholder and the honest failure surface. Keeps the
+/// tab from ever rendering blank (or a fabricated number) when there is no series to show.
+private struct StatsMessage: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.horizontal, 20).padding(.vertical, 22)
+    }
+}
+
+/// The loaded Stats view: the per-account rows (ordered to match the Status roster), then the aggregate
+/// callout + signal legend. Identity (name + monogram + active marker) joins the stats handles with the
+/// live roster the panel already holds — provider-neutral (#173), exactly like the Status roster.
+private struct StatsContent: View {
+    let wire: StatsWire
+    /// The active account's handle (from the watch snapshot the panel already renders) — marks the active
+    /// stats row, the only roster fact the Stats tab reads. `nil` when none is active.
+    let activeLabel: String?
+    /// The roster's handle order, so the Stats rows list accounts identically to the Status tab.
+    let rosterOrder: [String]
+
+    var body: some View {
+        let handles = StatusPanelFormat.orderedStatHandles(
+            summaryHandles: Set(wire.summary.accounts.keys), rosterOrder: rosterOrder)
+        // Resolve monograms over the SAME handle set the Stats tab lists (issue #445) — the disambiguation
+        // kit applies identically on both tabs, since they render the same accounts.
+        let monograms = StatusPanelFormat.accountMonograms(handles)
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(handles, id: \.self) { handle in
+                    if let account = wire.summary.accounts[handle] {
+                        StatStripRow(handle: handle,
+                                     monogram: monograms[handle] ?? "?",
+                                     account: account,
+                                     series: StatusPanelFormat.sparkSeries(wire.series, handle: handle),
+                                     isActive: handle == activeLabel)
+                    }
+                }
+            }
+            // Mock `.stats { padding:6px 8px 2px }` — inset to align with the roster + aggregate below.
+            .padding(.horizontal, PanelMetrics.rosterInset).padding(.top, 6).padding(.bottom, 2)
+
+            StatsAggregate(roster: wire.summary.roster, window: wire.window)
+            SignalLegend()
+        }
+    }
+}
+
+/// One account's Stats row (mock `.stat`): identity + a 7-day session-peak sparkline + the neutral signal
+/// pill, over a three-cell numeric body (session mean/peak, weekly peak, cap-hits). The active account wears
+/// the accent-tint card fill (mock `.stat.active`, the SAME `--active-bg` token the Status roster uses).
+private struct StatStripRow: View {
+    let handle: String
+    /// The roster-resolved 2-char monogram for this handle (issue #445), computed once by `StatsContent`.
+    let monogram: String
+    let account: StatsAccountStats
+    /// The per-bucket session-peak series (0…1, fixed-scale) — the sparkline source.
+    let series: [Double]
+    let isActive: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let signal = StatusPanelFormat.statsSignal(account.band)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                StatusDot(isActive: isActive)
+                MonogramBadge(label: handle, monogram: monogram)
+                // Provider-neutral name (#15): the redacted handle, exactly as the Status roster shows it —
+                // the mock's `.s-prov` provider brand is intentionally dropped (the shipped app names no provider).
+                Text(handle)
+                    .font(.system(size: 13, weight: .semibold))
+                    // MIDDLE-truncation (issue #445) — same as the Status roster, so a same-local-part handle's
+                    // distinguishing suffix survives elision on the Stats tab too.
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 6)
+                Sparkline(values: series)
+                SignalPill(signal: signal)
+            }
+            HStack(alignment: .top, spacing: 8) {
+                StatCell(label: "Session m/pk", value: StatusPanelFormat.statsSessionMeanPeak(account))
+                StatCell(label: "Weekly pk", value: StatusPanelFormat.statsWeeklyPeak(account))
+                StatCell(label: "Cap-hits", value: "\(account.capHits)")
+            }
+            .padding(.leading, 17)  // mock `.stat-body { margin-left:17px }` — aligns the body under the name
+        }
+        .padding(.vertical, 10).padding(.horizontal, 8)  // mock `.stat { padding:10px 8px }`
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(isActive ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark) : Color.clear)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// The spoken row summary — identity + signal + the numeric body, so the sparkline (accessibility-hidden,
+    /// a purely visual trend) is still conveyed as facts.
+    private var accessibilityLabel: String {
+        let signal = StatusPanelFormat.statsSignal(account.band)
+        let sessionMean = StatusPanelFormat.statsPercent(account.session.mean)
+        let sessionPeak = StatusPanelFormat.statsPercent(account.session.peak)
+        let weeklyPeak = StatusPanelFormat.statsPercent(account.weekly.peak)
+        let active = isActive ? ", active" : ""
+        return "\(handle)\(active). \(signal.label). Session mean \(sessionMean) percent, "
+            + "peak \(sessionPeak) percent. Weekly peak \(weeklyPeak) percent. \(account.capHits) cap hits."
+    }
+}
+
+/// One numeric cell of the Stats row's three-column body (mock `.sc`): an uppercase micro-label over a
+/// tabular-figure value. Equal-width (`maxWidth: .infinity`), mirroring the mock's `repeat(3, 1fr)` grid.
+private struct StatCell: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased())
+                .font(.system(size: 9, weight: .semibold)).tracking(0.5)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Text(value)
+                .font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The per-account 7-day sparkline (mock `.spark`): a drawn area + line + end-dot over the per-bucket session
+/// peaks, on the FIXED [0, 1] (0–100% of cap) scale — R-2 parity with the CLI trend sparkline (`src/stats.rs`),
+/// NOT auto-normalised. The 96 × 28 box + inset 3 reproduce the mock's `.spark` viewBox exactly. The geometry
+/// is the pure, unit-tested `StatusPanelFormat.sparkPoints`; this view only strokes/fills it.
+private struct Sparkline: View {
+    let values: [Double]
+    @Environment(\.colorScheme) private var colorScheme
+
+    private let boxWidth = 96.0
+    private let boxHeight = 28.0
+    private let inset = 3.0
+
+    var body: some View {
+        Canvas { context, _ in
+            let points = StatusPanelFormat.sparkPoints(values, width: boxWidth, height: boxHeight, inset: inset)
+            guard points.count >= 2 else { return }
+            let color = Color.spark(dark: colorScheme == .dark)
+
+            var line = Path()
+            line.move(to: CGPoint(x: points[0].x, y: points[0].y))
+            for point in points.dropFirst() {
+                line.addLine(to: CGPoint(x: point.x, y: point.y))
+            }
+
+            // Area = the line closed down to the plot baseline (mock `.sp-area` closes to y = height − inset),
+            // filled at a fraction of the stroke alpha (mock `.sp-area { fill-opacity:.2 }`).
+            let baseline = boxHeight - inset
+            var area = line
+            area.addLine(to: CGPoint(x: points[points.count - 1].x, y: baseline))
+            area.addLine(to: CGPoint(x: points[0].x, y: baseline))
+            area.closeSubpath()
+            context.fill(area, with: .color(color.opacity(0.2)))
+
+            context.stroke(line, with: .color(color),
+                           style: StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round))
+
+            // The end dot marks the latest bucket (mock `.sp-dot`, r 1.7).
+            let last = points[points.count - 1]
+            let dot = Path(ellipseIn: CGRect(x: last.x - 1.7, y: last.y - 1.7, width: 3.4, height: 3.4))
+            context.fill(dot, with: .color(color))
+        }
+        .frame(width: boxWidth, height: boxHeight)
+        .accessibilityHidden(true)  // a purely visual trend; the row label speaks the numeric values
+    }
+}
+
+/// The neutral utilisation signal pill (mock `.signal`): a colored dot + descriptor word (underused /
+/// balanced / saturated), tinted by the mock's `--sig-*` tokens. A DESCRIPTOR of the session-peak band, never
+/// a recommendation — the read-only Stats tab states the magnitude, it does not advise.
+private struct SignalPill: View {
+    let signal: StatusPanelFormat.StatSignal
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let dark = colorScheme == .dark
+        HStack(spacing: 5) {
+            Circle()
+                .fill(Color.statsSignalText(signal, dark: dark))
+                .frame(width: 6, height: 6)
+            Text(signal.label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.statsSignalText(signal, dark: dark))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background(Capsule().fill(Color.statsSignalFill(signal, dark: dark)))
+        .fixedSize()
+        .accessibilityHidden(true)  // spoken via the row's accessibility label
+    }
+}
+
+/// The aggregate callout under the Stats rows (mock `.agg`): the roster-wide all-accounts-high water + swap
+/// count over the window, in a neutral card. Facts only (magnitudes + the span), never a recommendation.
+private struct StatsAggregate: View {
+    let roster: StatsRoster
+    let window: StatsWindow
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "chart.line.uptrend.xyaxis")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Text(StatusPanelFormat.statsAggregateText(roster: roster, window: window))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 9).padding(.horizontal, 11)
+        .background(RoundedRectangle(cornerRadius: 9).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
+        .padding(.horizontal, 12).padding(.vertical, 6)  // mock `.agg { margin:6px 12px }`
+    }
+}
+
+/// The signal legend (mock `.sig-legend`): the three descriptor pills + the neutrality note. Reinforces the
+/// read-only ethos — "descriptive · equal weight · no action implied" — so the pills never read as an alarm.
+private struct SignalLegend: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Text("SIGNAL")
+                    .font(.system(size: 9.5, weight: .semibold)).tracking(0.6)
+                    .foregroundStyle(.tertiary)
+                SignalPill(signal: .underused)
+                SignalPill(signal: .balanced)
+                SignalPill(signal: .saturated)
+                Spacer(minLength: 0)
+            }
+            Text("descriptive · equal weight · no action implied")
+                .font(.system(size: 10)).italic()
+                .foregroundStyle(.tertiary)
+        }
+        // Mock `.sig-legend { margin:2px 12px 13px; border-top }` — a hairline over the note.
+        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 13)
+        .overlay(alignment: .top) {
+            Divider().padding(.horizontal, 12)
+        }
+        .accessibilityHidden(true)  // static explanatory chrome; the per-row labels speak each signal
     }
 }
 

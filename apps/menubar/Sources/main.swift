@@ -29,6 +29,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var store: WatchStatusStore?
     private var statusItemController: StatusItemController?
     private var transport: WatchTransport?
+    private var accountEventNotifier: AccountEventNotifier?
+    #if DEBUG
+    /// Retains the debug glyph-gallery status items (the issue #437 `SESSIOMETER_GLYPH_GALLERY` harness) so
+    /// they are not deallocated while the gallery-only app runs; empty in normal operation.
+    private var galleryItems: [NSStatusItem] = []
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
@@ -39,6 +45,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            idx + 1 < CommandLine.arguments.count {
             RenderPanelTool.run(outputDir: CommandLine.arguments[idx + 1])
             exit(0)
+        }
+
+        // Bar-glyph render-parity tooling (issue #525): `--render-bar-glyphs <dir>` renders every status-
+        // item glyph — template-tinted, per appearance, @1x + @2x, plus the menu-open inverted state — to
+        // committable PNGs the parity gate diffs against, then exits. Like `--render-panel` it never wires
+        // the status item; unlike the panel it exists because `NSStatusItem` template tinting is applied by
+        // the system and is invisible to SwiftUI `ImageRenderer`.
+        if let idx = CommandLine.arguments.firstIndex(of: "--render-bar-glyphs"),
+           idx + 1 < CommandLine.arguments.count {
+            RenderBarGlyphTool.run(outputDir: CommandLine.arguments[idx + 1])
+            exit(0)
+        }
+
+        // Glyph-gallery harness (issue #437): `SESSIOMETER_GLYPH_GALLERY=1` installs one real menu-bar
+        // status item per StatusGlyph — the four bespoke template gauges side by side — and wires nothing
+        // else (no daemon, no transport). It exists so #437's PRIORITY-1 falsifier — shape-distinctness at
+        // real bar size (light + dark, Increase Contrast, over a bright wallpaper, beside system icons) —
+        // can be captured from ACTUAL NSStatusItems, which a headless raster proxy cannot settle. Opt-in and
+        // inert in normal operation; it never JUDGES distinctness, it only makes the on-device capture
+        // possible. The app keeps running afterwards (no exit) so the items stay live to screenshot.
+        if ProcessInfo.processInfo.environment["SESSIOMETER_GLYPH_GALLERY"] == "1" {
+            galleryItems = StatusGlyph.allCases.map { glyph in
+                let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+                item.button?.image = StatusGauge.image(for: glyph)
+                item.button?.setAccessibilityLabel(
+                    "Sessiometer glyph gallery: \(StatusGauge.accessibilityDescription(for: glyph))")
+                return item
+            }
+            appLog.info("glyph gallery installed: \(self.galleryItems.count, privacy: .public) items (SESSIOMETER_GLYPH_GALLERY)")
+            return
         }
         #endif
 
@@ -78,11 +114,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             swapClient = nil
         }
 
+        // The Stats-tab read path (issue #446): the SAME short-lived control-command transport, for the
+        // one-shot `stats` query (#356) the panel runs when the operator opens the Stats tab. A bounded READ
+        // answered off the daemon's run loop (no lock, unlike `swap`), so a modest 5 s budget clears a slower
+        // store aggregation without the swap path's 15 s lock headroom. A resolve failure degrades to a nil
+        // client → the tab shows an honest "unavailable" (and the watch transport ALSO fails, so the panel is
+        // disconnected and never offers the seg anyway).
+        let statsClient: ControlCommandClient?
+        switch ControlCommandClient.production(timeout: .seconds(5)) {
+        case .success(let client):
+            statsClient = client
+        case .failure(let error):
+            appLog.error("stats client unavailable: \(String(describing: error), privacy: .public)")
+            statsClient = nil
+        }
+
         let controller = StatusItemController(store: store,
                                               captureClient: captureClient,
-                                              swapClient: swapClient)
+                                              swapClient: swapClient,
+                                              statsClient: statsClient)
         controller.start()
         statusItemController = controller
+
+        // Native swap / all-accounts-exhausted notifications (issue #267, REQ-MBR-B-017): a thin
+        // observer over the SAME redacted store the panel renders. It posts a GENERIC macOS
+        // notification (the EVENT, never the account — no label / email / credential, the redaction AC)
+        // when the active account changes or the fleet runs out of viable targets. A `UserDefaults`
+        // on/off toggle (default on) is the persisted home #268's settings UI will later surface;
+        // authorization + display are OS-bound (a manual pre-release step). Zero egress:
+        // `UNUserNotificationCenter` is a local OS call, no network. Installed BEFORE `store.start(...)`
+        // below so the observer never misses the first snapshot's transition.
+        let notifier = AccountEventNotifier(preferences: NotificationPreferences(),
+                                            presenter: UserNotificationPresenter())
+        notifier.start(observing: store)
+        accountEventNotifier = notifier
 
         // Feed the store from the daemon's watch socket — or degrade loudly if the path won't resolve.
         switch WatchTransport.production() {
@@ -93,6 +158,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .failure(let error):
             appLog.error("watch transport unavailable: \(String(describing: error), privacy: .public)")
             store.start(consuming: Self.disconnectedStream(reason: Self.reason(for: error)))
+        }
+
+        // Sleep/wake gating of the warm-dwell escalation (issue #526): suspend the store's warm-dwell timer
+        // across system sleep so a benign overnight lid-close — a long disconnect that resolves in ~1 s on
+        // wake — never escalates a warm drop to Attention while asleep (the app would otherwise open on a
+        // FALSE "!" at its most-seen moment every morning). `willSleep` suspends the dwell; `didWake` resets
+        // it to a fresh window. These arrive on `NSWorkspace.shared.notificationCenter` (NOT the default
+        // center) on the main thread; the store's `systemWillSleep` / `systemDidWake` are `@MainActor`, so
+        // hop via `Task { @MainActor in }` (macOS 13 floor rules out `MainActor.assumeIsolated`, 14+). The
+        // store methods are unit-tested directly with synthetic sleep/wake; only THIS OS wiring is the
+        // on-device falsifier the issue asks the operator to verify post-merge.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        _ = workspaceCenter.addObserver(forName: NSWorkspace.willSleepNotification,
+                                        object: nil, queue: .main) { [weak store] _ in
+            Task { @MainActor in store?.systemWillSleep() }
+        }
+        _ = workspaceCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                        object: nil, queue: .main) { [weak store] _ in
+            Task { @MainActor in store?.systemDidWake() }
         }
     }
 

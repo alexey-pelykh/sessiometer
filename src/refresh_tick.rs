@@ -720,6 +720,10 @@ mod tests {
             idle_after_secs,
             timeout_secs: 90,
             claude_bin: None,
+            // Irrelevant to the parked sweep — `proactive_keep_warm` is read only by the active
+            // keep-warm path; the #468 default keeps these RefreshTick tests exercising the
+            // unchanged parked behavior.
+            proactive_keep_warm: false,
         }
     }
 

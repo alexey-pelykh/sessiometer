@@ -152,6 +152,114 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.usageTextTint(.red),    StatusPanelFormat.healthTint(.red))
     }
 
+    // MARK: - Chrome fidelity tokens (#388 — theme-aware accent emphasis + neutral fills)
+    //
+    // These assert the EXACT mock values (`apps/menubar/design/menubar-preview.html`) the SwiftUI view is a
+    // thin `@Environment(\.colorScheme)` consumer of. This layer IS the fidelity gate: the real popover can't
+    // be screenshot-verified in CI, so a wrong number here (a typo, a dropped dark bump, a base-hue slip) is
+    // caught ONLY by these assertions — never by an eyeball.
+
+    func testAccentEmphasisOpacityIsThemeAwareAtTheMockValues() {
+        // Light (dark:false) is what already shipped; dark is the bump the panel was MISSING (the dark active
+        // row / swap callout read ~1.5–1.8× too faint when hardcoded to the light values).
+        // LIGHT: --active-bg .08 · --accent-halo .20 · --accent-tint .10 · --accent-tint-border .20
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeRowFill,     dark: false), 0.08)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeDotHalo,     dark: false), 0.20)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutFill,   dark: false), 0.10)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutBorder, dark: false), 0.20)
+        // DARK: --active-bg .15 · --accent-halo .30 · --accent-tint .16 · --accent-tint-border .30
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeRowFill,     dark: true),  0.15)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.activeDotHalo,     dark: true),  0.30)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutFill,   dark: true),  0.16)
+        XCTAssertEqual(StatusPanelFormat.accentOpacity(.swapCalloutBorder, dark: true),  0.30)
+    }
+
+    func testEveryAccentEmphasisIsHeavierInDark() {
+        // The point of I3: dark is STRICTLY heavier than light for every accent surface. An equal pair would
+        // mean a site was left theme-invariant — exactly the bug this fixes — so the loop guards all four.
+        for emphasis in [StatusPanelFormat.AccentEmphasis.activeRowFill, .activeDotHalo,
+                         .swapCalloutFill, .swapCalloutBorder] {
+            XCTAssertGreaterThan(StatusPanelFormat.accentOpacity(emphasis, dark: true),
+                                 StatusPanelFormat.accentOpacity(emphasis, dark: false),
+                                 "\(emphasis) must be heavier in dark (the mock raises every accent-emphasis alpha)")
+        }
+    }
+
+    func testNeutralFillMatchesTheMockGrayInLightWhiteInDark() {
+        // Mock neutral FILL family: systemGray (120,120,128) in light, white in dark — replacing the washed
+        // `Color.secondary.opacity(k)` (label base ~60,60,67 already ~0.5 alpha → ≈half the intended fill).
+        let g = 120.0 / 255, b = 128.0 / 255
+        // LIGHT over systemGray: --badge-bg .16 · --track .22 · --card-bg .08
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: false), .init(red: g, green: g, blue: b, alpha: 0.16))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.track, dark: false), .init(red: g, green: g, blue: b, alpha: 0.22))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.card,  dark: false), .init(red: g, green: g, blue: b, alpha: 0.08))
+        // DARK over white: --badge-bg .10 · --track .14 · --card-bg .05
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: true), .init(red: 1, green: 1, blue: 1, alpha: 0.10))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.track, dark: true), .init(red: 1, green: 1, blue: 1, alpha: 0.14))
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.card,  dark: true), .init(red: 1, green: 1, blue: 1, alpha: 0.05))
+    }
+
+    func testNeutralFillBaseHueMatchesTheMockNotTheWashedLabelColor() {
+        // The washout wasn't only alpha — the base HUE was wrong too. Guard the base so a regression back to a
+        // label-derived neutral, a flat gray, or a white-in-light slip fails loudly (not just a subtle shade).
+        let light = StatusPanelFormat.neutralFill(.badge, dark: false)
+        XCTAssertEqual(light.red,   120.0 / 255)
+        XCTAssertEqual(light.green, 120.0 / 255)
+        XCTAssertEqual(light.blue,  128.0 / 255)   // a hair bluer than R/G — the mock's systemGray, not flat gray
+        XCTAssertEqual(StatusPanelFormat.neutralFill(.badge, dark: true).red, 1.0)  // dark base is pure white
+    }
+
+    // MARK: - Active-row tag (issue #501 — neutral sentence-case capsule, mock `.tag`)
+
+    func testActiveTagLabelIsNeutralSentenceCase() {
+        // The active tag is a calm SENTENCE-CASE capsule (mock `.tag`), NOT the old letter-spaced accent
+        // uppercase pill. Guard the exact label so a regression back to "ACTIVE" — which read as an accent
+        // web badge and re-inflated the active over-signalling #387 M5 reduced — fails loudly.
+        XCTAssertEqual(StatusPanelFormat.activeTagLabel, "Active")
+        XCTAssertNotEqual(StatusPanelFormat.activeTagLabel, "ACTIVE")
+        // Sentence-case: leading capital, remainder lowercase — never all-caps.
+        XCTAssertNotEqual(StatusPanelFormat.activeTagLabel, StatusPanelFormat.activeTagLabel.uppercased(),
+                          "the tag must be sentence-case, not letter-spaced uppercase (mock `.tag`)")
+        XCTAssertEqual(StatusPanelFormat.activeTagLabel.prefix(1), "A")
+        XCTAssertEqual(String(StatusPanelFormat.activeTagLabel.dropFirst()),
+                       StatusPanelFormat.activeTagLabel.dropFirst().lowercased())
+    }
+
+    func testActiveTagLabelClearsContrastOnTheBadgeCapsuleBothThemes() {
+        // The tag reuses the neutral `.badge` fill (`neutralFill(.badge, …)`) + `--text-2` text; on the
+        // capsule the label must clear the WCAG 1.4.11 3:1 floor (the tag is a DECORATIVE non-text
+        // redundancy cue — `accessibilityHidden`, the row's spoken label already carries ", active"). This
+        // reproduces the mock's design-token math over a representative opaque chrome base and guards the
+        // tokens from drifting below the floor; the mock claims ~3.9:1 light / ~3.8:1 dark. Reuses the
+        // shared `RGB` / `contrast` WCAG helpers below; only the capsule's translucent compositing is local.
+
+        // LIGHT — `--text-2` rgba(60,60,67,.72) on the `.badge` capsule over #f5f5f7 (the mock's stated
+        // opaque light base, `menubar-preview.html:155`). Observed ≈4.1:1.
+        let lightText2 = StatusPanelFormat.FillRGBA(red: 60/255, green: 60/255, blue: 67/255, alpha: 0.72)
+        let lightCapsule = composite(StatusPanelFormat.neutralFill(.badge, dark: false), over: RGB(245, 245, 247))
+        let lightRatio = contrast(composite(lightText2, over: lightCapsule), lightCapsule)
+        XCTAssertGreaterThanOrEqual(lightRatio, 3.0,
+                                    "light tag label must clear WCAG 1.4.11 3:1 (observed ≈4.1:1)")
+
+        // DARK — `--text-2` rgba(235,235,245,.6) on the `.badge` capsule over #3a3a3c (the standard macOS
+        // dark control tone the mock's ~3.8:1 claim corresponds to). Observed ≈3.7:1.
+        let darkText2 = StatusPanelFormat.FillRGBA(red: 235/255, green: 235/255, blue: 245/255, alpha: 0.6)
+        let darkCapsule = composite(StatusPanelFormat.neutralFill(.badge, dark: true), over: RGB(58, 58, 60))
+        let darkRatio = contrast(composite(darkText2, over: darkCapsule), darkCapsule)
+        XCTAssertGreaterThanOrEqual(darkRatio, 3.0,
+                                    "dark tag label must clear WCAG 1.4.11 3:1 (observed ≈3.7:1)")
+    }
+
+    /// Source-over composite of a translucent `FillRGBA` over an opaque `RGB` base → the opaque rendered
+    /// colour. The shared palette helpers assume opaque fills; the #501 tag capsule (and its `--text-2`
+    /// label over it) is translucent, so flatten each layer before measuring contrast.
+    private func composite(_ top: StatusPanelFormat.FillRGBA, over base: RGB) -> RGB {
+        let a = top.alpha
+        return RGB(a * top.red   + (1 - a) * base.red,
+                   a * top.green + (1 - a) * base.green,
+                   a * top.blue  + (1 - a) * base.blue)
+    }
+
     // MARK: - authCell (mirror `src/cli.rs` `health_cell` — byte parity)
 
     func testAuthCellMirrorsHealthCell() {
@@ -225,6 +333,37 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2).kind, .error)
         XCTAssertEqual(StatusPanelFormat.banner(for: .unsupported, accountCount: 0).kind, .error)
 
+        // Crash-looping (#169): a fault banner, never healthy; the held snapshot's numbers are refused.
+        let crash = StatusPanelFormat.banner(for: .crashLooping, accountCount: 3)
+        XCTAssertEqual(crash.kind, .error)
+        XCTAssertEqual(crash.title, "Daemon crash-looping")
+        XCTAssertEqual(crash.detail, "Restarting repeatedly; holding status until it stays up.")
+
+        // #499: daemon-starting is a transient info banner; not-running is an absent-daemon error banner —
+        // distinct titles, so both read distinct from EACH OTHER and from the socket-dropped banner.
+        let starting = StatusPanelFormat.banner(for: .starting, accountCount: 0)
+        XCTAssertEqual(starting.kind, .info)
+        XCTAssertEqual(starting.title, "Starting…")
+        let notRunning = StatusPanelFormat.banner(for: .notRunning, accountCount: 0)
+        XCTAssertEqual(notRunning.kind, .error)
+        XCTAssertEqual(notRunning.title, "Daemon not running")
+        let dropped = StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 0)
+        let staleBanner = StatusPanelFormat.banner(for: .stale, accountCount: 0)
+        XCTAssertNotEqual(notRunning.title, dropped.title, "not-running must not read as the socket-dropped banner")
+
+        // #526: the warm-dwell transient banner is CALMER than the escalated drop — a self-resolving
+        // `.warning` "Reconnecting…", not the loud `.error` "Daemon not responding" the escalation shows.
+        // This is the panel-side of the same calm-"…"-then-loud-"!" split the glyph makes.
+        let reconnecting = StatusPanelFormat.banner(for: .reconnecting(reason: "EOF"), accountCount: 2)
+        XCTAssertEqual(reconnecting.kind, .warning, "reconnecting is a calm warning, never the disconnected error")
+        XCTAssertEqual(reconnecting.title, "Reconnecting…")
+        XCTAssertNotEqual(reconnecting.kind, dropped.kind, "the transient must not read as loud as the escalation")
+        XCTAssertNotEqual(reconnecting.title, dropped.title, "reconnecting must not read as the escalated drop")
+        XCTAssertNotEqual(starting.title, dropped.title, "starting must not read as the socket-dropped banner")
+        XCTAssertNotEqual(starting.title, staleBanner.title, "starting must not read as the stale banner")
+        XCTAssertNotEqual(notRunning.title, staleBanner.title, "not-running must not read as the stale banner")
+        XCTAssertNotEqual(starting.title, notRunning.title)
+
         // Only `.connected` is ever the healthy kind (the never-healthy-when-dead invariant).
         for state in Self.allNonConnectedStates {
             XCTAssertNotEqual(StatusPanelFormat.banner(for: state, accountCount: 1).kind, .healthy,
@@ -270,8 +409,9 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertTrue(
             StatusPanelFormat.banner(for: .disconnected(reason: "EOF"), accountCount: 2, ageText: "updated 4m ago")
                 .detail.contains("· updated 4m ago."))
-        // …while transient / refused states never do (no retained reading to age).
-        for state in [ConnectionState.connecting, .emptyRoster, .unsupported] {
+        // …while transient / refused states never do (no retained reading to age) — including the #499
+        // cold-refused daemon-absent states, which never held a reading.
+        for state in [ConnectionState.connecting, .emptyRoster, .unsupported, .starting, .notRunning] {
             XCTAssertFalse(
                 StatusPanelFormat.banner(for: state, accountCount: 0, ageText: "updated 12s ago")
                     .detail.contains("updated"),
@@ -348,6 +488,131 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(
             StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: .session, resetsAt: nil), now: 1_000_000),
             "Every account over its session limit")
+    }
+
+    // MARK: - canonicalScrubBanner (issue #469 — the fleet-wide scrubbed-canonical signal)
+
+    // #469: the daemon's `canonical_scrub` rollup renders a distinct HONEST BANNER (title + detail +
+    // kind) naming the state and, for the un-recoverable residual, the `claude /login` remedy. The View
+    // renders it ABOVE the roster in `.connected` / `.stale`, so a connected-but-scrubbed panel reads
+    // visibly degraded (never healthy). Absent (nil) when the shared canonical is healthy.
+    func testCanonicalScrubBannerNamesTheStateAndRemedy() throws {
+        // Exhausted → an `.error` banner: the state (title) + the actionable re-login remedy (detail).
+        let exhausted = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.exhausted))
+        XCTAssertEqual(exhausted.title, "Shared login scrubbed")
+        XCTAssertEqual(exhausted.kind, .error, "the un-recoverable residual reads as an error")
+        XCTAssertTrue(exhausted.detail.contains("claude /login"), "detail names the remedy: \(exhausted.detail)")
+
+        // Recovering → a calm `.info` banner; the fleet may self-heal, so NO re-login prompt.
+        let recovering = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.recovering))
+        XCTAssertEqual(recovering.title, "Shared login scrubbed")
+        XCTAssertEqual(recovering.kind, .info, "the self-healing state is calm, not an error")
+        XCTAssertFalse(recovering.detail.contains("claude /login"),
+                       "recovering carries no re-login remedy — it may self-heal")
+
+        // Healthy (nil) → no banner (same single-cardinality as `nextSwapFooter(nil)`).
+        XCTAssertNil(StatusPanelFormat.canonicalScrubBanner(nil))
+    }
+
+    // #469 content-parity with the CLI (`src/cli.rs` `render_status`): both surfaces name the SAME state
+    // ("scrubbed") and, on the exhausted case, the SAME `claude /login` remedy; the recovering case names
+    // "recovering automatically" and carries NO re-login remedy on BOTH surfaces (R-2 STATE-parity — the
+    // same facts, each medium phrasing its own way, so the panel checks its own rendered title + detail).
+    func testCanonicalScrubBannerIsContentParityWithTheCLI() throws {
+        let exhausted = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.exhausted))
+        let exhaustedText = "\(exhausted.title) \(exhausted.detail)"
+        XCTAssertTrue(exhaustedText.contains("scrubbed"), "names the state: \(exhaustedText)")
+        XCTAssertTrue(exhaustedText.contains("claude /login"), "names the shared remedy: \(exhaustedText)")
+
+        let recovering = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(.recovering))
+        let recoveringText = "\(recovering.title) \(recovering.detail)"
+        XCTAssertTrue(recoveringText.contains("scrubbed"), "names the state: \(recoveringText)")
+        XCTAssertTrue(recoveringText.lowercased().contains("recovering automatically"),
+                      "names the calm self-heal cue: \(recoveringText)")
+        XCTAssertFalse(recoveringText.contains("claude /login"),
+                       "recovering carries no re-login remedy — parity with the CLI")
+    }
+
+    // #469 / #15: no secret in the canonical-scrub banner — a bare state discriminant, never a token or
+    // email. The wire rollup carries no handle at all today (even a future additive handle would be a
+    // non-secret roster label, #516), so the banner is trivially redaction-clean.
+    func testCanonicalScrubBannerCarriesNoSecret() throws {
+        for scrub in [CanonicalScrub.exhausted, .recovering] {
+            let banner = try XCTUnwrap(StatusPanelFormat.canonicalScrubBanner(scrub))
+            let text = "\(banner.title) \(banner.detail)"
+            XCTAssertFalse(text.lowercased().contains("token"), "no token in the scrub banner: \(text)")
+            XCTAssertFalse(text.contains("@"), "no email in the scrub banner: \(text)")
+        }
+    }
+
+    // MARK: - keychainLockedBanner (issue #498 — the fleet-wide unreadable-credential signal)
+
+    // #498: the daemon's `keychain_locked` rollup renders a distinct HONEST BANNER (title + detail + kind)
+    // naming the state and the UNLOCK-THE-KEYCHAIN remedy. The View renders it ABOVE the roster in
+    // `.connected` / `.stale`, so a connected-but-locked panel reads visibly degraded (never healthy).
+    // Absent (nil) when the login keychain is unlocked.
+    func testKeychainLockedBannerNamesTheStateAndRemedy() throws {
+        // Locked → an `.error` banner: the state (title) + the actionable unlock remedy (detail).
+        let locked = try XCTUnwrap(StatusPanelFormat.keychainLockedBanner(true))
+        XCTAssertEqual(locked.title, "Keychain locked")
+        XCTAssertEqual(locked.kind, .error, "a locked keychain is an unresolved error until the operator unlocks")
+        XCTAssertTrue(locked.detail.lowercased().contains("unlock"), "detail names the remedy: \(locked.detail)")
+
+        // The unlock remedy is DISTINCT from the scrub's `claude /login` (#498-vs-#469): a re-login cannot
+        // help while the keychain that STORES the credential is locked.
+        XCTAssertFalse(locked.detail.contains("claude /login"),
+                       "keychain-locked never prompts re-login — unlock the keychain: \(locked.detail)")
+
+        // Unlocked (false) → no banner (same single-cardinality as `canonicalScrubBanner(nil)`).
+        XCTAssertNil(StatusPanelFormat.keychainLockedBanner(false))
+    }
+
+    // #498 content-parity with the CLI (`src/cli.rs` `render_status` — the `shared login: unreadable …`
+    // line): both surfaces name the SAME state (keychain "locked") and the SAME "unlock" remedy, and
+    // NEITHER names `claude /login` (R-2 STATE-parity — the same facts, each medium phrasing its own way,
+    // so the panel checks its own rendered title + detail).
+    func testKeychainLockedBannerIsContentParityWithTheCLI() throws {
+        let locked = try XCTUnwrap(StatusPanelFormat.keychainLockedBanner(true))
+        let text = "\(locked.title) \(locked.detail)".lowercased()
+        XCTAssertTrue(text.contains("keychain"), "names the subject: \(text)")
+        XCTAssertTrue(text.contains("locked"), "names the state: \(text)")
+        XCTAssertTrue(text.contains("unlock"), "names the shared remedy: \(text)")
+        XCTAssertFalse(text.contains("claude /login"),
+                       "keychain-locked carries no re-login remedy — parity with the CLI: \(text)")
+    }
+
+    // #498 / #15: no secret in the keychain-locked banner — a bare fleet-wide state discriminant, never a
+    // token or email. The wire flag is a bare `Bool` carrying no handle at all, so the banner is trivially
+    // redaction-clean.
+    func testKeychainLockedBannerCarriesNoSecret() throws {
+        let banner = try XCTUnwrap(StatusPanelFormat.keychainLockedBanner(true))
+        let text = "\(banner.title) \(banner.detail)"
+        XCTAssertFalse(text.lowercased().contains("token"), "no token in the keychain-locked banner: \(text)")
+        XCTAssertFalse(text.contains("@"), "no email in the keychain-locked banner: \(text)")
+    }
+
+    // MARK: - daemonFaultBanner (issue #498 — worst-first single daemon-level fault banner)
+
+    // The panel shows ONE daemon-level fault banner even when multiple faults are set. Worst-first:
+    // keychain-locked (#498) OUTRANKS canonical-scrub (#469) — an UNREADABLE shared item is at least as
+    // severe as a readable-but-scrubbed one, and its unlock remedy must reach the operator before the
+    // scrub's `claude /login` (which cannot help while the keychain is locked). In practice the two are
+    // daemon-mutually-exclusive; this pins the deterministic tiebreak as a tested invariant.
+    func testDaemonFaultBannerIsWorstFirstKeychainOverScrub() throws {
+        // BOTH present → keychain-locked wins (the sole banner names the keychain state, not the scrub).
+        let both = try XCTUnwrap(StatusPanelFormat.daemonFaultBanner(keychainLocked: true, scrub: .exhausted))
+        XCTAssertEqual(both.title, "Keychain locked", "keychain-locked outranks canonical-scrub: \(both.title)")
+
+        // Keychain-only → the keychain banner.
+        let keychainOnly = try XCTUnwrap(StatusPanelFormat.daemonFaultBanner(keychainLocked: true, scrub: nil))
+        XCTAssertEqual(keychainOnly.title, "Keychain locked")
+
+        // Scrub-only → the scrub banner (keychain healthy, so it falls through to the scrub).
+        let scrubOnly = try XCTUnwrap(StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .exhausted))
+        XCTAssertEqual(scrubOnly.title, "Shared login scrubbed")
+
+        // Neither → no banner.
+        XCTAssertNil(StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil))
     }
 
     // MARK: - captureCommand (the CLI-equivalent subcommand; in-app capture affordance is #360)
@@ -472,6 +737,12 @@ final class StatusPanelFormatTests: XCTestCase {
             StatusPanelFormat.headerSubtitle(state: .disconnected(reason: "EOF"), accountCount: 3,
                                              activeLabel: "work", ageStale: false),
             "3 accounts · last-known")
+        // #526: a warm drop still WITHIN the dwell shows the SAME retained roster header as the escalation —
+        // the dimmed last-known roster, never a false "active".
+        XCTAssertEqual(
+            StatusPanelFormat.headerSubtitle(state: .reconnecting(reason: "EOF"), accountCount: 3,
+                                             activeLabel: "work", ageStale: false),
+            "3 accounts · last-known")
         // Absent / transitional states speak their status, not a roster count.
         XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .connecting, accountCount: 0,
                                                         activeLabel: nil, ageStale: false),
@@ -482,6 +753,10 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .unsupported, accountCount: 3,
                                                         activeLabel: "work", ageStale: false),
                        "Version mismatch")
+        // Crash-looping (#169): a fault sub-line, never a false "N accounts · active" roster claim.
+        XCTAssertEqual(StatusPanelFormat.headerSubtitle(state: .crashLooping, accountCount: 3,
+                                                        activeLabel: "work", ageStale: false),
+                       "Daemon fault")
     }
 
     // MARK: - Swap callout (issue #355 — design-reference parity)
@@ -520,6 +795,124 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertNil(StatusPanelFormat.swapCalloutReason(nil))
     }
 
+    // MARK: - Account identity color (issue #445 — deterministic label→palette hash, WCAG-AA, accent-excluded)
+
+    func testAccountColorIndexIsStableAndBounded() {
+        // Deterministic: the same label maps to the same slot on EVERY call (FNV-1a — never the per-process
+        // randomized `Hasher`, which would reshuffle every account's color each launch).
+        for label in ["work-alice", "work-bob", "acme.gmail.com", "", "Personal", "  spaced  "] {
+            let a = StatusPanelFormat.accountColorIndex(for: label)
+            let b = StatusPanelFormat.accountColorIndex(for: label)
+            XCTAssertEqual(a, b, "index for '\(label)' must be stable across calls")
+            XCTAssertTrue((0..<StatusPanelFormat.accountColorCount).contains(a),
+                          "index \(a) for '\(label)' must be within the palette")
+        }
+        // Leading/trailing whitespace is trimmed before hashing, so a padded label keeps its color.
+        XCTAssertEqual(StatusPanelFormat.accountColorIndex(for: "work"),
+                       StatusPanelFormat.accountColorIndex(for: "  work  "))
+        // A 6-account same-local-part roster spreads across several slots, not one collapsed color.
+        let indices = ["work-alice", "work-bob", "work-carol", "work-dave", "work-erin", "work-frank"]
+            .map(StatusPanelFormat.accountColorIndex(for:))
+        XCTAssertGreaterThanOrEqual(Set(indices).count, 3,
+                                    "a 6-account same-local-part roster should not collapse to < 3 colors")
+    }
+
+    func testEveryPaletteSlotIsReachable() {
+        // Each of the N slots is hit by some label — no dead palette entry (also proves the probe helper
+        // works). Keyed by the fill's components (FillRGBA is Equatable, not Hashable) → distinct per slot.
+        let keys = (0..<StatusPanelFormat.accountColorCount).map { slot -> String in
+            let fill = paletteFill(slot, dark: false)
+            return "\(fill.red),\(fill.green),\(fill.blue)"
+        }
+        XCTAssertEqual(Set(keys).count, StatusPanelFormat.accountColorCount,
+                       "every palette slot must be reachable and its fill distinct")
+    }
+
+    func testAccountPaletteMeetsWcagAAAgainstThePanelReferenceBase() {
+        // The panel floats on live vibrancy — NOT headlessly measurable (the owner-eyeball residual, same class
+        // as #326/#388/#446/#504). We assert against the mock's OPAQUE popover reference base, the same
+        // convention the #388 `--text-2` comment uses ("4.53:1 over #f5f5f7"): light #f7f7fa / dark #26262b.
+        let lightBase = RGB(247, 247, 250)
+        let darkBase = RGB(38, 38, 43)
+        let lightText = StatusPanelFormat.accountMonogramColor(dark: false)
+        let darkText = StatusPanelFormat.accountMonogramColor(dark: true)
+        for slot in 0..<StatusPanelFormat.accountColorCount {
+            let lightFill = paletteFill(slot, dark: false)
+            let darkFill = paletteFill(slot, dark: true)
+            // Badge FILL vs the panel base — WCAG 1.4.11 non-text ≥ 3:1 (a perceptible color region).
+            XCTAssertGreaterThanOrEqual(contrast(lightFill, lightBase), 3.0,
+                                        "light fill \(slot) must clear 3:1 on the panel base")
+            XCTAssertGreaterThanOrEqual(contrast(darkFill, darkBase), 3.0,
+                                        "dark fill \(slot) must clear 3:1 on the panel base")
+            // Monogram GLYPH vs its actual background (the opaque fill) — WCAG 1.4.3 text ≥ 4.5:1.
+            XCTAssertGreaterThanOrEqual(contrast(lightText, lightFill), 4.5,
+                                        "light monogram \(slot) must clear 4.5:1 on its fill")
+            XCTAssertGreaterThanOrEqual(contrast(darkText, darkFill), 4.5,
+                                        "dark monogram \(slot) must clear 4.5:1 on its fill")
+        }
+    }
+
+    func testAccountPaletteExcludesTheAccentHue() {
+        // Accent = brand blue (#007aff light / #0a84ff dark), hue ≈ 211°. Every palette hue sits ≥ 25° away so
+        // the identity color never reads as the one accent action (#445 AC "excluding the active/accent hue").
+        let accentHue = hue(RGB(0, 122, 255))
+        for slot in 0..<StatusPanelFormat.accountColorCount {
+            let h = hue(paletteFill(slot, dark: false))
+            let delta = min(abs(h - accentHue), 360 - abs(h - accentHue))
+            XCTAssertGreaterThanOrEqual(delta, 25,
+                                        "palette hue \(slot) (\(Int(h))°) is too close to the accent (\(Int(accentHue))°)")
+        }
+    }
+
+    // MARK: - Smart monogram (issue #445 — distinguishing token, collision-escalating, never label.first)
+
+    func testMonogramUsesTheDistinguishingTokenNotLabelFirst() {
+        // `label.first` would collapse a same-local-part roster to one letter; the smart monogram pairs the
+        // first token's initial with the distinguishing suffix token's initial.
+        let m = StatusPanelFormat.accountMonograms(["work-alice", "work-bob", "work-carol"])
+        XCTAssertEqual(m["work-alice"], "WA")
+        XCTAssertEqual(m["work-bob"], "WB")
+        XCTAssertEqual(m["work-carol"], "WC")
+        XCTAssertFalse(Set(m.values).contains("W"), "must not collapse to label.first")
+    }
+
+    func testMonogramsAreDistinctAcrossSimilarRosters() {
+        // The core AC property: two similar labels never collapse to the same pair — the resolved set is fully
+        // distinct, each ≤ 2 chars, non-empty.
+        let rosters: [[String]] = [
+            ["work-alice", "work-bob", "work-carol", "work-dave", "work-erin", "work-frank"],
+            // Shared prefix AND suffix — the distinguishing token is in the MIDDLE, so first⋅last collapses
+            // (all → "WX") and the ladder must escalate to first⋅second to stay distinct.
+            ["work-alpha-x", "work-beta-x", "work-gamma-x"],
+            ["acme.gmail.com", "acme.work.com", "acme.proton.me"],
+            ["proj-1", "proj-2", "proj-10", "proj-11"],
+            ["work", "works", "working", "workflow"],
+            ["a", "b", "c"],
+            ["team/alpha", "team/beta", "team/gamma"],
+        ]
+        for roster in rosters {
+            let m = StatusPanelFormat.accountMonograms(roster)
+            XCTAssertEqual(Set(m.values).count, roster.count, "monograms must be distinct for \(roster)")
+            for (label, mono) in m {
+                XCTAssertFalse(mono.isEmpty, "monogram for '\(label)' must be non-empty")
+                XCTAssertLessThanOrEqual(mono.count, 2, "monogram '\(mono)' must be ≤ 2 chars")
+            }
+        }
+    }
+
+    func testMonogramDerivationIsDeterministic() {
+        let roster = ["work-alice", "work-bob", "acme.gmail.com"]
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(roster), StatusPanelFormat.accountMonograms(roster))
+    }
+
+    func testMonogramSingleTokenAndDegenerateLabels() {
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["Work"])["Work"], "WO")   // 2 chars from one token
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["camelCase"])["camelCase"], "CC")  // camelCase split
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["x"])["x"], "X")          // lone char → itself
+        XCTAssertEqual(StatusPanelFormat.accountMonograms([""])[""], "?")            // empty → sentinel
+        XCTAssertEqual(StatusPanelFormat.accountMonograms(["  "])["  "], "?")        // whitespace → sentinel
+    }
+
     // MARK: - Helpers
 
     private func cell(_ auth: CredentialHealth, recovering: Bool = false, enabled: Bool = true) -> String {
@@ -535,8 +928,26 @@ final class StatusPanelFormatTests: XCTestCase {
         return AccountRow.rows(from: status)
     }
 
+    /// The badge fill for palette slot `index` — found via the REAL public API by probing for a label that
+    /// hashes to that slot (so the test exercises `accountColorIndex` + `accountBadgeFill`, not a private peek).
+    private func paletteFill(_ index: Int, dark: Bool) -> StatusPanelFormat.FillRGBA {
+        StatusPanelFormat.accountBadgeFill(for: probeLabel(mappingTo: index), dark: dark)
+    }
+
+    /// A short label whose color hash lands on `index` — a deterministic search over the FNV-1a mapping.
+    private func probeLabel(mappingTo index: Int) -> String {
+        for n in 0..<100_000 {
+            let candidate = "probe\(n)"
+            if StatusPanelFormat.accountColorIndex(for: candidate) == index { return candidate }
+        }
+        XCTFail("no probe label mapped to palette slot \(index)")
+        return ""
+    }
+
     private static let allNonConnectedStates: [ConnectionState] = [
-        .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported,
+        .connecting, .emptyRoster, .stale, .disconnected(reason: "EOF"), .unsupported, .crashLooping,
+        .starting, .notRunning,   // #499
+        .reconnecting(reason: "EOF"),   // #526: the transient warm drop must never read healthy either
     ]
 
     /// A DEAD account that is mid-recovery (#109) — the current daemon's `snapshotAwaitingDead` golden
@@ -546,3 +957,59 @@ final class StatusPanelFormatTests: XCTestCase {
     {"type":"snapshot","schema_version":{"major":1,"minor":0},"generated_at":1,"accounts":[{"label":"heal","active":false,"enabled":true,"quarantined":true,"recovering":true,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":null,"refresh_enabled":false}
     """#
 }
+
+// MARK: - #445 palette test helpers: WCAG contrast + hue over sRGB
+//
+// Pure color math for the palette assertions — the standard WCAG 2.x relative-luminance / contrast-ratio and
+// an HSV hue, over sRGB. Kept in the test target (not shipped) so `StatusPanelFormat` stays a plain color
+// vocabulary; the assertions do the verification. The palette fills are opaque (alpha 1), so a fill's own
+// color IS its rendered color — no compositing needed here.
+
+private struct RGB {
+    let red, green, blue: Double
+    init(_ r: Int, _ g: Int, _ b: Int) {
+        red = Double(r) / 255; green = Double(g) / 255; blue = Double(b) / 255
+    }
+    /// Raw sRGB components already in 0…1 (e.g. a composited result).
+    init(_ r: Double, _ g: Double, _ b: Double) { red = r; green = g; blue = b }
+    init(_ c: StatusPanelFormat.FillRGBA) { red = c.red; green = c.green; blue = c.blue }
+}
+
+private func srgbToLinear(_ c: Double) -> Double {
+    c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+}
+
+private func relativeLuminance(_ c: RGB) -> Double {
+    0.2126 * srgbToLinear(c.red) + 0.7152 * srgbToLinear(c.green) + 0.0722 * srgbToLinear(c.blue)
+}
+
+private func contrast(_ a: RGB, _ b: RGB) -> Double {
+    let hi = max(relativeLuminance(a), relativeLuminance(b))
+    let lo = min(relativeLuminance(a), relativeLuminance(b))
+    return (hi + 0.05) / (lo + 0.05)
+}
+
+private func contrast(_ a: StatusPanelFormat.FillRGBA, _ b: RGB) -> Double { contrast(RGB(a), b) }
+private func contrast(_ a: StatusPanelFormat.FillRGBA, _ b: StatusPanelFormat.FillRGBA) -> Double {
+    contrast(RGB(a), RGB(b))
+}
+
+/// The HSV hue in degrees (0…360); 0 for an achromatic color (never expected in the palette).
+private func hue(_ c: RGB) -> Double {
+    let maxComponent = max(c.red, c.green, c.blue)
+    let minComponent = min(c.red, c.green, c.blue)
+    let delta = maxComponent - minComponent
+    guard delta > 0 else { return 0 }
+    var h: Double
+    if maxComponent == c.red {
+        h = (c.green - c.blue) / delta
+    } else if maxComponent == c.green {
+        h = 2 + (c.blue - c.red) / delta
+    } else {
+        h = 4 + (c.red - c.green) / delta
+    }
+    h *= 60
+    return h < 0 ? h + 360 : h
+}
+
+private func hue(_ c: StatusPanelFormat.FillRGBA) -> Double { hue(RGB(c)) }

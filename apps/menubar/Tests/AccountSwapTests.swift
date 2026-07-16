@@ -31,7 +31,7 @@ final class AccountSwapTests: XCTestCase {
     }
 
     // The panel NEVER forces. `force` is a POLICY bypass (it skips the quarantined / weekly-exhausted /
-    // cooldown gates that protect the operator); a hover-revealed row click is far too low-ceremony to
+    // cooldown gates that protect the operator); an armed-on-hover row click is far too low-ceremony to
     // carry a silent override. Forcing stays explicit, in the CLI's `use --force`.
     func testSwapCommandNeverForces() throws {
         for target in ["Work", "Personal", "a1b2c3"] {
@@ -304,7 +304,7 @@ final class AccountSwapTests: XCTestCase {
 
     // Below the budget the affordance is not merely hidden — the caller makes the row NON-INTERACTIVE, so a
     // too-narrow row can never degrade into an invisible whole-row hot-zone (the mis-click hazard the
-    // hover-reveal exists to prevent).
+    // arm-on-hover guard exists to prevent).
     func testARowBelowTheBudgetDoesNotHostTheAffordance() {
         XCTAssertFalse(StatusPanelFormat.rowFitsSwitchAffordance(
             rowWidth: StatusPanelFormat.switchAffordanceMinRowWidth - 1))
@@ -319,6 +319,39 @@ final class AccountSwapTests: XCTestCase {
         XCTAssertTrue(StatusPanelFormat.rowFitsSwitchAffordance(rowWidth: StatusPanelFormat.defaultRowWidth))
         XCTAssertGreaterThanOrEqual(StatusPanelFormat.defaultRowWidth,
                                     StatusPanelFormat.switchAffordanceMinRowWidth)
+    }
+
+    // MARK: - StatusPanelFormat: the persistent swap chip (issue #448 — visible at rest, brightens when armed)
+
+    // The chip is HIDDEN only where the row is not a switch target at all (the active row, a dropped
+    // connection): `offersSwitch: false` → `.hidden`, whatever the hover state.
+    func testSwitchChipIsHiddenOnANonSwitchTargetRow() {
+        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: false, armed: false), .hidden)
+        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: false, armed: true), .hidden)
+    }
+
+    // The load-bearing #448 change: a switch target's chip is PERSISTENT — VISIBLE at rest (`.resting`, no
+    // longer `.hidden` as #169's hover-reveal left it), and it BRIGHTENS to `.armed` when the row is armed
+    // (hover / focus). The resting-visible state is what makes a row discoverable as actionable on a
+    // transient popover — the exact gap #448 closes.
+    func testSwitchChipIsPersistentAtRestAndBrightensWhenArmed() {
+        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, armed: false), .resting,
+                       "a switch target's chip must be VISIBLE (not hidden) at rest — the #448 discoverability fix")
+        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, armed: true), .armed,
+                       "the chip brightens (arms) when the row is hovered/focused")
+        // The resting state is explicitly NOT hidden — the whole point of #448 (a regression back to
+        // hover-only would flip this to `.hidden` and fail loudly).
+        XCTAssertNotEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, armed: false), .hidden)
+    }
+
+    // The slot widened 18 → 28 (#448) so the now-persistent chip sits comfortably; the shipped panel still
+    // clears the layout budget with the wider slot — guarded against the REAL constants, so a future width
+    // regression fails loudly rather than silently truncating the label.
+    func testSwitchChipSlotWidenedAndStillFitsTheShippedPanel() {
+        XCTAssertEqual(StatusPanelFormat.switchAffordanceSlotWidth, 28)
+        XCTAssertGreaterThan(StatusPanelFormat.switchAffordanceSlotWidth, 18,
+                             "the persistent chip earns more room than #169's hover-revealed 18 pt slot")
+        XCTAssertTrue(StatusPanelFormat.rowFitsSwitchAffordance(rowWidth: StatusPanelFormat.defaultRowWidth))
     }
 
     // MARK: - StatusPanelFormat: the copy

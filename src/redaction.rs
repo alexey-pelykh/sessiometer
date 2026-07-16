@@ -25,10 +25,22 @@
 //!   - an OAuth token prefix (`sk-ant-…`), or a known token verbatim;
 //!   - a fingerprint of a known injected credential blob — its leading bytes (a
 //!     raw-blob leak) and its sha256 prefix (a "redacted to a hash" leak);
-//!   - an `@`-bearing, email-shaped token (account identity is a stable, non-PII
-//!     handle — never the email);
+//!   - an `@`-bearing, email-shaped token that is NOT an operator-authored account
+//!     label (account identity is a stable, non-PII handle; an operator MAY label an
+//!     account with their own email — a permitted authored value from the
+//!     capture-input path, #444 — but any OTHER email shape is a leak);
 //!   - as a backstop for any secret that matches none of those exact patterns, a
 //!     long, high-entropy run.
+//!
+//! Regime scope of the email waiver (#444): it is scoped to the
+//! **solo-operator-own-accounts** regime — every account label is the operator's OWN
+//! identity, so they can waive their own concern by choosing to label an account with
+//! their own email (the `config.toml` roster is the operator's own local store; the
+//! committed label is their choice). A future roster whose label is a THIRD party's
+//! email (e.g. a household member's) cannot be waived this way: there the derived
+//! non-email-handle path (a generated handle, never the raw address) becomes
+//! mandatory. The current roster does not hit that case; this note re-triggers the
+//! derived-handle path should a multi-owner roster ever arrive.
 //!
 //! The corpus is driven by the daemon's full poll→decide→swap loop under fault
 //! injection. That driver lives with the loop it exercises — see
@@ -86,7 +98,10 @@ pub(crate) mod meter {
     pub(crate) struct Secrets {
         /// The canonical `Claude Code-credentials` blob (bearer-token JSON).
         blob: Vec<u8>,
-        /// The account email that identifies the secrets' owner.
+        /// The credential-read account email that identifies the secrets' owner. This
+        /// is the credential-read path — NEVER an authored label, so a leak of it must
+        /// always surface as an `EmailShape` (#444). The capture-input allow-set
+        /// (`authored_labels`) is a SEPARATE input to [`scan`], never seeded from here.
         email: String,
         /// The bearer-token strings embedded in `blob`, scanned for verbatim.
         tokens: Vec<String>,
@@ -134,9 +149,11 @@ pub(crate) mod meter {
         BlobLeadingBytes,
         /// The known blob's sha256 prefix appears (a "redacted to a hash" leak).
         BlobSha256 { hex_prefix: String },
-        /// An `@`-bearing, email-shaped token appears.
+        /// An `@`-bearing, email-shaped token that is NOT an operator-authored label
+        /// appears — a leak (a stranger's address, a misrendered credential email).
         EmailShape { matched: String },
-        /// The known account email appears verbatim.
+        /// A recognized operator-authored account label appears — a permitted authored
+        /// value (from the capture-input allow-set), NOT a leak (#444).
         KnownEmail,
         /// A long, high-entropy run — the backstop for unrecognized secret formats.
         HighEntropyRun { run: String, entropy: f64 },
@@ -155,9 +172,15 @@ pub(crate) mod meter {
     const ENTROPY_MIN_BITS: f64 = 3.5;
 
     /// Scan `corpus` for every class of secret leak, returning all findings
-    /// (empty ⇒ clean). Pure, so the meter's own tests can plant a leak and
-    /// assert it is caught.
-    pub(crate) fn scan(corpus: &str, secrets: &Secrets) -> Vec<Finding> {
+    /// (empty ⇒ clean, once `KnownEmail` is filtered — see [`assert_clean`]). Pure, so
+    /// the meter's own tests can plant a leak and assert it is caught.
+    ///
+    /// `authored_labels` is the capture-input allow-set (#444): the operator's own
+    /// account labels, structurally SEPARATE from the credential-read `secrets` (an
+    /// authored label may legitimately be an email; the credential-read email is never
+    /// in this set). An email shape that matches an authored label is a permitted
+    /// `KnownEmail`; every other email shape is an `EmailShape` leak.
+    pub(crate) fn scan(corpus: &str, secrets: &Secrets, authored_labels: &[&str]) -> Vec<Finding> {
         let mut findings = Vec::new();
 
         // 1. OAuth token prefixes, then the known tokens verbatim.
@@ -196,12 +219,19 @@ pub(crate) mod meter {
             });
         }
 
-        // 3. Email — any `@`-bearing email-shaped token, then the known email.
-        if let Some(matched) = first_email_shape(corpus) {
-            findings.push(Finding::EmailShape { matched });
-        }
-        if corpus.contains(secrets.email()) {
-            findings.push(Finding::KnownEmail);
+        // 3. Email — classify EVERY email-shaped token by provenance (#444). An
+        //    operator-authored account label (in the capture-input allow-set) is a
+        //    permitted `KnownEmail`; every OTHER email shape — a stranger's address, a
+        //    misrendered credential-read email — is an `EmailShape` leak. The
+        //    credential-read `secrets.email()` is NEVER in `authored_labels`, so a leak
+        //    of it surfaces here as an `EmailShape`. Scanning ALL shapes (not just the
+        //    first) means a leak hiding AFTER a permitted label is still caught.
+        for matched in all_email_shapes(corpus) {
+            if authored_labels.contains(&matched.as_str()) {
+                findings.push(Finding::KnownEmail);
+            } else {
+                findings.push(Finding::EmailShape { matched });
+            }
         }
 
         // 4. Entropy backstop — the longest high-entropy alnum run, if any.
@@ -213,12 +243,20 @@ pub(crate) mod meter {
     }
 
     /// Assert `corpus` carries no secret leak (the METER gate); panics with the
-    /// findings on any leak.
-    pub(crate) fn assert_clean(corpus: &str, secrets: &Secrets) {
-        let findings = scan(corpus, secrets);
+    /// findings on any leak. `authored_labels` is the capture-input allow-set (#444):
+    /// an email shape matching one is a permitted `KnownEmail`, filtered out here; every
+    /// other finding is a leak. Pass `&[]` for the strict "no email at all" invariant.
+    pub(crate) fn assert_clean(corpus: &str, secrets: &Secrets, authored_labels: &[&str]) {
+        let findings = scan(corpus, secrets, authored_labels);
+        // A `KnownEmail` is a recognized operator-authored account label (#444) — a
+        // permitted value, not a leak; every other finding is a leak.
+        let leaks: Vec<_> = findings
+            .into_iter()
+            .filter(|f| !matches!(f, Finding::KnownEmail))
+            .collect();
         assert!(
-            findings.is_empty(),
-            "redaction METER (#15): emitted output leaked a secret: {findings:#?}"
+            leaks.is_empty(),
+            "redaction METER (#15/#444): emitted output leaked a secret: {leaks:#?}"
         );
     }
 
@@ -232,10 +270,18 @@ pub(crate) mod meter {
         corpus[idx..end].to_owned()
     }
 
-    /// The first `@`-bearing, email-shaped token in `corpus` (`local@domain.tld`),
-    /// or `None`. Stricter than a bare `@` search so an operator label that merely
-    /// contains an `@` is not flagged — only an actual email shape is.
-    fn first_email_shape(corpus: &str) -> Option<String> {
+    /// Every `@`-bearing, email-shaped token (`local@domain.tld`) in `corpus`, in
+    /// order. Stricter than a bare `@` search so an operator handle that merely
+    /// contains an `@` is not flagged — only an actual email shape is. Returns ALL (not
+    /// just the first) so a leaked email hiding AFTER a permitted authored label is
+    /// still caught (#444). Surrounding punctuation (a marker space, `=`, `"`, an ANSI
+    /// reset) is not email-local, so the extracted token is the clean address across
+    /// every channel — the colored `status` render, the UDS JSON, the event log.
+    ///
+    /// Private: [`unauthored_emails`] is the cross-module entry point (the filtered
+    /// public form); this raw building block is used only within `meter`.
+    fn all_email_shapes(corpus: &str) -> Vec<String> {
+        let mut shapes = Vec::new();
         for (at, _) in corpus.match_indices('@') {
             // Local part: the maximal run of email-local chars ending at `@`.
             let local_start = corpus[..at]
@@ -256,10 +302,23 @@ pub(crate) mod meter {
                 .map_or(0, |(i, c)| i + c.len_utf8());
             let domain = &after[..domain_end];
             if domain_has_tld(domain) {
-                return Some(format!("{}@{}", &corpus[local_start..at], domain));
+                shapes.push(format!("{}@{}", &corpus[local_start..at], domain));
             }
         }
-        None
+        shapes
+    }
+
+    /// Test-only (#444): the email-shaped tokens in `text` that are NOT one of
+    /// `authored` — the operator's own account labels (the capture-input allow-set).
+    /// Empty ⇒ a label-carrying channel leaked no NON-authored email: an operator's
+    /// own email label is permitted, any OTHER email shape (a credential-read email, a
+    /// stranger's address) is a leak. This is the provenance-scoped invariant that
+    /// replaces the cruder "no `@`" assertion on every channel the METER covers.
+    pub(crate) fn unauthored_emails(text: &str, authored: &[&str]) -> Vec<String> {
+        all_email_shapes(text)
+            .into_iter()
+            .filter(|e| !authored.contains(&e.as_str()))
+            .collect()
     }
 
     /// A character valid in an email local-part (the conservative common subset).
@@ -339,15 +398,24 @@ pub(crate) mod meter {
         #[test]
         fn email_shape_matches_a_real_address_and_ignores_non_emails() {
             assert_eq!(
-                first_email_shape("hold=work victim@meter-redaction.example end"),
-                Some("victim@meter-redaction.example".to_owned())
+                all_email_shapes("hold=work victim@meter-redaction.example end"),
+                vec!["victim@meter-redaction.example".to_owned()]
             );
             // A bare `@`, an `@` with no dotted TLD, and a label-like `@` are not
             // email-shaped — the precision that lets an operator handle carry an
             // `@` without a false positive.
-            assert_eq!(first_email_shape("a @ b"), None);
-            assert_eq!(first_email_shape("user@localhost"), None);
-            assert_eq!(first_email_shape("@leading"), None);
+            assert!(all_email_shapes("a @ b").is_empty());
+            assert!(all_email_shapes("user@localhost").is_empty());
+            assert!(all_email_shapes("@leading").is_empty());
+            // ALL shapes, not just the first (#444): a leaked email hiding AFTER a
+            // permitted authored label must still be caught.
+            assert_eq!(
+                all_email_shapes("me@my-own.example then victim@meter-redaction.example"),
+                vec![
+                    "me@my-own.example".to_owned(),
+                    "victim@meter-redaction.example".to_owned(),
+                ]
+            );
         }
 
         // --- the meter, end to end (a clean corpus vs each planted leak) --------
@@ -365,14 +433,14 @@ pub(crate) mod meter {
 
         #[test]
         fn the_meter_passes_a_clean_corpus() {
-            assert_eq!(scan(CLEAN, &Secrets::meter_fixture()), Vec::new());
+            assert_eq!(scan(CLEAN, &Secrets::meter_fixture(), &[]), Vec::new());
         }
 
         #[test]
         fn the_meter_catches_a_leaked_token_prefix() {
             let secrets = Secrets::meter_fixture();
             let leaked = format!("{CLEAN}authorization: Bearer sk-ant-oat-LEAKED\n");
-            let findings = scan(&leaked, &secrets);
+            let findings = scan(&leaked, &secrets, &[]);
             assert!(
                 findings
                     .iter()
@@ -387,7 +455,7 @@ pub(crate) mod meter {
             // The verbatim access token from the fixture, embedded in output.
             let token = "sk-ant-oat-METER0SECRET0ACCESS0bC9dE2fG7hJ4kL6mN8";
             let leaked = format!("{CLEAN}debug: token={token}\n");
-            let findings = scan(&leaked, &secrets);
+            let findings = scan(&leaked, &secrets, &[]);
             assert!(
                 findings
                     .iter()
@@ -401,7 +469,7 @@ pub(crate) mod meter {
             let secrets = Secrets::meter_fixture();
             let blob = String::from_utf8(secrets.blob().to_vec()).unwrap();
             let leaked = format!("{CLEAN}dumped credential: {blob}\n");
-            let findings = scan(&leaked, &secrets);
+            let findings = scan(&leaked, &secrets, &[]);
             assert!(
                 findings.contains(&Finding::BlobLeadingBytes),
                 "a raw blob dump must be caught by its leading bytes: {findings:#?}"
@@ -415,7 +483,7 @@ pub(crate) mod meter {
             // correlatable fingerprint — the meter must catch the hash too.
             let sha = sha256_hex(secrets.blob());
             let leaked = format!("{CLEAN}credential fingerprint: {sha}\n");
-            let findings = scan(&leaked, &secrets);
+            let findings = scan(&leaked, &secrets, &[]);
             assert!(
                 findings
                     .iter()
@@ -425,19 +493,53 @@ pub(crate) mod meter {
         }
 
         #[test]
-        fn the_meter_catches_a_leaked_email() {
+        fn the_meter_catches_the_credential_email_as_an_unauthored_shape() {
             let secrets = Secrets::meter_fixture();
-            let leaked = format!("{CLEAN}account: victim@meter-redaction.example\n");
-            let findings = scan(&leaked, &secrets);
+            let leaked = format!("{CLEAN}account: {}\n", secrets.email());
+            // #444 AC2: the credential-read email is NEVER an authored label — even with
+            // a NON-EMPTY capture-input allow-set it must surface as an `EmailShape`
+            // leak, never a permitted `KnownEmail`. This is the provenance guarantee:
+            // a value on the credential-read path can never be whitelisted.
+            let findings = scan(&leaked, &secrets, &["me@my-own.example"]);
             assert!(
-                findings
-                    .iter()
-                    .any(|f| matches!(f, Finding::EmailShape { .. })),
-                "a leaked email must be caught by its shape: {findings:#?}"
+                findings.iter().any(
+                    |f| matches!(f, Finding::EmailShape { matched } if matched == secrets.email())
+                ),
+                "the credential email must be caught as an unauthored email shape: {findings:#?}"
             );
             assert!(
+                !findings.contains(&Finding::KnownEmail),
+                "the credential email must never be whitelisted as an authored label: {findings:#?}"
+            );
+        }
+
+        #[test]
+        fn the_meter_permits_an_operator_authored_email_label() {
+            let secrets = Secrets::meter_fixture();
+            // #444 AC1: an operator who labels an account with their OWN email — a
+            // capture-input value — reaches the operator-facing channels legitimately.
+            // In the allow-set it classifies as a permitted `KnownEmail`, never an
+            // `EmailShape` leak, and `assert_clean` passes.
+            let corpus = format!("{CLEAN}* me@my-own.example · session 5%\n");
+            let findings = scan(&corpus, &secrets, &["me@my-own.example"]);
+            assert!(
                 findings.contains(&Finding::KnownEmail),
-                "the known email must also be caught verbatim: {findings:#?}"
+                "an authored email label classifies as a permitted KnownEmail: {findings:#?}"
+            );
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| matches!(f, Finding::EmailShape { .. })),
+                "an authored email label is not an EmailShape leak: {findings:#?}"
+            );
+            assert_clean(&corpus, &secrets, &["me@my-own.example"]);
+            // Divergence guard: WITHOUT authoring it, the SAME surface fails — proving
+            // it is the allow-set, not the fixture, that permits the label.
+            assert!(
+                scan(&corpus, &secrets, &[])
+                    .iter()
+                    .any(|f| matches!(f, Finding::EmailShape { matched } if matched == "me@my-own.example")),
+                "an un-authored email label is a leak"
             );
         }
 
@@ -449,7 +551,7 @@ pub(crate) mod meter {
             // the only thing that can catch it.
             let unknown = "Zm9vYmFyYmF6cXV4d29tYmF0MT234567890AbCdEfGh";
             let leaked = format!("{CLEAN}opaque={unknown}\n");
-            let findings = scan(&leaked, &secrets);
+            let findings = scan(&leaked, &secrets, &[]);
             assert!(
                 findings.iter().any(
                     |f| matches!(f, Finding::HighEntropyRun { entropy, .. } if *entropy >= 3.5)

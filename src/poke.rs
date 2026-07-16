@@ -601,6 +601,8 @@ mod tests {
             access_expires_at: None,
             refresh_health: None,
             health,
+            // Bounded-blindness (#479) is not read by poke's verdict — inert here.
+            blind_active: None,
         }
     }
 
@@ -609,6 +611,9 @@ mod tests {
     fn status_snapshot(lines: Vec<AccountStatusLine>) -> StatusResponse {
         StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: lines,
             next_swap: None,

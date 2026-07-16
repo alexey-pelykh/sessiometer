@@ -61,6 +61,20 @@ pub(crate) enum Error {
     #[error("could not render stats as JSON: {0}")]
     StatsSerialize(&'static str),
 
+    /// The `reliability --json` readout could not be serialized. Unreachable — the wire is
+    /// bare integers / bools / nulls (issue #455); mapped, never panicked.
+    #[error("could not render reliability readout as JSON: {0}")]
+    ReliabilitySerialize(&'static str),
+
+    /// `reliability --since` got a value that is not a relative duration — a non-negative
+    /// integer with a unit `s`/`m`/`h`/`d`/`w` (e.g. `30m`, `24h`, `7d`, `2w`). Unlike
+    /// `stats --since`, this window is duration-only (issue #494): an absolute date is not
+    /// accepted here.
+    #[error(
+        "invalid --since `{0}`: expected a relative duration (e.g. 30m, 24h, 7d, 2w — units s/m/h/d/w)"
+    )]
+    ReliabilitySinceInvalid(String),
+
     /// The current user's home directory could not be resolved from the
     /// password database (see [`crate::paths`]).
     #[error("could not resolve the home directory for the current user")]
@@ -157,13 +171,16 @@ pub(crate) enum Error {
     #[error("invalid config: {0}")]
     ConfigInvalid(String),
 
-    /// The cross-field rule failed: `target_max_usage` exceeds `session_trigger`
+    /// The cross-field rule failed: `target_max_session_usage` exceeds `session_trigger`
     /// (no account could ever become a swap target, since the ceiling a candidate
     /// must sit below is itself above the trigger). A distinct variant from
     /// [`Error::ConfigInvalid`] so this case can be matched specifically
     /// (issue #3).
-    #[error("invalid config: target_max_usage ({target_max_usage}) must not exceed session_trigger ({trigger})")]
-    ConfigTargetMaxAboveTrigger { target_max_usage: i64, trigger: i64 },
+    #[error("invalid config: target_max_session_usage ({target_max_session_usage}) must not exceed session_trigger ({trigger})")]
+    ConfigTargetMaxSessionAboveTrigger {
+        target_max_session_usage: i64,
+        trigger: i64,
+    },
 
     /// Claude Code's state file (`~/.claude.json`) does not exist — Claude Code
     /// has not run / no account is logged in, so there is nothing to capture.
@@ -202,6 +219,15 @@ pub(crate) enum Error {
     /// quote; the message points at `list` to show the valid handles.
     #[error("no account labelled `{label}` — run `sessiometer list` to see the roster")]
     AccountLabelNotFound { label: String },
+
+    /// A `config-set` (issue #268) label edit named an `account_uuid` that matches no
+    /// roster account — a stale settings client (the account was `remove`d between its
+    /// `config-get` read and the edit) or a client bug. The uuid is a non-secret roster
+    /// key (issue #15), safe to quote. Distinct from [`AccountLabelNotFound`](Error::AccountLabelNotFound)
+    /// (a `<label>` lookup): the settings path keys label edits by the immutable uuid, not
+    /// the mutable label, so a duplicate-label roster stays unambiguous.
+    #[error("no account with account_uuid `{account_uuid}` in the roster")]
+    AccountUuidNotFound { account_uuid: String },
 
     /// A per-account stash is missing one or both of its keychain items
     /// (credential / oauthAccount), so the account cannot be restored. Carries
@@ -866,6 +892,44 @@ mod tests {
             assert!(
                 !message.to_lowercase().contains("token"),
                 "no token: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn label_bearing_errors_carry_an_authored_email_label_but_flag_an_unauthored_one() {
+        // #444/#447: the label-bearing errors quote the account's roster label, which
+        // MAY now be an operator-authored email (the capture prompt pre-fills it). The
+        // handle-fixture tests above stay green because their labels are handles; this
+        // guards the email-label case directly — an authored email label is PERMITTED
+        // (it is the operator's own value, shown back to them), while an UNAUTHORED
+        // email spilled into the same message would still be caught. Provenance-scoped,
+        // consistent with the render/event/store channels (see
+        // `redaction::meter::unauthored_emails`).
+        let authored = "alice@example.com";
+        for message in [
+            Error::AccountLabelNotFound {
+                label: authored.into(),
+            }
+            .to_string(),
+            Error::UseTargetQuarantined {
+                label: authored.into(),
+            }
+            .to_string(),
+        ] {
+            // The authored email label IS quoted in the operator-facing message…
+            assert!(message.contains(authored), "label is quoted: {message}");
+            // …and permitted WHEN authored…
+            assert!(
+                crate::redaction::meter::unauthored_emails(&message, &[authored]).is_empty(),
+                "an operator-authored email label is permitted: {message}"
+            );
+            // …but the same shape reads as a leak WITHOUT the provenance allow-set
+            // (the assertion is not vacuous — the message really does carry an `@`).
+            assert_eq!(
+                crate::redaction::meter::unauthored_emails(&message, &[]),
+                vec![authored.to_owned()],
+                "without provenance the label reads as an unauthored email: {message}"
             );
         }
     }

@@ -281,6 +281,48 @@ struct Report {
     /// unknown (no config loaded) — see [`split_orphans`] — so a pre-`capture` `stats` reads
     /// exactly as before. Summary-window stats only (the series need not re-carry them).
     orphans: BTreeMap<String, AccountStats>,
+    /// The per-account velocity + runway readout (issue #543), keyed by the SAME handle as
+    /// `summary.per_account` — one entry per summary account, overlaid by [`with_velocity`]
+    /// AFTER [`build_report`] (so the base report stays a pure aggregate). Empty until that
+    /// overlay runs (a bare `build_report` result — every hermetic aggregate test — carries no
+    /// velocity), so the readout is presentation-additive: a report built without it renders
+    /// and serializes exactly as it did pre-#543. Summary-window only, like `orphans`.
+    velocity: BTreeMap<String, AccountVelocity>,
+}
+
+/// One account's velocity + runway readout (issue #543) — the recent per-account usage RATE
+/// and the approximate head-room to its swap trigger, computed stats-side by replaying #539's
+/// session-velocity EMA over the stored sample series (same α, same reset guard, same
+/// [`MIN_VELOCITY_SAMPLES`] gate) so the shown rate matches the daemon's own projection rather
+/// than a second, divergent one. Every field is `Option` — an unknown / zero / stale velocity
+/// yields `None` (honest degradation), NEVER a fabricated or infinite number.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AccountVelocity {
+    /// Smoothed session-usage rate in usage-FRACTION per second (the EMA's native unit; the
+    /// human/wire views scale it to `%/min`). `None` when the account has < 2 usable sample
+    /// intervals, a window reset cleared the EMA, or the last reading is stale. Non-negative.
+    session_rate: Option<f64>,
+    /// Smoothed weekly-usage rate (fraction/second) — the SAME smoothing recipe applied to the
+    /// weekly dimension (#539 retains only the session EMA; the weekly runway `#541` wants
+    /// reuses the identical definition, not a divergent one). `None` on the same cases.
+    weekly_rate: Option<f64>,
+    /// Approximate whole seconds until the session reading reaches `session_trigger` at the
+    /// smoothed rate: `(trigger − current) / rate`. `None` when the rate is unknown or `0`, or
+    /// the reading is already at/over the trigger (no positive head-room to state as a fact).
+    session_runway_secs: Option<i64>,
+    /// Approximate whole seconds until the weekly reading reaches `weekly_trigger`. `None` on
+    /// the same cases (commonly `None` — the weekly window moves slowly, so a flat weekly
+    /// dimension has no measurable rate).
+    weekly_runway_secs: Option<i64>,
+    /// The account's remaining WEEKLY head-room as a usage fraction — `max(0, weekly_trigger −
+    /// latest weekly reading)` — the pool contribution the fleet aggregate (issue #544) sums. `Some`
+    /// EXACTLY when [`Self::weekly_rate`] is `Some` (a KNOWN weekly velocity), so head-room is
+    /// recorded only for an account whose burn is also known: a KNOWN-zero (flat, measured) account
+    /// keeps a `Some` head-room (real spare capacity, `0` burn), while an unknown / stale account is
+    /// `None` and excluded from the aggregate — [`fleet_runway`] owns why. Distinct from
+    /// [`Self::weekly_runway_secs`], which is `None` for a flat account even though its head-room is
+    /// positive — this field is the raw head-room the pool needs, not the per-account time-to-trigger.
+    weekly_headroom: Option<f64>,
 }
 
 /// Entry point for the `stats` verb: read the store once, resolve the window, aggregate,
@@ -299,14 +341,20 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     // orphan partition (every handle renders as before), so `stats` still works pre-`capture`.
     let config = Config::load().ok();
     let params = params_from(config.as_ref());
+    let vparams = velocity_params_from(config.as_ref());
     let roster = config.as_ref().map(roster_handles);
-    let report = build_report(
-        &data,
-        window,
-        args.accounts,
-        roster.as_ref(),
+    let report = with_velocity(
+        build_report(
+            &data,
+            window,
+            args.accounts,
+            roster.as_ref(),
+            &params,
+            offset,
+        ),
+        &data.samples,
         &params,
-        offset,
+        &vparams,
     );
 
     let out = if args.json {
@@ -316,6 +364,71 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     };
     print!("{out}");
     Ok(())
+}
+
+/// The daemon `stats` socket verb (issue #356): read the store, compute the bounded per-account
+/// daily series, and return the reply line the spawned socket task writes verbatim — the compact
+/// `StatsWire` JSON for `period`, or a non-secret `{"error":"…"}` envelope on an invalid period or
+/// an unreadable store.
+///
+/// Reads the SAME on-disk store `sessiometer stats` reads and runs it through the SAME
+/// [`build_report`] + [`stats_wire`] pipeline, so a socket read equals `sessiometer stats --period
+/// <period> --json` for the same instant (R-2 parity) — only the serialization differs (compact
+/// here, for the newline-delimited socket frame; the CLI pretty-prints for a file). `period` is the
+/// CLI `--period` grammar (`day|week|month|lifetime`); the panel Stats tab's 7-day daily series is
+/// `week` (the CLI has NO `--period 7d` — `7d` is `--since` grammar — so the issue's `"7d"` example
+/// maps to `week`, the 7-day daily-bucket window). A missing `period` defaults to `week`, mirroring
+/// the CLI default.
+///
+/// Pure of daemon state — only the store files + wall clock + on-disk config — so the daemon answers
+/// it in a blocking task OFF the run loop (the store read is blocking `std::fs`; ADR-0001 forbids
+/// stalling the single runtime thread). Non-secret by construction: usage fractions + already-
+/// redacted roster labels (issue #15), never a credential — so, like `status` / `watch`, the verb is
+/// un-auth-gated.
+pub(crate) fn socket_stats_reply(period: Option<&str>) -> String {
+    let now = wall_clock_now();
+    let offset = local_offset_secs(now);
+    match NativeHistoryStore::from_paths().and_then(|store| StoreData::read(&store)) {
+        Ok(data) => stats_socket_json(&data, now, offset, period),
+        // An unreadable / missing store is a non-secret failure, not a panic — the panel shows
+        // "stats unavailable" rather than a broken view (the same tolerance the CLI reader has).
+        Err(_) => r#"{"error":"stats unavailable"}"#.to_owned(),
+    }
+}
+
+/// Build the compact `stats` socket reply from an already-read store — the testable core of
+/// [`socket_stats_reply`], split out so a controlled `StoreData` can assert R-2 parity with the CLI
+/// `--json` render without touching the real on-disk store. Same [`build_report`] + [`stats_wire`]
+/// pipeline [`render_json`] uses, serialized COMPACT (no trailing newline — the socket framing
+/// appends it). Returns a redacted `{"error":…}` envelope on an invalid period or a non-finite usage
+/// value; the caller maps an unreadable store to the same shape.
+fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&str>) -> String {
+    // `since` is always `None` over the socket — only the CLI `--since` grammar drives that path — so
+    // the sole `plan_window` failure here is an unknown `--period` value (`StatsPeriodInvalid`).
+    let window = match plan_window(period, None, now, data) {
+        Ok(window) => window,
+        Err(_) => return r#"{"error":"invalid period"}"#.to_owned(),
+    };
+    // One config load feeds both the aggregator thresholds and roster reconciliation, exactly as
+    // `run` does; a missing / malformed config falls back to defaults (the read-only view still
+    // works pre-`capture`). Re-read from disk — the same config the CLI reader sees — rather than
+    // the daemon's in-memory copy (which the spawned, `Send`-only task cannot borrow), so the socket
+    // series stays byte-parity with `stats --json`.
+    let config = Config::load().ok();
+    let params = params_from(config.as_ref());
+    let vparams = velocity_params_from(config.as_ref());
+    let roster = config.as_ref().map(roster_handles);
+    // No account filter over the socket — the whole roster (matches `stats --period <p> --json` with
+    // no `--account`). Overlay the velocity + runway readout from the SAME params the CLI uses, so a
+    // socket read stays byte-parity with `stats --period <p> --json` (issue #543 keeps R-2).
+    let report = with_velocity(
+        build_report(data, window, Vec::new(), roster.as_ref(), &params, offset),
+        &data.samples,
+        &params,
+        &vparams,
+    );
+    serde_json::to_string(&stats_wire(&report))
+        .unwrap_or_else(|_| r#"{"error":"stats unavailable"}"#.to_owned())
 }
 
 /// The resolved terminal environment for the human render — the ONE impure probe of
@@ -499,6 +612,274 @@ fn roster_handles(config: &Config) -> BTreeSet<String> {
     config.roster.iter().map(|a| a.label.clone()).collect()
 }
 
+/// The #539 SUSTAINED-motion gate, mirrored stats-side (issue #543): a velocity is usable only
+/// once its EMA has blended at least this many intervals, so a single-interval spike is never
+/// reported as a trend. Kept in lockstep with `crate::daemon`'s own `MIN_VELOCITY_SAMPLES` (both
+/// `2`) — deliberately duplicated rather than shared, to keep this readout a stats-local change
+/// (no daemon edit); the provenance is cited here so the two cannot silently drift.
+const MIN_VELOCITY_SAMPLES: u32 = 2;
+
+/// The velocity + runway knobs (issue #543), derived from config ONCE — mirroring
+/// [`params_from`] so the two read the same [`crate::config`]. All in the sample's own units
+/// (usage fractions), so [`account_velocity`] never reasons about the percent/fraction mismatch.
+/// A missing / malformed config falls back to built-in [`Tunables`] defaults, so the read-only
+/// view still works pre-`capture` (the same tolerance the aggregator params have).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VelocityParams {
+    /// The #539 session-velocity EMA smoothing weight α (`session_velocity_ema_alpha_pct / 100`)
+    /// — REUSED verbatim so the stats-shown rate matches the daemon's own projection, never a
+    /// second, divergent rate. `1.0` = no smoothing (the raw last-interval rate).
+    session_ema_alpha: f64,
+    /// The session swap trigger as a fraction — the neutral head-room reference for the session
+    /// runway (`(trigger − current) / rate`): the point the daemon acts, stated as a fact.
+    session_trigger: f64,
+    /// The weekly swap trigger as a fraction — the weekly-runway reference.
+    weekly_trigger: f64,
+}
+
+fn velocity_params_from(config: Option<&Config>) -> VelocityParams {
+    let (alpha_pct, session, weekly) = match config {
+        Some(c) => (
+            c.tunables.session_velocity_ema_alpha_pct,
+            c.tunables.session_trigger,
+            c.tunables.weekly_trigger,
+        ),
+        None => {
+            let t = Tunables::default();
+            (
+                t.session_velocity_ema_alpha_pct,
+                t.session_trigger,
+                t.weekly_trigger,
+            )
+        }
+    };
+    VelocityParams {
+        session_ema_alpha: f64::from(alpha_pct) / 100.0,
+        session_trigger: f64::from(session) / 100.0,
+        weekly_trigger: f64::from(weekly) / 100.0,
+    }
+}
+
+/// Replay #539's velocity EMA over one dimension's `(ts, fraction)` samples in ASCENDING ts
+/// order — the SAME smoothing the daemon applies live (`Daemon::note_session_velocity`): the
+/// per-interval instant rate `(next − prev) / elapsed` in fraction-per-second, blended `α·instant
+/// + (1 − α)·prev`, SEEDED with the raw rate on the first interval (not zero — a zero seed biases
+/// the EMA below the true rate), and CLEARED whenever an interval has non-positive elapsed OR the
+/// reading DROPS (a window reset), so a post-reset climb re-seeds from the drop. Returns the
+/// smoothed rate ONLY once ≥ [`MIN_VELOCITY_SAMPLES`] intervals have blended since the last reset
+/// (#539's sustained gate); fewer → `None`. Non-negative by construction (a drop resets).
+fn replay_velocity_ema(series: &[(i64, f64)], alpha: f64) -> Option<f64> {
+    let mut ema: Option<(f64, u32)> = None; // (rate, intervals blended since the last reset)
+    for pair in series.windows(2) {
+        let (prev_ts, prev_v) = pair[0];
+        let (next_ts, next_v) = pair[1];
+        let elapsed = next_ts - prev_ts;
+        if elapsed <= 0 || next_v < prev_v {
+            ema = None; // reset — mirrors `note_session_velocity` clearing the slot
+            continue;
+        }
+        let instant = (next_v - prev_v) / elapsed as f64;
+        ema = Some(match ema {
+            Some((prev_rate, n)) => (
+                alpha * instant + (1.0 - alpha) * prev_rate,
+                n.saturating_add(1),
+            ),
+            None => (instant, 1),
+        });
+    }
+    match ema {
+        Some((rate, blended)) if blended >= MIN_VELOCITY_SAMPLES => Some(rate),
+        _ => None,
+    }
+}
+
+/// Approximate whole seconds until `current` reaches `trigger` at `rate` (fraction/second):
+/// `(trigger − current) / rate`. `None` — NEVER a sentinel — when the rate is unknown or
+/// non-positive (an idle / flat dimension has no finite runway) or the reading is already at/over
+/// the trigger (no positive head-room left to state as a neutral fact).
+fn runway_secs(rate: Option<f64>, current: f64, trigger: f64) -> Option<i64> {
+    let rate = rate?;
+    if rate <= 0.0 || current >= trigger {
+        return None;
+    }
+    Some(((trigger - current) / rate).round() as i64)
+}
+
+/// The per-account velocity + runway readout (issue #543) for `handle`, computed over its
+/// in-window samples. Both dimensions' rates come from [`replay_velocity_ema`] (the #539 recipe);
+/// each runway is [`runway_secs`] from the account's LATEST in-window reading to its trigger.
+/// Returns the all-`None` default (honest degradation) when the account has no in-window reading,
+/// or its latest reading is STALE — older than the aggregator's forward-coverage horizon before
+/// the window end (the daemon stopped polling / an idle or blind account) — so a no-longer-current
+/// reading never backs a velocity or a fabricated runway.
+///
+/// This is a faithful re-application of #539's rate DEFINITION over the STORED series, NOT a
+/// reconstruction of the daemon's transient in-memory EMA (an offline reader cannot see that). The
+/// two agree on a steadily-polled account; they can differ slightly across a polling GAP (a
+/// throttle / failure writes no sample), where the live daemon FREEZES its EMA and skips the gap
+/// interval while this replay blends one long spanning interval — a bounded, CONSERVATIVE
+/// approximation (a large elapsed damps the instant rate, so it under- rather than over-states
+/// velocity) that still resets on a drop and never yields a wrong-sign / infinite / sentinel value.
+fn account_velocity(
+    samples: &[Sample],
+    handle: &str,
+    window: &Window,
+    params: &AggregateParams,
+    vparams: &VelocityParams,
+) -> AccountVelocity {
+    // This account's in-window readings, ascending by ts. The store appends chronologically, but
+    // sort defensively — the aggregator does too, and the EMA replay depends on the order.
+    let mut rows: Vec<&Sample> = samples
+        .iter()
+        .filter(|s| s.acct == handle && s.ts >= window.start && s.ts < window.end)
+        .collect();
+    rows.sort_by_key(|s| s.ts);
+    let Some(last) = rows.last() else {
+        return AccountVelocity::default(); // no reading — everything unknown
+    };
+    // STALE: the latest reading no longer covers the window end (gap honesty — a reading is valid
+    // only over `[ts, ts + stale_after)`), so there is no CURRENT velocity to state.
+    if window.end - last.ts > params.stale_after_secs {
+        return AccountVelocity::default();
+    }
+    let session_series: Vec<(i64, f64)> = rows.iter().map(|s| (s.ts, s.session)).collect();
+    let weekly_series: Vec<(i64, f64)> = rows.iter().map(|s| (s.ts, s.weekly)).collect();
+    let session_rate = replay_velocity_ema(&session_series, vparams.session_ema_alpha);
+    let weekly_rate = replay_velocity_ema(&weekly_series, vparams.session_ema_alpha);
+    AccountVelocity {
+        session_rate,
+        weekly_rate,
+        session_runway_secs: runway_secs(session_rate, last.session, vparams.session_trigger),
+        weekly_runway_secs: runway_secs(weekly_rate, last.weekly, vparams.weekly_trigger),
+        // The pool contribution for the fleet aggregate (issue #544): raw weekly head-room from the
+        // SAME latest reading and trigger the weekly runway uses, recorded ONLY when the weekly
+        // velocity is known (so an unknown / stale account contributes neither head-room nor burn).
+        // Clamped at `0` — an over-trigger account is exhausted (no spare capacity), never negative.
+        weekly_headroom: weekly_rate.map(|_| (vparams.weekly_trigger - last.weekly).max(0.0)),
+    }
+}
+
+/// Overlay the per-account velocity + runway readout (issue #543) onto a built [`Report`],
+/// computing one [`AccountVelocity`] per SUMMARY account from `samples`. Applied AFTER
+/// [`build_report`] (which leaves `report.velocity` empty) by BOTH the CLI reader ([`run`]) and
+/// the daemon `stats` socket verb ([`stats_socket_json`]), from the SAME `params` / `vparams`, so
+/// the two stay byte-parity (R-2). Series buckets and orphans carry no velocity — this is a
+/// CURRENT-rate readout, not a per-bucket or non-roster metric.
+fn with_velocity(
+    mut report: Report,
+    samples: &[Sample],
+    params: &AggregateParams,
+    vparams: &VelocityParams,
+) -> Report {
+    report.velocity = report
+        .summary
+        .per_account
+        .keys()
+        .map(|handle| {
+            (
+                handle.clone(),
+                account_velocity(samples, handle, &report.window, params, vparams),
+            )
+        })
+        .collect();
+    report
+}
+
+/// The fleet/roster weekly runway aggregate (issue #544) — the single approximate figure that
+/// answers the operator's fleet-level question, "across all my accounts, how long do I last?"
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FleetRunway {
+    /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
+    /// combined weekly burn — `Σ head-room ÷ Σ rate` over the counted accounts. `None` when no
+    /// counted account has a measurable burn (`Σ rate == 0`): honest degradation, never an infinite
+    /// or sentinel figure. Days-scale in practice — the weekly window is the days horizon (the
+    /// session dimension resets every few hours, so it is not the "how long do I last" figure).
+    runway_secs: Option<i64>,
+    /// Accounts that CONTRIBUTED to the aggregate — those with a KNOWN weekly velocity (the
+    /// honest-degradation gate). The `n` of the surfaced `n of m`.
+    counted: usize,
+    /// Accounts OBSERVED in the window (`seen > 0`) — the `m` of `n of m`. `observed − counted` were
+    /// EXCLUDED for an unknown / stale weekly velocity: surfaced as a fact, never silently dropped.
+    observed: usize,
+}
+
+/// Aggregate the per-account weekly velocity + head-room (the issue #543 overlay) into ONE fleet
+/// runway (issue #544), a pure function of the already-built [`Report`] — it reuses the #157 window
+/// machinery and the #543 per-account readout VERBATIM, adding NO parallel aggregation path and no
+/// second rate/sample walk (`report.velocity` is the single source).
+///
+/// AGGREGATION METHOD (the design choice the issue delegates, settled here): the roster is a shared
+/// POOL of weekly head-room drained at the combined observed rate —
+///
+/// ```text
+///   fleet runway ≈  Σ_counted max(0, weekly_trigger − weekly_now)  ÷  Σ_counted weekly_rate
+/// ```
+///
+/// — summed over the accounts with a known weekly velocity. This is what honestly answers "how long
+/// until I am FORCED TO STOP":
+///
+/// - NOT the soonest single-account exhaustion (`min` runway): the daemon SWAPS to the next account
+///   at a trigger, it does not stop — so the first exhaustion is a swap, not the end. `min` answers
+///   the wrong question and drastically understates the fleet.
+/// - NOT an average of per-account runways: that gives equal weight to an idle spare account's long
+///   runway and an active account's short one, and for identical accounts collapses to a single
+///   account's runway — it is not a pool.
+/// - The pool form is honest because only ONE account burns at a time (a single active credential):
+///   an idle peer reads a flat, ~0 weekly rate, so `Σ rate` is dominated by whichever account is
+///   actually climbing, and `Σ head-room / Σ rate` is the pool's true remaining time. When several
+///   accounts genuinely burned across the window it stays a faithful, CONSERVATIVE reading of the
+///   observed combined rate — it never OVER-states runway.
+///
+/// HONEST DEGRADATION (the load-bearing AC): an account with an unknown / stale weekly velocity is
+/// EXCLUDED ENTIRELY — neither its head-room (numerator) nor its burn (denominator) enters. Treating
+/// such an account as zero-burn would add head-room WITHOUT burn and inflate the runway; excluding it
+/// avoids that and is surfaced as `observed − counted` in the `n of m` cardinality. A KNOWN-zero
+/// (flat, measured) account DOES count — it is real spare capacity contributing head-room at `0`
+/// burn, which correctly EXTENDS the runway rather than fabricating it.
+///
+/// Returns `None` (no fleet figure at all) when the per-account overlay never ran (a bare
+/// [`build_report`], so the wire stays byte-identical to pre-#544), when no account was observed, or
+/// when no account could be counted. A `Some` with `runway_secs == None` is the counted-but-not-
+/// burning case (every counted account is flat): the cardinality is still surfaced, the runway is an
+/// explicit unknown.
+fn fleet_runway(report: &Report) -> Option<FleetRunway> {
+    if report.velocity.is_empty() {
+        return None; // the per-account overlay never ran — a bare aggregate carries no fleet
+    }
+    let mut observed = 0usize;
+    let mut counted = 0usize;
+    let mut total_headroom = 0.0_f64;
+    let mut total_rate = 0.0_f64;
+    for (handle, a) in &report.summary.per_account {
+        if a.seen == 0 {
+            continue; // gap honesty: an unmeasured account is not a fleet member (matches the band)
+        }
+        observed += 1;
+        let Some(v) = report.velocity.get(handle) else {
+            continue;
+        };
+        // Count an account ONLY with a KNOWN weekly velocity (both fields are `Some` together): the
+        // honest-degradation gate. An unknown / stale account is skipped ENTIRELY — never zero-burned.
+        let (Some(headroom), Some(rate)) = (v.weekly_headroom, v.weekly_rate) else {
+            continue;
+        };
+        total_headroom += headroom;
+        total_rate += rate;
+        counted += 1;
+    }
+    if counted == 0 {
+        return None; // nothing to aggregate — no fleet figure to state
+    }
+    // `None` when the combined burn is zero (every counted account is flat) — no measurable drain, so
+    // no finite runway to state (honest degradation, never an infinite / sentinel figure).
+    let runway_secs = (total_rate > 0.0).then(|| (total_headroom / total_rate).round() as i64);
+    Some(FleetRunway {
+        runway_secs,
+        counted,
+        observed,
+    })
+}
+
 /// Aggregate the window's samples into a filtered summary + series.
 ///
 /// The summary is one whole-window `aggregate`; the series is one `aggregate` per bucket.
@@ -546,6 +927,10 @@ fn build_report(
         series,
         offset,
         orphans,
+        // Empty here — the velocity + runway readout (issue #543) is an overlay applied AFTER
+        // this pure aggregate, by [`with_velocity`], so a bare `build_report` (every hermetic
+        // aggregate test) renders/serializes exactly as it did pre-#543.
+        velocity: BTreeMap::new(),
     }
 }
 
@@ -621,28 +1006,60 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 // --- rendering: numeric text ------------------------------------------------
 
 /// The per-account table header, sized to the handle column. Shared by the live-account
-/// table and the "not in roster" section (issue #314) so both foot identical columns.
-fn text_table_header(handle_w: usize) -> String {
-    format!(
-        "{}  cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share\n",
+/// table and the "not in roster" section (issue #314) so both foot identical columns. The
+/// numeric text view is the WIDER surface (design-stats.md §D-STA-5): it carries `signal` and the
+/// full `session` / `weekly` `m/p/p95` triples alongside the compact TTY chart table's peaks. The
+/// `velocity` / `runway` columns are shown only when at least one account HAS the datum
+/// (`show_velocity` / `show_runway`) — the empty-column elision, honest degradation over a fleet
+/// with no computable rate.
+fn text_table_header(handle_w: usize, show_velocity: bool, show_runway: bool) -> String {
+    let mut h = format!(
+        "{}  signal     cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share",
         pad_end("account", handle_w),
-    )
+    );
+    if show_velocity {
+        h.push_str("  velocity");
+    }
+    if show_runway {
+        h.push_str("  runway");
+    }
+    h.push('\n');
+    h
 }
 
 /// One per-account table row, sized to the handle column. Shared by the live-account table
 /// and the orphan section, so an orphan row is column-identical to a live one — the ONLY
-/// difference is which section it sits under.
-fn text_account_row(handle: &str, a: &AccountStats, handle_w: usize) -> String {
-    format!(
-        "{}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%\n",
+/// difference is which section it sits under. `signal` is the neutral class word (`—` for an
+/// unobserved account — gap honesty); `velocity` / `runway` render only when their column is
+/// shown, `—` for an account without the datum. `v` is this account's velocity overlay (an orphan
+/// with no overlay renders `—`).
+fn text_account_row(
+    handle: &str,
+    a: &AccountStats,
+    v: Option<&AccountVelocity>,
+    handle_w: usize,
+    show_velocity: bool,
+    show_runway: bool,
+) -> String {
+    let mut row = format!(
+        "{}  {:<9}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%",
         pad_end(handle, handle_w),
+        signal_cell(a),
         pct(a.coverage),
         triple(&a.session),
         triple(&a.weekly),
         a.cap_hits,
         fmt_dur(a.time_at_cap_secs),
         pct(a.contribution_share),
-    )
+    );
+    if show_velocity {
+        row.push_str(&format!("  {:>8}", velocity_cell(v)));
+    }
+    if show_runway {
+        row.push_str(&format!("  {:>6}", runway_cell(v)));
+    }
+    row.push('\n');
+    row
 }
 
 /// Render the numeric text view: the window echo, the per-account summary table, an optional
@@ -675,10 +1092,30 @@ fn render_text(report: &Report) -> String {
             .max()
             .unwrap_or(0)
             .max(display_width("account"));
+        // Optional-column elision for the numeric view (§D-STA-5): `velocity` / `runway` render
+        // only when at least one shown account (live OR orphan) HAS the datum. A fleet with no
+        // computable rate foots exactly as it did before the columns existed — honest degradation,
+        // not a wall of `—`. Computed across BOTH sections so the two tables carry the same columns.
+        let any_account_has = |has: fn(&AccountVelocity) -> bool| {
+            summary
+                .per_account
+                .keys()
+                .chain(report.orphans.keys())
+                .any(|h| report.velocity.get(h).is_some_and(has))
+        };
+        let show_velocity = any_account_has(|v| v.session_rate.is_some());
+        let show_runway = any_account_has(|v| v.session_runway_secs.is_some());
         if has_live {
-            out.push_str(&text_table_header(handle_w));
+            out.push_str(&text_table_header(handle_w, show_velocity, show_runway));
             for (handle, a) in &summary.per_account {
-                out.push_str(&text_account_row(handle, a, handle_w));
+                out.push_str(&text_account_row(
+                    handle,
+                    a,
+                    report.velocity.get(handle),
+                    handle_w,
+                    show_velocity,
+                    show_runway,
+                ));
             }
         }
         // Non-roster handles (issue #314): a clearly-labelled, self-contained section so an
@@ -689,17 +1126,25 @@ fn render_text(report: &Report) -> String {
                 out.push('\n');
             }
             out.push_str(&format!("not in roster ({}):\n", report.orphans.len()));
-            out.push_str(&text_table_header(handle_w));
+            out.push_str(&text_table_header(handle_w, show_velocity, show_runway));
             for (handle, a) in &report.orphans {
-                out.push_str(&text_account_row(handle, a, handle_w));
+                out.push_str(&text_account_row(
+                    handle,
+                    a,
+                    report.velocity.get(handle),
+                    handle_w,
+                    show_velocity,
+                    show_runway,
+                ));
             }
         }
     }
 
     out.push('\n');
-    // The neutral summary band (issue #160), then the roster line. The numeric text is the
-    // NON-TTY surface, so the band renders WITHOUT colour (zero ANSI on a pipe).
-    let band = render_summary(report, false);
+    // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
+    // fleet-runway), then the roster line — ONE contiguous block, no blank line between. The
+    // summary carries no trailing newline, so the terminating `\n` here abuts the roster line.
+    let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
@@ -831,17 +1276,21 @@ impl SignalBand {
     }
 }
 
-/// The neutral summary band for the human views (issue #160): a per-account symmetric
-/// signal line, then the lowest-utilisation callout. Returns an EMPTY string when there is
-/// nothing to summarise (an empty roster), so a caller can append it unconditionally. Pure
-/// over `color` (the shared gate), so the band is golden-testable with and without ANSI.
-/// Facts only — magnitudes and neutral descriptors, never a recommendation or forecast.
-fn render_summary(report: &Report, color: bool) -> String {
+/// The neutral roster block for the human views: the aggregate-only foot beneath the one
+/// per-account table (design-stats.md §D-STA-5). Per-account facts — `signal` / `velocity` /
+/// `runway` — are COLUMNS of that table now, NOT band lists (the #543/#544 stacked
+/// `handle value · …` walls are retired); what remains here is strictly roster/fleet-level:
+/// the lowest-utilisation callout and the fleet-runway aggregate. Returns an EMPTY string when
+/// there is nothing to summarise (no observed account), so a caller appends it unconditionally.
+/// Lines are 2-space indented (the §D-STA-5 render) and carry NO trailing newline, so the caller
+/// terminates the block and the roster line foots it contiguously. Facts only — magnitudes and
+/// neutral descriptors, never a recommendation or forecast (issue #160).
+fn render_summary(report: &Report) -> String {
     // OBSERVED accounts only — gap honesty. An account can be in the summary with `seen ==
     // 0` (it held the active credential but the daemon polled a different one), its readings
-    // zeroed rather than measured; banding that as "underused" or ranking its fabricated 0%
-    // as the lowest would invent a low reading the aggregator deliberately never does. The
-    // band summarises what was MEASURED, so an unmeasured account is simply not in it.
+    // zeroed rather than measured; ranking its fabricated 0% as the lowest would invent a low
+    // reading the aggregator deliberately never does. The block summarises what was MEASURED,
+    // so an unmeasured account is simply not in it.
     let observed: Vec<(&String, &AccountStats)> = report
         .summary
         .per_account
@@ -852,42 +1301,151 @@ fn render_summary(report: &Report, color: bool) -> String {
         return String::new();
     }
 
-    // Per-account signal, symmetric emphasis. The band is keyed on the session PEAK — the
-    // same basis as the wire's #159 `band` — so the two views classify a reading alike.
-    let signals: Vec<String> = observed
-        .iter()
-        .map(|(handle, a)| {
-            let band = SignalBand::of(a.session.peak);
-            let word = band.label();
-            match (color, band.sgr()) {
-                (true, sgr) if !sgr.is_empty() => format!("{handle} \x1b[{sgr}m{word}\x1b[0m"),
-                _ => format!("{handle} {word}"),
-            }
-        })
-        .collect();
+    let mut lines: Vec<String> = Vec::new();
 
     // Lowest-utilisation account: the smallest session MEAN among the observed — a
     // magnitude, not a verdict. The handle breaks ties, so the pick is deterministic.
-    let lowest = observed
-        .iter()
-        .min_by(|a, b| {
-            a.1.session
-                .mean
-                .total_cmp(&b.1.session.mean)
-                .then_with(|| a.0.cmp(b.0))
-        })
-        .map(|(handle, a)| {
-            format!(
-                "lowest utilisation: {handle} (session mean {}%)",
-                pct(a.session.mean)
-            )
-        });
-
-    let mut out = format!("signal  {}\n", signals.join(" · "));
-    if let Some(lowest) = lowest {
-        out.push_str(&format!("        {lowest}\n"));
+    if let Some((handle, a)) = observed.iter().min_by(|a, b| {
+        a.1.session
+            .mean
+            .total_cmp(&b.1.session.mean)
+            .then_with(|| a.0.cmp(b.0))
+    }) {
+        lines.push(format!(
+            "  lowest utilisation: {handle} (session mean {}%)",
+            pct(a.session.mean)
+        ));
     }
-    out
+
+    // The FLEET/roster runway aggregate (issue #544): ONE approximate figure for "across all my
+    // accounts, how long do I last?" — the roster's combined weekly head-room drained at its
+    // combined weekly burn, days-scale (`fmt_runway_days`). NEUTRAL and APPROXIMATE (a `~` figure,
+    // framed "at the current combined rate"), so it clears the amended #542 guard. Rendered ONLY
+    // when the pool has a finite runway; the counted-account cardinality `(n of m counted)` is
+    // ALWAYS shown alongside it, so an excluded (unknown / stale) account is surfaced as a fact,
+    // not silently folded in as zero-burn.
+    if let Some(FleetRunway {
+        runway_secs: Some(secs),
+        counted,
+        observed,
+    }) = fleet_runway(report)
+    {
+        lines.push(format!(
+            "  accounts last {} at the current combined rate ({counted} of {observed} counted)",
+            fmt_runway_days(secs),
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// A usage rate in the sample's native fraction-per-SECOND, scaled to percent-per-minute
+/// (`× 60 × 100`) — the neutral unit BOTH the human (`fmt_pct_per_min`) and wire
+/// (`round_pct_per_min`) views present, so the two scale the EMA's native rate identically
+/// (the `pct` sibling for the plain fraction → percent conversion).
+fn pct_per_min(rate_frac_per_sec: f64) -> f64 {
+    rate_frac_per_sec * 60.0 * 100.0
+}
+
+/// A smoothed usage rate (usage-fraction per SECOND — the EMA's native unit) as a neutral
+/// `%/min` string, to one decimal. `0.0%/min` for an idle (flat) account is an honest
+/// reading, not a gap.
+fn fmt_pct_per_min(rate_frac_per_sec: f64) -> String {
+    format!("{:.1}%/min", pct_per_min(rate_frac_per_sec))
+}
+
+/// An APPROXIMATE hours-scale runway, e.g. `~4h`, `~45m`, `~30s` — rounded to the coarsest
+/// non-zero unit so a glance reads the scale, not false precision. The session window is hours-
+/// scale, so this is the session runway's natural unit.
+fn fmt_runway_hours(secs: i64) -> String {
+    if secs >= HOUR_SECS {
+        format!("~{}h", (secs as f64 / HOUR_SECS as f64).round() as i64)
+    } else if secs >= 60 {
+        // Round to minutes — but a rounded-up 60 m IS an hour, so promote it to the coarser
+        // `~1h` rather than emit a boundary `~60m` (the coarsest non-zero unit, not false
+        // precision at the top of the minutes range).
+        match (secs as f64 / 60.0).round() as i64 {
+            60 => "~1h".to_owned(),
+            mins => format!("~{mins}m"),
+        }
+    } else {
+        format!("~{}s", secs.max(0))
+    }
+}
+
+/// An APPROXIMATE days-scale runway, e.g. `~5 days`, `~1 day`, falling back to `~Xh` under a day
+/// — days is the weekly window's natural scale, so this is the weekly runway's unit.
+fn fmt_runway_days(secs: i64) -> String {
+    if secs >= DAY_SECS {
+        let d = (secs as f64 / DAY_SECS as f64).round() as i64;
+        format!("~{} {}", d, if d == 1 { "day" } else { "days" })
+    } else {
+        fmt_runway_hours(secs)
+    }
+}
+
+// --- rendering: per-account COLUMN cells (issue #556) ------------------------
+//
+// The per-account signal / velocity / runway are COLUMNS of the one per-account table now
+// (design-stats.md §D-STA-5), not lists in the neutral band — a new per-account metric is a
+// column addition, never a footer list keyed per account. These formatters render one account's
+// cell for each; they foot BOTH the numeric text table and the TTY chart table with the identical
+// value, and the gap sentinel `—` is honest degradation, never a fabricated figure.
+
+/// This account's SIGNAL cell — the neutral symmetric class word for an OBSERVED account
+/// (`seen > 0`), or the gap sentinel `—` for an unobserved one (its readings were zeroed, not
+/// measured; classifying a fabricated 0% as "underused" would invent a reading the aggregator
+/// never made — the per-cell form of the band's observed-only filter). Keyed on the session PEAK,
+/// the same basis as the wire [`Band`], so the word and the session tint classify one reading alike.
+fn signal_cell(a: &AccountStats) -> &'static str {
+    if a.seen > 0 {
+        SignalBand::of(a.session.peak).label()
+    } else {
+        "—"
+    }
+}
+
+/// The SIGNAL cell's SYMMETRIC emphasis SGR (issue #160 / §D-STA-6): `Some("33")` for BOTH
+/// deviations from the balanced middle (equal weight — underuse is not "good", saturation not
+/// "alarm"), `None` for the balanced middle and for an unobserved `—` (no colour wrap). The
+/// descriptor WORD carries the full signal, so a NO_COLOR reader loses nothing.
+fn signal_sgr(a: &AccountStats) -> Option<&'static str> {
+    if a.seen == 0 {
+        return None;
+    }
+    match SignalBand::of(a.session.peak).sgr() {
+        "" => None,
+        sgr => Some(sgr),
+    }
+}
+
+/// This account's compact SESSION cell — `mean/peak` in whole percents (e.g. `42/100`), so a
+/// lowest-by-MEAN account reads self-consistently even while `saturated` by PEAK (the signal is
+/// banded on peak). The wider numeric table keeps the full `mean/peak/p95` [`triple`]; this is the
+/// compact TTY form.
+fn session_cell(a: &AccountStats) -> String {
+    format!("{}/{}", pct(a.session.mean), pct(a.session.peak))
+}
+
+/// This account's compact VELOCITY cell — the neutral session `%/min` rate, or `—` when the rate
+/// is unknown (too few samples, stale, or no velocity overlay on the report). The COLUMN form of
+/// the retired band's velocity list; `0.0%/min` for an idle-but-known account is a reading, `—` a gap.
+fn velocity_cell(v: Option<&AccountVelocity>) -> String {
+    match v.and_then(|v| v.session_rate) {
+        Some(rate) => fmt_pct_per_min(rate),
+        None => "—".to_owned(),
+    }
+}
+
+/// This account's compact RUNWAY cell — the APPROXIMATE session head-room to the swap trigger
+/// (`~Xh`), or `—` when unknown / already at the trigger. The `~` marks it approximate and the
+/// trigger is the neutral reference (a fact, not advice), so the cell clears the #542 guard. The
+/// weekly per-account head-room is not shown per row — it feeds the aggregate `fleet` line instead.
+fn runway_cell(v: Option<&AccountVelocity>) -> String {
+    match v.and_then(|v| v.session_runway_secs) {
+        Some(secs) => fmt_runway_hours(secs),
+        None => "—".to_owned(),
+    }
 }
 
 // --- rendering: local-time window echo --------------------------------------
@@ -1007,11 +1565,37 @@ struct BucketWire {
     accounts: BTreeMap<String, AccountWire>,
 }
 
-/// The per-account + roster body shared by the summary and each series bucket.
+/// The per-account + roster body for the summary. Mirrors the shape of a series [`BucketWire`] (a
+/// distinct type) but additionally carries the summary-only [`FleetWire`] roster aggregate.
 #[derive(Serialize)]
 struct PeriodWire {
     roster: RosterWire,
     accounts: BTreeMap<String, AccountWire>,
+    /// The fleet/roster weekly runway aggregate (issue #544): PRESENT when ≥ 1 summary account has a
+    /// KNOWN weekly velocity (so the pool can be aggregated), OMITTED otherwise (no countable account,
+    /// or a bare aggregate that never ran the velocity overlay — the wire then stays byte-identical to
+    /// pre-#544). Summary-only — a series [`BucketWire`] never carries it, exactly as it carries no
+    /// per-account velocity. Additive to `schema:1` (the `#159`/`#160`/`#543` extend-without-bumping
+    /// precedent); does NOT bump `schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fleet: Option<FleetWire>,
+}
+
+/// The fleet/roster weekly runway aggregate on the `--json` wire (issue #544) — the machine peer of
+/// the human band's fleet-runway line. `runway_secs` is explicit `null` (NEVER a sentinel like `0` /
+/// `999`) when the counted accounts have no combined burn; `counted` / `observed` carry the `n of m`
+/// cardinality so a reader sees exactly how many accounts the figure rests on — and that
+/// `observed − counted` accounts were EXCLUDED for an unknown / stale velocity (honest degradation,
+/// never silently zero-burned).
+#[derive(Serialize)]
+struct FleetWire {
+    /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
+    /// combined weekly burn, or `null` when no counted account has a measurable burn.
+    runway_secs: Option<i64>,
+    /// Accounts that CONTRIBUTED to the aggregate (a known weekly velocity) — the `n` of `n of m`.
+    counted: usize,
+    /// Accounts OBSERVED in the window (`seen > 0`) — the `m`; `observed − counted` were excluded.
+    observed: usize,
 }
 
 #[derive(Serialize)]
@@ -1027,6 +1611,33 @@ struct AccountWire {
     contribution_share: f64,
     /// Neutral utilisation-level descriptor from the session peak (issue #160 consumes it).
     band: Band,
+    /// The velocity + runway readout (issue #543): PRESENT on a summary account with a KNOWN
+    /// session velocity, OMITTED otherwise (insufficient / stale data — the reader reads that as
+    /// an absent field) and on every series bucket + orphan (a current-rate readout is neither
+    /// per-bucket nor a non-roster metric). Additive to `schema:1` (the `#159`/`#160`
+    /// extend-without-bumping precedent); does NOT bump `schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    velocity: Option<VelocityWire>,
+}
+
+/// The per-account velocity + runway readout on the `--json` wire (issue #543) — the machine peer
+/// of the human table's `velocity` / `runway` columns. A KNOWN object carries the session rate as a
+/// real number; an individually-unknown figure (a zero-rate or at/over-trigger runway, a flat
+/// weekly) is explicit `null`, NEVER a sentinel like `0` or `999`. Rates are `%/min`; runways are
+/// whole seconds (the reader scales to whatever unit it renders).
+#[derive(Serialize)]
+struct VelocityWire {
+    /// Smoothed session-usage rate in percent-per-minute (#539's EMA, replayed stats-side over
+    /// the stored series). Always a real number — the object is present only when it is known.
+    session_pct_per_min: f64,
+    /// Smoothed weekly-usage rate in percent-per-minute, or `null` when the weekly dimension has
+    /// no measurable rate (flat / reset / fewer than two sample intervals).
+    weekly_pct_per_min: Option<f64>,
+    /// Approximate whole seconds until the session reading reaches `session_trigger`, or `null`
+    /// when the rate is `0` or the reading is already at/over the trigger (no positive head-room).
+    session_runway_secs: Option<i64>,
+    /// Approximate whole seconds until the weekly reading reaches `weekly_trigger`, or `null`.
+    weekly_runway_secs: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1112,13 +1723,16 @@ impl CoverageClass {
     }
 }
 
-/// Render the stable `--json` document.
-fn render_json(report: &Report) -> Result<String> {
+/// Build the stable `--json` wire document from a resolved report. Extracted from [`render_json`]
+/// so BOTH the CLI `--json` render (pretty, below) AND the daemon `stats` socket verb (issue #356,
+/// [`socket_stats_reply`], compact) serialize the IDENTICAL `StatsWire` — the R-2 parity guarantee
+/// is structural (one builder), not a re-derivation kept in lockstep by hand.
+fn stats_wire(report: &Report) -> StatsWire<'_> {
     let (period, since) = match &report.window.kind {
         WindowKind::Period(p) => (Some(p.wire_tag()), None),
         WindowKind::Since(s) => (None, Some(s.as_str())),
     };
-    let wire = StatsWire {
+    StatsWire {
         schema: JSON_SCHEMA_VERSION,
         window: WindowWire {
             start: report.window.start,
@@ -1135,29 +1749,50 @@ fn render_json(report: &Report) -> Result<String> {
                 start: r.period.start,
                 end: r.period.end,
                 roster: roster_wire(&r.roster),
-                accounts: accounts_wire(&r.per_account),
+                // Series buckets carry no velocity — it is a CURRENT-rate readout, not per-bucket.
+                accounts: accounts_wire(&r.per_account, None),
             })
             .collect(),
         summary: PeriodWire {
             roster: roster_wire(&report.summary.roster),
-            accounts: accounts_wire(&report.summary.per_account),
+            accounts: accounts_wire(&report.summary.per_account, Some(&report.velocity)),
+            // The fleet/roster runway aggregate (issue #544) — summary-only, from the SAME built
+            // report the CLI and daemon socket both serialize, so the fleet figure keeps R-2 parity
+            // structurally (one `stats_wire` builder). Absent on a bare aggregate (no overlay).
+            fleet: fleet_runway(report).map(fleet_wire),
         },
-        orphans: accounts_wire(&report.orphans),
-    };
-    let mut json = serde_json::to_string_pretty(&wire)
+        // Orphans carry no velocity either (a non-roster readout is out of scope, issue #543).
+        orphans: accounts_wire(&report.orphans, None),
+    }
+}
+
+/// Render the stable `--json` document — the human / file view: PRETTY-printed with a trailing
+/// newline. (The daemon `stats` socket verb serializes the same [`stats_wire`] COMPACT, no trailing
+/// newline — issue #356; the newline is the socket framing, added on write.)
+fn render_json(report: &Report) -> Result<String> {
+    let mut json = serde_json::to_string_pretty(&stats_wire(report))
         .map_err(|_| Error::StatsSerialize("a usage value was not a finite number"))?;
     json.push('\n');
     Ok(json)
 }
 
-fn accounts_wire(per_account: &BTreeMap<String, AccountStats>) -> BTreeMap<String, AccountWire> {
+/// Map a per-account aggregate map to its wire form, attaching each account's velocity readout
+/// from `velocity` when supplied (the summary; `None` for series buckets and orphans, which carry
+/// no velocity — issue #543).
+fn accounts_wire(
+    per_account: &BTreeMap<String, AccountStats>,
+    velocity: Option<&BTreeMap<String, AccountVelocity>>,
+) -> BTreeMap<String, AccountWire> {
     per_account
         .iter()
-        .map(|(handle, a)| (handle.clone(), account_wire(a)))
+        .map(|(handle, a)| {
+            let v = velocity.and_then(|m| m.get(handle));
+            (handle.clone(), account_wire(a, v))
+        })
         .collect()
 }
 
-fn account_wire(a: &AccountStats) -> AccountWire {
+fn account_wire(a: &AccountStats, velocity: Option<&AccountVelocity>) -> AccountWire {
     AccountWire {
         seen: a.seen,
         coverage: a.coverage,
@@ -1168,7 +1803,40 @@ fn account_wire(a: &AccountStats) -> AccountWire {
         time_at_cap_secs: a.time_at_cap_secs,
         contribution_share: a.contribution_share,
         band: Band::of(a.session.peak),
+        velocity: velocity.and_then(velocity_wire),
     }
+}
+
+/// The wire form of an [`AccountVelocity`] — `Some` only when the SESSION velocity is known (the
+/// discriminator between "figures present" and "object absent"); the session rate is then a real
+/// number and the weekly rate / both runways are explicit `null` when individually unknown. Rates
+/// are rounded to `%/min` (3 decimals) so the wire is stable — no float-tail noise — while keeping
+/// the weekly dimension's small figures; runways stay whole seconds.
+fn velocity_wire(v: &AccountVelocity) -> Option<VelocityWire> {
+    let session = v.session_rate?; // absent field when the session velocity is unknown
+    Some(VelocityWire {
+        session_pct_per_min: round_pct_per_min(session),
+        weekly_pct_per_min: v.weekly_rate.map(round_pct_per_min),
+        session_runway_secs: v.session_runway_secs,
+        weekly_runway_secs: v.weekly_runway_secs,
+    })
+}
+
+/// The wire form of the fleet/roster runway aggregate (issue #544). A plain field copy — the honest
+/// degradation (unknown runway → `null`, the `n of m` cardinality) is already resolved in
+/// [`fleet_runway`]; this only reshapes it for `serde`.
+fn fleet_wire(f: FleetRunway) -> FleetWire {
+    FleetWire {
+        runway_secs: f.runway_secs,
+        counted: f.counted,
+        observed: f.observed,
+    }
+}
+
+/// A usage rate (fraction/second) as percent-per-minute, rounded to 3 decimals so the `--json`
+/// wire is stable across runs yet keeps the weekly dimension's small values.
+fn round_pct_per_min(rate_frac_per_sec: f64) -> f64 {
+    (pct_per_min(rate_frac_per_sec) * 1000.0).round() / 1000.0
 }
 
 fn dim_wire(d: &crate::usage_stats::DimStats) -> DimWire {
@@ -1351,11 +2019,18 @@ fn render_line(
     format!("{}\n", line.trim_end())
 }
 
-/// Render a header row plus one line per data row, dropping the lowest-priority droppable
-/// columns until the table fits `w` — or only always-keep columns remain, in which case the
-/// table is allowed to OVERFLOW rather than WRAP a row (issue #159: never wrap). Colour is
-/// applied per cell only when `color` is set.
+/// Render a header row plus one line per data row. An EMPTY-COLUMN ELISION pre-pass first drops
+/// any DROPPABLE column that is uniformly the gap sentinel `—` (design-stats.md §D-STA-5 — a
+/// column with no datum on any row carries nothing; this is what self-drops `velocity` / `runway`
+/// on a fleet with no computable rate). Then the lowest-priority droppable columns are dropped
+/// until the table fits `w` — or only always-keep columns remain, in which case the table is
+/// allowed to OVERFLOW rather than WRAP a row (issue #159: never wrap). Colour is applied per cell
+/// only when `color` is set.
 fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
+    // Empty-column elision: a droppable column uniformly `—` across every row is omitted before
+    // the width fit. A keep-column (`priority == None`, the `account · session · signal` floor) is
+    // never elided, even if every cell is a gap.
+    columns.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != "—"));
     while table_width(&columns) > w {
         match columns.iter().filter_map(|c| c.priority).min() {
             Some(p) => columns.retain(|c| c.priority != Some(p)),
@@ -1380,11 +2055,15 @@ fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
     out
 }
 
-/// The per-account chart table: `account`, the whole-window `session` and `weekly` peak %,
-/// and a `trend` sparkline of the per-bucket session peak. Priority column-drop under a
-/// narrow terminal — `trend` drops FIRST, then `weekly`; `account` + `session` (the most
-/// actionable signal) are always kept — never wrapping. Colour tints each `%` by its
-/// neutral utilisation band; the sparkline glyphs carry their own magnitude.
+/// The per-account chart table (design-stats.md §D-STA-5): `account`, the neutral `signal` word,
+/// the compact `session` mean/peak %, the `weekly` peak %, the session `runway` and `velocity`,
+/// and a `trend` sparkline of the per-bucket session peak. Priority column-drop under a narrow
+/// terminal — `trend` sheds FIRST, then `velocity`, `runway`, `weekly` (a populated rate
+/// out-informs the sparkline; an empty one is already gone via elision) — while the
+/// `account · session · signal` FLOOR is always kept, never wrapping (issue #159). A `velocity` /
+/// `runway` column that is uniformly `—` is elided before the width fit ([`render_table`]). Colour
+/// tints each magnitude by its neutral utilisation band and the signal word symmetrically; the
+/// sparkline glyphs carry their own magnitude.
 fn render_chart_table(
     report: &Report,
     accounts: &[&String],
@@ -1394,26 +2073,43 @@ fn render_chart_table(
 ) -> String {
     let summary = &report.summary;
     let n = accounts.len();
-    let (mut acct, mut sess, mut sess_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut week, mut week_c, mut trend) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut acct, mut sig, mut sig_c) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sess, mut sess_c, mut week, mut week_c) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut runway, mut velocity, mut trend) = (Vec::new(), Vec::new(), Vec::new());
     for &h in accounts {
         let a = &summary.per_account[h];
+        let v = report.velocity.get(h);
         acct.push(h.clone());
-        sess.push(format!("{}%", pct(a.session.peak)));
+        sig.push(signal_cell(a).to_owned());
+        sig_c.push(signal_sgr(a));
+        sess.push(session_cell(a));
         sess_c.push(Some(Band::of(a.session.peak).sgr()));
         week.push(format!("{}%", pct(a.weekly.peak)));
         week_c.push(Some(Band::of(a.weekly.peak).sgr()));
+        runway.push(runway_cell(v));
+        velocity.push(velocity_cell(v));
         trend.push(render_sparkline(
             &account_series(&report.series, h, session_peak),
             ascii,
         ));
     }
+    // Column ORDER is the §D-STA-5 render; drop PRIORITY (lowest `Some(n)` shed first) is the
+    // corrected order `trend → velocity → runway → weekly`. The `account · session · signal`
+    // floor is `priority: None` — never dropped.
     let columns = vec![
         ChartCol {
             header: "account",
             cells: acct,
             colors: vec![None; n],
             lead_gap: 0,
+            priority: None,
+        },
+        ChartCol {
+            header: "signal",
+            cells: sig,
+            colors: sig_c,
+            lead_gap: 2,
             priority: None,
         },
         ChartCol {
@@ -1427,6 +2123,20 @@ fn render_chart_table(
             header: "weekly",
             cells: week,
             colors: week_c,
+            lead_gap: 2,
+            priority: Some(4),
+        },
+        ChartCol {
+            header: "runway",
+            cells: runway,
+            colors: vec![None; n],
+            lead_gap: 2,
+            priority: Some(3),
+        },
+        ChartCol {
+            header: "velocity",
+            cells: velocity,
+            colors: vec![None; n],
             lead_gap: 2,
             priority: Some(2),
         },
@@ -1618,10 +2328,12 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
         out.push_str(&block);
     }
     out.push('\n');
-    // The neutral summary band (issue #160), the "not in roster" line (issue #314), then the
-    // roster line. Honours the shared colour gate (symmetric emphasis when open; the
-    // descriptor word still carries the signal when closed).
-    let band = render_summary(report, color);
+    // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
+    // fleet-runway — per-account signal/velocity/runway are TABLE COLUMNS now, not band lists),
+    // the "not in roster" line (issue #314), then the roster line — ONE contiguous block. The
+    // summary is colour-free: it reports roster-level magnitudes, and the per-account `signal`
+    // colour lives in the table cell (issue #160 symmetric emphasis, unchanged).
+    let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
@@ -1690,6 +2402,7 @@ mod tests {
             series: series.iter().map(|b| ureport(b)).collect(),
             offset: 0,
             orphans: BTreeMap::new(),
+            velocity: BTreeMap::new(),
         }
     }
 
@@ -1779,12 +2492,15 @@ mod tests {
 
     #[test]
     fn chart_table_golden_wide() {
+        // §D-STA-5 columns: `account · signal · session(mean/peak) · weekly · trend`. The fixture
+        // carries no velocity overlay, so `velocity` / `runway` are uniformly `—` and elide before
+        // the width fit — the sparse-fleet default. `session` is mean/peak (`50/99`) not peak-only.
         let r = two_account_charts();
         assert_eq!(
             render_chart_table(&r, &keys(&r), 60, false, false),
-            "account  session  weekly  trend\n\
-             alpha    99%      40%     ▃▅█\n\
-             beta     20%      5%      ▂ ▂\n",
+            "account  signal     session  weekly  trend\n\
+             alpha    saturated  50/99    40%     ▃▅█\n\
+             beta     underused  10/20    5%      ▂ ▂\n",
         );
     }
 
@@ -1917,7 +2633,7 @@ mod tests {
         let r = two_account_charts();
         let out = render_charts(&r, 60, false, false);
         assert!(out.starts_with("usage — last 24h (Jun 30–Jul 1)\n\n"));
-        assert!(out.contains("account  session  weekly  trend\n"));
+        assert!(out.contains("account  signal     session  weekly  trend\n"));
         assert!(out.contains("contribution share\n"));
         assert!(out.contains("session pattern — hourly mean\n"));
         assert!(out.contains("session distribution — mean · p95 · peak\n"));
@@ -1932,8 +2648,8 @@ mod tests {
         // run and carries no Unicode block glyph.
         let r = two_account_charts();
         let table = render_chart_table(&r, &keys(&r), 60, false, true);
-        assert!(table.contains("alpha    99%      40%     -+@\n"));
-        assert!(table.contains("beta     20%      5%      : :\n"));
+        assert!(table.contains("alpha    saturated  50/99    40%     -+@\n"));
+        assert!(table.contains("beta     underused  10/20    5%      : :\n"));
         for glyph in ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '░', '▒', '▓'] {
             assert!(!table.contains(glyph), "no Unicode block survives --ascii");
         }
@@ -1944,30 +2660,35 @@ mod tests {
     #[test]
     fn narrow_terminal_drops_trend_then_weekly_keeping_session_never_wrapping() {
         let r = two_account_charts();
-        // Just too narrow for the trend column → it drops FIRST; weekly stays.
-        let w25 = render_chart_table(&r, &keys(&r), 25, false, false);
+        // The floor is `account · signal · session` (§D-STA-5); `velocity` / `runway` are elided
+        // (this fixture has no overlay), so the priority drop reduces to `trend → weekly`. Just too
+        // narrow for the trend column → it drops FIRST; signal + session + weekly stay.
+        let w40 = render_chart_table(&r, &keys(&r), 40, false, false);
         assert_eq!(
-            w25,
-            "account  session  weekly\n\
-             alpha    99%      40%\n\
-             beta     20%      5%\n",
+            w40,
+            "account  signal     session  weekly\n\
+             alpha    saturated  50/99    40%\n\
+             beta     underused  10/20    5%\n",
         );
-        // Narrower still → weekly drops NEXT; account + session are always kept, even when
-        // that overflows the width — the row is never wrapped.
+        // Narrower still → weekly drops NEXT; the `account · signal · session` floor is always kept.
+        let w30 = render_chart_table(&r, &keys(&r), 30, false, false);
+        assert_eq!(
+            w30,
+            "account  signal     session\n\
+             alpha    saturated  50/99\n\
+             beta     underused  10/20\n",
+        );
+        // Below the floor width the floor OVERFLOWS rather than wrapping — nothing more drops, so
+        // the render is byte-identical to the floor at any narrower width, one line per account.
         let w15 = render_chart_table(&r, &keys(&r), 15, false, false);
-        assert_eq!(
-            w15,
-            "account  session\n\
-             alpha    99%\n\
-             beta     20%\n",
-        );
+        assert_eq!(w15, w30, "below the floor width nothing more drops");
         assert_eq!(
             w15.lines().count(),
             3,
             "one header + one line per account: no wrap"
         );
         assert!(
-            w15.contains("99%") && w15.contains("20%"),
+            w15.contains("50/99") && w15.contains("10/20"),
             "the session signal is kept"
         );
     }
@@ -2013,15 +2734,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn piped_numeric_table_golden_with_the_folded_columns() {
+        // A frozen byte-golden of the piped numeric view (issue #556) — the unversioned de-facto
+        // contract (#159): the window echo, the per-account table with the FOLDED `signal` /
+        // `velocity` / `runway` columns (§D-STA-5), and the contiguous aggregate roster block. `aa`
+        // carries a velocity overlay (populated cells); `bb` has none (`—`). This pins the exact
+        // piped column layout so a silent reflow (reordered / re-spaced columns) is caught — the
+        // existing `piped == render_text` check is circular and cannot see a layout regression.
+        let mut r = charts_report(
+            &[
+                ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
+                ("bb", stat(3, ds(0.10, 0.15, 0.12), 0.20, 0.40)),
+            ],
+            &[],
+        );
+        r.velocity.insert(
+            "aa".to_string(),
+            AccountVelocity {
+                session_rate: Some(0.00015),
+                session_runway_secs: Some(7200),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            render_text(&r),
+            "usage — last 24h (Jun 30–Jul 1)\n\n\
+             account  signal     cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share  velocity  runway\n\
+             aa       saturated  100%  30/90/85         0/40/0              0     0s    60%  0.9%/min     ~2h\n\
+             bb       underused  100%  10/15/12         0/20/0              0     0s    40%         —       —\n\
+             \n  lowest utilisation: bb (session mean 10%)\n\
+             roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)\n",
+        );
+    }
+
     // --- issue #159 AC: NO_COLOR / --no-color → zero ANSI, full signal in text --------
 
     #[test]
     fn color_gate_governs_every_ansi_byte() {
         let r = two_account_charts();
-        // Gate open → the utilisation bands tint the `%` cells (alpha's 99% is red).
+        // Gate open → the utilisation bands tint the cells (alpha's hot 50/99 session reads red).
         let colored = render_chart_table(&r, &keys(&r), 60, true, false);
         assert!(
-            colored.contains("\x1b[31m99%\x1b[0m"),
+            colored.contains("\x1b[31m50/99\x1b[0m"),
             "hot session reads red"
         );
         assert!(
@@ -2033,9 +2788,249 @@ mod tests {
         let plain = render_charts(&r, 60, false, false);
         assert!(!plain.contains('\x1b'), "no ANSI when the gate is closed");
         assert!(
-            plain.contains("99%") && plain.contains("▃▅█"),
+            plain.contains("50/99") && plain.contains("▃▅█"),
             "full signal without colour"
         );
+    }
+
+    // --- issue #556 AC: per-account columns, empty-column elision, floor, roster block -----
+
+    #[test]
+    fn priority_drop_sheds_trend_then_velocity_then_runway_then_weekly_keeping_the_floor() {
+        // With a velocity overlay PRESENT (so `velocity` + `runway` do NOT elide), the narrow-width
+        // priority drop sheds `trend → velocity → runway → weekly` in that exact order (§D-STA-5),
+        // while the `account · signal · session` floor is always kept and OVERFLOWS, never wrapping.
+        let mut r = two_account_charts();
+        for h in ["alpha", "beta"] {
+            r.velocity.insert(
+                h.to_string(),
+                AccountVelocity {
+                    session_rate: Some(0.001),
+                    session_runway_secs: Some(7200),
+                    ..Default::default()
+                },
+            );
+        }
+        let header_cols = |w: usize| -> Vec<String> {
+            render_chart_table(&r, &keys(&r), w, false, false)
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        // Wide → the full §D-STA-5 catalog order.
+        assert_eq!(
+            header_cols(200),
+            ["account", "signal", "session", "weekly", "runway", "velocity", "trend"]
+        );
+        // Walk the width down and record the order in which columns vanish.
+        let mut prev = header_cols(200);
+        let mut shed: Vec<String> = Vec::new();
+        for w in (5..200).rev() {
+            let now = header_cols(w);
+            for c in &prev {
+                if !now.contains(c) {
+                    shed.push(c.clone());
+                }
+            }
+            prev = now;
+        }
+        assert_eq!(shed, ["trend", "velocity", "runway", "weekly"]);
+        // The floor is `account · signal · session`, never wrapped — one header + one line per
+        // account even when it overflows a very narrow width.
+        assert_eq!(header_cols(5), ["account", "signal", "session"]);
+        assert_eq!(
+            render_chart_table(&r, &keys(&r), 5, false, false)
+                .lines()
+                .count(),
+            3,
+            "one header + one line per account: no wrap"
+        );
+    }
+
+    #[test]
+    fn the_signal_cell_is_a_dash_for_an_unobserved_account_never_a_fabricated_class() {
+        // Gap honesty at the CELL level (§D-STA-5): an OBSERVED account carries its neutral class
+        // word; an unobserved one (`seen == 0`, zeroed readings) shows `—`, never a fabricated
+        // "underused". `signal_sgr` leaves both the gap and the balanced middle un-emphasised (an
+        // empty SGR would emit a bare reset), colouring only the two symmetric deviations alike.
+        assert_eq!(
+            signal_cell(&stat(3, ds(0.10, 0.15, 0.12), 0.0, 0.5)),
+            "underused"
+        );
+        assert_eq!(
+            signal_cell(&stat(3, ds(0.40, 0.60, 0.50), 0.0, 0.5)),
+            "balanced"
+        );
+        assert_eq!(signal_cell(&stat(0, ds(0.00, 0.00, 0.00), 0.0, 0.5)), "—");
+        assert_eq!(signal_sgr(&stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.5)), None);
+        assert_eq!(signal_sgr(&stat(3, ds(0.4, 0.6, 0.5), 0.0, 0.5)), None);
+        assert_eq!(
+            signal_sgr(&stat(3, ds(0.1, 0.15, 0.12), 0.0, 0.5)),
+            Some("33")
+        );
+        assert_eq!(
+            signal_sgr(&stat(3, ds(0.7, 0.95, 0.9), 0.0, 0.5)),
+            Some("33")
+        );
+    }
+
+    #[test]
+    fn the_roster_block_is_one_contiguous_indented_aggregate_beneath_the_table() {
+        // §D-STA-5: the aggregate summary (lowest-utilisation [+ fleet]) and the roster line form
+        // ONE block beneath the table — the aggregate lines 2-space indented, and NO blank line
+        // separating them from the roster line (they read as a single foot).
+        let text = render_text(&report_fixture());
+        let lines: Vec<&str> = text.lines().collect();
+        let lu = lines
+            .iter()
+            .position(|l| l.contains("lowest utilisation:"))
+            .expect("a lowest-utilisation line");
+        let roster = lines
+            .iter()
+            .position(|l| l.starts_with("roster:"))
+            .expect("a roster line");
+        assert!(
+            lines[lu].starts_with("  lowest utilisation:"),
+            "the aggregate line is 2-space indented: {:?}",
+            lines[lu]
+        );
+        assert!(lu < roster, "the aggregate precedes the roster line");
+        assert!(
+            lines[lu..=roster].iter().all(|l| !l.is_empty()),
+            "the bottom block is contiguous — no blank line within it: {:?}",
+            &lines[lu..=roster]
+        );
+    }
+
+    #[test]
+    fn velocity_and_runway_columns_elide_when_empty_and_appear_when_any_account_has_them() {
+        // Empty-column elision (§D-STA-5): a fleet with NO computable rate shows neither column; a
+        // fleet where AT LEAST ONE account has a rate shows the column, with `—` for the accounts
+        // lacking it (an explicit gap, never a fabricated 0).
+        let sparse = two_account_charts(); // no velocity overlay
+        let text = render_text(&sparse);
+        assert!(
+            !text.contains("velocity") && !text.contains("runway"),
+            "both columns elide on a sparse fleet: {text}"
+        );
+
+        let mut mixed = two_account_charts();
+        mixed.velocity.insert(
+            "alpha".to_string(),
+            AccountVelocity {
+                session_rate: Some(0.001),
+                session_runway_secs: Some(7200),
+                ..Default::default()
+            },
+        );
+        let text = render_text(&mixed);
+        assert!(
+            text.contains("velocity") && text.contains("runway"),
+            "the columns appear when one account has the datum: {text}"
+        );
+        assert!(
+            text.contains("6.0%/min") && text.contains("~2h"),
+            "alpha's populated velocity + runway cells: {text}"
+        );
+        assert!(
+            text.contains('—'),
+            "beta's missing datum is an explicit gap, not a fabricated 0: {text}"
+        );
+    }
+
+    #[test]
+    fn full_email_labels_degrade_within_80_and_70_columns_never_wrapping() {
+        // AC (#556 width-fit falsifier): the reporter's 6-account fleet with FULL operator email
+        // labels (~29 cols — the wide account column, never shortened). SPARSE (no velocity overlay)
+        // → `velocity` / `runway` elide and the table fits 80 and 70. DENSE (every account has a
+        // rate) → at 80 the lowest-priority `trend` sheds, by 70 `velocity` too — strictly by
+        // priority — while the `account · signal · session` floor is one line per row, never wrapped.
+        let emails = [
+            "oleksii@pelykh-consulting.com",
+            "oleksii@pelykh.com",
+            "oleksii@pelykh.consulting",
+            "oleksii@pelykhconsulting.com",
+            "oleksii@pelykhconsulting.eu",
+            "oleksii@pelykhconsulting.fr",
+        ];
+        let accts: Vec<(&str, AccountStats)> = emails
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| {
+                let base = 0.30 + i as f64 * 0.10;
+                (e, stat(3, ds(base, base + 0.05, base), 0.40, 1.0 / 6.0))
+            })
+            .collect();
+
+        // SPARSE: velocity + runway elide (all `—`); the table fits 80 and 70 with no wrap.
+        let sparse = charts_report(&accts, &[]);
+        for w in [80, 70] {
+            let t = render_chart_table(&sparse, &keys(&sparse), w, false, false);
+            assert_eq!(t.lines().count(), 7, "header + 6 rows, no wrap at {w}");
+            assert!(
+                !t.contains("velocity") && !t.contains("runway"),
+                "a sparse fleet elides both columns at {w}: {t}"
+            );
+            assert!(
+                t.lines().all(|l| l.chars().count() <= w),
+                "the sparse table fits within {w}: {t}"
+            );
+        }
+
+        // DENSE: give every account a rate + runway so neither column elides.
+        let mut dense = charts_report(&accts, &[]);
+        for &e in &emails {
+            dense.velocity.insert(
+                e.to_string(),
+                AccountVelocity {
+                    session_rate: Some(0.001),
+                    session_runway_secs: Some(7200),
+                    ..Default::default()
+                },
+            );
+        }
+        let header = |w: usize| -> Vec<String> {
+            render_chart_table(&dense, &keys(&dense), w, false, false)
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        // At 80 the lowest-priority `trend` sheds; `velocity` is still shown. By 70, `velocity` too.
+        assert!(
+            !header(80).contains(&"trend".to_string()),
+            "trend sheds first at 80: {:?}",
+            header(80)
+        );
+        assert!(
+            header(80).contains(&"velocity".to_string()),
+            "velocity survives at 80: {:?}",
+            header(80)
+        );
+        assert!(
+            !header(70).contains(&"velocity".to_string()),
+            "velocity sheds by 70: {:?}",
+            header(70)
+        );
+        // The `account · signal · session` floor is always kept, one line per account, never wrapped.
+        for w in [80, 70, 40] {
+            assert_eq!(
+                render_chart_table(&dense, &keys(&dense), w, false, false)
+                    .lines()
+                    .count(),
+                7,
+                "one header + 6 rows at {w}: no wrap"
+            );
+            let hdr = header(w);
+            assert_eq!(hdr[0], "account");
+            assert_eq!(hdr[1], "signal");
+            assert_eq!(hdr[2], "session");
+        }
     }
 
     // --- issue #159: --json wire stays byte-stable vs #158 (no chart glyphs) ----------
@@ -2101,6 +3096,30 @@ mod tests {
 
     fn params() -> AggregateParams {
         AggregateParams::new(300, 0.80, 0.80)
+    }
+
+    /// Velocity knobs for the hermetic velocity + runway tests (issue #543): EMA α 0.5 (the #539
+    /// default), session trigger 0.80 (matching `params`' session cap), weekly trigger 0.95.
+    fn vparams() -> VelocityParams {
+        VelocityParams {
+            session_ema_alpha: 0.5,
+            session_trigger: 0.80,
+            weekly_trigger: 0.95,
+        }
+    }
+
+    /// Build a `--period day` report from `samples` (window ending at `now`) and overlay the
+    /// velocity + runway readout — the SAME `build_report` → `with_velocity` pairing `run` and the
+    /// daemon socket verb apply in production.
+    fn velocity_report(samples: Vec<Sample>, now: i64) -> Report {
+        let store = data(samples, "");
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        with_velocity(
+            build_report(&store, window, vec![], None, &params(), 0),
+            &store.samples,
+            &params(),
+            &vparams(),
+        )
     }
 
     /// Resolve an RFC 3339 instant to epoch seconds via the crate's canonical parser.
@@ -2440,7 +3459,55 @@ mod tests {
     #[test]
     fn json_handles_are_redacted_and_no_secret_leaks() {
         let json = render_json(&report_fixture()).unwrap();
-        assert!(!json.contains('@'), "no email may reach the wire: {json}");
+        // Handle fixture (`work`/`play`): no authored labels, so an empty allow-set is
+        // the strict bar — any `@`-shape would be UNAUTHORED and fail. Provenance
+        // vocabulary rather than a blanket no-`@` (issue #15, relaxed by #444/#447 —
+        // an operator-authored email label reaches `stats` via `Sample.acct`).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "no unauthored email may reach the wire: {json}"
+        );
+        assert!(!json.contains("sk-ant"), "no token may reach the wire");
+    }
+
+    #[test]
+    fn json_permits_an_operator_authored_email_label() {
+        // #447: `stats` reads the persisted store and keys `per_account` by
+        // `Sample.acct` — the roster label, which may now be an operator-authored
+        // email. That label surfaces verbatim as a JSON account key; it is PERMITTED
+        // under the same provenance-scoped waiver as the store's write side (#444),
+        // while a stray UNAUTHORED email would still fail.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let authored = "alice@example.com";
+        let store = data(
+            vec![
+                sample(now - 2 * HOUR_SECS, authored, 0.9, 0.4),
+                sample(now - HOUR_SECS, authored, 0.99, 0.45),
+            ],
+            "",
+        );
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        let report = build_report(&store, window, vec![], None, &params(), 0);
+        let json = render_json(&report).unwrap();
+
+        // The authored email label IS the account key on the wire (runtime honesty)…
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["summary"]["accounts"][authored].is_object(),
+            "the authored email label keys the account: {json}"
+        );
+        // …permitted WHEN authored…
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[authored]).is_empty(),
+            "an operator-authored email label is permitted: {json}"
+        );
+        // …but the same bytes read as a leak WITHOUT the provenance allow-set (the
+        // assertion is not vacuous — the label really does carry an `@`; it recurs
+        // across the summary + series, so assert containment, not an exact count).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).contains(&authored.to_owned()),
+            "without provenance the label reads as an unauthored email: {json}"
+        );
         assert!(!json.contains("sk-ant"), "no token may reach the wire");
     }
 
@@ -2634,18 +3701,26 @@ mod tests {
             series: vec![bucket(0, 6 * HOUR_SECS)],
             offset: 0,
             orphans: BTreeMap::new(),
+            velocity: BTreeMap::new(),
         }
     }
 
     // --- the framing guard: a CENTRAL banned vocabulary + its scanner ----------------
 
-    /// The editorialising / recommendation / forecast vocabulary the neutral summary band
-    /// (issue #160) must NEVER contain — a value judgement (`healthy`, `danger`), an
-    /// imperative (`add`, `upgrade`), a recommendation (`should`, `recommend`), or a
-    /// projection (`forecast`, `predict`). CENTRAL + explicit so the guard stays
-    /// maintainable: one list, one scanner, extended in a single place. Neutral MAGNITUDE
-    /// words the wire legitimately uses (`idle`/`low`/`moderate`/`high`/`at_cap`) are
-    /// deliberately absent — they describe, they do not editorialise.
+    /// The editorialising vocabulary the neutral summary band (issue #160) — and every
+    /// surface this guard scans — must NEVER contain: a value judgement (`healthy`, `danger`),
+    /// an acquisitive imperative (`add`, `upgrade`, `buy`), a recommendation (`should`,
+    /// `recommend`), or ALARMIST projection FRAMING (`forecast`, `imminent`, `soon`). CENTRAL +
+    /// explicit so the guard stays maintainable: one list, one scanner, extended in a single
+    /// place.
+    ///
+    /// Boundary (issue #542, ADR-0020) — these ban the FRAMING, not the FACT. A neutrally
+    /// framed velocity + runway readout — a `%/min` rate, an approximate time-to-trigger or
+    /// days-of-runway phrased as an observation (`~4h to trigger`, `~3 days at current rate`) —
+    /// is PERMITTED: it uses none of this vocabulary. What stays banned is the acquisitive CALL
+    /// (a purchase prompt) and the alarmist projection words, never a head-room number. Neutral
+    /// MAGNITUDE words the wire legitimately uses (`idle`/`low`/`moderate`/`high`/`at_cap`) are
+    /// likewise absent — they describe, they do not editorialise.
     const BANNED_TOKENS: &[&str] = &[
         // Imperatives / recommended actions (issue #160: "add / buy / upgrade / cancel /
         // bypass / need more").
@@ -2694,7 +3769,9 @@ mod tests {
         "consider",
         "advise",
         "advice",
-        // Projections / forecasts (issue #160: "no projections / forecasts").
+        // Alarmist / editorialising projection FRAMING. A neutral numeric runway is a
+        // permitted FACT (issue #542, ADR-0020); these ban the ALARM ("forecast", "imminent",
+        // "soon"), not the head-room number ("~4h to trigger").
         "forecast",
         "predict",
         "prediction",
@@ -2705,10 +3782,20 @@ mod tests {
         "soon",
     ];
 
-    /// The first banned token appearing in `text`, or `None` when it is clean. Strips ANSI
-    /// SGR runs first (so a colour-wrapped word tokenises intact), then matches whole
-    /// lowercase WORDS on non-alphanumeric boundaries — so `at-risk`, `At Risk`, and
-    /// `risk!` all trip `risk`, while `saturated` or an account handle never false-trips.
+    /// Acquisitive purchase-CALLS that span two adjacent words, so the single-token scan above
+    /// misses them (issue #542): the imperative-free `top up` / `get more` a purchase prompt
+    /// reaches for once `buy`/`add`/`upgrade` are gone. The discriminator the guard draws is the
+    /// CALL to acquire, never the head-room fact — `runs out in ~4h` is permitted, `runs out —
+    /// top up` is not. Kept SHORT and matched on WORD boundaries (adjacent tokens, not a raw
+    /// substring) so a neutral render never false-trips (`laptop update` is not `top up`).
+    const BANNED_PHRASES: &[&str] = &["top up", "get more"];
+
+    /// The first banned token OR acquisitive phrase appearing in `text`, or `None` when it is
+    /// clean. Strips ANSI SGR runs first (so a colour-wrapped word tokenises intact), then
+    /// matches whole lowercase WORDS on non-alphanumeric boundaries — so `at-risk`, `At Risk`,
+    /// and `risk!` all trip `risk`, while `saturated` or an account handle never false-trips —
+    /// and finally adjacent-word purchase-calls (`top up`), so a neutral head-room fact passes
+    /// while an acquisitive call does not (issue #542).
     fn scan_banned(text: &str) -> Option<&'static str> {
         let mut plain = String::with_capacity(text.len());
         let mut chars = text.chars();
@@ -2724,12 +3811,28 @@ mod tests {
                 plain.push(c);
             }
         }
-        let words: std::collections::HashSet<String> = plain
+        // Lowercase words in READING ORDER (a Vec, not a set) — the order lets the phrase scan
+        // below match an adjacent-word purchase-call without a fragile substring test.
+        let words: Vec<String> = plain
             .split(|c: char| !c.is_ascii_alphanumeric())
             .filter(|w| !w.is_empty())
             .map(str::to_ascii_lowercase)
             .collect();
-        BANNED_TOKENS.iter().copied().find(|b| words.contains(*b))
+        // A single editorialising / acquisitive WORD (issue #160).
+        if let Some(hit) = BANNED_TOKENS
+            .iter()
+            .copied()
+            .find(|b| words.iter().any(|w| w == b))
+        {
+            return Some(hit);
+        }
+        // A purchase-CALL spanning adjacent words (issue #542): `top up` / `get more`.
+        BANNED_PHRASES.iter().copied().find(|phrase| {
+            let parts: Vec<&str> = phrase.split(' ').collect();
+            words
+                .windows(parts.len())
+                .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
+        })
     }
 
     /// Every object key in `v`, recursively — the surface the `--json` banned-token scan
@@ -2751,13 +3854,16 @@ mod tests {
     // --- AC: symmetric emphasis, facts only, deterministic render --------------------
 
     #[test]
-    fn summary_band_is_neutral_symmetric_and_deterministic() {
-        // The whole band, frozen: a per-account signal line (underused · balanced ·
-        // saturated) then the lowest-utilisation callout — MAGNITUDES and neutral
-        // descriptors only, no imperative, no forecast, no verdict.
+    fn summary_band_is_neutral_and_deterministic() {
+        // The bottom roster block, frozen: AGGREGATE-ONLY (§D-STA-5). Per-account signal /
+        // velocity / runway are TABLE COLUMNS now, never band lists — what remains is the
+        // lowest-utilisation callout, a MAGNITUDE and neutral descriptor (no imperative, no
+        // forecast, no verdict). `three_band_report` carries no velocity overlay and no weekly
+        // head-room, so there is no fleet line; the block is the single lowest-util line, 2-space
+        // indented and WITHOUT a trailing newline (the caller foots it with the roster line).
         assert_eq!(
-            render_summary(&three_band_report(), false),
-            "signal  aa underused · bb balanced · cc saturated\n        lowest utilisation: aa (session mean 10%)\n",
+            render_summary(&three_band_report()),
+            "  lowest utilisation: aa (session mean 10%)",
         );
     }
 
@@ -2777,13 +3883,16 @@ mod tests {
         );
         assert!(SignalBand::Balanced.sgr().is_empty(), "the middle is not");
 
-        // And in the rendered band: both deviation words are wrapped in the identical SGR,
-        // the middle word is plain — proof the colour half is symmetric too.
-        let colored = render_summary(&three_band_report(), true);
-        assert!(colored.contains("aa \x1b[33munderused\x1b[0m"));
-        assert!(colored.contains("cc \x1b[33msaturated\x1b[0m"));
+        // And in the rendered SIGNAL column: both deviation words are wrapped in the identical
+        // SGR, the balanced middle is plain — proof the colour half is symmetric too. The signal
+        // is a TABLE COLUMN now (§D-STA-5), so the emphasis is asserted on the chart-table cell,
+        // not on the (now aggregate-only) band.
+        let three = three_band_report();
+        let table = render_chart_table(&three, &keys(&three), 80, true, false);
+        assert!(table.contains("\x1b[33munderused\x1b[0m"));
+        assert!(table.contains("\x1b[33msaturated\x1b[0m"));
         assert!(
-            colored.contains("· bb balanced ·"),
+            table.contains("balanced") && !table.contains("\x1b[33mbalanced"),
             "balanced is not colour-wrapped"
         );
     }
@@ -2806,17 +3915,16 @@ mod tests {
 
     #[test]
     fn summary_band_shows_in_both_human_views_but_never_on_the_json_wire() {
-        // Human surfaces (numeric text + charts) both foot with the band.
+        // Human surfaces (numeric text + charts) both foot with the aggregate roster block.
         let text = render_text(&report_fixture());
         assert!(
-            text.contains("signal  "),
-            "the numeric text carries the band"
+            text.contains("lowest utilisation:"),
+            "the numeric text carries the roster block"
         );
-        assert!(text.contains("lowest utilisation:"));
         let charts = render_charts(&two_account_charts(), 60, false, false);
         assert!(
-            charts.contains("signal  "),
-            "the charts view carries the band"
+            charts.contains("lowest utilisation:"),
+            "the charts view carries the roster block"
         );
 
         // The band is HUMAN-only — none of its vocabulary reaches the schema:1 wire (which
@@ -2848,8 +3956,7 @@ mod tests {
         let all_gap = charts_report(&[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))], &[]);
         for report in [&three, &single, &all_gap] {
             for surface in [
-                render_summary(report, false),
-                render_summary(report, true),
+                render_summary(report),
                 render_text(report),
                 render_charts(report, 80, true, false),
             ] {
@@ -2867,9 +3974,11 @@ mod tests {
         json_keys(&serde_json::from_str(&json).unwrap(), &mut keys);
         assert_eq!(scan_banned(&keys.join(" ")), None, "json keys are neutral");
 
-        // The guard BITES: inject a banned word into a real render and it is caught — proof
-        // the test would FAIL if editorialising copy ever slipped into the band.
-        let poisoned = render_summary(&three, false).replace("balanced", "upgrade");
+        // The guard BITES: inject a banned word into a real render and it is caught — proof the
+        // test would FAIL if editorialising copy ever slipped in. Injected into the numeric text
+        // (which carries the `signal` column word `balanced`), the aggregate band having no
+        // per-account signal list to poison.
+        let poisoned = render_text(&three).replace("balanced", "upgrade");
         assert_eq!(
             scan_banned(&poisoned),
             Some("upgrade"),
@@ -2881,6 +3990,474 @@ mod tests {
         assert_eq!(
             scan_banned("signal aa underused bb balanced cc saturated"),
             None
+        );
+    }
+
+    // --- AC (issue #542): PERMIT a neutral runway, still BAN the acquisitive call ----
+
+    #[test]
+    fn framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call() {
+        // PERMIT — a neutrally framed velocity + runway readout is descriptive head-room, not
+        // advice: a `%/min` rate, an approximate time-to-trigger, days-of-runway "at current
+        // rate", and the bare "runs out in ~Xh" fact all read as an observation and pass clean.
+        // (Unblocks issue #541's per-account + fleet runway surfaces, issues #543 / #544, which
+        // can render these without tripping the guard.)
+        for permitted in [
+            "runway  work ~4h to trigger · 1.4%/min",
+            "runway  fleet ~3 days at current rate",
+            "velocity  work 0.8%/min · weekly 0.20%/min",
+            "work runs out in ~4h at current rate",
+            "~12h to trigger · ~5 days of runway",
+        ] {
+            assert_eq!(
+                scan_banned(permitted),
+                None,
+                "a neutral velocity/runway readout is permitted: {permitted:?}"
+            );
+        }
+
+        // BAN — the acquisitive / purchase-timeline framing stays caught: a call to acquire,
+        // whether a single imperative ("buy" / "add" / "upgrade") OR an imperative-free purchase
+        // phrase ("top up" / "get more"). The intent-leak concern is the PURCHASE PROMPT, never
+        // the head-room number.
+        for (acquisitive, caught) in [
+            ("running low — top up / buy more", "buy"),
+            ("you'll run out — top up", "top up"),
+            ("add credits before you run out", "add"),
+            ("get more before it resets", "get more"),
+            ("almost out — upgrade to keep going", "upgrade"),
+        ] {
+            assert_eq!(
+                scan_banned(acquisitive),
+                Some(caught),
+                "an acquisitive purchase-prompt still fails the guard: {acquisitive:?}"
+            );
+        }
+
+        // The boundary is the CALL, not the fact: the SAME "runs out" head-room passes as a
+        // neutral observation, and fails the instant a purchase call is appended.
+        assert_eq!(scan_banned("work runs out in ~4h"), None);
+        assert_eq!(scan_banned("work runs out in ~4h — top up"), Some("top up"));
+    }
+
+    // --- AC (issue #543): per-account velocity + runway readout (summary + --json) ----
+
+    #[test]
+    fn known_velocity_yields_the_expected_rate_and_runway_in_both_views() {
+        // Three readings 300 s apart, session climbing a steady +0.01/interval → a constant instant
+        // rate the EMA reproduces exactly: 0.01/300 frac/s = 0.2 %/min. From the last reading 0.52
+        // toward the 0.80 session trigger, head-room 0.28 → 0.28 ÷ (0.01/300) = 8400 s ≈ ~2h. The
+        // weekly dimension is FLAT (a known ZERO rate), so its runway is unknown — an explicit null.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.30),
+                sample(now - 600, "work", 0.51, 0.30),
+                sample(now - 300, "work", 0.52, 0.30),
+            ],
+            now,
+        );
+
+        // Human: velocity + runway are TABLE COLUMNS now (§D-STA-5) — the header carries both and
+        // the `work` row its neutral %/min rate + approximate SESSION head-room (`~2h`), facts not
+        // advice. (The weekly head-room feeds the aggregate fleet line, not the per-row cell.)
+        let text = render_text(&report);
+        assert!(text.contains("velocity"), "velocity column header: {text}");
+        assert!(text.contains("runway"), "runway column header: {text}");
+        assert!(text.contains("0.2%/min"), "the neutral rate cell: {text}");
+        assert!(
+            text.contains("~2h"),
+            "the approximate session head-room cell: {text}"
+        );
+        assert_eq!(scan_banned(&text), None, "the real render is neutral");
+
+        // Wire: the velocity object carries %/min + whole-second runway; the flat weekly is a
+        // KNOWN 0.0 rate with an EXPLICIT null runway (honest degradation, never a sentinel).
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let vel = &v["summary"]["accounts"]["work"]["velocity"];
+        assert!((vel["session_pct_per_min"].as_f64().unwrap() - 0.2).abs() < 1e-9);
+        assert_eq!(vel["session_runway_secs"].as_i64().unwrap(), 8400);
+        assert_eq!(vel["weekly_pct_per_min"].as_f64().unwrap(), 0.0);
+        assert!(
+            vel["weekly_runway_secs"].is_null(),
+            "a flat weekly is a null runway, not a 0 / 999 sentinel: {vel}"
+        );
+    }
+
+    #[test]
+    fn weekly_runway_renders_in_days_when_it_is_meaningful() {
+        // Session climbs (as above → ~2h), weekly climbs slowly +0.001/interval → 0.001/300 frac/s;
+        // from 0.302 toward the 0.95 weekly trigger, head-room 0.648 → 0.648 ÷ (0.001/300) = 194 400
+        // s ≈ 2.25 d → "~2 days". Proves the weekly head-room renders on its natural day scale.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.300),
+                sample(now - 600, "work", 0.51, 0.301),
+                sample(now - 300, "work", 0.52, 0.302),
+            ],
+            now,
+        );
+        let text = render_text(&report);
+        // The per-row runway cell is the SESSION head-room (`~2h`); the WEEKLY head-room feeds the
+        // aggregate fleet line (§D-STA-5 — weekly per-account is not a per-row cell), on day scale.
+        assert!(text.contains("~2h"), "session head-room cell: {text}");
+        assert!(
+            text.contains("accounts last ~2 days at the current combined rate"),
+            "weekly head-room on the fleet line: {text}"
+        );
+        assert_eq!(scan_banned(&text), None, "the days render is neutral");
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let secs = v["summary"]["accounts"]["work"]["velocity"]["weekly_runway_secs"]
+            .as_i64()
+            .unwrap();
+        assert!(
+            (secs - 194_400).abs() <= 2,
+            "weekly runway ≈ 194 400 s: {secs}"
+        );
+    }
+
+    #[test]
+    fn zero_velocity_reports_a_known_rate_but_an_unknown_runway() {
+        // A flat account (three identical readings) has a KNOWN velocity of 0.0 %/min but NO finite
+        // runway — the AC's "zero velocity → runway unknown". The wire carries 0.0 with an explicit
+        // null runway; the human pairs "0.0%/min" with a "—".
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.30),
+                sample(now - 600, "work", 0.60, 0.30),
+                sample(now - 300, "work", 0.60, 0.30),
+            ],
+            now,
+        );
+        let text = render_text(&report);
+        // The velocity cell reads the KNOWN zero; the runway column — uniformly `—` across the
+        // fleet (no finite head-room) — elides entirely (§D-STA-5 empty-column elision).
+        assert!(text.contains("0.0%/min"), "known zero rate cell: {text}");
+        assert!(
+            !text.contains("runway"),
+            "the all-unknown runway column elides: {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let vel = &v["summary"]["accounts"]["work"]["velocity"];
+        assert_eq!(vel["session_pct_per_min"].as_f64().unwrap(), 0.0);
+        assert!(
+            vel["session_runway_secs"].is_null(),
+            "zero velocity → null runway, not a sentinel: {vel}"
+        );
+    }
+
+    #[test]
+    fn too_few_samples_leave_the_velocity_unknown_and_the_wire_field_absent() {
+        // A single reading cannot form even one interval → the velocity is unknown. The human band
+        // carries no velocity line, and the wire OMITS the velocity object (an absent field, the
+        // AC's permitted "null / absent" — never a fabricated rate).
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(vec![sample(now - 300, "work", 0.60, 0.30)], now);
+        let text = render_text(&report);
+        assert!(
+            text.contains("work"),
+            "the account still appears in the table"
+        );
+        assert!(
+            !text.contains("velocity"),
+            "no velocity column without a rate (elided): {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let work = &v["summary"]["accounts"]["work"];
+        assert_eq!(
+            work["seen"].as_i64().unwrap(),
+            1,
+            "the reading was still counted"
+        );
+        assert!(
+            work.get("velocity").is_none(),
+            "an unknown velocity omits the wire object: {work}"
+        );
+    }
+
+    #[test]
+    fn a_stale_last_reading_leaves_the_velocity_unknown() {
+        // Three climbing readings that WOULD yield a velocity (cf. the known-velocity test) but whose
+        // latest is far older than the aggregator's forward-coverage horizon (300 s) before now — the
+        // daemon stopped polling / an idle window. No CURRENT velocity → unknown, though the readings
+        // are still aggregated (seen == 3). Isolates STALENESS from insufficiency.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 7800, "work", 0.50, 0.30),
+                sample(now - 7500, "work", 0.51, 0.30),
+                sample(now - 7200, "work", 0.52, 0.30),
+            ],
+            now,
+        );
+        let text = render_text(&report);
+        assert!(
+            !text.contains("velocity"),
+            "a stale reading shows no velocity column (elided): {text}"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let work = &v["summary"]["accounts"]["work"];
+        assert_eq!(
+            work["seen"].as_i64().unwrap(),
+            3,
+            "the readings were still counted"
+        );
+        assert!(
+            work.get("velocity").is_none(),
+            "a stale velocity omits the wire object: {work}"
+        );
+    }
+
+    #[test]
+    fn the_velocity_readout_is_neutral_across_every_surface_and_the_wire_keys() {
+        // The #542 guard AC for the LIVE readout: a mixed roster — one account climbing (session +
+        // weekly runway), one flat (zero rate), one under-sampled (unknown) — rendered on BOTH human
+        // surfaces, with and without colour, contains no banned vocabulary; and the `--json` keys the
+        // readout adds are neutral too. This is what unblocks #543 on top of #542.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.300),
+                sample(now - 600, "work", 0.51, 0.301),
+                sample(now - 300, "work", 0.52, 0.302),
+                sample(now - 900, "home", 0.40, 0.20),
+                sample(now - 600, "home", 0.40, 0.20),
+                sample(now - 300, "home", 0.40, 0.20),
+                sample(now - 300, "spare", 0.10, 0.05),
+            ],
+            now,
+        );
+        // The readout lives in the TABLE now (§D-STA-5). The piped numeric view always carries the
+        // velocity column (it is not width-degraded); every surface — the aggregate band included —
+        // stays neutral.
+        assert!(
+            render_text(&report).contains("velocity"),
+            "the piped table carries the velocity column"
+        );
+        for surface in [
+            render_summary(&report),
+            render_text(&report),
+            render_charts(&report, 80, true, false),
+        ] {
+            assert_eq!(
+                scan_banned(&surface),
+                None,
+                "the velocity + runway readout must contain no banned token: {surface:?}"
+            );
+        }
+
+        // The `--json` keys the readout adds are neutral (the wire carries figures, no verb).
+        let json = render_json(&report).unwrap();
+        let mut wire_keys = Vec::new();
+        json_keys(&serde_json::from_str(&json).unwrap(), &mut wire_keys);
+        assert!(
+            wire_keys.iter().any(|k| k == "velocity"),
+            "the velocity object reached the wire"
+        );
+        assert_eq!(
+            scan_banned(&wire_keys.join(" ")),
+            None,
+            "the velocity wire keys are neutral (issue #542 guard)"
+        );
+    }
+
+    #[test]
+    fn velocity_and_runway_formatters_are_approximate_and_scale_aware() {
+        // The rate scales fraction/second → %/min; runways round to the coarsest non-zero unit with
+        // an explicit `~`, hours for the session scale and days for the weekly scale.
+        assert_eq!(fmt_pct_per_min(0.01 / 300.0), "0.2%/min");
+        assert_eq!(fmt_pct_per_min(0.0), "0.0%/min");
+        assert_eq!(fmt_runway_hours(8400), "~2h");
+        assert_eq!(fmt_runway_hours(1200), "~20m");
+        assert_eq!(fmt_runway_hours(3585), "~1h"); // 59.75 m rounds up → promoted to ~1h, not a boundary ~60m
+        assert_eq!(fmt_runway_days(432_000), "~5 days");
+        assert_eq!(fmt_runway_days(86_400), "~1 day");
+        assert_eq!(fmt_runway_days(18_000), "~5h"); // under a day falls back to hours
+    }
+
+    // --- AC (issue #544): fleet/roster runway aggregate ("accounts last ~X days") ------
+
+    #[test]
+    fn fleet_runway_pools_weekly_headroom_and_surfaces_the_counted_cardinality() {
+        // A three-account roster: `work` and `home` climb their weekly dimension at a steady, KNOWN
+        // rate; `stale` climbs too but its latest reading is far older than the coverage horizon, so
+        // it has no CURRENT velocity and is EXCLUDED. The fleet pools the counted accounts' weekly
+        // head-room over their combined burn (the design choice, settled in `fleet_runway`):
+        //   work: last weekly 0.302 → head-room 0.95 − 0.302 = 0.648, rate 0.001/300 frac/s
+        //   home: last weekly 0.502 → head-room 0.95 − 0.502 = 0.448, rate 0.001/300 frac/s
+        //   Σ head-room 1.096 ÷ Σ rate (0.002/300) = 164 400 s ≈ 1.9 d → "~2 days".
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.50, 0.300),
+                sample(now - 600, "work", 0.51, 0.301),
+                sample(now - 300, "work", 0.52, 0.302),
+                sample(now - 900, "home", 0.40, 0.500),
+                sample(now - 600, "home", 0.41, 0.501),
+                sample(now - 300, "home", 0.42, 0.502),
+                // `stale`: three climbing readings whose latest is > the stale horizon before `now`.
+                sample(now - 7800, "stale", 0.50, 0.30),
+                sample(now - 7500, "stale", 0.51, 0.31),
+                sample(now - 7200, "stale", 0.52, 0.32),
+            ],
+            now,
+        );
+
+        // The pure aggregate: 2 of 3 counted (stale excluded), pooled runway ≈ 164 400 s.
+        let fleet = fleet_runway(&report).expect("a countable fleet");
+        assert_eq!(
+            (fleet.counted, fleet.observed),
+            (2, 3),
+            "stale is observed but not counted"
+        );
+        let secs = fleet.runway_secs.expect("a finite pooled runway");
+        assert!(
+            (secs - 164_400).abs() <= 2,
+            "pooled runway ≈ 164 400 s: {secs}"
+        );
+
+        // Human: the roster block foots with ONE approximate, neutral fleet figure + the n-of-m
+        // cardinality (§D-STA-5 — an aggregate line, 2-space indented, no per-account `fleet` prefix).
+        let text = render_text(&report);
+        assert!(
+            text.contains("  accounts last ~2 days at the current combined rate (2 of 3 counted)"),
+            "fleet line: {text}"
+        );
+        assert_eq!(
+            scan_banned(&text),
+            None,
+            "the fleet render is neutral (issue #542 guard)"
+        );
+
+        // Wire: a `fleet` object on the SUMMARY, carrying the whole-second runway + the cardinality.
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let fleet_obj = &v["summary"]["fleet"];
+        assert!(
+            (fleet_obj["runway_secs"].as_i64().unwrap() - 164_400).abs() <= 2,
+            "{fleet_obj}"
+        );
+        assert_eq!(fleet_obj["counted"].as_i64().unwrap(), 2);
+        assert_eq!(fleet_obj["observed"].as_i64().unwrap(), 3);
+
+        // The `--json` keys the aggregate adds are neutral too (facts only, no verb — #542 guard).
+        let mut keys = Vec::new();
+        json_keys(&v, &mut keys);
+        assert!(
+            keys.iter().any(|k| k == "fleet"),
+            "the fleet object reached the wire"
+        );
+        assert_eq!(
+            scan_banned(&keys.join(" ")),
+            None,
+            "the fleet wire keys are neutral (issue #542 guard)"
+        );
+    }
+
+    #[test]
+    fn fleet_runway_excludes_a_stale_account_instead_of_zero_burning_it() {
+        // Honest degradation (the load-bearing AC): an unknown / stale account is dropped ENTIRELY —
+        // neither its head-room nor its burn enters. Proven by INVARIANCE: adding a stale account to a
+        // healthy roster leaves the pooled runway UNCHANGED (only the `observed` denominator grows).
+        // Zero-burning it instead — adding its head-room with no burn — would INFLATE the runway.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let two = vec![
+            sample(now - 900, "work", 0.50, 0.300),
+            sample(now - 600, "work", 0.51, 0.301),
+            sample(now - 300, "work", 0.52, 0.302),
+            sample(now - 900, "home", 0.40, 0.500),
+            sample(now - 600, "home", 0.41, 0.501),
+            sample(now - 300, "home", 0.42, 0.502),
+        ];
+        let mut with_stale = two.clone();
+        with_stale.extend([
+            // A LARGE-head-room stale account (weekly ~0.10) — if it were zero-burned, its ~0.85
+            // head-room would balloon the numerator and stretch the runway well past the true value.
+            sample(now - 7800, "stale", 0.50, 0.08),
+            sample(now - 7500, "stale", 0.51, 0.09),
+            sample(now - 7200, "stale", 0.52, 0.10),
+        ]);
+
+        let clean = fleet_runway(&velocity_report(two, now)).expect("countable");
+        let mixed = fleet_runway(&velocity_report(with_stale, now)).expect("countable");
+        assert_eq!(
+            clean.runway_secs, mixed.runway_secs,
+            "a stale account must not change the pooled runway (excluded, not zero-burned)"
+        );
+        assert_eq!((clean.counted, clean.observed), (2, 2));
+        assert_eq!(
+            (mixed.counted, mixed.observed),
+            (2, 3),
+            "the stale account is surfaced in `observed` (m) but not `counted` (n)"
+        );
+    }
+
+    #[test]
+    fn fleet_runway_degrades_honestly_without_a_finite_pool_or_an_overlay() {
+        let now = epoch("2026-07-01T12:00:00Z");
+
+        // (a) Every counted account is FLAT (a known ZERO burn) → no combined drain → the runway is an
+        // explicit unknown, but the cardinality is still surfaced (counted > 0). The human omits the
+        // line (no figure to state); the wire carries the object with a `null` runway (never a
+        // sentinel), so a machine reader still learns "2 accounts, no measurable burn".
+        let flat = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.60),
+                sample(now - 600, "work", 0.60, 0.60),
+                sample(now - 300, "work", 0.60, 0.60),
+                sample(now - 900, "home", 0.40, 0.40),
+                sample(now - 600, "home", 0.40, 0.40),
+                sample(now - 300, "home", 0.40, 0.40),
+            ],
+            now,
+        );
+        let fleet = fleet_runway(&flat).expect("counted-but-not-burning is still a fleet");
+        assert_eq!((fleet.counted, fleet.observed), (2, 2));
+        assert!(
+            fleet.runway_secs.is_none(),
+            "no combined burn → unknown runway"
+        );
+        assert!(
+            !render_text(&flat).contains("fleet  "),
+            "no fleet line without a figure"
+        );
+        let v: serde_json::Value = serde_json::from_str(&render_json(&flat).unwrap()).unwrap();
+        assert!(
+            v["summary"]["fleet"]["runway_secs"].is_null(),
+            "an unknown fleet runway is an explicit null, not a sentinel: {}",
+            v["summary"]["fleet"]
+        );
+        assert_eq!(v["summary"]["fleet"]["counted"].as_i64().unwrap(), 2);
+        assert_eq!(
+            scan_banned(&render_json(&flat).unwrap()),
+            None,
+            "the null-runway fleet object is neutral too"
+        );
+
+        // (b) Every account is UNDER-SAMPLED (a single reading → no interval → no velocity) → NOTHING
+        // is countable → no fleet at all, on either surface (the wire OMITS the object).
+        let thin = velocity_report(
+            vec![
+                sample(now - 300, "work", 0.60, 0.30),
+                sample(now - 300, "home", 0.40, 0.20),
+            ],
+            now,
+        );
+        assert!(
+            fleet_runway(&thin).is_none(),
+            "nothing countable → no fleet"
+        );
+        assert!(!render_text(&thin).contains("fleet  "));
+        let v2: serde_json::Value = serde_json::from_str(&render_json(&thin).unwrap()).unwrap();
+        assert!(
+            v2["summary"].get("fleet").is_none(),
+            "the wire omits an empty fleet: {}",
+            v2["summary"]
         );
     }
 
@@ -2990,25 +4567,26 @@ mod tests {
         // Empty roster → the band is empty (nothing to summarise); the views print their
         // own "no per-account usage" line, never a panic.
         let empty = charts_report(&[], &[]);
-        assert_eq!(render_summary(&empty, false), "");
-        assert_eq!(render_summary(&empty, true), "");
+        assert_eq!(render_summary(&empty), "");
         let _ = render_text(&empty);
         let _ = render_charts(&empty, 80, true, false);
 
-        // A single account bands off its one reading and is its own lowest-utilisation pick.
+        // A single account is its own lowest-utilisation pick. The band is AGGREGATE-ONLY now
+        // (§D-STA-5) — the per-account `signal` word is a table column, not a band entry.
         let single = charts_report(&[("solo", stat(1, ds(0.5, 0.5, 0.5), 0.0, 1.0))], &[]);
-        let band = render_summary(&single, false);
-        assert!(band.contains("solo balanced"));
-        assert!(band.contains("lowest utilisation: solo"));
+        assert_eq!(
+            render_summary(&single),
+            "  lowest utilisation: solo (session mean 50%)"
+        );
 
-        // An all-gap account (present in the summary, absent from every bucket) still bands
-        // its summary reading — no panic, no fabricated data, still neutral.
+        // An all-gap account (present in the summary, absent from every bucket) still ranks as the
+        // lowest — no panic, no fabricated data, still neutral.
         let all_gap = charts_report(
             &[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))],
             &[&[], &[]],
         );
-        let band = render_summary(&all_gap, false);
-        assert!(band.contains("ghost underused"));
+        let band = render_summary(&all_gap);
+        assert!(band.contains("lowest utilisation: ghost"));
         assert_eq!(scan_banned(&band), None);
     }
 
@@ -3025,11 +4603,10 @@ mod tests {
             ],
             &[],
         );
-        let band = render_summary(&report, false);
-        assert!(band.contains("live balanced"));
+        let band = render_summary(&report);
         assert!(
             !band.contains("dark"),
-            "an unsampled account is not banded: {band:?}"
+            "an unsampled account is not in the aggregate block: {band:?}"
         );
         assert!(
             band.contains("lowest utilisation: live"),
@@ -3038,7 +4615,7 @@ mod tests {
 
         // A roster of ONLY unsampled accounts has nothing measured to summarise → empty band.
         let all_dark = charts_report(&[("dark", stat(0, ds(0.0, 0.0, 0.0), 0.0, 1.0))], &[]);
-        assert_eq!(render_summary(&all_dark, false), "");
+        assert_eq!(render_summary(&all_dark), "");
     }
 
     // --- issue #314: non-roster ("orphan") handle partition --------------------------
@@ -3312,5 +4889,146 @@ mod tests {
         );
         let head = out.split("not in roster").next().unwrap();
         assert!(!head.contains("backup"), "never rendered as a live account");
+    }
+
+    // --- daemon `stats` socket verb (issue #356) --------------------------------------
+
+    #[test]
+    fn socket_stats_json_equals_the_cli_json_for_the_same_report() {
+        // R-2 parity (issue #356), structural: the socket verb and `stats --json` serialize the SAME
+        // `stats_wire` from the SAME report — the socket COMPACT, the CLI PRETTY — so they must
+        // decode to the identical JSON value (the bytes differ only in whitespace). Parity is
+        // guaranteed by the shared builder, not kept in lockstep by hand.
+        let report = report_fixture();
+        let socket = serde_json::to_string(&stats_wire(&report)).unwrap();
+        let cli = render_json(&report).unwrap();
+        let socket_v: serde_json::Value = serde_json::from_str(&socket).unwrap();
+        let cli_v: serde_json::Value = serde_json::from_str(cli.trim_end()).unwrap();
+        assert_eq!(
+            socket_v, cli_v,
+            "the stats socket wire must equal `stats --json` for the same window (R-2 parity)"
+        );
+    }
+
+    #[test]
+    fn socket_stats_defaults_a_missing_period_to_week() {
+        // A `stats` request with no period resolves the SAME window as an explicit `week` — the
+        // 7-day daily-bucket series the panel Stats tab reads (the CLI's own default, too).
+        let now = epoch("2026-07-08T00:00:00Z");
+        let store = data(
+            vec![
+                sample(now - 2 * DAY_SECS, "work", 0.6, 0.3),
+                sample(now - 5 * DAY_SECS, "spare", 0.2, 0.1),
+            ],
+            "",
+        );
+        assert_eq!(
+            stats_socket_json(&store, now, 0, None),
+            stats_socket_json(&store, now, 0, Some("week")),
+            "a periodless stats request is the 7-day `week` window"
+        );
+        // And it is genuinely the 7-day series: 7 bounded daily buckets, period tag `week`.
+        let v: serde_json::Value =
+            serde_json::from_str(&stats_socket_json(&store, now, 0, None)).unwrap();
+        assert_eq!(v["window"]["period"], "week");
+        assert_eq!(v["series"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn socket_stats_rejects_an_invalid_period_with_a_redacted_envelope() {
+        // The issue's literal `"7d"` example is NOT a valid `--period` (it is `--since` grammar) — the
+        // 7-day series is `"week"`, not `"7d"`. The socket rejects an unknown period with a non-secret
+        // machine envelope, exactly as the CLI errors on it (issue #356). Rejection precedes any store
+        // read, so an empty store still yields the envelope, never a panic.
+        let store = data(vec![], "");
+        assert_eq!(
+            stats_socket_json(&store, 1_000_000, 0, Some("7d")),
+            r#"{"error":"invalid period"}"#
+        );
+        assert_eq!(
+            stats_socket_json(&store, 1_000_000, 0, Some("garbage")),
+            r#"{"error":"invalid period"}"#
+        );
+    }
+
+    #[test]
+    fn socket_stats_serves_an_empty_store_as_a_valid_empty_series() {
+        // An empty store is not an error — the panel shows an empty 7-day series, not "unavailable"
+        // (the same tolerance the CLI reader has). A bounded, well-formed reply.
+        let now = epoch("2026-07-08T00:00:00Z");
+        let reply = stats_socket_json(&data(vec![], ""), now, 0, Some("week"));
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert_eq!(
+            v["series"].as_array().unwrap().len(),
+            7,
+            "still 7 bounded daily buckets"
+        );
+        assert!(
+            v["summary"]["accounts"].as_object().unwrap().is_empty(),
+            "no accounts in an empty store"
+        );
+    }
+
+    // --- Cross-language wire golden: stats socket reply (issues #356 / #340) -----------
+    //
+    // The `stats` socket verb (#356) puts `StatsWire` on the cross-language boundary for the first
+    // time (the Swift menubar previously mirrored only the snapshot/heartbeat/status frames). This is
+    // its byte-drift golden — the stats sibling of daemon.rs's snapshot/heartbeat goldens (#340),
+    // living here because `StatsWire` + `stats_wire` are private to this module. Deterministic (a
+    // fixed report), so the pin test re-emits in-process and asserts byte-equality — the same
+    // discipline as the daemon goldens. Mirrored by Swift `Fixtures.statsBasic`
+    // (`apps/menubar/Tests/Fixtures.swift`), which the CI swift job pins to the SAME committed bytes.
+
+    /// The frozen `stats` socket reply the cross-language guard pins: the SAME [`wire_golden_report`]
+    /// the CLI `--json` byte-stability golden ([`WIRE_GOLDEN`]) uses, serialized the way the socket
+    /// verb emits it — COMPACT (`to_string`, no trailing newline; the newline is the socket framing).
+    /// Freezing the identical report both PRETTY (CLI) and COMPACT (socket) makes R-2 parity
+    /// self-evident: one `stats_wire`, two serializations.
+    fn wire_golden_stats_socket_frame() -> String {
+        serde_json::to_string(&stats_wire(&wire_golden_report()))
+            .expect("the stats golden report serializes")
+    }
+
+    /// One-time emitter for the committed `stats` socket golden (issues #356 / #340). `#[ignore]` —
+    /// NOT part of the suite; it WRITES the bytes the pin test and Swift `Fixtures.statsBasic`
+    /// consume. Run it ONLY alongside a deliberate `StatsWire` change:
+    ///   `cargo test -- --ignored emit_wire_stats_golden_fixture`
+    /// then update the Swift mirror (`apps/menubar/Tests/Fixtures.swift`) so the byte-equality holds.
+    #[test]
+    #[ignore = "one-time wire-stats-golden emitter — run ONLY alongside a deliberate StatsWire change"]
+    fn emit_wire_stats_golden_fixture() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build/fixtures");
+        std::fs::create_dir_all(&dir).expect("create build/fixtures");
+        std::fs::write(
+            dir.join("wire-stats-basic.json"),
+            wire_golden_stats_socket_frame(),
+        )
+        .expect("write wire-stats golden");
+    }
+
+    /// The committed `stats` socket golden — the exact bytes Swift `Fixtures.statsBasic` is pinned to.
+    /// `include_str!` makes the file a compile-time input, so it must exist before this module
+    /// compiles (emit once via [`emit_wire_stats_golden_fixture`]).
+    const WIRE_STATS_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-stats-basic.json"
+    ));
+
+    #[test]
+    fn the_committed_stats_wire_golden_still_matches_the_socket_encoder() {
+        // The cross-language pin (issues #356 / #340), the stats sibling of daemon.rs's
+        // snapshot/heartbeat goldens. `StatsWire` serialization is deterministic, so re-emitting
+        // in-process and comparing to the COMMITTED bytes catches any shape drift — a renamed /
+        // added / reordered / re-typed field, a `schema` bump — that shifts the bytes: the golden
+        // goes stale and this fails, forcing a regenerate (`emit_wire_stats_golden_fixture`) that in
+        // turn breaks the Swift byte-equality until the hand-written Swift mirror is updated too.
+        assert_eq!(
+            wire_golden_stats_socket_frame(),
+            WIRE_STATS_GOLDEN,
+            "the committed wire-stats golden drifted from the stats socket encoder — re-run \
+             `cargo test -- --ignored emit_wire_stats_golden_fixture`, then update the Swift mirror \
+             (apps/menubar/Tests/Fixtures.swift) so its fixture stays byte-identical"
+        );
     }
 }

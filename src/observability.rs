@@ -72,6 +72,22 @@ pub(crate) enum SwapReason {
     /// An operator `sessiometer use <account> --force` whose policy gate was
     /// BYPASSED (#63). Safety behavior is never bypassed — only policy.
     Forced,
+    /// The #452 bounded-blindness preemptive gate fired (ADR-0017): the active account
+    /// was blind past `session_blind_swap_secs` with a retained pre-blind anchor at/over
+    /// `session_blind_risk_band` and a viable target existed, so it swapped away before it
+    /// could self-exhaust unobserved. `session_pct` carries the STALE pre-blind anchor —
+    /// the only session signal available while blind — not a fresh reading.
+    BlindPreempt,
+    /// The #539 velocity-projection preemptive gate fired (ADR-0017): the active account's
+    /// OBSERVED reading was below the trigger, but its projected session usage
+    /// (`last + velocity × session_velocity_horizon_secs`, keyed off the #399 velocity signal)
+    /// crossed it, so it swapped away before the observed reading would trip the reactive
+    /// trigger — closing the OBSERVED reactive overshoot (#363). Unlike `BlindPreempt`,
+    /// `session_pct` carries the FRESH observed reading at swap-out (the projection is off a live
+    /// reading, never a stale anchor). Distinct from `Session` so the false-projection SLI and the
+    /// projected swap-out overshoot readout (`sessiometer reliability`) can separate the projective
+    /// swaps from the reactive residual.
+    VelocityPreempt,
 }
 
 impl SwapReason {
@@ -82,6 +98,8 @@ impl SwapReason {
             SwapReason::Weekly => "weekly",
             SwapReason::Manual => "manual",
             SwapReason::Forced => "forced",
+            SwapReason::BlindPreempt => "blind_preempt",
+            SwapReason::VelocityPreempt => "velocity_preempt",
         }
     }
 }
@@ -304,6 +322,38 @@ impl CredentialHealth {
     }
 }
 
+/// The shared canonical `Claude Code-credentials` item's OWN per-poll liveness (issue #464) — the
+/// one keychain item every local `claude` session reads, distinct from any single roster account's
+/// [`CredentialHealth`]. A closed classification carried on the `diag=canonical` per-poll line and
+/// driving the edge-triggered [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`] pair.
+/// Non-secret — a bare discriminant (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalLiveness {
+    /// Readable AND carrying a live (non-empty) refresh token — a usable shared credential every
+    /// session can authenticate with.
+    Present,
+    /// SCRUBBED / empty: readable but the tokens are cleared in place (an empty refresh token —
+    /// Claude Code's first-`invalid_grant` scrub, the DEAD signal per [`crate::refresh::refresh_token`]),
+    /// OR the item is gone entirely (`CredentialNotFound`). Either way no session can authenticate —
+    /// the "Not logged in" state umbrella #463 exists to make visible.
+    Scrubbed,
+    /// UNKNOWN: the read failed for a transient / non-lock, non-not-found reason, so this poll
+    /// carries no liveness evidence either way. The edge-trigger HOLDS its current signal rather
+    /// than invent a scrub or a recovery from a flaky read.
+    Unknown,
+}
+
+impl CanonicalLiveness {
+    /// The `state=` token for the `diag=canonical` line.
+    fn as_str(self) -> &'static str {
+        match self {
+            CanonicalLiveness::Present => "present",
+            CanonicalLiveness::Scrubbed => "scrubbed",
+            CanonicalLiveness::Unknown => "unknown",
+        }
+    }
+}
+
 /// The outcome of one `sessiometer login` invocation (issue #135) — the `outcome=` token of the
 /// single redacted [`Event::Login`] the verb emits. The four terminal states of a login:
 /// `Onboarded` / `Revived` map from the reconcile's [`crate::capture::LoginOutcome`] (a new vs an
@@ -490,7 +540,7 @@ pub(crate) enum Event {
     },
     /// The ACTIVE account's credential is DEAD *and* no live account is a viable emergency
     /// swap target — the strictly-WORSE sibling of [`Self::AllExhausted`] (issue #405). The
-    /// emergency path (issue #42) drops the `target_max_usage` reserve AND the session gate, so
+    /// emergency path (issue #42) drops the `target_max_session_usage` reserve AND the session gate, so
     /// the ONLY remaining filter is weekly exhaustion: reaching here means every live spare is
     /// weekly-exhausted, and the daemon HOLDS on the dead active with no way to escape. Until now
     /// this state returned SILENTLY — a strictly-worse condition than `all_exhausted` yet emitting
@@ -538,6 +588,47 @@ pub(crate) enum Event {
     /// it and returned it to the rotation (issue #42). Edge-triggered: exactly ONCE
     /// on the recovery transition. `account` is the HANDLE — never a token or email.
     CredentialRestored { account: String },
+    /// The SHARED canonical `Claude Code-credentials` item was observed SCRUBBED/EMPTY — its
+    /// tokens cleared in place (Claude Code's first-`invalid_grant` scrub) or the item gone
+    /// entirely — so every local `claude` session now reads "Not logged in" (issue #464,
+    /// umbrella #463). Edge-triggered: emitted exactly ONCE on the transition INTO the scrubbed
+    /// state, never per poll while it stays scrubbed, and afresh if it recovers and is scrubbed
+    /// again. `account` is the last-known active HANDLE (operator label) the scrub emptied, or
+    /// absent when no active account was resolved (e.g. a daemon started against an already-empty
+    /// item) — never a token or email (issue #15). Renders `mode=scrub` (issue #475): the
+    /// UNRECOVERABLE (`/login`-needed) half of the two-mode `mode=(yank|scrub)` classification — the
+    /// RECOVERABLE rotation-yank is carried as `mode=yank` on the `diag=canonical` line, so an
+    /// operator `grep mode=` sees both "Not logged in" causes and their opposite remedies. Distinct
+    /// from [`Event::CredentialDead`] (a PER-ACCOUNT quarantine edge keyed on a 401-streak): this is
+    /// the SHARED item's OWN liveness, the fleet-wide lockout no `credential_dead` fires for — the
+    /// umbrella's core observability gap.
+    CanonicalScrubbed { account: Option<String> },
+    /// The shared canonical item RECOVERED — read live again (a non-empty refresh token) after a
+    /// scrub, so sessions can authenticate once more (issue #464). The clearing counterpart of
+    /// [`Event::CanonicalScrubbed`], mirroring the [`Event::CredentialDead`] /
+    /// [`Event::CredentialRestored`] durable-pair idiom. Edge-triggered: exactly ONCE on the
+    /// recovery transition. `account` is the newly-resolved HANDLE, or absent — never a token or
+    /// email (issue #15).
+    CanonicalRestored { account: Option<String> },
+    /// The daemon AUTONOMOUSLY adopted a viable roster account's token into a scrubbed/empty
+    /// canonical (issue #467), healing every local `claude` session on its next request — no
+    /// operator action. The narrow carve-out from ADR-0007 decision 4 that ADR-0018 decision 1
+    /// automates: recovery for a scrubbed canonical was `use --force`-gated, but when the canonical
+    /// is empty AND a live target exists (NOT the genuinely-all-dead `active_dead_no_target` case),
+    /// the daemon may adopt without the gate. `account` is the ADOPTED target's HANDLE (operator
+    /// label), never a token or email (issue #15). Distinct from [`Event::CanonicalRestored`], which
+    /// is the OBSERVATION that the item reads live again on a later poll (and also fires after an
+    /// operator `claude /login`): this names the daemon's own recovery ACTION and WHICH account it
+    /// adopted, emitted at adopt time.
+    CanonicalRecovered { account: String },
+    /// The daemon BACKED OFF autonomous scrubbed-canonical recovery (issue #467): the canonical was
+    /// re-scrubbed more than the bound allows within the churn window (a persistent multi-session
+    /// rotation churn), so continuing to adopt would thrash the re-auth loop. The daemon holds and
+    /// leaves the `canonical_scrubbed` signal up for the operator (status + menubar, issue #469)
+    /// rather than churning. Edge-triggered: emitted ONCE per back-off episode, afresh after the
+    /// churn window resets and recovery resumes. `account` is the last-known active HANDLE the scrub
+    /// emptied, or absent when none was resolved — never a token or email (issue #15).
+    CanonicalRecoveryExhausted { account: Option<String> },
     /// `account`'s refresh token is confirmed DEAD and UNRECOVERABLE by automation: a
     /// quarantined account's isolated #106-sweep refresh returned `outcome=dead` (the
     /// stored refresh token is revoked/empty), so no daemon path can revive it — only
@@ -748,8 +839,9 @@ pub(crate) enum Event {
     /// (rate-limit) from a `5xx` / network transient — what makes the "429 count" queryable;
     /// `consecutive` is the account's per-account back-off streak (#293, the exponential-widening
     /// driver, the same running-count idiom [`Event::Monitor401`] carries); `retry_after_secs` is
-    /// the RAW server-advised `Retry-After` when the response supplied one, BEFORE the
-    /// [`crate::daemon`] `POLL_BACKOFF_CAP` clamp (#294/#295); and `backoff_secs` is the resulting
+    /// the RAW server-advised `Retry-After` when the response supplied one, BEFORE any
+    /// [`crate::daemon`] `POLL_BACKOFF_CAP` clamp (#294/#295 — peer-only since #453, where the
+    /// active account hard-floors `Retry-After` un-clamped); and `backoff_secs` is the resulting
     /// armed window (the effective wait). Emitted on EACH throttled poll, not just the first, so
     /// the durable log shows the window WIDEN across the episode — the residual-late-swap signal
     /// (#363/#368/#369) that a single first-throttle line would hide. `account` is the account
@@ -770,21 +862,132 @@ pub(crate) enum Event {
     /// [`Event::UsageRollup`]'s no-op silence. `account` is the account UUID — never the operator
     /// `label` (#15), matching [`Event::UsageBackoff`].
     UsageBackoffCleared { account: String },
-    /// The per-account usage VELOCITY between the last two readings (issue #399): the SIGNED change
-    /// in each rounded-percent dimension since the account's previous reading (`to_pct(next) -
-    /// to_pct(prev)`), so the durable log carries how fast each account is climbing — the
-    /// measurement the gated adaptive-trigger follow-up (#368) is waiting on. Emitted only when the
-    /// account measurably MOVED (a non-zero delta in either dimension), so a flat idle account
-    /// stays silent (again mirroring [`Event::UsageRollup`]); never emitted across a poll gap (a
-    /// throttle / failure clears the prior reading), so a delta always spans two real consecutive
-    /// readings. `session_delta_pct` / `weekly_delta_pct` are POSITIVE when usage is rising and
-    /// NEGATIVE when a window reset dropped it. `account` is the account UUID (#15); both deltas are
-    /// bare signed percents (a difference of two `0..=100` values, so within `-100..=100`), never a
-    /// token.
+    /// A NON-active peer entered the WIDENED, reset-aware slow-poll cadence (issue #537): a
+    /// successful poll read it out of rotation (weekly- or session-exhausted), so the daemon
+    /// arms a per-account `exhausted_poll_until` window and SKIPS its poll until the window
+    /// elapses — bounded by `exhausted_poll_secs` (the hourly ceiling) and pulled earlier by a
+    /// known `resets_at`. The `window_secs` is that armed window. Edge-triggered: emitted ONCE
+    /// on the normal→slow transition (NOT re-emitted on each re-arm while the peer stays
+    /// exhausted — it never LEFT the widened cadence in between), the entry partner of
+    /// [`Event::ExhaustedSlowPollCleared`]. The sibling idiom of [`Event::UsageBackoff`], but a
+    /// DISTINCT signal: this is a quota-exhaustion poll-cadence policy, not a 429/5xx rate-limit
+    /// back-off — overloading `usage_backoff` would fire spurious rate-limit events on an
+    /// HTTP-200 success (ADR-0009 / ADR-0019). `account` is the account UUID — a non-PII
+    /// identifier secret-free BY CONSTRUCTION, never the operator `label` (issue #15).
+    ExhaustedSlowPoll { account: String, window_secs: u64 },
+    /// A peer LEFT the widened slow-poll cadence (issue #537): a later poll read it viable
+    /// again (below both triggers) OR it was promoted to the active account (which is exempt
+    /// and polled at full cadence), so its `exhausted_poll_until` window is cleared and it
+    /// returns to the normal cadence. The edge-triggered EXIT partner of
+    /// [`Event::ExhaustedSlowPoll`]'s ENTER, so the slow-poll episode's SPAN is bracketed in
+    /// the durable log. Emitted ONLY when a window was actually armed — a plain viable poll
+    /// with no prior slow-poll stays silent, mirroring [`Event::UsageBackoffCleared`].
+    /// `account` is the account UUID — never the operator `label` (issue #15).
+    ExhaustedSlowPollCleared { account: String },
+    /// The ACTIVE account entered the near-limit poll-coverage fast-poll (issue #540): its reading —
+    /// or the #539 velocity projection — reached the near-limit band, so the daemon TIGHTENED its
+    /// poll sub-interval to `sub_interval_secs` (the `near_limit_poll_secs` cap) so no long poll gap
+    /// opens on the final climb to the limit. The near-limit-scoped MIRROR of
+    /// [`Event::ExhaustedSlowPoll`] (#537), which WIDENS an idle peer — same edge-triggered idiom,
+    /// opposite direction. Emitted ONCE on the below-band → near-limit transition (NOT re-emitted on
+    /// each held near-limit tick while the active stays in the band), and UNPAIRED: the band ends at
+    /// a swap (its own [`Event::Swap`], `session_pct` at swap-out) or a below-band / blind reading,
+    /// so no CLEARED partner is needed to bracket the span. A quota-poll-cadence policy, distinct
+    /// from the 429/5xx `usage_backoff` rate-limit (ADR-0009), like its `ExhaustedSlowPoll` sibling.
+    /// `account` is the account UUID — a non-PII identifier secret-free BY CONSTRUCTION, never the
+    /// operator `label` (issue #15); `sub_interval_secs` is a bare duration, never a token.
+    NearLimitPollCoverage {
+        account: String,
+        sub_interval_secs: u64,
+    },
+    /// The per-account usage VELOCITY between the last two readings (issue #399, normalized to
+    /// %/min by issue #449): the SIGNED change in each rounded-percent dimension since the account's
+    /// previous reading (`to_pct(next) - to_pct(prev)`), carried alongside the `elapsed_secs`
+    /// interval between those two readings so the durable log expresses how fast each account is
+    /// climbing as a TIME-NORMALIZED rate — the measurement the gated bounded-blindness spike (#451)
+    /// and the adaptive-trigger follow-up (#368) are waiting on. A raw per-reading delta is
+    /// ambiguous without its interval (a `+7` over one minute burns far faster than `+7` over ten),
+    /// so [`to_log_line`](Event::to_log_line) derives and renders `session_pct_per_min` /
+    /// `weekly_pct_per_min` from the stored delta and `elapsed_secs` — the same
+    /// store-the-ingredients-derive-the-view idiom as the refresh line's `window_secs`. Emitted only
+    /// when the account measurably MOVED (a non-zero delta in either dimension) AND the interval is
+    /// known and positive, so a flat idle account stays silent (again mirroring
+    /// [`Event::UsageRollup`]); never emitted across a poll gap (a throttle / failure clears the
+    /// prior reading AND its timestamp), so a delta always spans two real consecutive readings.
+    /// `session_delta_pct` / `weekly_delta_pct` are POSITIVE when usage is rising and NEGATIVE when a
+    /// window reset dropped it. `account` is the account UUID (#15); both deltas are bare signed
+    /// percents (a difference of two `0..=100` values, so within `-100..=100`) and `elapsed_secs` a
+    /// bare duration, never a token.
     UsageVelocity {
         account: String,
         session_delta_pct: i16,
         weekly_delta_pct: i16,
+        /// Whole seconds between the two readings this velocity spans (issue #449) — the interval
+        /// [`to_log_line`](Event::to_log_line) divides the deltas by to render the %/min rate.
+        /// Always `> 0` at emission (the daemon suppresses a zero / unknown interval), so the rate
+        /// derivation never divides by zero.
+        elapsed_secs: u64,
+    },
+    /// The ACTIVE account's session-usage BLIND WINDOW just closed (issue #449, umbrella #363 Path
+    /// B): the account had gone blind — a `429` / `5xx` / failed poll cleared its
+    /// [`crate::daemon`] `last_readings` slot so [`crate::swap::decide`] had no reading to act on —
+    /// and this poll read it live again. `duration_secs` is how long it was blind, measured from the
+    /// retained pre-blind anchor ([`crate::daemon`]'s `last_good`, issue #450) to this recovery — the
+    /// same `blind_elapsed` the bounded-blindness preemptive swap (#452, ADR-0017) keys off, now made
+    /// durable so the spike (#451) can derive its constants from real blind-window distributions
+    /// rather than a replay. `session_pct` is the anchor's session usage (how NEAR the limit the
+    /// account was when it went blind), and `near_limit` tags whether that anchor was at/over the
+    /// session trigger (the "risk band"): the two together export BOTH umbrella SLIs — the
+    /// blind-window duration (`duration_secs`) and time-blind-near-limit (`duration_secs` summed over
+    /// the `near_limit=true` episodes, the anchor being fixed for a whole window). Edge-triggered:
+    /// emitted exactly ONCE per blind episode, on the recovery poll — never per held blind tick, and
+    /// only for the ACTIVE account (the anchor belongs to it by identity). `account` is the account
+    /// UUID (#15) — matching the usage-family `acct=` (never the free-form label); every other field
+    /// a bare number / bool, never a token or email.
+    ///
+    /// `session_at_recovery` is the POST-RECOVERY swap-necessity SLI (issue #482): the FRESH session
+    /// pct the account read live at this recovery poll, distinct from `session_pct` (the STALE
+    /// pre-blind anchor). Together with the anchor (`session_pct`) and the anchor's age
+    /// (`duration_secs` doubles as the "anchor_age" #482 names — both are `now - anchor.at`), it
+    /// reconciles whether a HYPOTHETICAL (or, once #452 lands, actual) preemptive swap-away keyed on
+    /// the stale anchor would have been `swap_necessary` (the account really was climbing toward the
+    /// ceiling — `session_at_recovery` held at/above the anchor) or `wasted` (it had already reset /
+    /// wasn't climbing — `session_at_recovery` dropped well below). The RAW recovery pct is recorded,
+    /// NOT a baked classification: the necessary/wasted THRESHOLD is #451/#484's to derive against
+    /// production, so this SLI supplies the ingredient and leaves the verdict a query-time view.
+    BlindWindow {
+        account: String,
+        duration_secs: u64,
+        session_pct: u8,
+        session_at_recovery: u8,
+        near_limit: bool,
+    },
+    /// The #452 bounded-blindness preemptive-swap GATE became ELIGIBLE for the ACTIVE account
+    /// (issue #482, umbrella #363 Path B) — the no-viable-target-at-gate-fire SLI, the FALSIFIER for
+    /// the ADR-0017 cost-asymmetry premise ("firing early on a stale anchor is cheap because a
+    /// viable target reliably exists to catch the swap"). Emitted at the moment the gate's first two
+    /// conditions hold — the active account has been blind past the interim `T`
+    /// ([`crate::daemon`]'s `BLIND_GATE_SECS`) AND its retained pre-blind anchor (`last_good`, #450)
+    /// sat at/over the interim `risk_band` ([`crate::daemon`]'s `BLIND_GATE_RISK_BAND`, LOWER than
+    /// the reactive session trigger) — recording whether the gate's THIRD condition, a viable swap
+    /// target (a peer under `target_max_session_usage`, ADR-0013), is present. `viable_target=false`
+    /// is the premise's counter-evidence: if it is non-trivial, #452's predicate must be revisited.
+    ///
+    /// Instruments the gate premise BEFORE #452 is built (ADR-0017 implementation pending), keyed on
+    /// the interim constants the ADR names, so #451/#484 can finalize `T` / `risk_band` against
+    /// production rather than a replay. DISTINCT from #449's `blind_window` (which closes on
+    /// RECOVERY) and #455's swap-out overshoot SLO (which measures the swap): this measures the GATE
+    /// and its premise, whether or not any swap follows. Edge-triggered: emitted exactly ONCE per
+    /// blind episode (the gate would swap once, ending the episode), on the tick the gate first turns
+    /// eligible — never per held blind tick. `blind_secs` is the blind_elapsed at that moment and
+    /// `session_pct` the anchor's session usage (context for the reading). `account` is the account
+    /// UUID (#15) — matching the usage-family `acct=`; every other field a bare number / bool, never
+    /// a token or email.
+    BlindGateEligible {
+        account: String,
+        viable_target: bool,
+        blind_secs: u64,
+        session_pct: u8,
     },
 }
 
@@ -868,6 +1071,42 @@ impl Event {
             }
             Event::CredentialRestored { account } => {
                 format!("ts={ts} event=credential_restored account={account}")
+            }
+            Event::CanonicalScrubbed { account } => {
+                // `account` trails optionally (an empty value would split the key=val grammar) —
+                // absent when no active account was resolved at scrub time. Mirrors
+                // `all_exhausted`'s optional `resets_at`.
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                // `mode=scrub` (issue #475): the durable half of the two-mode `mode=(yank|scrub)`
+                // classification the umbrella needs — this UNRECOVERABLE empty-canonical scrub (needs
+                // `/login`) vs the RECOVERABLE rotation-yank carried as `mode=yank` on the
+                // `diag=canonical` line. A constant token (not a stored field — the event's identity
+                // already fixes the mode), so an operator `grep mode=` surfaces BOTH modes in one
+                // vocabulary. Renders before the optional `account` to keep a stable line prefix.
+                format!("ts={ts} event=canonical_scrubbed mode=scrub{account}")
+            }
+            Event::CanonicalRestored { account } => {
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=canonical_restored{account}")
+            }
+            Event::CanonicalRecovered { account } => {
+                format!("ts={ts} event=canonical_recovered account={account}")
+            }
+            Event::CanonicalRecoveryExhausted { account } => {
+                // `account` trails optionally (an empty value would split the key=val grammar) —
+                // absent when no active account was resolved at back-off time. Mirrors
+                // `canonical_scrubbed`'s optional `account`.
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                format!("ts={ts} event=canonical_recovery_exhausted{account}")
             }
             Event::CredentialUnrecoverable { account } => {
                 format!("ts={ts} event=credential_unrecoverable account={account}")
@@ -1107,16 +1346,85 @@ impl Event {
             Event::UsageBackoffCleared { account } => {
                 format!("ts={ts} event=usage_backoff_cleared acct={account}")
             }
+            Event::ExhaustedSlowPoll {
+                account,
+                window_secs,
+            } => {
+                // `acct=` carries the account UUID (never the free-form `label`, #15), matching
+                // the sibling `usage_backoff` line; `window_secs` is the armed slow-poll window
+                // (a bare duration, never a token). Redacted to uuid + window ONLY (issue #537).
+                format!(
+                    "ts={ts} event=exhausted_slow_poll acct={account} window_secs={window_secs}"
+                )
+            }
+            Event::ExhaustedSlowPollCleared { account } => {
+                format!("ts={ts} event=exhausted_slow_poll_cleared acct={account}")
+            }
+            Event::NearLimitPollCoverage {
+                account,
+                sub_interval_secs,
+            } => {
+                // `acct=` carries the account UUID (never the free-form `label`, #15), matching the
+                // sibling `exhausted_slow_poll` line; `sub_interval_secs` is the tightened near-limit
+                // poll cadence (a bare duration, never a token). Redacted to uuid + cadence ONLY
+                // (issue #540 / #15).
+                format!(
+                    "ts={ts} event=near_limit_poll_coverage acct={account} sub_interval_secs={sub_interval_secs}"
+                )
+            }
             Event::UsageVelocity {
                 account,
                 session_delta_pct,
                 weekly_delta_pct,
+                elapsed_secs,
             } => {
-                // Both deltas are bare SIGNED percents (a difference of two `0..=100` values), so a
-                // `-` sign can prefix the number — a `key=val` token existing parsers read as-is.
-                // `acct=` is the UUID (#15), matching the sibling `usage_backoff` line.
+                // Normalized to %/min (issue #449): the raw per-reading delta was ambiguous without
+                // its interval, so the velocity is rendered as a TIME rate — each delta divided by
+                // the interval in minutes (`elapsed_secs / 60`), to two decimals. Derived HERE from
+                // the stored delta + `elapsed_secs` (the same store-ingredients-derive-view idiom the
+                // refresh line's `window_secs` uses); `elapsed_secs > 0` at emission, so this never
+                // divides by zero. The raw signed deltas + interval trail the rate so the exact
+                // measurement stays recoverable for the #451 spike. `acct=` is the UUID (#15),
+                // matching the sibling `usage_backoff` line; a negative rate / delta renders its `-`
+                // sign, a `key=val` token existing parsers read as-is.
+                let minutes = *elapsed_secs as f64 / 60.0;
+                let session_pct_per_min = f64::from(*session_delta_pct) / minutes;
+                let weekly_pct_per_min = f64::from(*weekly_delta_pct) / minutes;
                 format!(
-                    "ts={ts} event=usage_velocity acct={account} session_delta_pct={session_delta_pct} weekly_delta_pct={weekly_delta_pct}"
+                    "ts={ts} event=usage_velocity acct={account} session_pct_per_min={session_pct_per_min:.2} weekly_pct_per_min={weekly_pct_per_min:.2} elapsed_secs={elapsed_secs} session_delta_pct={session_delta_pct} weekly_delta_pct={weekly_delta_pct}"
+                )
+            }
+            Event::BlindWindow {
+                account,
+                duration_secs,
+                session_pct,
+                session_at_recovery,
+                near_limit,
+            } => {
+                // The active account's blind-window CLOSE (issue #449) + the post-recovery
+                // swap-necessity SLI (issue #482). All bare numbers + a bool (#15): how long it was
+                // blind (= the anchor's age), the pre-blind anchor's session pct (how near the limit
+                // it was), the FRESH session pct read at recovery, and whether that anchor sat in the
+                // risk band. `session_at_recovery` vs `session_pct` reconciles a stale-anchor swap as
+                // necessary-vs-wasted (the threshold left to #451/#484). `acct=` is the UUID, matching
+                // the usage-family lines.
+                format!(
+                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}"
+                )
+            }
+            Event::BlindGateEligible {
+                account,
+                viable_target,
+                blind_secs,
+                session_pct,
+            } => {
+                // The #452 gate-eligibility SLI (issue #482). All bare numbers + a bool (#15):
+                // whether a viable swap target existed when the preemptive gate turned eligible, how
+                // long the active account had been blind, and the pre-blind anchor's session pct.
+                // `viable_target=false` is the premise falsifier. `acct=` is the UUID, matching the
+                // usage-family lines.
+                format!(
+                    "ts={ts} event=blind_gate_eligible acct={account} viable_target={viable_target} blind_secs={blind_secs} session_pct={session_pct}"
                 )
             }
         }
@@ -1144,7 +1452,12 @@ fn system_time_from_epoch(secs: i64) -> SystemTime {
 /// is emitted. A pre-1970 clock (a `duration_since` error) renders as the epoch — a
 /// clearly-wrong but safe sentinel, so a skewed clock can never panic a log write
 /// (the daemon's logging is best-effort).
-fn rfc3339(ts: SystemTime) -> String {
+///
+/// `pub(crate)` so the windowed `reliability` readout (#494) can render its `--since`
+/// cutoff back to the log's own `ts=` shape through this SAME renderer — the inverse
+/// of [`crate::usage::epoch_from_rfc3339`], which parses `ts=` the other way — rather
+/// than hand-rolling a second copy of the civil-date arithmetic.
+pub(crate) fn rfc3339(ts: SystemTime) -> String {
     let secs = ts
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1363,11 +1676,22 @@ pub(crate) enum DecisionClass {
     Swap,
     /// Emergency-swapped away from a dead active account (issue #42).
     EmergencySwap,
+    /// Preemptively swapped away from a BLIND active account before it could
+    /// self-exhaust unobserved (issue #452, ADR-0017) — the bounded-blindness gate fired.
+    PreemptiveSwap,
+    /// Preemptively swapped away from an OBSERVED active account whose PROJECTED session usage
+    /// crossed the trigger before the observed reading did (issue #539, ADR-0017) — the
+    /// velocity-projection gate fired. Distinct from `PreemptiveSwap` (blind, stale anchor):
+    /// this fires on a fresh reading + its velocity.
+    VelocityPreemptiveSwap,
     /// Over the trigger but no viable target — the all-exhausted hold (issue #11).
     AllExhausted,
     /// The active credential is dead and no target is viable — held, unable to
     /// escape (issue #42).
     ActiveDeadNoTarget,
+    /// The shared canonical was scrubbed/empty and the daemon autonomously adopted a
+    /// viable target's token into it, healing every session (issue #467).
+    CanonicalAdopted,
     /// The active account could not be identified — poll-only.
     SkipActiveUnknown,
     /// The active account's reading was unavailable this cycle — never swap on
@@ -1388,8 +1712,11 @@ impl DecisionClass {
             DecisionClass::Hold => "hold",
             DecisionClass::Swap => "swap",
             DecisionClass::EmergencySwap => "emergency_swap",
+            DecisionClass::PreemptiveSwap => "preemptive_swap",
+            DecisionClass::VelocityPreemptiveSwap => "velocity_preemptive_swap",
             DecisionClass::AllExhausted => "all_exhausted",
             DecisionClass::ActiveDeadNoTarget => "active_dead_no_target",
+            DecisionClass::CanonicalAdopted => "canonical_adopted",
             DecisionClass::SkipActiveUnknown => "skip_active_unknown",
             DecisionClass::SkipActiveUnavailable => "skip_active_unavailable",
             DecisionClass::SkipCooldown => "skip_cooldown",
@@ -1417,7 +1744,7 @@ pub(crate) enum Diagnostic {
     Start {
         accounts: usize,
         poll_secs: u64,
-        target_max_usage: u8,
+        target_max_session_usage: u8,
         session_trigger: u8,
         weekly_trigger: u8,
         monitor_401_n: u8,
@@ -1433,20 +1760,50 @@ pub(crate) enum Diagnostic {
     /// the normal jittered interval.
     ///
     /// `retry_after_secs` LABELS the SOURCE of that wait (issue #295): the RAW
-    /// server-advised `Retry-After` (delta-seconds, BEFORE the `POLL_BACKOFF_CAP`
-    /// clamp) the throttled poll's response supplied, when any. `Some` ⇒ the server
+    /// server-advised `Retry-After` (delta-seconds, BEFORE any daemon cap — the
+    /// `POLL_BACKOFF_CAP` clamp is peer-only since #453) the throttled poll's response
+    /// supplied, when any. `Some` ⇒ the server
     /// advised a floor; `None` ⇒ the wait is the daemon's self-capped exponential (or
     /// the keychain-lock back-off), with no server advice. It disambiguates a
     /// `backoff_secs` an operator otherwise cannot place, by comparison: absent ⇒
     /// self-capped exponential; `== backoff_secs` ⇒ the server-advised wait governed;
     /// `< backoff_secs` ⇒ the server advised a smaller floor but the exponential governed;
-    /// `> backoff_secs` ⇒ the #294 cap clamped a pathological value (e.g.
+    /// `> backoff_secs` ⇒ the #294 cap clamped a pathological value on a PEER (e.g.
     /// `backoff_secs=3600 retry_after_secs=86400`). Pre-cap on purpose, so that clamped
     /// value stays visible rather than collapsing into an indistinguishable `backoff_secs=3600`.
+    /// The ACTIVE account never shows `> backoff_secs`: its `Retry-After` is an un-clamped
+    /// floor (issue #453), so `backoff_secs >= retry_after_secs` always holds for it.
     Tick {
         decision: DecisionClass,
         backoff_secs: Option<u64>,
         retry_after_secs: Option<u64>,
+    },
+    /// The shared canonical `Claude Code-credentials` item's OWN per-poll reading (issue #464):
+    /// its liveness `state` ([`CanonicalLiveness`]: present / scrubbed / unknown), a redaction-safe
+    /// `fingerprint` of the current refresh token (a SHA-256 hex PREFIX — identity, never the
+    /// token), the resolved account `handle`, and the access-token `expires_at` (epoch seconds).
+    /// The LEVEL record emitted every poll — the measurable substrate the rotation-interference
+    /// rate (#465) and the autonomous-recovery trigger (#467) consume; its edge-crossings are the
+    /// durable [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`] pair. Every field is a
+    /// discriminant / hash-prefix / handle / timestamp — never a secret (issue #15). The three
+    /// optional fields are absent on a scrubbed / unknown read (no live token to fingerprint, no
+    /// expiry, possibly no resolvable handle).
+    Canonical {
+        state: CanonicalLiveness,
+        fingerprint: Option<String>,
+        account: Option<String>,
+        expires_at: Option<i64>,
+        /// The PRIOR poll's canonical fingerprint when THIS poll observed a Present→Present
+        /// rotation (issue #475) — `Some(prev)` iff the refresh-token fingerprint CHANGED since
+        /// the last Present observation (a rotation-YANK: the shared item rotated under mid-flight
+        /// sessions, which get a RECOVERABLE 401 while the item stays live — distinct from the
+        /// UNRECOVERABLE scrub the durable [`Event::CanonicalScrubbed`] carries). Renders the
+        /// additive trailing `mode=yank prev=<prev>` marker, giving the `diag=canonical` line the
+        /// same `mode=(yank|scrub)` vocabulary the durable scrub event carries — so `grep mode=`
+        /// surfaces both "Not logged in" modes. `None` on a non-rotating poll, the seeding first
+        /// observation, and every non-Present read. A non-secret 16-hex SHA-256 prefix (issue #15),
+        /// the same shape as `fingerprint` — never a token.
+        rotated_from: Option<String>,
     },
     /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap
     /// target is possible again. The edge-triggered LEAVE marker — the symmetric
@@ -1474,17 +1831,17 @@ impl Diagnostic {
             Diagnostic::Start {
                 accounts,
                 poll_secs,
-                target_max_usage,
+                target_max_session_usage,
                 session_trigger,
                 weekly_trigger,
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
-                // target_max_usage (#398) is always-valued — render its percent directly,
+                // target_max_session_usage (#398) is always-valued — render its percent directly,
                 // like the other counts/percentages (no `off` sentinel to carry).
                 format!(
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
-                     target_max_usage={target_max_usage} session_trigger={session_trigger} \
+                     target_max_session_usage={target_max_session_usage} session_trigger={session_trigger} \
                      weekly_trigger={weekly_trigger} monitor_401_n={monitor_401_n} \
                      monitor_recovery_m={monitor_recovery_m}"
                 )
@@ -1515,6 +1872,42 @@ impl Diagnostic {
                     None => String::new(),
                 };
                 format!("ts={ts} diag=tick decision={decision}{backoff}{retry_after}")
+            }
+            Diagnostic::Canonical {
+                state,
+                fingerprint,
+                account,
+                expires_at,
+                rotated_from,
+            } => {
+                let state = state.as_str();
+                // Each optional field renders only when present — an empty value after `=` would
+                // split the `key=val` grammar (mirrors `diag=tick`'s optional `backoff_secs`).
+                // `expires_at` is raw epoch SECONDS, matching this channel's `*_secs` convention
+                // and the wire's `access_expires_at` unit.
+                let fingerprint = match fingerprint {
+                    Some(fp) => format!(" fingerprint={fp}"),
+                    None => String::new(),
+                };
+                let account = match account {
+                    Some(label) => format!(" account={label}"),
+                    None => String::new(),
+                };
+                let expires_at = match expires_at {
+                    Some(secs) => format!(" expires_at={secs}"),
+                    None => String::new(),
+                };
+                // The rotation-YANK marker (issue #475): additive TRAILING tokens present ONLY on a
+                // Present→Present fingerprint delta, so a non-rotating poll line is byte-for-byte
+                // unchanged (every existing `key=val` parser is unaffected). `prev` is the prior
+                // fingerprint — a non-secret hash prefix like `fingerprint`, never the prior token.
+                let rotated = match rotated_from {
+                    Some(prev) => format!(" mode=yank prev={prev}"),
+                    None => String::new(),
+                };
+                format!(
+                    "ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}{rotated}"
+                )
             }
             Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
             Diagnostic::ActiveDeadNoTargetCleared => {
@@ -1673,6 +2066,60 @@ mod tests {
     }
 
     #[test]
+    fn swap_line_renders_the_velocity_preempt_reason_redaction_clean() {
+        // Issue #539: the projective swap renders `reason=velocity_preempt` with `session_pct`
+        // carrying the FRESH observed reading at swap-out — the exact wire token the reliability
+        // parser greps to fold the projected-swap-out-overshoot SLI. Below the ceiling it carries no
+        // `late=` marker (a projective swap fires while observed < trigger ≤ 99, so it is never late).
+        // The line is redaction-clean (#15): only the operator HANDLES + a percent, never the email
+        // or token — the same single-surface discipline every other swap reason rides.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::VelocityPreempt,
+            session_pct: 92,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=swap from=work to=spare reason=velocity_preempt session_pct=92")
+        );
+        assert!(
+            !line.contains("late"),
+            "a projective swap is never late: {line}"
+        );
+    }
+
+    #[test]
+    fn swap_line_renders_the_blind_preempt_reason_redaction_clean() {
+        // Issue #479 (surface 2, LOG medium): the #452 bounded-blindness preemptive swap renders
+        // `reason=blind_preempt` with `session_pct` carrying the STALE pre-blind anchor (the only
+        // session signal available while blind) — the durable event-log narration of the same swap the
+        // `status` wire reflects as prose (`recent_blind_preempt_swap`) and the daemon retains for the
+        // `use <label>` undo. Each medium in its own idiom (R-2 STATE-parity): the log carries the
+        // machine-greppable `reason=`/`from=`/`to=` tuple, `status` carries the operator prose. Below
+        // the ceiling (a blind-preempt fires on an anchor at/over the risk band but under the reactive
+        // trigger ≤ 99) it carries no `late=` marker. Redaction-clean (#15): only the operator HANDLES
+        // + a percent ride the line, never the email or token — the single-surface discipline every
+        // other swap reason rides.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::BlindPreempt,
+            session_pct: 68,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=swap from=work to=spare reason=blind_preempt session_pct=68")
+        );
+        assert!(
+            !line.contains("late"),
+            "a blind-preempt swap fires under the reactive trigger, never late: {line}"
+        );
+    }
+
+    #[test]
     fn all_exhausted_renders_cause_and_resets_at_when_known_and_omits_reset_otherwise() {
         // No reset reported (#11 fallback) → resets_at is simply absent and the line
         // stays well-formed; cause (#398) is always present.
@@ -1781,6 +2228,147 @@ mod tests {
         assert_eq!(
             line,
             format!("{TS0} event=credential_restored account=work")
+        );
+    }
+
+    #[test]
+    fn canonical_scrubbed_carries_the_scrub_mode_and_optional_handle() {
+        // Issue #464/#475: the shared-item scrub renders the constant `mode=scrub` classification
+        // (the durable half of `mode=(yank|scrub)`) then the last-known active HANDLE (never a
+        // token or email) — and omits `account` cleanly when no active account was resolved (a
+        // daemon started against an already-empty item), keeping a stable `... mode=scrub` prefix.
+        let with_handle = Event::CanonicalScrubbed {
+            account: Some("work".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            with_handle,
+            format!("{TS0} event=canonical_scrubbed mode=scrub account=work")
+        );
+
+        let no_handle = Event::CanonicalScrubbed { account: None }.to_log_line(at_epoch(0));
+        assert_eq!(
+            no_handle,
+            format!("{TS0} event=canonical_scrubbed mode=scrub")
+        );
+    }
+
+    #[test]
+    fn canonical_restored_carries_the_handle_when_known_and_omits_it_otherwise() {
+        // Issue #464: the clearing counterpart, same optional-handle grammar.
+        let with_handle = Event::CanonicalRestored {
+            account: Some("work".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            with_handle,
+            format!("{TS0} event=canonical_restored account=work")
+        );
+
+        let no_handle = Event::CanonicalRestored { account: None }.to_log_line(at_epoch(0));
+        assert_eq!(no_handle, format!("{TS0} event=canonical_restored"));
+    }
+
+    #[test]
+    fn canonical_recovered_carries_the_adopted_account_handle() {
+        // Issue #467: the autonomous adopt-target recovery renders the adopted account HANDLE
+        // (never a token or email). `account` is required — recovery only fires with a viable
+        // target in hand, so there is always a handle to name.
+        let line = Event::CanonicalRecovered {
+            account: "spare".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=canonical_recovered account=spare")
+        );
+    }
+
+    #[test]
+    fn canonical_recovery_exhausted_carries_the_handle_when_known_and_omits_it_otherwise() {
+        // Issue #467: the back-off surface when re-scrub churn exceeds the window bound — same
+        // optional-handle grammar as `canonical_scrubbed` (an empty value would split key=val),
+        // absent when no active account was resolved at back-off time.
+        let with_handle = Event::CanonicalRecoveryExhausted {
+            account: Some("work".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            with_handle,
+            format!("{TS0} event=canonical_recovery_exhausted account=work")
+        );
+
+        let no_handle =
+            Event::CanonicalRecoveryExhausted { account: None }.to_log_line(at_epoch(0));
+        assert_eq!(
+            no_handle,
+            format!("{TS0} event=canonical_recovery_exhausted")
+        );
+    }
+
+    #[test]
+    fn canonical_diagnostic_renders_state_and_appends_each_present_field() {
+        // Issue #464: the per-poll level line. A live read carries all four fields; a scrubbed /
+        // unknown read carries only `state` (no live token to fingerprint, no expiry), each
+        // optional field appended only when present (an empty value would split the grammar).
+        let present = Diagnostic::Canonical {
+            state: CanonicalLiveness::Present,
+            fingerprint: Some("0123456789abcdef".to_owned()),
+            account: Some("work".to_owned()),
+            expires_at: Some(1_782_777_600),
+            rotated_from: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            present,
+            format!(
+                "{TS0} diag=canonical state=present fingerprint=0123456789abcdef account=work expires_at=1782777600"
+            )
+        );
+
+        let scrubbed = Diagnostic::Canonical {
+            state: CanonicalLiveness::Scrubbed,
+            fingerprint: None,
+            account: Some("work".to_owned()),
+            expires_at: None,
+            rotated_from: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            scrubbed,
+            format!("{TS0} diag=canonical state=scrubbed account=work")
+        );
+
+        let unknown = Diagnostic::Canonical {
+            state: CanonicalLiveness::Unknown,
+            fingerprint: None,
+            account: None,
+            expires_at: None,
+            rotated_from: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(unknown, format!("{TS0} diag=canonical state=unknown"));
+    }
+
+    #[test]
+    fn canonical_diagnostic_appends_the_yank_marker_only_on_a_rotation() {
+        // Issue #475: a Present→Present fingerprint delta appends the additive TRAILING
+        // `mode=yank prev=<prior-fingerprint>` marker (after every #464 field), giving the level
+        // line the same `mode=(yank|scrub)` vocabulary the durable scrub event carries. `prev` is a
+        // non-secret hash prefix, never a token.
+        let yank = Diagnostic::Canonical {
+            state: CanonicalLiveness::Present,
+            fingerprint: Some("0123456789abcdef".to_owned()),
+            account: Some("work".to_owned()),
+            expires_at: Some(1_782_777_600),
+            rotated_from: Some("fedcba9876543210".to_owned()),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            yank,
+            format!(
+                "{TS0} diag=canonical state=present fingerprint=0123456789abcdef account=work expires_at=1782777600 mode=yank prev=fedcba9876543210"
+            )
         );
     }
 
@@ -2178,7 +2766,10 @@ mod tests {
         }
         .to_log_line(at_epoch(0));
         for line in [&rollup, &gap] {
-            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
             // The refresh/login events use `outcome=`/`token`; ours carry no credential field.
             assert!(!line.contains("token"), "no token may appear: {line}");
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
@@ -2202,7 +2793,10 @@ mod tests {
 
         // The #15 single-surface guarantee: the only free field is the redacted uuid handle —
         // never an email or token.
-        assert!(!with_uuid.contains('@'), "no email may appear: {with_uuid}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&with_uuid, &[]).is_empty(),
+            "no non-authored email may appear (#15/#444): {with_uuid}"
+        );
         assert!(
             !with_uuid.contains("token"),
             "no token may appear: {with_uuid}"
@@ -2240,8 +2834,9 @@ mod tests {
 
     #[test]
     fn no_event_line_carries_an_email_or_token_sigil() {
-        // #15: every field is a handle / enum / number / timestamp, so a token or
-        // email can never reach a rendered line. Handles here are plain labels.
+        // #15/#444: every field is a handle / enum / number / timestamp, so a token
+        // or a NON-authored email can never reach a rendered line. The handles here are
+        // plain (non-email) labels; an operator's own email label would be permitted.
         let events = [
             Event::Swap {
                 from: "work".to_owned(),
@@ -2304,7 +2899,10 @@ mod tests {
         ];
         for event in &events {
             let line = event.to_log_line(at_epoch(0));
-            assert!(!line.contains('@'), "no email sigil: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email sigil (#15/#444): {line}"
+            );
             assert!(!line.to_lowercase().contains("token"), "no token: {line}");
             // Exactly one line — no embedded newline could split or forge a record.
             assert_eq!(line.lines().count(), 1, "single line: {line}");
@@ -2365,7 +2963,7 @@ mod tests {
         for line in logged.lines() {
             assert!(line.starts_with("ts="), "every line is stamped: {line:?}");
         }
-        assert!(!logged.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty());
     }
 
     #[test]
@@ -2650,7 +3248,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         }
         .to_log_line(at_epoch(0));
         for line in [&export, &import] {
-            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
             assert!(!line.contains("token"), "no token may appear: {line}");
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
             assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
@@ -2733,30 +3334,188 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
-    fn usage_velocity_line_carries_signed_percent_deltas() {
-        // A climbing account: both deltas POSITIVE (the #368 adaptive-trigger measurement).
+    fn exhausted_slow_poll_line_carries_the_uuid_and_window() {
+        // The durable ENTER line (issue #537): the account UUID (not a label, #15) and the armed
+        // slow-poll window — redacted to uuid + window ONLY. No token/email surface exists.
+        let line = Event::ExhaustedSlowPoll {
+            account: "u-A".to_owned(),
+            window_secs: 3600,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=exhausted_slow_poll acct=u-A window_secs=3600")
+        );
+        // #15: no non-authored email, no token/bearer/api-key, and the identity is the UUID.
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no non-authored email may appear (#15): {line}"
+        );
+        assert!(!line.contains("token") && !line.contains("Bearer") && !line.contains("sk-ant"));
+    }
+
+    #[test]
+    fn exhausted_slow_poll_cleared_line_carries_the_uuid() {
+        // The edge-triggered EXIT partner (issue #537): just the account UUID — the slow-poll
+        // episode's span is bracketed by pairing this with the last ENTER line.
+        let line = Event::ExhaustedSlowPollCleared {
+            account: "u-A".to_owned(),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=exhausted_slow_poll_cleared acct=u-A")
+        );
+    }
+
+    #[test]
+    fn near_limit_poll_coverage_line_carries_the_uuid_and_cadence() {
+        // The durable band-ENTER line (issue #540): the active account UUID (not a label, #15) and
+        // the tightened near-limit poll cadence — redacted to uuid + cadence ONLY, the same
+        // single-surface discipline as its `exhausted_slow_poll` sibling. No token/email surface
+        // exists (the mirror-image sibling of `exhausted_slow_poll_line_carries_the_uuid_and_window`).
+        let line = Event::NearLimitPollCoverage {
+            account: "u-A".to_owned(),
+            sub_interval_secs: 60,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=near_limit_poll_coverage acct=u-A sub_interval_secs=60")
+        );
+        // #15: no non-authored email, no token/bearer/api-key, and the identity is the UUID.
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no non-authored email may appear (#15): {line}"
+        );
+        assert!(!line.contains("token") && !line.contains("Bearer") && !line.contains("sk-ant"));
+    }
+
+    #[test]
+    fn usage_velocity_line_normalizes_the_signed_deltas_to_percent_per_minute() {
+        // A climbing account, normalized to %/min (issue #449): session +7 over a 300 s (5 min)
+        // interval renders `session_pct_per_min=1.40` (7 / 5), weekly +2 → `0.40` — the raw deltas +
+        // interval trail so the exact measurement stays recoverable for the #451 spike.
         let climbing = Event::UsageVelocity {
             account: "u-A".to_owned(),
             session_delta_pct: 7,
             weekly_delta_pct: 2,
+            elapsed_secs: 300,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             climbing,
-            format!("{TS0} event=usage_velocity acct=u-A session_delta_pct=7 weekly_delta_pct=2")
+            format!("{TS0} event=usage_velocity acct=u-A session_pct_per_min=1.40 weekly_pct_per_min=0.40 elapsed_secs=300 session_delta_pct=7 weekly_delta_pct=2")
         );
 
-        // A window reset dropped the reading: a NEGATIVE session delta renders with its `-` sign,
-        // a `key=val` token existing parsers read as-is.
+        // A window reset dropped the reading over a 60 s interval: a NEGATIVE rate renders with its
+        // `-` sign (−92 / 1 min = −92.00), a `key=val` token existing parsers read as-is.
         let reset = Event::UsageVelocity {
             account: "u-A".to_owned(),
             session_delta_pct: -92,
             weekly_delta_pct: 0,
+            elapsed_secs: 60,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             reset,
-            format!("{TS0} event=usage_velocity acct=u-A session_delta_pct=-92 weekly_delta_pct=0")
+            format!("{TS0} event=usage_velocity acct=u-A session_pct_per_min=-92.00 weekly_pct_per_min=0.00 elapsed_secs=60 session_delta_pct=-92 weekly_delta_pct=0")
+        );
+    }
+
+    #[test]
+    fn usage_velocity_rate_depends_on_the_interval_not_just_the_delta() {
+        // The point of the #449 normalization: the SAME +6 delta is a different %/min depending on
+        // how long it took. Over 1 min it is 6.00 %/min; over 6 min it is 1.00 %/min — the durable
+        // log now distinguishes a fast burn from a slow climb that a raw delta alone conflated.
+        let fast = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: 6,
+            weekly_delta_pct: 0,
+            elapsed_secs: 60,
+        }
+        .to_log_line(at_epoch(0));
+        let slow = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: 6,
+            weekly_delta_pct: 0,
+            elapsed_secs: 360,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(fast.contains("session_pct_per_min=6.00"), "{fast}");
+        assert!(slow.contains("session_pct_per_min=1.00"), "{slow}");
+    }
+
+    #[test]
+    fn blind_window_line_carries_duration_anchor_pct_recovery_pct_and_near_limit() {
+        // The active account recovered after 8 min (480 s) blind while its pre-blind anchor sat at
+        // 96 % — in the risk band, so `near_limit=true` — and read live at 98 % on recovery (still
+        // climbing above the anchor → a stale-anchor preemptive swap would have been NECESSARY,
+        // issue #482). Three umbrella #363 SLIs read off this line: the blind-window duration,
+        // time-blind-near-limit (filtered to `near_limit=true`), and post-recovery swap-necessity
+        // (`session_at_recovery` vs the `session_pct` anchor).
+        let line = Event::BlindWindow {
+            account: "u-A".to_owned(),
+            duration_secs: 480,
+            session_pct: 96,
+            session_at_recovery: 98,
+            near_limit: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=blind_window acct=u-A duration_secs=480 session_pct=96 session_at_recovery=98 near_limit=true")
+        );
+    }
+
+    #[test]
+    fn blind_window_line_marks_a_below_band_recovery_not_near_limit() {
+        // A blind window whose anchor was comfortably below the trigger (40 %) is STILL recorded —
+        // the spike wants the full distribution — but `near_limit=false` keeps it out of the
+        // time-blind-near-limit sum. Recovery read 42 % (near the anchor, never climbed toward the
+        // ceiling): the #482 recovery pct is recorded regardless of the near-limit tag.
+        let line = Event::BlindWindow {
+            account: "u-B".to_owned(),
+            duration_secs: 90,
+            session_pct: 40,
+            session_at_recovery: 42,
+            near_limit: false,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=blind_window acct=u-B duration_secs=90 session_pct=40 session_at_recovery=42 near_limit=false")
+        );
+    }
+
+    #[test]
+    fn blind_gate_eligible_line_carries_viable_target_blind_secs_and_anchor_pct() {
+        // The #452 preemptive gate turned eligible for the active account after 360 s blind with its
+        // anchor at 70 % (in the interim risk band) — and a viable swap target WAS present, so the
+        // ADR-0017 cost-asymmetry premise holds this time (`viable_target=true`, issue #482).
+        let present = Event::BlindGateEligible {
+            account: "u-A".to_owned(),
+            viable_target: true,
+            blind_secs: 360,
+            session_pct: 70,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            present,
+            format!("{TS0} event=blind_gate_eligible acct=u-A viable_target=true blind_secs=360 session_pct=70")
+        );
+        // The FALSIFIER case: the gate was eligible but NO viable target existed — the premise's
+        // counter-evidence, the whole reason #482 measures at gate-fire and not only at swap.
+        let absent = Event::BlindGateEligible {
+            account: "u-B".to_owned(),
+            viable_target: false,
+            blind_secs: 900,
+            session_pct: 88,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            absent,
+            format!("{TS0} event=blind_gate_eligible acct=u-B viable_target=false blind_secs=900 session_pct=88")
         );
     }
 
@@ -2782,11 +3541,30 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 account: "u-A".to_owned(),
                 session_delta_pct: -5,
                 weekly_delta_pct: 1,
+                elapsed_secs: 120,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 97,
+                session_at_recovery: 99,
+                near_limit: true,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::BlindGateEligible {
+                account: "u-A".to_owned(),
+                viable_target: false,
+                blind_secs: 600,
+                session_pct: 88,
             }
             .to_log_line(at_epoch(0)),
         ];
         for line in &lines {
-            assert!(!line.contains('@'), "no email may appear: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
             assert!(!line.contains("token"), "no token may appear: {line}");
             assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
             assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
@@ -2799,12 +3577,12 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn start_line_renders_the_effective_config_summary() {
-        // target_max_usage (#398, always-valued) renders as its percent, like the rest —
+        // target_max_session_usage (#398, always-valued) renders as its percent, like the rest —
         // counts and percentages only, no handle.
         let line = Diagnostic::Start {
             accounts: 3,
             poll_secs: 30,
-            target_max_usage: 70,
+            target_max_session_usage: 70,
             session_trigger: 90,
             weekly_trigger: 98,
             monitor_401_n: 5,
@@ -2814,7 +3592,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         assert_eq!(
             line,
             format!(
-                "{TS0} diag=start accounts=3 poll_secs=30 target_max_usage=70 \
+                "{TS0} diag=start accounts=3 poll_secs=30 target_max_session_usage=70 \
                  session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4"
             )
         );
@@ -2910,6 +3688,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             (DecisionClass::EmergencySwap, "emergency_swap"),
             (DecisionClass::AllExhausted, "all_exhausted"),
             (DecisionClass::ActiveDeadNoTarget, "active_dead_no_target"),
+            (DecisionClass::CanonicalAdopted, "canonical_adopted"),
             (DecisionClass::SkipActiveUnknown, "skip_active_unknown"),
             (
                 DecisionClass::SkipActiveUnavailable,
@@ -2954,7 +3733,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             Diagnostic::Start {
                 accounts: 2,
                 poll_secs: 30,
-                target_max_usage: 70,
+                target_max_session_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 98,
                 monitor_401_n: 5,
@@ -2976,7 +3755,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         ];
         for diag in &diags {
             let line = diag.to_log_line(at_epoch(0));
-            assert!(!line.contains('@'), "no email sigil: {line}");
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email sigil (#15/#444): {line}"
+            );
             assert!(!line.to_lowercase().contains("token"), "no token: {line}");
             assert_eq!(line.lines().count(), 1, "single line: {line}");
         }

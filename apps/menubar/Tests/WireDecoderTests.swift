@@ -15,12 +15,14 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 3))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 7))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
         XCTAssertEqual(v.refreshEnabled, false)
         XCTAssertNil(v.systemicRefreshFailure, "systemic_refresh_failure null decodes to nil")
+        XCTAssertNil(v.canonicalScrub, "canonical_scrub absent (healthy) decodes to nil")
+        XCTAssertFalse(v.keychainLocked, "keychain_locked absent (unlocked) decodes to false")
         XCTAssertEqual(v.accounts.count, 1)
 
         let a = v.accounts[0]
@@ -42,8 +44,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 3)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 3))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 7)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 7))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -89,9 +91,10 @@ final class WireDecoderTests: XCTestCase {
     }
 
     // AC (#393): the `roster_order` reason decodes — ≥2 accounts qualified, none reported a weekly
-    // reset, so the earliest roster index won. The client must accept every tag the daemon emits
-    // (an unknown `kind` is a hard decode error), and must never render this as "only viable
-    // target" — other targets were viable.
+    // reset, so the earliest roster index won. The client must decode every KNOWN tag the daemon
+    // emits to its own case (an UNKNOWN `kind` now degrades to `reason: nil` — issue #412,
+    // `testUnknownReasonKindDecodesToNilReasonAndFrameStillDecodes`), and must never render this as
+    // "only viable target" — other targets were viable.
     func testDecodesNextSwapTargetWithRosterOrderReason() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotRosterOrderTarget) else {
             return XCTFail("expected a snapshot frame")
@@ -149,6 +152,51 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(a.auth, .degraded)
     }
 
+    // AC (#516): the daemon-level `canonical_scrub` = `exhausted` rollup decodes — the fleet-wide
+    // scrubbed-AND-recovery-exhausted (un-recoverable) state that no per-account `auth` reflects, which
+    // #469 renders with the `claude /login` remedy. Byte-pinned to the Rust golden (WireGoldenTests),
+    // so the `{"state":"exhausted"}` discriminant is under the cross-language byte-drift guard.
+    func testDecodesCanonicalScrubExhausted() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubExhausted) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 7))
+        XCTAssertEqual(v.canonicalScrub, .exhausted)
+        // The rest of the frame still decodes normally alongside the added rollup.
+        XCTAssertEqual(v.accounts.count, 1)
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
+    // AC (#516): the OTHER known `canonical_scrub` state — `recovering` (scrubbed, adopt in progress,
+    // the self-may-heal state) — decodes to its own case. The client must decode every KNOWN state the
+    // daemon emits (an UNKNOWN one is a HARD error — `testUnknownCanonicalScrubStateThrows`), which one
+    // byte-golden (carrying `exhausted`) cannot cover.
+    func testDecodesCanonicalScrubRecovering() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubRecovering) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.canonicalScrub, .recovering)
+    }
+
+    // AC (#498): the daemon-level `keychain_locked` = `true` flag decodes — the fleet-wide
+    // unreadable-credential lockout (the login keychain is LOCKED, so the shared item can't be READ at
+    // all) that no per-account `auth` reflects, DISTINCT from `canonical_scrub` (a readable-but-scrubbed
+    // item). A bare `bool`: absent (the healthy/unlocked frame, `skip_serializing_if`) → false
+    // (`testDecodesRealSnapshotFrame`), present → true here. The wire prerequisite for the menubar #498
+    // surface; not byte-pinned to a golden (the goldens cover the unlocked frame, which omits the flag).
+    func testDecodesKeychainLocked() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotKeychainLocked) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 7))
+        XCTAssertTrue(v.keychainLocked)
+        // The flag is independent of `canonical_scrub` (a locked keychain can't be read to know
+        // scrubbed-ness), and the rest of the frame still decodes normally alongside it.
+        XCTAssertNil(v.canonicalScrub)
+        XCTAssertEqual(v.accounts.count, 1)
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
     // AC: "`auth` → CredentialHealth including `null`".
     func testAuthNullIsTolerated() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotAuthNull) else {
@@ -173,6 +221,9 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertNil(a.accessExpiresAt)
         XCTAssertNil(a.refreshHealth)
         XCTAssertNil(a.auth)
+        // Back-compat (#498): a pre-#498 (minor 0) frame omits `keychain_locked` → decodes to false —
+        // the `decodeIfPresent ?? false` additive-default path (mirrors the Rust `#[serde(default)]`).
+        XCTAssertFalse(v.keychainLocked, "an older daemon that never emits keychain_locked → false")
     }
 
     // AC: forward-compat MINOR — unknown additive keys ignored, still supported.
@@ -195,6 +246,32 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 1))
         XCTAssertTrue(v.isSchemaSupported, "a pre-#393 minor stays supported")
         XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: nil))
+    }
+
+    // AC (#412): a NEWER daemon's unrecognised `next_swap.reason.kind` is a forward-compat DECORATION
+    // — it must degrade to `reason: nil` (the bare target label, the SAME path as a pre-#393 omitted
+    // reason) and the frame must STILL decode, never be lost. This is the whole fix: one unknown
+    // rationale must not silently freeze the panel (`WatchStatusStore` drops an undecodable line, so
+    // an unrecognised kind used to take down every account row, every meter, the whole frame).
+    func testUnknownReasonKindDecodesToNilReasonAndFrameStillDecodes() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotUnknownReasonKind) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertTrue(v.isSchemaSupported, "a newer minor stays supported")
+        // The unrecognised reason degrades to the bare target label (reason == nil)…
+        XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: nil))
+        // …and the REST of the frame survived — this is the regression the fix prevents.
+        XCTAssertEqual(v.accounts.count, 1, "the whole frame decoded, not just next_swap")
+        XCTAssertEqual(v.accounts[0].label, "work")
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
+    // AC (#412): the tolerance is for UNRECOGNISED kinds ONLY. A MALFORMED known kind — here
+    // `soonest_reset` without its required `resets_at` — is corruption, not forward-compat, so it
+    // stays a HARD decode error; it must NOT be swallowed to `nil` the way an unknown kind is. This
+    // pins the tolerate-vs-reject discriminator so a future refactor cannot over-tolerate into it.
+    func testMalformedKnownReasonKindStillThrows() {
+        XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotTargetMalformedReason))
     }
 
     // AC: "Unknown `type` → ignored (returns an 'unknown' frame, NOT an error)".
@@ -236,6 +313,13 @@ final class WireDecoderTests: XCTestCase {
     // Faithful mirror: an unknown internally-tagged `next_swap` state is a hard error.
     func testUnknownNextSwapStateThrows() {
         XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotUnknownNextSwap))
+    }
+
+    // Faithful mirror (#516): an unknown internally-tagged `canonical_scrub` state is a hard error —
+    // the same reject posture as `next_swap.state` (a mis-rendered fleet state is dangerous), NOT the
+    // tolerated-decoration posture of an unknown `reason.kind`.
+    func testUnknownCanonicalScrubStateThrows() {
+        XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotUnknownCanonicalScrub))
     }
 
     // Faithful mirror: an unknown `auth` value is a hard error.

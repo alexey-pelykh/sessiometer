@@ -112,7 +112,8 @@ enum StatusPanelFormat {
     /// its affordance:
     ///   * `notATarget` — the ACTIVE row (a disabled button reads as "broken", so it stays a plain
     ///     display row).
-    ///   * `available` — a viable switch target: an enabled, quiet, hover-revealed button.
+    ///   * `available` — a viable switch target: an enabled button carrying a persistent, quiet swap chip
+    ///     (visible at rest, brightening on hover — #448).
     ///   * `blocked(reason)` — a wire-visibly non-viable target: a disabled button carrying its reason.
     ///
     /// `isEnabled` is accepted and DELIBERATELY IGNORED — pinned as a parameter (rather than simply not
@@ -164,24 +165,31 @@ enum StatusPanelFormat {
 
     // MARK: - Switch-affordance layout budget (issue #169 watch-out: never truncate to something uninformative)
 
-    /// The trailing hover-switch slot's own width in points — wide enough for the swap glyph and for the
-    /// small `ProgressView` that replaces it while the swap is in flight. This EXCLUDES the row `HStack`'s
-    /// 9 pt spacing that precedes it, so the slot's total trailing cost is `switchAffordanceSlotWidth + 9`.
+    /// The trailing swap-chip slot's own width in points — wide enough for the swap glyph and for the small
+    /// `ProgressView` that replaces it while the swap is in flight. This EXCLUDES the row `HStack`'s 9 pt
+    /// spacing that precedes it, so the slot's total trailing cost is `switchAffordanceSlotWidth + 9`.
     ///
-    /// The slot is laid out on EVERY roster row — invisible on the active row, and at rest on the others.
-    /// Two consequences, both load-bearing: the auth column stays aligned across active and non-active
-    /// rows, and, decisively, revealing the glyph on hover can never REFLOW the row. The label's available
-    /// width is identical hovered and at rest, so its truncation is too.
-    static let switchAffordanceSlotWidth: Double = 18
+    /// #448 widened this 18 → 28: the chip is no longer hover-REVEALED but PERSISTENT — a quiet, low-emphasis
+    /// mark shown at rest on every switch target so a first-time operator sees the row is actionable on a
+    /// transient popover — so the slot now carries a visible glyph in the steady state and earns a little
+    /// more room to sit comfortably (still far under the row's spare width; see `switchAffordanceMinRowWidth`).
+    ///
+    /// The slot is laid out on EVERY roster row — empty on the active row, the quiet chip at rest on the
+    /// others. Two consequences, both load-bearing: the auth column stays aligned across active and
+    /// non-active rows, and, decisively, NEITHER the chip's resting presence NOR its hover-brighten can
+    /// REFLOW the row (the slot width is identical hidden / resting / armed). The label's available width is
+    /// constant, so its truncation is too.
+    static let switchAffordanceSlotWidth: Double = 28
 
     /// The minimum row width, in points, at which the manual-switch affordance is offered at all.
     ///
     /// Derived from the row's fixed columns at their tightest: 16 (row insets) + 8 (status dot) + 9 +
     /// 30 (monogram) + 9 + 64 (a label floor worth reading) + 6 (min spacer) + 60 (auth glyph + its
-    /// longest cue) + 27 (the slot plus its 9 pt spacing) ≈ 229, rounded up for breathing room. Below
-    /// this, the affordance is not merely hidden — the row is not interactive AT ALL, so a too-narrow row
-    /// can never degrade into an invisible whole-row hot-zone (the mis-click hazard hover-reveal exists to
-    /// prevent).
+    /// longest cue) + 37 (the #448-widened 28 pt slot plus its 9 pt spacing) ≈ 239 — kept at the round 240
+    /// floor (the shipped `defaultRowWidth` ≈ 364 clears it with ~125 pt to spare, so the +10 slot bump does
+    /// not press it). Below this, the affordance is not merely hidden — the row is not interactive AT ALL, so
+    /// a too-narrow row can never degrade into an invisible whole-row hot-zone (the mis-click hazard the
+    /// arm-on-hover guard exists to prevent: the chip is quiet and cursor-less at rest, armed only on hover).
     static let switchAffordanceMinRowWidth: Double = 240
 
     /// Whether a row of `rowWidth` points can host the manual-switch affordance without squeezing the
@@ -202,6 +210,35 @@ enum StatusPanelFormat {
 
     /// The width available to one roster row on the shipped fixed-width panel.
     static var defaultRowWidth: Double { panelContentWidth - 2 * rosterHorizontalInset }
+
+    // MARK: - Swap-chip emphasis (issue #448 — persistent-quiet, brightens when armed)
+
+    /// The per-row swap chip's emphasis level. #169 revealed the trailing swap glyph ONLY on hover, so on a
+    /// transient popover a first-time operator never saw a row was actionable. #448 makes it PERSISTENT: a
+    /// quiet, low-emphasis mark shown AT REST on every switch target, that BRIGHTENS when the row is armed
+    /// (hover / focus). The view maps each level to a neutral SYSTEM tint — `.resting` → `.tertiary`
+    /// (≈ the mock's `--text-3` decorative token), `.armed` → `.secondary` (≈ `--text-2`) — a SEMANTIC tint
+    /// step, never a hardcoded opacity (the #388 "tints/opacities live in the testable layer" discipline).
+    /// Neutral at every level, never `.tint`: the one accent action is the footer Swap (Von Restorff).
+    enum SwitchChipEmphasis: Equatable {
+        /// No chip — the active row / a dropped connection (the row is not a switch target), left pure data.
+        case hidden
+        /// Visible but quiet — the steady state on a switch target (viable OR wire-blocked; the glyph SHAPE,
+        /// arrow vs `nosign`, carries the block, not the emphasis).
+        case resting
+        /// Brightened — the row is armed (hovered / focused), inviting the press.
+        case armed
+    }
+
+    /// The chip emphasis for a row (issue #448). Kept HERE (not decided inline in the view) so the
+    /// resting-visible-vs-armed-brighten distinction is unit-asserted against the design intent rather than
+    /// buried in SwiftUI. `offersSwitch` is the view's own gate (a non-active row that fits the width);
+    /// `armed` is whether the row is currently hovered/focused. A non-target row is `.hidden`; a switch
+    /// target is `.resting` at rest and `.armed` once armed — the persistent-quiet → brighten behavior.
+    static func switchChipEmphasis(offersSwitch: Bool, armed: Bool) -> SwitchChipEmphasis {
+        guard offersSwitch else { return .hidden }
+        return armed ? .armed : .resting
+    }
 
     // MARK: - Swap phase copy (issue #169 — the in-flight / settled swap states)
 
@@ -388,6 +425,113 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Panel chrome fidelity tokens (#388 — theme-aware accent emphasis + neutral fills)
+    //
+    // The design mock (`apps/menubar/design/menubar-preview.html`) hand-tunes its accent-emphasis opacities
+    // and its neutral chrome fills PER THEME; the SwiftUI panel had them hardcoded to the LIGHT values,
+    // theme-invariant. Two washouts fell out of that:
+    //   * DARK accent emphasis (active row / dot halo / swap callout) rendered ~1.5–1.8× too faint — the
+    //     mock bumps these opacities in dark, the panel did not.
+    //   * Neutral fills routed through `Color.secondary.opacity(k)` washed out in BOTH themes: `.secondary`
+    //     is the LABEL family (base ~(60,60,67), already ~0.5 alpha), so `secondary.opacity(k)` renders at
+    //     ≈ half the mock's intended alpha AND over the wrong base hue (the mock's neutral fills are the
+    //     systemGray/white FILL family, base (120,120,128)/white).
+    // These pure, theme-parameterized tokens carry the mock's EXACT values into the testable layer, so the
+    // view stays a thin `@Environment(\.colorScheme)` consumer and every number is unit-asserted against the
+    // oracle (the panel cannot be screenshot-verified in CI; the `StatusPanelFormatTests` assertion is the
+    // gate). The accent HUE itself is NOT here — it stays `Color.accentColor`, pinned to the brand-blue
+    // `AccentColor` asset (#391, #007aff/#0a84ff), which already equals the mock's `--accent`; only the
+    // theme-variant ALPHA lives here.
+    //
+    // GUARDRAIL: never `Color.secondary.opacity(k)` a FILL. `.secondary` is a label-family (text) tint; a
+    // translucent neutral FILL must use `neutralFill` below — that mis-use IS the washout this fixes.
+    // `.secondary` stays correct for secondary TEXT and for the neutral (`.neutral`/unknown) tint role.
+
+    /// An accent-tinted emphasis SURFACE whose opacity the mock raises in dark mode. The accent hue is
+    /// `Color.accentColor` (brand-blue asset, #391); these cases name only the theme-variant alpha.
+    enum AccentEmphasis: Equatable {
+        /// The active row's accent-tint card fill — mock `--active-bg` (.08 light / .15 dark).
+        case activeRowFill
+        /// The active status dot's soft accent halo — mock `--accent-halo` (.20 light / .30 dark).
+        case activeDotHalo
+        /// The swap-callout hero card's accent-tint fill — mock `--accent-tint` (.10 light / .16 dark).
+        case swapCalloutFill
+        /// The swap-callout hero card's accent-tint hairline border — mock `--accent-tint-border`
+        /// (.20 light / .30 dark).
+        case swapCalloutBorder
+    }
+
+    /// The theme-aware opacity for an accent-emphasis surface, applied over `Color.accentColor`. `light` is
+    /// the mock's light-theme value (unchanged from what shipped — the panel was already correct in light);
+    /// `dark` raises it to the mock's dark value so the active row / swap callout read at the mock's intended
+    /// dark emphasis instead of the too-faint light value. Values are the mock's `--active-bg` /
+    /// `--accent-halo` / `--accent-tint` / `--accent-tint-border` alphas
+    /// (`apps/menubar/design/menubar-preview.html`).
+    static func accentOpacity(_ emphasis: AccentEmphasis, dark: Bool) -> Double {
+        switch emphasis {
+        case .activeRowFill:     return dark ? 0.15 : 0.08
+        case .activeDotHalo:     return dark ? 0.30 : 0.20
+        case .swapCalloutFill:   return dark ? 0.16 : 0.10
+        case .swapCalloutBorder: return dark ? 0.30 : 0.20
+        }
+    }
+
+    /// A translucent NEUTRAL fill role — the mock's gray-in-light / white-in-dark chrome fills, formerly
+    /// (mis-)rendered via `Color.secondary.opacity(k)` (the #388 washout). Distinct from the health/usage
+    /// TINT roles (`PanelTint`): those are semantic FOREGROUND tints on contrast-safe asset colorsets
+    /// (#406, Increase-Contrast-adaptive); these are DECORATIVE background fills (no text / WCAG 1.4.11
+    /// role — the glyph or content on top carries meaning), carried as exact sRGB values so they are
+    /// unit-testable in the asset-catalog-free logic-test bundle (`MenubarTests` compiles no `.xcassets`).
+    enum NeutralFillRole: Equatable {
+        /// The monogram badge + the header app-glyph badge — mock `--badge-bg`
+        /// (gray(120,120,128) .16 light / white .10 dark).
+        case badge
+        /// The usage-meter track — mock `--track` (gray(120,120,128) .22 light / white .14 dark).
+        case track
+        /// The capture card's background — mock `--card-bg` (gray(120,120,128) .08 light / white .05 dark).
+        case card
+    }
+
+    /// A resolved sRGB fill as raw components — the Foundation-only handle the SwiftUI view turns into a
+    /// `Color(.sRGB, …)`. Kept as NUMBERS (not a `Color`) so this layer stays AppKit/SwiftUI-free and the
+    /// values are directly unit-assertable against the mock (component-wise `Equatable`).
+    struct FillRGBA: Equatable {
+        let red: Double
+        let green: Double
+        let blue: Double
+        let alpha: Double
+    }
+
+    /// The theme-aware sRGB fill for a neutral role — the mock's exact `--badge-bg` / `--track` /
+    /// `--card-bg` values (`apps/menubar/design/menubar-preview.html`). The base is the mock's neutral FILL
+    /// family: systemGray (120,120,128) in light, white in dark, each at the mock's per-role alpha. The view
+    /// renders this as a PLAIN translucent fill (NOT routed through the panel material), so the source-over
+    /// composite matches the mock's rgba math.
+    static func neutralFill(_ role: NeutralFillRole, dark: Bool) -> FillRGBA {
+        // Mock neutral base: systemGray (120,120,128) in light, white in dark.
+        let base: (r: Double, g: Double, b: Double) = dark ? (1, 1, 1) : (120.0 / 255, 120.0 / 255, 128.0 / 255)
+        let alpha: Double
+        switch role {
+        case .badge: alpha = dark ? 0.10 : 0.16
+        case .track: alpha = dark ? 0.14 : 0.22
+        case .card:  alpha = dark ? 0.05 : 0.08
+        }
+        return FillRGBA(red: base.r, green: base.g, blue: base.b, alpha: alpha)
+    }
+
+    // MARK: - Active-row tag (issue #501 — neutral sentence-case capsule, mock `.tag`)
+
+    /// The roster active-row tag label. A calm NEUTRAL sentence-case capsule (mock `.tag`,
+    /// `apps/menubar/design/menubar-preview.html:243`) — `--badge-bg` fill + `--text-2` text, NO
+    /// border — reusing the same neutral `.badge` fill token (`neutralFill(.badge, …)`) as the
+    /// monogram badge. The tag is ONE of the row's THREE redundant "active" cues (filled accent dot +
+    /// this tag + accent-tint row fill), so active never rides on colour alone (WCAG 1.4.1 / R-2). It
+    /// is SENTENCE-CASE — NOT the letter-spaced uppercase "ACTIVE" that read as an accent web badge and,
+    /// as a second accent element beside the dot, re-inflated the active over-signalling #387 M5 reduced
+    /// (a same-hue accent-on-accent-tint pill also sank the label to ~3:1). On the neutral capsule the
+    /// label clears the WCAG 1.4.11 3:1 floor (≈4.1:1 light / ≈3.7:1 dark — asserted in `StatusPanelFormatTests`).
+    static let activeTagLabel = "Active"
+
     /// The full AUTH cell string, mirroring `src/cli.rs` `health_cell` BYTE-FOR-BYTE: the glyph, a
     /// PROVEN-DEAD account's `claude /login` cue and a `degraded` (quarantined-but-refreshable) one's
     /// needs-refresh `degradedCue` (issue #427) — each softened to `recovering` for a healing account
@@ -519,6 +663,17 @@ enum StatusPanelFormat {
             return Banner(title: "Data may be stale",
                           detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
                           kind: .warning)
+        case .reconnecting:
+            // The warm-dwell transient banner (#526): a routine drop still WITHIN the dwell — calmer than the
+            // escalated `.disconnected` (`.warning`, not `.error`) with self-resolving copy, so the panel matches
+            // the calm "…" glance the glyph shows during the dwell. Retains the last-known reading's age, like
+            // `.disconnected` / `.stale`, so the dimmed roster is honestly dated. The title already carries the
+            // "reconnecting" fact, so the detail complements it with the reading's provenance rather than
+            // echoing it (the sibling banners split title/detail the same way).
+            let base = "Showing last-known"
+            return Banner(title: "Reconnecting…",
+                          detail: ageText.map { "\(base) · \($0)." } ?? "\(base).",
+                          kind: .warning)
         case .disconnected:
             let base = "Reconnecting; showing last-known"
             return Banner(title: "Daemon not responding",
@@ -527,6 +682,28 @@ enum StatusPanelFormat {
         case .unsupported:
             return Banner(title: "Update required",
                           detail: "The daemon speaks a newer version this app can't read.",
+                          kind: .error)
+        case .crashLooping:
+            // The crash-loop FAULT banner (#169): a persistent fault shape that never renders healthy —
+            // the held snapshot's numbers are refused until the daemon stays up (the healthy-flash is
+            // debounced). Clock-free copy ("repeatedly", not "5× in the last minute") — the machine
+            // counts consecutive unstable reconnects, not wall-clock restarts.
+            return Banner(title: "Daemon crash-looping",
+                          detail: "Restarting repeatedly; holding status until it stays up.",
+                          kind: .error)
+        case .starting:
+            // The daemon-starting banner (#499): a transient, non-degraded "coming up" state — same weight
+            // as `.connecting` (`.info`). A STATIC message; the app fakes no progress it isn't doing.
+            return Banner(title: "Starting…",
+                          detail: "Waiting for the daemon to come up.",
+                          kind: .info)
+        case .notRunning:
+            // The not-running banner (#499): the daemon is absent, so numbers are not trustworthy
+            // (`.error`, like `.disconnected` / `.unsupported`). The Start-daemon affordance is #170
+            // (launch-at-login via SMAppService), deferred and signing-blocked — so the banner degrades
+            // to this inert explanatory line, with no button yet.
+            return Banner(title: "Daemon not running",
+                          detail: "The daemon isn't running.",
                           kind: .error)
         }
     }
@@ -641,6 +818,83 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - `canonical_scrub` banner (issue #469 — the fleet-wide scrubbed-canonical signal)
+
+    /// The honest-state BANNER for the daemon's `canonical_scrub` rollup (`WireModel.swift`
+    /// `CanonicalScrub`, wire #516), or `nil` when the shared canonical is healthy (the wire key is
+    /// absent → no banner, same single-cardinality as `nextSwapFooter(nil)`). The shared
+    /// `Claude Code-credentials` canonical item has been SCRUBBED — every `claude` session is logged
+    /// out — the fleet-wide lockout NO per-account `auth` cell reflects (each row can read perfectly
+    /// healthy while the shared item sits emptied), so no roster glyph carries it; only this daemon-level
+    /// banner does. The View renders it ABOVE the roster in the `.connected` / `.stale` body, so a
+    /// connected-but-scrubbed panel reads visibly DEGRADED (never healthy) while the live rows still show.
+    ///
+    /// Content-parity with the CLI's `shared login: scrubbed …` line (`src/cli.rs` `render_status`): the
+    /// SAME state and the SAME `claude /login` remedy, each medium phrasing it its own way (R-2
+    /// STATE-parity, as ADR-0016 did for `ActiveDeadNoTarget` / `nextSwapFooter`). `.exhausted` → an
+    /// `.error` banner naming the state AND the actionable remedy (the un-recoverable residual that needs
+    /// a re-login); `.recovering` → a calm `.info` banner with NO remedy (the daemon may self-heal by
+    /// adopting a live account, so a re-login prompt would cry wolf). A fleet-wide STATE discriminant
+    /// only — never per-account, never a token or email (issue #15). The remedy verb is the established
+    /// `claude /login` cue the dead-credential `authCell` already uses — deliberately, so the operator
+    /// meets ONE re-login verb.
+    static func canonicalScrubBanner(_ scrub: CanonicalScrub?) -> Banner? {
+        switch scrub {
+        case .exhausted:
+            return Banner(title: "Shared login scrubbed",
+                          detail: "Every session is logged out — run claude /login.",
+                          kind: .error)
+        case .recovering:
+            return Banner(title: "Shared login scrubbed",
+                          detail: "Recovering automatically — no action needed.",
+                          kind: .info)
+        case nil:
+            return nil
+        }
+    }
+
+    // MARK: - `keychain_locked` banner (issue #498 — the fleet-wide unreadable-credential signal)
+
+    /// The honest-state BANNER for the daemon's `keychain_locked` flag (`WireModel.swift`
+    /// `keychainLocked`, wire #521), or `nil` when the login keychain is unlocked (the wire key is absent
+    /// → no banner, same single-cardinality as `canonicalScrubBanner(nil)`). The macOS login keychain is
+    /// LOCKED, so the daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied)
+    /// — the fleet-wide unreadable-credential lockout NO per-account `auth` cell reflects (each row can
+    /// read perfectly healthy while the shared item sits unreadable), so no roster glyph carries it; only
+    /// this daemon-level banner does. The View renders it ABOVE the roster in the `.connected` / `.stale`
+    /// body, so a connected-but-locked panel reads visibly DEGRADED (never healthy) while the live rows
+    /// still show.
+    ///
+    /// The daemon-level SIBLING of `canonicalScrubBanner`, but for an UNREADABLE item rather than a
+    /// readable-but-scrubbed one — so the REMEDY DIFFERS: UNLOCK THE KEYCHAIN, never `claude /login` (a
+    /// re-login cannot help while the keychain that STORES the credential is locked). The design SSOT
+    /// (`design-menubar.md`, the 9-state map) calls this the "actionable shape, waiting for unlock".
+    /// Always an `.error` banner — a bare binary state with no calm/self-heal variant like the scrub's
+    /// `.recovering` (the daemon stays blocked until the operator unlocks). Content-parity with the CLI's
+    /// `shared login: unreadable …` line (`src/cli.rs` `render_status`): the SAME state and the SAME
+    /// unlock remedy, each medium phrasing it its own way (R-2 STATE-parity, as ADR-0016 did for
+    /// `ActiveDeadNoTarget`). A fleet-wide STATE discriminant only — never per-account, never a token or
+    /// email (issue #15).
+    static func keychainLockedBanner(_ locked: Bool) -> Banner? {
+        guard locked else { return nil }
+        return Banner(title: "Keychain locked",
+                      detail: "The login keychain is locked — unlock it to read the shared login.",
+                      kind: .error)
+    }
+
+    /// The single worst-first daemon-level fault banner for the `.connected` / `.stale` body — the panel
+    /// shows ONE banner even when multiple daemon-level faults are set. Priority: keychain-locked (#498)
+    /// OUTRANKS canonical-scrub (#469) — an UNREADABLE shared item (the daemon cannot read it at all) is
+    /// at least as severe as a readable-but-SCRUBBED one, and its remedy (unlock the keychain) must reach
+    /// the operator before the scrub's `claude /login`, which cannot help while the keychain is locked. In
+    /// practice the two are daemon-mutually-exclusive (a locked keychain can't be read to know
+    /// scrubbed-ness), so this is a deterministic tiebreak, not a common composite. `nil` when both are
+    /// healthy (no banner). Keeps the worst-first order a testable pure function rather than a `??` buried
+    /// in the View.
+    static func daemonFaultBanner(keychainLocked: Bool, scrub: CanonicalScrub?) -> Banner? {
+        keychainLockedBanner(keychainLocked) ?? canonicalScrubBanner(scrub)
+    }
+
     // MARK: - Header identity + swap callout (issue #355 — design-reference parity)
 
     /// The header's identity sub-line — the design reference's `app-sub` ("N accounts · {active}
@@ -655,9 +909,12 @@ enum StatusPanelFormat {
         let count = "\(accountCount) account\(plural)"
         switch state {
         case .connecting:   return "Connecting to the daemon…"
+        case .starting:     return "Connecting to the daemon…"   // #499: the "coming up" identity line (mock app-sub)
+        case .notRunning:   return "Daemon not running"          // #499: no last-known reading to age (never connected)
         case .emptyRoster:  return "Welcome"
         case .unsupported:  return "Version mismatch"
-        case .disconnected: return "\(count) · last-known"
+        case .crashLooping: return "Daemon fault"
+        case .disconnected, .reconnecting: return "\(count) · last-known"   // #526: both warm drops show the retained roster
         case .connected, .stale:
             let base = activeLabel.map { "\(count) · \($0) active" } ?? count
             let isStale: Bool = { if case .stale = state { return true } else { return ageStale } }()
@@ -753,5 +1010,400 @@ enum StatusPanelFormat {
             phrase = phrase.isEmpty ? "parked" : "\(phrase), parked"
         }
         return phrase
+    }
+
+    // MARK: - Stats tab (issue #446 — the mock's `.stats` view, fed by the #356 socket `stats` verb)
+    //
+    // Pure presentation over the decoded `StatsWire` (WireModel.swift), mirroring the design mock
+    // (`apps/menubar/design/menubar-preview.html` `.stats`) — so the SwiftUI `StatsView` stays a thin
+    // consumer and every number is unit-asserted against the oracle (the panel cannot be screenshot-verified
+    // in CI, exactly like the #388 chrome tokens above; the `StatusPanelFormatTests` assertion is the gate).
+
+    /// The Stats-tab header phrase for the resolved window — mock `.app-sub` "Usage stats · last 7 days" for
+    /// the panel's default `week` window. Derived from the wire's OWN window (not hardcoded), so a different
+    /// period reads honestly and the header never fabricates a phrase it did not query.
+    static func statsHeaderSubtitle(_ window: StatsWindow) -> String {
+        "Usage stats · \(statsWindowPhrase(window))"
+    }
+
+    /// The Stats-tab header shown BEFORE the wire's own window arrives (loading / failed / idle): the phrase
+    /// for the panel's fixed `week` query (`StatsCommand.period`). A `week`-window `statsHeaderSubtitle`
+    /// renders the identical string — `StatsTests.testDefaultHeaderSubtitleMatchesTheWeekWindowHeader` locks
+    /// the two together so this pre-load constant can never drift from the loaded-window header.
+    static let statsDefaultHeaderSubtitle = "Usage stats · last 7 days"
+
+    /// The compact window phrase for the Stats header / aggregate callout. The preset periods read as the
+    /// mock's spelled-out spans; a `--since` window falls back to its raw offset, and anything else to the
+    /// wire's own human echo — never an invented span.
+    static func statsWindowPhrase(_ window: StatsWindow) -> String {
+        switch window.period {
+        case "day": return "last 24h"
+        case "week": return "last 7 days"
+        case "month": return "last 30 days"
+        case "lifetime": return "all time"
+        default:
+            if let since = window.since { return "since \(since)" }
+            return window.label
+        }
+    }
+
+    /// A quota fraction (0…1, the `StatsDim` wire scale) as a whole percent — the stats analogue of the CLI's
+    /// `pct` (`src/stats.rs`), which rounds `fraction × 100`. Clamped at the floor so a tiny negative never
+    /// prints; NOT clamped at the top (an over-cap peak legitimately reads > 100%).
+    static func statsPercent(_ fraction: Double) -> Int {
+        Int((max(0, fraction) * 100).rounded())
+    }
+
+    /// The Stats row's "Session m/pk" cell — mean then peak, mock `.sc-val` "42 / 100%" (the mean bare, the
+    /// peak carrying the single trailing `%`).
+    static func statsSessionMeanPeak(_ account: StatsAccountStats) -> String {
+        "\(statsPercent(account.session.mean)) / \(statsPercent(account.session.peak))%"
+    }
+
+    /// The Stats row's "Weekly pk" cell — the weekly peak percent, mock `.sc-val` "88%".
+    static func statsWeeklyPeak(_ account: StatsAccountStats) -> String {
+        "\(statsPercent(account.weekly.peak))%"
+    }
+
+    /// The honest one-line message the Stats tab shows when the query did not yield a series — never a blank
+    /// tab, never a fabricated number (the crown-jewel honesty rule, applied to the read-only Stats surface).
+    static func statsFailureText(_ failure: StatsFailure) -> String {
+        switch failure {
+        case .unavailable:
+            return "Usage stats unavailable — the daemon socket didn't resolve."
+        case .transport:
+            return "Couldn't reach the daemon for usage stats."
+        case .daemonError(let reason):
+            return "Usage stats error: \(reason)."
+        case .undecodable:
+            return "Usage stats came back in an unreadable form."
+        }
+    }
+
+    /// The neutral three-way utilisation signal the mock's `.signal` pill shows, collapsed from the wire's
+    /// finer `band` EXACTLY as the CLI does (`src/stats.rs` `SignalBand::of`): idle/low → underused,
+    /// moderate → balanced, high/at-cap → saturated. A DESCRIPTOR (equal-weight departures from the balanced
+    /// middle), never a recommendation — the Stats tab is read-only.
+    enum StatSignal: Equatable {
+        case underused
+        case balanced
+        case saturated
+
+        /// The provisional descriptor word (mock `.signal` label; final copy pending #160's framing review).
+        var label: String {
+            switch self {
+            case .underused: return "underused"
+            case .balanced: return "balanced"
+            case .saturated: return "saturated"
+            }
+        }
+    }
+
+    /// Collapse a wire `band` into the mock's three-way signal (see `StatSignal`).
+    static func statsSignal(_ band: StatsBand) -> StatSignal {
+        switch band {
+        case .idle, .low: return .underused
+        case .moderate: return .balanced
+        case .high, .atCap: return .saturated
+        }
+    }
+
+    /// The aggregate callout under the Stats rows — mock `.agg` "All accounts ≥90% at once — 3 episodes
+    /// (1h40m) · swaps 28 · last 7 days", built from the summary `roster` (`StatsRoster`) + the window phrase.
+    /// Facts only (magnitudes + the neutral span), never a recommendation.
+    static func statsAggregateText(roster: StatsRoster, window: StatsWindow) -> String {
+        let episodes = roster.allHighEpisodes
+        let epWord = episodes == 1 ? "episode" : "episodes"
+        return "All accounts ≥90% at once — \(episodes) \(epWord) (\(statsDuration(roster.allHighSecs)))"
+            + " · swaps \(roster.swapCount) · \(statsWindowPhrase(window))"
+    }
+
+    /// A whole-second span as the compact coarse duration the aggregate callout uses — the two-largest-unit
+    /// form mirroring the CLI's `fmt_dur` (`src/stats.rs`): `1h40m` / `1h` / `40m` / `30s`; a non-positive
+    /// span is `0s`. Distinct from `humanizeUntil` (the reset-in cell, which reads `now` / `<1m`).
+    static func statsDuration(_ secs: Int64) -> String {
+        if secs <= 0 { return "0s" }
+        let hour: Int64 = 3600
+        let hours = secs / hour
+        let mins = (secs % hour) / 60
+        let s = secs % 60
+        if hours > 0 {
+            return mins > 0 ? "\(hours)h\(mins)m" : "\(hours)h"
+        } else if mins > 0 {
+            return "\(mins)m"
+        } else {
+            return "\(s)s"
+        }
+    }
+
+    // MARK: - Stats sparkline geometry (issue #446 — R-2 parity with the CLI trend sparkline)
+
+    /// One sparkline vertex in the SVG-style box, as raw `Double`s (Foundation-only, so it stays in the
+    /// logic-test bundle and is component-wise `Equatable`-testable). The view maps these to `CGPoint`s.
+    struct SparkPoint: Equatable {
+        let x: Double
+        let y: Double
+    }
+
+    /// The per-bucket session-peak series for `handle`, in bucket order — the CLI trend sparkline's pick
+    /// (`src/stats.rs`: "the per-bucket session peak — the sparkline 'how hot did it get' pick"). A bucket
+    /// with no reading for the handle plots at the floor (`0`), honestly — the aggregator never invents a
+    /// reading, and neither does this: an unmeasured bucket is a real low, not a gap the sparkline hides.
+    static func sparkSeries(_ series: [StatsBucket], handle: String) -> [Double] {
+        series.map { $0.accounts[handle]?.session.peak ?? 0 }
+    }
+
+    /// Map a value series to sparkline vertices in a `width` × `height` box, on the FIXED [0, 1] (0–100% of
+    /// the quota cap) scale — R-2 parity with the CLI sparkline (`src/stats.rs` `ramp_level`, which clamps to
+    /// `[0, 1]`), NOT auto-normalised per account: a value of `1.0` reaches the top, `0.0` the floor, an
+    /// over-cap reading clamps to the top. `inset` keeps the stroke off the edges; with the mock's box
+    /// (96 × 28, inset 3) this reproduces the mock's `.spark` path vertices exactly. `x` is evenly spaced
+    /// across the plot; a single-point series centres. An empty series yields no points.
+    static func sparkPoints(
+        _ values: [Double],
+        width: Double,
+        height: Double,
+        inset: Double
+    ) -> [SparkPoint] {
+        guard !values.isEmpty else { return [] }
+        let left = inset, right = width - inset
+        let top = inset, bottom = height - inset
+        let n = values.count
+        return values.enumerated().map { index, value in
+            let x = n == 1 ? (left + right) / 2 : left + Double(index) / Double(n - 1) * (right - left)
+            let clamped = min(1, max(0, value))
+            let y = bottom - clamped * (bottom - top)
+            return SparkPoint(x: x, y: y)
+        }
+    }
+
+    /// The Stats rows, ORDERED to match the Status roster (so the two tabs list accounts identically), with
+    /// any stats-only handle (present in the window but not the live roster — normally none, the daemon splits
+    /// orphans out) appended alphabetically. Pure over the two key sets, so the view's roster join is testable
+    /// without SwiftUI. Handles NOT in `summaryHandles` (a roster account with no reading this window) are
+    /// omitted — the Stats view shows what was MEASURED, matching the CLI summary.
+    static func orderedStatHandles(summaryHandles: Set<String>, rosterOrder: [String]) -> [String] {
+        var out: [String] = []
+        var placed: Set<String> = []
+        for label in rosterOrder where summaryHandles.contains(label) {
+            out.append(label)
+            placed.insert(label)
+        }
+        for handle in summaryHandles.sorted() where !placed.contains(handle) {
+            out.append(handle)
+        }
+        return out
+    }
+
+    // MARK: - Stats color tokens (issue #446 — mock `--spark` + `--sig-*`, theme-aware, unit-testable)
+
+    /// The sparkline stroke / area / end-dot color — mock `--spark` (`rgba(60,60,67,.55)` light /
+    /// `rgba(235,235,245,.5)` dark), the secondary-label neutral graphic tint. Carried as an exact `FillRGBA`
+    /// (like the #388 neutral fills) so it is unit-assertable in the asset-catalog-free logic bundle; the view
+    /// renders the line/dot at this alpha and the area at a fraction of it (mock `.sp-area { fill-opacity:.2 }`).
+    /// Its OWN label-family base (60,60,67)/(235,235,245) — distinct from the (120,120,128)/white chrome-fill
+    /// family (`neutralFill`) — so it is a separate token, not a `NeutralFillRole` case.
+    static func sparkColor(dark: Bool) -> FillRGBA {
+        dark
+            ? FillRGBA(red: 235.0 / 255, green: 235.0 / 255, blue: 245.0 / 255, alpha: 0.5)
+            : FillRGBA(red: 60.0 / 255, green: 60.0 / 255, blue: 67.0 / 255, alpha: 0.55)
+    }
+
+    /// The signal pill's background FILL — mock `--sig-under-bg` / `--sig-bal-bg` / `--sig-sat-bg`, per theme.
+    static func statsSignalFill(_ signal: StatSignal, dark: Bool) -> FillRGBA {
+        switch (signal, dark) {
+        case (.underused, false): return FillRGBA(red: 0, green: 122.0 / 255, blue: 255.0 / 255, alpha: 0.12)
+        case (.underused, true): return FillRGBA(red: 64.0 / 255, green: 140.0 / 255, blue: 230.0 / 255, alpha: 0.20)
+        case (.balanced, false): return FillRGBA(red: 30.0 / 255, green: 150.0 / 255, blue: 105.0 / 255, alpha: 0.13)
+        case (.balanced, true): return FillRGBA(red: 50.0 / 255, green: 180.0 / 255, blue: 130.0 / 255, alpha: 0.18)
+        case (.saturated, false): return FillRGBA(red: 178.0 / 255, green: 120.0 / 255, blue: 20.0 / 255, alpha: 0.15)
+        case (.saturated, true): return FillRGBA(red: 210.0 / 255, green: 160.0 / 255, blue: 80.0 / 255, alpha: 0.20)
+        }
+    }
+
+    /// The signal pill's foreground (label + dot) color — mock `--sig-under-fg` / `--sig-bal-fg` /
+    /// `--sig-sat-fg`, per theme. Opaque (alpha 1); it carries text, so — unlike the decorative bg fill — it
+    /// is the readable channel.
+    static func statsSignalText(_ signal: StatSignal, dark: Bool) -> FillRGBA {
+        switch (signal, dark) {
+        case (.underused, false): return FillRGBA(red: 38.0 / 255, green: 104.0 / 255, blue: 189.0 / 255, alpha: 1)
+        case (.underused, true): return FillRGBA(red: 130.0 / 255, green: 179.0 / 255, blue: 237.0 / 255, alpha: 1)
+        case (.balanced, false): return FillRGBA(red: 28.0 / 255, green: 138.0 / 255, blue: 95.0 / 255, alpha: 1)
+        case (.balanced, true): return FillRGBA(red: 96.0 / 255, green: 207.0 / 255, blue: 161.0 / 255, alpha: 1)
+        case (.saturated, false): return FillRGBA(red: 150.0 / 255, green: 102.0 / 255, blue: 17.0 / 255, alpha: 1)
+        case (.saturated, true): return FillRGBA(red: 224.0 / 255, green: 178.0 / 255, blue: 104.0 / 255, alpha: 1)
+        }
+    }
+
+    // MARK: - Account identity disambiguation kit (issue #445 — per-account color + smart monogram)
+    //
+    // A roster of same-local-part accounts (`work-alice`, `work-bob`, …) collapses the panel's identity
+    // cues: every MonogramBadge shows the same first letter and tail-truncation hides the one distinguishing
+    // part of each label. This restores distinguishability with THREE cues, none alone sufficient (WCAG
+    // 1.4.1 — color is NEVER the sole signal, always paired with the monogram + the label text): a per-account
+    // COLOR, a smart 2-char MONOGRAM from the distinguishing token, and MIDDLE-truncation (the last is a view-
+    // layer `.truncationMode` change; the two below are the testable pure core).
+    //
+    // IDENTITY HANDLE = `label` (issue #15 / R-2). The AC says "seed the color from the on-wire
+    // `account_uuid`", but `account_uuid` is NOT on the status wire: `AccountStatusLine` (`snapshot.rs` /
+    // `WireModel.swift`) carries `label` as the ONE identity handle and never a uuid, and no uuid rides any
+    // wire golden. Seeding from `label` keeps the AC's "no wire change" TRUE and honors R-2 (one handle,
+    // rendered per-medium — the handle IS `label`). Trade-off accepted: the color re-derives if the operator
+    // renames the label — fine for a disambiguation AID (rename is rare; the color is never the sole cue).
+
+    /// A resolved fill helper — an opaque sRGB `FillRGBA` from 0…255 components (like the mock's hex values).
+    private static func accountRGB(_ red: Double, _ green: Double, _ blue: Double) -> FillRGBA {
+        FillRGBA(red: red / 255, green: green / 255, blue: blue / 255, alpha: 1)
+    }
+
+    /// The per-account badge FILL palette (issue #445) — 8 LOW-CHROMA, colorblind-considerate hues (they vary
+    /// in luminance as well as hue, so the cue survives color-vision deficiency), the active/accent blue hue
+    /// EXCLUDED. Per theme the fill inverts to stay high-contrast on the panel: LIGHT is a muted mid-DARK tone
+    /// (a near-white monogram reads on it, and it clears the near-white panel); DARK is a muted mid-LIGHT tone
+    /// (a near-black monogram reads on it, and it clears the near-black panel). Exact sRGB so
+    /// `StatusPanelFormatTests` can assert WCAG-AA against the panel reference base. NEUTRAL by construction
+    /// (#173): a muted identity hue, never a vivid provider brand color.
+    private static let accountFillPalette: [(light: FillRGBA, dark: FillRGBA)] = [
+        (accountRGB(78,  64, 112), accountRGB(190, 176, 216)),  // violet
+        (accountRGB(100, 60, 112), accountRGB(206, 172, 214)),  // purple
+        (accountRGB(116, 58,  98), accountRGB(218, 168, 200)),  // magenta
+        (accountRGB(122, 56,  66), accountRGB(226, 168, 174)),  // rose
+        (accountRGB(122, 74,  46), accountRGB(226, 182, 150)),  // clay
+        (accountRGB(98,  80,  38), accountRGB(210, 190, 138)),  // ochre
+        (accountRGB(64,  92,  50), accountRGB(176, 202, 156)),  // moss
+        (accountRGB(38,  96,  88), accountRGB(148, 204, 194)),  // teal
+    ]
+
+    /// The number of palette slots — the modulus of the color hash, exposed for the palette tests.
+    static var accountColorCount: Int { accountFillPalette.count }
+
+    /// The palette index for a label (issue #445) — a STABLE, deterministic FNV-1a hash of the trimmed label
+    /// mod the palette size. Deliberately NOT Swift's `Hasher`/`hashValue`, which is per-process RANDOMIZED
+    /// (it would reshuffle every account's color on each launch and defeat any test); FNV-1a is a fixed
+    /// function, so an account keeps its color across launches and the mapping is unit-assertable.
+    static func accountColorIndex(for label: String) -> Int {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        var hash: UInt32 = 2_166_136_261
+        for byte in trimmed.utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16_777_619
+        }
+        return Int(hash % UInt32(accountFillPalette.count))
+    }
+
+    /// The badge FILL for a label + theme (issue #445) — the label-seeded palette hue.
+    static func accountBadgeFill(for label: String, dark: Bool) -> FillRGBA {
+        let slot = accountFillPalette[accountColorIndex(for: label)]
+        return dark ? slot.dark : slot.light
+    }
+
+    /// The account MONOGRAM glyph color for a theme (issue #445) — a high-contrast neutral (near-white in
+    /// light, near-black in dark) that carries the 2-char monogram ON the badge fill (the opaque fill is the
+    /// glyph's real background). Theme-uniform across the palette; the per-account HUE lives in the FILL, so
+    /// the glyph itself stays neutral and legible on every slot in both themes (asserted ≥ 4.5:1 in tests).
+    static func accountMonogramColor(dark: Bool) -> FillRGBA {
+        dark ? accountRGB(28, 28, 30) : accountRGB(245, 245, 247)
+    }
+
+    /// A roster-aware map of `label` → 2-char MONOGRAM (issue #445). Derived from the label's DISTINGUISHING
+    /// token — NOT `label.first`, which collapses a same-local-part roster (`work-alice`, `work-bob`, … all →
+    /// "W"). Collision-ESCALATING: assigned greedily in roster order, each label taking its most-distinguishing
+    /// FREE candidate, so two similar labels never collapse to the same pair — the resolved set is fully
+    /// DISTINCT for distinct labels. A single-token short label degenerates to its first two chars ("Work" →
+    /// "WO"); a lone character is itself ("x" → "X"); an empty/whitespace label is "?".
+    static func accountMonograms(_ labels: [String]) -> [String: String] {
+        var result: [String: String] = [:]
+        var used: Set<String> = []
+        for label in labels {
+            if result[label] != nil { continue }   // a duplicate label resolves once to the same monogram
+            let candidate = monogramCandidates(label).first { !used.contains($0) }
+                ?? uniqueMonogramFallback(label, used: used)
+            result[label] = candidate
+            used.insert(candidate)
+        }
+        return result
+    }
+
+    /// The ordered candidate monograms for a label, most-distinguishing first (issue #445): the FIRST token's
+    /// initial paired with the LAST token's initial (`work-alice` → "WA" — the same-local-part case the kit
+    /// targets), then first⋅second, then the identity-initial paired with each later char of the collapsed
+    /// string (keeps the leading letter while escalating), then each token's own leading pair, then the
+    /// collapsed leading pair. All 2-char, uppercased, de-duplicated; a lone char / empty label falls to a
+    /// 1-char / "?" tail so `accountMonograms` always has a non-empty seed.
+    private static func monogramCandidates(_ label: String) -> [String] {
+        let tokens = monogramTokens(label)
+        let collapsed = tokens.joined()
+        var out: [String] = []
+        func push(_ s: String) {
+            if s.count == 2 && !out.contains(s) { out.append(s) }
+        }
+        if tokens.count >= 2 {
+            push(monogramInitial(tokens[0]) + monogramInitial(tokens[tokens.count - 1]))  // first ⋅ last
+            push(monogramInitial(tokens[0]) + monogramInitial(tokens[1]))                 // first ⋅ second
+        }
+        if let first = collapsed.first {
+            let lead = String(first).uppercased()
+            for ch in collapsed.dropFirst() {                                             // first ⋅ each later char
+                push(lead + String(ch).uppercased())
+            }
+        }
+        for token in tokens.reversed() { push(monogramLeadingPair(token)) }               // each token's own pair
+        push(monogramLeadingPair(collapsed))
+        if out.isEmpty {
+            out.append(collapsed.first.map { String($0).uppercased() } ?? "?")            // lone char / empty
+        }
+        return out
+    }
+
+    /// Split a label into alphanumeric tokens (issue #445) — separators are any non-alphanumeric PLUS the
+    /// lowercase→uppercase and letter↔digit boundaries, so `work-alice`, `work.alice`, `workAlice`, and
+    /// `work1` all tokenize to their parts. Empty runs are dropped.
+    private static func monogramTokens(_ label: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var previous: Character?
+        for ch in label {
+            guard ch.isLetter || ch.isNumber else {
+                if !current.isEmpty { tokens.append(current); current = "" }
+                previous = nil
+                continue
+            }
+            if let prev = previous, monogramIsBoundary(prev, ch), !current.isEmpty {
+                tokens.append(current); current = ""
+            }
+            current.append(ch)
+            previous = ch
+        }
+        if !current.isEmpty { tokens.append(current) }
+        return tokens
+    }
+
+    /// A camelCase / letter↔digit split point — the boundaries `monogramTokens` cuts on (beyond punctuation).
+    private static func monogramIsBoundary(_ a: Character, _ b: Character) -> Bool {
+        if a.isLowercase && b.isUppercase { return true }
+        if a.isLetter && b.isNumber { return true }
+        if a.isNumber && b.isLetter { return true }
+        return false
+    }
+
+    /// A token's first character, uppercased (empty for an empty token — never passed one).
+    private static func monogramInitial(_ token: String) -> String {
+        token.first.map { String($0).uppercased() } ?? ""
+    }
+
+    /// A token's leading two characters, uppercased — a 1-char token yields a 1-char string that
+    /// `monogramCandidates` skips (candidates must be 2 chars), so it never emits a half-pair.
+    private static func monogramLeadingPair(_ token: String) -> String {
+        String(token.prefix(2)).uppercased()
+    }
+
+    /// A guaranteed-UNIQUE monogram when every derived candidate is already taken (issue #445) — the first
+    /// alnum char paired with a digit, then the bare char, then a "?"-series. Rarely reached (the candidate
+    /// walk resolves realistic rosters), it exists so full distinctness is an INVARIANT, not a hope.
+    private static func uniqueMonogramFallback(_ label: String, used: Set<String>) -> String {
+        let base = monogramTokens(label).joined().first.map { String($0).uppercased() } ?? "?"
+        for n in 2...9 where !used.contains(base + String(n)) { return base + String(n) }
+        if !used.contains(base) { return base }
+        for n in 1...99 where !used.contains("?" + String(n)) { return "?" + String(n) }
+        return "?"
     }
 }

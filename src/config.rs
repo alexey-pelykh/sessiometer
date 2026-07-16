@@ -19,12 +19,12 @@
 //! keychain stash name is derived from `account_uuid`, not stored (issue #70).
 //! Error messages quote only those non-secret fields.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml_writer::{ToTomlValue, TomlStringBuilder};
 
 use crate::error::{Error, Result};
@@ -46,6 +46,30 @@ const DEFAULT_POLL_SECS: u64 = 300;
 /// (and successive cycles) decorrelate over a ~1–3 min spread rather than clustering
 /// within ~±30 s of the 5 min mark.
 const DEFAULT_POLL_JITTER_STDDEV: f64 = 60.0;
+/// Default `exhausted_poll_secs` (issue #537): the WIDENED poll cadence applied to an
+/// out-of-rotation (weekly- or session-exhausted) NON-active peer. Such a peer's usage
+/// number can only change when its server-side window resets (a time the daemon already
+/// knows — `weekly_resets_at` / `session_resets_at`) or on a RARE out-of-band server reset,
+/// so re-polling it every `poll_secs` is a wasted request each cycle. One hour is the
+/// worst-case blindness ceiling for the rare early reset; the daemon pulls the next poll
+/// EARLIER when a known `resets_at` lands sooner (see [`crate::daemon`]'s exhaustion window).
+/// Deliberately the same 3600 s as [`DEFAULT_REFRESH_CADENCE_SECS`] — an hour is the crate's
+/// standard "slow background" cadence.
+const DEFAULT_EXHAUSTED_POLL_SECS: u64 = 3600;
+/// Default `near_limit_poll_secs` (issue #540): the TIGHTENED poll sub-interval (the per-tick
+/// spacing) applied to the ACTIVE account while its reading — or the #539 projection — is in the
+/// near-limit band. The OPPOSITE direction of [`DEFAULT_EXHAUSTED_POLL_SECS`] (which WIDENS an
+/// exhausted peer): near-limit, the active is the one account that can climb to its limit WHILE
+/// active, so its poll cadence is tightened so no long gap opens on the final stretch (the poll-gap
+/// residual #363/#538 named). Applied as `min(poll_secs / N, near_limit_poll_secs)`, so via the
+/// #366 active-interleave (which re-observes the active every ~2 sub-intervals) the active is
+/// re-polled within ~`2 × near_limit_poll_secs` = ~120 s near-limit — inside the ratified 60-150 s
+/// active band. Bounded BELOW the band: it only engages when the active is in/approaching the band,
+/// so the steady-state (below-band) cadence — and the source-scoped 429 footprint the fixed
+/// `poll_secs` protects — is unchanged. 60 s keeps the tightened tick at/above the ~50 s
+/// observed-safe spacing (the D-LAT-2 finding); `0` disables the path (the kill-switch, like
+/// `session_velocity_horizon_secs`).
+const DEFAULT_NEAR_LIMIT_POLL_SECS: u64 = 60;
 /// Default seconds to wait after a swap before another is allowed.
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
 /// The NON-ZERO floor for `cooldown_secs` (issue #272): the smallest interval, in
@@ -72,11 +96,11 @@ pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
 const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
 /// Default `session_trigger` percent.
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
-/// Default `target_max_usage` percent (issue #398): the default-on swap-target
+/// Default `target_max_session_usage` percent (issue #398): the default-on swap-target
 /// reserve — only swap TO an account whose session usage is below this. Sits
 /// below `session_trigger` so a swapped-to target keeps runway before the next
 /// poll; supersedes #10's opt-in (an absent key now means this, not "off").
-const DEFAULT_TARGET_MAX_USAGE: u8 = 80;
+const DEFAULT_TARGET_MAX_SESSION_USAGE: u8 = 80;
 /// Default `weekly_trigger` percent — separate from and higher than
 /// `session_trigger` (issue #41): the weekly window is the longer, harder limit,
 /// so the active account is allowed closer to full on it before a swap-away.
@@ -86,6 +110,42 @@ const DEFAULT_MONITOR_401_N: u8 = 3;
 /// Default consecutive recovery-probe successes before a quarantined (dead)
 /// account is restored to the rotation (issue #42).
 const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
+/// Default `session_blind_swap_secs` (issue #452, ADR-0017): the interim `T` for the
+/// bounded-blindness preemptive-swap gate — the active account's retained pre-blind
+/// anchor must be stale beyond this before the gate turns eligible. 300 s is roughly
+/// three consecutive active 429s under the #453 active-poll backoff cap (120 s), i.e.
+/// genuinely stuck (confirmed by the #451 replay). Setting the tunable to its 86400 s
+/// ceiling (24 h, far beyond any real blind window) disables the path — the kill-switch.
+const DEFAULT_SESSION_BLIND_SWAP_SECS: u64 = 300;
+/// Default `session_blind_risk_band` percent (issue #452, ADR-0017): the retained
+/// pre-blind anchor (`last_good`, #450) must be at/over this for the preemptive gate to
+/// arm. Deliberately LOWER than `session_trigger` — the gate acts preemptively on a
+/// stale anchor, before the account would trip the reactive trigger. 60 is the low end
+/// of the conservative 60-to-65 band #484 ratified: the #451 replay is flat from 68 %
+/// down to 50 %, so the data bounds only the ceiling and the fire-early-is-cheaper
+/// asymmetry (a late swap hits the wall on an unattended run; an early one only spends a
+/// recoverable-target swap) picks the low end.
+const DEFAULT_SESSION_BLIND_RISK_BAND: u8 = 60;
+/// Default `session_velocity_horizon_secs` (issue #539, ADR-0017): the projection horizon `H`
+/// (seconds) for the velocity-projection preemptive trigger — the active account swaps away when
+/// its PROJECTED session usage (`last + velocity × H`) crosses the trigger, before the observed
+/// reading does. 120 s ≈ one active poll interval (the post-#366 interleave cadence, NOT the
+/// `poll_secs=300` peer cadence), the horizon the #538 spike validated on 22,022 real samples
+/// (P50=94 / P100=98 covered-swap, 0 over-fire at H ≤ 150 s). Setting it to `0` disables the path
+/// — the projection reduces to `last`, which never crosses (the reactive path already held) — the
+/// kill-switch.
+const DEFAULT_SESSION_VELOCITY_HORIZON_SECS: u64 = 120;
+/// Default `session_velocity_min_project_above` percent (issue #539, ADR-0017): the projective
+/// trigger only projects when the observed session reading is at/over this. The #538 spike's FREE
+/// guard — projection can't reach below it anyway (max reach ≤ 14 pp at H ≤ 150 s) — so it costs no
+/// benefit while excluding spurious low-usage projections. Conventionally BELOW `session_trigger`
+/// (the projection fires in the band beneath the reactive trigger).
+const DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE: u8 = 85;
+/// Default `session_velocity_ema_alpha_pct` (issue #539, ADR-0017): the EMA smoothing weight α
+/// (percent) applied to the per-account session-velocity signal (#399) — `ema = α·instant +
+/// (1-α)·prev` — to damp a single-interval velocity spike so the projection keys off SUSTAINED
+/// motion. α ≈ 0.5 (the #538-validated value); 100 means no smoothing (raw last-interval velocity).
+const DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT: u8 = 50;
 
 /// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
 /// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
@@ -236,6 +296,32 @@ pub(crate) struct Tunables {
     /// per `poll_secs / N` sub-interval (issue #80), so a roster of N accounts is swept
     /// once per `poll_secs` without bursting all N requests at once.
     pub(crate) poll_secs: u64,
+    /// Widened re-poll cadence, in seconds, for an out-of-rotation (weekly- or
+    /// session-exhausted) NON-active peer (issue #537): `poll_secs..=86400`, default 3600
+    /// (one hour). Such a peer's usage can only change on a server-side window reset (a
+    /// time the daemon already knows via `resets_at`) or a RARE out-of-band reset, so
+    /// re-polling it every `poll_secs` wastes a request each cycle. This is the CEILING of
+    /// its slow-poll window; a known `resets_at` sooner than this pulls the next poll
+    /// earlier (see [`crate::daemon`]). The lower bound is `poll_secs` (a slow-polled peer
+    /// must never re-poll FASTER than the normal cadence); the ACTIVE account is EXEMPT (its
+    /// swap-away trigger must stay observable). Distinct from the rate-limit back-off
+    /// (`poll_backoff_until`, ADR-0009), which is armed by 429/5xx and cleared on any
+    /// success — an exhausted account is an HTTP-200 success, so it needs its own window.
+    pub(crate) exhausted_poll_secs: u64,
+    /// Tightened re-poll sub-interval, in seconds, for the ACTIVE account while its reading (or the
+    /// #539 velocity projection) is in the near-limit band (issue #540): `0` or `5..=3600`, default
+    /// 60. The near-limit-scoped MIRROR of `exhausted_poll_secs` — where that WIDENS an exhausted
+    /// peer's cadence, this TIGHTENS the active account's on its final climb to the limit, so no
+    /// long poll gap opens while it is near the limit (the poll-gap half of #363's residual, split
+    /// from #539's projection per the #538 spike). Applied as `min(poll_secs / N, near_limit_poll_secs)`,
+    /// so with the #366 active-interleave the active is re-observed within ~`2 ×` this near-limit.
+    /// It ONLY engages while the active is in/approaching the band (keyed off the SAME signals #539
+    /// uses — last reading + `usage_velocity`); BELOW the band the sub-interval is the unchanged
+    /// `poll_secs / N`, so the steady-state 429 footprint stays flat. ACTIVE-account only (the
+    /// #453 active-vs-peer asymmetry); a peer being near-limit does nothing. `0` disables the path
+    /// (the kill-switch). A value above the base sub-interval is inert (the `min` never binds), not
+    /// an error, so no cross-field bound to `poll_secs`.
+    pub(crate) near_limit_poll_secs: u64,
     /// Seconds to wait after a swap before another is allowed
     /// (`COOLDOWN_SECS_FLOOR..=3600` — a non-zero floor, #272). Consumed by the
     /// cooldown logic (#10 / #11).
@@ -245,12 +331,12 @@ pub(crate) struct Tunables {
     /// to receive the active session — only swap *to* an account whose session usage
     /// is below this percent (`1..=session_trigger`; an explicit `0` admits no target
     /// and is rejected), so a freshly-swapped target keeps runway before the next
-    /// poll. Always valued — an absent key means [`DEFAULT_TARGET_MAX_USAGE`], not
+    /// poll. Always valued — an absent key means [`DEFAULT_TARGET_MAX_SESSION_USAGE`], not
     /// "off" (this supersedes #10's opt-in `Option`). Raise it toward `session_trigger`
     /// to admit busier targets (equal is inert); the always-on session gate
     /// (`session < session_trigger`, [`crate::daemon`]) still prevents oscillation
     /// independently.
-    pub(crate) target_max_usage: u8,
+    pub(crate) target_max_session_usage: u8,
     /// Swap *away* from the active account at or above this session percent
     /// (`50..=99`).
     pub(crate) session_trigger: u8,
@@ -259,6 +345,33 @@ pub(crate) struct Tunables {
     /// Separate from `session_trigger` (no cross-field constraint), typically set
     /// higher; the daemon swaps when EITHER dimension reaches its own trigger.
     pub(crate) weekly_trigger: u8,
+    /// Bounded-blindness preemptive-swap gate threshold `T` (issue #452, ADR-0017), in
+    /// seconds: the active account's retained pre-blind anchor (`last_good`, #450) must
+    /// be stale beyond this before the gate arms. Promoted from the interim
+    /// `BLIND_GATE_SECS` daemon constant (SLI-only until #452). A value at the validated
+    /// 86400 ceiling disables the path (no blind window runs that long) — the kill-switch.
+    pub(crate) session_blind_swap_secs: u64,
+    /// Bounded-blindness preemptive-swap `risk_band` (issue #452, ADR-0017), as a
+    /// session-usage percent: the pre-blind anchor must be at/over this for the gate to
+    /// arm. Promoted from the interim `BLIND_GATE_RISK_BAND` daemon constant; DISTINCT
+    /// from and biased below `session_trigger` (the gate acts preemptively on a stale
+    /// anchor). Conservative 60 by default (#484).
+    pub(crate) session_blind_risk_band: u8,
+    /// Velocity-projection preemptive-trigger horizon `H` (issue #539, ADR-0017), in seconds:
+    /// the active account swaps away when its PROJECTED session usage (`last + velocity × H`,
+    /// keyed off the #399 usage-velocity signal) crosses the trigger, before the observed reading
+    /// does — closing the OBSERVED reactive overshoot (#363) #452's blind-window path does not.
+    /// `0` disables the path (projection reduces to `last`, never crosses) — the kill-switch.
+    pub(crate) session_velocity_horizon_secs: u64,
+    /// Velocity-projection guard (issue #539, ADR-0017), as a session-usage percent: the projective
+    /// trigger only projects when the observed reading is at/over this. The #538 spike's FREE guard
+    /// (projection can't reach lower anyway); conventionally BELOW `session_trigger`, like
+    /// `session_blind_risk_band`.
+    pub(crate) session_velocity_min_project_above: u8,
+    /// Velocity-projection EMA smoothing weight α (issue #539, ADR-0017), as a percent: the per-poll
+    /// blend `ema = α·instant + (1-α)·prev` damps a single-interval velocity spike so the projection
+    /// keys off SUSTAINED motion. `100` = no smoothing (raw last-interval velocity).
+    pub(crate) session_velocity_ema_alpha_pct: u8,
     /// Consecutive non-scope 401s before an account is treated as DEAD (`1..=20`).
     /// Consumed by the daemon's per-account health state (issue #42): the Nth
     /// consecutive 401 on an account's stored token quarantines it (stop polling /
@@ -297,10 +410,17 @@ impl Default for Tunables {
     fn default() -> Self {
         Self {
             poll_secs: DEFAULT_POLL_SECS,
+            exhausted_poll_secs: DEFAULT_EXHAUSTED_POLL_SECS,
+            near_limit_poll_secs: DEFAULT_NEAR_LIMIT_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
-            target_max_usage: DEFAULT_TARGET_MAX_USAGE,
+            target_max_session_usage: DEFAULT_TARGET_MAX_SESSION_USAGE,
             session_trigger: DEFAULT_SESSION_TRIGGER,
             weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
+            session_blind_swap_secs: DEFAULT_SESSION_BLIND_SWAP_SECS,
+            session_blind_risk_band: DEFAULT_SESSION_BLIND_RISK_BAND,
+            session_velocity_horizon_secs: DEFAULT_SESSION_VELOCITY_HORIZON_SECS,
+            session_velocity_min_project_above: DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE,
+            session_velocity_ema_alpha_pct: DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT,
             monitor_401_n: DEFAULT_MONITOR_401_N,
             monitor_recovery_m: DEFAULT_MONITOR_RECOVERY_M,
             poll_strategy: Strategy {
@@ -379,6 +499,19 @@ pub(crate) struct RefreshConfig {
     /// (#375) style outage without waiting for an account to die. Bounds `1..=100`; **default**
     /// [`DEFAULT_REFRESH_SYSTEMIC_FAILURE_N`]. Governs detection only — never a swap/poll decision.
     pub(crate) systemic_failure_n: u32,
+    /// Whether the #282 PROACTIVE keep-warm of the ACTIVE account fires (issue #468). **Off by
+    /// default** — the second, tighter opt-in for a *live*-canonical rotation. Gated within
+    /// `[refresh].enabled` (which wires the keep-warm engine at all, ADR-0015): with the engine off
+    /// this is moot; with it on and this `false`, the active account is kept warm ONLY reactively
+    /// (`should_keep_warm_retry`, on a real 401) + recovered by the #467 autonomous adopt-target —
+    /// the pre-emptive near-expiry mint that rotates the live shared token every cadence is
+    /// suppressed. Finding #476 (`docs/findings/0476-keep-warm-scrub-risk-tradeoff.md`, predicate C)
+    /// measured that proactive mint at ~44 % of the daemon's canonical churn (4.6 rotation-yanks/day,
+    /// all `rotated=true`) and — since #467 re-based the scrub it guards against from fleet-wide
+    /// unrecoverable to `continue`-recoverable — recommends gating it off, leaning on the reactive
+    /// backstop. Set `true` to restore the pre-#468 proactive keep-warm (finding #476 fallback A's
+    /// base, or an on/off capture comparison). The reactive backstop is UNAFFECTED by this flag.
+    pub(crate) proactive_keep_warm: bool,
 }
 
 impl Default for RefreshConfig {
@@ -391,6 +524,10 @@ impl Default for RefreshConfig {
             timeout_secs: DEFAULT_REFRESH_TIMEOUT_SECS,
             claude_bin: None,
             systemic_failure_n: DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
+            // Issue #468 / finding #476 predicate C: proactive keep-warm of the active account is
+            // OFF by default (leans on the reactive backstop + #467 recovery); an explicit opt-in
+            // restores the pre-#468 pre-emptive mint.
+            proactive_keep_warm: false,
         }
     }
 }
@@ -673,7 +810,7 @@ impl Config {
     ///
     /// Returns [`Error::ConfigNotFound`] if the file is absent (the daemon has
     /// nothing to run until `capture` writes one), [`Error::ConfigParse`] /
-    /// [`Error::ConfigInvalid`] / [`Error::ConfigTargetMaxAboveTrigger`] for a file
+    /// [`Error::ConfigInvalid`] / [`Error::ConfigTargetMaxSessionAboveTrigger`] for a file
     /// that exists but is malformed. Never silently substitutes defaults for a
     /// malformed file. A well-formed file with an *empty* roster loads
     /// successfully (tunables preserved) — the "at least one account" rule is the
@@ -719,7 +856,7 @@ impl Config {
     /// read maps [`Error::ConfigNotFound`] / [`Error::Io`] just as
     /// [`load_path`](Config::load_path) does, and the SAME [`parse`](Config::parse) →
     /// [`validate`](Config::validate) seam maps [`Error::ConfigParse`] /
-    /// [`Error::ConfigInvalid`] / [`Error::ConfigTargetMaxAboveTrigger`]. It then re-reads
+    /// [`Error::ConfigInvalid`] / [`Error::ConfigTargetMaxSessionAboveTrigger`]. It then re-reads
     /// the raw text into a permissive [`toml::Table`] PURELY to detect key presence,
     /// which the typed `#[serde(default)]` layer cannot report.
     pub(crate) fn load_with_origin(path: &Path) -> Result<OriginReport> {
@@ -778,14 +915,24 @@ impl Config {
                     present("tunables", "poll_secs"),
                 ),
                 entry(
+                    "exhausted_poll_secs",
+                    t.exhausted_poll_secs.to_string(),
+                    present("tunables", "exhausted_poll_secs"),
+                ),
+                entry(
+                    "near_limit_poll_secs",
+                    t.near_limit_poll_secs.to_string(),
+                    present("tunables", "near_limit_poll_secs"),
+                ),
+                entry(
                     "cooldown_secs",
                     t.cooldown_secs.to_string(),
                     present("tunables", "cooldown_secs"),
                 ),
                 entry(
-                    "target_max_usage",
-                    t.target_max_usage.to_string(),
-                    present("tunables", "target_max_usage"),
+                    "target_max_session_usage",
+                    t.target_max_session_usage.to_string(),
+                    present("tunables", "target_max_session_usage"),
                 ),
                 entry(
                     "session_trigger",
@@ -796,6 +943,31 @@ impl Config {
                     "weekly_trigger",
                     t.weekly_trigger.to_string(),
                     present("tunables", "weekly_trigger"),
+                ),
+                entry(
+                    "session_blind_swap_secs",
+                    t.session_blind_swap_secs.to_string(),
+                    present("tunables", "session_blind_swap_secs"),
+                ),
+                entry(
+                    "session_blind_risk_band",
+                    t.session_blind_risk_band.to_string(),
+                    present("tunables", "session_blind_risk_band"),
+                ),
+                entry(
+                    "session_velocity_horizon_secs",
+                    t.session_velocity_horizon_secs.to_string(),
+                    present("tunables", "session_velocity_horizon_secs"),
+                ),
+                entry(
+                    "session_velocity_min_project_above",
+                    t.session_velocity_min_project_above.to_string(),
+                    present("tunables", "session_velocity_min_project_above"),
+                ),
+                entry(
+                    "session_velocity_ema_alpha_pct",
+                    t.session_velocity_ema_alpha_pct.to_string(),
+                    present("tunables", "session_velocity_ema_alpha_pct"),
                 ),
                 entry(
                     "monitor_401_n",
@@ -871,6 +1043,11 @@ impl Config {
                     "systemic_failure_n",
                     r.systemic_failure_n.to_string(),
                     present("refresh", "systemic_failure_n"),
+                ),
+                entry(
+                    "proactive_keep_warm",
+                    r.proactive_keep_warm.to_string(),
+                    present("refresh", "proactive_keep_warm"),
                 ),
                 entry(
                     "claude_bin",
@@ -977,6 +1154,78 @@ impl Config {
         paths::write_private_file(path, self.render().as_bytes())
     }
 
+    /// Apply a `config-set` control command's edits (issue #268) to the config `text`
+    /// read from disk, re-validating the WHOLE result through the same
+    /// [`validate`](Config::validate) that [`load`](Config::load) runs — so every range
+    /// and cross-field rule (`target_max_session_usage <= session_trigger`,
+    /// `exhausted_poll_secs >= poll_secs`, the `near_limit_poll_secs` 0-or-band shape, …)
+    /// is enforced atomically over the FINAL state. An invalid batch is rejected with
+    /// nothing written; a batch is valid iff its resulting config is (an individually
+    /// out-of-order pair — e.g. raising `poll_secs` past the old `exhausted_poll_secs`
+    /// while also raising the latter — validates because both land before the check).
+    ///
+    /// `tunables` carries only the scalar `[tunables]` edits the settings UI may make
+    /// ([`SetTunables`] is the allow-list — a credential, an `[[account]]`, or any other
+    /// key is unrepresentable there). `labels` maps `account_uuid` → a new label; a uuid
+    /// matching no roster account is [`Error::AccountUuidNotFound`]. ONLY an existing
+    /// account's `label` is touched — the roster is never grown, shrunk, or re-keyed, and
+    /// no credential is reachable (the #268 safety boundary).
+    ///
+    /// Returns the re-validated [`Config`] to persist (via [`save_to`](Config::save_to))
+    /// plus a [`SettingsChange`] recording which classes actually changed, so the daemon
+    /// picks the reload semantics: a tunable change is reload-by-restart (the daemon
+    /// derives its strategy fields once at construction), a label change adopts live.
+    pub(crate) fn apply_settings(
+        text: &str,
+        tunables: &SetTunables,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<(Config, SettingsChange)> {
+        // Baseline: the current on-disk config, fully validated. A currently-invalid file
+        // (hand-broken) fails HERE, so config-set refuses rather than overwrite a file it
+        // cannot understand — the daemon maps this to a `config-unreadable` rejection.
+        let before = Config::parse(text)?;
+        // Overlay the edits onto the raw layer so the SINGLE validate() sees the final
+        // state; the file is re-parsed (tiny) rather than cloning the non-`Clone` raw.
+        let mut raw: RawConfig =
+            toml::from_str(text).map_err(|err| Error::ConfigParse(err.to_string()))?;
+        overlay_tunables(&mut raw.tunables, tunables);
+        overlay_labels(&mut raw.account, labels)?;
+        let after = Config::validate(raw)?;
+        let change = SettingsChange {
+            tunables_changed: after.tunables != before.tunables,
+            labels_changed: after.roster != before.roster,
+        };
+        Ok((after, change))
+    }
+
+    /// A non-secret projection of the effective config for the `config-get` control
+    /// command (issue #268): the scalar tunables the settings UI edits + each roster
+    /// account's non-secret `account_uuid` / `label` / `enabled`. Carries NO credential
+    /// (the roster keys on uuid + label only, issue #15), so it is exactly as safe to
+    /// return over the same-user control socket as the `status` / `watch` snapshots.
+    pub(crate) fn view(&self) -> ConfigView {
+        ConfigView {
+            tunables: TunablesView::from(&self.tunables),
+            accounts: self
+                .roster
+                .iter()
+                .map(|account| AccountView {
+                    account_uuid: account.account_uuid.clone(),
+                    label: account.label.clone(),
+                    enabled: account.enabled,
+                })
+                .collect(),
+        }
+    }
+
+    /// Parse `text` and project it to a [`ConfigView`] (issue #268) — the `config-get` read path's
+    /// one-call text→view seam, keeping [`parse`](Config::parse) private while giving the daemon a
+    /// non-secret projection to serialize. Errors exactly as [`load`](Config::load) would (a parse or
+    /// validation failure), which `config-get` maps to a `config unreadable` envelope.
+    pub(crate) fn view_from_text(text: &str) -> Result<ConfigView> {
+        Ok(Config::parse(text)?.view())
+    }
+
     /// The base poll interval — the un-jittered `poll_secs`. The run loop now
     /// draws a jittered interval each cycle from the poll strategy (issue #38),
     /// so this is a tested accessor for the base rather than the live cadence.
@@ -1025,7 +1274,7 @@ impl Config {
 
     /// Stage two: bounds-check every tunable and the roster, producing the typed
     /// `Config`. Each rejection names the offending field; the cross-field rule
-    /// (`target_max_usage <= session_trigger`) gets its own distinct error.
+    /// (`target_max_session_usage <= session_trigger`) gets its own distinct error.
     fn validate(raw: RawConfig) -> Result<Self> {
         let t = raw.tunables;
 
@@ -1035,9 +1284,53 @@ impl Config {
         // session (an unusual but valid operator choice), so both are configurable
         // independently (AC #3).
         range("weekly_trigger", t.weekly_trigger, 50, 99)?;
-        // target_max_usage is default-on (#398): absent → DEFAULT_TARGET_MAX_USAGE, clamped
+        // Issue #452 (ADR-0017) bounded-blindness preemptive-swap gate. `session_blind_swap_secs`
+        // is `T` in seconds: floored at 60 (at least one poll cycle blind) and capped at 86400 — a
+        // 24 h ceiling far beyond any real blind window, so setting it there disables the path (the
+        // config kill-switch). `session_blind_risk_band` is a session percent, 50..=99 like the
+        // triggers but conventionally set BELOW `session_trigger` (the gate fires preemptively on a
+        // stale anchor). No NEW cross-field: ADR-0017's `target_max_session_usage <= session_trigger`
+        // is the existing reserve invariant enforced below — the blind path's target still needs
+        // runway below its own reactive trigger, which that invariant already guarantees.
+        range(
+            "session_blind_swap_secs",
+            t.session_blind_swap_secs,
+            60,
+            86_400,
+        )?;
+        range("session_blind_risk_band", t.session_blind_risk_band, 50, 99)?;
+        // Issue #539 (ADR-0017) velocity-projection preemptive trigger. `session_velocity_horizon_secs`
+        // is the projection horizon `H` in seconds: `0..=600`, where `0` disables the path (the
+        // projection reduces to `last`, which — the reactive path having already held — never crosses,
+        // the config kill-switch), and 600 is a sanity ceiling (the #538 spike validated H ≈ 120 and
+        // showed over-fire creeping in above ~150, so a large H is a foot-gun the false-projection SLI
+        // surfaces; the ceiling just bounds the absurd). `session_velocity_min_project_above` is a
+        // session percent (`50..=99`) conventionally set BELOW `session_trigger` — the projective peer
+        // fires in the band beneath the reactive trigger — exactly like `session_blind_risk_band`, so no
+        // NEW cross-field. `session_velocity_ema_alpha_pct` is the EMA weight α (`1..=100`); the `0`
+        // floor is excluded because α=0 would freeze the EMA (never integrate a new sample), a
+        // degenerate value, while 100 is the valid "no smoothing" (raw last-interval) end.
+        range(
+            "session_velocity_horizon_secs",
+            t.session_velocity_horizon_secs,
+            0,
+            600,
+        )?;
+        range(
+            "session_velocity_min_project_above",
+            t.session_velocity_min_project_above,
+            50,
+            99,
+        )?;
+        range(
+            "session_velocity_ema_alpha_pct",
+            t.session_velocity_ema_alpha_pct,
+            1,
+            100,
+        )?;
+        // target_max_session_usage is default-on (#398): absent → DEFAULT_TARGET_MAX_SESSION_USAGE, clamped
         // down to session_trigger so the default honors the SAME
-        // `target_max_usage <= session_trigger` invariant the present-value arm enforces
+        // `target_max_session_usage <= session_trigger` invariant the present-value arm enforces
         // (#417 — without the clamp a `session_trigger < 80` config loads with an
         // unchecked reserve of 80 and then bricks after a render→parse round-trip, since
         // #398 renders the default as a live line; an equal reserve is inert per
@@ -1045,18 +1338,18 @@ impl Config {
         // target, silently disabling proactive swapping) and its upper bound is
         // session_trigger (a higher reserve could never admit a target), the latter a
         // distinct cross-field error.
-        let target_max_usage = match t.target_max_usage {
-            None => DEFAULT_TARGET_MAX_USAGE.min(t.session_trigger as u8),
+        let target_max_session_usage = match t.target_max_session_usage {
+            None => DEFAULT_TARGET_MAX_SESSION_USAGE.min(t.session_trigger as u8),
             Some(value) => {
                 if value == 0 {
-                    // The swap predicate is `usage.session < target_max_usage`, so 0
+                    // The swap predicate is `usage.session < target_max_session_usage`, so 0
                     // admits NO account and silently disables proactive swapping (the
                     // daemon just holds). 0 is the natural wrong guess for "no
                     // restriction" — its exact opposite (#414) — so reject it with the
                     // remedy spelled out, rather than let a live, hand-editable line
                     // brick swapping in silence.
                     return Err(Error::ConfigInvalid(format!(
-                        "target_max_usage = 0 admits no swap target and silently disables \
+                        "target_max_session_usage = 0 admits no swap target and silently disables \
                          proactive swapping; it must be in 1..={}. Raise it toward \
                          session_trigger to admit more targets.",
                         t.session_trigger
@@ -1064,13 +1357,13 @@ impl Config {
                 }
                 if value < 0 {
                     return Err(Error::ConfigInvalid(format!(
-                        "target_max_usage must be in 1..={}, got {value}",
+                        "target_max_session_usage must be in 1..={}, got {value}",
                         t.session_trigger
                     )));
                 }
                 if value > t.session_trigger {
-                    return Err(Error::ConfigTargetMaxAboveTrigger {
-                        target_max_usage: value,
+                    return Err(Error::ConfigTargetMaxSessionAboveTrigger {
+                        target_max_session_usage: value,
                         trigger: t.session_trigger,
                     });
                 }
@@ -1078,6 +1371,35 @@ impl Config {
             }
         };
         range("poll_secs", t.poll_secs, 5, 3600)?;
+        // The widened exhausted-peer cadence (issue #537) is bounded BELOW by `poll_secs` (a
+        // cross-field rule, checked after `poll_secs` above so the bound is the validated
+        // value): a slow-polled peer must never re-poll FASTER than the normal cadence — an
+        // `exhausted_poll_secs < poll_secs` would defeat the whole point (poll MORE often, not
+        // less). The 86400 s (24 h) ceiling is a sanity bound far beyond any real quota window.
+        // The lower bound is dynamic, so `range` cannot express it — spell the cross-field
+        // remedy out, mirroring `target_max_session_usage`'s message.
+        if !(t.poll_secs..=86_400).contains(&t.exhausted_poll_secs) {
+            return Err(Error::ConfigInvalid(format!(
+                "exhausted_poll_secs must be in {}..=86400 (>= poll_secs so a slow-polled \
+                 exhausted peer never re-polls faster than the normal cadence), got {}",
+                t.poll_secs, t.exhausted_poll_secs
+            )));
+        }
+        // The near-limit active-poll sub-interval cap (issue #540). `0` disables the path (the
+        // kill-switch, like `session_velocity_horizon_secs` below); a non-zero value is a poll
+        // cadence in the SAME `5..=3600` s band as `poll_secs` (a sub-5 s cadence sits below the
+        // daemon's own poll floor). Deliberately NOT cross-fielded to `poll_secs`: the daemon
+        // applies it as `min(poll_secs / N, near_limit_poll_secs)`, so a value ABOVE the base
+        // sub-interval is simply inert (the `min` never binds) rather than an error — a lowered
+        // `poll_secs` whose base already sits below this cap just leaves #540 inert, which is
+        // correct (the steady cadence is already tight). `range` cannot express the `0`-or-band
+        // shape, so spell it out, mirroring the `exhausted_poll_secs` message above.
+        if t.near_limit_poll_secs != 0 && !(5..=3600).contains(&t.near_limit_poll_secs) {
+            return Err(Error::ConfigInvalid(format!(
+                "near_limit_poll_secs must be 0 (disabled) or in 5..=3600, got {}",
+                t.near_limit_poll_secs
+            )));
+        }
         // cooldown_secs has a NON-ZERO floor (issue #272): it is configurable ABOVE
         // COOLDOWN_SECS_FLOOR but not below it, so swap pacing can never be tuned down
         // to zero. The daemon's per-cycle draw clamps to the same floor, so a jitter
@@ -1105,10 +1427,17 @@ impl Config {
         // draws + clamps from the strategy each cycle.
         let tunables = Tunables {
             poll_secs: t.poll_secs as u64,
+            exhausted_poll_secs: t.exhausted_poll_secs as u64,
+            near_limit_poll_secs: t.near_limit_poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
-            target_max_usage,
+            target_max_session_usage,
             session_trigger: t.session_trigger as u8,
             weekly_trigger: t.weekly_trigger as u8,
+            session_blind_swap_secs: t.session_blind_swap_secs as u64,
+            session_blind_risk_band: t.session_blind_risk_band as u8,
+            session_velocity_horizon_secs: t.session_velocity_horizon_secs as u64,
+            session_velocity_min_project_above: t.session_velocity_min_project_above as u8,
+            session_velocity_ema_alpha_pct: t.session_velocity_ema_alpha_pct as u8,
             monitor_401_n: t.monitor_401_n as u8,
             monitor_recovery_m: t.monitor_recovery_m as u8,
             poll_strategy: Strategy {
@@ -1192,6 +1521,7 @@ impl Config {
                 .filter(|bin| !bin.trim().is_empty())
                 .map(PathBuf::from),
             systemic_failure_n: r.systemic_failure_n as u32,
+            proactive_keep_warm: r.proactive_keep_warm,
         };
 
         // The one-shot `login` verb's settings (issue #135). The timeout is bounds-checked like the
@@ -1307,6 +1637,30 @@ impl Config {
              # honouring any Retry-After — instead of re-polling at the fixed interval.\n",
         );
         out.push_str(&format!("poll_secs = {}\n", t.poll_secs));
+        out.push_str(
+            "# Widened re-poll cadence (poll_secs..=86400) for an out-of-rotation peer — one\n\
+             # that is weekly- or session-exhausted (issue #537). Its usage can only change\n\
+             # when its server-side window resets (a time the daemon already knows) or on a\n\
+             # rare out-of-band reset, so re-polling it every poll_secs wastes a request. The\n\
+             # default 3600 (1 h) is the ceiling; a known resets_at sooner than this polls\n\
+             # earlier. The ACTIVE account is never slow-polled. Must be >= poll_secs.\n",
+        );
+        out.push_str(&format!(
+            "exhausted_poll_secs = {}\n",
+            t.exhausted_poll_secs
+        ));
+        out.push_str(
+            "# Tightened poll sub-interval (0 to disable, else 5..=3600) for the ACTIVE account\n\
+             # while it is near its limit (issue #540) — the mirror of exhausted_poll_secs, which\n\
+             # WIDENS an idle peer. On the active account's final climb its cadence tightens to\n\
+             # this so no long poll gap opens near the limit; below the near-limit band the cadence\n\
+             # is the unchanged poll_secs/N, so the steady rate is flat. Default 60. Applied as\n\
+             # min(poll_secs/N, this), so a value above the base sub-interval is inert.\n",
+        );
+        out.push_str(&format!(
+            "near_limit_poll_secs = {}\n",
+            t.near_limit_poll_secs
+        ));
         out.push_str(&format!(
             "# Seconds to wait after a swap before another swap is allowed \
              ({COOLDOWN_SECS_FLOOR}..=3600; a non-zero floor — pacing can't be disabled to zero).\n"
@@ -1318,7 +1672,10 @@ impl Config {
              # This is NOT the level that triggers a swap. Default-on (#398); 0 is rejected\n\
              # — it admits no target and would disable proactive swapping.\n",
         );
-        out.push_str(&format!("target_max_usage = {}\n", t.target_max_usage));
+        out.push_str(&format!(
+            "target_max_session_usage = {}\n",
+            t.target_max_session_usage
+        ));
         out.push_str(
             "# Swap AWAY from the active account at or above this session percent (50..=99).\n",
         );
@@ -1329,6 +1686,53 @@ impl Config {
              # dimension reaches its own trigger.\n",
         );
         out.push_str(&format!("weekly_trigger = {}\n", t.weekly_trigger));
+        out.push_str(
+            "# Bounded-blindness preemptive swap (issue #452, ADR-0017): when the active\n\
+             # account's usage poll stays blind (429/5xx) longer than this many seconds AND\n\
+             # its last good reading was at/over session_blind_risk_band, swap it away before\n\
+             # it can self-exhaust unobserved. Floor 60; set to the 86400 ceiling to disable.\n",
+        );
+        out.push_str(&format!(
+            "session_blind_swap_secs = {}\n",
+            t.session_blind_swap_secs
+        ));
+        out.push_str(
+            "# The last-known session percent (50..=99) at/over which a blind active account\n\
+             # is eligible for the preemptive swap above. Set BELOW session_trigger — it acts\n\
+             # on the stale pre-blind reading, before the reactive trigger would fire.\n",
+        );
+        out.push_str(&format!(
+            "session_blind_risk_band = {}\n",
+            t.session_blind_risk_band
+        ));
+        out.push_str(
+            "# Velocity-projection preemptive swap (issue #539, ADR-0017): swap the active\n\
+             # account away when its PROJECTED session usage (last + velocity * H) crosses the\n\
+             # trigger before the observed reading does — H is this horizon in seconds\n\
+             # (~ the active poll cadence; 120 validated by #538). Set to 0 to disable.\n",
+        );
+        out.push_str(&format!(
+            "session_velocity_horizon_secs = {}\n",
+            t.session_velocity_horizon_secs
+        ));
+        out.push_str(
+            "# Only project when the observed session percent (50..=99) is at/over this — the\n\
+             # projection can't reach lower anyway, so it is a free guard. Set BELOW\n\
+             # session_trigger (the projective peer fires in the band beneath it).\n",
+        );
+        out.push_str(&format!(
+            "session_velocity_min_project_above = {}\n",
+            t.session_velocity_min_project_above
+        ));
+        out.push_str(
+            "# EMA smoothing weight alpha (1..=100 percent) for the session-velocity signal,\n\
+             # to damp a single-interval spike so the projection keys off sustained motion.\n\
+             # ~50 validated by #538; 100 means no smoothing (raw last-interval velocity).\n",
+        );
+        out.push_str(&format!(
+            "session_velocity_ema_alpha_pct = {}\n",
+            t.session_velocity_ema_alpha_pct
+        ));
         out.push_str(
             "# Consecutive non-scope 401s before an account is treated as DEAD and\n\
              # quarantined (1..=20).\n",
@@ -1409,6 +1813,17 @@ impl Config {
              # signal (event + `status` indicator) distinct from per-account at-risk.\n",
         );
         out.push_str(&format!("systemic_failure_n = {}\n", r.systemic_failure_n));
+        out.push_str(
+            "# Pre-emptively refresh the ACTIVE account's token in place before it nears expiry\n\
+             # (issue #468). OFF by default: this rotates the live shared credential every cadence,\n\
+             # and the active account is instead kept warm reactively (on a real 401) and recovered\n\
+             # by autonomous adopt-target. Set true to restore the pre-emptive mint. Only takes\n\
+             # effect when enabled = true. See docs/findings/0476-keep-warm-scrub-risk-tradeoff.md.\n",
+        );
+        out.push_str(&format!(
+            "proactive_keep_warm = {}\n",
+            r.proactive_keep_warm
+        ));
         out.push_str(
             "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave\n\
              # empty) to resolve from $CLAUDE_BIN then $PATH.\n",
@@ -1670,6 +2085,197 @@ fn basic_string(s: &str) -> String {
     TomlStringBuilder::new(s).as_basic().to_toml_value()
 }
 
+// ── Settings-edit surface (issue #268): the daemon-routed config-get / config-set backend. ──
+//
+// The menubar settings UI (a pure control-socket client) reads the effective config via the
+// `config-get` command → [`ConfigView`] and writes tunable/label edits via `config-set` →
+// [`Config::apply_settings`]. `config.toml` stays the single source of truth (the daemon
+// load→mutate→save's through the SAME tested `render`/`validate` path); tunables are
+// reload-by-restart, labels adopt live. The SAFETY boundary — tunables + existing-account
+// labels ONLY, never a credential or roster STRUCTURE — is enforced STRUCTURALLY: the
+// editable surface IS these types, so a forbidden key is unrepresentable, not merely unshown.
+
+/// The scalar `[tunables]` edits a `config-set` may carry (issue #268), mirroring the
+/// scalar [`RawTunables`] keys 1:1. Every field is `Option` — an omitted key is an
+/// UNEDITED key — and `#[serde(deny_unknown_fields)]` rejects ANY other key (a credential,
+/// an `[[account]]`, a `[jitter]` / `[refresh]` / … block, or a mistyped tunable) as a hard
+/// parse error. This type IS the settable allow-list: the roster structure and every
+/// credential are unrepresentable, so the #268 safety boundary holds by construction, not by
+/// convention. The `[jitter]` strategy specs are deliberately excluded (structured, not
+/// scalar form fields); `enabled` is excluded from v1 (it stays the CLI `enable`/`disable`
+/// verb, mirroring "add/remove routes to CLI").
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetTunables {
+    #[serde(default)]
+    pub(crate) poll_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) exhausted_poll_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) near_limit_poll_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) cooldown_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) target_max_session_usage: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_trigger: Option<i64>,
+    #[serde(default)]
+    pub(crate) weekly_trigger: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_blind_swap_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_blind_risk_band: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_velocity_horizon_secs: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_velocity_min_project_above: Option<i64>,
+    #[serde(default)]
+    pub(crate) session_velocity_ema_alpha_pct: Option<i64>,
+    #[serde(default)]
+    pub(crate) monitor_401_n: Option<i64>,
+    #[serde(default)]
+    pub(crate) monitor_recovery_m: Option<i64>,
+}
+
+/// Which classes of edit a [`Config::apply_settings`] actually changed (issue #268), so the
+/// daemon picks reload semantics: `tunables_changed` ⇒ reload-by-restart (the daemon derives
+/// its strategy fields once at construction, with no re-derivation primitive), `labels_changed`
+/// ⇒ adopt live via the daemon's roster reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettingsChange {
+    pub(crate) tunables_changed: bool,
+    pub(crate) labels_changed: bool,
+}
+
+/// The `config-get` control-command reply (issue #268): a non-secret projection of the
+/// effective config — the scalar tunables the settings UI edits + the roster's non-secret
+/// per-account fields. Produced by [`Config::view`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ConfigView {
+    pub(crate) tunables: TunablesView,
+    pub(crate) accounts: Vec<AccountView>,
+}
+
+/// The scalar tunables in a [`ConfigView`] (issue #268) — the effective values the settings
+/// UI displays and edits. Mirrors [`Tunables`]' scalar fields; the `[jitter]` strategy
+/// fields are omitted (not form-editable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TunablesView {
+    pub(crate) poll_secs: u64,
+    pub(crate) exhausted_poll_secs: u64,
+    pub(crate) near_limit_poll_secs: u64,
+    pub(crate) cooldown_secs: u64,
+    pub(crate) target_max_session_usage: u8,
+    pub(crate) session_trigger: u8,
+    pub(crate) weekly_trigger: u8,
+    pub(crate) session_blind_swap_secs: u64,
+    pub(crate) session_blind_risk_band: u8,
+    pub(crate) session_velocity_horizon_secs: u64,
+    pub(crate) session_velocity_min_project_above: u8,
+    pub(crate) session_velocity_ema_alpha_pct: u8,
+    pub(crate) monitor_401_n: u8,
+    pub(crate) monitor_recovery_m: u8,
+}
+
+impl From<&Tunables> for TunablesView {
+    fn from(t: &Tunables) -> Self {
+        Self {
+            poll_secs: t.poll_secs,
+            exhausted_poll_secs: t.exhausted_poll_secs,
+            near_limit_poll_secs: t.near_limit_poll_secs,
+            cooldown_secs: t.cooldown_secs,
+            target_max_session_usage: t.target_max_session_usage,
+            session_trigger: t.session_trigger,
+            weekly_trigger: t.weekly_trigger,
+            session_blind_swap_secs: t.session_blind_swap_secs,
+            session_blind_risk_band: t.session_blind_risk_band,
+            session_velocity_horizon_secs: t.session_velocity_horizon_secs,
+            session_velocity_min_project_above: t.session_velocity_min_project_above,
+            session_velocity_ema_alpha_pct: t.session_velocity_ema_alpha_pct,
+            monitor_401_n: t.monitor_401_n,
+            monitor_recovery_m: t.monitor_recovery_m,
+        }
+    }
+}
+
+/// One roster account in a [`ConfigView`] (issue #268): its non-secret `account_uuid` (the
+/// stable label-edit key), `label`, and `enabled` flag. No credential — the roster holds
+/// none (issue #15).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AccountView {
+    pub(crate) account_uuid: String,
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+}
+
+/// Overlay a `config-set`'s scalar tunable edits (issue #268) onto the raw layer — each
+/// `Some(v)` replaces that key, each `None` leaves it. `target_max_session_usage` maps to
+/// the raw `Option` (its absence sentinel); every other key to its plain scalar. Ranges are
+/// NOT checked here — [`Config::validate`] does that atomically over the overlaid result.
+fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
+    if let Some(v) = edits.poll_secs {
+        raw.poll_secs = v;
+    }
+    if let Some(v) = edits.exhausted_poll_secs {
+        raw.exhausted_poll_secs = v;
+    }
+    if let Some(v) = edits.near_limit_poll_secs {
+        raw.near_limit_poll_secs = v;
+    }
+    if let Some(v) = edits.cooldown_secs {
+        raw.cooldown_secs = v;
+    }
+    if let Some(v) = edits.target_max_session_usage {
+        raw.target_max_session_usage = Some(v);
+    }
+    if let Some(v) = edits.session_trigger {
+        raw.session_trigger = v;
+    }
+    if let Some(v) = edits.weekly_trigger {
+        raw.weekly_trigger = v;
+    }
+    if let Some(v) = edits.session_blind_swap_secs {
+        raw.session_blind_swap_secs = v;
+    }
+    if let Some(v) = edits.session_blind_risk_band {
+        raw.session_blind_risk_band = v;
+    }
+    if let Some(v) = edits.session_velocity_horizon_secs {
+        raw.session_velocity_horizon_secs = v;
+    }
+    if let Some(v) = edits.session_velocity_min_project_above {
+        raw.session_velocity_min_project_above = v;
+    }
+    if let Some(v) = edits.session_velocity_ema_alpha_pct {
+        raw.session_velocity_ema_alpha_pct = v;
+    }
+    if let Some(v) = edits.monitor_401_n {
+        raw.monitor_401_n = v;
+    }
+    if let Some(v) = edits.monitor_recovery_m {
+        raw.monitor_recovery_m = v;
+    }
+}
+
+/// Overlay a `config-set`'s label edits (issue #268): each `account_uuid` → new label is
+/// written onto the MATCHING existing raw account. A uuid matching none is
+/// [`Error::AccountUuidNotFound`]. Never appends/removes an entry — only an existing
+/// account's `label` field is touched, so the roster structure (and every credential keyed
+/// off it) is out of reach (the #268 safety boundary). The new label's non-emptiness is
+/// enforced downstream by [`Config::validate`].
+fn overlay_labels(accounts: &mut [RawAccount], labels: &BTreeMap<String, String>) -> Result<()> {
+    for (account_uuid, new_label) in labels {
+        let account = accounts
+            .iter_mut()
+            .find(|account| &account.account_uuid == account_uuid)
+            .ok_or_else(|| Error::AccountUuidNotFound {
+                account_uuid: account_uuid.clone(),
+            })?;
+        account.label = new_label.clone();
+    }
+    Ok(())
+}
+
 /// Permissive deserialization target: every key optional (documented default),
 /// integers kept wide so out-of-range values reach [`Config::validate`] with a
 /// clear message rather than failing as a `serde` type error.
@@ -1723,21 +2329,36 @@ fn default_account_enabled() -> bool {
 struct RawTunables {
     #[serde(default = "default_poll_secs")]
     poll_secs: i64,
+    #[serde(default = "default_exhausted_poll_secs")]
+    exhausted_poll_secs: i64,
+    #[serde(default = "default_near_limit_poll_secs")]
+    near_limit_poll_secs: i64,
     #[serde(default = "default_cooldown_secs")]
     cooldown_secs: i64,
-    /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_TARGET_MAX_USAGE`
+    /// Default-on (#398): absent → `None` here, mapped to `DEFAULT_TARGET_MAX_SESSION_USAGE`
     /// in [`Config::validate`] (the raw layer keeps `Option` to detect absence).
-    /// Accepts the pre-#415 key `session_floor` as a deprecation alias (ADR-0006): an
-    /// existing `config.toml` written with `session_floor = N` still parses to this
-    /// field, and `save` re-emits it under the new key. Both keys present in one file →
-    /// serde's duplicate-field parse error, so an operator mid-migration gets no silent
-    /// winner.
-    #[serde(default, alias = "session_floor")]
-    target_max_usage: Option<i64>,
+    /// Accepts the two pre-rename keys `target_max_usage` (#415) and `session_floor`
+    /// (pre-#415) as deprecation aliases (ADR-0006): an existing `config.toml` written with
+    /// either old key still parses to this field, and `save` re-emits it under the new key.
+    /// #443 is the LAST rename of this key — the alias stack stops at these two. Any two of
+    /// the three spellings present in one file → serde's duplicate-field parse error, so an
+    /// operator mid-migration gets no silent winner.
+    #[serde(default, alias = "target_max_usage", alias = "session_floor")]
+    target_max_session_usage: Option<i64>,
     #[serde(default = "default_session_trigger")]
     session_trigger: i64,
     #[serde(default = "default_weekly_trigger")]
     weekly_trigger: i64,
+    #[serde(default = "default_session_blind_swap_secs")]
+    session_blind_swap_secs: i64,
+    #[serde(default = "default_session_blind_risk_band")]
+    session_blind_risk_band: i64,
+    #[serde(default = "default_session_velocity_horizon_secs")]
+    session_velocity_horizon_secs: i64,
+    #[serde(default = "default_session_velocity_min_project_above")]
+    session_velocity_min_project_above: i64,
+    #[serde(default = "default_session_velocity_ema_alpha_pct")]
+    session_velocity_ema_alpha_pct: i64,
     #[serde(default = "default_monitor_401_n")]
     monitor_401_n: i64,
     #[serde(default = "default_monitor_recovery_m")]
@@ -1748,10 +2369,17 @@ impl Default for RawTunables {
     fn default() -> Self {
         Self {
             poll_secs: default_poll_secs(),
+            exhausted_poll_secs: default_exhausted_poll_secs(),
+            near_limit_poll_secs: default_near_limit_poll_secs(),
             cooldown_secs: default_cooldown_secs(),
-            target_max_usage: None,
+            target_max_session_usage: None,
             session_trigger: default_session_trigger(),
             weekly_trigger: default_weekly_trigger(),
+            session_blind_swap_secs: default_session_blind_swap_secs(),
+            session_blind_risk_band: default_session_blind_risk_band(),
+            session_velocity_horizon_secs: default_session_velocity_horizon_secs(),
+            session_velocity_min_project_above: default_session_velocity_min_project_above(),
+            session_velocity_ema_alpha_pct: default_session_velocity_ema_alpha_pct(),
             monitor_401_n: default_monitor_401_n(),
             monitor_recovery_m: default_monitor_recovery_m(),
         }
@@ -1761,6 +2389,12 @@ impl Default for RawTunables {
 fn default_poll_secs() -> i64 {
     DEFAULT_POLL_SECS as i64
 }
+fn default_exhausted_poll_secs() -> i64 {
+    DEFAULT_EXHAUSTED_POLL_SECS as i64
+}
+fn default_near_limit_poll_secs() -> i64 {
+    DEFAULT_NEAR_LIMIT_POLL_SECS as i64
+}
 fn default_cooldown_secs() -> i64 {
     DEFAULT_COOLDOWN_SECS as i64
 }
@@ -1769,6 +2403,21 @@ fn default_session_trigger() -> i64 {
 }
 fn default_weekly_trigger() -> i64 {
     i64::from(DEFAULT_WEEKLY_TRIGGER)
+}
+fn default_session_blind_swap_secs() -> i64 {
+    DEFAULT_SESSION_BLIND_SWAP_SECS as i64
+}
+fn default_session_blind_risk_band() -> i64 {
+    i64::from(DEFAULT_SESSION_BLIND_RISK_BAND)
+}
+fn default_session_velocity_horizon_secs() -> i64 {
+    DEFAULT_SESSION_VELOCITY_HORIZON_SECS as i64
+}
+fn default_session_velocity_min_project_above() -> i64 {
+    i64::from(DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE)
+}
+fn default_session_velocity_ema_alpha_pct() -> i64 {
+    i64::from(DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT)
 }
 fn default_monitor_401_n() -> i64 {
     i64::from(DEFAULT_MONITOR_401_N)
@@ -1798,6 +2447,11 @@ struct RawRefresh {
     claude_bin: Option<String>,
     #[serde(default = "default_refresh_systemic_failure_n")]
     systemic_failure_n: i64,
+    // Issue #468: an absent key resolves to `false` (proactive keep-warm OFF, predicate C) — the
+    // bool `Default`, so a plain `#[serde(default)]` is the right default here (unlike `enabled`,
+    // whose default is `true` and needs a named default fn).
+    #[serde(default)]
+    proactive_keep_warm: bool,
 }
 
 impl Default for RawRefresh {
@@ -1810,6 +2464,7 @@ impl Default for RawRefresh {
             timeout_secs: default_refresh_timeout_secs(),
             claude_bin: None,
             systemic_failure_n: default_refresh_systemic_failure_n(),
+            proactive_keep_warm: false,
         }
     }
 }
@@ -1977,7 +2632,7 @@ mod tests {
 [tunables]
 poll_secs = 30
 cooldown_secs = 45
-target_max_usage = 70
+target_max_session_usage = 70
 session_trigger = 90
 weekly_trigger = 97
 monitor_401_n = 5
@@ -2003,6 +2658,219 @@ label = "personal"
         )
     }
 
+    // ── config-set / config-get backend (issue #268) ──
+
+    /// A `BTreeMap<uuid, label>` for the `config-set` label edits (fully qualified so the
+    /// test needs no extra `use`).
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(uuid, label)| (uuid.to_string(), label.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn apply_settings_overlays_a_tunable_and_revalidates() {
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(300),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.poll_secs, 300);
+        assert!(change.tunables_changed);
+        assert!(!change.labels_changed);
+        // A tunables-only edit leaves the roster untouched.
+        assert_eq!(after.roster.len(), 2);
+    }
+
+    #[test]
+    fn apply_settings_relabels_an_account_by_uuid() {
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("11111111-1111-1111-1111-111111111111", "day-job")]),
+        )
+        .unwrap();
+        assert!(change.labels_changed);
+        assert!(!change.tunables_changed);
+        let renamed = after
+            .roster
+            .iter()
+            .find(|a| a.account_uuid == "11111111-1111-1111-1111-111111111111")
+            .unwrap();
+        assert_eq!(renamed.label, "day-job");
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_out_of_range_tunable() {
+        // poll_secs floor is 5; 4 is out of range → the whole batch is rejected.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(4),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_validates_the_final_batch_not_intermediate_states() {
+        // Current: poll_secs=30, exhausted_poll_secs=60. Raising poll_secs to 300 AND
+        // exhausted to 7200 is valid as a WHOLE (300 <= 7200), even though applying poll
+        // first would transiently violate `exhausted >= poll` (60 < 300). Atomic validation
+        // over the final state is what lets a settings-form "Apply" move coupled fields.
+        let base = with_tunables("poll_secs = 30\nexhausted_poll_secs = 60");
+        let (after, _) = Config::apply_settings(
+            &base,
+            &SetTunables {
+                poll_secs: Some(300),
+                exhausted_poll_secs: Some(7200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.poll_secs, 300);
+        assert_eq!(after.tunables.exhausted_poll_secs, 7200);
+    }
+
+    #[test]
+    fn apply_settings_rejects_a_cross_field_invalid_batch() {
+        // exhausted_poll_secs must be >= poll_secs; 200 < 300 → rejected as a whole.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(300),
+                exhausted_poll_secs: Some(200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_rejects_target_max_above_session_trigger() {
+        // VALID session_trigger=90; target_max_session_usage=95 > 90 → the distinct cross-field error.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                target_max_session_usage: Some(95),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ConfigTargetMaxSessionAboveTrigger { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_unknown_account_uuid() {
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("no-such-uuid", "x")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::AccountUuidNotFound { .. }));
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_empty_label() {
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("11111111-1111-1111-1111-111111111111", "  ")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_reports_no_change_for_a_noop_edit() {
+        // Submitting the current value + current label changes nothing.
+        let (_, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(30), // VALID's current poll_secs
+                ..SetTunables::default()
+            },
+            &labels(&[("11111111-1111-1111-1111-111111111111", "work")]),
+        )
+        .unwrap();
+        assert!(!change.tunables_changed);
+        assert!(!change.labels_changed);
+    }
+
+    #[test]
+    fn apply_settings_refuses_a_currently_unreadable_config() {
+        // A hand-broken file fails at the baseline parse — config-set never overwrites a
+        // file it cannot understand.
+        let err = Config::apply_settings(
+            "this is not toml [[[",
+            &SetTunables::default(),
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigParse(_)));
+    }
+
+    #[test]
+    fn set_tunables_rejects_a_forbidden_key() {
+        // SAFETY invariant: only the scalar tunable keys are representable. A credential, a
+        // roster field, or any other key is a hard parse error (deny_unknown_fields), so the
+        // credential/roster-structure boundary cannot be crossed through config-set.
+        for forbidden in [
+            r#"{"account_uuid":"x"}"#,
+            r#"{"credential":"secret"}"#,
+            r#"{"label":"x"}"#,
+            r#"{"enabled":true}"#,
+            r#"{"poll_secs":300,"roster":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SetTunables>(forbidden).is_err(),
+                "forbidden key accepted: {forbidden}"
+            );
+        }
+        // A bare scalar tunable parses; unset keys stay None.
+        let ok: SetTunables = serde_json::from_str(r#"{"poll_secs":300}"#).unwrap();
+        assert_eq!(ok.poll_secs, Some(300));
+        assert_eq!(ok.session_trigger, None);
+    }
+
+    #[test]
+    fn config_view_projects_tunables_and_roster() {
+        let view = Config::parse(VALID).unwrap().view();
+        assert_eq!(view.tunables.poll_secs, 30);
+        assert_eq!(view.tunables.session_trigger, 90);
+        assert_eq!(view.accounts.len(), 2);
+        assert_eq!(
+            view.accounts[0].account_uuid,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(view.accounts[0].label, "work");
+        assert!(view.accounts[0].enabled);
+    }
+
+    #[test]
+    fn config_view_serde_round_trips() {
+        let view = Config::parse(VALID).unwrap().view();
+        let json = serde_json::to_string(&view).unwrap();
+        let back: ConfigView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+    }
+
     #[test]
     fn parses_a_valid_config() {
         let config = Config::parse(VALID).unwrap();
@@ -2011,10 +2879,23 @@ label = "personal"
             config.tunables,
             Tunables {
                 poll_secs: 30,
+                // VALID omits exhausted_poll_secs → the compiled-in default (issue #537).
+                exhausted_poll_secs: 3600,
+                // VALID omits near_limit_poll_secs → the compiled-in default (issue #540). 60 > the
+                // configured poll_secs (30) here, so it is inert for this config (min never binds) —
+                // valid, not an error (no cross-field bound to poll_secs).
+                near_limit_poll_secs: 60,
                 cooldown_secs: 45,
-                target_max_usage: 70,
+                target_max_session_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 97,
+                // VALID sets no blind-swap keys → the compiled-in defaults (issue #452).
+                session_blind_swap_secs: 300,
+                session_blind_risk_band: 60,
+                // VALID sets no velocity-projection keys → the compiled-in defaults (issue #539).
+                session_velocity_horizon_secs: 120,
+                session_velocity_min_project_above: 85,
+                session_velocity_ema_alpha_pct: 50,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
                 // No [jitter] table in VALID → default strategies: poll jitters
@@ -2045,8 +2926,11 @@ label = "personal"
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
         assert_eq!(config.tunables.session_trigger, 95);
-        // #398: the target_max_usage reserve is default-on at 80.
-        assert_eq!(config.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
+        // #398: the target_max_session_usage reserve is default-on at 80.
+        assert_eq!(
+            config.tunables.target_max_session_usage,
+            DEFAULT_TARGET_MAX_SESSION_USAGE
+        );
     }
 
     #[test]
@@ -2094,7 +2978,7 @@ label = "personal"
     #[test]
     fn session_and_weekly_triggers_are_independently_configurable() {
         // AC #3: the two triggers are set independently — there is NO cross-field
-        // rule, so weekly may even sit BELOW session (unlike target_max_usage, which
+        // rule, so weekly may even sit BELOW session (unlike target_max_session_usage, which
         // is capped at session_trigger).
         let t = Config::parse(&with_tunables("session_trigger = 90\nweekly_trigger = 99"))
             .unwrap()
@@ -2104,7 +2988,7 @@ label = "personal"
         assert_eq!(t.trigger_strategy.base, 90.0);
         assert_eq!(t.weekly_trigger_strategy.base, 99.0);
 
-        // weekly BELOW session is accepted (no target_max_usage-style cross-field constraint).
+        // weekly BELOW session is accepted (no target_max_session_usage-style cross-field constraint).
         let inverted = Config::parse(&with_tunables("session_trigger = 95\nweekly_trigger = 60"))
             .unwrap()
             .tunables;
@@ -2128,11 +3012,11 @@ label = "personal"
 
     #[test]
     fn rejects_target_max_above_trigger_with_a_distinct_error() {
-        let toml = with_tunables("target_max_usage = 95\nsession_trigger = 90");
+        let toml = with_tunables("target_max_session_usage = 95\nsession_trigger = 90");
         assert!(matches!(
             Config::parse(&toml),
-            Err(Error::ConfigTargetMaxAboveTrigger {
-                target_max_usage: 95,
+            Err(Error::ConfigTargetMaxSessionAboveTrigger {
+                target_max_session_usage: 95,
                 trigger: 90
             })
         ));
@@ -2140,146 +3024,173 @@ label = "personal"
 
     #[test]
     fn rejects_negative_target_max() {
-        let toml = with_tunables("target_max_usage = -1");
+        let toml = with_tunables("target_max_session_usage = -1");
         assert!(matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))));
     }
 
     #[test]
     fn rejects_zero_target_max_naming_the_consequence() {
-        // #414: target_max_usage = 0 makes the swap predicate `usage.session < 0` admit no
+        // #414: target_max_session_usage = 0 makes the swap predicate `usage.session < 0` admit no
         // account, so proactive swapping is silently disabled and the daemon just holds.
-        // Since #398 made target_max_usage a live, hand-editable line, 0 is the natural
+        // Since #398 made target_max_session_usage a live, hand-editable line, 0 is the natural
         // (wrong) guess for "no restriction" — its exact opposite. validate must reject it
         // with a message that names the consequence AND points at the remedy (raise it
         // toward session_trigger to admit more targets).
-        let toml = with_tunables("target_max_usage = 0\nsession_trigger = 90");
+        let toml = with_tunables("target_max_session_usage = 0\nsession_trigger = 90");
         match Config::parse(&toml) {
             Err(Error::ConfigInvalid(msg)) => assert!(
                 msg.contains("disables proactive swapping") && msg.contains("session_trigger"),
                 "rejection must name the consequence and the remedy, got: {msg}"
             ),
-            Ok(_) => panic!("target_max_usage = 0 must be rejected, not accepted"),
-            Err(e) => panic!("target_max_usage = 0 must be ConfigInvalid, got: {e}"),
+            Ok(_) => panic!("target_max_session_usage = 0 must be rejected, not accepted"),
+            Err(e) => panic!("target_max_session_usage = 0 must be ConfigInvalid, got: {e}"),
         }
 
         // The reject is precisely 0, not "any low value": 1 is the valid lower edge and
         // still parses (inert-but-valid — admits only accounts at 0% session).
-        let one = Config::parse(&with_tunables("target_max_usage = 1\nsession_trigger = 90"))
-            .expect("target_max_usage = 1 is the valid lower bound and must parse");
-        assert_eq!(one.tunables.target_max_usage, 1);
+        let one = Config::parse(&with_tunables(
+            "target_max_session_usage = 1\nsession_trigger = 90",
+        ))
+        .expect("target_max_session_usage = 1 is the valid lower bound and must parse");
+        assert_eq!(one.tunables.target_max_session_usage, 1);
 
         // …and the absent-key default path (#417 clamp) is untouched by the reject: an
-        // absent target_max_usage still yields the default-on reserve, never 0.
+        // absent target_max_session_usage still yields the default-on reserve, never 0.
         let absent = Config::parse(&with_tunables("session_trigger = 90")).unwrap();
-        assert_eq!(absent.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
+        assert_eq!(
+            absent.tunables.target_max_session_usage,
+            DEFAULT_TARGET_MAX_SESSION_USAGE
+        );
     }
 
     #[test]
-    fn target_max_usage_defaults_to_80_when_absent() {
-        // #398: an absent target_max_usage takes the default-on reserve (80), even when
+    fn target_max_session_usage_defaults_to_80_when_absent() {
+        // #398: an absent target_max_session_usage takes the default-on reserve (80), even when
         // other tunables are set…
         let absent = Config::parse(&with_tunables("session_trigger = 95")).unwrap();
-        assert_eq!(absent.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
+        assert_eq!(
+            absent.tunables.target_max_session_usage,
+            DEFAULT_TARGET_MAX_SESSION_USAGE
+        );
         // …and a present value overrides it at that percent.
         let set = Config::parse(&with_tunables(
-            "target_max_usage = 90\nsession_trigger = 95",
+            "target_max_session_usage = 90\nsession_trigger = 95",
         ))
         .unwrap();
-        assert_eq!(set.tunables.target_max_usage, 90);
+        assert_eq!(set.tunables.target_max_session_usage, 90);
     }
 
     #[test]
-    fn rendered_default_config_documents_target_max_usage_as_a_live_value() {
-        // #398: render emits a LIVE target_max_usage line (default-on) that round-trips
+    fn rendered_default_config_documents_target_max_session_usage_as_a_live_value() {
+        // #398: render emits a LIVE target_max_session_usage line (default-on) that round-trips
         // back to the same value — never a commented-out opt-in.
         let mut config = Config::parse(VALID).unwrap();
-        config.tunables.target_max_usage = DEFAULT_TARGET_MAX_USAGE;
+        config.tunables.target_max_session_usage = DEFAULT_TARGET_MAX_SESSION_USAGE;
         let text = config.render();
-        assert!(text.contains("target_max_usage = 80"), "got {text}");
-        assert!(!text.contains("# target_max_usage ="), "got {text}");
+        assert!(text.contains("target_max_session_usage = 80"), "got {text}");
+        assert!(!text.contains("# target_max_session_usage ="), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
-        assert_eq!(reparsed.tunables.target_max_usage, DEFAULT_TARGET_MAX_USAGE);
+        assert_eq!(
+            reparsed.tunables.target_max_session_usage,
+            DEFAULT_TARGET_MAX_SESSION_USAGE
+        );
     }
 
     #[test]
     fn absent_target_max_default_clamps_to_trigger_below_80_and_survives_round_trip() {
-        // #417 (regression from #398): with session_trigger < 80 and NO target_max_usage
+        // #417 (regression from #398): with session_trigger < 80 and NO target_max_session_usage
         // key, the absent-key default (80) MUST clamp down to session_trigger — honoring
-        // the same target_max_usage <= session_trigger invariant the present-value arm
+        // the same target_max_session_usage <= session_trigger invariant the present-value arm
         // already enforces (ADR-0013 Decision 1). Without the clamp the first load
         // silently yields a reserve of 80 (> trigger — the cross-field check is skipped on
         // the absent-key arm), render() then emits it as a LIVE line (#398), and the SECOND
-        // parse rejects the config with ConfigTargetMaxAboveTrigger — bricking a valid config
+        // parse rejects the config with ConfigTargetMaxSessionAboveTrigger — bricking a valid config
         // after any save/export round-trip (enable/disable/remove account, capture
         // write-back, export→import). The existing round-trip test above only covers the
         // default trigger = 95 (where 80 < 95), so it never reached this corner.
-        let toml = with_tunables("session_trigger = 70"); // no target_max_usage key
+        let toml = with_tunables("session_trigger = 70"); // no target_max_session_usage key
         let config = Config::parse(&toml).unwrap();
         // The default is clamped to the trigger — the maximally-permissive inert value
         // (ADR-0013: an equal reserve admits exactly what the always-on gate admits),
         // never left at 80.
-        assert_eq!(config.tunables.target_max_usage, 70);
-        assert!(config.tunables.target_max_usage <= config.tunables.session_trigger);
+        assert_eq!(config.tunables.target_max_session_usage, 70);
+        assert!(config.tunables.target_max_session_usage <= config.tunables.session_trigger);
 
         // …and it survives a render → parse round-trip: the exact path that bricked.
         let text = config.render();
-        assert!(text.contains("target_max_usage = 70"), "got {text}");
+        assert!(text.contains("target_max_session_usage = 70"), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
-        assert_eq!(reparsed.tunables.target_max_usage, 70);
+        assert_eq!(reparsed.tunables.target_max_session_usage, 70);
         assert_eq!(reparsed.tunables.session_trigger, 70);
     }
 
     #[test]
-    fn deprecated_session_floor_alias_parses_and_renders_as_target_max_usage() {
-        // #415: `session_floor` was renamed to `target_max_usage` (the old name read
-        // backwards — it is a CEILING on the target's usage, not a minimum). The key is a
-        // persisted, operator-visible line in every existing config.toml, so the rename is
-        // a schema migration (ADR-0006), not a sed: the deprecated key MUST still parse for
-        // a deprecation window, mapping onto the new field.
+    fn deprecated_aliases_parse_and_render_as_target_max_session_usage() {
+        // Schema-migration guard (ADR-0006). The target-reserve key has been renamed twice:
+        // `session_floor` → `target_max_usage` (#415) → `target_max_session_usage` (#443, the
+        // unqualified `usage` hid the session axis). Each rename kept the prior key as a serde
+        // deprecation alias, and #443 is the LAST rename (the alias stack stops at two). Every
+        // existing config.toml carries a persisted, operator-visible line, so BOTH deprecated
+        // keys MUST still parse onto the new field, and render MUST rewrite them to the new
+        // canonical key.
 
-        // The OLD key still loads and maps onto the new field…
+        // All three spellings load onto the new field with the same value (AC: assert all three).
+        for key in [
+            "session_floor",
+            "target_max_usage",
+            "target_max_session_usage",
+        ] {
+            let cfg = Config::parse(&with_tunables(&format!("{key} = 70\nsession_trigger = 90")))
+                .unwrap_or_else(|e| panic!("a config written with `{key}` must still parse: {e}"));
+            assert_eq!(
+                cfg.tunables.target_max_session_usage, 70,
+                "`{key}` must map onto target_max_session_usage",
+            );
+        }
+
+        // A deprecated-key file is REWRITTEN to the new key on render (the one-way key rewrite,
+        // mirroring the #70 stash drop): the emitted file carries `target_max_session_usage`,
+        // never either old key.
         let old = Config::parse(&with_tunables("session_floor = 70\nsession_trigger = 90"))
             .expect("a config written with the deprecated `session_floor` key must still parse");
-        assert_eq!(old.tunables.target_max_usage, 70);
-
-        // …the NEW key loads to the same value…
-        let new = Config::parse(&with_tunables(
-            "target_max_usage = 70\nsession_trigger = 90",
-        ))
-        .expect("the new `target_max_usage` key parses");
-        assert_eq!(new.tunables.target_max_usage, 70);
-
-        // …and a deprecated-key file is REWRITTEN to the new key on render (the one-way key
-        // rewrite, mirroring the #70 stash drop): the emitted file carries
-        // `target_max_usage`, never the old `session_floor`.
         let rendered = old.render();
         assert!(
-            rendered.contains("target_max_usage = 70"),
+            rendered.contains("target_max_session_usage = 70"),
             "render must emit the new key: {rendered}"
         );
         assert!(
-            !rendered.contains("session_floor"),
-            "render must NOT emit the deprecated key: {rendered}"
+            !rendered.contains("session_floor") && !rendered.contains("target_max_usage"),
+            "render must NOT emit either deprecated key: {rendered}"
         );
 
         // Export → import round-trip survives the deprecated-key input: parsing the render
         // of an old-key file yields the same value under the new field.
         let reimported = Config::parse(&rendered).expect("the rendered new-key file re-imports");
-        assert_eq!(reimported.tunables.target_max_usage, 70);
+        assert_eq!(reimported.tunables.target_max_session_usage, 70);
     }
 
     #[test]
-    fn both_target_max_usage_and_deprecated_alias_present_is_a_parse_error() {
-        // #415: mid-migration an operator might leave BOTH the deprecated `session_floor`
-        // and the new `target_max_usage` in one file. serde's alias maps both onto the same
-        // field, so a file carrying both is a duplicate-field parse error rather than a
-        // silent winner — the operator is told to pick one (the issue's precedence choice).
-        let toml = with_tunables("session_floor = 70\ntarget_max_usage = 80\nsession_trigger = 90");
-        assert!(
-            matches!(Config::parse(&toml), Err(Error::ConfigParse(_))),
-            "both keys present must be a ConfigParse error, got: {:?}",
-            Config::parse(&toml)
-        );
+    fn multiple_reserve_key_spellings_present_is_a_parse_error() {
+        // Mid-migration an operator might leave more than one spelling of the reserve key in
+        // one file. serde maps the canonical `target_max_session_usage` and both deprecated
+        // aliases (`target_max_usage` #415, `session_floor` pre-#415) onto the same field, so
+        // ANY two present at once is a duplicate-field parse error rather than a silent winner
+        // — the operator is told to pick one (the issue's precedence choice). Cover every
+        // collision-capable pair plus all three at once.
+        let collisions = [
+            "session_floor = 70\ntarget_max_usage = 80",
+            "session_floor = 70\ntarget_max_session_usage = 80",
+            "target_max_usage = 70\ntarget_max_session_usage = 80",
+            "session_floor = 70\ntarget_max_usage = 75\ntarget_max_session_usage = 80",
+        ];
+        for combo in collisions {
+            let toml = with_tunables(&format!("{combo}\nsession_trigger = 90"));
+            assert!(
+                matches!(Config::parse(&toml), Err(Error::ConfigParse(_))),
+                "multiple reserve-key spellings present must be a ConfigParse error for `{combo}`, got: {:?}",
+                Config::parse(&toml)
+            );
+        }
     }
 
     #[test]
@@ -2287,8 +3198,16 @@ label = "personal"
         for (key, value) in [
             ("poll_secs", "4"),
             ("poll_secs", "3601"),
-            ("cooldown_secs", "0"), // below the non-zero floor (#272)
-            ("cooldown_secs", "4"), // still below the floor (#272)
+            ("exhausted_poll_secs", "86401"), // above the 24 h ceiling (#537)
+            ("near_limit_poll_secs", "4"), // below the 5 s floor, yet not the 0 kill-switch (#540)
+            ("near_limit_poll_secs", "3601"), // above the 3600 s ceiling (#540)
+            ("session_velocity_horizon_secs", "601"), // above the 600 s sanity ceiling (#539)
+            ("session_velocity_min_project_above", "49"), // below the 50 % floor (#539)
+            ("session_velocity_min_project_above", "100"), // above the 99 % ceiling (#539)
+            ("session_velocity_ema_alpha_pct", "0"), // alpha=0 freezes the EMA — degenerate (#539)
+            ("session_velocity_ema_alpha_pct", "101"), // above 100 % (#539)
+            ("cooldown_secs", "0"),        // below the non-zero floor (#272)
+            ("cooldown_secs", "4"),        // still below the floor (#272)
             ("cooldown_secs", "3601"),
             ("monitor_401_n", "0"),
             ("monitor_401_n", "21"),
@@ -2301,6 +3220,84 @@ label = "personal"
                 "{key} = {value} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn exhausted_poll_secs_defaults_to_one_hour() {
+        // Issue #537: an absent `exhausted_poll_secs` defaults to the compiled-in 3600 s (1 h)
+        // ceiling — the slow-poll cadence is on by default without an operator opting in.
+        let config = Config::parse(&with_tunables("poll_secs = 300")).unwrap();
+        assert_eq!(config.tunables.exhausted_poll_secs, 3600);
+    }
+
+    #[test]
+    fn exhausted_poll_secs_must_be_at_least_poll_secs_and_below_the_ceiling() {
+        // Issue #537: the widened cadence is bounded BELOW by `poll_secs` (a slow-polled peer
+        // must never re-poll FASTER than the normal cadence — that would defeat the point) and
+        // ABOVE by 86400 s. The lower bound is a CROSS-FIELD rule, so the rejection names both
+        // the field and `poll_secs`, mirroring `target_max_session_usage`'s message.
+        let below = with_tunables("poll_secs = 600\nexhausted_poll_secs = 599");
+        match Config::parse(&below) {
+            Err(Error::ConfigInvalid(msg)) => assert!(
+                msg.contains("exhausted_poll_secs") && msg.contains("600"),
+                "rejection must name the field and poll_secs, got: {msg}"
+            ),
+            other => panic!("exhausted_poll_secs < poll_secs must be rejected, got: {other:?}"),
+        }
+
+        // The lower edge (== poll_secs) LOADS — an equal cadence is the inert boundary, not a
+        // slow-down, but it is a valid operator choice and threads through to the tunable.
+        let at_floor = Config::parse(&with_tunables("poll_secs = 600\nexhausted_poll_secs = 600"))
+            .expect("exhausted_poll_secs == poll_secs is the valid lower edge");
+        assert_eq!(at_floor.tunables.exhausted_poll_secs, 600);
+
+        // The upper edge (the 24 h ceiling) loads; one over is rejected.
+        let at_ceiling = Config::parse(&with_tunables("exhausted_poll_secs = 86400"))
+            .expect("the 86400 s ceiling is valid");
+        assert_eq!(at_ceiling.tunables.exhausted_poll_secs, 86_400);
+        assert!(matches!(
+            Config::parse(&with_tunables("exhausted_poll_secs = 86401")),
+            Err(Error::ConfigInvalid(_))
+        ));
+
+        // A mid-range value >= poll_secs loads and threads through verbatim.
+        let mid = Config::parse(&with_tunables(
+            "poll_secs = 300\nexhausted_poll_secs = 7200",
+        ))
+        .expect("a value in poll_secs..=86400 loads");
+        assert_eq!(mid.tunables.exhausted_poll_secs, 7200);
+    }
+
+    #[test]
+    fn near_limit_poll_secs_accepts_zero_disabled_or_the_5_to_3600_band() {
+        // Issue #540: the near-limit fast-poll cap is `0` (disabled — the kill-switch) OR in the
+        // 5..=3600 s band. The `0`-OR-band shape is the load-bearing subtlety: a naive
+        // `(5..=3600).contains()` WITHOUT the `!= 0` guard would reject the documented kill-switch.
+        // There is deliberately NO cross-field bound against `poll_secs` (unlike #537's
+        // `exhausted_poll_secs`): an above-base value is INERT via the `min(poll_secs / N, cap)` in
+        // `next_subinterval`, not a load-time error — so no default-vs-configured footgun.
+
+        // Absent → the compiled-in 60 s default.
+        let default = Config::parse(&with_tunables("poll_secs = 300")).unwrap();
+        assert_eq!(default.tunables.near_limit_poll_secs, 60);
+
+        // 0 is the disabled kill-switch and MUST load — it is NOT a sub-floor rejection.
+        let disabled = Config::parse(&with_tunables("near_limit_poll_secs = 0"))
+            .expect("0 is the valid disabled kill-switch, not a sub-floor rejection");
+        assert_eq!(disabled.tunables.near_limit_poll_secs, 0);
+
+        // Both band edges load and thread through verbatim.
+        for edge in [5u64, 3600] {
+            let cfg = Config::parse(&with_tunables(&format!("near_limit_poll_secs = {edge}")))
+                .unwrap_or_else(|e| panic!("near_limit_poll_secs = {edge} is a valid edge: {e:?}"));
+            assert_eq!(cfg.tunables.near_limit_poll_secs, edge);
+        }
+
+        // An above-base cap LOADS (no cross-field bound): with poll_secs = 30 the base sub-interval
+        // is already < 60, so a 60 s cap can never bind — but it is inert, not a rejection.
+        let inert = Config::parse(&with_tunables("poll_secs = 30\nnear_limit_poll_secs = 60"))
+            .expect("an above-base cap is inert, not an error (no cross-field bound)");
+        assert_eq!(inert.tunables.near_limit_poll_secs, 60);
     }
 
     #[test]
@@ -2358,10 +3355,11 @@ label = "personal"
         // file must PARSE (empty roster) and PRESERVE the operator's tunables, so
         // `capture` can load it to add the first account. The "at least one account"
         // rule is the daemon's `require_roster` precondition, not a parse rejection.
-        let config = Config::parse("[tunables]\npoll_secs = 120\ntarget_max_usage = 80\n").unwrap();
+        let config =
+            Config::parse("[tunables]\npoll_secs = 120\ntarget_max_session_usage = 80\n").unwrap();
         assert!(config.roster.is_empty());
         assert_eq!(config.tunables.poll_secs, 120);
-        assert_eq!(config.tunables.target_max_usage, 80);
+        assert_eq!(config.tunables.target_max_session_usage, 80);
     }
 
     #[test]
@@ -2468,6 +3466,8 @@ label = "personal"
                 idle_after_secs: 120,
                 timeout_secs: 60,
                 claude_bin: Some(PathBuf::from("/opt/claude/bin/claude")),
+                // Absent from the parsed TOML above → the #468 default (proactive keep-warm off).
+                proactive_keep_warm: false,
             }
         );
         // The cadence is also the near-expiry horizon, exposed as a Duration.
@@ -2495,6 +3495,35 @@ label = "personal"
         let toml = format!("{VALID}\n[refresh]\nenabled = false\n");
         let config = Config::parse(&toml).unwrap();
         assert!(!config.refresh.enabled);
+    }
+
+    #[test]
+    fn refresh_proactive_keep_warm_defaults_off() {
+        // Issue #468 / finding #476 predicate C: an absent `proactive_keep_warm` key resolves to
+        // OFF even with `[refresh]` maintenance ON — the active account is then kept warm reactively
+        // (on a real 401) + recovered by #467, not by the pre-emptive live-canonical mint.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.refresh.enabled);
+        assert!(
+            !config.refresh.proactive_keep_warm,
+            "proactive keep-warm is off by default (#468)"
+        );
+    }
+
+    #[test]
+    fn refresh_proactive_keep_warm_opt_in_parses_and_round_trips() {
+        // An operator restores the pre-#468 pre-emptive mint (finding #476 fallback A's base) with
+        // an explicit `proactive_keep_warm = true`; a present key is never overridden by the
+        // off-by-default serde default, and the opt-in survives the render->parse round trip.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\nproactive_keep_warm = true\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.refresh.proactive_keep_warm);
+        let reparsed = Config::parse(&config.render()).unwrap();
+        assert!(
+            reparsed.refresh.proactive_keep_warm,
+            "the opt-in survives emit->parse (#468)"
+        );
     }
 
     #[test]
@@ -2943,14 +3972,19 @@ label = "personal"
     fn rendered_config_documents_the_tunables() {
         let text = Config::parse(VALID).unwrap().render();
         // AC #5: the written file carries the inline tunable docs, in particular
-        // the target_max_usage "most-full a target may be to receive the session" semantics.
+        // the target_max_session_usage "most-full a target may be to receive the session" semantics.
         assert!(text.contains("The most-full an account may be to receive"));
         for key in [
             "poll_secs",
+            "exhausted_poll_secs",
+            "near_limit_poll_secs",
             "cooldown_secs",
-            "target_max_usage",
+            "target_max_session_usage",
             "session_trigger",
             "weekly_trigger",
+            "session_velocity_horizon_secs",
+            "session_velocity_min_project_above",
+            "session_velocity_ema_alpha_pct",
             "monitor_401_n",
             "monitor_recovery_m",
         ] {
@@ -3050,12 +4084,12 @@ label = "personal"
 
     #[test]
     fn accepts_inclusive_bounds() {
-        // Each bound's edge is valid: trigger 50/99, target_max_usage 1 (the non-zero lower bound;
+        // Each bound's edge is valid: trigger 50/99, target_max_session_usage 1 (the non-zero lower bound;
         // 0 admits no target) and floor == trigger, poll 5/3600, cooldown 5/3600 (5 =
         // the non-zero floor, #272), monitor 1/20.
         for fragment in [
-            "session_trigger = 50\ntarget_max_usage = 1",
-            "session_trigger = 99\ntarget_max_usage = 99", // target_max_usage == trigger is allowed
+            "session_trigger = 50\ntarget_max_session_usage = 1",
+            "session_trigger = 99\ntarget_max_session_usage = 99", // target_max_session_usage == trigger is allowed
             "weekly_trigger = 50",
             "weekly_trigger = 99",
             "poll_secs = 5",
@@ -3121,7 +4155,7 @@ label = "personal"
         assert_eq!(by_key("session_trigger").value, "90");
         // Every OTHER tunable in the present section is still a compiled-in default.
         assert_eq!(by_key("poll_secs").origin, Origin::Default);
-        assert_eq!(by_key("target_max_usage").origin, Origin::Default);
+        assert_eq!(by_key("target_max_session_usage").origin, Origin::Default);
         assert_eq!(by_key("monitor_401_n").origin, Origin::Default);
 
         // Every optional section is absent → not present, all values Default.
@@ -3281,7 +4315,7 @@ label = \"work\"
     /// writes for a full config MUST also appear in `origin_report`. Without this, a tunable
     /// added to `render` but forgotten in `origin_report` would be silently DROPPED from
     /// `config show` — the drift most likely as the schema grows (jitter #38, refresh #105,
-    /// stats #161, migration #150, target_max_usage #398). Asserts `live ⊆ reported`.
+    /// stats #161, migration #150, target_max_session_usage #398). Asserts `live ⊆ reported`.
     #[test]
     fn origin_report_reports_every_key_render_writes() {
         let config = Config::parse(VALID).unwrap();

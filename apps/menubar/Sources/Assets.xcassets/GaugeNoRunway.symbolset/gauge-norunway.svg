@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+ <g id="Notes"/>
+ <g id="Guides">
+  <line id="Capline-S" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Baseline-S" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Capline-M" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Baseline-M" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Capline-L" x1="2" y1="3" x2="22" y2="3" stroke="#27AAE1" stroke-width="0.05"/>
+  <line id="Baseline-L" x1="2" y1="21" x2="22" y2="21" stroke="#27AAE1" stroke-width="0.05"/>
+ </g>
+ <g id="Symbols" fill="#000000">
+  <g id="Regular-S"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></g>
+  <g id="Regular-M"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></g>
+  <g id="Regular-L"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></g>
+ </g>
+</svg>

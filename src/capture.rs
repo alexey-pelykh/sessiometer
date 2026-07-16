@@ -60,6 +60,7 @@ use crate::observability::{Event, EventLog, LoginEventOutcome};
 use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -96,6 +97,15 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     let claude_json = paths::claude_json()?;
     let existing = load_existing()?;
 
+    // #447: when the operator gave no label on the command line, offer the harvested
+    // email as the editable, pre-filled default at an interactive prompt. A confirmed
+    // value (accepted email or a typed replacement) is operator-authored, so it may be
+    // an email under the #444 provenance-scoped waiver. Any outcome that is NOT an
+    // operator confirmation — non-tty (piped/scripted), no email to offer, not logged
+    // in, or EOF at the prompt — leaves the label unset so the locked path below falls
+    // back to the uuid-derived default: no path ever auto-commits an unconfirmed email.
+    let label = label.or_else(|| prefill_label_from_identity(&claude_json));
+
     let report = capture_locked(
         Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
         &RealCredentialStore::new(),
@@ -115,6 +125,69 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
         confirmation(report.outcome, &report.label, report.count)
     );
     Ok(())
+}
+
+/// Offer the harvested email as the pre-filled label default at an interactive prompt
+/// (issue #447), returning the operator-confirmed label — or `None` to fall through to
+/// the uuid-derived default ([`derive_label`]).
+///
+/// The email is read via a cheap, UNLOCKED identity peek used ONLY to seed the prompt.
+/// It is deliberately NOT the captured identity: the authoritative identity read stays
+/// under the swap lock in [`capture_locked`] (#357), which re-reads `~/.claude.json`
+/// after the operator answers. The only value that could go stale between the peek and
+/// that locked read is the *cosmetic* label default — never the credential↔identity
+/// pairing the lock protects — and only if the operator switches the active account
+/// mid-prompt; the label is re-nameable via a re-capture with an explicit label.
+///
+/// Best-effort by design: any peek failure (not logged in, unreadable file) yields
+/// `None` and lets [`capture_locked`]'s own identity read surface the authoritative
+/// error, rather than pre-empting it here. The peeked email is held in `Zeroizing`
+/// (via [`OauthAccount::email`]) and dropped the instant this returns (#447 AC5).
+fn prefill_label_from_identity(claude_json: &Path) -> Option<String> {
+    let email = read_oauth_account_from(claude_json).ok()?.email()?;
+    // A non-terminal stdout (piped / scripted) must never block on input nor commit an
+    // email the operator did not confirm — fall through to the uuid-derived default.
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    prompt_label_default(&email, &mut stdin.lock(), &mut stdout)
+        .ok()
+        .flatten()
+    // `email` (Zeroizing) drops here — the harvested address is wiped once the label
+    // is resolved, whatever the operator chose (#447 AC5).
+}
+
+/// The pure, testable prompt core: write `Account label [<email>]: `, read one line,
+/// and resolve the operator's choice (issue #447).
+///
+/// - an empty line (bare Enter) **accepts** the pre-filled `email` default;
+/// - a non-empty line **replaces** it with the trimmed value;
+/// - EOF with no input (Ctrl-D on an empty line) returns `None` — no confirmation,
+///   so the caller falls back to the uuid-derived default.
+///
+/// Every `Some` return is therefore a value the operator actively confirmed at the
+/// prompt — an operator-authored label (permitted as an email by the #444 provenance
+/// seam). This function NEVER yields the email without the operator pressing Enter on
+/// it, satisfying "no path auto-commits the email without the operator confirming it".
+fn prompt_label_default(
+    email: &str,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> std::io::Result<Option<String>> {
+    write!(output, "Account label [{email}]: ")?;
+    output.flush()?;
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Ok(None); // EOF (Ctrl-D) with no input: treat as no confirmation
+    }
+    let trimmed = line.trim();
+    Ok(Some(if trimmed.is_empty() {
+        email.to_owned() // bare Enter: accept the pre-filled email default
+    } else {
+        trimmed.to_owned() // operator typed a replacement (e.g. `work` / `EU`)
+    }))
 }
 
 /// The capture core wrapped in the single-writer swap lock (issue #64): acquired BEFORE the
@@ -898,6 +971,53 @@ mod tests {
         assert_eq!(roster.len(), 7);
     }
 
+    // --- prompt_label_default (pure prefill core, #447) ---
+
+    /// Drive the prompt with a scripted input line; return (resolved label, prompt
+    /// text written). The prompt text proves the email is *offered* as the default.
+    fn run_prompt(email: &str, typed: &str) -> (Option<String>, String) {
+        let mut input = std::io::Cursor::new(typed.as_bytes().to_vec());
+        let mut output: Vec<u8> = Vec::new();
+        let resolved = prompt_label_default(email, &mut input, &mut output).unwrap();
+        (resolved, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn prompt_offers_the_email_as_the_pre_filled_default() {
+        // AC: capturing an account offers the email as an editable, pre-filled label.
+        let (_resolved, shown) = run_prompt("alice@example.com", "\n");
+        assert_eq!(shown, "Account label [alice@example.com]: ");
+    }
+
+    #[test]
+    fn bare_enter_accepts_the_email_default() {
+        // Empty line = accept the offered email → an operator-CONFIRMED (authored)
+        // value, never a silent auto-commit (the operator pressed Enter on it).
+        let (resolved, _) = run_prompt("alice@example.com", "\n");
+        assert_eq!(resolved.as_deref(), Some("alice@example.com"));
+    }
+
+    #[test]
+    fn a_typed_value_replaces_the_email_default() {
+        // AC: the operator shortens it (e.g. to `work` / `EU`).
+        let (resolved, _) = run_prompt("alice@example.com", "work\n");
+        assert_eq!(resolved.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn a_typed_value_is_trimmed() {
+        let (resolved, _) = run_prompt("alice@example.com", "  EU  \n");
+        assert_eq!(resolved.as_deref(), Some("EU"));
+    }
+
+    #[test]
+    fn eof_with_no_input_declines_and_falls_back() {
+        // Ctrl-D on an empty line = no confirmation → `None`, so the caller uses the
+        // uuid-derive default. Never auto-commits the email without a confirmation.
+        let (resolved, _) = run_prompt("alice@example.com", "");
+        assert!(resolved.is_none());
+    }
+
     // --- confirmation (exact AC strings) ---
 
     #[test]
@@ -969,8 +1089,8 @@ mod tests {
         let existing = Config {
             roster: vec![],
             tunables: Tunables {
-                poll_secs: 120,       // a non-default the operator set
-                target_max_usage: 70, // a non-default reserve (default 80) the operator set
+                poll_secs: 120,               // a non-default the operator set
+                target_max_session_usage: 70, // a non-default reserve (default 80) the operator set
                 ..Tunables::default()
             },
             refresh: RefreshConfig::default(),
@@ -992,9 +1112,9 @@ mod tests {
         assert_eq!(report.outcome, CaptureOutcome::Captured);
         assert_eq!(report.config.roster.len(), 1);
         // The operator's tunables survive the bootstrap (NOT reset to defaults:
-        // poll_secs default is 300, target_max_usage default is 80 — #398).
+        // poll_secs default is 300, target_max_session_usage default is 80 — #398).
         assert_eq!(report.config.tunables.poll_secs, 120);
-        assert_eq!(report.config.tunables.target_max_usage, 70);
+        assert_eq!(report.config.tunables.target_max_session_usage, 70);
     }
 
     #[tokio::test]
@@ -1106,7 +1226,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\ntarget_max_usage = 70\n",
+            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\ntarget_max_session_usage = 70\n",
         )
         .unwrap();
 
@@ -1117,16 +1237,16 @@ mod tests {
             "a file with no [[account]] loads with an empty roster"
         );
         // The operator's tunables survive the load — NOT reset to defaults (default
-        // poll_secs is 300, default target_max_usage is 80 — #398).
+        // poll_secs is 300, default target_max_session_usage is 80 — #398).
         assert_eq!(config.tunables.poll_secs, 120);
-        assert_eq!(config.tunables.target_max_usage, 70);
+        assert_eq!(config.tunables.target_max_session_usage, 70);
     }
 
     #[test]
     fn load_existing_from_reads_the_deprecated_session_floor_key() {
         // #415: an existing on-disk config.toml written with the pre-rename `session_floor`
         // key must still load through the real load_existing → load_path seam, mapping onto
-        // `target_max_usage` via the serde deprecation alias. Guards the schema migration
+        // `target_max_session_usage` via the serde deprecation alias. Guards the schema migration
         // (ADR-0006) at the actual file boundary, not just an in-memory parse.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1139,7 +1259,7 @@ mod tests {
         let loaded = load_existing_from(&path).unwrap();
         let config = loaded.expect("a tunables-only file that EXISTS is Some, not None");
         // The deprecated key maps onto the new field — the operator's reserve survives.
-        assert_eq!(config.tunables.target_max_usage, 70);
+        assert_eq!(config.tunables.target_max_session_usage, 70);
     }
 
     #[test]

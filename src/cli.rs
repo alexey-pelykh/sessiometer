@@ -22,9 +22,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
-    run_loop, AccountStatusLine, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap,
-    NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown,
-    SchemaVersion, StatusResponse, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
+    run_loop, AccountStatusLine, CanonicalScrub, Daemon, ExternalLoginWatcher, InstanceLock,
+    NextSwap, NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller,
+    RealShutdown, SchemaVersion, StatusResponse, UnixControl, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -114,6 +115,8 @@ enum Command {
     Poke { target: Option<String> },
     /// `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`.
     Stats(crate::stats::StatsArgs),
+    /// `reliability [--json]` — the OFFLINE reliability-SLO readout over the event log (#455).
+    Reliability(crate::reliability::ReliabilityArgs),
     /// `export [PATH] …`. The raw flags are carried and resolved to an `Encryption` in
     /// `execute`, so this variant stays a plain comparable value for the parser tests.
     Export {
@@ -209,6 +212,7 @@ enum HelpTopic {
     Remove,
     Poke,
     Stats,
+    Reliability,
     Export,
     Import,
 }
@@ -232,6 +236,7 @@ impl HelpTopic {
             HelpTopic::Remove => "sessiometer remove --help",
             HelpTopic::Poke => "sessiometer poke --help",
             HelpTopic::Stats => "sessiometer stats --help",
+            HelpTopic::Reliability => "sessiometer reliability --help",
             HelpTopic::Export => "sessiometer export --help",
             HelpTopic::Import => "sessiometer import --help",
         }
@@ -257,6 +262,7 @@ impl HelpTopic {
             HelpTopic::Remove => REMOVE_USAGE,
             HelpTopic::Poke => POKE_USAGE,
             HelpTopic::Stats => STATS_USAGE,
+            HelpTopic::Reliability => RELIABILITY_USAGE,
             HelpTopic::Export => EXPORT_USAGE,
             HelpTopic::Import => IMPORT_USAGE,
         }
@@ -540,6 +546,34 @@ fn parse_stats(parser: &mut lexopt::Parser) -> Result<Command> {
     }))
 }
 
+/// Parse `reliability [--since <duration>] [--json]` (issues #455/#494) — the offline
+/// reliability-SLO readout. `--since` takes a relative-duration value (space- or
+/// `=`-separated, handled by lexopt); there are no positionals. Duration parse and
+/// validation live in `reliability::run`, so this layer just captures the raw string
+/// (mirrors `parse_stats`).
+fn parse_reliability(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut json = false;
+    let mut since = None;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Reliability)),
+            Long("json") => json = true,
+            Long("since") => {
+                since = Some(
+                    required_value(parser, "since", HelpTopic::Reliability)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            other => return Err(unexpected(other, HelpTopic::Reliability)),
+        }
+    }
+    Ok(Command::Reliability(crate::reliability::ReliabilityArgs {
+        json,
+        since,
+    }))
+}
+
 /// Parse `export [PATH] [--plaintext] [--no-secrets] [--passphrase-file <path> |
 /// --passphrase-stdin]` (issue #148) — the first non-flag token is the PATH, extras
 /// ignored. The passphrase source is NEVER an argv value (#39): `--passphrase-file` takes
@@ -659,6 +693,7 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         "remove" => parse_positional(parser, HelpTopic::Remove, |label| Command::Remove { label }),
         "poke" => parse_positional(parser, HelpTopic::Poke, |target| Command::Poke { target }),
         "stats" => parse_stats(parser),
+        "reliability" => parse_reliability(parser),
         "export" => parse_export(parser),
         "import" => parse_import(parser),
         other => Err(Error::UnknownCommand(other.to_owned())),
@@ -712,6 +747,7 @@ async fn execute(command: Command) -> Result<()> {
         Command::Remove { label } => remove_account(label).await,
         Command::Poke { target } => crate::poke::poke(target).await,
         Command::Stats(args) => crate::stats::run(args).await,
+        Command::Reliability(args) => crate::reliability::run(args),
         Command::Export {
             path,
             no_secrets,
@@ -774,6 +810,7 @@ COMMANDS:
     remove <label>       Delete an account: drop it from the rotation and erase its stash
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
+    reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
     export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout
     import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite
 
@@ -796,7 +833,11 @@ const CAPTURE_USAGE: &str = "sessiometer capture — stash the active account in
 USAGE:
     sessiometer capture [<label>]
 
-    <label>     a name for the captured account (auto-derived from its account-uuid if omitted)
+    <label>     a name for the captured account. Omit it at a terminal and capture
+                offers the account's email as an editable, pre-filled default —
+                press Enter to accept it, or type a shorter handle (e.g. `work`).
+                Omit it when piped/scripted and the label auto-derives from the
+                account-uuid (no prompt, and never the email unconfirmed).
     -h, --help  print this help
 ";
 
@@ -885,7 +926,7 @@ USAGE:
     sessiometer config <path|validate|show> [--origin]
 
     path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
-    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_usage > session_trigger
+    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_session_usage > session_trigger
     show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
     --origin    (with show) tag each value's provenance, so a silently-defaulted absent section is visible
     -h, --help  print this help
@@ -977,6 +1018,26 @@ USAGE:
     --no-color      force the chart colour overlay off
     --ascii         force the ASCII glyph ramp
     -h, --help      print this help
+";
+
+const RELIABILITY_USAGE: &str = "sessiometer reliability — swap-out overshoot SLO readout, offline (reads the event log directly)
+
+USAGE:
+    sessiometer reliability [--since <duration>] [--json]
+
+    --since <d> bound all four indicators to events at/after now - <duration>. <duration> is a
+                non-negative integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w). Omit for
+                the whole-log aggregate (the default).
+    --json      print the readout as JSON (schema:2, for scripts) instead of the text view
+    -h, --help  print this help
+
+READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
+works when the daemon is down. It reports four indicators, each with its target: swap-out
+session_pct P50/P95/P100 (targets P50 <= 97, P100 < 99); time spent blind while near the limit; a
+false-preempt proxy from the blind-window recovery reconciliation; and the usage-poll 429 vs
+transient counts. By default the indicators fold the whole log; --since <duration> bounds them to a
+recent window (the cutoff is documented in both output forms). The readout is roster-wide numbers
+only — no per-account breakdown, no identifiers.
 ";
 
 const EXPORT_USAGE: &str = "sessiometer export — serialize state to an (encrypted by default) migration artifact
@@ -1119,7 +1180,7 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     diag.emit(&Diagnostic::Start {
         accounts: config.roster.len(),
         poll_secs: config.tunables.poll_secs,
-        target_max_usage: config.tunables.target_max_usage,
+        target_max_session_usage: config.tunables.target_max_session_usage,
         session_trigger: config.tunables.session_trigger,
         weekly_trigger: config.tunables.weekly_trigger,
         monitor_401_n: config.tunables.monitor_401_n,
@@ -1182,11 +1243,22 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         // the LIVE canonical token, so it stays behind the operator's opt-in: with `[refresh]` off
         // the active account lapses at expiry and recovers via the #42 emergency swap to a live
         // spare, exactly as before. `cadence()` (`[refresh].cadence_secs`) is the near-expiry
-        // horizon and the proactive throttle — no second config knob.
-        daemon = daemon.with_keep_warm_engine(
-            Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
-            config.refresh.cadence(),
-        );
+        // horizon and the proactive throttle (the near-expiry cadence is a single knob; the #468
+        // proactive on/off opt-in wired below is a separate boolean gate, not a second cadence).
+        // Issue #468 / finding #476 predicate C: the PROACTIVE path (the pre-emptive near-expiry
+        // mint) is a SECOND, default-off opt-in NESTED here. `with_proactive_keep_warm` gates ONLY
+        // that path; the REACTIVE backstop (`should_keep_warm_retry`, on an active 401) keys off the
+        // engine seam alone, so it fires whenever `[refresh].enabled` wires the engine, regardless
+        // of this flag. With `proactive_keep_warm = false` (the default) the active account is kept
+        // warm reactively + recovered by the #467 autonomous adopt-target, cutting the ~44 % of
+        // canonical churn the pre-emptive mint contributed (#476) — safe only because #467 re-based
+        // the scrub it guards against to `continue`-recoverable.
+        daemon = daemon
+            .with_keep_warm_engine(
+                Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
+                config.refresh.cadence(),
+            )
+            .with_proactive_keep_warm(config.refresh.proactive_keep_warm);
     }
     let mut refresh_tick = RefreshTick::new(
         config.roster.clone(),
@@ -1728,8 +1800,8 @@ fn config_path() -> Result<()> {
 /// `config validate` (issue #401): parse + validate `config.toml` WITHOUT running, routing
 /// through the SAME [`Config::load_path`] seam the daemon loads through — so a typo'd/unknown
 /// key (`deny_unknown_fields` → [`Error::ConfigParse`]), an out-of-range value
-/// ([`Error::ConfigInvalid`]), or `target_max_usage > session_trigger`
-/// ([`Error::ConfigTargetMaxAboveTrigger`]) surfaces here with the identical message the daemon
+/// ([`Error::ConfigInvalid`]), or `target_max_session_usage > session_trigger`
+/// ([`Error::ConfigTargetMaxSessionAboveTrigger`]) surfaces here with the identical message the daemon
 /// would fail on, and a clean file reports valid. Read-only: it loads and validates, nothing
 /// more. A validation failure propagates as the loader's error, so it exits non-zero (usable
 /// in a pre-flight check) — `main` prints it and maps the exit code.
@@ -1901,7 +1973,9 @@ fn management_suffix(managed: bool) -> &'static str {
 /// classify — `n/a` is not a false "healthy") stay uncolored.
 ///
 /// Sourced solely from the response's non-secret fields — labels, percentages,
-/// reset instants, a next-swap candidate label — so it can never print a token or email (issue #15);
+/// reset instants, a next-swap candidate label — so it can never print a token, nor any
+/// email EXCEPT an operator-authored account label the operator chose to set as their own
+/// label (issue #15; #444 — an authored email label is a permitted value, never a leak);
 /// the ANSI overlay adds only `\x1b[3Xm`…`\x1b[0m`, never a secret.
 ///
 /// `pub(crate)` so the issue-#15 redaction METER (driven from [`crate::daemon`])
@@ -2021,53 +2095,161 @@ pub(crate) fn render_status(
     }
 
     out.push('\n');
+    // The blind ACTIVE account's retained-anchor projection (issue #479, umbrella #363 Path B), or
+    // `None` when the active account is not in bounded blindness. Resolved ONCE so the per-account
+    // blind line AND the cornered-state detection below read the SAME value. `blind_active` is set
+    // only on the active account and only while blind (a pre-#479 daemon omits it → `None`).
+    let active_blind = response
+        .accounts
+        .iter()
+        .find(|account| account.active)
+        .and_then(|account| account.blind_active.map(|blind| (&account.label, blind)));
+
+    // CORNERED (issue #479, surface 3): the active account is blind, ADR-0017 auto-protection is
+    // DEGRADED (the preemptive gate is armed but acting on a STALE anchor), AND there is no viable
+    // target to swap to — the one bounded-blindness state the daemon CANNOT resolve itself, so the
+    // operator must act. Keying off `auto_protection_degraded` (blind PAST the interim gate window,
+    // anchor at/over the risk band) rather than the raw last-known % is deliberate: before the gate
+    // window the daemon is still self-resolving by waiting out a transient blind blip, so a loudest
+    // alarm THEN would cry wolf — DEGRADED is exactly "auto-protection WOULD swap now but can't".
+    // Composes two daemon verdicts (`blind_active` + `next_swap == no_viable_target`) already on the
+    // wire, so it needs no new field. `active_blind` is `Copy`, so this leaves it usable below.
+    let cornered = match (active_blind, &response.next_swap) {
+        (Some((label, blind)), Some(NextSwap::NoViableTarget { cause, resets_at }))
+            if blind.auto_protection_degraded =>
+        {
+            Some((label, blind, cause, resets_at))
+        }
+        _ => None,
+    };
+
+    if let Some((label, blind, cause, resets_at)) = cornered {
+        // The loudest, distinct state: blind + DEGRADED + nowhere to swap. Name the source, how long
+        // blind, the stale last-known %, WHY the fleet is blocked (the relief cause/reset FOLDED IN
+        // from `next_swap`, so the remedy is not lost when this alarm replaces that footer), and the
+        // ONE remedy only the operator can apply — add or free an account. Printed as DATA
+        // (unconditional, survives a pipe / redirect), red-emphasized when the color gate is open
+        // (the SAME SGR the DEGRADED / systemic lines use); the plain text conveys it under
+        // --no-color. The surface only REFLECTS this daemon-pushed state; it never self-swaps (#169).
+        let dur = humanize_until(blind.blind_secs as i64);
+        let last_known = blind.last_known_session_pct;
+        let relief = match resets_at {
+            Some(at) => format!(", resets in {}", humanize_until(at - now)),
+            None => String::new(),
+        };
+        let blocked = match cause {
+            Some(NoTargetCause::Weekly) => format!("every account is weekly-exhausted{relief}"),
+            Some(NoTargetCause::Session) => {
+                format!("every account is over its session limit{relief}")
+            }
+            None => "no viable target".to_owned(),
+        };
+        let body = format!(
+            "CORNERED: active {label} blind for {dur} at last-known session {last_known}% and \
+             auto-protection cannot act — {blocked}; add or free an account"
+        );
+        if color {
+            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
+        } else {
+            out.push_str(&body);
+            out.push('\n');
+        }
+    } else if let Some((label, blind)) = active_blind {
+        // Not cornered — the normal per-account blind-active line (issue #479 surface 1, shipped in
+        // #496): narrate the REAL state — how long blind, last-known session %, and whether ADR-0017
+        // auto-protection is OK or DEGRADED — instead of the content-free `n/a … 🟡`. Printed as DATA
+        // (unconditional), like the systemic-refresh line below; only the DEGRADED emphasis is
+        // color-gated. DEGRADED is a fault: the gate is armed but acting on a STALE anchor.
+        let dur = humanize_until(blind.blind_secs as i64);
+        let last_known = blind.last_known_session_pct;
+        let verdict = if blind.auto_protection_degraded {
+            "DEGRADED (acting on a stale anchor)"
+        } else {
+            "OK"
+        };
+        let body = format!(
+            "active {label}: blind for {dur} — last-known session {last_known}% — \
+             auto-protection {verdict}"
+        );
+        if color && blind.auto_protection_degraded {
+            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
+        } else {
+            out.push_str(&body);
+            out.push('\n');
+        }
+    }
+
+    // The #452 preemptive-swap NARRATION (issue #479, surface 2): when the daemon swapped a BLIND
+    // active account away on its stale pre-blind anchor, `status` narrates it — the source, the
+    // last-known % the gate FIRED on, the target, and the `use <from>` undo — so an operator can
+    // reverse it if the swapped-away account has since recovered. The SAME information the durable
+    // `event=swap … reason=blind_preempt` log line holds, reflected HERE because `render_status`
+    // reads only this wire, never the event log — each medium in its own idiom (R-2 STATE-parity, as
+    // the `canonical_scrub` footer is). Daemon-side windowed + target-still-active
+    // (`recent_blind_preempt_swap`, projected only within a bounded window while its target is still
+    // active), so this stays a pure render — the surface REFLECTS, never self-swaps (#169). Omitted
+    // from the wire (no line) when there is no recent-and-still-current preemptive swap.
+    if let Some(swap) = &response.recent_blind_preempt_swap {
+        let from = &swap.from_label;
+        let to = &swap.to_label;
+        let pct = swap.last_known_session_pct;
+        out.push_str(&format!(
+            "swapped off {from} (blind @ last-known {pct}%) → {to}; \
+             undo with 'use {from}' if it recovered\n"
+        ));
+    }
+
     // The forward-looking next-swap candidate (issue #88), computed daemon-side
     // ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like
     // the table footer it replaces (per-cell health coloring is #84, orthogonal). A
     // `None` field means the daemon sent no candidate — either a current daemon with no
     // active account to anchor a swap from, or (via `#[serde(default)]`) a pre-#88 daemon
-    // that omits the field — and renders a bare `none` either way.
-    match &response.next_swap {
-        // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
-        // so the CLI operator sees WHY this account — the identical "why this target?" the panel
-        // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
-        // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
-        Some(NextSwap::Target { to, reason }) => {
-            let why = match reason {
-                Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
-                Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
-                Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
-                None => "",
-            };
-            out.push_str(&format!("next swap: {to}{why}\n"));
-        }
-        // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
-        // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
-        // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
-        // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
-        // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
-        // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
-        Some(NextSwap::NoViableTarget { cause, resets_at }) => {
-            let relief = match resets_at {
-                Some(at) => format!("; resets in {}", humanize_until(at - now)),
-                None => String::new(),
-            };
-            match cause {
-                // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
-                // the meaningful escape is more accounts.
-                Some(NoTargetCause::Weekly) => out.push_str(&format!(
+    // that omits the field — and renders a bare `none` either way. SUPPRESSED when cornered
+    // (issue #479): the cornered alarm above already folded in this exact `no_viable_target` relief,
+    // so re-printing `next swap: none — …` would be redundant (cornered fires only on that arm).
+    if cornered.is_none() {
+        match &response.next_swap {
+            // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
+            // so the CLI operator sees WHY this account — the identical "why this target?" the panel
+            // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
+            // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
+            Some(NextSwap::Target { to, reason }) => {
+                let why = match reason {
+                    Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+                    Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
+                    Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
+                    None => "",
+                };
+                out.push_str(&format!("next swap: {to}{why}\n"));
+            }
+            // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
+            // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
+            // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
+            // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
+            // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
+            // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
+            Some(NextSwap::NoViableTarget { cause, resets_at }) => {
+                let relief = match resets_at {
+                    Some(at) => format!("; resets in {}", humanize_until(at - now)),
+                    None => String::new(),
+                };
+                match cause {
+                    // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
+                    // the meaningful escape is more accounts.
+                    Some(NoTargetCause::Weekly) => out.push_str(&format!(
                     "next swap: none — every account is weekly-exhausted{relief} — add an account\n"
                 )),
-                // A session-wide block lifts at the sooner session reset (minutes/hours), so the
-                // reset time itself is the remedy.
-                Some(NoTargetCause::Session) => out.push_str(&format!(
-                    "next swap: none — every account is over its session limit{relief}\n"
-                )),
-                None => out.push_str("next swap: none (no viable target)\n"),
+                    // A session-wide block lifts at the sooner session reset (minutes/hours), so the
+                    // reset time itself is the remedy.
+                    Some(NoTargetCause::Session) => out.push_str(&format!(
+                        "next swap: none — every account is over its session limit{relief}\n"
+                    )),
+                    None => out.push_str("next swap: none (no viable target)\n"),
+                }
             }
+            Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
+            None => out.push_str("next swap: none\n"),
         }
-        Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
-        None => out.push_str("next swap: none\n"),
     }
 
     // The systemic refresh-failure indicator (issue #378): the daemon reports the refresh
@@ -2095,6 +2277,57 @@ pub(crate) fn render_status(
             out.push_str(&body);
             out.push('\n');
         }
+    }
+
+    // The daemon-level KEYCHAIN-LOCKED rollup (issue #498): the macOS login keychain is LOCKED, so the
+    // daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied). The
+    // daemon-LEVEL sibling of the `canonical_scrub` line below, but for an UNREADABLE item rather than a
+    // readable-but-emptied one — so the remedy DIFFERS: UNLOCK THE KEYCHAIN, never `claude /login` (a
+    // re-login cannot help while the keychain that stores the credential is locked). Surfaced as DATA
+    // (unconditional, like the scrub + systemic lines — so it survives a pipe / redirect / `status |
+    // grep`, an operator's health check must see it), naming the state AND the unlock remedy.
+    // Content-parity with the menubar (`StatusPanelFormat.keychainLockedBanner`): same state + same
+    // unlock remedy, each medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for
+    // `ActiveDeadNoTarget`). Printed PLAIN — the action-first footer register of the `shared login:
+    // scrubbed …` sibling (ADR-0016), NOT the systemic line's red SGR. Rendered ABOVE `canonical_scrub`
+    // (worst-first: an unreadable item is at least as severe as a readable-but-scrubbed one), though the
+    // two are daemon-mutually-exclusive in practice (a locked keychain can't be read to know
+    // scrubbed-ness). A bare BINARY state discriminant — never a token or email (#15). `false` (a
+    // healthy / pre-#498 daemon that omits the field) prints nothing.
+    if response.keychain_locked {
+        out.push_str(
+            "shared login: unreadable — the login keychain is locked; unlock it to restore access\n",
+        );
+    }
+
+    // The daemon-level CANONICAL-SCRUB rollup (issue #469, umbrella #463): the shared
+    // `Claude Code-credentials` canonical item has been SCRUBBED (its token cleared), so every
+    // `claude` session is logged out — the fleet-wide lockout NO per-account `AUTH` column reflects
+    // (each account row can read perfectly healthy while the shared item sits emptied). Surfaced as
+    // DATA (unconditional, like the systemic line above — so it survives a pipe / redirect /
+    // `status | grep`, an operator's health check must be able to see it), naming the state and, for
+    // the un-recoverable residual, the `claude /login` remedy. Content-parity with the menubar
+    // (`StatusPanelFormat.canonicalScrubBanner`): same state + same `claude /login` remedy, each
+    // medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for `ActiveDeadNoTarget`).
+    // Printed PLAIN — no color overlay, in the action-first footer register of the `next swap: none
+    // — …` footer above (ADR-0016), NOT the systemic line's red SGR. A fleet-wide STATE discriminant
+    // only — never per-account, never a token or email (#15). `None` (a healthy / pre-#516 daemon
+    // that omits the field) prints nothing.
+    match response.canonical_scrub {
+        // Exhausted — recovery backed off (the bounded adopt churn hit its cap, or no viable adopt
+        // target exists), so the canonical stays empty until a re-login. Name the state AND the
+        // actionable remedy; `claude /login` is the byte-shared remedy the menubar names too.
+        Some(CanonicalScrub::Exhausted) => out.push_str(
+            "shared login: scrubbed — every session is logged out and auto-recovery is exhausted; \
+             run claude /login to restore it\n",
+        ),
+        // Recovering — the daemon is autonomously adopting a live account back into the canonical, so
+        // the fleet may self-heal with NO operator action. The calm, no-remedy cue (lower severity).
+        Some(CanonicalScrub::Recovering) => out.push_str(
+            "shared login: scrubbed — recovering automatically (adopting a live account); \
+             no action needed\n",
+        ),
+        None => {}
     }
 
     // The isolated-refresh discoverability advisory (issue #138): when the periodic refresh
@@ -2217,7 +2450,15 @@ impl StatusRow {
         let marker = if account.active { '*' } else { ' ' };
         StatusRow {
             account: format!("{marker} {}", account.label),
-            session: pct(account.session_pct),
+            // A blind active account with a retained anchor shows its last-known session % with a
+            // `~` (stale / approximate) marker, NOT a bare `n/a` — the row stops reporting "no data"
+            // when the daemon holds a pre-blind anchor (#479); the full state (blind duration +
+            // auto-protection OK/DEGRADED) trails as the footer line. Every other account keeps the
+            // fresh-reading-or-`n/a` cell.
+            session: match account.blind_active {
+                Some(blind) => format!("~{}%", blind.last_known_session_pct),
+                None => pct(account.session_pct),
+            },
             session_reset: reset_cell(account.session_resets_at, now),
             weekly: pct(account.weekly_pct),
             weekly_reset: reset_cell(account.weekly_resets_at, now),
@@ -2228,7 +2469,13 @@ impl StatusRow {
             // its OWN proximity (issue #94), how soon that window flips. A cell with no
             // reading stays `None` (uncolored).
             account_severity: severity(account, now),
-            session_severity: account.session_pct.map(util_severity),
+            // A blind active account colors its stale `~%` by the last-known utilization band — the
+            // anchor's near-limit reading IS the risk the operator should see (#479); otherwise the
+            // fresh reading's band, or uncolored when there is no reading.
+            session_severity: match account.blind_active {
+                Some(blind) => Some(util_severity(blind.last_known_session_pct)),
+                None => account.session_pct.map(util_severity),
+            },
             session_reset_severity: proximity_severity(account.session_resets_at, now),
             weekly_severity: weekly_cell_severity(account),
             weekly_reset_severity: proximity_severity(account.weekly_resets_at, now),
@@ -3758,7 +4005,9 @@ fn remove_confirmation(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::Tunables;
-    use crate::daemon::{AccountStatusLine, NextSwap, NoTargetCause};
+    use crate::daemon::{
+        AccountStatusLine, BlindActive, BlindPreemptSwap, NextSwap, NoTargetCause,
+    };
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -3912,8 +4161,8 @@ personal  22222222-2222-2222-2222-222222222222\n\
             1,
         );
         assert!(
-            !out.contains('@'),
-            "list output must not contain an email: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "list output must not contain a non-authored email (#15/#444): {out:?}"
         );
         assert!(
             !out.to_lowercase().contains("token"),
@@ -4021,6 +4270,9 @@ spare  22222222-2222\n\
         spare.enabled = false;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4047,6 +4299,9 @@ spare  22222222-2222\n\
         // and distinct from the per-account `needs re-login`. #15-clean: a count only, no token/email.
         let response = |systemic| StatusResponse {
             systemic_refresh_failure: systemic,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: None,
@@ -4062,8 +4317,9 @@ spare  22222222-2222\n\
             "carries the count: {down}"
         );
         assert!(
-            !out.contains('@') && !out.to_lowercase().contains("token"),
-            "no secret reaches the surface (#15): {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty()
+                && !out.to_lowercase().contains("token"),
+            "no secret reaches the surface (#15/#444): {out:?}"
         );
 
         // A threshold-of-1 config fires at the first all-error sweep — the noun stays singular.
@@ -4081,6 +4337,455 @@ spare  22222222-2222\n\
     }
 
     #[test]
+    fn render_status_surfaces_the_canonical_scrub_rollup_with_the_relogin_remedy() {
+        // Issue #469: when the daemon reports the shared canonical is SCRUBBED, `status` shows a
+        // dedicated footer line — the fleet-wide lockout no per-account `AUTH` column reflects —
+        // naming the state and, for the un-recoverable residual, the `claude /login` remedy. The
+        // account rows can read perfectly healthy (60/25) while the shared item sits emptied.
+        // #15-clean: a bare state discriminant, never a token or email.
+        let response = |scrub| StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: scrub,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+
+        // Exhausted → names the state AND the actionable `claude /login` remedy (byte-shared with
+        // the menubar's `canonicalScrubBanner` — content-parity, R-2 state-parity).
+        let exhausted = render_status(&response(Some(CanonicalScrub::Exhausted)), NOW, None, false);
+        let line = exhausted
+            .lines()
+            .find(|l| l.contains("shared login: scrubbed"))
+            .expect("the scrubbed line is present");
+        assert!(
+            line.contains("auto-recovery is exhausted") && line.contains("claude /login"),
+            "exhausted names the state + the re-login remedy: {line}"
+        );
+
+        // Recovering → the calm, no-action cue; NEVER the `claude /login` remedy (the daemon may
+        // self-heal by adopting a live account — surfacing a re-login would cry wolf).
+        let recovering = render_status(
+            &response(Some(CanonicalScrub::Recovering)),
+            NOW,
+            None,
+            false,
+        );
+        let line = recovering
+            .lines()
+            .find(|l| l.contains("shared login: scrubbed"))
+            .expect("the scrubbed line is present");
+        assert!(
+            line.contains("recovering automatically") && line.contains("no action needed"),
+            "recovering is a calm no-action cue: {line}"
+        );
+        assert!(
+            !recovering.contains("claude /login"),
+            "recovering carries no re-login remedy: {recovering:?}"
+        );
+
+        // Healthy (None) prints no scrubbed line at all.
+        assert!(
+            !render_status(&response(None), NOW, None, false).contains("shared login"),
+            "no scrubbed line when the canonical is healthy"
+        );
+
+        // The scrubbed line is DATA — it survives with the color gate CLOSED (--no-color) exactly as
+        // it does open, so a piped `status | grep` health check sees it (like the systemic line).
+        assert!(
+            render_status(&response(Some(CanonicalScrub::Exhausted)), NOW, None, true)
+                .contains("shared login: scrubbed"),
+            "the scrubbed line is unconditional data, present under --color too"
+        );
+
+        // #15/#444: no secret reaches EITHER rendered state (a state discriminant only).
+        for out in [&exhausted, &recovering] {
+            assert!(
+                crate::redaction::meter::unauthored_emails(out, &[]).is_empty()
+                    && !out.to_lowercase().contains("token"),
+                "no secret reaches the canonical-scrub surface (#15/#444): {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_status_surfaces_the_keychain_locked_rollup_with_the_unlock_remedy() {
+        // Issue #498: when the daemon reports the login keychain is LOCKED (so the shared canonical is
+        // UNREADABLE — access denied, distinct from #469's readable-but-scrubbed item), `status` shows a
+        // dedicated footer line naming the state AND the UNLOCK remedy (NOT `claude /login` — a re-login
+        // cannot help while the keychain is locked). The account rows can read perfectly healthy (60/25)
+        // while the shared item sits unreadable. #15-clean: a bare state discriminant, never a token or
+        // email.
+        let response = |locked| StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: locked,
+            recent_blind_preempt_swap: None,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+
+        // Locked → names the state (keychain locked) AND the unlock remedy — content-parity with the
+        // menubar's `keychainLockedBanner` (same state + same UNLOCK remedy, R-2 state-parity).
+        let locked = render_status(&response(true), NOW, None, false);
+        let line = locked
+            .lines()
+            .find(|l| l.contains("shared login: unreadable"))
+            .expect("the keychain-locked line is present");
+        assert!(
+            line.contains("keychain is locked") && line.contains("unlock"),
+            "locked names the state + the unlock remedy: {line}"
+        );
+        // NEVER the `claude /login` remedy — that is #469's (a readable-but-scrubbed item); a re-login
+        // cannot help while the keychain that STORES the credential is locked (the #498-vs-#469 point).
+        assert!(
+            !locked.contains("claude /login"),
+            "keychain-locked carries the UNLOCK remedy, never the re-login one: {locked:?}"
+        );
+
+        // Unlocked (false) prints no keychain line at all.
+        assert!(
+            !render_status(&response(false), NOW, None, false).contains("shared login: unreadable"),
+            "no keychain-locked line when the keychain is unlocked"
+        );
+
+        // The keychain-locked line is DATA — it survives with the color gate CLOSED (--no-color) exactly
+        // as it does open, so a piped `status | grep` health check sees it (like the scrub line).
+        assert!(
+            render_status(&response(true), NOW, None, true).contains("shared login: unreadable"),
+            "the keychain-locked line is unconditional data, present under --color too"
+        );
+
+        // #15/#444: no secret reaches the rendered state (a bare state discriminant only).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&locked, &[]).is_empty()
+                && !locked.to_lowercase().contains("token"),
+            "no secret reaches the keychain-locked surface (#15/#444): {locked:?}"
+        );
+    }
+
+    #[test]
+    fn render_status_narrates_a_blind_active_account_instead_of_bare_n_a() {
+        // Issue #479: a blind active account with a retained anchor renders a SEMANTIC line (blind
+        // duration + last-known session % + auto-protection state) plus a stale `~%` cell, not the
+        // content-free `n/a … 🟡` the bare failed-poll row shows.
+        let degraded = AccountStatusLine {
+            health: Some(CredentialHealth::Stale),
+            blind_active: Some(BlindActive {
+                blind_secs: 480,
+                last_known_session_pct: 87,
+                auto_protection_degraded: true,
+            }),
+            ..status_line("work", true, None, None)
+        };
+        let response = StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            refresh_enabled: None,
+            accounts: vec![degraded],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, false);
+        // The semantic footer line states the REAL state — not "no data".
+        assert!(
+            out.contains("active work: blind for")
+                && out.contains("last-known session 87%")
+                && out.contains("auto-protection DEGRADED"),
+            "the blind active account is narrated with its retained anchor + degraded gate: {out}",
+        );
+        // The row's SESSION% cell shows the stale last-known `~87%`, not a bare `n/a`.
+        assert!(
+            out.contains("~87%"),
+            "the session cell shows the stale anchor pct, not n/a: {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_blind_active_ok_below_the_gate_and_absent_when_not_blind() {
+        // Issue #479: OK (blind but not past the gate) says auto-protection OK, no DEGRADED alarm;
+        // a non-blind active account carries no projection → no line and the usual `n/a` cell.
+        let ok = AccountStatusLine {
+            blind_active: Some(BlindActive {
+                blind_secs: 30,
+                last_known_session_pct: 42,
+                auto_protection_degraded: false,
+            }),
+            ..status_line("work", true, None, None)
+        };
+        let out = render_status(
+            &StatusResponse {
+                systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                recent_blind_preempt_swap: None,
+                refresh_enabled: None,
+                accounts: vec![ok],
+                next_swap: None,
+            },
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            out.contains("auto-protection OK") && !out.contains("DEGRADED"),
+            "a blind-but-not-yet-degraded active reads OK: {out}",
+        );
+
+        // A normal (non-blind) active account: no `blind_active` → no narration line, bare `n/a` cell.
+        let normal = render_status(
+            &StatusResponse {
+                systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                recent_blind_preempt_swap: None,
+                refresh_enabled: None,
+                accounts: vec![status_line("work", true, None, None)],
+                next_swap: None,
+            },
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            !normal.contains("blind for") && normal.contains("n/a"),
+            "a non-blind account is unchanged — no line, bare n/a: {normal}",
+        );
+    }
+
+    #[test]
+    fn render_status_blind_active_colors_only_the_degraded_footer_under_color() {
+        // Issue #479: the blind footer's color gate is `color && auto_protection_degraded`, so under
+        // `--color` the DEGRADED line is red-wrapped (the SAME SGR overlay the systemic-refresh line
+        // uses) while the OK line stays PLAIN — an OK line is never emphasized even with color on.
+        let blind = |degraded: bool| StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            refresh_enabled: None,
+            accounts: vec![AccountStatusLine {
+                blind_active: Some(BlindActive {
+                    blind_secs: 480,
+                    last_known_session_pct: 87,
+                    auto_protection_degraded: degraded,
+                }),
+                ..status_line("work", true, None, None)
+            }],
+            next_swap: None,
+        };
+        // DEGRADED + color → the footer body is wrapped in the red SGR (the reset directly follows it).
+        let degraded = render_status(&blind(true), NOW, None, true);
+        assert!(
+            degraded.contains("auto-protection DEGRADED (acting on a stale anchor)\x1b[0m"),
+            "the degraded blind footer is red-wrapped under --color: {degraded:?}",
+        );
+        // OK + color → the footer stays PLAIN (newline-terminated, no SGR) — the `&& degraded` guard.
+        let ok = render_status(&blind(false), NOW, None, true);
+        assert!(
+            ok.contains("auto-protection OK\n") && !ok.contains("auto-protection OK\x1b[0m"),
+            "the OK blind footer stays plain even under --color: {ok:?}",
+        );
+    }
+
+    /// A cornered response: the active account is blind + DEGRADED, and `next_swap` is
+    /// `NoViableTarget` with the given cause/reset — the composition that fires the surface-3 alarm.
+    fn cornered_response(cause: Option<NoTargetCause>, resets_at: Option<i64>) -> StatusResponse {
+        StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            refresh_enabled: None,
+            accounts: vec![AccountStatusLine {
+                blind_active: Some(BlindActive {
+                    blind_secs: 480,
+                    last_known_session_pct: 87,
+                    auto_protection_degraded: true,
+                }),
+                ..status_line("work", true, None, None)
+            }],
+            next_swap: Some(NextSwap::NoViableTarget { cause, resets_at }),
+        }
+    }
+
+    #[test]
+    fn render_status_cornered_is_the_loudest_state_and_names_the_remedy() {
+        // Issue #479 (surface 3): active blind + DEGRADED + no viable target = the one bounded-
+        // blindness state the daemon cannot resolve itself. It renders ONE loud, distinct alarm that
+        // names the source, the stale last-known %, WHY the fleet is blocked (folded in from the
+        // no-target relief), and the operator remedy — and SUPPRESSES both the separate blind-DEGRADED
+        // line and the `next swap: none — …` footer, which split read as two unrelated observations.
+        let out = render_status(
+            &cornered_response(
+                Some(NoTargetCause::Weekly),
+                Some(NOW + 2 * 86_400 + 4 * 3_600),
+            ),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            out.contains("CORNERED: active work blind for")
+                && out.contains("last-known session 87%")
+                && out.contains("auto-protection cannot act")
+                && out.contains("every account is weekly-exhausted, resets in 2d4h")
+                && out.contains("add or free an account"),
+            "the cornered alarm names source + stale pct + blocker + remedy: {out}",
+        );
+        // The two constituent lines are FOLDED INTO the alarm, not printed separately.
+        assert!(
+            !out.contains("auto-protection DEGRADED"),
+            "the separate blind-DEGRADED line is suppressed when cornered: {out}",
+        );
+        assert!(
+            !out.contains("next swap:"),
+            "the next-swap footer is suppressed when cornered (folded into the alarm): {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_cornered_folds_each_no_target_cause() {
+        // The remedy relief is folded from `next_swap`'s cause, so the operator still sees WHY. A
+        // SESSION-wide block names the sooner reset; an absent cause (pre-#405 daemon) falls back to
+        // the bare "no viable target" — each still carrying the "add or free an account" remedy.
+        let session = render_status(
+            &cornered_response(Some(NoTargetCause::Session), Some(NOW + 47 * 60)),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            session.contains("every account is over its session limit, resets in 47m")
+                && session.contains("add or free an account"),
+            "session-cause cornered folds the session relief: {session}",
+        );
+        let bare = render_status(&cornered_response(None, None), NOW, None, false);
+        assert!(
+            bare.contains("CORNERED: active work")
+                && bare.contains("no viable target")
+                && bare.contains("add or free an account"),
+            "a causeless cornered still alarms with the remedy: {bare}",
+        );
+    }
+
+    #[test]
+    fn render_status_is_not_cornered_without_both_degraded_and_no_target() {
+        // Cornered requires BOTH auto-protection DEGRADED AND no viable target. Either alone renders
+        // the ordinary (non-alarming) surfaces — the two guards that keep the loudest state rare.
+
+        // (a) Blind + DEGRADED but a VIABLE target exists → the daemon WILL swap; the normal
+        //     blind-DEGRADED line + the ordinary `next swap: <target>` footer, NOT the cornered alarm.
+        let has_target = StatusResponse {
+            next_swap: Some(NextSwap::Target {
+                to: "spare".to_owned(),
+                reason: Some(NextSwapReason::OnlyCandidate),
+            }),
+            ..cornered_response(None, None)
+        };
+        let out = render_status(&has_target, NOW, None, false);
+        assert!(
+            !out.contains("CORNERED")
+                && out.contains("auto-protection DEGRADED")
+                && out.contains("next swap: spare (only viable target)"),
+            "degraded + a viable target is NOT cornered — the daemon will swap: {out}",
+        );
+
+        // (b) Blind but auto-protection OK (not yet past the gate) + no viable target → the daemon is
+        //     still self-resolving by waiting out the blip; the normal blind-OK line + the ordinary
+        //     no-target footer, NOT the loudest alarm (the anti-cry-wolf guard).
+        let ok_no_target = StatusResponse {
+            accounts: vec![AccountStatusLine {
+                blind_active: Some(BlindActive {
+                    blind_secs: 30,
+                    last_known_session_pct: 62,
+                    auto_protection_degraded: false,
+                }),
+                ..status_line("work", true, None, None)
+            }],
+            ..cornered_response(Some(NoTargetCause::Weekly), None)
+        };
+        let out = render_status(&ok_no_target, NOW, None, false);
+        assert!(
+            !out.contains("CORNERED")
+                && out.contains("auto-protection OK")
+                && out.contains("next swap: none — every account is weekly-exhausted"),
+            "blind-OK (pre-gate) + no target is NOT cornered — cry-wolf guard: {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_cornered_is_red_under_color() {
+        // The cornered alarm is unconditionally red-emphasized under the color gate (the loudest
+        // state) — the SAME SGR the DEGRADED / systemic lines use — while the plain text conveys the
+        // crisis under --no-color / a pipe.
+        let colored = render_status(
+            &cornered_response(Some(NoTargetCause::Weekly), None),
+            NOW,
+            None,
+            true,
+        );
+        assert!(
+            colored.contains("add or free an account\x1b[0m"),
+            "the cornered alarm is red-wrapped under --color: {colored:?}",
+        );
+        let plain = render_status(
+            &cornered_response(Some(NoTargetCause::Weekly), None),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            plain.contains("add or free an account\n") && !plain.contains("\x1b["),
+            "the cornered alarm is plain under --no-color: {plain:?}",
+        );
+    }
+
+    #[test]
+    fn render_status_narrates_a_recent_preemptive_swap_with_the_undo() {
+        // Issue #479 (surface 2): a daemon-pushed `recent_blind_preempt_swap` renders a narration line
+        // naming the source, the last-known % the gate fired on, the target, and the `use <from>` undo
+        // — reflected in `status` (the same information the `event=swap … reason=blind_preempt` log
+        // line holds). Absent from the wire → no line.
+        let narrated = StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: Some(BlindPreemptSwap {
+                from_label: "spare".to_owned(),
+                to_label: "work".to_owned(),
+                last_known_session_pct: 68,
+            }),
+            refresh_enabled: None,
+            accounts: vec![status_line("work", true, Some(20), Some(15))],
+            next_swap: None,
+        };
+        let out = render_status(&narrated, NOW, None, false);
+        assert!(
+            out.contains(
+                "swapped off spare (blind @ last-known 68%) → work; \
+                 undo with 'use spare' if it recovered"
+            ),
+            "the preemptive swap is narrated with source + stale pct + target + undo: {out}",
+        );
+
+        // No recent preemptive swap on the wire → no narration line.
+        let quiet = StatusResponse {
+            recent_blind_preempt_swap: None,
+            ..narrated
+        };
+        let out = render_status(&quiet, NOW, None, false);
+        assert!(
+            !out.contains("swapped off") && !out.contains("undo with"),
+            "no line when there is no recent preemptive swap: {out}",
+        );
+    }
+
+    #[test]
     fn render_status_marks_a_quarantined_account_needs_relogin() {
         // Issue #42: a dead-credential account carries the durable `needs re-login`
         // tag in `status`, while a healthy account's line is unchanged. The tag is a
@@ -4089,6 +4794,9 @@ spare  22222222-2222\n\
         spare.quarantined = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4105,8 +4813,8 @@ spare  22222222-2222\n\
             "the dead account carries the durable re-login tag: {spare}"
         );
         assert!(
-            !out.contains('@'),
-            "no email on the printed surface: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "no non-authored email on the printed surface (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
     }
@@ -4125,6 +4833,9 @@ spare  22222222-2222\n\
         dead.quarantined = true; // quarantined but NOT recovering — still dead
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
             next_swap: None,
@@ -4142,8 +4853,8 @@ spare  22222222-2222\n\
         );
         // The tag is a plain string — no token, no email reaches the surface (#15).
         assert!(
-            !out.contains('@'),
-            "no email on the printed surface: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "no non-authored email on the printed surface (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
     }
@@ -4224,6 +4935,9 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![healthy_but_spent, dead],
             next_swap: None,
@@ -4240,7 +4954,7 @@ spare  22222222-2222\n\
             "the dead account shows the red glyph and the actionable cue: {spare}"
         );
         // The glyph IS the signal — present even without color, and #15-clean.
-        assert!(!out.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&out, &[]).is_empty());
         assert!(!out.to_lowercase().contains("token"));
         // The AUTH column starts at the SAME display offset in both rows — the preceding
         // columns pad to one width despite the dead row's `n/a` cells and the healthy row's
@@ -4265,6 +4979,9 @@ spare  22222222-2222\n\
         // columns). Any glyph rollup materializes the column and its label.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 health: Some(CredentialHealth::Healthy),
@@ -4293,6 +5010,9 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 line("healthy", Healthy),
@@ -4359,6 +5079,9 @@ spare  22222222-2222\n\
         // expiry reads an honest `unknown`. The DEFAULT table stays compact — no raw clock.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 AccountStatusLine {
@@ -4404,10 +5127,10 @@ spare  22222222-2222\n\
             "an account with no stored expiry reads an honest placeholder: {}",
             vline("spare")
         );
-        // #15: sourced from labels + a timestamp only, so no email rides the surface.
+        // #15/#444: labels + a timestamp only, so no NON-authored email rides the surface.
         assert!(
-            !verbose.contains('@'),
-            "no email on the verbose surface: {verbose}"
+            crate::redaction::meter::unauthored_emails(&verbose, &[]).is_empty(),
+            "no non-authored email on the verbose surface (#15/#444): {verbose}"
         );
     }
 
@@ -4417,6 +5140,9 @@ spare  22222222-2222\n\
         // `status --verbose` on an empty roster adds nothing.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![],
             next_swap: None,
@@ -4551,6 +5277,7 @@ spare  22222222-2222\n\
             access_expires_at: None,
             refresh_health: None,
             health: None,
+            blind_active: None,
         }
     }
 
@@ -4578,6 +5305,7 @@ spare  22222222-2222\n\
             access_expires_at: None,
             refresh_health: None,
             health: None,
+            blind_active: None,
         }
     }
 
@@ -4606,6 +5334,9 @@ spare  22222222-2222\n\
         work.active = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 work,
@@ -4646,6 +5377,9 @@ spare  22222222-2222\n\
         // these display labels.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -4699,6 +5433,9 @@ spare  22222222-2222\n\
         // only the weekly reset; now it shows the session reset too.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 // healthy: session 12m, weekly 5d — both appear.
@@ -4785,6 +5522,9 @@ spare  22222222-2222\n\
         quarantined.quarantined = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             next_swap: None,
@@ -4810,6 +5550,9 @@ spare  22222222-2222\n\
         // takes its label with it.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![{
                 let mut a = status_line_resets(
@@ -4897,6 +5640,9 @@ spare  22222222-2222\n\
         let footer = |next_swap| {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap,
@@ -4995,6 +5741,9 @@ spare  22222222-2222\n\
         // per-cell health coloring is #84, orthogonal; the footer stays uncolored.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
@@ -5031,6 +5780,9 @@ spare  22222222-2222\n\
         // interactive TTY).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5064,6 +5816,9 @@ spare  22222222-2222\n\
         for health in [Unknown, Stale, AtRisk, Degraded, Dead] {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: Some(false),
                 accounts: vec![
                     health_line("account-a", true, Healthy),
@@ -5085,6 +5840,9 @@ spare  22222222-2222\n\
         // non-active account — the maintenance mechanism is already on.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(true),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5104,6 +5862,9 @@ spare  22222222-2222\n\
         // AC-2: refresh off, but every NON-ACTIVE account is 🟢 Healthy → nothing to advise.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5126,6 +5887,9 @@ spare  22222222-2222\n\
         // non-active accounts healthy does NOT arm the advisory.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Dead),
@@ -5148,6 +5912,9 @@ spare  22222222-2222\n\
         // ANSI overlay. Same response as AC-1, only the gate differs.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5173,6 +5940,9 @@ spare  22222222-2222\n\
         // it cannot know.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5195,6 +5965,9 @@ spare  22222222-2222\n\
         // (cli.rs:951-953), so the advisory can never reach a `--json | jq` consumer as data.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5219,6 +5992,9 @@ spare  22222222-2222\n\
         // next-swap candidate label, so a token / email can never reach the printed surface.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5235,8 +6011,8 @@ spare  22222222-2222\n\
         };
         let out = render_status(&response, NOW, None, false);
         assert!(
-            !out.contains('@'),
-            "status output must not contain an email: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "status output must not contain a non-authored email (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
     }
@@ -5531,6 +6307,9 @@ spare  22222222-2222\n\
         // a pipe / redirect / log never carries an escape (the gate's promise).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "hot",
@@ -5553,6 +6332,9 @@ spare  22222222-2222\n\
     fn color_on_tints_each_row_and_strips_back_to_the_exact_plain_table() {
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 // green: low utilization.
@@ -5613,6 +6395,9 @@ spare  22222222-2222\n\
         // per-cell color, not one row-wide tint.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -5650,6 +6435,9 @@ spare  22222222-2222\n\
         // utilization (both `%` here are a calm green).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -5693,6 +6481,9 @@ spare  22222222-2222\n\
         // while its colored siblings prove the overlay is active.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "half",
@@ -5728,6 +6519,9 @@ spare  22222222-2222\n\
         // misalign it — and keeps the `SESSION%` header (issue #99) over its data too.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -5782,6 +6576,9 @@ spare  22222222-2222\n\
         // now-correct `display_width` (2 cells for the coalesced glyph), not char count.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -5868,6 +6665,9 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![
                 line_for("ascii", Some(NOW + 4 * 3_600)),
@@ -5901,6 +6701,9 @@ spare  22222222-2222\n\
         // never an `@`-email or a token sigil.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5918,8 +6721,8 @@ spare  22222222-2222\n\
         let out = render_status(&response, NOW, None, true);
         assert!(out.contains('\x1b'), "the overlay is active: {out:?}");
         assert!(
-            !out.contains('@'),
-            "no email on the colored surface: {out:?}"
+            crate::redaction::meter::unauthored_emails(&out, &[]).is_empty(),
+            "no non-authored email on the colored surface (#15/#444): {out:?}"
         );
         assert!(!out.to_lowercase().contains("token"));
         assert!(!out.contains("sk-ant-"));
@@ -6004,6 +6807,9 @@ spare  22222222-2222\n\
         // serializes this exact response verbatim, the same surface scripts consume.)
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6208,6 +7014,9 @@ spare  22222222-2222\n\
             generated_at: 1_782_777_600,
             status: StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: Some(NextSwap::Target {
@@ -6268,6 +7077,9 @@ spare  22222222-2222\n\
             generated_at,
             status: StatusResponse {
                 systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                recent_blind_preempt_swap: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: None,
@@ -6382,8 +7194,11 @@ spare  22222222-2222\n\
         assert!(json.contains("\"generated_at\": 1782777600"), "got {json}");
         // The payload stays FLAT at the top level (not nested under a key).
         assert!(json.contains("\"accounts\""), "got {json}");
-        // Redaction unchanged (issue #15): no email/token on the `--json` wire.
-        assert!(!json.contains('@'), "got {json}");
+        // Redaction (#15/#444): no NON-authored email, no token, on the `--json` wire.
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "got {json}"
+        );
         assert!(!json.to_lowercase().contains("token"), "got {json}");
     }
 
@@ -7797,6 +8612,67 @@ spare  22222222-2222\n\
                 ascii: false,
             })
         );
+    }
+
+    #[test]
+    fn reliability_parses_bare_json_and_since() {
+        // Bare defaults to the human view with no window.
+        assert_eq!(
+            parse_argv(&["reliability"]).unwrap(),
+            Command::Reliability(crate::reliability::ReliabilityArgs {
+                json: false,
+                since: None,
+            })
+        );
+        assert_eq!(
+            parse_argv(&["reliability", "--json"]).unwrap(),
+            Command::Reliability(crate::reliability::ReliabilityArgs {
+                json: true,
+                since: None,
+            })
+        );
+        // `--since` captures its RAW value (space- or `=`-separated); duration parse + validation
+        // are deferred to `reliability::run`, so the CLI layer just carries the string through.
+        for argv in [
+            vec!["reliability", "--since", "7d"],
+            vec!["reliability", "--since=7d"],
+        ] {
+            assert_eq!(
+                parse_argv(&argv).unwrap(),
+                Command::Reliability(crate::reliability::ReliabilityArgs {
+                    json: false,
+                    since: Some("7d".to_string()),
+                }),
+                "argv {argv:?} must carry the raw --since value",
+            );
+        }
+        // `--since` composes with `--json`.
+        assert_eq!(
+            parse_argv(&["reliability", "--since", "24h", "--json"]).unwrap(),
+            Command::Reliability(crate::reliability::ReliabilityArgs {
+                json: true,
+                since: Some("24h".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn reliability_since_without_a_value_is_a_clear_error() {
+        // `--since` as the last token → a clear "needs a value", not a silent empty window.
+        let err = parse_argv(&["reliability", "--since"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
+        assert!(err.to_string().contains("since"), "got: {err}");
+    }
+
+    #[test]
+    fn reliability_help_routes_and_an_unknown_flag_is_a_clear_error() {
+        assert_eq!(
+            parse_argv(&["reliability", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Reliability)
+        );
+        // A stray positional or flag the readout does not accept → strict-usage error.
+        let err = parse_argv(&["reliability", "--period"]).unwrap_err();
+        assert!(matches!(err, Error::CliUsage { .. }));
     }
 
     #[test]

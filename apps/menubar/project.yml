@@ -35,6 +35,11 @@ targets:
         # resolve to `Assets.xcassets/AccentColor` (#007aff light / #0a84ff dark) instead of the user's
         # macOS system accent, so a non-blue system accent can't drift the panel hue off the design mock.
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # Ship the bespoke full-color app icon (#438): the asset compiler resolves `Assets.xcassets/AppIcon`
+        # (the 10-size mac AppIcon set generated from the brand SSOT `brand/generate.sh`, #442) and sets
+        # `CFBundleIconName`, so the app shows the Cycle-Gauge icon in Dock / Finder / About. Full color is
+        # correct on these surfaces — unlike the monochrome menu-bar status-item template glyphs (#325/#437).
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
   # Wire-decoder (#322) + socket-transport (#323) + status-store (#324) unit tests. A STANDALONE
   # logic-test bundle: no TEST_HOST, so it never launches the app — it compiles the pure production
   # sources directly alongside the tests (NOT the whole Sources dir: main.swift is the app's
@@ -72,12 +77,34 @@ targets:
       # connector. No socket, no live daemon, and so never a real credential swap in a test run. `SwapAck`
       # is already compiled above as the decoder this model routes on.
       - path: Sources/AccountSwapModel.swift
+      # Stats tab (#446): the AppKit-free Stats-tab model (idle → loading → loaded → failed) + its
+      # `StatsCommand` / `StatsFailure`, over the SAME WatchConnection seam, so the one-shot `stats` query's
+      # phase machine — including the "keep prior series while refetching" gate and the decode/error/transport
+      # branches — is driven hermetically by the in-process fake connector. No socket, no live daemon. The
+      # `StatsWire` decoder it routes on is already compiled via WireModel.swift above.
+      - path: Sources/PanelStatsModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
+      # Native swap / all-accounts-exhausted notifications (#267): the pure event deriver + neutral
+      # (redacted) content + toggle-gating shell. Compiled here (NOT UserNotificationPresenter.swift or
+      # main.swift — those touch UNUserNotificationCenter / AppKit the headless bundle can't drive) so
+      # swap/exhausted detection, content redaction, and toggle gating are tested against a spy
+      # presenter with no OS notification surface.
+      - path: Sources/AccountEventNotifier.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
       # StatusItemController/StatusPanelView/main.swift — those touch NSStatusBar/AppKit UI that a
       # headless logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
       - path: Sources/StatusGauge.swift
+      # Bar-glyph render-parity renderer (#525): the pure template-tint + explicit-pixel-size raster factory
+      # `BarGlyphParityTests` drives (NOT RenderBarGlyphTool.swift — that touches CommandLine/exit app-tool
+      # surface; the renderer itself is pure AppKit drawing that runs headless). Compiled here so the drift
+      # gate re-renders the glyphs in-process and diffs against the committed references.
+      - path: Sources/BarGlyphRenderer.swift
+      # The compiled asset catalog (#525): the bar-glyph parity gate resolves the REAL bespoke `.symbolset`s
+      # via `StatusGauge.image(for:in:)` against THIS bundle — `NSImage(named:)` would swallow them into the
+      # fallbackRing here (the logic-test bundle's `Bundle.main` is the xctest runner, not the catalog).
+      # actool compiles it into `MenubarTests.xctest/Contents/Resources/Assets.car`.
+      - path: Sources/Assets.xcassets
       # Status-panel format (#326): the pure, `src/cli.rs`-mirroring presentation layer (health/reset/pct).
       # Added here (NOT StatusPanelView.swift/main.swift — SwiftUI/AppKit the headless bundle can't drive)
       # so the byte-parity contract with the Rust `status` verb is tested in isolation.

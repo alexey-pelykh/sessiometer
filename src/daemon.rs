@@ -69,7 +69,7 @@
 //! session gate (a session-saturated account is never a swap target, mirroring the
 //! weekly-exhaustion exclusion); the post-swap cooldown (#10) additionally PACES swaps
 //! — a re-swap is refused until the per-cycle jittered cooldown has elapsed — and the
-//! swap-target `target_max_usage` reserve (#398) is a default-on ceiling on top: a
+//! swap-target `target_max_session_usage` reserve (#398) is a default-on ceiling on top: a
 //! PROACTIVE swap only lands on an account whose session usage is *below* it, so the
 //! target keeps runway. The reserve is a hard filter on that path — if nothing sits
 //! below it, holding is the correct answer. An EMERGENCY swap (the active credential is
@@ -104,8 +104,9 @@ use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
 use crate::observability::{
-    BackoffClass, CaptureEventOutcome, CredentialHealth, DecisionClass, Diagnostic, DiagnosticLog,
-    Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome, SwapReason,
+    BackoffClass, CanonicalLiveness, CaptureEventOutcome, CredentialHealth, DecisionClass,
+    Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome,
+    SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
@@ -136,8 +137,9 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
-    StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
+    AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub, NextSwap, NextSwapReason,
+    NoTargetCause, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -149,8 +151,9 @@ pub(crate) use snapshot::{status_response, RefreshHealth};
 mod socket;
 
 pub(crate) use socket::{
-    notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_swap_ack,
-    CaptureAck, CaptureCommand, CaptureRejection, Control, ControlSignal, ControlYield, SwapAck,
+    notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_config_set_ack,
+    write_swap_ack, CaptureAck, CaptureCommand, CaptureRejection, ConfigSetAck, ConfigSetCommand,
+    ConfigSetEffect, ConfigSetRejection, Control, ControlSignal, ControlYield, SwapAck,
     SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
@@ -161,8 +164,9 @@ pub(crate) use socket::{
 // `use super::*` resolves them while a non-test build sees no unused re-export.
 #[cfg(test)]
 pub(crate) use socket::{
-    control_reply, encode_heartbeat_frame, encode_snapshot_frame, parse_watch_frame, serve_control,
-    serve_watch, ServeOutcome, WatchFrame, MAX_CONTROL_LINE_BYTES,
+    config_get_reply, control_reply, encode_heartbeat_frame, encode_snapshot_frame,
+    parse_watch_frame, serve_control, serve_stats, serve_watch, ServeOutcome, StatsRequest,
+    WatchFrame, MAX_CONTROL_LINE_BYTES,
 };
 
 mod run_loop;
@@ -212,18 +216,195 @@ const LOCK_BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// is the actual ceiling. `6` (×64) is past the cap for any realistic interval, so
 /// it is a safety bound, not the operative limit.
 const POLL_BACKOFF_MAX_SHIFT: u32 = 6;
-/// Ceiling on the rate-limit / transient poll back-off (issue #76). Under sustained
-/// `429` / `5xx` the effective poll spacing grows exponentially but settles here —
-/// one poll per hour, gentle on a throttling endpoint without going fully dark. A
-/// server-advised `Retry-After` is honoured as a MINIMUM but is itself clamped to this
-/// ceiling (issue #294), so this is the absolute maximum any single account's
-/// poll-backoff window can reach.
+/// Ceiling on the rate-limit / transient poll back-off (issue #76) for a NON-active
+/// (peer) account. Under sustained `429` / `5xx` the effective poll spacing grows
+/// exponentially but settles here — one poll per hour, gentle on a throttling endpoint
+/// without going fully dark. A server-advised `Retry-After` is honoured as a MINIMUM but
+/// is itself clamped to this ceiling (issue #294), so this is the absolute maximum a
+/// PEER's poll-backoff window can reach. The ACTIVE account is bounded MORE tightly by
+/// [`ACTIVE_POLL_BACKOFF_CAP`] and honours `Retry-After` as an un-clamped floor instead
+/// (issue #453).
 const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
+/// Ceiling on the ACTIVE account's OWN rate-limit / transient poll back-off (issue #453,
+/// the `active_backoff_cap_secs` tunable — default 120 s). Much tighter than the peer
+/// [`POLL_BACKOFF_CAP`]: a `429` on the active account blinds the very account being
+/// consumed, so its self-backoff (the exponential arm, when the server gives NO
+/// `Retry-After`) is clamped here to recover observability fast, rather than letting the
+/// exponential climb toward an hour. Applies ONLY to the exponential arm — a server
+/// `Retry-After` is an ABSOLUTE floor for the active account (never clamped by this or by
+/// [`POLL_BACKOFF_CAP`]), so the daemon never re-polls before the server said it may
+/// (issue #453 AC). Peers are unaffected — they keep the [`POLL_BACKOFF_CAP`] ceiling and
+/// the #294 pathological-`Retry-After` clamp.
+const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
+/// Interim `T` for the #452 bounded-blindness preemptive-swap gate (ADR-0017): the active
+/// account's retained pre-blind anchor must be stale beyond this before the gate turns eligible.
+/// The always-on measurement band for the gate-premise SLI (issue #482, the
+/// [`Event::BlindGateEligible`] no-viable-target falsifier) and the [`blind_active_view`] status
+/// projection (#479). #452's SWAP action keys off the `session_blind_swap_secs` CONFIG tunable
+/// instead (default-equal to this, so the two align out of the box); this const stays the SLI /
+/// status band DELIBERATELY, so the config kill-switch disables the swap without blinding #484's
+/// ratification SLIs. The interim value (300 s) is the one ADR-0017 names; measuring the SLI at
+/// exactly it is what lets #484 confirm-or-refute the constant against production.
+///
+/// INTERIM / REVERSIBLE — stays so until the production ratification bar (issue #484, documented on
+/// [`BLIND_GATE_RISK_BAND`] and shared by both constants) is met; promotion reads PRODUCTION SLIs
+/// (#482 / #449 / #455), NOT a re-run of the #451 replay.
+const BLIND_GATE_SECS: u64 = 300;
+/// Interim `risk_band` for the #452 gate (ADR-0017), as a session-usage fraction: the retained
+/// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) must be at/over this for the gate to
+/// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_trigger`
+/// ([`Daemon::session_trigger_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
+/// stale anchor, before the account would have tripped the reactive band. The always-on SLI
+/// (#482) / status (#479) measurement band; #452's swap keys off the `session_blind_risk_band`
+/// CONFIG tunable (default-equal), so the action threshold and this measurement band align out of
+/// the box, but a config kill-switch disables only the action — the SLI keeps measuring.
+///
+/// INTERIM / REVERSIBLE, biased CONSERVATIVE (issue #484). ADR-0017 named the interim at 65 %; #484
+/// biases it to the low end of a conservative **[60, 65] band** — the interim evolution the ADR
+/// anticipated ("to be finalised"), not a rewrite. Why low: the #451 replay is FLAT (0 walls /
+/// disasters / false-preempts) all the way from 68 % down to 50 %, so the data bounds only the
+/// CEILING (≤ 68 % — above it the gate can't fire before S1's own pre-blind anchor) and leaves the
+/// floor free. With the floor undetermined the swap-timing asymmetry decides it: firing LATE misses
+/// the swap outright (unrecoverable), firing EARLY only spends a swap onto a still-recoverable
+/// target — so more margin (a lower band) is the cheap-error direction. 60 % is that low end;
+/// production evidence is required to move it UP.
+///
+/// PROMOTION BAR (interim → locked), shared with [`BLIND_GATE_SECS`], read off PRODUCTION SLIs — NOT
+/// a re-run of the #451 replay (which only reproduces its own assumptions: linear velocity,
+/// `t_fire = T` ignoring the ±1-poll-tick granularity, n=3 from one fleet). Holds interim until ALL:
+/// (1) **≥ 5** distinct gated-eligible blind episodes (#482 [`Event::BlindGateEligible`],
+/// `viable_target=true`) — 5 itself a conservative interim, above the replay's discredited n=3;
+/// (2) **zero session walls** across them (no `reason=session` swap-out or blind recovery at/over
+/// ~99 %, via #455's swap-out overshoot P100 SLO + #449's `blind_window` `session_at_recovery`);
+/// (3) a **majority** classified `swap_necessary=true` (#482's post-recovery swap-necessity —
+/// `session_at_recovery` climbed meaningfully above the stale anchor over its `anchor_age`). A
+/// promotion commit cites those readings; absent them the band holds at 60 %.
+const BLIND_GATE_RISK_BAND: f64 = 0.60;
+
+/// Minimum velocity samples the #539 EMA must have blended before its rate is trusted for a
+/// projective swap (ADR-0017). At `1` the EMA is a SINGLE freshly-seeded interval — an isolated
+/// spike would project and fire on it, defeating the "damp single-interval spikes" purpose of the
+/// smoothing; requiring `>= 2` means ≥ 2 intervals have blended, so a spike that did not persist has
+/// already decayed back below the crossing (the "no-fire without SUSTAINED velocity" invariant).
+/// A small compile-time interim (like [`BLIND_GATE_SECS`]): the operator-facing tunables are the
+/// horizon / guard / α; this floor is an internal soundness bound on the smoothing, not a policy dial.
+const MIN_VELOCITY_SAMPLES: u32 = 2;
+
+/// The ADR-0017 preemptive-gate ARMING predicate on the retained pre-blind anchor: blind past the
+/// interim [`BLIND_GATE_SECS`] (strict `>`) AND the anchor at/over the interim [`BLIND_GATE_RISK_BAND`]
+/// (`>=`). The SINGLE source of truth for "the gate is armed", so [`blind_active_view`]'s
+/// `auto_protection_degraded` projection (#479) and [`Daemon::note_blind_gate_eligibility`]'s
+/// not-eligible guard (#482) cannot drift apart — both express THIS one predicate (the latter as its
+/// negation) rather than re-encoding the two comparisons independently.
+fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
+    blind_secs > BLIND_GATE_SECS && anchor_session >= BLIND_GATE_RISK_BAND
+}
+
+/// How long (seconds) `status` NARRATES a #452 bounded-blindness preemptive swap (issue #479) after
+/// it fires — the bounded window the retained [`BlindPreemptSwap`] notice is projected onto the wire
+/// (`recent_blind_preempt_swap`). The notice is a transient, high-signal "the daemon just swapped you
+/// off a blind account on a stale reading — undo with `use <from>` if it recovered" prompt, so it is
+/// deliberately short: long enough for an operator glancing at `status` shortly after a swap to catch
+/// it, short enough not to nag as stale chrome once the moment has passed (and any superseding swap
+/// clears it sooner, via the target-still-active projection gate). Scaled at the gate window
+/// [`BLIND_GATE_SECS`] — the same order of time the blindness episode that triggered the swap unfolds
+/// over.
+///
+/// INTERIM — the display window is a UX dial, not a correctness bound, and no production evidence yet
+/// fixes it; 300 s is a defensible starting scale (ratification-pending, issue #479). Distinct from
+/// the swap gate's own thresholds; changing it only widens/narrows the narration window, never
+/// whether a swap fires.
+const BLIND_PREEMPT_NOTICE_SECS: u64 = 300;
+
+/// Project the active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) for the
+/// `status` wire, or `None` when the account is not in bounded blindness. PURE — a function of the
+/// retained pre-blind anchor (`last_good`, #450), the blind predicate, the quarantine flag, and the
+/// monotonic clock — so it is unit-tested directly and `status` surfaces a SEMANTIC line
+/// (blind duration + last-known session % + auto-protection OK/DEGRADED) instead of the content-free
+/// `n/a … 🟡` a bare failed-poll row shows.
+///
+/// Returns `Some` only when ALL hold — the same episode shape [`Daemon::note_blind_gate_eligibility`]
+/// gates on, MINUS its viable-target check (surfacing the state does not need a target):
+/// - `active_is_blind` — the active account's live reading is cleared (`last_readings[active]` is
+///   `None`, a `429`/`5xx` blind window), AND
+/// - `!quarantined` — a DEAD (#42) blind active belongs to the `emergency_swap` path, not bounded
+///   blindness; ADR-0017 keeps the two separate, so a quarantined active is excluded, AND
+/// - a retained anchor exists (`anchor` is `Some`, #450) — never a spurious projection on a
+///   genuinely-unknown account with no reading to key off.
+///
+/// `auto_protection_degraded` is the shared [`blind_gate_armed`] predicate — the SAME arming test
+/// [`Daemon::note_blind_gate_eligibility`] gates on (there as its negation), so the two projections
+/// cannot drift apart.
+fn blind_active_view(
+    anchor: Option<LastGood>,
+    active_is_blind: bool,
+    quarantined: bool,
+    at: Instant,
+) -> Option<BlindActive> {
+    if quarantined || !active_is_blind {
+        return None;
+    }
+    let anchor = anchor?;
+    let blind_secs = at.saturating_duration_since(anchor.at).as_secs();
+    Some(BlindActive {
+        blind_secs,
+        last_known_session_pct: to_pct(anchor.session),
+        auto_protection_degraded: blind_gate_armed(blind_secs, anchor.session),
+    })
+}
+
+/// Project the retained #452 preemptive-swap record into the `status` wire narration (issue #479), or
+/// `None` when there is no swap to narrate. PURE — a function of the record, the CURRENT active
+/// account's label, and the monotonic clock — so it is unit-tested directly. `Some` only when BOTH:
+/// - **still current** — the swap's TARGET (`to`) is STILL the active account. Any later swap (reactive
+///   / emergency / manual `use` / external-login reconcile) moves the active away from `to`, so the
+///   "swapped off X → Y" narration is stale and self-invalidates here — no scattered clear at every
+///   swap site needed (the one clear in [`record_swap`](Daemon::record_swap) only covers same-active
+///   supersession within the window; this covers the rest). A manual `use <from>` — the very undo the
+///   notice names — moves active back to `from`, so it clears the hint at its most natural moment; AND
+/// - **recent** — within the [`BLIND_PREEMPT_NOTICE_SECS`] window since the swap fired, measured on the
+///   SAME monotonic clock the anchor / cooldown use.
+///
+/// Keeps `render_status` a pure function of the wire (the window + supersession are decided daemon-side
+/// here), honoring the #169 UI-never-acts invariant.
+fn recent_blind_preempt_swap_view(
+    record: Option<&BlindPreemptSwapRecord>,
+    active_label: Option<&str>,
+    at: Instant,
+) -> Option<BlindPreemptSwap> {
+    let record = record?;
+    if active_label != Some(record.to.as_str()) {
+        return None;
+    }
+    if at.saturating_duration_since(record.at).as_secs() >= BLIND_PREEMPT_NOTICE_SECS {
+        return None;
+    }
+    Some(BlindPreemptSwap {
+        from_label: record.from.clone(),
+        to_label: record.to.clone(),
+        last_known_session_pct: record.last_known_session_pct,
+    })
+}
+
 /// Upper bound (seconds) on the jittered start-up delay (issue #76). Before its
 /// FIRST poll the daemon waits a uniform `[0, this)` so that repeated restarts of
 /// the same config — and the N accounts within a cycle — do not synchronize an
 /// immediate burst of usage requests. Small enough to stay responsive on launch.
 const STARTUP_DELAY_CAP: f64 = 30.0;
+
+/// Maximum autonomous scrubbed-canonical adopt-target recoveries (issue #467) within one
+/// [`SCRUB_ADOPT_WINDOW`] before the daemon BACKS OFF. An isolated scrub is healed at once; only a
+/// rapid re-scrub cluster — the canonical getting emptied again right after each adopt (a persistent
+/// multi-session rotation churn) — trips the bound, after which the daemon holds and surfaces the
+/// stuck state (the durable `canonical_recovery_exhausted` event + #469's status/menubar signal)
+/// rather than thrashing a re-auth loop.
+const SCRUB_ADOPT_MAX: u32 = 3;
+/// The rolling window over which [`SCRUB_ADOPT_MAX`] autonomous adopts are counted (issue #467).
+/// Sized comfortably above a few adopt→re-scrub cycles at the default 5-minute poll cadence
+/// ([`crate::config`] `DEFAULT_POLL_SECS` = 300) so a genuine churn burst is contained within one
+/// window, yet short enough that a fresh, isolated scrub an hour later opens a new episode and is
+/// healed immediately. On expiry the counter resets and autonomous recovery resumes.
+const SCRUB_ADOPT_WINDOW: Duration = Duration::from_secs(3600);
 
 /// Shutdown seam: resolves when a graceful stop has been requested. Behind a seam
 /// so the loop's stop path is driven deterministically in tests (a real
@@ -366,8 +547,13 @@ fn record_usage_sample(
 /// - **Gap honesty**: a FAILED poll (`Err` — API error, 401, offline) records
 ///   NOTHING. A gap is absent, never a fabricated zero/healthy sample (issue #157
 ///   reads a missing sample as UNKNOWN, never zero).
-/// - **Redaction-clean**: `acct` is the account's redacted handle (`label`), never
-///   an email or token — the store's invariant (issue #15).
+/// - **Redaction-clean**: `acct` is the account's roster `label` — never a token or a
+///   credential-read email. Since #444/#447 an operator-*authored* label MAY be an
+///   email (the capture prompt pre-fills the harvested address), so the store carries
+///   it verbatim under the SAME provenance-scoped rule as the render/event channels:
+///   an authored email label is permitted; an UNAUTHORED email (a stranger's address,
+///   a blob spill) is not (issue #15, relaxed by #444; see
+///   `redaction::meter::unauthored_emails`).
 /// - **Fail-open**: a store-write error (disk full, permission, torn write) is logged
 ///   and swallowed; it must never break the poll/swap loop or crash the daemon. The
 ///   credential rotation/health path is unaffected by a sampling failure.
@@ -861,6 +1047,27 @@ fn has_live_refresh_token(canonical: &Credential) -> bool {
     matches!(crate::refresh::refresh_token(canonical.expose()), Some(rt) if !rt.is_empty())
 }
 
+/// The hex length of the canonical refresh-token FINGERPRINT (issue #464) — a SHA-256 hex
+/// PREFIX, never the token. 16 chars (64 bits) is ample to tell one credential's token from
+/// another across polls (the rotation-interference signal #465 reads) while staying UNDER the
+/// redaction meter's 20-char high-entropy-run backstop (`redaction::meter::ENTROPY_MIN_RUN`), so
+/// the fingerprint reads CLEAN; it matches the existing 16-hex uuid-seed slice in
+/// [`keep_warm_stagger_secs`].
+const CANONICAL_FINGERPRINT_HEX: usize = 16;
+
+/// A redaction-safe fingerprint of a canonical token: the first [`CANONICAL_FINGERPRINT_HEX`]
+/// chars of its SHA-256 hex digest (issue #464). Identity WITHOUT the secret — it changes when
+/// the canonical's token rotates (a refresh / swap / out-of-band `/login`), so the scrub-driving
+/// rotation is measurable from the log, yet reveals nothing of the token (a one-way hash,
+/// prefix-truncated). Hashing an INDIVIDUAL token (not the whole blob) keeps it distinct from the
+/// meter's `BlobSha256` fingerprint, and the 16-char prefix stays under its high-entropy backstop,
+/// so the value reads clean through the #15 meter. Reuses the hand-rolled [`crate::sha256`]
+/// primitive (no new dependency — the CONTRIBUTING minimal-dependency line). A pure function,
+/// unit-tested directly.
+fn canonical_fingerprint(token: &[u8]) -> String {
+    crate::sha256::sha256_hex(token)[..CANONICAL_FINGERPRINT_HEX].to_owned()
+}
+
 /// A deterministic per-account keep-warm stagger offset in `[0, cadence)` seconds (issue #282),
 /// ADDED to the near-expiry horizon so each account's proactive mint fires at a DIFFERENT phase of
 /// the shared ~8h token TTL. Without it a roster logged in together would all reach the same
@@ -908,14 +1115,40 @@ pub(crate) enum TickAction {
     /// the cooldown. Distinct from [`Swapped`](Self::Swapped) so a forced
     /// dead-credential escape is visible in tests and outcomes.
     EmergencySwapped { from: usize, to: usize },
+    /// PREEMPTIVELY-swapped away from a BLIND (not dead) active account `from` to `to`
+    /// before it could self-exhaust unobserved (issue #452, ADR-0017): the bounded-blindness
+    /// gate fired — the active was blind past `session_blind_swap_secs`, its retained
+    /// pre-blind anchor (`last_good`, #450) sat at/over `session_blind_risk_band`, and a
+    /// viable target existed. Distinct from [`Swapped`](Self::Swapped) (reactive, on a fresh
+    /// reading) and [`EmergencySwapped`](Self::EmergencySwapped) (dead active, gates
+    /// bypassed): this path HONORS cooldown and the target reserve, and keys off the STALE
+    /// anchor — never the missing reading — so a genuinely-unknown active makes no swap.
+    PreemptivelySwapped { from: usize, to: usize },
+    /// PREEMPTIVELY-swapped away from an OBSERVED active account `from` to `to` whose PROJECTED
+    /// session usage crossed the trigger before the observed reading did (issue #539, ADR-0017):
+    /// the velocity-projection gate fired — the observed reading was at/over
+    /// `session_velocity_min_project_above` but below the trigger, its retained EMA velocity
+    /// (≥ [`MIN_VELOCITY_SAMPLES`] samples) projected `last + rate × session_velocity_horizon_secs`
+    /// at/over the trigger, and a viable target existed. Distinct from
+    /// [`PreemptivelySwapped`](Self::PreemptivelySwapped) (BLIND, stale anchor): this fires on a
+    /// FRESH reading + its velocity. Like it, HONORS cooldown and the target reserve, and never
+    /// fires on a missing reading or an unwarmed velocity.
+    VelocityPreemptivelySwapped { from: usize, to: usize },
     /// The active account's credential is DEAD (quarantined, #42) but no other
     /// account is a viable swap target — the daemon holds on the dead active, unable
     /// to escape. The `credential_dead` signal already fired on the death transition,
     /// so this state is silent (no repeat-spam). The dead-credential cousin of
     /// [`NoViableTarget`](Self::NoViableTarget).
     ActiveDeadNoTarget,
+    /// The shared canonical `Claude Code-credentials` item was scrubbed/empty (Claude Code's
+    /// first-`invalid_grant` scrub, ADR-0018) and the daemon AUTONOMOUSLY adopted a viable roster
+    /// account (roster index `to`) into it — healing every local `claude` session on its next
+    /// request with no operator action (issue #467). The narrow ADR-0007 decision-4 carve-out: a
+    /// scrubbed canonical WITH a live target, distinct from the genuinely-all-dead
+    /// [`ActiveDeadNoTarget`](Self::ActiveDeadNoTarget) that still needs a manual `claude /login`.
+    CanonicalAdopted { to: usize },
     /// Active is over the trigger but no other account is a viable target: every
-    /// other account is weekly-exhausted (or, with the opt-in target-max-usage
+    /// other account is weekly-exhausted (or, with the opt-in target-max-session-usage
     /// enabled, all over it). The all-exhausted terminal state (#11) — the loop
     /// holds and emits one edge-triggered `all_exhausted` signal, never swapping.
     NoViableTarget,
@@ -948,7 +1181,10 @@ impl TickAction {
             TickAction::Held => DecisionClass::Hold,
             TickAction::Swapped { .. } => DecisionClass::Swap,
             TickAction::EmergencySwapped { .. } => DecisionClass::EmergencySwap,
+            TickAction::PreemptivelySwapped { .. } => DecisionClass::PreemptiveSwap,
+            TickAction::VelocityPreemptivelySwapped { .. } => DecisionClass::VelocityPreemptiveSwap,
             TickAction::ActiveDeadNoTarget => DecisionClass::ActiveDeadNoTarget,
+            TickAction::CanonicalAdopted { .. } => DecisionClass::CanonicalAdopted,
             TickAction::NoViableTarget => DecisionClass::AllExhausted,
             TickAction::SkippedActiveUnknown => DecisionClass::SkipActiveUnknown,
             TickAction::SkippedActiveUnavailable => DecisionClass::SkipActiveUnavailable,
@@ -1001,6 +1237,77 @@ struct LastSwap {
     at: Instant,
 }
 
+/// The ACTIVE account's last SUCCESSFUL usage reading, retained as a pre-blind
+/// anchor (issue #450) SEPARATELY from [`DecisionState::last_readings`] — which a
+/// failed / throttled poll clears to `None`, leaving the reactive swap path
+/// (`swap::decide`) byte-for-byte unchanged but losing any answer to "how near the
+/// band was the active account when it went blind?". Refreshed on every successful
+/// active-account poll and carried untouched across a `429` / `5xx`, so the
+/// bounded-blindness preemptive swap (issue #452, ADR-0017) can key off `session`
+/// and `blind_elapsed = now - at`. Reset to `None` on every swap-away / active-loss
+/// (the reset sites at [`record_swap`](Daemon::record_swap),
+/// [`adopt_manual_swap`](Daemon::adopt_manual_swap), and the reconcile paths), so it
+/// always describes the CURRENT active account — which is why the anchor carries no
+/// account handle of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LastGood {
+    /// Session-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading.
+    session: f64,
+    /// Weekly-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading.
+    weekly: f64,
+    /// When the reading was observed — monotonic ([`Instant`]), so #452 measures
+    /// `blind_elapsed` against the SAME clock as the swap cooldown ([`LastSwap::at`]).
+    /// Process-local: never serialized (an [`Instant`] is meaningless across the socket).
+    at: Instant,
+}
+
+/// The most recent #452 bounded-blindness PREEMPTIVE swap, retained so `status` can NARRATE it
+/// (issue #479). Set in [`Daemon::blind_swap`] on a successful swap-away from a BLIND active account;
+/// projected onto the wire ([`BlindPreemptSwap`]) by [`recent_blind_preempt_swap_view`] only while
+/// still-current (the swap's `to` is still active) AND recent (within [`BLIND_PREEMPT_NOTICE_SECS`]).
+/// Cleared in [`Daemon::record_swap`] (so a later same-active swap supersedes it before
+/// [`blind_swap`](Daemon::blind_swap) re-sets its own); a differently-targeted swap self-invalidates
+/// it at projection time instead. DEDICATED — kept SEPARATE from the cooldown-bearing [`LastSwap`]
+/// (read on every swap path) exactly as [`LastGood`] is kept separate from `last_readings`, so the
+/// narration state never burdens the cooldown primitive. Non-secret — two operator handles + a `u8`
+/// + a process-local [`Instant`] (never serialized), never a token or email (issue #15).
+#[derive(Debug, Clone, PartialEq)]
+struct BlindPreemptSwapRecord {
+    /// The label swapped AWAY FROM (the blind account) — the undo the surface names is `use <from>`.
+    from: String,
+    /// The label swapped TO (now active) — the target-still-active projection gate compares against it.
+    to: String,
+    /// The stale pre-blind session % the gate fired on (`to_pct(anchor.session)`), captured at
+    /// swap-time (by projection time the anchor `last_good` is `None`).
+    last_known_session_pct: u8,
+    /// When the swap fired — monotonic ([`Instant`]), so the [`BLIND_PREEMPT_NOTICE_SECS`] window is
+    /// measured against the SAME clock as the anchor / cooldown. Process-local: never serialized.
+    at: Instant,
+}
+
+/// The retained per-account SESSION-velocity signal (issue #399), EMA-smoothed, for the #539
+/// velocity-projection preemptive trigger (ADR-0017). The transient [`usage_velocity`] the poll
+/// fold logs is discarded, so the projective path — which runs at decision time, a step AFTER the
+/// fold that would recompute it — has nothing to project from; this carries a smoothed rate ACROSS
+/// polls instead. Held in [`DecisionState::session_velocity`], one slot per roster account (only the
+/// ACTIVE slot is projected, but every account accrues its own so the signal is warm the moment it
+/// becomes active), reset to `None` on a session-usage DROP (a 5 h window reset / recovery — the
+/// prior climbing trend is then stale) so a post-reset projection never keys off a pre-reset rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VelocityEma {
+    /// EMA-smoothed session-usage rate as a FRACTION per second (`[0.0, 1.0]`-domain usage /
+    /// second), NOT the integer `%/min` the durable [`Event::UsageVelocity`] renders — kept in the
+    /// same fraction units as the `session` reading + the trigger so the projection
+    /// `last + rate × horizon_secs` needs no unit conversion. Non-negative while climbing (a drop
+    /// resets the slot to `None`, so a stored rate is never negative).
+    rate: f64,
+    /// Velocity samples folded into `rate` since the last reset. The SUSTAINED-velocity gate: a
+    /// single seeded sample (`samples == 1`) is one interval's spike, so the projective path fires
+    /// only at [`MIN_VELOCITY_SAMPLES`] (≥ 2) — the EMA has then blended ≥ 2 intervals, so an
+    /// isolated spike that did not persist has already been damped back down.
+    samples: u32,
+}
+
 /// Per-account health carried ACROSS ticks — the dead-credential lifecycle state
 /// (issue #42), indexed by roster position. Daemon-level (not per-poll) because the
 /// 401 streak and the recovery probe must accumulate across ticks: a per-poll
@@ -1037,8 +1344,12 @@ pub(crate) struct AccountHealth {
     recovery_successes: u32,
     /// The last-observed stored access-token `expiresAt` as epoch SECONDS (issue #119),
     /// folded from a refresh sweep's [`RefreshObservation`] (the engine reads it in MS;
-    /// converted at the fold). `None` until the refresh engine has observed this account
-    /// (e.g. `[refresh]` is off). The rollup's `Stale` (expired) input + the wire clock.
+    /// converted at the fold), AND — for the ACTIVE account, which the parked sweep excludes —
+    /// reconciled to the freshly-PROMOTED canonical token on each keep-warm promote (issue #477,
+    /// [`promote_canonical`](Daemon::promote_canonical)), so the rollup judges staleness off the
+    /// live canonical the sessions read rather than the un-restashed (deliberately stale) stash.
+    /// `None` until the refresh engine has observed this account (e.g. `[refresh]` is off). The
+    /// rollup's `Stale` (expired) input + the wire clock.
     access_expires_at: Option<i64>,
     /// The access-token `expiresAt` as epoch SECONDS observed on the POLL path (issue
     /// #141) — read from the SAME credential the usage poll used (the canonical item for
@@ -1098,7 +1409,8 @@ pub(crate) struct AccountHealth {
     /// A `429` (rate-limited) or `5xx` / network transient advances it; any other poll
     /// outcome resets it to 0. Drives the exponential widening of this account's back-off
     /// window: the wait is the jittered poll interval times `2^min(streak,
-    /// POLL_BACKOFF_MAX_SHIFT)`, capped at [`POLL_BACKOFF_CAP`] (never below a server
+    /// POLL_BACKOFF_MAX_SHIFT)`, capped at [`POLL_BACKOFF_CAP`] for a peer or the tighter
+    /// [`ACTIVE_POLL_BACKOFF_CAP`] for the active account (issue #453; never below a server
     /// `Retry-After`). Per-account so one account's throttle never widens another's cadence
     /// — see [`note_account_backoff`](Daemon::note_account_backoff).
     poll_backoff_streak: u32,
@@ -1110,6 +1422,25 @@ pub(crate) struct AccountHealth {
     /// first throttle; on the same monotonic clock as
     /// [`last_keep_warm_attempt`](Self::last_keep_warm_attempt).
     poll_backoff_until: Option<Instant>,
+    /// The monotonic-[`Clock`] instant before which this NON-active account's poll is SKIPPED
+    /// because it is OUT OF ROTATION — weekly- or session-exhausted (issue #537). Armed by a
+    /// SUCCESSFUL poll whose reading is out of rotation
+    /// ([`note_exhausted_poll`](Daemon::note_exhausted_poll)) to
+    /// `now + min(exhausted_poll_secs, max(soonest_applicable_resets_at - now, poll_secs))`,
+    /// and cleared when a later poll reads the account viable again OR when it becomes the
+    /// active account (which is exempt). While [`Daemon::tick`] sees `now < exhausted_poll_until`
+    /// (and the account is NOT active) it skips this account's poll — an exhausted peer's usage
+    /// number cannot change until its server-side window resets, so re-polling it every
+    /// `poll_secs` is a wasted request (see
+    /// [`exhausted_slow_polling`](Daemon::exhausted_slow_polling)).
+    ///
+    /// DELIBERATELY SEPARATE from [`poll_backoff_until`](Self::poll_backoff_until) (ADR-0019):
+    /// that back-off is armed by a 429/5xx and CLEARED on any success, but an exhausted account
+    /// is an HTTP-200 SUCCESS — the very poll that reads exhaustion would clear a shared window —
+    /// and it drives the 429 `UsageBackoff` events + streak, so overloading it would fire
+    /// spurious rate-limit signals. `None` until the first out-of-rotation reading; on the same
+    /// monotonic clock as `poll_backoff_until`.
+    exhausted_poll_until: Option<Instant>,
 }
 
 /// Per-loop decision state carried across polls.
@@ -1128,6 +1459,11 @@ struct DecisionState {
     /// `status` candidate is #88's `next_swap`,
     /// computed fresh from readings — not this record.)
     last_swap: Option<LastSwap>,
+    /// The most recent #452 preemptive swap-away, retained so `status` can narrate it (issue #479):
+    /// `Some` from a successful [`Daemon::blind_swap`] until superseded / aged out. See
+    /// [`BlindPreemptSwapRecord`]. `None` by default (no preemptive swap yet). DEDICATED, kept off the
+    /// cooldown-bearing `last_swap` above.
+    last_blind_preempt_swap: Option<BlindPreemptSwapRecord>,
     /// Per-account health carried across ticks (issue #42), indexed by roster
     /// position: the consecutive-401 streak (feeding the `monitor_401` log event and
     /// the dead-credential threshold), the quarantine flag, and the recovery-probe
@@ -1167,6 +1503,42 @@ struct DecisionState {
     /// backed-off retry while the keychain stays locked — mirroring
     /// `signaled_all_exhausted`.
     signaled_keychain_locked: bool,
+    /// Edge-trigger guard for the canonical-scrub signal (issue #464): set when a
+    /// `canonical_scrubbed` event is emitted (the shared `Claude Code-credentials` item was
+    /// observed empty/scrubbed), cleared when the item is next observed LIVE (which emits the
+    /// `canonical_restored` counterpart). So the scrub fires exactly ONCE per episode — not once
+    /// per poll while the item stays scrubbed — and afresh if it recovers and is scrubbed again.
+    /// Mirrors `signaled_all_exhausted`; UNLIKE it, a transient unreadable poll does NOT clear it
+    /// (only a confirmed live read does), so a flaky read never fabricates a recovery.
+    signaled_canonical_scrubbed: bool,
+    /// The PRIOR poll's canonical refresh-token FINGERPRINT (issue #475), retained across polls to
+    /// detect a rotation-YANK: a Present→Present fingerprint change means the shared item ROTATED
+    /// under any mid-flight sessions, which get a RECOVERABLE 401 → "Not logged in" (they re-read
+    /// the still-live item on `continue`, no `/login`) — the frequent sibling of the rare,
+    /// UNRECOVERABLE scrub `signaled_canonical_scrubbed` tracks (umbrella #463). A non-secret 16-hex
+    /// SHA-256 prefix (issue #15), NEVER a token. Updated ONLY by [`note_canonical_liveness`](Daemon::note_canonical_liveness)
+    /// — NOT committed by the daemon's OWN swap / keep-warm canonical writes, UNLIKE `canonical_watch`
+    /// — so a self-authored rotation is still observed as a yank, keeping the diagnostic yank series
+    /// the full canonical-rotation denominator #465 measures (and a reconcile-independent cross-check).
+    /// `None` until the first Present observation seeds it, and reset to `None` on a scrub (so the next
+    /// Present re-seeds without a false yank across the recovery edge).
+    prev_canonical_fingerprint: Option<String>,
+    /// Count of autonomous scrubbed-canonical adopt-target recoveries (issue #467) within the current
+    /// churn window — the bound against a re-auth thrash loop when the canonical keeps getting
+    /// re-scrubbed right after each adopt. Incremented only on a LANDED adopt; reset to `0` when
+    /// [`scrub_adopt_window_start`](Self::scrub_adopt_window_start) is older than [`SCRUB_ADOPT_WINDOW`].
+    /// Once it reaches [`SCRUB_ADOPT_MAX`] the daemon backs off (holds + surfaces) for the rest of the
+    /// window. Default `0`.
+    scrub_adopt_count: u32,
+    /// When the current scrub-adopt churn window opened (issue #467): set on the FIRST adopt of an
+    /// episode, used to age out [`scrub_adopt_count`](Self::scrub_adopt_count) after
+    /// [`SCRUB_ADOPT_WINDOW`]. On the same monotonic clock as the tick's `at`. `None` between episodes.
+    scrub_adopt_window_start: Option<Instant>,
+    /// Edge-trigger guard for the scrub-adopt back-off signal (issue #467): set when a
+    /// `canonical_recovery_exhausted` event is emitted (the adopt bound was hit), cleared when the
+    /// churn window resets — so the back-off fires exactly ONCE per episode, not once per held tick
+    /// while the canonical stays scrubbed. Mirrors `signaled_all_exhausted`.
+    signaled_scrub_adopt_exhausted: bool,
     /// Last-known usage reading per roster account (issue #80), indexed by roster
     /// position. The daemon polls ONE account per tick (staggered, the active
     /// interleaved before each peer — #366), so a decision is taken on the most recent
@@ -1178,6 +1550,54 @@ struct DecisionState {
     /// ([`decision_readings`](Daemon::decision_readings)), so stale carried data can
     /// never leak into [`pick_target`].
     last_readings: Vec<Option<Usage>>,
+    /// When each [`last_readings`](Self::last_readings) slot was observed (issue #449), indexed in
+    /// lockstep with it — the monotonic ([`Instant`]) time of the reading now in that slot, `None`
+    /// whenever the slot is `None` (never polled, or cleared by a failed poll). The per-account
+    /// usage-velocity signal divides its delta by `now - last_reading_at[i]` to normalize to %/min;
+    /// keeping the timestamp PARALLEL to `last_readings` (rather than folding it into the `Copy`
+    /// decision [`Usage`]) leaves the swap-decision type lean and every reader of `last_readings`
+    /// unchanged. Process-local: never serialized (an [`Instant`] is meaningless across the socket).
+    last_reading_at: Vec<Option<Instant>>,
+    /// The retained per-account SESSION-velocity EMA (issue #539, ADR-0017), indexed in lockstep
+    /// with [`last_readings`](Self::last_readings) — the smoothed rate the #539 velocity-projection
+    /// preemptive trigger ([`Daemon::velocity_swap`]) projects from. `None` until an account has a
+    /// usable two-reading interval, and RESET to `None` on a session-usage DROP (a 5 h reset /
+    /// recovery). Updated in the poll fold by [`note_session_velocity`](Daemon::note_session_velocity)
+    /// from the SAME `(prev, next, elapsed)` the durable [`Event::UsageVelocity`] uses, and rebuilt
+    /// in lockstep by [`reconcile_roster`](Daemon::reconcile_roster). Sized to the roster in
+    /// [`Daemon::new`]. See [`VelocityEma`].
+    session_velocity: Vec<Option<VelocityEma>>,
+    /// The ACTIVE account's retained pre-blind anchor (issue #450): its last
+    /// SUCCESSFUL reading (`session` / `weekly` fractions) plus the monotonic time it
+    /// was observed, kept ACROSS a `429` / `5xx` blindness window that clears
+    /// [`last_readings`](Self::last_readings)`[active]` to `None`. `None` until the
+    /// active account is polled successfully once, and reset to `None` on every
+    /// swap-away / active-loss so it always belongs to the CURRENT active account.
+    /// Consumed by the bounded-blindness preemptive swap (issue #452, ADR-0017); the
+    /// reactive `swap::decide` path never reads it, so keeping it separate leaves that
+    /// path byte-for-byte unchanged. See [`LastGood`].
+    last_good: Option<LastGood>,
+    /// Edge-trigger latch for the #452 gate-premise SLI (issue #482): set once a
+    /// [`Event::BlindGateEligible`] has fired for the
+    /// CURRENT blind episode of the active account, so the SLI emits exactly ONCE per episode (the
+    /// gate would swap once, ending the episode) rather than every held blind tick. Cleared when the
+    /// active account regains a live reading (recovery) OR its anchor ([`last_good`](Self::last_good))
+    /// is dropped (swap-away / active-loss) — the latch and the anchor share the blind-episode
+    /// lifecycle, so [`note_blind_gate_eligibility`](Daemon::note_blind_gate_eligibility) manages both
+    /// clears in one place and no `last_good` reset site has to touch it.
+    blind_gate_signaled: bool,
+    /// Whether the ACTIVE account's near-limit poll-coverage fast-poll is engaged (issue #540):
+    /// the active's last reading — or the #539 velocity projection — is in the near-limit band, so
+    /// [`next_subinterval`](Daemon::next_subinterval) tightens the poll sub-interval to
+    /// [`near_limit_poll_secs`](Daemon::near_limit_poll_secs). Recomputed every tick from the
+    /// post-decision state ([`near_limit_fast_poll_engaged`](Daemon::near_limit_fast_poll_engaged))
+    /// so it always reflects the CURRENT active account and its freshest reading; the wait path
+    /// reads this cached verdict rather than re-deriving it, and its `false → true` transition is
+    /// the edge that emits the durable [`Event::NearLimitPollCoverage`] exactly once per band
+    /// entry (its `true → false` transition clears silently — the band ends at a swap, which emits
+    /// its own [`Event::Swap`], or at a below-band reading). Defaults `false` (below-band / not yet
+    /// warmed / kill-switch), so a fresh daemon and every baseline test start on the normal cadence.
+    near_limit_fast_poll: bool,
     /// The staggered poll schedule for the CURRENT cycle (issues #80, #366): the roster
     /// indices to poll, in order — the active account INTERLEAVED before each enabled,
     /// non-quarantined non-active peer (`[active, p1, active, p2, …]`, issue #366), so
@@ -1253,14 +1673,65 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// jitter; the live swap path (`decide_action`) uses the per-cycle drawn trigger.
     session_trigger_base: f64,
     /// Default-on swap-target session reserve (issue #398) as a fraction
-    /// (`target_max_usage / 100`), always valued. The PROACTIVE swap path passes it as
+    /// (`target_max_session_usage / 100`), always valued. The PROACTIVE swap path passes it as
     /// `Some(..)` to [`pick_target`] — only swap TO an account whose session usage is
     /// below it — layering a STRICTER reserve on the always-on session gate
     /// (`session < session_trigger`, which prevents oscillation on its own). The
     /// EMERGENCY path ([`Self::emergency_swap`]) passes `None` instead: when the active
     /// credential is DEAD, liveness beats the reserve. Supersedes #10's opt-in `None`
-    /// default — the config `target_max_usage` is now always set.
-    target_max_usage: f64,
+    /// default — the config `target_max_session_usage` is now always set.
+    target_max_session_usage: f64,
+    /// The #452 bounded-blindness preemptive-swap gate `T` (ADR-0017), in seconds:
+    /// [`Self::blind_swap`] fires only after the active account has been blind LONGER than
+    /// this (config `session_blind_swap_secs`, strict `>`). Set to the config ceiling it
+    /// disables the path — the kill-switch. DELIBERATELY DISTINCT from the interim
+    /// [`BLIND_GATE_SECS`] const that keys the always-on gate-premise SLI (#482) and the
+    /// [`blind_active_view`] status projection (#479): those keep measuring at the interim
+    /// band for #484 ratification even when this operator kill-switch is set, so disabling
+    /// the SWAP never blinds the ratification SLIs. Equal to the const by default (both 300),
+    /// so the measurement band and the action threshold align out of the box.
+    session_blind_swap_secs: u64,
+    /// The #452 preemptive-swap `risk_band` (ADR-0017) as a session fraction (config
+    /// `session_blind_risk_band / 100`): [`Self::blind_swap`] fires only when the retained
+    /// pre-blind anchor (`last_good`, #450) sat at/over this. Sibling of
+    /// `session_blind_swap_secs`; likewise distinct from the SLI/status [`BLIND_GATE_RISK_BAND`].
+    session_blind_risk_band: f64,
+    /// The widened re-poll cadence CEILING, in seconds, for an out-of-rotation (weekly- or
+    /// session-exhausted) NON-active peer (issue #537, config `exhausted_poll_secs`): the most
+    /// an exhausted peer's poll is deferred. A known `resets_at` sooner than this pulls the next
+    /// poll earlier; the FLOOR of the window is `poll_secs` (a slow-polled peer never re-polls
+    /// faster than the normal cadence), read from [`poll_strategy`](Self::poll_strategy)`.base`.
+    /// The ACTIVE account is exempt. See [`exhausted_poll_window`] and
+    /// [`note_exhausted_poll`](Self::note_exhausted_poll).
+    exhausted_poll_secs: u64,
+    /// The TIGHTENED poll sub-interval CAP, in seconds, for the ACTIVE account while its reading (or
+    /// the #539 projection) is in the near-limit band (issue #540, config `near_limit_poll_secs`):
+    /// the near-limit-scoped MIRROR of [`exhausted_poll_secs`](Self::exhausted_poll_secs) — that
+    /// WIDENS an exhausted peer, this TIGHTENS the active account on its final climb. Applied by
+    /// [`next_subinterval`](Self::next_subinterval) as `min(poll_secs / N, near_limit_poll_secs)`
+    /// ONLY while [`near_limit_fast_poll`](DecisionState::near_limit_fast_poll) is set, so with the
+    /// #366 active-interleave the active is re-observed within ~`2 ×` this near-limit; below the
+    /// band the sub-interval is the unchanged `poll_secs / N`. `0` disables the path — the
+    /// kill-switch, like [`session_velocity_horizon_secs`](Self::session_velocity_horizon_secs).
+    near_limit_poll_secs: u64,
+    /// The #539 velocity-projection horizon `H` (ADR-0017), in seconds (config
+    /// `session_velocity_horizon_secs`): [`Self::velocity_swap`] projects
+    /// `observed + session_velocity[active].rate × H` and fires when it crosses the trigger. `0`
+    /// disables the path (the projection reduces to `observed`, which the reactive path already
+    /// held below the trigger, so it never crosses) — the kill-switch. Kept as `u64` seconds (not a
+    /// pre-divided `f64`) so the projection reads `rate` (fraction/sec) × `H` in the SAME units the
+    /// EMA stores.
+    session_velocity_horizon_secs: u64,
+    /// The #539 velocity-projection guard (ADR-0017) as a session FRACTION (config
+    /// `session_velocity_min_project_above / 100`): [`Self::velocity_swap`] projects only when the
+    /// observed reading is at/over this. The #538 spike's free guard (the projection cannot reach
+    /// below it), biased below `session_trigger` like [`Self::session_blind_risk_band`].
+    session_velocity_min_project_above: f64,
+    /// The #539 velocity-projection EMA weight α (ADR-0017) as a FRACTION (config
+    /// `session_velocity_ema_alpha_pct / 100`): [`Self::note_session_velocity`] blends
+    /// `ema = α·instant + (1-α)·prev` to damp a single-interval spike. `1.0` = no smoothing (raw
+    /// last-interval velocity).
+    session_velocity_ema_alpha: f64,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
@@ -1352,10 +1823,23 @@ pub(crate) struct Daemon<P, C, S, K> {
     keep_warm: Option<Box<dyn KeepWarm>>,
     /// The keep-warm near-expiry horizon AND the proactive per-account attempt throttle
     /// (issue #282), sourced from `[refresh].cadence_secs` — the SAME dual-purpose knob the
-    /// parked sweep uses for its own near-expiry horizon (no second config knob). A per-account
-    /// stagger offset in `[0, cadence)` is added on top for de-correlation. Only read when
-    /// [`keep_warm`](Self::keep_warm) is wired; the `new` default is an inert placeholder.
+    /// parked sweep uses for its own near-expiry horizon (no second *cadence* knob; the #468
+    /// [`proactive_keep_warm`](Self::proactive_keep_warm) opt-in is a separate on/off gate, not a
+    /// cadence). A per-account stagger offset in `[0, cadence)` is added on top for de-correlation.
+    /// Only read when [`keep_warm`](Self::keep_warm) is wired; the `new` default is an inert
+    /// placeholder.
     keep_warm_cadence: Duration,
+    /// Whether the PROACTIVE keep-warm path ([`keep_active_warm`](Self::keep_active_warm)) fires
+    /// (issue #468, finding #476 predicate C). **`false` by default** — the pre-emptive near-expiry
+    /// mint that rotates the LIVE shared canonical every cadence is the ~44 % of daemon canonical
+    /// churn #476 measured, and #467's autonomous adopt-target re-based the scrub it guards against
+    /// to `continue`-recoverable, so the default leans on the REACTIVE backstop
+    /// ([`should_keep_warm_retry`](Self::should_keep_warm_retry)) + #467 instead. Set by
+    /// [`with_proactive_keep_warm`](Self::with_proactive_keep_warm) from `[refresh].proactive_keep_warm`;
+    /// gates ONLY the proactive path — the reactive backstop keys off [`keep_warm`](Self::keep_warm)
+    /// alone and is UNAFFECTED. Independent of, and nested within, the `[refresh].enabled` seam wiring
+    /// (an unwired [`keep_warm`](Self::keep_warm) makes this moot).
+    proactive_keep_warm: bool,
     /// The systemic refresh-failure threshold (issue #378): consecutive all-eligible-account
     /// refresh-error sweeps before the daemon surfaces a mechanism-down signal. Sourced from
     /// `[refresh].systemic_failure_n` (`1..=100`) via
@@ -1387,6 +1871,12 @@ where
         // Carried last-known reading + warm-up tracking per account (issue #80), one
         // slot per account, sized to the roster like `health`.
         let last_readings = vec![None; roster.len()];
+        // Reading timestamps parallel to `last_readings` (issue #449), for the %/min velocity
+        // interval — sized to the roster like `last_readings`, `None` until each account is polled.
+        let last_reading_at = vec![None; roster.len()];
+        // Per-account session-velocity EMA (issue #539), parallel to `last_readings` — `None` until
+        // each account has a usable two-reading interval, so no projection off an unwarmed signal.
+        let session_velocity = vec![None; roster.len()];
         let polled_once = vec![false; roster.len()];
         Self {
             roster,
@@ -1402,7 +1892,24 @@ where
             // off (issue #72), NOT the per-cycle jittered swap-decision draw.
             weekly_trigger_base: f64::from(tunables.weekly_trigger) / 100.0,
             session_trigger_base: f64::from(tunables.session_trigger) / 100.0,
-            target_max_usage: f64::from(tunables.target_max_usage) / 100.0,
+            target_max_session_usage: f64::from(tunables.target_max_session_usage) / 100.0,
+            session_blind_swap_secs: tunables.session_blind_swap_secs,
+            session_blind_risk_band: f64::from(tunables.session_blind_risk_band) / 100.0,
+            // The widened exhausted-peer cadence ceiling (issue #537); the floor is `poll_secs`,
+            // read from `poll_strategy.base` at use so no second raw copy of it is stored.
+            exhausted_poll_secs: tunables.exhausted_poll_secs,
+            // The tightened near-limit active-poll sub-interval cap (issue #540), in seconds; `0`
+            // disables the path. Read as-is (a plain Duration cap in `next_subinterval`), not a
+            // fraction, so no conversion here.
+            near_limit_poll_secs: tunables.near_limit_poll_secs,
+            // The velocity-projection horizon / guard / EMA weight (issue #539); the guard + weight
+            // are stored as fractions (like `session_blind_risk_band` / the triggers), the horizon
+            // as seconds so the projection multiplies the fraction/sec EMA rate by it directly.
+            session_velocity_horizon_secs: tunables.session_velocity_horizon_secs,
+            session_velocity_min_project_above: f64::from(
+                tunables.session_velocity_min_project_above,
+            ) / 100.0,
+            session_velocity_ema_alpha: f64::from(tunables.session_velocity_ema_alpha_pct) / 100.0,
             cooldown_strategy: tunables.cooldown_strategy,
             // The un-jittered cooldown window the socket `swap` command gates a manual
             // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
@@ -1439,6 +1946,10 @@ where
             // inert placeholder until the engine is wired (it is read only when `keep_warm` is).
             keep_warm: None,
             keep_warm_cadence: Duration::from_secs(3600),
+            // Issue #468: proactive keep-warm of the active account is OFF by default (predicate C);
+            // production opts in via `with_proactive_keep_warm` from `[refresh].proactive_keep_warm`.
+            // The reactive backstop does not read this, so it is unaffected.
+            proactive_keep_warm: false,
             // The #378 systemic-failure threshold defaults to the config default (opt-in wiring
             // via `with_systemic_failure_n`); hermetic tests that exercise the detector pass the
             // threshold directly to `SystemicRefreshHealth::note`, so this placeholder only sets
@@ -1447,6 +1958,8 @@ where
             state: DecisionState {
                 health,
                 last_readings,
+                last_reading_at,
+                session_velocity,
                 polled_once,
                 ..DecisionState::default()
             },
@@ -1583,6 +2096,18 @@ where
         self
     }
 
+    /// Opt the PROACTIVE keep-warm path in (issue #468, finding #476 predicate C). Off by default
+    /// (see [`proactive_keep_warm`](Self::proactive_keep_warm)); production passes
+    /// `[refresh].proactive_keep_warm` here, chained after [`with_keep_warm_engine`](Self::with_keep_warm_engine)
+    /// inside the `[refresh].enabled` block. Separate from the engine wiring because the flag gates
+    /// ONLY the proactive path while the REACTIVE backstop keys off the shared
+    /// [`keep_warm`](Self::keep_warm) seam alone — one seam, two independently-gated consumers.
+    /// Builder-style to mirror [`with_keep_warm_engine`](Self::with_keep_warm_engine).
+    pub(crate) fn with_proactive_keep_warm(mut self, enabled: bool) -> Self {
+        self.proactive_keep_warm = enabled;
+        self
+    }
+
     /// Replace the jitter RNG with a deterministically-seeded one — the test seam
     /// for reproducible per-cycle draws (issue #38 AC).
     #[cfg(test)]
@@ -1665,6 +2190,11 @@ where
         // cycle and back off, #13), re-auth re-stash detection (the canonical
         // changed out-of-band, #13), and the active resolution below. A locked
         // keychain is the one outcome that short-circuits the entire tick.
+        // Issue #464: distinguish a CONFIRMED gone canonical (`CredentialNotFound`, exit 44 — the
+        // scrubbed/empty item) from a transient read failure, so `note_canonical_liveness` below
+        // edge-triggers the scrub only on the former and HOLDS the signal on the latter (a flaky
+        // read must never fabricate a scrub or a recovery).
+        let mut canonical_absent = false;
         let canonical = match self.store.read().await {
             Err(Error::KeychainLocked { .. }) => return self.locked_tick(),
             Ok(canonical) => {
@@ -1676,11 +2206,20 @@ where
                     .await;
                 Some(canonical)
             }
+            Err(Error::CredentialNotFound) => {
+                // The canonical item is GONE (exit 44) — a confirmed scrub/empty, not a lock:
+                // clear the back-off and fall through to poll (the loop never swaps on missing
+                // data, so an unknown active simply holds). `note_canonical_liveness` reads
+                // `canonical_absent` to edge-trigger the scrub event.
+                self.state.lock_backoff = None;
+                self.state.signaled_keychain_locked = false;
+                canonical_absent = true;
+                None
+            }
             Err(_) => {
-                // Unreadable for a non-lock reason (not-found / transient): no
-                // change-detection is possible, but it is not a lock — clear the
-                // back-off and fall through to poll (the loop never swaps on missing
-                // data, so an unknown active simply holds).
+                // Unreadable for a non-lock, non-not-found reason (transient): no
+                // change-detection is possible and it is not a confirmed scrub — clear the
+                // back-off and fall through to poll, holding the canonical signal.
                 self.state.lock_backoff = None;
                 self.state.signaled_keychain_locked = false;
                 None
@@ -1699,6 +2238,20 @@ where
             };
         }
         let active = self.state.active;
+
+        // Issue #464: record the canonical item's OWN per-poll liveness (present / scrubbed /
+        // unknown + a redaction-safe token fingerprint, handle, and expiry) and edge-trigger the
+        // durable `canonical_scrubbed` / `canonical_restored` events — so the shared-credential
+        // "Not logged in" scrub is diagnosable from `sessiometer.log` alone, even when no
+        // `credential_dead` fires (umbrella #463). Reuses the canonical already read above (no
+        // extra keychain read) and the just-resolved `active` for the handle.
+        let canonical_liveness = self.note_canonical_liveness(
+            canonical.as_ref(),
+            canonical_absent,
+            active,
+            &mut events,
+            &mut diagnostics,
+        );
 
         // Poll ONE account this tick — the next entry in the staggered schedule
         // (issue #80): the active account interleaved before each enabled,
@@ -1730,7 +2283,16 @@ where
         // cursor already advanced in `next_poll_index`, so the slot is consumed and the
         // account is re-attempted once the window elapses. Transient (`5xx` / network) is
         // scoped the same way — see `note_account_backoff`.
-        if let Some(i) = poll_idx.filter(|&i| !self.account_backing_off(i)) {
+        //
+        // The SECOND skip predicate is the out-of-rotation slow-poll (issue #537): a NON-active
+        // peer read weekly- or session-exhausted is skipped until its `exhausted_poll_until`
+        // window elapses — its usage cannot change until its server-side window resets, so
+        // re-polling it every `poll_secs` wastes a request. Same skip mechanics as the back-off
+        // (slot consumed, `last_readings` carried, no usage request); the ACTIVE account is
+        // exempt inside `exhausted_slow_polling` so its swap-away trigger stays observable.
+        if let Some(i) = poll_idx
+            .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
+        {
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
@@ -1784,28 +2346,104 @@ where
             });
             // Fold the outcome into account `i`'s OWN back-off (issue #293): a `429` / `5xx`
             // advances its per-account streak and arms its back-off window; any other
-            // outcome clears both. The returned widened wait rides the diagnostic tick line;
-            // the durable back-off ENTER / EXIT events (issue #399) ride `events`.
-            this_tick_backoff = self.note_account_backoff(i, &result, &mut events);
-            // Durable per-account usage VELOCITY (issue #399): the signed percent delta between
-            // this reading and the account's previous one, so the durable log carries how fast each
-            // account is climbing (the gated #368 adaptive-trigger measurement). Both readings must
-            // be present — the account's FIRST reading, or a reading after a throttle / failure
-            // (which clears the slot below to `None`), has nothing to diff — and the account must
-            // have measurably MOVED (a non-zero rounded delta in either dimension), mirroring
-            // `usage_rollup`'s no-op silence so a flat idle account stays quiet on the always-on log.
-            if let (Some(prev), Ok(next)) = (self.state.last_readings[i].as_ref(), result.as_ref())
-            {
+            // outcome clears both. The ACTIVE account self-caps its back-off tighter and
+            // hard-floors `Retry-After` (issue #453), so pass whether `i` is the active
+            // account. The returned widened wait rides the diagnostic tick line; the durable
+            // back-off ENTER / EXIT events (issue #399) ride `events`.
+            this_tick_backoff =
+                self.note_account_backoff(i, active == Some(i), &result, &mut events);
+            // A single monotonic read for this poll, shared by the velocity interval (#449), the
+            // blind-window close (#449), and the `last_good` anchor refresh (#450) so all three
+            // reason against the SAME instant.
+            let now = self.clock.now();
+            // Durable per-account usage VELOCITY (issue #399), normalized to %/min (issue #449): the
+            // signed percent delta between this reading and the account's previous one, carried with
+            // the `elapsed_secs` interval so the durable log expresses a TIME rate (the gated #451
+            // spike / #368 measurement). Both readings AND the prior timestamp must be present — the
+            // account's FIRST reading, or a reading after a throttle / failure (which clears the slot
+            // + its timestamp below), has nothing to diff — the interval must be positive, and the
+            // account must have measurably MOVED (a non-zero rounded delta in either dimension),
+            // mirroring `usage_rollup`'s no-op silence so a flat idle account stays quiet.
+            if let (Some(prev), Ok(next), Some(prev_at)) = (
+                self.state.last_readings[i].as_ref(),
+                result.as_ref(),
+                self.state.last_reading_at[i],
+            ) {
                 let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
-                if session_delta_pct != 0 || weekly_delta_pct != 0 {
+                let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
+                // Copy the fraction readings out (issue #539) — `Usage` is `Copy`, so this ends the
+                // `prev`/`next` borrows and frees `self` for the `&mut self` EMA update below.
+                let (prev_session, next_session) = (prev.session, next.session);
+                if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
                     events.push(Event::UsageVelocity {
                         account: self.roster[i].account_uuid.clone(),
                         session_delta_pct,
                         weekly_delta_pct,
+                        elapsed_secs,
+                    });
+                }
+                // Issue #539: fold THIS interval into the account's session-velocity EMA (the
+                // projective trigger's signal), from the SAME `(prev, next, elapsed)` the durable
+                // velocity event uses. Folded on EVERY interval, including a flat/zero one (which
+                // correctly decays the EMA toward "not climbing"), unlike the event above whose
+                // non-zero-delta gate keeps the log quiet for an idle account.
+                self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
+            }
+            // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
+            // the active had gone blind (a `429` / `5xx` cleared `last_readings[active]` so
+            // `swap::decide` had no reading to act on) and this poll reads it live again. Measured
+            // from the retained pre-blind anchor (`last_good`, #450) — read HERE, before the refresh
+            // below, so it is still the OLD anchor — so `duration_secs` is the `blind_elapsed` #452
+            // keys off (and the "anchor_age" the #482 recovery SLI names), and `near_limit` tags
+            // whether the anchor sat at/over the session trigger (the risk band). `session_at_recovery`
+            // is this poll's FRESH session pct (issue #482): paired with the stale anchor
+            // (`session_pct`) + its age (`duration_secs`) it reconciles a hypothetical stale-anchor
+            // preemptive swap as necessary (still climbing) vs wasted (already reset). The
+            // `last_readings[i].is_none()` was-blind check plus `last_good.is_some()` excludes a
+            // first-ever poll (a `None` slot that was never blind); `active == Some(i)` scopes it to
+            // the active account the anchor belongs to. Edge-triggered: the None→live transition fires
+            // exactly once per blind episode.
+            if active == Some(i) && result.is_ok() && self.state.last_readings[i].is_none() {
+                if let (Some(anchor), Ok(fresh)) = (self.state.last_good, result.as_ref()) {
+                    events.push(Event::BlindWindow {
+                        account: self.roster[i].account_uuid.clone(),
+                        duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
+                        session_pct: to_pct(anchor.session),
+                        session_at_recovery: to_pct(fresh.session),
+                        near_limit: anchor.session >= self.session_trigger_base,
                     });
                 }
             }
             self.state.last_readings[i] = result.ok();
+            // Track WHEN this reading was observed, in lockstep with `last_readings` (issue #449):
+            // `now` on a live reading, cleared on a failed poll — so the velocity interval above
+            // spans only two real consecutive readings (never a gap).
+            self.state.last_reading_at[i] = self.state.last_readings[i].as_ref().map(|_| now);
+            // Fold this poll into the account's out-of-rotation slow-poll window (issue #537):
+            // arm/refresh it on a NON-active peer read exhausted (skip its poll until its
+            // server-side window resets), or clear it when the account reads viable again / is
+            // the active account. Reads the reading just stored above; `now` is the shared
+            // monotonic instant (the window deadline), `wall_clock_now_secs()` the wall epoch
+            // (the `resets_at` delta). Off the swap-decision path — a pure widening of THIS
+            // account's own poll cadence, like the per-account back-off (`note_account_backoff`).
+            self.note_exhausted_poll(i, active, now, wall_clock_now_secs(), &mut events);
+            // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
+            // anchor, SEPARATE from `last_readings` (which the assignment above clears to
+            // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
+            // Refreshed on every successful active poll and carried untouched across a
+            // throttle / failure, so the bounded-blindness preemptive swap (#452) can reason
+            // about how near the band the active account was when it went blind. Reset to
+            // `None` on swap-away (`record_swap` / `adopt_manual_swap` / the reconcile paths),
+            // so the anchor always belongs to the current active account.
+            if active == Some(i) {
+                if let Some(reading) = self.state.last_readings[i] {
+                    self.state.last_good = Some(LastGood {
+                        session: reading.session,
+                        weekly: reading.weekly,
+                        at: now,
+                    });
+                }
+            }
             // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
             // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
             // rollup reads, so `status --json` surfaces the access-token expiry with
@@ -1831,7 +2469,30 @@ where
         // (disabled / quarantined) non-active account back to `None` so its stale
         // carried value can never become a swap target (issue #80).
         let readings = self.decision_readings(active);
-        let action = self.decide_action(at, active, &readings, &mut events).await;
+        // Issue #482 (umbrella #363 Path B): record the #452 gate-premise SLI — at the moment the
+        // bounded-blindness preemptive swap gate (ADR-0017) turns eligible for the blind active
+        // account, whether a viable swap target exists. Evaluated on the SAME carried readings the
+        // decision below acts on, BEFORE `decide_action` may mutate state, so it captures the gate's
+        // eligibility entering the decision. Edge-triggered once per blind episode; a no-op on a
+        // live / dead / not-yet-eligible active. Instruments the premise before #452's swap is built.
+        self.note_blind_gate_eligibility(active, &readings, at, &mut events);
+        // Issue #467: a SCRUBBED / empty shared canonical (Claude Code's first-`invalid_grant` scrub,
+        // ADR-0018) locks out every local `claude` session. If a viable target exists, autonomously
+        // adopt its token into the emptied canonical — the narrow ADR-0007 decision-4 carve-out —
+        // healing the fleet on the next request with no operator action. No viable target (or the
+        // churn bound already hit) falls THROUGH to the normal decision, so the genuinely-all-dead
+        // `active_dead_no_target` / surfaced scrub signal stands — never a silent adopt churn.
+        let action = if matches!(canonical_liveness, CanonicalLiveness::Scrubbed) {
+            match self
+                .recover_scrubbed_canonical(active, &readings, at, &mut events)
+                .await
+            {
+                Some(recovered) => recovered,
+                None => self.decide_action(at, active, &readings, &mut events).await,
+            }
+        } else {
+            self.decide_action(at, active, &readings, &mut events).await
+        };
         // Edge-trigger the all-exhausted signal (issue #11): clear the guard
         // whenever this cycle is NOT the no-viable-target state, so a later
         // re-entry signals afresh. `decide_action` sets the guard (and emits once)
@@ -1859,12 +2520,31 @@ where
             }
             self.state.signaled_active_dead_no_target = false;
         }
+        // Issue #540: refresh the near-limit poll-coverage verdict from the POST-decision state
+        // (`self.state.active` is the post-swap active — the same index the snapshot below reads),
+        // so `next_subinterval` tightens the wait against the CURRENT active's freshest reading. Its
+        // `false → true` transition is the band-entry edge — emit the durable `NearLimitPollCoverage`
+        // ONCE here (not every held near-limit tick), mirroring the edge-triggered `ExhaustedSlowPoll`
+        // (#537) / `UsageBackoff` (#399) idiom. The `true → false` band-exit clears the latch
+        // silently: the band ends either at a swap (which emits its own `Swap`) or at a below-band /
+        // blind reading, so no paired CLEARED event is needed to bracket the span.
+        let near_limit_engaged = self.near_limit_fast_poll_engaged();
+        if near_limit_engaged && !self.state.near_limit_fast_poll {
+            if let Some(active_idx) = self.state.active {
+                events.push(Event::NearLimitPollCoverage {
+                    account: self.roster[active_idx].account_uuid.clone(),
+                    sub_interval_secs: self.near_limit_poll_secs,
+                });
+            }
+        }
+        self.state.near_limit_fast_poll = near_limit_engaged;
         // The rate-limit / transient back-off is PER-ACCOUNT now (issue #293): it is
         // applied by skipping the throttled account's own poll above (`account_backing_off`
         // / `note_account_backoff`), NOT by widening the WHOLE loop's wait — so the active
         // account and every other account keep polling on their normal cadence. `next_wait`
-        // therefore stays `None` in the normal tick path; only the locked-keychain tick
-        // (#13, `locked_tick`) still returns a whole-loop wait.
+        // therefore stays `None` in the normal tick path (the near-limit tightening rides
+        // `next_subinterval` via the cached `near_limit_fast_poll` above, not a whole-loop wait);
+        // only the locked-keychain tick (#13, `locked_tick`) still returns a whole-loop wait.
         let next_wait: Option<Duration> = None;
         // The per-tick decision diagnostic (issue #77), with any back-off this tick
         // imposed — the decision class names what the loop did (swap / hold / skip /
@@ -2018,6 +2698,97 @@ where
             .collect()
     }
 
+    /// Record the #452 gate-premise SLI (issue #482): at the moment the bounded-blindness preemptive
+    /// swap gate (ADR-0017) turns ELIGIBLE for the active account, emit whether a viable swap target
+    /// exists — the no-viable-target-at-gate-fire FALSIFIER for the ADR's cost-asymmetry premise. This
+    /// instruments the gate premise BEFORE #452's swap path is built, so #451/#484 can finalise the
+    /// interim `T` / `risk_band` against production rather than a replay.
+    ///
+    /// Eligibility is the gate's first two ADR-0017 conditions on the retained pre-blind anchor
+    /// ([`last_good`](DecisionState::last_good), #450): the active account has been blind (its live
+    /// reading cleared, `last_readings[active].is_none()`) past the interim [`BLIND_GATE_SECS`], and
+    /// the anchor sat at/over the interim [`BLIND_GATE_RISK_BAND`]. The gate's THIRD condition — a
+    /// viable target — is the value the SLI records, selected exactly as #452's gate would via the
+    /// shared [`pick_target`] with the BASE (un-jittered) triggers (a standing measurement, not a
+    /// per-cycle swap draw). Gated on warm-up (#80): before the first full cycle the carried readings
+    /// are partial, so an unpolled peer would read as a FALSE no-viable-target; by `T` = 300 s warm-up
+    /// is long done, so this only guards the degenerate early window.
+    ///
+    /// Edge-triggered exactly ONCE per blind episode (the gate would swap once, ending the episode)
+    /// via [`blind_gate_signaled`](DecisionState::blind_gate_signaled). The latch is CLEARED here on
+    /// both episode-end edges — the active account regaining a live reading (recovery), and the anchor
+    /// being absent (swap-away / active-loss dropped `last_good`, or no active) — so no `last_good`
+    /// reset site has to touch it. `at` is the tick's monotonic clock, the SAME [`Instant`] the anchor
+    /// and swap cooldown use.
+    fn note_blind_gate_eligibility(
+        &mut self,
+        active: Option<usize>,
+        readings: &[Option<Usage>],
+        at: Instant,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(active_idx) = active else {
+            // No active resolved → no episode; the anchor is already dropped on active-loss. Clear.
+            self.state.blind_gate_signaled = false;
+            return;
+        };
+        // A live reading means the active account is NOT blind (recovered, or never blind) → the
+        // episode is over: clear the latch so the NEXT episode signals afresh.
+        if self.state.last_readings[active_idx].is_some() {
+            self.state.blind_gate_signaled = false;
+            return;
+        }
+        // A QUARANTINED (dead, #42) blind active belongs to the `emergency_swap` path, NOT the #452
+        // preemptive gate — ADR-0017 keeps the two separate (bounded blindness is a healthy 429'd
+        // active, not a dead one). Exclude it so the premise SLI measures only the #452 path and does
+        // not inflate the gate-eligible count with cases the emergency path would handle instead.
+        if self.state.health[active_idx].quarantined {
+            return;
+        }
+        // No anchor → no episode (swap-away / active-loss dropped `last_good`): the latch's other
+        // clear edge, so both ends of an episode reset it in this one place.
+        let Some(anchor) = self.state.last_good else {
+            self.state.blind_gate_signaled = false;
+            return;
+        };
+        // The gate's first two ADR-0017 conditions on the (constant-through-a-blind-episode) anchor,
+        // via the shared [`blind_gate_armed`] predicate (the same test #479's `blind_active_view`
+        // projects): NOT armed — not yet past the interim T, or the anchor below the risk band → not
+        // yet eligible; leave the latch untouched (it is already clear pre-first-emit).
+        let blind_elapsed = at.saturating_duration_since(anchor.at);
+        if !blind_gate_armed(blind_elapsed.as_secs(), anchor.session) {
+            return;
+        }
+        // Partial-reading guard (#80 warm-up): don't measure viable-target availability off an
+        // incomplete first cycle, or an unpolled peer fabricates a no-viable-target falsifier.
+        if !self.state.warmed_up {
+            return;
+        }
+        // Edge-trigger: already signalled this episode → the gate would have swapped once; be silent.
+        if self.state.blind_gate_signaled {
+            return;
+        }
+        // The gate's THIRD condition IS the SLI: a viable swap target — a peer under
+        // `target_max_session_usage` (ADR-0013) — chosen exactly as #452's gate would, via the shared
+        // `pick_target` with the BASE (un-jittered) triggers (the same preview `next_swap` uses).
+        let viable_target = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            Some(self.target_max_session_usage),
+            self.session_trigger_base,
+            self.weekly_trigger_base,
+        )
+        .is_some();
+        events.push(Event::BlindGateEligible {
+            account: self.roster[active_idx].account_uuid.clone(),
+            viable_target,
+            blind_secs: blind_elapsed.as_secs(),
+            session_pct: to_pct(anchor.session),
+        });
+        self.state.blind_gate_signaled = true;
+    }
+
     /// The number of DISTINCT accounts in the current poll rotation (issue #80): the
     /// active account plus every enabled, non-quarantined non-active account. This is the
     /// divisor that spreads a cycle's polls across the interval (see
@@ -2156,6 +2927,9 @@ where
                         // re-resolved against the new canonical below.
                         self.state.canonical_watch.commit(canonical);
                         self.state.active = None;
+                        // Issue #450: the departed active's `last_good` is now stale —
+                        // drop it (mirrors the swap-away reset in `record_swap`).
+                        self.state.last_good = None;
                     }
                     // else: the re-stash failed (e.g. a locked keychain) — do NOT
                     // commit; leave the change to re-fire and catch up next cycle.
@@ -2184,6 +2958,9 @@ where
                     // or display match and re-resolves to `None`, so `decide_action`
                     // routes to the safe `SkippedActiveUnknown` path.
                     self.state.active = None;
+                    // Issue #450: the departed active's `last_good` is now stale — drop
+                    // it (mirrors the swap-away reset in `record_swap`).
+                    self.state.last_good = None;
                 }
             },
         }
@@ -2498,9 +3275,12 @@ where
     /// BEFORE any 401 — so a live session always reads a warm token and the overnight false-death
     /// cascade never starts. Serialized into [`tick`](Self::tick) just before
     /// [`decide_action`](Self::decide_action). Inert (an immediate return) unless the keep-warm
-    /// seam is wired.
+    /// seam is wired AND the proactive path is opted in.
     ///
     /// Gates, in order (each a cheap check before the expensive `claude -p` mint):
+    /// - the PROACTIVE path is opted in ([`proactive_keep_warm`](Self::proactive_keep_warm), issue
+    ///   #468 / finding #476 predicate C — OFF by default, so this whole path is inert unless an
+    ///   operator sets `[refresh].proactive_keep_warm = true`; the reactive backstop is unaffected);
     /// - the seam is wired, an active account resolved, and its canonical blob is readable;
     /// - the active account is NOT quarantined (a dead account is the streak's job, not re-warmed);
     /// - the token is within `[refresh].cadence_secs + `[`keep_warm_stagger_secs`]` of expiry (the
@@ -2519,6 +3299,17 @@ where
         now_ms: i64,
         events: &mut Vec<Event>,
     ) {
+        // Issue #468 / finding #476 predicate C: the proactive path is OFF by default. The
+        // pre-emptive near-expiry mint rotates the LIVE shared canonical every cadence (~44 % of
+        // daemon canonical churn, #476), so an operator opts in explicitly via
+        // `[refresh].proactive_keep_warm`; otherwise the active account leans on the REACTIVE
+        // backstop (`should_keep_warm_retry`, on a real 401) + the #467 autonomous adopt-target.
+        // This gate is proactive-only: `should_keep_warm_retry` does NOT read the flag, so the
+        // reactive backstop still fires. DO NOT remove this without the #476 fallback-A analysis —
+        // gating proactive off is only safe because #467 recovers the scrub it makes likelier.
+        if !self.proactive_keep_warm {
+            return;
+        }
         if self.keep_warm.is_none() {
             return;
         }
@@ -2653,6 +3444,19 @@ where
         self.store.write(cred).await?;
         // Baseline-commit so #140 / the #13 reconcile do not misfire on the daemon's own write.
         self.state.canonical_watch.commit(cred);
+        // Issue #477: the token just promoted IS the live canonical the active account now
+        // resolves to — so reconcile the rollup's staleness input to it. A keep-warm is
+        // `refreshed_not_restashed` (it PROMOTES to canonical, never re-stashes), and the active
+        // account is excluded from the parked refresh sweep that folds `access_expires_at`, so
+        // without this the field stays pinned to the deliberately-stale un-restashed stash expiry
+        // and `credential_health` false-fires `Stale` while the canonical is fresh (the 2026-07-11
+        // forensic case). MS→s at the boundary, matching `apply_refresh_observation`. The genuine
+        // signal is preserved: this only runs on a real promote (a written canonical), so a
+        // dead/rejected canonical is never bumped and still reads `Stale` — whether short-circuited
+        // BEFORE the mint (an empty refresh token, `has_live_refresh_token`) or AFTER it (a server
+        // `Dead` / `NoChange` mint with no fresh token to promote, the `match minted` arm).
+        self.state.health[i].access_expires_at =
+            crate::refresh::expires_at(cred.expose()).map(millis_to_secs);
         Ok(true)
     }
 
@@ -2692,10 +3496,15 @@ where
                 Some(_) => return TickAction::Held,
             }
         }
-        // The active account's own reading is unavailable (transient / a 401 below the
-        // dead threshold / unreadable) → skip; never swap on missing data.
+        // The active account's own reading is unavailable this cycle (transient / a 401
+        // below the dead threshold / a 429|5xx blind window / unreadable). Before skipping,
+        // consult the #452 bounded-blindness preemptive gate (ADR-0017): a HEALTHY (non-dead;
+        // the dead case took the emergency path above) active that has been blind too long,
+        // with a retained pre-blind anchor already near the band and a viable target, swaps
+        // away NOW rather than burning to exhaustion behind the blindness. Not eligible →
+        // the historical skip; never a swap on missing data (the gate keys off the anchor).
         let Some(active_usage) = readings[active_idx] else {
-            return TickAction::SkippedActiveUnavailable;
+            return self.blind_swap(at, active_idx, readings, events).await;
         };
         // Draw this cycle's swap-away triggers (issues #38, #41): each jittered +
         // clamped to 50..=99 percent, then to a fraction for the decision. The
@@ -2712,7 +3521,24 @@ where
             WEEKLY_TRIGGER_PCT_HI,
         ) / 100.0;
         if swap::decide(&active_usage, session_trigger, weekly_trigger) == SwapDecision::Hold {
-            return TickAction::Held;
+            // Reactive says HOLD — the observed reading is below both triggers. Before holding,
+            // consult the #539 velocity-projection peer (ADR-0017): if the active account's PROJECTED
+            // session usage (last + retained velocity × horizon) crosses the session trigger within
+            // the horizon, swap it away NOW — ahead of the observed reading tripping the reactive
+            // trigger — closing the observed reactive overshoot (#363) that #452's blind-window path
+            // does not address. Not eligible (kill-switch off, no sustained velocity, below the guard,
+            // projection short, or no viable target) → the historical Held. This is the ONLY new call
+            // into the reactive decision; every other branch below is byte-for-byte unchanged.
+            return self
+                .velocity_swap(
+                    at,
+                    active_idx,
+                    session_trigger,
+                    weekly_trigger,
+                    readings,
+                    events,
+                )
+                .await;
         }
         // Over the trigger — but until the staggered loop has polled every account in
         // the rotation at least once (issue #80 warm-up), the carried readings are
@@ -2750,7 +3576,7 @@ where
             active_idx,
             readings,
             &self.enabled_mask(),
-            Some(self.target_max_usage),
+            Some(self.target_max_session_usage),
             session_trigger,
             weekly_trigger,
         ) else {
@@ -2767,7 +3593,7 @@ where
             // edge-triggered: emit only on ENTERING the state, so the payload is computed
             // once per episode, not every poll while it holds.
             if !self.state.signaled_all_exhausted {
-                let session_ceiling = session_trigger.min(self.target_max_usage);
+                let session_ceiling = session_trigger.min(self.target_max_session_usage);
                 let (cause, hold_idx, resets_at) = all_exhausted_relief(
                     active_idx,
                     readings,
@@ -2829,7 +3655,18 @@ where
     /// the normal swap and the emergency swap (#42).
     async fn record_swap(&mut self, target_idx: usize, incoming: &str, at: Instant) {
         self.state.active = Some(target_idx);
+        // Issue #450: the swapped-TO account has no pre-blind anchor yet — drop the
+        // departing active's `last_good` so a stale foreign anchor cannot outlive the
+        // swap. Load-bearing for the bounded-blindness path (#452): its OWN swap lands
+        // here, so without this the anchor would still describe the account just left,
+        // and the path could re-fire on it once the cooldown lapses.
+        self.state.last_good = None;
         self.state.last_swap = Some(LastSwap { at });
+        // Issue #479: any swap supersedes an earlier #452 preemptive-swap narration — the active
+        // account is changing, so the "swapped off X → Y" notice is now stale. Clear it here (the
+        // shared swap path); a blind-preempt swap re-sets its OWN notice right after this call, and a
+        // differently-targeted swap self-invalidates the notice at projection time anyway.
+        self.state.last_blind_preempt_swap = None;
         if let Ok(incoming_stashed) = self.stash.read(incoming).await {
             self.state
                 .canonical_watch
@@ -2853,6 +3690,27 @@ where
             &self.store,
             &self.stash,
             outgoing,
+            incoming,
+            &self.claude_json,
+        )
+        .await
+    }
+
+    /// Run one out-of-band [`swap::adopt_target`] recovery (issue #467), serialized by the
+    /// single-writer swap lock (#64) when configured — the adopt counterpart of
+    /// [`locked_swap`](Self::locked_swap). UNLIKE a swap it does NOT re-stash an outgoing account
+    /// (the canonical is scrubbed / empty — there is nothing to re-stash); it only installs the
+    /// incoming account's token via the atomic `-U` write, honouring the no-torn-swap invariant
+    /// (ADR-0003). SAFETY is enforced inside the engine: a LOCKED / unreadable keychain aborts with
+    /// ZERO writes ("locked ≠ gone"), and the incoming stash is read before any mutation. With no
+    /// lock configured (hermetic tests) it runs unlocked — no second in-process writer to serialize.
+    async fn locked_adopt(&self, incoming: &str) -> Result<swap::SwapReport> {
+        swap::adopt_target_locked(
+            self.swap_lock_path
+                .as_deref()
+                .map(|path| (path, swap::SWAP_LOCK_MAX_WAIT)),
+            &self.store,
+            &self.stash,
             incoming,
             &self.claude_json,
         )
@@ -2938,6 +3796,13 @@ where
             // canonical-watch baseline below, so `reconcile_canonical_change` will see
             // this write as `Unchanged` and never re-observe it.
             self.deactivate_recovery_probe(prev_active, next_active);
+            // Issue #450: a manual swap to a DIFFERENT account leaves the departing
+            // active's `last_good` stale — drop it so the anchor tracks the new active.
+            // A duplicate / same-account notification (`next == prev`) keeps it. Mirrors
+            // the reset in `record_swap`.
+            if next_active != prev_active {
+                self.state.last_good = None;
+            }
             self.state.canonical_watch.commit(&canonical);
         }
         // Record it as the latest swap: arms the cooldown (#10). The cooldown arming
@@ -3206,6 +4071,101 @@ where
         (CaptureAck::Rejected { reason }, Some(event))
     }
 
+    /// Apply an authenticated `config-set` control command (issue #268) where `&mut self` is
+    /// available: the tunable + non-credential-label edits the settings UI submitted, applied to
+    /// the authoritative on-disk `config.toml` through the tested Rust writer, and NOTHING else —
+    /// the safety boundary (no credential, no roster add/remove) is STRUCTURAL, enforced by
+    /// [`ConfigSetCommand`]'s [`SetTunables`](crate::config::SetTunables) allow-list + uuid-keyed
+    /// label map, so a forbidden edit is unrepresentable here, not merely unhandled.
+    ///
+    /// Load→overlay→validate→save is the SAME path `capture` uses: read the current file TEXT,
+    /// [`apply_settings`](crate::config::Config::apply_settings) overlays the edits onto the raw
+    /// layer and re-validates the WHOLE edited config atomically (so a cross-field rule — e.g.
+    /// `target_max_session_usage <= session_trigger` — sees the FINAL state, never a transient
+    /// intermediate), then [`save_to`](crate::config::Config::save_to) writes it 0600-atomically
+    /// (temp + rename). Every refusal is a TRUE no-op — ZERO writes — leaving the old file intact:
+    /// no wired `config_path` → `Unavailable`; absent file → `NoConfig`; unreadable / malformed
+    /// baseline → `ConfigUnreadable`; a stale label uuid → `UnknownAccount`; a range / cross-field
+    /// violation → `Invalid` (with the non-secret field-named `detail`); an atomic-write failure →
+    /// `SaveFailed`. On success the `effect` tells the UI what the change requires: a LABEL change
+    /// is adopted LIVE — the in-memory roster is reconciled to the freshly-written file (the SAME
+    /// [`reconcile_roster`](Self::reconcile_roster) core the #139 roster-reload drives) — while a
+    /// TUNABLE change is reload-by-restart (the daemon derives its strategy fields once at
+    /// construction, with no re-derivation primitive), and a no-op edit writes nothing
+    /// (`Unchanged`). A batch that changes both reports `RestartRequired` (the operative action).
+    ///
+    /// The `config.toml` read is small and inline like `capture`'s `load_existing` (not
+    /// `spawn_blocking`): a few KB, well under a tick, and this runs on the run loop's single task
+    /// where `&mut self` lives (ADR-0001). Returns only the redacted [`ConfigSetAck`] — a config
+    /// edit emits no durable [`Event`] in v1 (the event log records swaps + captures; a
+    /// config-change audit line is a clean future addition, not needed for the settings surface).
+    async fn perform_config_set(&mut self, command: &ConfigSetCommand) -> ConfigSetAck {
+        // No wired config path (the hermetic-test default) — config-set is unavailable, exactly as
+        // `capture` fails closed with no path to persist to.
+        let Some(config_path) = self.config_path.clone() else {
+            return ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::Unavailable,
+                detail: None,
+            };
+        };
+        // Read the current on-disk config TEXT: `apply_settings` re-parses + overlays it, and the
+        // save re-renders the canonical commented form (the comments live in the renderer, not the
+        // input). Absent → nothing to edit; unreadable → refuse rather than clobber a file we
+        // cannot read. Read inline like `capture`'s `load_existing` (small file, ADR-0001).
+        let text = match std::fs::read_to_string(&config_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return ConfigSetAck::Rejected {
+                    reason: ConfigSetRejection::NoConfig,
+                    detail: None,
+                };
+            }
+            Err(_) => {
+                return ConfigSetAck::Rejected {
+                    reason: ConfigSetRejection::ConfigUnreadable,
+                    detail: None,
+                };
+            }
+        };
+        // Overlay + atomically re-validate the WHOLE edited config. A rejection writes NOTHING —
+        // the old file is intact.
+        let (config, change) =
+            match Config::apply_settings(&text, &command.tunables, &command.labels) {
+                Ok(applied) => applied,
+                Err(err) => {
+                    let (reason, detail) = classify_config_set_failure(&err);
+                    return ConfigSetAck::Rejected { reason, detail };
+                }
+            };
+        // A no-op edit (the submitted values already equal the current ones) writes nothing.
+        if !change.tunables_changed && !change.labels_changed {
+            return ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Unchanged,
+            };
+        }
+        // Persist the validated config atomically (temp + rename, 0600). A write failure leaves the
+        // OLD file intact — report `SaveFailed`, adopt nothing.
+        if config.save_to(&config_path).is_err() {
+            return ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::SaveFailed,
+                detail: None,
+            };
+        }
+        // A LABEL change is adopted LIVE: reconcile the in-memory roster to the freshly-written
+        // file (the SAME core the #139 roster-reload drives), so `status` reflects the new label
+        // within the poll cadence. A TUNABLE change is reload-by-restart (no hot-reload primitive).
+        if change.labels_changed {
+            self.reconcile_roster(config.roster);
+        }
+        // A tunable change is the operative action even if a label also changed (both persisted).
+        let effect = if change.tunables_changed {
+            ConfigSetEffect::RestartRequired
+        } else {
+            ConfigSetEffect::Live
+        };
+        ConfigSetAck::Applied { effect }
+    }
+
     /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
     ///
     /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
@@ -3278,6 +4238,12 @@ where
         // handful of accounts, so the per-account `position` scan is inconsequential.)
         let mut health = Vec::with_capacity(new_roster.len());
         let mut last_readings = Vec::with_capacity(new_roster.len());
+        let mut last_reading_at = Vec::with_capacity(new_roster.len());
+        // Issue #539: the session-velocity EMA is re-keyed in lockstep with `last_readings` — kept
+        // for a persisting account (merely re-indexed), started fresh (`None`) for a new one, so the
+        // vec never drifts out of length/index sync with the roster (a projective read would
+        // otherwise index the wrong account or panic out of bounds).
+        let mut session_velocity = Vec::with_capacity(new_roster.len());
         let mut polled_once = Vec::with_capacity(new_roster.len());
         for account in &new_roster {
             match self
@@ -3288,11 +4254,15 @@ where
                 Some(old_idx) => {
                     health.push(self.state.health[old_idx].clone());
                     last_readings.push(self.state.last_readings[old_idx]);
+                    last_reading_at.push(self.state.last_reading_at[old_idx]);
+                    session_velocity.push(self.state.session_velocity[old_idx]);
                     polled_once.push(self.state.polled_once[old_idx]);
                 }
                 None => {
                     health.push(AccountHealth::default());
                     last_readings.push(None);
+                    last_reading_at.push(None);
+                    session_velocity.push(None);
                     polled_once.push(false);
                 }
             }
@@ -3310,8 +4280,18 @@ where
         self.roster = new_roster;
         self.state.health = health;
         self.state.last_readings = last_readings;
+        self.state.last_reading_at = last_reading_at;
+        self.state.session_velocity = session_velocity;
         self.state.polled_once = polled_once;
         self.state.active = active;
+        // Issue #450: `last_good` belongs to the active account by identity; reconcile
+        // keeps it whole if that account persists (it is merely re-indexed, like
+        // `last_readings` above), but drops it if the active account left the roster —
+        // a removed account's anchor must not leak into the next active's blindness
+        // reasoning (#452).
+        if active.is_none() {
+            self.state.last_good = None;
+        }
         // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
         // fresh one (the active interleaved before each enabled non-quarantined peer,
         // #366) at the next cycle start.
@@ -3351,7 +4331,7 @@ where
             active_idx,
             readings,
             &self.enabled_mask(),
-            // Drop the target-max-usage reserve on the emergency path (issue #398): the
+            // Drop the target-max-session-usage reserve on the emergency path (issue #398): the
             // active credential is DEAD, so liveness beats the reserve — escape to ANY
             // live account even if it is over the floor. Without this, a default-on floor
             // (#398) plus every live account at/above it would strand the daemon on the
@@ -3419,11 +4399,414 @@ where
         }
     }
 
+    /// The #452 bounded-blindness preemptive swap-away (ADR-0017) — the AVAILABILITY-path peer
+    /// of [`emergency_swap`](Self::emergency_swap). Fires for a HEALTHY (non-quarantined) active
+    /// that has gone BLIND (its live reading cleared to `None` on a 429/5xx) and stayed blind
+    /// too long to keep trusting the last reactive verdict. It keys off the RETAINED pre-blind
+    /// anchor (`last_good`, #450), NEVER the missing reading, and swaps only when ALL hold:
+    ///
+    /// - blind past the config `session_blind_swap_secs` (strict `>`), AND
+    /// - the anchor sat at/over the config `session_blind_risk_band`, AND
+    /// - a viable target exists — a peer under `target_max_session_usage` (ADR-0013), chosen via
+    ///   [`pick_target`] with the BASE (un-jittered) triggers, exactly as
+    ///   [`note_blind_gate_eligibility`](Self::note_blind_gate_eligibility)'s premise SLI (#482)
+    ///   previews it, so the swap fires where the SLI recorded the gate eligible.
+    ///
+    /// Unlike [`emergency_swap`](Self::emergency_swap) (dead active, #42) this does NOT drop the
+    /// target reserve to `f64::INFINITY` and does NOT bypass cooldown — ADR-0017 keeps the
+    /// availability path separate from the liveness one, so it takes no ADR-0013 emergency
+    /// exemption. No anchor / not-yet-armed / not warmed up / no viable target all fall THROUGH
+    /// to the historical [`TickAction::SkippedActiveUnavailable`] (the SLI already recorded the
+    /// no-viable-target episode where relevant); within cooldown yields
+    /// [`TickAction::SkippedCooldown`]. On a swap-engine error the state stays coherent (#6
+    /// no-half-swap) and the anchor is untouched, so the gate re-arms and retries next cycle.
+    async fn blind_swap(
+        &mut self,
+        at: Instant,
+        active_idx: usize,
+        readings: &[Option<Usage>],
+        events: &mut Vec<Event>,
+    ) -> TickAction {
+        // Key off the retained pre-blind anchor (#450) — NOT the missing reading. No anchor (a
+        // genuinely-unknown active, or one whose anchor a prior swap-away / active-loss dropped)
+        // → no episode, historical skip; never a spurious swap on absent data (#369's caution).
+        let Some(anchor) = self.state.last_good else {
+            return TickAction::SkippedActiveUnavailable;
+        };
+        // Gate conditions 1+2 (ADR-0017), on the CONFIG thresholds — the operator-tunable,
+        // kill-switchable ACTION band, deliberately distinct from the interim const the
+        // gate-premise SLI / status projection measure at (so a kill-switch disables the swap
+        // without blinding #484's ratification SLIs): blind past `session_blind_swap_secs` AND
+        // the anchor at/over `session_blind_risk_band`.
+        let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
+        if !(blind_elapsed > self.session_blind_swap_secs
+            && anchor.session >= self.session_blind_risk_band)
+        {
+            return TickAction::SkippedActiveUnavailable;
+        }
+        // #80 warm-up: until the staggered loop has polled every rotation account once, the
+        // carried readings are partial — a viable-target verdict off them could be spurious, so
+        // hold (skip) until the first cycle completes. Mirrors the reactive path + the SLI guard.
+        if !self.state.warmed_up {
+            return TickAction::SkippedActiveUnavailable;
+        }
+        // Cooldown (#10) is HONORED — this is not the emergency path (ADR-0017). Draw the
+        // per-cycle (jittered) cooldown exactly as the reactive path does; within it, defer.
+        let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
+            &mut self.rng,
+            COOLDOWN_SECS_LO,
+            COOLDOWN_SECS_HI,
+        ));
+        if let Some(last) = &self.state.last_swap {
+            if at.saturating_duration_since(last.at) < cooldown {
+                return TickAction::SkippedCooldown;
+            }
+        }
+        // Gate condition 3 (ADR-0017): a viable target — a peer under `target_max_session_usage`
+        // (ADR-0013), the reserve HONORED (NOT the emergency `None` / `f64::INFINITY` bypass).
+        // BASE (un-jittered) triggers, the same preview `note_blind_gate_eligibility` /
+        // `next_swap` use, so the fired swap matches the recorded premise. None → the SLI
+        // already logged a no-viable-target episode; fall through to the historical skip (never
+        // swap among saturated / exhausted peers).
+        let Some(target_idx) = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            Some(self.target_max_session_usage),
+            self.session_trigger_base,
+            self.weekly_trigger_base,
+        ) else {
+            return TickAction::SkippedActiveUnavailable;
+        };
+        // Run the swap through the SAME single-writer, no-torn-swap primitive (#6 / #64,
+        // ADR-0003) the reactive + emergency paths use — an error (incl. a fail-closed
+        // contended lock) leaves the canonical + both stashes coherent and the anchor intact
+        // (`record_swap` drops it only on success), so the gate re-arms and retries next cycle.
+        let outgoing = self.roster[active_idx].stash();
+        let incoming = self.roster[target_idx].stash();
+        match self.locked_swap(&outgoing, &incoming).await {
+            Ok(_report) => {
+                let from_label = self.roster[active_idx].label.clone();
+                let to_label = self.roster[target_idx].label.clone();
+                // The active is BLIND, so the stale pre-blind anchor is the only session signal — the
+                // same value the `swap` log line records and the narration surfaces (#479).
+                let last_known_session_pct = to_pct(anchor.session);
+                self.record_swap(target_idx, &incoming, at).await;
+                events.push(Event::Swap {
+                    from: from_label.clone(),
+                    to: to_label.clone(),
+                    reason: SwapReason::BlindPreempt,
+                    // Log it (as a percent, like every swap line) so the `swap` line agrees with the
+                    // value the gate keyed off. Never a token / email (#15).
+                    session_pct: last_known_session_pct,
+                });
+                // Retain the swap for `status` to NARRATE (issue #479): `record_swap` above cleared any
+                // prior notice (superseding a same-active one), so set THIS swap's as the current one.
+                // `recent_blind_preempt_swap_view` projects it onto the wire only while still-current +
+                // recent; the narration names the `use <from>` undo (derived from `from`, not stored).
+                self.state.last_blind_preempt_swap = Some(BlindPreemptSwapRecord {
+                    from: from_label,
+                    to: to_label,
+                    last_known_session_pct,
+                    at,
+                });
+                TickAction::PreemptivelySwapped {
+                    from: active_idx,
+                    to: target_idx,
+                }
+            }
+            Err(_) => TickAction::SwapFailed,
+        }
+    }
+
+    /// Fold one poll interval into account `i`'s retained session-velocity EMA (issue #539,
+    /// ADR-0017) — the signal [`velocity_swap`](Self::velocity_swap) projects from. Called from the
+    /// poll fold with the SAME `(prev, next, elapsed_secs)` the durable [`Event::UsageVelocity`]
+    /// uses (fraction readings copied out so `self` is free to mutate). Pure state update, no event.
+    ///
+    /// - A session-usage DROP (`next < prev`) means the 5 h window reset (usage is monotonic within a
+    ///   window) or a recovery — the prior climbing trend is stale, so the slot is reset to `None`;
+    ///   a zero/degenerate interval likewise resets (nothing to integrate). Either way the projective
+    ///   path then needs a fresh pair of readings (≥ [`MIN_VELOCITY_SAMPLES`]) before it can fire.
+    /// - Otherwise the instantaneous rate `(next - prev) / elapsed` (session fraction per second,
+    ///   `>= 0`) is blended into the EMA at weight `session_velocity_ema_alpha`, seeded with the raw
+    ///   rate on the first sample (NOT zero — a zero seed biases the EMA to asymptote BELOW the true
+    ///   rate and would miss real overshoots; the single-spike case is instead gated by
+    ///   [`MIN_VELOCITY_SAMPLES`], not by seed choice), and the sample count is advanced.
+    fn note_session_velocity(
+        &mut self,
+        i: usize,
+        prev_session: f64,
+        next_session: f64,
+        elapsed_secs: u64,
+    ) {
+        if elapsed_secs == 0 || next_session < prev_session {
+            self.state.session_velocity[i] = None;
+            return;
+        }
+        let instant = (next_session - prev_session) / elapsed_secs as f64;
+        let alpha = self.session_velocity_ema_alpha;
+        self.state.session_velocity[i] = Some(match self.state.session_velocity[i] {
+            Some(prev) => VelocityEma {
+                rate: alpha * instant + (1.0 - alpha) * prev.rate,
+                samples: prev.samples.saturating_add(1),
+            },
+            None => VelocityEma {
+                rate: instant,
+                samples: 1,
+            },
+        });
+    }
+
+    /// The #539 velocity-projection preemptive swap (ADR-0017) — the OBSERVED-overshoot peer of the
+    /// reactive session trigger, called from [`decide_action`](Self::decide_action) exactly where the
+    /// reactive path would HOLD (observed below the trigger). It swaps the active account away when
+    /// its PROJECTED session usage crosses the trigger within the horizon, closing the residual
+    /// reactive overshoot (#363) that fires because `usage_velocity` (#399) peaks between the ~cadence
+    /// observations. Unlike [`blind_swap`](Self::blind_swap) it keys off a FRESH reading + its
+    /// retained velocity, never a stale anchor; like it, it is NOT emergency — HONORS cooldown and the
+    /// swap-target reserve ([`target_max_session_usage`](Self::target_max_session_usage), ADR-0013),
+    /// and routes through the no-torn-swap primitive ([`locked_swap`](Self::locked_swap), ADR-0003).
+    ///
+    /// Fires only when ALL hold (else `Held` — the reading is present and below the trigger, so the
+    /// non-fire outcome is a genuine hold, not the "unavailable" skip `blind_swap` returns):
+    /// - the horizon is non-zero (`0` is the config kill-switch — the projection would reduce to the
+    ///   observed reading, which already held below the trigger), **and**
+    /// - a retained velocity EMA exists with `>= MIN_VELOCITY_SAMPLES` samples (SUSTAINED — never a
+    ///   single-interval spike, and never a missing/`None` signal), **and**
+    /// - the observed reading is at/over `session_velocity_min_project_above` (the free guard), **and**
+    /// - `observed + rate × horizon >= session_trigger` (the projection crosses), **and**
+    /// - the roster is warmed up, the cooldown has elapsed (else `SkippedCooldown`), and a viable
+    ///   target exists (a peer under the reserve).
+    ///
+    /// `session_trigger` / `weekly_trigger` are the SAME per-cycle jittered draws the reactive path
+    /// used this tick, so the projection crosses the very trigger the reactive path just held below
+    /// and `pick_target` sees the same reserve — the projective peer is a strict early-fire of the
+    /// reactive decision, not a differently-calibrated one.
+    async fn velocity_swap(
+        &mut self,
+        at: Instant,
+        active_idx: usize,
+        session_trigger: f64,
+        weekly_trigger: f64,
+        readings: &[Option<Usage>],
+        events: &mut Vec<Event>,
+    ) -> TickAction {
+        // Kill-switch: horizon 0 → the projection is just the observed reading, which the reactive
+        // path already held below the trigger, so it can never cross. Cheap early exit.
+        let horizon = self.session_velocity_horizon_secs;
+        if horizon == 0 {
+            return TickAction::Held;
+        }
+        // The active's own FRESH reading (issue #539) — re-read from `readings[active_idx]` rather
+        // than threaded in as a separate arg (the `Copy` reading is already carried here, and the
+        // caller only reaches this path with it present). A missing slot cannot occur on the reactive
+        // Hold path that calls this, but hold defensively rather than project on absent data.
+        let Some(active_usage) = readings[active_idx] else {
+            return TickAction::Held;
+        };
+        // The retained velocity signal must exist AND be SUSTAINED (≥ MIN_VELOCITY_SAMPLES blended
+        // intervals). Absent (a first/failed poll, or reset by a window drop — the poll-gap case #540
+        // owns) or single-sample → never project (the "no-fire on a missing/unwarmed velocity"
+        // invariant): hold on the fresh reading rather than swap on a guess.
+        let Some(vel) = self.state.session_velocity[active_idx] else {
+            return TickAction::Held;
+        };
+        if vel.samples < MIN_VELOCITY_SAMPLES {
+            return TickAction::Held;
+        }
+        // The free guard (#538): only project from a reading already at/over the band. The
+        // projection cannot reach below it (max reach ≤ ~14 pp at H ≤ 150 s), so a lower reading can
+        // never cross anyway — the guard just excludes spurious low-usage projections cheaply.
+        if active_usage.session < self.session_velocity_min_project_above {
+            return TickAction::Held;
+        }
+        // Project `last + velocity × H` and require it to reach the trigger (the SAME jittered draw
+        // the reactive path held below this tick). Below → the velocity is not steep enough to
+        // overshoot within the horizon → hold and let the reactive path catch it if it climbs.
+        let projected = active_usage.session + vel.rate * horizon as f64;
+        if projected < session_trigger {
+            return TickAction::Held;
+        }
+        // #80 warm-up: the carried readings are partial until the staggered loop has polled every
+        // rotation account once — a viable-target verdict off them could be spurious, so hold. Mirrors
+        // the reactive + blind paths.
+        if !self.state.warmed_up {
+            return TickAction::Held;
+        }
+        // Cooldown (#10) is HONORED — this is not the emergency path (ADR-0017). Draw the per-cycle
+        // (jittered) cooldown exactly as the reactive + blind paths do; within it, defer. Reported as
+        // SkippedCooldown (the projection WANTED to fire) rather than a silent Held.
+        let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
+            &mut self.rng,
+            COOLDOWN_SECS_LO,
+            COOLDOWN_SECS_HI,
+        ));
+        if let Some(last) = &self.state.last_swap {
+            if at.saturating_duration_since(last.at) < cooldown {
+                return TickAction::SkippedCooldown;
+            }
+        }
+        // A viable target — a peer under `target_max_session_usage` (ADR-0013), the reserve HONORED
+        // (NOT the emergency `None` bypass). The SAME jittered triggers the reactive path used, so the
+        // projective peer selects exactly as the reactive swap it front-runs would. None → hold (never
+        // swap among saturated / exhausted peers; the reactive path owns the all-exhausted signal).
+        let Some(target_idx) = pick_target(
+            active_idx,
+            readings,
+            &self.enabled_mask(),
+            Some(self.target_max_session_usage),
+            session_trigger,
+            weekly_trigger,
+        ) else {
+            return TickAction::Held;
+        };
+        // Run the swap through the SAME single-writer, no-torn-swap primitive (#6 / #64, ADR-0003) the
+        // reactive + blind + emergency paths use — an error (incl. a fail-closed contended lock) leaves
+        // the canonical + both stashes coherent, so we retry next cycle.
+        let outgoing = self.roster[active_idx].stash();
+        let incoming = self.roster[target_idx].stash();
+        match self.locked_swap(&outgoing, &incoming).await {
+            Ok(_report) => {
+                self.record_swap(target_idx, &incoming, at).await;
+                events.push(Event::Swap {
+                    from: self.roster[active_idx].label.clone(),
+                    to: self.roster[target_idx].label.clone(),
+                    reason: SwapReason::VelocityPreempt,
+                    // The FRESH observed reading at swap-out (issue #539) — the projection fired off a
+                    // live reading, so `session_pct` is the real swap-out point (the projected
+                    // swap-out overshoot SLI's #363-acceptance sample), never a stale anchor. A
+                    // percent, like every swap line; never a token / email (#15).
+                    session_pct: to_pct(active_usage.session),
+                });
+                TickAction::VelocityPreemptivelySwapped {
+                    from: active_idx,
+                    to: target_idx,
+                }
+            }
+            Err(_) => TickAction::SwapFailed,
+        }
+    }
+
+    /// Autonomously recover a SCRUBBED / empty shared canonical (issue #467) — the ADR-0018
+    /// decision-1 mitigation. When Claude Code empties the shared `Claude Code-credentials` item on
+    /// its first `invalid_grant` (the fleet-wide "Not logged in" lockout, ADR-0018), the daemon
+    /// installs a VIABLE roster account's token back into the canonical via [`swap::adopt_target`],
+    /// so every live `claude` session re-reads a usable credential on its next request — no operator
+    /// `claude /login`.
+    ///
+    /// The narrow carve-out from ADR-0007 decision 4: recovery for a scrubbed canonical is
+    /// otherwise `use --force`-gated and the autonomous daemon never adopts; this relaxes the gate
+    /// ONLY for the scrubbed-**with-a-live-target** case. A genuinely-all-dead roster (no viable
+    /// target) is NOT this case — it returns `None` and falls through to the existing
+    /// `active_dead_no_target` / surfaced scrub signal, which still needs a manual `/login`
+    /// (ADR-0007 decision 4 / ADR-0016), never a silent adopt churn.
+    ///
+    /// Target selection mirrors [`emergency_swap`](Self::emergency_swap): [`pick_target`] with the
+    /// weekly-viability filter but the session gate and reserve bypassed (`f64::INFINITY` / `None`) —
+    /// liveness beats session headroom when the whole fleet is locked out. The active account is
+    /// EXCLUDED (`pick_target`'s always-on `i != active`): a scrubbed active is polled through the
+    /// now-empty canonical, so its reading is unreliable, whereas a spare is polled through its OWN
+    /// stash and is therefore a KNOWN-live token to adopt. An UNRESOLVED active
+    /// (`usize::MAX` sentinel — no roster index equals it) excludes nothing, so every account is a
+    /// candidate.
+    ///
+    /// BOUNDED against a re-auth thrash loop: at most [`SCRUB_ADOPT_MAX`] LANDED adopts per
+    /// [`SCRUB_ADOPT_WINDOW`]. On the bound the daemon backs off — emits one edge-triggered
+    /// [`Event::CanonicalRecoveryExhausted`] and holds — leaving the `canonical_scrubbed` signal up
+    /// for the operator (status / menubar, #469) rather than churning. The window ages out on its
+    /// own clock, so an isolated scrub an hour later opens a fresh episode and heals at once.
+    ///
+    /// Returns `Some(TickAction::CanonicalAdopted { to })` on a landed adopt (this cycle's decision
+    /// IS the recovery), else `None` to fall through to [`decide_action`](Self::decide_action).
+    async fn recover_scrubbed_canonical(
+        &mut self,
+        active: Option<usize>,
+        readings: &[Option<Usage>],
+        at: Instant,
+        events: &mut Vec<Event>,
+    ) -> Option<TickAction> {
+        // Age out the churn window: once the FIRST adopt of an episode is older than the window, open
+        // a fresh episode (counter + back-off latch reset), so an isolated scrub later heals at once.
+        // Elapsing is the ONLY reset — deliberately NOT an observed recovery (a top-of-tick canonical
+        // Present): under a SLOW re-scrub churn (each adopt survives a poll or two before CC re-scrubs)
+        // a reset-on-Present would clear the counter every episode and defeat the bound — the exact
+        // re-auth thrash AC4/#467 exists to cap.
+        if let Some(start) = self.state.scrub_adopt_window_start {
+            if at.saturating_duration_since(start) >= SCRUB_ADOPT_WINDOW {
+                self.state.scrub_adopt_count = 0;
+                self.state.scrub_adopt_window_start = None;
+                self.state.signaled_scrub_adopt_exhausted = false;
+            }
+        }
+
+        // Bound reached: BACK OFF rather than thrash the re-auth loop. Emit the durable back-off
+        // signal ONCE per episode (edge-triggered) and fall through — `canonical_scrubbed` already
+        // surfaces the stuck state for the operator (#469).
+        if self.state.scrub_adopt_count >= SCRUB_ADOPT_MAX {
+            if !self.state.signaled_scrub_adopt_exhausted {
+                events.push(Event::CanonicalRecoveryExhausted {
+                    account: active.map(|i| self.roster[i].label.clone()),
+                });
+                self.state.signaled_scrub_adopt_exhausted = true;
+            }
+            return None;
+        }
+
+        // Pick a VIABLE target with the emergency-path filter (mirroring `emergency_swap`): the
+        // weekly-exhaustion + enabled + not-active filter, but the session gate and reserve bypassed
+        // (`f64::INFINITY` / `None`) — the whole fleet is locked out, so liveness beats headroom. No
+        // viable target → `None`, falling through to the surfaced-signal path (never a churn).
+        let weekly_trigger = self.weekly_trigger_strategy.draw(
+            &mut self.rng,
+            WEEKLY_TRIGGER_PCT_LO,
+            WEEKLY_TRIGGER_PCT_HI,
+        ) / 100.0;
+        let target_idx = pick_target(
+            active.unwrap_or(usize::MAX),
+            readings,
+            &self.enabled_mask(),
+            None,
+            f64::INFINITY,
+            weekly_trigger,
+        )?;
+
+        // Install the target into the scrubbed canonical, lock-wrapped (#64). SAFETY holds inside the
+        // engine (ADR-0003): a LOCKED / unreadable keychain aborts with ZERO writes ("locked ≠
+        // gone"), the incoming stash is read before any mutation, and the canonical write is the
+        // atomic `-U` upsert (a concurrent reader sees the empty item then the adopted credential,
+        // never a torn blob). A concurrent WRITER — a `claude /login` landing a live token in the
+        // sub-tick window — is overwritten here by the known-live target: accepted last-writer-wins
+        // (ADR-0003 reconcile; ADR-0018 is reactive, not preventive), harmless as the fleet stays live
+        // and the window is a single tick's synchronous ms. #6 no-half-swap: a lock-busy / write error
+        // leaves the canonical un-torn and is retried next cycle — do NOT count it toward the bound (no
+        // adopt landed) and fall through to the normal decision this tick.
+        let incoming = self.roster[target_idx].stash();
+        match self.locked_adopt(&incoming).await {
+            Ok(_report) => {
+                // Adopt the swapped-in account exactly as a swap does: set it active, arm the
+                // post-swap cooldown, drop the departed pre-blind anchor, and COMMIT the write to the
+                // canonical_watch so the daemon's OWN adopt is not re-detected as an out-of-band
+                // `/login` (issue #13).
+                self.record_swap(target_idx, &incoming, at).await;
+                if self.state.scrub_adopt_window_start.is_none() {
+                    self.state.scrub_adopt_window_start = Some(at);
+                }
+                self.state.scrub_adopt_count += 1;
+                events.push(Event::CanonicalRecovered {
+                    account: self.roster[target_idx].label.clone(),
+                });
+                Some(TickAction::CanonicalAdopted { to: target_idx })
+            }
+            Err(_) => None,
+        }
+    }
+
     /// The forward-looking next-swap candidate for the `status` display (issue #88):
     /// who [`pick_target`] would choose right now, or why there is no candidate. THE
     /// candidate is computed daemon-side — the CLI never re-derives the selection rule
     /// (it cannot: the wire carries only rounded percents, not the raw `Usage` /
-    /// `target_max_usage` / triggers `pick_target` consumes). Uses the BASE (un-jittered)
+    /// `target_max_session_usage` / triggers `pick_target` consumes). Uses the BASE (un-jittered)
     /// session and weekly triggers ([`Self::session_trigger_base`],
     /// [`Self::weekly_trigger_base`]) — the same thresholds the snapshot's per-account
     /// exhaustion flags key off — so the candidate and the displayed exhaustion state
@@ -3443,7 +4826,7 @@ where
             active_idx,
             readings,
             &enabled,
-            Some(self.target_max_usage),
+            Some(self.target_max_session_usage),
             self.session_trigger_base,
             self.weekly_trigger_base,
         ) {
@@ -3484,14 +4867,14 @@ where
             // Carry the fleet-capacity RELIEF hint (issue #405) so the status footer can say WHY the
             // fleet is blocked and WHEN capacity returns, instead of a content-free "no viable
             // target". Uses the SAME `all_exhausted_relief` classification the durable events do,
-            // with the PROACTIVE session ceiling (`min(session_trigger_base, target_max_usage)`) so
+            // with the PROACTIVE session ceiling (`min(session_trigger_base, target_max_session_usage)`) so
             // it agrees with the base-trigger `pick_target_with_reason` verdict just above (the
             // snapshot keys off the BASE, un-jittered triggers — #88 — so the footer never flickers
             // with the per-cycle swap-decision jitter). Covers BOTH the active-alive-and-over-trigger
             // and the active-DEAD-and-stranded cases: a dead active leaves every live spare
             // weekly-exhausted, so relief classifies `Weekly` here while the dead active's 🔴 health
             // rides its own account row (the composite an operator needs — issue #405).
-            let session_ceiling = self.session_trigger_base.min(self.target_max_usage);
+            let session_ceiling = self.session_trigger_base.min(self.target_max_session_usage);
             let (cause, _hold, resets_at) = all_exhausted_relief(
                 active_idx,
                 readings,
@@ -3503,8 +4886,12 @@ where
                 SwapReason::Session => Some(NoTargetCause::Session),
                 SwapReason::Weekly => Some(NoTargetCause::Weekly),
                 // `all_exhausted_relief` only ever classifies Session|Weekly; the operator-swap
-                // reasons (Manual / Forced) cannot arise from a no-target verdict.
-                SwapReason::Manual | SwapReason::Forced => None,
+                // reasons (Manual / Forced) and the preemptive reasons (#452 BlindPreempt / #539
+                // VelocityPreempt) cannot arise from a no-target verdict.
+                SwapReason::Manual
+                | SwapReason::Forced
+                | SwapReason::BlindPreempt
+                | SwapReason::VelocityPreempt => None,
             };
             NextSwap::NoViableTarget { cause, resets_at }
         })
@@ -3544,7 +4931,7 @@ where
                 active,
                 &readings,
                 &enabled,
-                Some(self.target_max_usage),
+                Some(self.target_max_session_usage),
                 self.session_trigger_base,
                 self.weekly_trigger_base,
             ) {
@@ -3690,6 +5077,124 @@ where
         expires_at_ms.map(millis_to_secs)
     }
 
+    /// Record the canonical `Claude Code-credentials` item's OWN per-poll liveness (issue #464)
+    /// and edge-trigger its durable scrub / recovery events — the shared-credential observability
+    /// umbrella #463 needs to make the fleet-wide "Not logged in" scrub visible and measurable.
+    ///
+    /// `canonical` is the blob read ONCE at top-of-tick (`None` when unreadable); `absent`
+    /// distinguishes a CONFIRMED gone item ([`Error::CredentialNotFound`]) from a transient read
+    /// failure, so a flaky read classifies [`CanonicalLiveness::Unknown`] (no event, hold the
+    /// signal) rather than a false scrub. `active` supplies the handle — on a scrub the last-known
+    /// active account is the one Claude Code emptied for everyone.
+    ///
+    /// Two outputs: (1) a `diag=canonical` LEVEL line every poll — the fingerprint series +
+    /// present/scrubbed reading #465/#467 consume; (2) on a present↔scrubbed transition, one
+    /// durable [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`]. Non-secret by
+    /// construction: a liveness discriminant, a hash-prefix fingerprint, a handle, and a timestamp
+    /// — never a token or email (issue #15). Present/empty and the fingerprint both key off the
+    /// single audited [`crate::refresh::refresh_token`] extractor — the same discipline
+    /// [`has_live_refresh_token`] follows — so the emptiness rule lives in one place.
+    ///
+    /// RETURNS the classified [`CanonicalLiveness`] so the tick can react to a `Scrubbed` reading —
+    /// the autonomous adopt-target recovery (issue #467) heals a scrubbed canonical when a viable
+    /// target exists, off the same single audited emptiness rule this uses for the edge trigger.
+    fn note_canonical_liveness(
+        &mut self,
+        canonical: Option<&Credential>,
+        absent: bool,
+        active: Option<usize>,
+        events: &mut Vec<Event>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> CanonicalLiveness {
+        let handle = active.map(|i| self.roster[i].label.clone());
+        let (state, fingerprint, expires_at) = match canonical {
+            Some(cred) => {
+                let blob = cred.expose();
+                match crate::refresh::refresh_token(blob) {
+                    // A live (non-empty) refresh token — a usable shared credential.
+                    Some(rt) if !rt.is_empty() => (
+                        CanonicalLiveness::Present,
+                        Some(canonical_fingerprint(&rt)),
+                        crate::refresh::expires_at(blob).map(millis_to_secs),
+                    ),
+                    // A present-but-EMPTY refresh token (`Some("")`): the tokens were cleared in
+                    // place — the dead signal per `refresh::refresh_token`. Claude Code's observed
+                    // scrub empties the whole ITEM (→ `CredentialNotFound` below, ADR-0018); this
+                    // arm defensively catches an in-place clear too. No live token to fingerprint.
+                    Some(_) => (CanonicalLiveness::Scrubbed, None, None),
+                    // An unparseable / non-`claudeAiOauth` blob (`refresh_token` → `None`): the
+                    // item is present but its liveness cannot be determined — honestly UNKNOWN, not
+                    // a confirmed scrub (a corrupt read must never fabricate a scrub edge).
+                    None => (CanonicalLiveness::Unknown, None, None),
+                }
+            }
+            // The item is GONE (`CredentialNotFound`, exit 44) — the confirmed scrub Claude Code's
+            // `invalid_grant` empties the item into (ADR-0018), and the exact signal #467 adopts on.
+            None if absent => (CanonicalLiveness::Scrubbed, None, None),
+            // Transient / unreadable for a non-lock, non-not-found reason — no evidence this poll.
+            None => (CanonicalLiveness::Unknown, None, None),
+        };
+
+        // Rotation-YANK detection (issue #475): a Present→Present canonical fingerprint change means
+        // the shared item ROTATED under any mid-flight sessions — the RECOVERABLE "Not logged in"
+        // mode (they re-read the still-live item on `continue`, no `/login`), distinct from the
+        // UNRECOVERABLE scrub below. Derived purely from the observed present/valid state + the
+        // fingerprint delta (AC1: "not guessed"). The anchor is advanced ONLY here — never by the
+        // daemon's own swap / keep-warm canonical writes (UNLIKE `canonical_watch`) — so a
+        // self-authored rotation is still marked, keeping the yank series the full canonical-rotation
+        // denominator #465 measures.
+        let rotated_from = match (state, &fingerprint) {
+            (CanonicalLiveness::Present, Some(fp)) => {
+                // Advance the anchor; if a DIFFERENT fingerprint was anchored, mark the yank carrying
+                // the PRIOR fingerprint. The first observation (anchor `None`) seeds silently.
+                match self.state.prev_canonical_fingerprint.replace(fp.clone()) {
+                    Some(prev) if prev != *fp => Some(prev),
+                    _ => None,
+                }
+            }
+            // A scrub CLEARS the anchor: a rotation spanning a scrub is a scrub + recovery, not a
+            // yank — the `canonical_restored` edge marks the recovery, re-seeding on the next Present.
+            (CanonicalLiveness::Scrubbed, _) => {
+                self.state.prev_canonical_fingerprint = None;
+                None
+            }
+            // Unknown (or a present blob with no parseable fingerprint): no evidence — HOLD the anchor
+            // and mark nothing, the same "a flaky read carries no signal" hold the scrub edge uses.
+            _ => None,
+        };
+
+        // (1) The per-poll LEVEL record on the diagnostic channel (issue #464): every poll, so the
+        // fingerprint series + present/scrubbed reading are measurable from the log alone. On a
+        // rotation, the additive `mode=yank prev=…` marker (issue #475) rides this same line.
+        diagnostics.push(Diagnostic::Canonical {
+            state,
+            fingerprint,
+            account: handle.clone(),
+            expires_at,
+            rotated_from,
+        });
+
+        // (2) The durable, EDGE-triggered transition events (issue #464). A transient UNKNOWN
+        // carries no evidence — hold the current signal rather than fabricate a scrub or recovery.
+        match state {
+            CanonicalLiveness::Scrubbed => {
+                if !self.state.signaled_canonical_scrubbed {
+                    events.push(Event::CanonicalScrubbed { account: handle });
+                    self.state.signaled_canonical_scrubbed = true;
+                }
+            }
+            CanonicalLiveness::Present => {
+                if self.state.signaled_canonical_scrubbed {
+                    events.push(Event::CanonicalRestored { account: handle });
+                    self.state.signaled_canonical_scrubbed = false;
+                }
+            }
+            CanonicalLiveness::Unknown => {}
+        }
+
+        state
+    }
+
     /// Recompute every account's 5-state credential-health rollup (issue #119) against
     /// `now_secs` and emit one [`Event::CredentialHealth`] per account whose verdict CHANGED
     /// since the last call — the edge-triggered health timeline the issue's AC-3 requires
@@ -3743,6 +5248,11 @@ where
         readings: &[Option<Usage>],
         now_secs: i64,
     ) -> StatusSnapshot {
+        // One monotonic read for the bounded-blindness projection (issue #479): `blind_elapsed` is
+        // measured against the SAME clock the retained anchor's `at` was stamped on (`last_good`,
+        // #450) — the monotonic `clock` seam, DISTINCT from the wall-clock `now_secs` the freshness
+        // stamp + health rollup read.
+        let blind_at = self.clock.now();
         StatusSnapshot {
             accounts: self
                 .roster
@@ -3787,6 +5297,23 @@ where
                             readings[i].is_some(),
                             now_secs,
                         ),
+                        // The bounded-blindness projection (issue #479): ONLY the active account can
+                        // be in bounded blindness — it is the only one that self-exhausts while
+                        // active and the only one the `last_good` anchor belongs to. Keyed off
+                        // `last_readings[active].is_none()` (the true blind predicate the anchor +
+                        // `note_blind_gate_eligibility` logic use, NOT the masked `readings` arg) and
+                        // the retained anchor; `None` for every other account (and omitted from the
+                        // wire there via `skip_serializing_if`).
+                        blind_active: if active == Some(i) {
+                            blind_active_view(
+                                self.state.last_good,
+                                self.state.last_readings[i].is_none(),
+                                health.quarantined,
+                                blind_at,
+                            )
+                        } else {
+                            None
+                        },
                     }
                 })
                 .collect(),
@@ -3807,6 +5334,44 @@ where
             // when healthy — surfaced by `status` so the mechanism-down state is visible without
             // waiting for an account to die. A COUNT only (#15).
             systemic_refresh: self.state.systemic_refresh.status(),
+            // The daemon-level canonical-scrub rollup (issue #516): project the two edge-latched scrub
+            // signals into the wire discriminant so `status` / the menubar (#469) can surface the
+            // fleet-wide scrubbed lockout. GATE on `signaled_canonical_scrubbed` FIRST (the master "is
+            // the canonical currently empty" signal), THEN refine by exhaustion — because the restore
+            // path clears `signaled_canonical_scrubbed` (a live re-read) but NOT
+            // `signaled_scrub_adopt_exhausted` (cleared only on churn-window age-out, inside the
+            // scrubbed-gated `recover_scrubbed_canonical`), so `(scrubbed=false, exhausted=true)` is
+            // reachable after a `claude /login` recovery. Checking exhaustion first would then FALSELY
+            // report un-recoverable over a HEALED canonical. Recovery-EXHAUSTED (#467, the residual
+            // #469 renders with the `claude /login` remedy) outranks merely-scrubbed-but-RECOVERING
+            // (#464); both clear to `None` (healthy) once the canonical is observed live again.
+            canonical_scrub: if self.state.signaled_canonical_scrubbed {
+                if self.state.signaled_scrub_adopt_exhausted {
+                    Some(CanonicalScrub::Exhausted)
+                } else {
+                    Some(CanonicalScrub::Recovering)
+                }
+            } else {
+                None
+            },
+            // The daemon-level keychain-locked flag (issue #498): project the edge-latched
+            // `signaled_keychain_locked` signal straight onto the wire so `status` / the menubar (#498)
+            // can surface the fleet-wide unreadable-credential lockout (the login keychain is LOCKED, so
+            // the shared item can't be READ at all — distinct from a readable-but-scrubbed canonical).
+            // Read directly, mirroring `canonical_scrub` above: the latch is `true` for exactly the
+            // duration of a lock episode — set in `locked_tick` before this snapshot is built, cleared
+            // on the first readable cycle — so a direct read is a faithful "currently locked" indicator.
+            keychain_locked: self.state.signaled_keychain_locked,
+            // The daemon-level narrated preemptive-swap notice (issue #479): project the retained
+            // `last_blind_preempt_swap` record onto the wire, but only while STILL-CURRENT (the swap's
+            // target is still the active account) AND RECENT (within `BLIND_PREEMPT_NOTICE_SECS`) — both
+            // decided here (`recent_blind_preempt_swap_view`), on the same monotonic `blind_at` the
+            // #479 blind projection uses, so `render_status` stays a pure function of the wire (#169).
+            recent_blind_preempt_swap: recent_blind_preempt_swap_view(
+                self.state.last_blind_preempt_swap.as_ref(),
+                active.map(|i| self.roster[i].label.as_str()),
+                blind_at,
+            ),
         }
     }
 
@@ -3837,7 +5402,86 @@ where
     fn next_subinterval(&mut self) -> Duration {
         let interval = self.next_poll_interval();
         let len = self.rotation_len().max(1) as u32;
-        interval / len
+        let base = interval / len;
+        // Issue #540: while the active account is near its limit, cap the sub-interval to
+        // `near_limit_poll_secs` so the active — re-observed every ~2 sub-intervals by the #366
+        // interleave — is re-polled within ~2× that near-limit, closing the poll gap. A `min`, never
+        // a replacement: a roster whose base sub-interval is already tighter than the cap keeps its
+        // faster cadence, so the tightening only ever SHORTENS the wait. Below the band
+        // `near_limit_fast_poll` is clear and the base is returned unchanged — the steady-state
+        // cadence the source-scoped 429 footprint depends on stays flat. The cached bool can only be
+        // `true` when `near_limit_poll_secs != 0` (its sole writer,
+        // `near_limit_fast_poll_engaged`, gates on the kill-switch), so the cap is never `0`.
+        //
+        // This caps the SHARED per-tick spacing, so peer ticks in the #366 interleave tighten
+        // transiently WITH the active while it is in-band — a deliberate, accepted consequence, not
+        // a leak of the active-only TRIGGER (which keys off the active reading alone, never a peer's):
+        // capping only the active-position ticks would leave the active re-poll gap at `base + cap`
+        // (the wait after the interposed peer stays uncapped) and fail to close it, while a full
+        // active-priority takeover would deadlock #537's exhausted-peer observation. The peer
+        // transient is in-band-only (the steady-state above the band stays flat) and within the
+        // #538-validated envelope (active re-poll ≈ 2× cap, inside the ratified 60–150 s band).
+        if self.state.near_limit_fast_poll {
+            base.min(Duration::from_secs(self.near_limit_poll_secs))
+        } else {
+            base
+        }
+    }
+
+    /// Whether the ACTIVE account `active_idx` is in — or the #539 velocity projection places it
+    /// into — the near-limit band (issue #540): the trigger for the near-limit poll-coverage
+    /// fast-poll. Keyed off the SAME signals #539's [`velocity_swap`](Self::velocity_swap) uses (the
+    /// active's fresh reading plus its retained session-velocity EMA), so #540 keeps the very
+    /// reading + velocity #539 projects from warm through the final climb — the poll-gap
+    /// `velocity_swap` explicitly holds on (a velocity reset by a window drop). Requires a PRESENT
+    /// reading: a blind active (its slot cleared by a 429/5xx) carries no OBSERVED near-limit signal
+    /// and belongs to the #452 bounded-blindness path, not this one. Fires when EITHER the observed
+    /// reading is at/over the band floor
+    /// ([`session_velocity_min_project_above`](Self::session_velocity_min_project_above) — reused so
+    /// #540 and #539 share ONE band, no drift) OR, for a still-below-band reading, the sustained
+    /// projection `last + rate × H` reaches that floor within the horizon (the "approaching the
+    /// band" arm, so the fast-poll engages BEFORE a fast burst is even observed in-band). A pure
+    /// read of `self.state`; `active_idx` is a resolved roster index, so the slot always exists.
+    fn active_near_limit(&self, active_idx: usize) -> bool {
+        let Some(active_usage) = self.state.last_readings[active_idx] else {
+            return false;
+        };
+        let floor = self.session_velocity_min_project_above;
+        // In-band by the observed reading.
+        if active_usage.session >= floor {
+            return true;
+        }
+        // Approaching the band: the #539 projection reaches the floor within the horizon. Requires a
+        // SUSTAINED velocity EMA (≥ `MIN_VELOCITY_SAMPLES`), exactly as `velocity_swap` does — never
+        // a single-interval spike; a `0` horizon (the #539 kill-switch) collapses the projection to
+        // the observed reading, which is below the floor here, so it cannot reach.
+        let horizon = self.session_velocity_horizon_secs;
+        if horizon == 0 {
+            return false;
+        }
+        let Some(vel) = self.state.session_velocity[active_idx] else {
+            return false;
+        };
+        if vel.samples < MIN_VELOCITY_SAMPLES {
+            return false;
+        }
+        active_usage.session + vel.rate * horizon as f64 >= floor
+    }
+
+    /// Whether the near-limit poll-coverage fast-poll (issue #540) is engaged THIS tick: the path is
+    /// enabled (`near_limit_poll_secs != 0`, the kill-switch), the roster is warmed up (#80 — before
+    /// the first full cycle the carried readings are partial, and tightening the shared tick before
+    /// warm-up could starve peers of their first poll and stall the warm-up latch), an active
+    /// account is resolved, and it is [`active_near_limit`](Self::active_near_limit). The cached
+    /// verdict [`near_limit_fast_poll`](DecisionState::near_limit_fast_poll) is refreshed from this
+    /// every tick, so the wait path and the edge-triggered event read ONE consistent decision.
+    fn near_limit_fast_poll_engaged(&self) -> bool {
+        self.near_limit_poll_secs != 0
+            && self.state.warmed_up
+            && self
+                .state
+                .active
+                .is_some_and(|active_idx| self.active_near_limit(active_idx))
     }
 
     /// Sleep until the next single-account poll is due — a freshly drawn, jittered
@@ -3873,6 +5517,26 @@ where
             .is_some_and(|until| self.clock.now() < until)
     }
 
+    /// Whether NON-active account `i` is being SLOW-POLLED because it is out of rotation —
+    /// weekly- or session-exhausted (issue #537): it has an armed `exhausted_poll_until`
+    /// window that has not yet elapsed on the monotonic [`Clock`]. While `true`,
+    /// [`tick`](Self::tick) SKIPS that account's poll this cycle — an exhausted peer's usage
+    /// number cannot change until its server-side window resets, so re-polling every
+    /// `poll_secs` wastes a request. The ACTIVE account is EXEMPT (`active != Some(i)`): its
+    /// swap-away trigger must stay observable at full cadence (the #453 active-vs-peer
+    /// asymmetry), so even a stale armed window on an account just promoted to active (via
+    /// `use`) never skips it — the belt-and-suspenders partner of
+    /// [`note_exhausted_poll`](Self::note_exhausted_poll) never arming the active account.
+    /// `false` once the window elapses, when the account reads viable again, or when it is the
+    /// active account. The quota-exhaustion sibling of
+    /// [`account_backing_off`](Self::account_backing_off)'s rate-limit skip (ADR-0019).
+    fn exhausted_slow_polling(&self, i: usize, active: Option<usize>) -> bool {
+        active != Some(i)
+            && self.state.health[i]
+                .exhausted_poll_until
+                .is_some_and(|until| self.clock.now() < until)
+    }
+
     /// Fold account `i`'s poll outcome into its OWN rate-limit / transient back-off (issue
     /// #293, the per-account revision of #76's endpoint-global model). A `429`
     /// (rate-limited) or a `5xx` / network transient advances the account's exponential
@@ -3883,12 +5547,22 @@ where
     /// the diagnostic tick line — or `None` when the outcome was not a throttle.
     ///
     /// The base is this cycle's freshly-drawn, jittered poll interval — inheriting the #38
-    /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`, clamped to
-    /// [`POLL_BACKOFF_CAP`]. The first throttled poll already earns ~2× the interval, so
-    /// the account's re-poll spacing is WIDER than the fixed cadence — #76's core ask, now
-    /// per-account. A server-advised `Retry-After` is honoured as a MINIMUM (the wait is
-    /// never shorter than it) but clamped to [`POLL_BACKOFF_CAP`] as a MAXIMUM, so a
-    /// pathological value cannot dark the account past the exponential ceiling (issue #294).
+    /// decorrelation — times `2^min(streak, POLL_BACKOFF_MAX_SHIFT)`. The first throttled
+    /// poll already earns ~2× the interval, so the account's re-poll spacing is WIDER than
+    /// the fixed cadence — #76's core ask, now per-account. The exponential arm is clamped
+    /// to a ceiling that DIFFERS by role (issue #453, `is_active`): a PEER settles at
+    /// [`POLL_BACKOFF_CAP`] (one poll/hour), while the ACTIVE account — whose throttle blinds
+    /// the very account being consumed — settles at the much tighter
+    /// [`ACTIVE_POLL_BACKOFF_CAP`], recovering observability fast instead of climbing toward
+    /// an hour.
+    ///
+    /// A server-advised `Retry-After` is honoured as a MINIMUM (the wait is never shorter
+    /// than it), but the MAXIMUM differs by role: for a PEER it is itself clamped to
+    /// [`POLL_BACKOFF_CAP`], so a pathological value cannot dark the account past the ceiling
+    /// (issue #294); for the ACTIVE account it is an ABSOLUTE, un-clamped floor, so the daemon
+    /// never re-polls before the server said it may (issue #453 AC) — even past
+    /// [`POLL_BACKOFF_CAP`]. Un-clamping the active floor re-introduces the unbounded-`wait`
+    /// overflow #294 had retired, so the armed instant is computed with `checked_add` below.
     ///
     /// Scoping BOTH the `429` and the transient per-account is deliberate (issue #293): the
     /// `429` is per-Anthropic-org (independent buckets), and under a genuine endpoint outage
@@ -3897,6 +5571,7 @@ where
     fn note_account_backoff(
         &mut self,
         i: usize,
+        is_active: bool,
         result: &Result<Usage>,
         events: &mut Vec<Event>,
     ) -> Option<TickBackoff> {
@@ -3923,23 +5598,45 @@ where
         let streak = self.state.health[i].poll_backoff_streak.saturating_add(1);
         self.state.health[i].poll_backoff_streak = streak;
         let shift = streak.min(POLL_BACKOFF_MAX_SHIFT);
+        // The exponential self-backoff ceiling is role-dependent (issue #453): the ACTIVE
+        // account clamps tighter (`ACTIVE_POLL_BACKOFF_CAP`) so a throttle on the consumed
+        // account does not go dark for long; a PEER keeps the #294 `POLL_BACKOFF_CAP` ceiling.
+        let exp_cap = if is_active {
+            ACTIVE_POLL_BACKOFF_CAP
+        } else {
+            POLL_BACKOFF_CAP
+        };
         let widened = self
             .next_poll_interval()
             .checked_mul(1u32 << shift)
-            .unwrap_or(POLL_BACKOFF_CAP)
-            .min(POLL_BACKOFF_CAP);
-        // Clamp to `POLL_BACKOFF_CAP` as a MAXIMUM (issue #294) — bounds a pathological or buggy
-        // `Retry-After` (e.g. `86400`). `widened` is already ≤ the cap, so this bites only the
-        // `Retry-After` arm.
+            .unwrap_or(exp_cap)
+            .min(exp_cap);
         let wait = match signal.retry_after {
-            Some(ra) => widened.max(ra),
+            // ACTIVE (issue #453): a server `Retry-After` is an ABSOLUTE floor — NOT clamped,
+            // so the daemon never re-polls before the server said it may, even past
+            // `POLL_BACKOFF_CAP`. (The exponential arm is already ≤ `ACTIVE_POLL_BACKOFF_CAP`.)
+            Some(ra) if is_active => widened.max(ra),
+            // PEER (issue #294): the `Retry-After` arm is clamped to `POLL_BACKOFF_CAP` as a
+            // MAXIMUM, bounding a pathological / buggy value (e.g. `86400`). `widened` is
+            // already ≤ the cap, so this bites only the `Retry-After` arm.
+            Some(ra) => widened.max(ra).min(POLL_BACKOFF_CAP),
             None => widened,
-        }
-        .min(POLL_BACKOFF_CAP);
-        // `wait` is bounded to `POLL_BACKOFF_CAP` above, so adding it to the monotonic
-        // instant cannot overflow — the value is bounded at the source (issue #294), which
-        // supersedes #293's `checked_add` guard against an unbounded `Retry-After`.
-        self.state.health[i].poll_backoff_until = Some(self.clock.now() + wait);
+        };
+        // Arm the window on the monotonic clock. A PEER's `wait` is bounded to `POLL_BACKOFF_CAP`,
+        // so `now + wait` cannot overflow. The ACTIVE account's `Retry-After` floor is un-clamped
+        // (issue #453), which re-opens the unbounded-`Retry-After` overflow #294 had retired — so
+        // arm with `checked_add`. A value large enough to overflow the monotonic instant (~hundreds
+        // of billions of years) is garbage, not a bona-fide server directive, so it falls back to
+        // the peer ceiling rather than panic. `now` is read ONCE, and the REPORTED window (`armed`)
+        // is derived from the armed `until`, so the durable event / tick line always AGREE with
+        // `poll_backoff_until` — including in that fallback, where they then render like the peer
+        // clamp (a bounded `backoff_secs` beside the raw pathological `retry_after_secs`).
+        let now = self.clock.now();
+        let until = now
+            .checked_add(wait)
+            .unwrap_or_else(|| now + POLL_BACKOFF_CAP);
+        self.state.health[i].poll_backoff_until = Some(until);
+        let armed = until.saturating_duration_since(now);
         // Durable ENTER (issue #399): make the previously stderr-only 429 / back-off signal durable
         // — the account UUID, the throttle class (`429` vs transient), the running streak, the RAW
         // server `Retry-After` (pre-cap #295), and the effective armed window. Emitted on EACH
@@ -3952,16 +5649,94 @@ where
             class: signal.class,
             consecutive: streak,
             retry_after_secs: signal.retry_after.map(|ra| ra.as_secs()),
-            backoff_secs: wait.as_secs(),
+            backoff_secs: armed.as_secs(),
         });
-        // Carry the RAW server `Retry-After` (pre-cap) alongside the effective `wait` so the
-        // diagnostic tick line can LABEL the wait's source (issue #295): a `Some` marks a
+        // Carry the RAW server `Retry-After` (pre-cap) alongside the effective `armed` window so
+        // the diagnostic tick line can LABEL the wait's source (issue #295): a `Some` marks a
         // server-advised floor, a `None` marks the self-capped exponential. Pre-cap keeps a
-        // pathological value the #294 clamp bit visible (`wait` ≪ `retry_after`).
+        // pathological value the #294 PEER clamp bit visible (`armed` ≪ `retry_after`).
         Some(TickBackoff {
-            wait,
+            wait: armed,
             retry_after: signal.retry_after,
         })
+    }
+
+    /// Fold account `i`'s poll into its out-of-rotation slow-poll window (issue #537), the
+    /// quota-exhaustion sibling of [`note_account_backoff`](Self::note_account_backoff)'s
+    /// rate-limit back-off. Reads the account's freshly-stored reading
+    /// ([`last_readings`](DecisionState::last_readings)`[i]`):
+    ///
+    /// - **NON-active peer, reading out of rotation** (`weekly >= weekly_trigger_base ||
+    ///   session >= session_trigger_base`): arm `exhausted_poll_until = now + <window>` (the
+    ///   reset-aware [`exhausted_poll_window`]) so the peer's poll is skipped until the window
+    ///   elapses. Edge-triggered ENTER — a durable [`Event::ExhaustedSlowPoll`] fires ONLY on
+    ///   the normal→slow transition; a re-arm while the peer stays exhausted is not a new entry
+    ///   (it never left the widened cadence), mirroring `note_account_backoff`'s
+    ///   `was_backing_off` idiom.
+    /// - **Viable again, OR the ACTIVE account** (exempt — full cadence): clear the window.
+    ///   Edge-triggered EXIT — a durable [`Event::ExhaustedSlowPollCleared`] fires ONLY when a
+    ///   window was actually armed, bracketing the episode; a plain viable poll stays silent.
+    ///
+    /// A FAILED poll (`last_readings[i]` is `None`) carries NO exhaustion signal, so the window
+    /// is left untouched — the peer keeps whatever window it had (exactly as a throttle carries
+    /// the prior reading). `now` is the tick's monotonic [`Clock`] instant (the armed window's
+    /// deadline); `now_secs` is the tick's wall-clock epoch (the `resets_at` delta) — both read
+    /// once per tick and passed in, keeping the arithmetic on the pure [`exhausted_poll_window`]
+    /// (the same read-at-tick-pass-into-a-pure-fn idiom as `keep_active_warm`'s `now_ms`).
+    fn note_exhausted_poll(
+        &mut self,
+        i: usize,
+        active: Option<usize>,
+        now: Instant,
+        now_secs: i64,
+        events: &mut Vec<Event>,
+    ) {
+        // A failed poll carries no exhaustion signal — leave any window as-is.
+        let Some(reading) = self.state.last_readings[i] else {
+            return;
+        };
+        // The ACTIVE account is EXEMPT (peers only): polled at full cadence, so by definition
+        // NOT in the widened cadence. Treat it as "viable" so any armed window (e.g. a peer just
+        // promoted to active via `use`) is cleared with the EXIT edge, and it is never armed.
+        // Otherwise, out of rotation = at/above EITHER base trigger (the same thresholds the
+        // snapshot's `weekly_exhausted` verdict and the swap gate key off).
+        let out_of_rotation = active != Some(i)
+            && (reading.weekly >= self.weekly_trigger_base
+                || reading.session >= self.session_trigger_base);
+        let account_uuid = self.roster[i].account_uuid.clone();
+        if out_of_rotation {
+            let window = exhausted_poll_window(
+                &reading,
+                self.weekly_trigger_base,
+                self.session_trigger_base,
+                now_secs,
+                self.exhausted_poll_secs,
+                // The floor is `poll_secs` — the un-jittered base of the poll strategy (the same
+                // value `config.tunables.poll_secs` seeds it with); a slow-polled peer must never
+                // re-poll faster than the normal cadence.
+                self.poll_strategy.base as u64,
+            );
+            let health = &mut self.state.health[i];
+            let was_slow_polling = health.exhausted_poll_until.is_some();
+            // `window <= exhausted_poll_secs <= 86400 s`, so this bounded add cannot overflow the
+            // monotonic instant (unlike `note_account_backoff`'s un-clamped active `Retry-After`).
+            health.exhausted_poll_until = Some(now + window);
+            if !was_slow_polling {
+                events.push(Event::ExhaustedSlowPoll {
+                    account: account_uuid,
+                    window_secs: window.as_secs(),
+                });
+            }
+        } else {
+            let health = &mut self.state.health[i];
+            let was_slow_polling = health.exhausted_poll_until.is_some();
+            health.exhausted_poll_until = None;
+            if was_slow_polling {
+                events.push(Event::ExhaustedSlowPollCleared {
+                    account: account_uuid,
+                });
+            }
+        }
     }
 
     /// Draw the jittered start-up delay (issue #76): a uniform `[0,
@@ -4051,12 +5826,15 @@ struct BackoffSignal {
 
 /// The back-off one throttled poll imposed this tick (issue #293/#294), for the diagnostic
 /// tick line. The output sibling of [`BackoffSignal`] (the input): `wait` is the effective
-/// window armed on the account — `max(self-capped exponential, server Retry-After)`, clamped
-/// to [`POLL_BACKOFF_CAP`] — which the line renders as `backoff_secs`. `retry_after` is the
-/// RAW server-advised `Retry-After` the response supplied (issue #295), BEFORE that clamp,
-/// or `None` when the server sent none — the source label that tells a server-advised wait
-/// from the daemon's self-capped exponential. Pre-cap on purpose: a pathological value the
-/// #294 cap bit stays visible (`wait` = 3600 s beside `retry_after` = 86400 s), rather than
+/// window armed on the account — `max(self-capped exponential, server Retry-After)`, where
+/// the exponential self-caps at [`POLL_BACKOFF_CAP`] for a peer or the tighter
+/// [`ACTIVE_POLL_BACKOFF_CAP`] for the active account, and the `Retry-After` arm is clamped
+/// to [`POLL_BACKOFF_CAP`] for a peer but is an un-clamped floor for the active account
+/// (issue #453) — which the line renders as `backoff_secs`. `retry_after` is the RAW
+/// server-advised `Retry-After` the response supplied (issue #295), BEFORE any clamp, or
+/// `None` when the server sent none — the source label that tells a server-advised wait from
+/// the daemon's self-capped exponential. Pre-cap on purpose: a pathological value the #294
+/// PEER cap bit stays visible (`wait` = 3600 s beside `retry_after` = 86400 s), rather than
 /// collapsing into an unplaceable `backoff_secs=3600`.
 #[derive(Debug, Clone, Copy)]
 struct TickBackoff {
@@ -4098,6 +5876,64 @@ fn usage_velocity(prev: &Usage, next: &Usage) -> (i16, i16) {
     let session = i16::from(to_pct(next.session)) - i16::from(to_pct(prev.session));
     let weekly = i16::from(to_pct(next.weekly)) - i16::from(to_pct(prev.weekly));
     (session, weekly)
+}
+
+/// The widened slow-poll window for an out-of-rotation reading (issue #537): how long a
+/// weekly- or session-exhausted NON-active peer's poll is deferred.
+///
+/// `min(exhausted_poll_secs, max(soonest_applicable_resets_at - now, floor))`, where the
+/// "applicable" reset is the SOONEST `resets_at` among the dimensions that are actually
+/// exhausted (weekly's when weekly-exhausted, session's when session-exhausted; the sooner
+/// of the two when both are), and `floor` = `poll_secs`. When no applicable `resets_at` is
+/// known (absent / unparseable), it falls back to the full `exhausted_poll_secs` hourly
+/// ceiling. Rationale (issue #537): the hourly ceiling bounds worst-case blindness for the
+/// RARE server-side early reset; a known `resets_at` (which the daemon already retains) pulls
+/// the next poll EARLIER so a window that elapses sooner than an hour is caught promptly. The
+/// floor guards the degenerate `resets_at <= now` case (a server that is late resetting) from
+/// a busy re-poll every tick, and keeps a slow-polled peer from ever re-polling FASTER than a
+/// normal account's `poll_secs` cadence.
+///
+/// Pure — a function of the reading, the two base triggers, an explicit wall-clock `now_secs`
+/// (for the reset delta), and the two config bounds — so the arithmetic is unit-tested without
+/// a daemon or a real clock; the caller arms `exhausted_poll_until = monotonic_now + <this>`.
+/// With the validated `exhausted_poll_secs >= poll_secs` the result lands in
+/// `poll_secs..=exhausted_poll_secs` (both positive), so the caller's `Instant + Duration`
+/// cannot underflow.
+fn exhausted_poll_window(
+    reading: &Usage,
+    weekly_trigger: f64,
+    session_trigger: f64,
+    now_secs: i64,
+    exhausted_poll_secs: u64,
+    poll_secs: u64,
+) -> Duration {
+    // The soonest reset among the EXHAUSTED dimensions only — the window is keyed off a reset
+    // that actually gates this peer's return to rotation. A dimension below its trigger does
+    // not contribute its reset (it is not why the peer is out of rotation).
+    let mut soonest: Option<i64> = None;
+    let mut consider = |resets_at: Option<i64>| {
+        if let Some(at) = resets_at {
+            soonest = Some(soonest.map_or(at, |cur: i64| cur.min(at)));
+        }
+    };
+    if reading.weekly >= weekly_trigger {
+        consider(reading.weekly_resets_at);
+    }
+    if reading.session >= session_trigger {
+        consider(reading.session_resets_at);
+    }
+    let ceiling = exhausted_poll_secs as i64;
+    let floor = poll_secs as i64;
+    let secs = match soonest {
+        // Reset-aware: poll again by the known reset, but never sooner than the floor and
+        // never later than the hourly ceiling. A reset at/behind `now` collapses to the floor.
+        Some(resets_at) => (resets_at - now_secs).max(floor).min(ceiling),
+        // No applicable reset known → the plain hourly ceiling (issue #537 fallback).
+        None => ceiling,
+    };
+    // `secs` lands in `floor..=ceiling` (with the validated `poll_secs <= exhausted_poll_secs`);
+    // the `max(0)` is a belt-and-suspenders non-negativity guard for the cast.
+    Duration::from_secs(secs.max(0) as u64)
 }
 
 /// Pick the viable swap target whose weekly window resets SOONEST (issue #37):
@@ -4399,6 +6235,36 @@ fn classify_capture_failure(err: &Error) -> CaptureRejection {
     }
 }
 
+/// Map an [`apply_settings`](crate::config::Config::apply_settings) failure to the redacted
+/// `(reason, detail)` for a `config-set` ack (issue #268) — the config-set counterpart of
+/// [`classify_capture_failure`]. A malformed / unparseable BASELINE (the existing on-disk file
+/// cannot be understood) is `ConfigUnreadable` — config-set never overwrites a file it cannot
+/// re-render; a label edit naming an unknown roster uuid (a stale settings client) is
+/// `UnknownAccount`; a range or cross-field violation on the FINAL edited config is `Invalid`,
+/// carrying the non-secret field-named message as `detail` so the UI can point at the offending
+/// field. Secret-free by construction: the config file holds no secrets (issue #15) and the reason
+/// is a stable discriminant.
+fn classify_config_set_failure(err: &Error) -> (ConfigSetRejection, Option<String>) {
+    match err {
+        // The baseline on-disk file is malformed — the overlay re-parse failed on the existing
+        // text; refuse rather than clobber a file the daemon cannot re-render.
+        Error::ConfigParse(_) => (ConfigSetRejection::ConfigUnreadable, None),
+        // A label edit named an `account_uuid` no roster account has (a stale client — the account
+        // was `remove`d since its `config-get`).
+        Error::AccountUuidNotFound { .. } => (ConfigSetRejection::UnknownAccount, None),
+        // A range / cross-field rule failed on the FINAL edited config (an out-of-range tunable, an
+        // empty label, `exhausted_poll_secs < poll_secs`, `target_max_session_usage >
+        // session_trigger`); surface the non-secret field-named message as `detail`.
+        Error::ConfigTargetMaxSessionAboveTrigger { .. } => {
+            (ConfigSetRejection::Invalid, Some(err.to_string()))
+        }
+        Error::ConfigInvalid(msg) => (ConfigSetRejection::Invalid, Some(msg.clone())),
+        // `apply_settings` yields only the four above; any other error is a defensive `Invalid`
+        // with its redacted message rather than a silent mismap.
+        other => (ConfigSetRejection::Invalid, Some(other.to_string())),
+    }
+}
+
 /// Fold a captured/refreshed [`CaptureOutcome`](crate::capture::CaptureOutcome) onto the event's
 /// [`CaptureEventOutcome`] axis (issue #359) — the two SUCCESS tokens the durable audit line carries.
 fn capture_event_outcome(outcome: crate::capture::CaptureOutcome) -> CaptureEventOutcome {
@@ -4423,7 +6289,7 @@ fn capture_event_outcome_rejected(reason: CaptureRejection) -> CaptureEventOutco
 mod tests {
     use super::*;
     use crate::claude_state::OauthAccount;
-    use crate::config::Tunables;
+    use crate::config::{SetTunables, Tunables};
     // `SweepOutcome` is named only in test code here (the run loop consumes it by
     // inference); import it test-scoped so a non-test build sees no unused import.
     use crate::contract::SweepOutcome;
@@ -4532,6 +6398,27 @@ mod tests {
                     weekly,
                     weekly_resets_at: Some(weekly_resets_at),
                     session_resets_at: None,
+                }),
+            );
+            self
+        }
+        /// Like [`ok`](Self::ok) but with a known SESSION `resets_at` (epoch seconds) —
+        /// the out-of-rotation slow-poll tests (issue #537) script a session-exhausted
+        /// peer's session-window reset through this.
+        fn ok_resets_session(
+            mut self,
+            uuid: &str,
+            session: f64,
+            weekly: f64,
+            session_resets_at: i64,
+        ) -> Self {
+            self.readings.insert(
+                uuid.to_owned(),
+                Scripted::Ok(Usage {
+                    session,
+                    weekly,
+                    weekly_resets_at: None,
+                    session_resets_at: Some(session_resets_at),
                 }),
             );
             self
@@ -5041,12 +6928,31 @@ mod tests {
         const WEEKLY_TRIGGER: u8 = 98;
         Tunables {
             poll_secs: 60,
+            // The out-of-rotation slow-poll cadence (issue #537), default 3600. Baseline daemon
+            // tests never let a peer stay exhausted across ticks, so this is inert for them; the
+            // slow-poll tests drive it explicitly.
+            exhausted_poll_secs: 3600,
+            // The near-limit fast-poll (issue #540) is OFF by default here (the `0` kill-switch), so
+            // baseline daemon tests keep their exact `poll_secs/N` cadence and emit no
+            // `NearLimitPollCoverage` event; the #540 timing-seam tests set it explicitly to arm it.
+            near_limit_poll_secs: 0,
             cooldown_secs: cooldown,
             // Most daemon tests set an explicit floor; `tunables_floor_off` sets it
             // inert (== trigger) for the tests that pin the always-on gate instead.
-            target_max_usage: floor,
+            target_max_session_usage: floor,
             session_trigger: trigger,
             weekly_trigger: WEEKLY_TRIGGER,
+            // Issue #452 bounded-blindness preemptive swap: INERT by default (T parked at
+            // the kill-switch ceiling) so baseline daemon tests are unperturbed by the new
+            // gate; the blind-swap tests override `session_blind_swap_secs` to arm it.
+            session_blind_swap_secs: 86_400,
+            session_blind_risk_band: 60,
+            // Issue #539 velocity-projection preemptive trigger: INERT by default (horizon parked
+            // at 0, the kill-switch) so baseline daemon tests are unperturbed by the new projective
+            // gate; the velocity-swap tests override `session_velocity_horizon_secs` to arm it.
+            session_velocity_horizon_secs: 0,
+            session_velocity_min_project_above: 85,
+            session_velocity_ema_alpha_pct: 50,
             monitor_401_n: 3,
             monitor_recovery_m: 2,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
@@ -5058,9 +6964,9 @@ mod tests {
         }
     }
 
-    /// Tunables with the target-max-usage reserve INERT — set to `session_trigger`, so
+    /// Tunables with the target-max-session-usage reserve INERT — set to `session_trigger`, so
     /// `pick_target`'s floor filter never tightens beyond the always-on session gate
-    /// (config allows `target_max_usage == session_trigger`). Post-#398 the floor is
+    /// (config allows `target_max_session_usage == session_trigger`). Post-#398 the floor is
     /// always-valued, so "no extra tightening" is expressed this way rather than the
     /// removed opt-out; behaviorally identical to the old `None` for target selection.
     /// The tests that use it pin the always-on gate / weekly behavior, not the reserve.
@@ -5162,6 +7068,21 @@ mod tests {
             }
         }
         panic!("warm-up did not complete within {max_ticks} ticks — empty/degenerate schedule?");
+    }
+
+    /// The per-poll `diag=canonical` line every tick now emits (issue #464). These hermetic
+    /// tests seed the canonical store with an OPAQUE token (`b"A-token"`, etc.) rather than a
+    /// `claudeAiOauth`-shaped blob, so `refresh::refresh_token` cannot parse it — the item is
+    /// present but its liveness is UNKNOWN (never a false scrub), with the handle the resolved
+    /// active account's label. The expected leading diagnostic for any tick of such a daemon.
+    fn canonical_unknown_diag(active_label: &str) -> Diagnostic {
+        Diagnostic::Canonical {
+            state: CanonicalLiveness::Unknown,
+            fingerprint: None,
+            account: Some(active_label.to_owned()),
+            expires_at: None,
+            rotated_from: None,
+        }
     }
 
     // --- pick_target (pure) ------------------------------------------------
@@ -5496,7 +7417,7 @@ mod tests {
 
     #[test]
     fn pick_target_floor_tightens_below_the_always_on_session_gate() {
-        // The opt-in target_max_usage (#10) is a STRICTER reserve layered on the always-on
+        // The opt-in target_max_session_usage (#10) is a STRICTER reserve layered on the always-on
         // session gate: with the floor OFF a target need only clear the gate
         // (session < trigger); an enabled floor also excludes accounts that pass the
         // gate but sit at/above the floor. Effective ceiling = min(session_trigger, floor).
@@ -5535,7 +7456,7 @@ mod tests {
     #[test]
     fn pick_target_excludes_weekly_exhausted_accounts() {
         // #11: an account at/above the weekly trigger is not a viable target, even
-        // with the target-max-usage OFF and ample session headroom — swapping there
+        // with the target-max-session-usage OFF and ample session headroom — swapping there
         // would only re-trigger and thrash.
         let readings = vec![
             Some(Usage {
@@ -5962,6 +7883,7 @@ mod tests {
         assert_eq!(
             first.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::Live,
@@ -5980,6 +7902,7 @@ mod tests {
         assert_eq!(
             second.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "spare".to_owned(),
                     outcome: PollClass::Live,
@@ -6108,6 +8031,142 @@ mod tests {
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn last_good_retains_the_pre_blind_reading_across_an_active_429() {
+        // Issue #450 AC1: a `429` on the active account's poll clears `last_readings[active]`
+        // to `None` (the reactive `decide()` path is unchanged — it never swaps on missing
+        // data), but the SEPARATE `last_good` anchor keeps the pre-blind reading + its
+        // timestamp, so #452 can still reason about how near the band the active account was
+        // when it went blind.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.68, 0.40)
+                .ok("u-B", 0.05, 0.05)
+                .ok("u-C", 0.05, 0.05),
+        )
+        .await;
+
+        // Tick 1 polls the active `work` (u-A) — a clean reading seeds both the reactive slot
+        // and the anchor.
+        daemon.tick().await;
+        assert_eq!(
+            daemon.state.last_readings[0].map(|r| (r.session, r.weekly)),
+            Some((0.68, 0.40)),
+        );
+        let anchor = daemon
+            .state
+            .last_good
+            .expect("a clean active poll sets last_good");
+        assert_eq!((anchor.session, anchor.weekly), (0.68, 0.40));
+
+        // The active now `429`s. Drive to its next scheduled poll — the #366 interleave
+        // re-observes the active on tick 3 (`[active, peer, active, peer]`).
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.05, 0.05)
+            .ok("u-C", 0.05, 0.05);
+        daemon.tick().await; // tick 2 — peer `spare`
+        daemon.tick().await; // tick 3 — active `work` 429s
+
+        // Reactive path byte-for-byte unchanged: the slot is cleared to `None`.
+        assert_eq!(daemon.state.last_readings[0], None);
+        // …but the pre-blind anchor is retained intact.
+        assert_eq!(
+            daemon.state.last_good.map(|g| (g.session, g.weekly)),
+            Some((0.68, 0.40)),
+            "a 429 must not disturb the retained last-good anchor",
+        );
+    }
+
+    #[tokio::test]
+    async fn last_good_refreshes_on_each_successful_active_poll() {
+        // Issue #450 AC2: every successful active-account poll overwrites the anchor with the
+        // fresh reading AND a fresh observation time.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.20, 0.10)
+                .ok("u-B", 0.05, 0.05)
+                .ok("u-C", 0.05, 0.05),
+        )
+        .await;
+
+        daemon.tick().await; // tick 1 — active `work` at 0.20
+        let first = daemon
+            .state
+            .last_good
+            .expect("the first active poll sets the anchor");
+        assert_eq!((first.session, first.weekly), (0.20, 0.10));
+
+        // A later active poll reads higher, at a later time.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.30)
+            .ok("u-B", 0.05, 0.05)
+            .ok("u-C", 0.05, 0.05);
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.tick().await; // tick 2 — peer `spare`
+        daemon.tick().await; // tick 3 — active `work` re-observed (#366)
+
+        let second = daemon.state.last_good.expect("the anchor is still set");
+        assert_eq!(
+            (second.session, second.weekly),
+            (0.50, 0.30),
+            "the anchor tracks the latest active reading",
+        );
+        assert!(
+            second.at > first.at,
+            "the anchor's timestamp advances with each refresh",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swap_away_clears_last_good_so_it_never_describes_the_departed_active() {
+        // Issue #450: the anchor is "for the ACTIVE account", so a swap-away must clear it —
+        // otherwise the bounded-blindness path (#452), whose OWN swap lands in `record_swap`,
+        // would keep reading the near-band anchor of the account it just left and could
+        // spuriously re-swap once the cooldown lapses. (The reset also fires at
+        // `adopt_manual_swap` and the reconcile paths; this exercises the load-bearing
+        // daemon-swap path.)
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // Active `work` sits over the trigger; `spare` is wide open — a viable target.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.05, 0.05);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+        daemon.state.active = Some(0);
+        daemon.state.last_swap = Some(LastSwap {
+            at: daemon.clock.now(),
+        });
+        daemon.clock.advance(Duration::from_secs(150)); // past the 100s cooldown
+
+        // The warming run polls the active at 0.97 (which sets the anchor), then swaps away
+        // from it — you cannot swap an over-trigger active without first observing it, so the
+        // anchor is provably populated before the swap.
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+
+        assert_eq!(daemon.state.active, Some(1));
+        assert_eq!(
+            daemon.state.last_good, None,
+            "swapping away from the active account must clear its pre-blind anchor",
+        );
     }
 
     #[tokio::test]
@@ -6403,8 +8462,9 @@ mod tests {
         // AC (issue #293): a sustained 429 WIDENS the account's effective poll spacing —
         // it is SKIPPED between re-attempts rather than re-polled at the fixed interval —
         // and the loop itself no longer globally backs off (`next_wait` stays `None`). The
-        // first throttled poll arms a 2×-interval (120 s) window; each throttled re-poll
-        // doubles it.
+        // first throttled poll arms a 2×-interval (120 s) window. A is the ACTIVE account, so
+        // that window is clamped at ACTIVE_POLL_BACKOFF_CAP (120 s, #453) and stays flat on
+        // re-poll rather than doubling — the widened-vs-fixed-interval spacing is what this pins.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
 
@@ -6420,6 +8480,7 @@ mod tests {
         assert_eq!(
             first.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::RateLimited,
@@ -6445,43 +8506,46 @@ mod tests {
         assert_eq!(skipped.next_wait, None);
         assert_eq!(tick_backoff_secs(&skipped), None);
 
-        // Advancing past each window lets A be re-polled, and each throttled re-poll doubles
-        // the window: 240 s, then 480 s.
+        // Advancing past the window lets A be re-polled. A is the ACTIVE account, so its
+        // self-backoff is CLAMPED at ACTIVE_POLL_BACKOFF_CAP (120 s, issue #453) — it stays
+        // flat on each throttled re-poll rather than doubling toward the peer ceiling.
         daemon.clock.advance(Duration::from_secs(120));
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(240));
-        daemon.clock.advance(Duration::from_secs(240));
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(480));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+        daemon.clock.advance(Duration::from_secs(120));
+        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
     }
 
     #[tokio::test]
-    async fn the_rate_limit_back_off_doubles_then_caps() {
-        // The per-account back-off grows exponentially from the interval and saturates at
-        // the cap, so a sustained-429 account settles at one re-poll per hour rather than
-        // growing without bound — mirroring the locked-keychain back-off shape. Advancing
-        // the clock past each window re-polls the (still-throttled) account, so its streak
-        // climbs tick over tick.
+    async fn the_active_accounts_back_off_is_capped_not_climbing() {
+        // AC (issue #453): the ACTIVE account's self-backoff is clamped to
+        // ACTIVE_POLL_BACKOFF_CAP (120 s) and does NOT climb toward the peer POLL_BACKOFF_CAP
+        // (3600 s) — a 429 blinds the very account being consumed, so recovering observability
+        // fast (a 120 s ceiling) beats the peer's gentle-on-the-endpoint hour. With the 60 s
+        // base the first throttle already sits at the 120 s cap, so every subsequent throttle
+        // stays FLAT at 120 s rather than doubling (240, 480, …) — the peer path (which DOES
+        // climb) is pinned separately in `consecutive_rate_limits_widen_a_peers_durable_backoff_window`.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
         let mut waits = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..7 {
             let secs = tick_backoff_secs(&daemon.tick().await).unwrap();
-            waits.push(Duration::from_secs(secs));
+            waits.push(secs);
             // Step past the just-armed window so the next tick re-polls (not skips) A.
             daemon.clock.advance(Duration::from_secs(secs));
         }
-        // 60 s × 2^streak: 120, 240, 480, 960, 1920, then 3840→capped 3600, then 3600.
-        assert_eq!(
-            waits,
-            vec![
-                Duration::from_secs(120),
-                Duration::from_secs(240),
-                Duration::from_secs(480),
-                Duration::from_secs(960),
-                Duration::from_secs(1920),
-                POLL_BACKOFF_CAP,
-                POLL_BACKOFF_CAP,
-                POLL_BACKOFF_CAP,
-            ]
+        // Flat at the active cap across a climbing streak — never 240/480/… (the PEER shape).
+        assert_eq!(waits, vec![120, 120, 120, 120, 120, 120, 120]);
+        // The durable event's streak still CLIMBS (the episode stays diagnosable) while the
+        // armed window stays pinned at the active cap: streak 8 on the next throttle, window 120.
+        let last = daemon.tick().await;
+        assert!(
+            last.events.iter().any(|e| matches!(
+                e,
+                Event::UsageBackoff { account, consecutive, backoff_secs, .. }
+                    if account == "u-A" && *consecutive == 8 && *backoff_secs == 120
+            )),
+            "active durable event: streak climbs to 8, window pinned at 120: {:?}",
+            last.events,
         );
     }
 
@@ -6489,8 +8553,10 @@ mod tests {
     async fn retry_after_is_honoured_as_a_minimum_wait() {
         // AC: Retry-After is honoured as a MINIMUM for the account's back-off window. When
         // it exceeds the exponential it wins; when it is smaller, the larger exponential
-        // governs but the window is never below Retry-After.
-        // Larger than the 120 s first-cycle exponential → Retry-After (600 s) wins.
+        // governs but the window is never below Retry-After. `u-A` is the ACTIVE account, so
+        // its exponential arm is the ACTIVE_POLL_BACKOFF_CAP (120 s) — which here coincides
+        // with the 60 s base's first-cycle 2× (issue #453 does not change RA-as-minimum).
+        // Larger than the 120 s cap → Retry-After (600 s) wins.
         let (_d1, mut bigger) = rate_limit_daemon(
             FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(600))),
         )
@@ -6506,24 +8572,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_large_retry_after_is_clamped_to_the_cap() {
-        // AC (issue #294): a server `Retry-After` is honoured as a MINIMUM but clamped to a
-        // sane MAXIMUM — POLL_BACKOFF_CAP — so a pathological value cannot dark the account
-        // past the exponential ceiling. Supersedes the pre-#294 behaviour (a larger
-        // `Retry-After` overrode the cap unboundedly), whose premise this reverses.
-        //
-        // A full day of `Retry-After` clamps down to the 1 h cap.
+    async fn the_active_accounts_retry_after_is_an_absolute_floor() {
+        // AC (issue #453): for the ACTIVE account a server `Retry-After` is an ABSOLUTE floor —
+        // the daemon NEVER re-polls before it — so it is NOT clamped to POLL_BACKOFF_CAP the way
+        // a PEER's is (issue #294). A pathological full-day `Retry-After` therefore governs the
+        // active window IN FULL (it does not collapse to the 1 h peer ceiling); the peer clamp
+        // is pinned separately in `a_large_retry_after_is_clamped_to_the_cap_for_a_peer`.
         let one_day = Duration::from_secs(86_400);
         assert!(one_day > POLL_BACKOFF_CAP);
         let (_d1, mut pathological) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(one_day))).await;
         assert_eq!(
             tick_backoff_secs(&pathological.tick().await),
-            Some(POLL_BACKOFF_CAP.as_secs()),
+            Some(86_400),
+            "active Retry-After is an un-clamped floor — no re-poll before it (AC #453)",
         );
 
-        // Just below the cap is still honoured in full — the clamp bounds only the excess,
-        // it does not swallow a legitimate long-but-sane `Retry-After`.
+        // A value above the active cap but below the peer cap is likewise honoured verbatim
+        // (the active exponential arm is 120 s, so the 3599 s server floor governs).
         let just_under = POLL_BACKOFF_CAP - Duration::from_secs(1);
         let (_d2, mut sane) =
             rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", Some(just_under))).await;
@@ -6574,43 +8640,67 @@ mod tests {
         assert_eq!(tick_backoff_secs(&tick), Some(120));
         assert_eq!(tick_retry_after_secs(&tick), Some(10));
 
-        // (4) Server-advised, capped: the flagship #295 case. A pathological `Retry-After`
-        // (a full day) the #294 cap clamps to 1 h is now VISIBLE as the raw pre-cap label —
-        // the exact `backoff_secs=3600` ambiguity (server-advised vs self-capped) resolved.
-        let (_d4, mut capped) = rate_limit_daemon(
-            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(86_400))),
-        )
-        .await;
-        let tick = capped.tick().await;
-        assert_eq!(tick_backoff_secs(&tick), Some(POLL_BACKOFF_CAP.as_secs()));
-        assert_eq!(tick_retry_after_secs(&tick), Some(86_400));
+        // (The flagship #295 clamp case — a pathological `Retry-After` clamped to the cap with
+        // the raw value still surfaced on the label — is now PEER-only, since the active `u-A`
+        // hard-floors `Retry-After` un-clamped (#453). It is pinned in
+        // `a_large_retry_after_is_clamped_to_the_cap_for_a_peer`.)
     }
 
     #[tokio::test]
-    async fn a_clean_cycle_resets_the_rate_limit_back_off() {
-        // Once the account polls clean again the back-off clears (no more skipping, streak
-        // reset), so a LATER 429 restarts at 2× — not where the prior episode left off.
-        let (_dir, mut daemon) =
-            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
-        daemon.clock.advance(Duration::from_secs(120));
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(240));
-
-        // A clean poll clears the back-off and resets the streak. Advance past the window
-        // so the account is actually re-polled (not skipped) this tick.
-        daemon.clock.advance(Duration::from_secs(240));
-        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
-        let clean = daemon.tick().await;
-        assert!(
-            tick_polled(&clean),
-            "the window elapsed → the account is re-polled"
+    async fn a_clean_cycle_resets_a_peer_rate_limit_back_off() {
+        // Once an account polls clean again the back-off clears (streak + window reset), so a
+        // LATER 429 restarts at the base 2× — not where the prior episode left off. The reset
+        // path is role-agnostic (it runs before the active/peer split), but the "restart at
+        // base, not at 480" evidence needs the exponential CLIMB, which is PEER-only since #453
+        // — so this pins it on the throttled non-active `spare` (u-B); `work` (u-A) stays
+        // active and clean.
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", None),
+        )
+        .await;
+        // Climb the peer's window: 120 → 240.
+        assert_eq!(
+            tick_backoff_secs(&next_peer_tick(&mut daemon).await),
+            Some(120)
         );
-        assert_eq!(tick_backoff_secs(&clean), None);
+        daemon.clock.advance(Duration::from_secs(120));
+        assert_eq!(
+            tick_backoff_secs(&next_peer_tick(&mut daemon).await),
+            Some(240)
+        );
 
-        // A later 429 restarts the climb at the base multiplier, not at 480 (the cleared
-        // window means the account is polled straightaway, no advance needed).
-        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
-        assert_eq!(tick_backoff_secs(&daemon.tick().await), Some(120));
+        // The peer polls clean → its back-off clears. Advance past the 240 s window so the peer
+        // is actually re-polled (not skipped) on its next turn.
+        daemon.clock.advance(Duration::from_secs(240));
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.20, 0.10);
+        let cleared = next_peer_tick(&mut daemon).await;
+        assert_eq!(
+            tick_backoff_secs(&cleared),
+            None,
+            "the peer re-polled clean → no back-off"
+        );
+        assert!(
+            cleared.events.iter().any(|e| matches!(
+                e, Event::UsageBackoffCleared { account } if account == "u-B"
+            )),
+            "the clean re-poll emits a durable CLEARED, bracketing the episode: {:?}",
+            cleared.events,
+        );
+
+        // A later 429 restarts the climb at the base multiplier (120), NOT at 480 — the cleared
+        // window means the peer is re-polled straightaway, no advance needed.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .rate_limited("u-B", None);
+        assert_eq!(
+            tick_backoff_secs(&next_peer_tick(&mut daemon).await),
+            Some(120),
+            "streak reset → later 429 restarts at base, not where it left off",
+        );
     }
 
     #[tokio::test]
@@ -6701,22 +8791,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_durable_backoff_event_carries_the_raw_retry_after() {
-        // The durable event carries the RAW server `Retry-After` (pre-cap #294/#295), so the
-        // flagship pathological case stays diagnosable from the log alone: a full day of
-        // `Retry-After` clamped to the 1 h window renders `backoff_secs=3600 retry_after_secs=86400`.
-        let (_dir, mut daemon) = rate_limit_daemon(
-            FakeRosterPoller::new().rate_limited("u-A", Some(Duration::from_secs(86_400))),
+    async fn a_large_retry_after_is_clamped_to_the_cap_for_a_peer() {
+        // AC (issue #294, UNCHANGED for peers by #453): a PEER's server `Retry-After` is honoured
+        // as a MINIMUM but clamped to POLL_BACKOFF_CAP as a MAXIMUM, so a pathological value cannot
+        // dark the peer past the 1 h ceiling. Both the tick line and the durable event surface the
+        // RAW pre-cap value beside the clamped window (`backoff_secs=3600 retry_after_secs=86400`),
+        // resolving the #295 ambiguity. Contrast the active account, whose `Retry-After` is an
+        // un-clamped floor (`the_active_accounts_retry_after_is_an_absolute_floor`). `spare` (u-B)
+        // is the throttled peer; `work` (u-A) stays active and clean.
+        let one_day = Duration::from_secs(86_400);
+        assert!(one_day > POLL_BACKOFF_CAP);
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", Some(one_day)),
         )
         .await;
-        let first = daemon.tick().await;
-        assert!(first.events.contains(&Event::UsageBackoff {
-            account: "u-A".to_owned(),
-            class: BackoffClass::RateLimited,
-            consecutive: 1,
-            retry_after_secs: Some(86_400),
-            backoff_secs: POLL_BACKOFF_CAP.as_secs(),
-        }));
+        let outcome = next_peer_tick(&mut daemon).await;
+        // The pathological full-day floor clamps to the 1 h peer cap...
+        assert_eq!(
+            tick_backoff_secs(&outcome),
+            Some(POLL_BACKOFF_CAP.as_secs())
+        );
+        // ...while the RAW server value stays visible on the tick label (pre-cap #295)...
+        assert_eq!(tick_retry_after_secs(&outcome), Some(86_400));
+        // ...and on the durable event (clamped window beside the raw retry_after).
+        assert!(
+            outcome.events.contains(&Event::UsageBackoff {
+                account: "u-B".to_owned(),
+                class: BackoffClass::RateLimited,
+                consecutive: 1,
+                retry_after_secs: Some(86_400),
+                backoff_secs: POLL_BACKOFF_CAP.as_secs(),
+            }),
+            "peer durable event: clamped window + raw retry_after: {:?}",
+            outcome.events,
+        );
     }
 
     #[tokio::test]
@@ -6736,31 +8846,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_rate_limits_widen_the_durable_backoff_window() {
-        // Each throttled re-poll emits a fresh durable ENTER with the climbing streak and the
-        // widened window (120 → 240 → 480). This WIDENING is the residual-late-swap signal (#363's
-        // ~1674 s active-account gap) that a single first-throttle line would hide — the reason the
-        // event is emitted on EVERY throttle, not just the first.
-        let (_dir, mut daemon) =
-            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+    async fn consecutive_rate_limits_widen_a_peers_durable_backoff_window() {
+        // AC (issue #453): a PEER's back-off is UNCHANGED from #293/#294 — the exponential still
+        // doubles from the interval toward POLL_BACKOFF_CAP (1 h), NOT the tight active cap. Each
+        // throttled re-poll widens the window (120 → 240 → 480) and emits a fresh durable ENTER
+        // with the climbing streak — the residual-late-swap signal (#363's ~1674 s active-account
+        // gap) a single first-throttle line would hide. `spare` (u-B) is the throttled non-active
+        // peer; `work` (u-A) stays active and clean. Contrast the active account, capped flat
+        // (`the_active_accounts_back_off_is_capped_not_climbing`).
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", None),
+        )
+        .await;
         let mut seen = Vec::new();
+        let mut prior_window = 0u64;
         for _ in 0..3 {
-            let outcome = daemon.tick().await;
+            if prior_window != 0 {
+                // Advance past the peer's prior window so its next turn re-polls (not skips).
+                daemon.clock.advance(Duration::from_secs(prior_window));
+            }
+            let outcome = next_peer_tick(&mut daemon).await;
+            let window = tick_backoff_secs(&outcome).expect("the peer's turn armed a back-off");
             for e in &outcome.events {
                 if let Event::UsageBackoff {
+                    account,
                     consecutive,
                     backoff_secs,
                     ..
                 } = e
                 {
-                    seen.push((*consecutive, *backoff_secs));
+                    if account == "u-B" {
+                        seen.push((*consecutive, *backoff_secs));
+                    }
                 }
             }
-            // Step past the just-armed window so the next tick re-polls (not skips) A.
-            if let Some(secs) = tick_backoff_secs(&outcome) {
-                daemon.clock.advance(Duration::from_secs(secs));
-            }
+            prior_window = window;
         }
+        // Peer doubling toward the 1 h ceiling — the exact #293/#294 shape, unchanged by #453.
         assert_eq!(seen, vec![(1, 120), (2, 240), (3, 480)]);
     }
 
@@ -6804,9 +8928,10 @@ mod tests {
 
     #[tokio::test]
     async fn usage_velocity_is_emitted_on_the_second_reading() {
-        // AC (issue #399): velocity is queryable from the durable log. The FIRST reading has no
-        // prior to diff (silent); the SECOND emits a `usage_velocity` with the signed percent delta
-        // — here session climbed 10% → 17% (=+7) while weekly held at 20% (=0).
+        // AC (issue #399, normalized by #449): velocity is queryable from the durable log. The FIRST
+        // reading has no prior to diff (silent); the SECOND emits a `usage_velocity` with the signed
+        // percent delta AND the interval it spanned — here session climbed 10% → 17% (=+7) while
+        // weekly held at 20% (=0) over 60 s (so the rendered rate is 7.00 %/min).
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
         let first = daemon.tick().await;
@@ -6818,6 +8943,9 @@ mod tests {
             "the first reading has no prior to diff: {:?}",
             first.events,
         );
+        // The velocity is a %/min rate now (#449), so an interval must elapse between the two
+        // readings — advance the monotonic clock 60 s before the second poll.
+        daemon.clock.advance(Duration::from_secs(60));
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.17, 0.20);
         let second = daemon.tick().await;
         assert!(
@@ -6825,8 +8953,9 @@ mod tests {
                 account: "u-A".to_owned(),
                 session_delta_pct: 7,
                 weekly_delta_pct: 0,
+                elapsed_secs: 60,
             }),
-            "the second reading must emit its velocity: {:?}",
+            "the second reading must emit its velocity + interval: {:?}",
             second.events,
         );
     }
@@ -6834,10 +8963,13 @@ mod tests {
     #[tokio::test]
     async fn usage_velocity_is_silent_when_the_reading_is_flat() {
         // A flat reading (no measurable change) emits no `usage_velocity` — the no-op silence that
-        // keeps an idle account quiet on the always-on event log (mirroring `usage_rollup`).
+        // keeps an idle account quiet on the always-on event log (mirroring `usage_rollup`). Time
+        // DOES elapse (60 s) between the two reads, so the suppression is proven to come from the
+        // zero delta, not a zero interval (#449).
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.20)).await;
         daemon.tick().await; // seed the prior reading
+        daemon.clock.advance(Duration::from_secs(60));
         let flat = daemon.tick().await; // an identical reading → zero delta
         assert!(
             !flat
@@ -6852,16 +8984,19 @@ mod tests {
     #[tokio::test]
     async fn usage_velocity_is_negative_when_a_window_resets() {
         // A window reset drops the reading, so the delta is NEGATIVE (session 90% → 5% = -85) — the
-        // durable log distinguishes a reset from a climb by sign, the signal #368 consumes.
+        // durable log distinguishes a reset from a climb by sign, the signal #368 consumes. The
+        // reset spans a 60 s interval (#449), so the rendered rate is -85.00 %/min.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.90, 0.30)).await;
         daemon.tick().await; // seed a prior reading at 90% session
+        daemon.clock.advance(Duration::from_secs(60));
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.05, 0.30);
         let reset = daemon.tick().await;
         assert!(reset.events.contains(&Event::UsageVelocity {
             account: "u-A".to_owned(),
             session_delta_pct: -85,
             weekly_delta_pct: 0,
+            elapsed_secs: 60,
         }));
     }
 
@@ -6889,6 +9024,1191 @@ mod tests {
                 .any(|e| matches!(e, Event::UsageVelocity { .. })),
             "a velocity must not span a throttle gap: {:?}",
             post_gap.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_close_is_emitted_on_active_recovery_with_duration_and_near_limit() {
+        // Issue #449 (umbrella #363 Path B): the active account was near the limit (96%) when a 429
+        // blinded it — its `last_readings` slot cleared, so `swap::decide` had no reading. Five
+        // minutes later it reads live again; the daemon emits ONE durable `blind_window` close with
+        // the blind DURATION (300 s), the pre-blind anchor's session pct (96), and `near_limit=true`
+        // (the anchor sat at/over the 95% trigger). The two SLIs the #451 spike reads.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.96, 0.30)).await;
+        daemon.tick().await; // seed the pre-blind anchor at 96% session (in the risk band)
+
+        // A 429 blinds the active account: its reading is cleared, the #450 anchor is retained. No
+        // blind-window closes while still blind.
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        let blind = daemon.tick().await;
+        assert!(
+            !blind
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindWindow { .. })),
+            "no blind-window closes while still blind: {:?}",
+            blind.events,
+        );
+        daemon.clock.advance(Duration::from_secs(300));
+
+        // The recovering clean poll closes the blind window — exactly one `blind_window` event,
+        // measured from the retained anchor.
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.97, 0.30);
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 96,
+                // Recovered at 97% — above the 96% anchor, so a stale-anchor preemptive swap would
+                // have been necessary (still climbing). The #482 recovery pct (raw, un-classified).
+                session_at_recovery: 97,
+                near_limit: true,
+            }),
+            "the recovery must close the blind window with its duration + recovery pct + near-limit tag: {:?}",
+            recovered.events,
+        );
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::BlindWindow { .. }))
+                .count(),
+            1,
+            "exactly one blind_window per episode: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_close_tags_a_below_band_anchor_not_near_limit() {
+        // A blind window whose pre-blind anchor was well below the trigger (40%) is STILL recorded
+        // (the spike wants the full distribution) but tagged `near_limit=false` — it does not count
+        // toward time-blind-near-limit (#449).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.40, 0.30)).await;
+        daemon.tick().await; // anchor at 40% session — below the 95% risk band
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // blind
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.42, 0.30);
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 120,
+                session_pct: 40,
+                session_at_recovery: 42,
+                near_limit: false,
+            }),
+            "a below-band blind window is recorded but not near-limit: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_reactive_re_poll_emits_no_blind_window() {
+        // The negative: two consecutive LIVE active readings (no intervening blindness) close no
+        // blind window — the None→live edge never occurs, so `blind_window` is silent (#449).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.50, 0.30)).await;
+        daemon.tick().await; // first live reading (sets the anchor)
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.55, 0.30);
+        let second = daemon.tick().await; // a second live reading — never blind
+        assert!(
+            !second
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindWindow { .. })),
+            "a clean re-poll closes no blind window: {:?}",
+            second.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_eligible_signals_a_viable_target_once_past_the_interim_t() {
+        // Issue #482 SLI #1 (umbrella #363 Path B): the #452 preemptive-swap gate's premise falsifier.
+        // The active account's retained anchor sits at 70 % — inside the interim risk band (≥ 60 %,
+        // #484), below the 95 % reactive trigger — and a peer (u-B) has session reserve under the 80 % target_max.
+        // Once the active has been blind past the interim T, the gate is ELIGIBLE and a viable target
+        // exists, so the ADR-0017 cost-asymmetry premise holds this episode: exactly one
+        // `blind_gate_eligible` with `viable_target=true`, emitted whether or not a swap follows.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        // Warm up the full interleaved cycle so the viable-target read is off a COMPLETE last-known
+        // set (the SLI's #80 warm-up guard), not a partial one that would fabricate a false verdict.
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+
+        // Blind the active: a 429 clears u-A's reading (the #450 anchor at 70 % is retained). No gate
+        // signal yet — blind_elapsed is still 0 under the frozen clock, below the interim T.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            let out = daemon.tick().await;
+            assert!(
+                !out.events
+                    .iter()
+                    .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+                "no gate signal before the interim T elapses: {:?}",
+                out.events,
+            );
+        }
+
+        // Cross the interim T — now the gate's first two conditions hold and a viable target exists.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let eligible = daemon.tick().await;
+        assert!(
+            eligible.events.iter().any(|e| matches!(
+                e,
+                Event::BlindGateEligible {
+                    viable_target: true,
+                    session_pct: 70,
+                    ..
+                }
+            )),
+            "the gate turns eligible with a viable target present: {:?}",
+            eligible.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_eligible_reports_no_viable_target_the_premise_falsifier() {
+        // Issue #482 SLI #1: the FALSIFIER. Same eligible active (anchor 70 %, blind past T) but every
+        // peer is over the 80 % target_max reserve (u-B 85 %, u-C 90 %) — session-viable readings, just
+        // no reserve to catch a swap. `pick_target` finds none, so the gate is eligible with NO viable
+        // target: `viable_target=false` is the ADR-0017 cost-asymmetry counter-evidence #482 exists to
+        // surface (if non-trivial, #452's predicate must be revisited).
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.85, 0.10)
+                .ok("u-C", 0.90, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.85, 0.10)
+            .ok("u-C", 0.90, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let eligible = daemon.tick().await;
+        assert!(
+            eligible.events.iter().any(|e| matches!(
+                e,
+                Event::BlindGateEligible {
+                    viable_target: false,
+                    ..
+                }
+            )),
+            "eligible but no peer has reserve → the no-viable-target falsifier fires: {:?}",
+            eligible.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_fires_past_t_with_a_viable_target() {
+        // Issue #452 (ADR-0017): the S1 replay. u-A `429`'d with its retained pre-blind anchor at
+        // 68 % — inside the risk band (≥ 60 %), below the 95 % reactive trigger — and a peer (u-B /
+        // u-C at 10 %) has reserve under the 80 % target_max. Under the reactive path alone u-A would
+        // burn to exhaustion behind the blindness (S1: to 98 %); the bounded-blindness gate swaps it
+        // AWAY once blind past T, keying off the stale anchor, before it self-exhausts.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.68, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        // Arm the #452 SWAP at the interim T. The `tunables()` helper parks `session_blind_swap_secs`
+        // at the kill-switch ceiling so baseline tests stay inert; here we exercise the gate. The
+        // risk band is already 0.60 (the config default the helper carries).
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A active before the blind swap"
+        );
+
+        // Blind the active — its reading clears, the 68 % anchor (#450) is retained. The clock is
+        // frozen through this loop, so blind_elapsed stays 0 and the gate never arms yet.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            let out = daemon.tick().await;
+            assert!(
+                !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
+                "no preemptive swap before the interim T elapses: {:?}",
+                out.action,
+            );
+        }
+
+        // Cross the interim T — the gate arms (blind_elapsed > T, anchor ≥ risk band) and a viable
+        // target exists, so the preemptive swap fires.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the bounded-blindness gate swaps the blind active away before it self-exhausts: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the blind u-A"
+        );
+        // The swap logged a `blind_preempt` reason carrying the STALE anchor pct (68) as session_pct
+        // — the only session signal available while blind — and record_swap dropped the anchor so it
+        // cannot re-fire.
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    session_pct: 68,
+                    ..
+                }
+            )),
+            "a blind_preempt swap event carrying the stale anchor pct: {:?}",
+            swapped.events,
+        );
+        assert!(
+            daemon.state.last_good.is_none(),
+            "the swap dropped the departed active's anchor (no re-fire)",
+        );
+
+        // Issue #479 (surface 2): the swap is RETAINED for `status` to NARRATE — source (the departed
+        // active's LABEL "work", the operator-facing identifier the `use <label>` undo keys off, NOT
+        // the internal account id u-A), the stale pct it fired on (68), and the target (the new
+        // active) — the undo derivable as `use work`. Captured at swap-time, since `record_swap` has
+        // already dropped the anchor above.
+        let new_active = daemon.state.active.expect("a new active after the swap");
+        let record = daemon
+            .state
+            .last_blind_preempt_swap
+            .as_ref()
+            .expect("the preemptive swap is retained for narration (#479)");
+        assert_eq!(
+            record.from, "work",
+            "narrates the LABEL of the account swapped away from (the `use <label>` undo target)",
+        );
+        assert_eq!(
+            record.to, daemon.roster[new_active].label,
+            "narrates the target the swap landed on",
+        );
+        assert_eq!(
+            record.last_known_session_pct, 68,
+            "carries the stale anchor pct"
+        );
+
+        // And the wire snapshot PROJECTS it (still-current: the target is still active; recent: the
+        // clock has not advanced past the notice window since the swap), so `status` can render it.
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snap = daemon.snapshot(daemon.state.active, &readings, 0);
+        let narrated = snap
+            .recent_blind_preempt_swap
+            .expect("the wire narrates the recent preemptive swap (#479)");
+        assert_eq!(narrated.from_label, "work");
+        assert_eq!(narrated.to_label, daemon.roster[new_active].label);
+        assert_eq!(narrated.last_known_session_pct, 68);
+    }
+
+    #[tokio::test]
+    async fn blind_swap_does_not_fire_without_an_anchor() {
+        // Issue #452 / #369: the gate keys off the retained `last_good` anchor (#450), NEVER the
+        // missing reading. An active that never got a good reading has no anchor, so a genuinely-
+        // unknown account produces NO spurious swap however long it is blind.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .rate_limited("u-A", None)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(
+            daemon.state.last_good.is_none(),
+            "u-A never read good → no pre-blind anchor",
+        );
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
+            "no anchor → no preemptive swap, only the historical skip: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — nothing to key off"
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_does_not_fire_without_a_viable_target() {
+        // Issue #452 / ADR-0013: eligible active (anchor 70 %, blind past T) but every peer is over
+        // the 80 % target_max reserve (u-B 85 %, u-C 90 %) — session-viable readings, no reserve to
+        // catch a swap. The reserve is HONORED (not the emergency bypass), so `pick_target` finds
+        // none and the gate falls through to the historical skip — never a swap onto a saturated peer.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.85, 0.10)
+                .ok("u-C", 0.90, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.85, 0.10)
+            .ok("u-C", 0.90, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "eligible but no viable target → the historical skip, no swap: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A stays active — no target to swap to"
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_kill_switch_disables_the_path_but_the_sli_keeps_measuring() {
+        // Issue #452 (ADR-0017): the config kill-switch. `session_blind_swap_secs` parked high (the
+        // `tunables()` helper's 86400 ceiling) disables the SWAP even long past the interim T — yet
+        // the gate-premise SLI (#482), which keys off the interim const, keeps firing, so #484's
+        // ratification data keeps flowing while the action is disabled (the deliberate const/config split).
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        assert!(
+            daemon.session_blind_swap_secs >= 86_400,
+            "the helper parks the gate at the kill-switch ceiling (swap disabled by default)",
+        );
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        // Advance FAR past the interim T (but nowhere near the 24 h kill-switch ceiling).
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS * 10));
+        let out = daemon.tick().await;
+        assert!(
+            !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
+            "the config kill-switch disables the swap even long past the interim T: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no swap fired — active unchanged"
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "the gate-premise SLI keeps measuring at the interim const even with the swap disabled: {:?}",
+            out.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_below_the_risk_band_does_not_fire() {
+        // Issue #452 / #484: an anchor BELOW the risk band (50 % < the 60 % band) never arms the
+        // gate, however long the active is blind — the preemptive swap acts only near the band, where
+        // self-exhaustion is a real risk. Below it, the historical skip stands.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "an anchor below the risk band never arms the gate, however long blind: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — below the band"
+        );
+    }
+
+    // --- #539 velocity-projection preemptive swap (ADR-0017) ---------------------------------
+
+    /// A warmed three-account daemon with u-A active at `active_session` (kept below the 95 %
+    /// reactive trigger so the reactive path HOLDS and the projective peer is the only thing that
+    /// can fire) and u-B / u-C viable targets at 10 % (under the 80 % reserve). The velocity gate is
+    /// left INERT (`session_velocity_horizon_secs == 0`, the `tunables()` default) and the EMA slot
+    /// is `None` — each direct-call test arms the horizon and seeds `state.session_velocity[0]` to
+    /// the exact signal it exercises, then calls [`Daemon::velocity_swap`] with a cloned reading set
+    /// (so `self` is free for the `&mut` swap path). Peer readings default to viable targets.
+    async fn warmed_velocity_daemon(active_session: f64) -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", active_session, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A active before the projective swap"
+        );
+        // Frozen clock through the warm-up → every re-poll of the active saw a zero interval, so the
+        // EMA reset to `None`: the seed each test installs is the ONLY velocity signal in play.
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "the warm-up leaves the EMA unseeded (zero-interval resets)",
+        );
+        daemon
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_fires_past_the_projected_trigger() {
+        // Issue #539 (ADR-0017): the headline acceptance, end-to-end through the real `decide_action`
+        // hook. u-A climbs inside the guard band (86 % → 90 % → 92 %, all below the 95 % reactive
+        // trigger so the reactive path HOLDS every tick) at a SUSTAINED rate. Once two intervals have
+        // been blended (samples ≥ MIN_VELOCITY_SAMPLES), the projection `last + rate × H` crosses the
+        // trigger within the horizon and the active swaps AWAY — ahead of the observed reading
+        // tripping the reactive trigger — closing the observed reactive overshoot (#363).
+        // Warmed on a frozen clock (u-A at 86 %, schedule A, B, A, C): the helper asserts warmed-up,
+        // u-A active, and — since no interval elapsed — an unseeded (`None`) EMA. Same fixture the
+        // five direct-call velocity_swap tests route through.
+        let mut daemon = warmed_velocity_daemon(0.86).await;
+        // Arm the projective gate at 150 s — the TOP of the #538-validated safe band (H ≤ 150 s).
+        daemon.session_velocity_horizon_secs = 150;
+
+        // First climbing interval (86 % → 90 % over 60 s): the next active poll is tick 5 (A). This
+        // SEEDS the EMA (samples = 1) — a single interval, still below MIN_VELOCITY_SAMPLES.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.90, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(60));
+        let seeded = daemon.tick().await;
+        assert!(
+            matches!(seeded.action, TickAction::Held),
+            "one interval (samples = 1) is not yet SUSTAINED — the projection holds: {:?}",
+            seeded.action,
+        );
+        assert_eq!(
+            daemon.state.session_velocity[0].map(|v| v.samples),
+            Some(1),
+            "the first climbing interval seeds the EMA at one sample",
+        );
+
+        // Second climbing interval (90 % → 92 % over 60 s): tick 6 polls the peer u-B (no active
+        // update), tick 7 re-polls u-A and blends the second interval (samples = 2 → SUSTAINED). The
+        // projection 0.92 + rate × 150 now clears the 0.95 trigger, so the projective swap fires.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.92, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(60));
+        let peer = daemon.tick().await; // tick 6 = u-B, no active poll
+        assert!(
+            matches!(peer.action, TickAction::Held),
+            "the peer poll does not advance the active's velocity: {:?}",
+            peer.action,
+        );
+        let swapped = daemon.tick().await; // tick 7 = u-A → samples = 2, projection crosses
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::VelocityPreemptivelySwapped { from: 0, .. }
+            ),
+            "the projected usage crosses the trigger within the horizon → preemptive swap: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the climbing u-A"
+        );
+        // The swap logged a `velocity_preempt` reason carrying the FRESH observed reading (92 %, the
+        // live swap-out point — the projected-swap-out-overshoot SLI sample), never a stale anchor.
+        // The projective peer runs ONLY where the reactive path HELD (observed strictly below the
+        // session trigger in fraction space), so a swap-out is always below the trigger — here 92 <
+        // the 95 % trigger. In the default/validated trigger regime that keeps the ROUNDED swap-out
+        // pct under the P100 ≤ 98 acceptance; the ≤ 98 is an empirically-measured SLO (the #538 spike,
+        // not a hard invariant): a trigger set above ~98.5 % could round an in-band swap-out up to 99,
+        // which the reliability readout then surfaces honestly rather than silently masks.
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::VelocityPreempt,
+                    session_pct: 92,
+                    ..
+                }
+            )),
+            "a velocity_preempt swap event carrying the fresh observed pct: {:?}",
+            swapped.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_below_the_project_above_guard() {
+        // Issue #539 / #538: the free guard. A reading BELOW `session_velocity_min_project_above`
+        // (80 % < 85 %) never projects, even with a steep, well-sustained velocity — the guard
+        // short-circuits BEFORE the projection, excluding spurious low-usage projections cheaply.
+        let mut daemon = warmed_velocity_daemon(0.80).await;
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "a reading below the guard band holds regardless of velocity: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap — below the guard");
+        assert!(events.is_empty(), "no swap event emitted");
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_without_sustained_velocity() {
+        // Issue #539: SUSTAINED means ≥ MIN_VELOCITY_SAMPLES blended intervals. A single-interval
+        // spike (samples = 1) and a MISSING signal (`None`, the poll-gap case #540 owns) both HOLD on
+        // the fresh reading — the projection never fires on a one-off spike or an unwarmed velocity.
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.session_velocity_horizon_secs = 150;
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+
+        // A single-interval spike steep enough to cross IF it counted — but samples = 1 holds.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 1,
+        });
+        let mut events = Vec::new();
+        let spike = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(spike, TickAction::Held),
+            "a single-interval spike is not SUSTAINED → hold: {spike:?}",
+        );
+        assert!(events.is_empty());
+
+        // No retained signal at all → hold (never project on a missing velocity).
+        daemon.state.session_velocity[0] = None;
+        let mut events = Vec::new();
+        let missing = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(missing, TickAction::Held),
+            "a missing velocity signal → hold: {missing:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap either way");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_when_the_projection_falls_short() {
+        // Issue #539: an in-band, SUSTAINED, but SHALLOW velocity whose `rate × H` reach stays under
+        // the gap to the trigger does NOT fire — the projection is short, so hold and let the reactive
+        // path catch it if it keeps climbing. (0.90 + 0.0001 × 150 = 0.915 < 0.95.)
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.0001,
+            samples: 3,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "a shallow projection that stays under the trigger holds: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_kill_switch_horizon_zero_never_fires() {
+        // Issue #539 (ADR-0005): the config kill-switch. `session_velocity_horizon_secs == 0` reduces
+        // the projection to the observed reading — which the reactive path already held below the
+        // trigger — so even a steep, sustained, in-band velocity (94 %, one point under the trigger)
+        // can never cross. The disabled projective path is a plain `Held`.
+        let mut daemon = warmed_velocity_daemon(0.94).await;
+        daemon.session_velocity_horizon_secs = 0;
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "the horizon-0 kill-switch disables the projective swap: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap — kill-switch");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_without_a_viable_target() {
+        // Issue #539 / ADR-0013: an otherwise-eligible projection (in-band, sustained, crossing) but
+        // every peer is over the 80 % `target_max_session_usage` reserve (u-B 85 %, u-C 90 %). The
+        // reserve is HONORED — NOT the emergency `None` bypass — so `pick_target` finds none and the
+        // projective peer HOLDS rather than swap onto a saturated peer.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.90, 0.20)
+                .ok("u-B", 0.85, 0.10)
+                .ok("u-C", 0.90, 0.10),
+        )
+        .await;
+        daemon.session_velocity_horizon_secs = 150;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.001,
+            samples: 3,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "no peer under the reserve → the projective swap holds: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "u-A stays active — no target");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_honors_cooldown_not_emergency() {
+        // Issue #539 (ADR-0017): the projective peer is NOT the emergency path — it HONORS the swap
+        // cooldown (#10). With an otherwise-eligible projection but a swap inside the (jittered)
+        // cooldown window, it defers as `SkippedCooldown` (the projection WANTED to fire) rather than
+        // a silent hold — distinguishing it from the reserve-bypassing emergency swap.
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.session_velocity_horizon_secs = 150;
+        // A 600 s cooldown with a swap that JUST happened (frozen clock → zero elapsed since).
+        daemon.cooldown_strategy = Strategy::fixed(600.0);
+        daemon.state.last_swap = Some(LastSwap {
+            at: daemon.clock.now(),
+        });
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.001,
+            samples: 3,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.last_readings.clone();
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::SkippedCooldown),
+            "an eligible projection inside the cooldown defers, not swaps: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap — cooldown honored");
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn note_session_velocity_seeds_blends_and_resets() {
+        // Issue #539: the retained-EMA update seam. First interval SEEDS at the raw instant rate (NOT
+        // zero — a zero seed biases the EMA to asymptote BELOW the true rate and would miss real
+        // overshoots); the second BLENDS at α = 0.5; a session DROP (window reset / recovery) and a
+        // ZERO interval each RESET the slot to `None` (the climbing trend is stale / nothing to
+        // integrate), forcing a fresh pair of samples before the projection can fire again.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // First sample: seed at the raw instant rate (0.06 / 60 s = 0.001 /s), samples = 1.
+        daemon.note_session_velocity(0, 0.80, 0.86, 60);
+        let seeded = daemon.state.session_velocity[0].expect("seeded on the first interval");
+        assert!(
+            (seeded.rate - 0.001).abs() < 1e-9,
+            "seeded at the raw instant rate, not zero: {}",
+            seeded.rate,
+        );
+        assert_eq!(seeded.samples, 1);
+
+        // Second sample: blend at α (0.12 / 60 s = 0.002 /s), rate = 0.5·0.002 + 0.5·0.001, samples = 2.
+        daemon.note_session_velocity(0, 0.86, 0.98, 60);
+        let blended = daemon.state.session_velocity[0].expect("still present after the blend");
+        assert!(
+            (blended.rate - (0.5 * 0.002 + 0.5 * 0.001)).abs() < 1e-9,
+            "EMA blend at α = 0.5: {}",
+            blended.rate,
+        );
+        assert_eq!(blended.samples, 2);
+
+        // A session-usage DROP (next < prev — a 5 h window reset) resets the slot.
+        daemon.note_session_velocity(0, 0.98, 0.10, 60);
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "a usage drop resets the EMA (the climbing trend is stale)",
+        );
+
+        // Re-seed, then a ZERO interval (degenerate — nothing to integrate) resets it too.
+        daemon.note_session_velocity(0, 0.10, 0.20, 60);
+        assert!(daemon.state.session_velocity[0].is_some(), "re-seeded");
+        daemon.note_session_velocity(0, 0.20, 0.30, 0);
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "a zero interval resets the EMA",
+        );
+    }
+
+    #[test]
+    fn reconcile_roster_preserves_session_velocity_in_lockstep() {
+        // Issue #539: the per-account EMA is a parallel vec (like `last_readings`), so a roster
+        // reconcile MUST re-key it by uuid — preserved for a persisting account (merely re-indexed),
+        // `None` for a newly-onboarded one — or a projective read would index the wrong account or
+        // panic out of bounds. Here u-A is REMOVED (index shift) and u-C is ONBOARDED.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.003,
+            samples: 4,
+        });
+        daemon.state.session_velocity[1] = Some(VelocityEma {
+            rate: 0.007,
+            samples: 2,
+        });
+
+        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+
+        // The vec stays length- and index-aligned with the new roster.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
+        assert_eq!(daemon.state.session_velocity.len(), 2);
+        // u-B's EMA is preserved, re-indexed from slot 1 to slot 0.
+        let preserved = daemon.state.session_velocity[0].expect("u-B's EMA survives the reconcile");
+        assert_eq!(preserved.samples, 2);
+        assert!((preserved.rate - 0.007).abs() < 1e-9);
+        // u-C onboards with a fresh (`None`) EMA — no stale velocity leaks in from the removed u-A.
+        assert!(
+            daemon.state.session_velocity[1].is_none(),
+            "the onboarded account starts with no velocity",
+        );
+    }
+
+    #[test]
+    fn blind_active_view_projects_ok_below_the_gate_and_degraded_past_it() {
+        // Issue #479: the bounded-blindness projection is a PURE function of the retained anchor,
+        // the blind predicate, the quarantine flag, and the monotonic clock. A base instant + fixed
+        // deltas make `blind_elapsed` deterministic regardless of wall time.
+        let base = Instant::now();
+        let near_band = LastGood {
+            session: 0.70,
+            weekly: 0.20,
+            at: base,
+        };
+
+        // Blind, anchor in-band, but at EXACTLY T → OK: the gate arms on a strict `>` (matching
+        // `note_blind_gate_eligibility`), so at T it is not yet armed.
+        let ok = blind_active_view(
+            Some(near_band),
+            true,
+            false,
+            base + Duration::from_secs(BLIND_GATE_SECS),
+        )
+        .expect("a blind active account with an anchor projects a state");
+        assert_eq!(ok.blind_secs, BLIND_GATE_SECS);
+        assert_eq!(ok.last_known_session_pct, 70);
+        assert!(
+            !ok.auto_protection_degraded,
+            "at exactly T the strict `>` gate is not yet armed",
+        );
+
+        // One second past T with the anchor in-band → DEGRADED (mirrors the gate exactly).
+        let degraded = blind_active_view(
+            Some(near_band),
+            true,
+            false,
+            base + Duration::from_secs(BLIND_GATE_SECS + 1),
+        )
+        .expect("still projects a state past T");
+        assert!(
+            degraded.auto_protection_degraded,
+            "past T with the anchor at/over the risk band is DEGRADED",
+        );
+        assert_eq!(degraded.blind_secs, BLIND_GATE_SECS + 1);
+
+        // Long past T but the anchor sat BELOW the risk band → OK: the gate would never arm on it,
+        // so auto-protection is nominally intact regardless of how long the account has been blind.
+        let below_band = LastGood {
+            session: BLIND_GATE_RISK_BAND - 0.01,
+            weekly: 0.10,
+            at: base,
+        };
+        let ok_below = blind_active_view(
+            Some(below_band),
+            true,
+            false,
+            base + Duration::from_secs(BLIND_GATE_SECS + 100),
+        )
+        .expect("blind with an anchor still projects");
+        assert!(
+            !ok_below.auto_protection_degraded,
+            "a below-band anchor is never DEGRADED, however long it is blind",
+        );
+    }
+
+    #[test]
+    fn blind_active_view_is_none_when_not_bounded_blindness() {
+        let base = Instant::now();
+        let anchor = LastGood {
+            session: 0.70,
+            weekly: 0.20,
+            at: base,
+        };
+        let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
+        // A live reading (not blind) → no projection, even with an in-band anchor past T.
+        assert!(blind_active_view(Some(anchor), false, false, past_t).is_none());
+        // Blind but NO retained anchor (a genuinely-unknown active) → no spurious projection (#450).
+        assert!(blind_active_view(None, true, false, past_t).is_none());
+        // Blind WITH an anchor but QUARANTINED (dead, #42) → the emergency_swap path owns it, not
+        // bounded blindness (ADR-0017 keeps the two separate).
+        assert!(blind_active_view(Some(anchor), true, true, past_t).is_none());
+    }
+
+    #[test]
+    fn recent_blind_preempt_swap_view_projects_only_while_current_and_recent() {
+        // Issue #479 (surface 2): the narration projects a retained #452 preemptive swap ONLY while
+        // the swap's target is STILL the active account (still-current) AND within the
+        // `BLIND_PREEMPT_NOTICE_SECS` window (recent). A pure function of the record, the current
+        // active label, and the monotonic clock.
+        let base = Instant::now();
+        let record = BlindPreemptSwapRecord {
+            from: "spare".to_owned(),
+            to: "work".to_owned(),
+            last_known_session_pct: 68,
+            at: base,
+        };
+
+        // Still-current (active is still the target `work`) + recent (mid-window) → narrated, carrying
+        // source + stale pct + target; the undo `use spare` is derived by the renderer, not stored.
+        let shown = recent_blind_preempt_swap_view(
+            Some(&record),
+            Some("work"),
+            base + Duration::from_secs(BLIND_PREEMPT_NOTICE_SECS - 1),
+        )
+        .expect("a current, recent preemptive swap is narrated");
+        assert_eq!(shown.from_label, "spare");
+        assert_eq!(shown.to_label, "work");
+        assert_eq!(shown.last_known_session_pct, 68);
+
+        // Superseded — the active account is NO LONGER the swap target (a later swap / manual `use` /
+        // external login moved it away): the narration is stale → dropped, even well within the window.
+        assert!(
+            recent_blind_preempt_swap_view(Some(&record), Some("personal"), base).is_none(),
+            "a swap whose target is no longer active self-invalidates",
+        );
+        // The undo itself — a manual `use spare` moves active back to the swapped-AWAY account, which
+        // is neither `to` → also dropped (the hint vanishes once acted on).
+        assert!(recent_blind_preempt_swap_view(Some(&record), Some("spare"), base).is_none());
+        // No active account resolved → nothing to narrate a swap TO.
+        assert!(recent_blind_preempt_swap_view(Some(&record), None, base).is_none());
+
+        // Aged out — at/after the window boundary the notice expires even while its target is active.
+        assert!(
+            recent_blind_preempt_swap_view(
+                Some(&record),
+                Some("work"),
+                base + Duration::from_secs(BLIND_PREEMPT_NOTICE_SECS),
+            )
+            .is_none(),
+            "at the window boundary the notice has aged out",
+        );
+
+        // No record at all → nothing to narrate.
+        assert!(recent_blind_preempt_swap_view(None, Some("work"), base).is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_projects_blind_active_degraded_for_the_blind_active_account() {
+        // Issue #479: the daemon projects the bounded-blindness state onto the wire snapshot for the
+        // ACTIVE account only. Drive u-A (active, index 0) blind past the interim T with its anchor
+        // in-band, then assert the snapshot carries a DEGRADED `blind_active` on u-A and `None` on
+        // the peers — the same episode the #482 gate-eligibility SLI keys off, now SURFACED.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snap = daemon.snapshot(daemon.state.active, &readings, 0);
+        let active = snap
+            .accounts
+            .iter()
+            .find(|account| account.active)
+            .expect("an active account");
+        let blind = active
+            .blind_active
+            .expect("the blind active account carries a bounded-blindness projection");
+        assert!(
+            blind.auto_protection_degraded,
+            "blind past T with an in-band anchor is DEGRADED: {blind:?}",
+        );
+        assert_eq!(
+            blind.last_known_session_pct, 70,
+            "the projection carries the retained anchor's last-known session pct",
+        );
+        assert!(
+            blind.blind_secs > BLIND_GATE_SECS,
+            "blind_elapsed exceeds the interim T: {}",
+            blind.blind_secs,
+        );
+        assert!(
+            snap.accounts
+                .iter()
+                .filter(|account| !account.active)
+                .all(|account| account.blind_active.is_none()),
+            "only the active account carries a bounded-blindness projection",
+        );
+    }
+
+    #[test]
+    fn blind_gate_risk_band_holds_in_the_conservative_interim_band() {
+        // Issue #484: the interim `risk_band` is biased CONSERVATIVE to the 0.60 low end and MUST
+        // sit in the [0.60, 0.65] band until the documented production ratification bar (≥ 5
+        // gated-eligible episodes, zero session walls, majority `swap_necessary`) promotes it. The
+        // #451 replay bounds only the ≤ 0.68 CEILING, so the floor is a deliberate conservative choice,
+        // not data — this locks it against silently drifting back up toward that ceiling absent
+        // production evidence.
+        assert!(
+            (0.60..=0.65).contains(&BLIND_GATE_RISK_BAND),
+            "risk_band {BLIND_GATE_RISK_BAND} left the conservative interim [0.60, 0.65] band (#484)"
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_below_the_interim_risk_band_never_signals() {
+        // Issue #482 SLI #1: an anchor comfortably below the interim risk band (50 % < 60 %, #484) never makes
+        // the gate eligible, however long the active stays blind — the gate acts only on a near-band
+        // anchor, so a low-usage blind active is not a premise data point.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        // Well past the interim T — still no signal: the anchor is below the risk band.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS * 3));
+        let out = daemon.tick().await;
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "a below-band anchor never makes the gate eligible: {:?}",
+            out.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_gate_signals_once_per_episode_and_rearms_after_recovery() {
+        // Issue #482 SLI #1: edge-triggered exactly ONCE per blind episode (the gate would swap once,
+        // ending it), then re-arms once the active recovers and blinds afresh — so a long blind window
+        // is ONE data point and a later episode is a distinct one.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.70, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+
+        // Episode 1: blind, cross T, signal — then stay blind several more ticks: still exactly one.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let mut episode1 = 0;
+        for _ in 0..5 {
+            episode1 += daemon
+                .tick()
+                .await
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::BlindGateEligible { .. }))
+                .count();
+            daemon.clock.advance(Duration::from_secs(60));
+        }
+        assert_eq!(episode1, 1, "exactly one gate signal per blind episode");
+
+        // Recover the active: a live reading closes the episode and re-arms the latch.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.70, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_none() {
+            daemon.tick().await;
+        }
+
+        // Episode 2: blind afresh, cross T → the gate signals again (a distinct episode).
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let episode2 = daemon.tick().await;
+        assert!(
+            episode2
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "a fresh blind episode re-arms the gate signal: {:?}",
+            episode2.events,
         );
     }
 
@@ -6942,6 +10262,403 @@ mod tests {
             &tun,
         );
         (dir, daemon)
+    }
+
+    /// Tick a [`two_account_rate_limit_daemon`] until the NON-active peer `spare` (u-B) is
+    /// actually POLLED this tick — throttled or clean — returning that tick's outcome. The #366
+    /// schedule interleaves `[active, peer, …]`, so the active `work` ticks (and any skipped peer
+    /// ticks still inside a back-off window) are consumed until the peer's turn lands. The caller
+    /// MUST `advance` the clock past the peer's PRIOR window before each call after the first,
+    /// else the peer is skipped (still backing off) and never re-polls. Bounded so a misuse fails
+    /// loudly instead of hanging. The peer-path counterpart of driving the single-account
+    /// [`rate_limit_daemon`] every tick — needed because #453's active/peer split means the
+    /// peer's UNCHANGED back-off (climb-to-`POLL_BACKOFF_CAP`, #294 clamp) can only be observed on
+    /// a genuinely non-active account.
+    async fn next_peer_tick(daemon: &mut FakeDaemon) -> TickOutcome {
+        for _ in 0..6 {
+            let outcome = daemon.tick().await;
+            if outcome.diagnostics.iter().any(
+                |d| matches!(d, Diagnostic::Poll { account, .. } if account.as_str() == "spare"),
+            ) {
+                return outcome;
+            }
+        }
+        panic!(
+            "the peer `spare` was never polled — advance past its back-off window before calling"
+        );
+    }
+
+    /// Whether the tick POLLED the account with operator `label` (a `Diagnostic::Poll` for it)
+    /// — the observable that a slow-poll / back-off window did NOT suppress its poll this tick.
+    fn peer_polled(outcome: &TickOutcome, label: &str) -> bool {
+        outcome
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::Poll { account, .. } if account == label))
+    }
+
+    // --- Out-of-rotation slow-poll cadence (issue #537) ---
+
+    #[test]
+    fn exhausted_poll_window_caps_at_the_hourly_ceiling_when_the_reset_is_far() {
+        // A weekly-exhausted reading whose weekly window resets 2 h out (> the 1 h ceiling):
+        // the window is the ceiling — the hourly cap bounds worst-case blindness for the rare
+        // early reset. (Base triggers: weekly 0.98, session 0.95.)
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 7_200),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(3600),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_pulls_earlier_to_a_known_soon_reset() {
+        // The known reset lands in 30 min (< the 1 h ceiling) → poll again AT the reset, earlier
+        // than the ceiling: a window that elapses sooner than an hour is caught promptly.
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 1_800),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(1_800),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_floors_at_poll_secs_when_the_reset_is_imminent_or_past() {
+        let now = 1_000_000;
+        // Reset 10 s away (< the 60 s floor) → floored to poll_secs, not a sub-cadence re-poll.
+        let imminent = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 10),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&imminent, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(60),
+        );
+        // Reset already PAST but the account still reads exhausted (rare server lateness) →
+        // floored to poll_secs, so a persistently-late reset never busy-polls every tick.
+        let past = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: Some(now - 500),
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&past, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(60),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_falls_back_to_the_ceiling_when_the_reset_is_unknown() {
+        // No parseable reset for the exhausted dimension → the plain hourly ceiling (#537).
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.10,
+            weekly: 0.99,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(3600),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_keys_the_session_reset_when_only_session_is_exhausted() {
+        // session-exhausted (0.96 >= 0.95), weekly VIABLE (0.10 < 0.98): only session_resets_at
+        // is applicable — a weekly reset would NOT be why this peer is out of rotation, so a
+        // (here absent, but even if present) weekly reset does not key the window.
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.96,
+            weekly: 0.10,
+            weekly_resets_at: Some(now + 100), // must be IGNORED — weekly is not exhausted
+            session_resets_at: Some(now + 1_200),
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(1_200),
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_uses_the_sooner_reset_when_both_dimensions_are_exhausted() {
+        // Both exhausted; the weekly window resets sooner (15 min) than the session (40 min) →
+        // the SOONER applicable reset governs, catching relief at the earliest opportunity.
+        let now = 1_000_000;
+        let reading = Usage {
+            session: 0.96,
+            weekly: 0.99,
+            weekly_resets_at: Some(now + 900),
+            session_resets_at: Some(now + 2_400),
+        };
+        assert_eq!(
+            exhausted_poll_window(&reading, 0.98, 0.95, now, 3600, 60),
+            Duration::from_secs(900),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_weekly_exhausted_peer_is_slow_polled_until_its_window_elapses() {
+        // AC: a NON-active peer polled weekly-exhausted is SKIPPED on subsequent ticks until the
+        // widened window elapses, rather than re-polled every poll_secs. The reset is far out, so
+        // the window is the hourly ceiling (3600).
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10) // active: viable → holds
+                .ok_resets("u-B", 0.10, 0.99, now + 999_999), // peer: weekly-exhausted, reset far
+        )
+        .await;
+        // The peer's first poll reads it exhausted → arms the window + emits the ENTER edge.
+        let armed = next_peer_tick(&mut daemon).await;
+        assert!(
+            armed.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, window_secs }
+                    if account == "u-B" && *window_secs == 3600
+            )),
+            "the first exhausted poll arms the hourly window + emits ENTER: {:?}",
+            armed.events,
+        );
+        // Now the peer is SKIPPED on its subsequent turns (no clock advance): a full two cycles'
+        // worth of ticks come and go without a `spare` poll.
+        for _ in 0..4 {
+            let tick = daemon.tick().await;
+            assert!(
+                !peer_polled(&tick, "spare"),
+                "an exhausted peer must be skipped inside its slow-poll window",
+            );
+        }
+        // Advancing past the window re-polls it on its next turn (next_peer_tick would panic if
+        // it stayed skipped).
+        daemon.clock.advance(Duration::from_secs(3600));
+        let repoll = next_peer_tick(&mut daemon).await;
+        assert!(
+            peer_polled(&repoll, "spare"),
+            "the window elapsed → re-polled"
+        );
+        // The re-poll still reads u-B weekly-exhausted, so it RE-ARMS the window — but the
+        // edge-triggered ENTER is NOT re-emitted: the account never left the widened cadence (the
+        // window field stayed `Some` across the elapse, so `was_slow_polling` holds). Only a
+        // clear→re-arm re-emits ENTER. Binds AC: the enter/exit events are edge-triggered (once
+        // per transition), mirroring `note_account_backoff`'s was-backing-off idiom.
+        assert!(
+            !repoll
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ExhaustedSlowPoll { .. })),
+            "a re-arm while still exhausted must NOT re-emit the ENTER edge: {:?}",
+            repoll.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_exhausted_peer_is_slow_polled_keyed_off_the_session_reset() {
+        // AC: a session-exhausted (session >= session_trigger) non-active peer is slow-polled the
+        // same way, keyed off its SESSION reset. Here the session resets ~10 min out, so the
+        // window is pulled EARLIER than the hourly ceiling.
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok_resets_session("u-B", 0.96, 0.10, now + 600), // session-exhausted, resets soon
+        )
+        .await;
+        let armed = next_peer_tick(&mut daemon).await;
+        assert!(
+            armed.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, window_secs }
+                    // pulled earlier than the 3600 ceiling, ≈ the 600 s reset delta (± wall drift)
+                    if account == "u-B" && (595..=600).contains(window_secs)
+            )),
+            "session-exhausted peer arms a reset-aware sub-ceiling window: {:?}",
+            armed.events,
+        );
+        // Skipped within the window.
+        for _ in 0..4 {
+            assert!(!peer_polled(&daemon.tick().await, "spare"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_peer_with_no_known_reset_falls_back_to_the_hourly_ceiling() {
+        // AC: an exhausted peer whose reset is unknown/unparseable falls back to the hourly
+        // default (exhausted_poll_secs) — the window is EXACTLY 3600, independent of the wall
+        // clock (the deterministic fallback, distinct from the reset-aware sub-ceiling above).
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.99), // weekly-exhausted, NO resets_at
+        )
+        .await;
+        let armed = next_peer_tick(&mut daemon).await;
+        assert!(
+            armed.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPoll { account, window_secs }
+                    if account == "u-B" && *window_secs == 3600
+            )),
+            "unknown reset → the plain hourly fallback window: {:?}",
+            armed.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_polled_peer_that_reads_viable_again_clears_and_returns_to_full_cadence() {
+        // AC: a slow-polled peer that next polls viable clears its window (emitting the EXIT
+        // edge) and returns to the full cadence.
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) =
+            two_account_rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.10).ok_resets(
+                "u-B",
+                0.10,
+                0.99,
+                now + 999_999,
+            ))
+            .await;
+        // Arm the peer's slow-poll window.
+        next_peer_tick(&mut daemon).await;
+        // The peer's window resets (it is now viable). Advance past the window so it re-polls.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(3600));
+        let cleared = next_peer_tick(&mut daemon).await;
+        assert!(
+            cleared.events.iter().any(|e| matches!(
+                e, Event::ExhaustedSlowPollCleared { account } if account == "u-B"
+            )),
+            "the viable re-poll emits the EXIT edge, bracketing the episode: {:?}",
+            cleared.events,
+        );
+        // Back to full cadence: the peer polls again on its very next turn, no advance needed.
+        let full = next_peer_tick(&mut daemon).await;
+        assert!(
+            peer_polled(&full, "spare"),
+            "a cleared peer is back on the normal cadence",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_active_account_is_never_slow_polled_even_when_exhausted() {
+        // AC: the ACTIVE account is NEVER slow-polled, even weekly-exhausted — its swap-away
+        // trigger must stay observable at full cadence (the #453 active-vs-peer asymmetry).
+        // Single-account daemon: the active `work` reads weekly-exhausted with nowhere to swap,
+        // so it stays active and must keep polling every tick.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.99)).await;
+        for _ in 0..5 {
+            let tick = daemon.tick().await;
+            assert!(
+                tick_polled(&tick),
+                "the active account must be polled every tick, even exhausted",
+            );
+            assert!(
+                !tick
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::ExhaustedSlowPoll { .. })),
+                "the active account is exempt — it never arms a slow-poll window: {:?}",
+                tick.events,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_promoted_to_active_while_slow_polled_is_polled_at_full_cadence() {
+        // AC (issue #537): a peer armed for slow-polling while NON-active can then be promoted to
+        // active via `use`. Nothing on the promotion path clears its `exhausted_poll_until` (only a
+        // poll does), and the arm-site "never arm the active account" guarantee does not apply to a
+        // window armed legitimately while it WAS a peer — so `exhausted_slow_polling`'s
+        // `active != Some(i)` consult guard is what keeps the now-active account polling at full
+        // cadence despite the stale window (its swap-away trigger must stay observable, the #453
+        // asymmetry). Without the guard it would be SKIPPED until the window elapsed — active AND
+        // never re-polled. The sibling `the_active_account_is_never_slow_polled_even_when_exhausted`
+        // binds the ARM site; this binds the CONSULT site.
+        //
+        // Both accounts read weekly-exhausted so the promoted (still-exhausted) active has no viable
+        // target and simply HOLDS — isolating the exemption from a swap-away that would otherwise
+        // repoint active on the same tick (the all-exhausted-holds setup of the relief test).
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.99) // active: weekly-exhausted → holds (no viable target)
+                .ok_resets("u-B", 0.10, 0.99, now + 999_999), // peer: weekly-exhausted, reset far
+        )
+        .await;
+        // The peer's first poll (still NON-active) reads it exhausted → arms its slow-poll window.
+        next_peer_tick(&mut daemon).await;
+        assert!(
+            daemon.state.health[1].exhausted_poll_until.is_some(),
+            "the peer's slow-poll window is armed before promotion",
+        );
+        // Promote u-B to active — what `use u-B` effects (repoint active) — WITHOUT advancing the
+        // clock, so the window is still armed when the consult site runs on u-B's next slot.
+        daemon.state.active = Some(1);
+        // The now-active u-B polls at full cadence on its next slot: the consult-site exemption, not
+        // the still-armed window, decides. (next_peer_tick panics if it stays skipped.)
+        let promoted = next_peer_tick(&mut daemon).await;
+        assert!(
+            peer_polled(&promoted, "spare"),
+            "a peer promoted to active must poll at full cadence despite a stale armed window",
+        );
+        // That active poll cleared the stale window (active is treated viable) — no dangling
+        // deadline once it is back in rotation as the consumed account.
+        assert!(
+            daemon.state.health[1].exhausted_poll_until.is_none(),
+            "the active poll cleared the stale slow-poll window",
+        );
+    }
+
+    #[tokio::test]
+    async fn all_exhausted_relief_still_computes_from_a_slow_polled_peers_retained_reset() {
+        // AC: all-exhausted relief still computes correctly under slow-polling — it reads the
+        // peer's RETAINED reading (with its resets_at), which the slow-poll skip carries
+        // untouched (the same carry-readings mechanism as the back-off skip).
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.99) // active: weekly-exhausted (stays active — no viable target)
+                .ok_resets("u-B", 0.10, 0.99, now + 999_999), // peer: weekly-exhausted, known reset
+        )
+        .await;
+        // Warm up: poll both (A then B). B reads exhausted → armed for slow-poll.
+        next_peer_tick(&mut daemon).await;
+        // Tick to a B-SKIP tick and assert the all-exhausted decision still stands.
+        let mut saw_skipped_all_exhausted = false;
+        for _ in 0..4 {
+            let tick = daemon.tick().await;
+            if !peer_polled(&tick, "spare") {
+                assert_eq!(
+                    tick.action,
+                    TickAction::NoViableTarget,
+                    "all-exhausted relief must still compute while the peer is slow-polled",
+                );
+                saw_skipped_all_exhausted = true;
+            }
+        }
+        assert!(
+            saw_skipped_all_exhausted,
+            "the peer was skipped at least once"
+        );
+        // The peer's reading — with its weekly reset — is RETAINED across the skips, so the
+        // relief math (soonest_weekly_reset) still has the reset to key off.
+        let retained = daemon.state.last_readings[1].expect("peer reading retained across skips");
+        assert_eq!(retained.weekly_resets_at, Some(now + 999_999));
     }
 
     #[tokio::test]
@@ -7206,6 +10923,186 @@ mod tests {
             &tun,
         );
         assert_eq!(solo.next_subinterval(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn near_limit_fast_poll_engages_only_on_an_in_band_active_reading_or_projection() {
+        // Issue #540: the engage predicate for the near-limit poll-coverage fast-poll. It fires
+        // ONLY when the ACTIVE account's OBSERVED reading is in the #539 band (≥ the shared
+        // `session_velocity_min_project_above` floor, 0.85) OR the #539 velocity projection
+        // `last + rate × H` reaches that floor from a still-below reading — reusing the very signals
+        // #539 projects from, so #540 keeps them warm through the final climb (the poll-gap
+        // `velocity_swap` explicitly holds on). Every other arm holds it OFF, so the steady-state
+        // (below-band) cadence is never tightened (AC 3).
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.near_limit_poll_secs = 60; // enable the path (the `tunables` fixture ships it at 0)
+        daemon.session_velocity_horizon_secs = 150; // arm the #539 projection horizon
+        let usage = |session: f64| Usage {
+            session,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+
+        // In-band by the OBSERVED reading (0.90 ≥ 0.85): engaged, no projection needed.
+        assert!(
+            daemon.near_limit_fast_poll_engaged(),
+            "an in-band observed reading engages the fast-poll",
+        );
+
+        // Below the band with NO velocity signal (the poll-gap case #540 owns): NOT engaged.
+        daemon.state.last_readings[0] = Some(usage(0.80));
+        daemon.state.session_velocity[0] = None;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "below the band with no velocity → not engaged",
+        );
+
+        // Below the band, but a SUSTAINED projection reaches the floor (0.80 + 0.01 × 150 = 2.3 ≥
+        // 0.85): the "approaching the band" arm engages BEFORE the fast burst is observed in-band.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 3,
+        });
+        assert!(
+            daemon.near_limit_fast_poll_engaged(),
+            "a sustained projection into the band engages the fast-poll",
+        );
+
+        // A SHORT projection (0.80 + 0.0001 × 150 = 0.815 < 0.85) stays below the floor → NOT
+        // engaged; the reactive path catches it if it keeps climbing.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.0001,
+            samples: 3,
+        });
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "a projection that falls short of the floor → not engaged",
+        );
+
+        // A single-interval spike (samples < MIN_VELOCITY_SAMPLES) is not SUSTAINED → NOT engaged,
+        // exactly as #539's projection guards — never fire on a one-off spike.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 1,
+        });
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "a single-sample spike is not sustained → not engaged",
+        );
+
+        // The #539 horizon kill-switch (0) collapses the projection to the observed (below-band)
+        // reading → NOT engaged, even with a steep, well-sustained velocity.
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        daemon.session_velocity_horizon_secs = 0;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "horizon 0 disables the projection arm → not engaged below-band",
+        );
+        daemon.session_velocity_horizon_secs = 150; // restore for the arms below
+
+        // A BLIND active (its slot cleared by a 429/5xx) carries no OBSERVED near-limit signal —
+        // that is the #452 bounded-blindness path, not #540's — so a None reading holds it OFF.
+        daemon.state.last_readings[0] = None;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "a blind active (None reading) → not engaged (#452's domain, not #540's)",
+        );
+
+        // Re-arm an in-band reading, then verify the three GATE guards each independently hold off.
+        daemon.state.last_readings[0] = Some(usage(0.90));
+        assert!(daemon.near_limit_fast_poll_engaged(), "re-armed in-band");
+
+        // Kill-switch: near_limit_poll_secs == 0 disables the whole path.
+        daemon.near_limit_poll_secs = 0;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "the near_limit_poll_secs kill-switch (0) disables the path",
+        );
+        daemon.near_limit_poll_secs = 60;
+
+        // Not warmed up: tightening the shared tick before the first full cycle could starve peers
+        // of their first poll and stall the warm-up latch (#80).
+        daemon.state.warmed_up = false;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "an un-warmed roster never engages (peers must complete their first poll)",
+        );
+        daemon.state.warmed_up = true;
+
+        // No active resolved: there is nothing to keep warm.
+        daemon.state.active = None;
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "no active account → not engaged",
+        );
+    }
+
+    #[tokio::test]
+    async fn near_limit_fast_poll_caps_the_active_sub_interval_in_band_only() {
+        // Issue #540 (AC 2 + AC 3): the near-limit poll-coverage TIMING seam. While the active's
+        // reading is in the band, the per-tick sub-interval is capped to `near_limit_poll_secs`
+        // (60 s) — so the active, re-observed every ~2 sub-intervals by the #366 interleave, never
+        // opens a near-limit poll gap. BELOW the band the cap is inert and the sub-interval is the
+        // un-capped base, so the steady-state poll footprint the source-scoped 429 budget depends on
+        // stays flat.
+        //
+        // A `fixed(600 s)` interval over the 3-account rotation gives a base sub-interval of
+        // 600 / 3 = 200 s — deliberately ABOVE the 60 s cap so the cap actually BINDS (the small-N /
+        // high-poll_secs regime #540 targets, the ≥ 400–900 s poll-gap residual; where the base is
+        // already tighter than the cap the `min` leaves it untouched). The FakeClock is frozen, so
+        // the seam is exercised via a direct `next_subinterval()` call — no real clock, no network.
+
+        // --- BELOW the band: the cap is inert, the base cadence is unchanged, no edge event ---
+        let mut below = warmed_velocity_daemon(0.80).await; // active reading below the 0.85 floor
+        below.poll_strategy = Strategy::fixed(600.0);
+        below.near_limit_poll_secs = 60;
+        let out = below.tick().await;
+        assert!(
+            !below.state.near_limit_fast_poll,
+            "0.80 < 0.85 floor → the fast-poll stays disengaged",
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::NearLimitPollCoverage { .. })),
+            "no band-entry event below the band: {:?}",
+            out.events,
+        );
+        assert_eq!(
+            below.next_subinterval(),
+            Duration::from_secs(200),
+            "below the band the sub-interval is the un-capped base (600 / 3) — footprint flat",
+        );
+
+        // --- IN the band: the cap binds, the active re-polls within it, the edge event emits once
+        let mut inband = warmed_velocity_daemon(0.90).await; // active reading at/over the floor
+        inband.poll_strategy = Strategy::fixed(600.0);
+        inband.near_limit_poll_secs = 60;
+        let out = inband.tick().await;
+        assert!(
+            inband.state.near_limit_fast_poll,
+            "0.90 ≥ 0.85 floor → the fast-poll engages",
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                Event::NearLimitPollCoverage {
+                    sub_interval_secs: 60,
+                    ..
+                }
+            )),
+            "band entry emits the durable near_limit_poll_coverage event carrying the cap: {:?}",
+            out.events,
+        );
+        assert_eq!(
+            inband.next_subinterval(),
+            Duration::from_secs(60),
+            "in the band the sub-interval is capped to near_limit_poll_secs — no poll gap ≥ the cap",
+        );
     }
 
     #[tokio::test]
@@ -7557,7 +11454,7 @@ mod tests {
         let outcome = warmed_tick(&mut daemon).await;
 
         assert_eq!(outcome.action, TickAction::NoViableTarget);
-        // Floor-driven exhaustion: B is weekly-viable but over the target-max-usage, so
+        // Floor-driven exhaustion: B is weekly-viable but over the target-max-session-usage, so
         // the block is session-wide (#398) — cause=session, naming B ("spare", the
         // account relief comes from at its session reset). The poller reports no
         // session reset, so `resets_at` is omitted (the soonest-reset path is covered
@@ -7624,8 +11521,24 @@ mod tests {
         // all-exhausted, holds on B (soonest reset), and emits once (issue #80).
         let first = warmed_tick(&mut daemon).await;
         assert_eq!(first.action, TickAction::NoViableTarget);
+        // That last warm-up tick also polls a weekly-exhausted PEER, which arms its
+        // out-of-rotation slow-poll window and emits an ExhaustedSlowPoll (issue #537) — a
+        // concern orthogonal to this all-exhausted HOLD test, and whose window value is
+        // wall-clock-dependent (the fixture resets are fixed historical dates). Filter the
+        // slow-poll events out (they have their own tests) and pin the DECISION event exactly.
+        let decision_events: Vec<_> = first
+            .events
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e,
+                    Event::ExhaustedSlowPoll { .. } | Event::ExhaustedSlowPollCleared { .. }
+                )
+            })
+            .cloned()
+            .collect();
         assert_eq!(
-            first.events,
+            decision_events,
             vec![Event::AllExhausted {
                 hold: "spare".to_owned(),
                 cause: SwapReason::Weekly,
@@ -7702,6 +11615,7 @@ mod tests {
         assert_eq!(
             outcome.diagnostics,
             vec![
+                canonical_unknown_diag("work"),
                 Diagnostic::Poll {
                     account: "work".to_owned(),
                     outcome: PollClass::Live,
@@ -8471,6 +12385,9 @@ mod tests {
     fn status_response_carries_handles_and_percentages_and_never_a_secret() {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -8522,7 +12439,7 @@ mod tests {
         assert!(!json.contains("last_swap"));
         // Issue #15: the projection sources only labels + percentages, so neither an
         // email nor a token can ever reach the wire — the new candidate included.
-        assert!(!json.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
         assert!(!json.to_lowercase().contains("token"));
     }
 
@@ -9183,6 +13100,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_projects_the_canonical_scrub_rollup_gated_on_the_scrubbed_signal() {
+        // Issue #516: `snapshot` projects the two edge-latched scrub signals into the wire rollup,
+        // GATED on `signaled_canonical_scrubbed` FIRST and only THEN refined by exhaustion. The gate
+        // is load-bearing: the restore path clears `signaled_canonical_scrubbed` (a confirmed live
+        // re-read) but NOT `signaled_scrub_adopt_exhausted` (cleared only on a churn-window age-out,
+        // inside the scrubbed-gated `recover_scrubbed_canonical`), so `(scrubbed=false, exhausted=true)`
+        // is REACHABLE after a `claude /login` recovery — and MUST read healthy, never a stale
+        // un-recoverable. This projection is the daemon-side wiring the pure serialize test can't reach.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        const NOW: i64 = 1_782_777_600;
+        let no_readings: [Option<Usage>; 3] = [None, None, None];
+        let rollup = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).canonical_scrub;
+
+        // Healthy: neither signal set → the rollup is absent.
+        assert_eq!(
+            rollup(&daemon),
+            None,
+            "a healthy canonical projects no rollup"
+        );
+
+        // Scrubbed, adopt still in progress (#464) → Recovering, the lower-severity self-may-heal state.
+        daemon.state.signaled_canonical_scrubbed = true;
+        assert_eq!(
+            rollup(&daemon),
+            Some(CanonicalScrub::Recovering),
+            "a scrubbed-but-recovering canonical projects Recovering"
+        );
+
+        // Scrubbed AND recovery exhausted (#467) → Exhausted, the residual un-recoverable state #469
+        // renders with the `claude /login` remedy. Exhaustion OUTRANKS recovering (most-severe wins).
+        daemon.state.signaled_scrub_adopt_exhausted = true;
+        assert_eq!(
+            rollup(&daemon),
+            Some(CanonicalScrub::Exhausted),
+            "recovery-exhausted outranks merely-recovering"
+        );
+
+        // THE GATE (the correctness subtlety): the canonical RECOVERS — a live re-read clears
+        // `signaled_canonical_scrubbed` — while the exhausted latch still lingers (not yet aged out).
+        // The rollup MUST read healthy, never a stale `Exhausted` over a healed canonical.
+        daemon.state.signaled_canonical_scrubbed = false;
+        assert_eq!(
+            rollup(&daemon),
+            None,
+            "a healed canonical reads healthy even while the exhausted latch lingers"
+        );
+    }
+
     #[test]
     fn redaction_meter_covers_the_new_credential_clock_fields() {
         use crate::redaction::meter::{assert_clean, Secrets};
@@ -9194,6 +13160,9 @@ mod tests {
         let secrets = Secrets::meter_fixture();
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -9235,7 +13204,561 @@ mod tests {
         assert!(corpus.contains(r#""refresh_health":{"#));
         // The rollup rides the wire under the `auth` key (issue #143 renamed `health` → `auth`).
         assert!(corpus.contains(r#""auth":"stale""#));
-        assert_clean(&corpus, &secrets);
+        assert_clean(&corpus, &secrets, &[]);
+    }
+
+    #[test]
+    fn canonical_fingerprint_is_the_16_hex_prefix_of_the_token_sha256() {
+        // Issue #464: a stable, redaction-safe identity — the first 16 hex of the token's
+        // SHA-256, deterministic and distinct per token, never the token itself. 16 chars keeps
+        // it under the redaction meter's 20-char high-entropy backstop.
+        let fp = canonical_fingerprint(b"live-rt");
+        assert_eq!(fp.len(), CANONICAL_FINGERPRINT_HEX);
+        assert_eq!(fp, crate::sha256::sha256_hex(b"live-rt")[..16]);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        // A different token yields a different fingerprint (identity, not a constant) — the
+        // rotation signal #465 reads.
+        assert_ne!(fp, canonical_fingerprint(b"other-rt"));
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_edge_triggers_the_scrub_once_then_the_restore() {
+        // Issue #464: the shared canonical's present↔scrubbed transitions each emit EXACTLY ONE
+        // durable event — the scrub fires once (not per poll while it stays empty), a transient
+        // unreadable poll HOLDS the signal, and only a confirmed live read fires the clearing
+        // restore. The core edge-trigger AC.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let live = cred(
+            br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"live-rt","expiresAt":1782777600000}}"#,
+        );
+
+        // Present while nothing is signalled: no event, one `diag=canonical` present line.
+        let mut events = Vec::new();
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&live), false, Some(0), &mut events, &mut diags);
+        assert!(
+            events.is_empty(),
+            "a present item with no prior scrub emits no event: {events:?}"
+        );
+        // The Present arm's field population through the METHOD: the fingerprint derived from the
+        // live refresh token and the `expiresAt` ms→s fold (1782777600000 ms → 1782777600 s). This
+        // is the FIRST Present observation, so it SEEDS the yank anchor silently (`rotated_from:
+        // None` — no rotation to mark).
+        assert_eq!(
+            diags,
+            vec![Diagnostic::Canonical {
+                state: CanonicalLiveness::Present,
+                fingerprint: Some(canonical_fingerprint(b"live-rt")),
+                account: Some("work".to_owned()),
+                expires_at: Some(1_782_777_600),
+                rotated_from: None,
+            }]
+        );
+        assert!(!daemon.state.signaled_canonical_scrubbed);
+        assert_eq!(
+            daemon.state.prev_canonical_fingerprint,
+            Some(canonical_fingerprint(b"live-rt")),
+            "the first Present observation seeds the yank anchor"
+        );
+
+        // The item is scrubbed (gone) → exactly one `canonical_scrubbed` carrying the handle.
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(None, true, Some(0), &mut events, &mut Vec::new());
+        assert_eq!(
+            events,
+            vec![Event::CanonicalScrubbed {
+                account: Some("work".to_owned())
+            }]
+        );
+        assert!(daemon.state.signaled_canonical_scrubbed);
+
+        // Still scrubbed next poll → no repeat (edge-triggered, not level-triggered).
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(None, true, Some(0), &mut events, &mut Vec::new());
+        assert!(
+            events.is_empty(),
+            "a persisting scrub re-signals nothing: {events:?}"
+        );
+        assert!(daemon.state.signaled_canonical_scrubbed);
+
+        // A transient unreadable poll (absent=false) carries no evidence → no event, signal HELD:
+        // a flaky read must never fabricate a recovery.
+        let mut events = Vec::new();
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(None, false, Some(0), &mut events, &mut diags);
+        assert!(
+            events.is_empty(),
+            "a flaky read fabricates no recovery: {events:?}"
+        );
+        assert!(
+            daemon.state.signaled_canonical_scrubbed,
+            "the scrub signal survives a transient read"
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "the unknown level reading is still recorded"
+        );
+
+        // A confirmed live read → exactly one `canonical_restored`, signal cleared.
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(Some(&live), false, Some(0), &mut events, &mut Vec::new());
+        assert_eq!(
+            events,
+            vec![Event::CanonicalRestored {
+                account: Some("work".to_owned())
+            }]
+        );
+        assert!(!daemon.state.signaled_canonical_scrubbed);
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_treats_an_emptied_refresh_token_as_scrubbed() {
+        // Issue #464: Claude Code's in-place scrub clears the tokens rather than deleting the
+        // item — a readable blob with an EMPTY refresh token is the DEAD signal (refresh.rs), so
+        // it must classify scrubbed and edge-trigger the event just like a gone item, and the
+        // level line records the scrubbed state with no fingerprint / expiry.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let emptied =
+            cred(br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}"#);
+        let mut events = Vec::new();
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&emptied), false, Some(0), &mut events, &mut diags);
+        assert_eq!(
+            events,
+            vec![Event::CanonicalScrubbed {
+                account: Some("work".to_owned())
+            }]
+        );
+        assert_eq!(
+            diags,
+            vec![Diagnostic::Canonical {
+                state: CanonicalLiveness::Scrubbed,
+                fingerprint: None,
+                account: Some("work".to_owned()),
+                expires_at: None,
+                rotated_from: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_adopts_a_viable_target_into_a_scrubbed_canonical() {
+        // Issue #467 AC1: an emptied canonical with a viable roster account → the daemon installs
+        // that account's token and emits a recovery event, with NO operator action — so a live
+        // session recovers on its next request. The narrow ADR-0007 d4 carve-out (ADR-0018 d1): a
+        // scrubbed canonical WITH a live target is not `active_dead_no_target`.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.40) // active, below trigger → warm-up holds, no swap
+            .ok("u-B", 0.10, 0.20) // viable spare — earliest index, so the pick
+            .ok("u-C", 0.15, 0.25); // viable spare
+        let mut daemon = three_account_daemon(poller).await;
+        // Warm-up runs on the opaque canonical (`refresh_token` can't parse `b"A-token"` → liveness
+        // UNKNOWN, never Scrubbed), so the recovery branch is NOT taken and nothing is adopted.
+        let warm = warmed_tick(&mut daemon).await;
+        assert!(
+            !matches!(warm.action, TickAction::CanonicalAdopted { .. }),
+            "an UNKNOWN-liveness (non-scrubbed) canonical never triggers an adopt: {:?}",
+            warm.action
+        );
+        assert_eq!(daemon.state.active, Some(0));
+
+        // Claude Code scrubs the shared canonical to empty on its first `invalid_grant` (ADR-0018).
+        daemon.store.set_not_found(true);
+        let outcome = daemon.tick().await;
+
+        assert_eq!(outcome.action, TickAction::CanonicalAdopted { to: 1 });
+        assert!(
+            outcome.events.contains(&Event::CanonicalRecovered {
+                account: "spare".to_owned()
+            }),
+            "the autonomous recovery emits a durable event naming the adopted account: {:?}",
+            outcome.events
+        );
+        // The scrub itself is still recorded (the fleet-wide lockout event), even though brief.
+        assert!(outcome.events.contains(&Event::CanonicalScrubbed {
+            account: Some("work".to_owned())
+        }));
+        // The canonical now holds the adopted spare's token, so every session re-reads a usable
+        // credential on its next request — no `claude /login`.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "the adopted account is now active"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_adopt_a_scrubbed_canonical_when_no_target_is_viable() {
+        // Issue #467 AC2: no viable target → fall THROUGH to the existing decision path (the surfaced
+        // signal), never a silent adopt churn. Here every spare is weekly-exhausted, so `pick_target`
+        // finds nothing and the recovery yields to the normal `decide_action` (Held) — the canonical
+        // stays scrubbed (zero adopt writes) and the durable `canonical_scrubbed` signal stands.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.40) // active, viable, below trigger
+            .ok("u-B", 0.10, 0.99) // weekly-EXHAUSTED (> 0.98 trigger) → not a viable target
+            .ok("u-C", 0.15, 0.99); // weekly-EXHAUSTED → not a viable target
+        let mut daemon = three_account_daemon(poller).await;
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+
+        daemon.store.set_not_found(true);
+        let outcome = daemon.tick().await;
+
+        assert!(
+            !matches!(outcome.action, TickAction::CanonicalAdopted { .. }),
+            "no viable target → no adopt: {:?}",
+            outcome.action
+        );
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalRecovered { .. })),
+            "no recovery event when nothing was adopted: {:?}",
+            outcome.events
+        );
+        // The scrub IS surfaced (the durable signal the operator acts on), not swallowed.
+        assert!(outcome.events.contains(&Event::CanonicalScrubbed {
+            account: Some("work".to_owned())
+        }));
+        // Zero adopt writes: the canonical stays scrubbed (no thrash) until a viable target appears
+        // or the operator re-logs-in (ADR-0007 d4 / ADR-0016 remedy for the all-dead case).
+        assert!(
+            matches!(daemon.store.read().await, Err(Error::CredentialNotFound)),
+            "the canonical is left scrubbed — no adopt write"
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no state change without an adopt"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_scrubbed_canonical_aborts_with_zero_writes_when_unreadable() {
+        // Issue #467 AC3 (no ADR-0003 regression): a LOCKED / unreadable keychain is "could not
+        // read", NOT "gone" — the adopt MUST abort with ZERO writes rather than clobber a canonical
+        // it could not read. Driven at the daemon layer by calling the recovery directly against an
+        // unreadable store; the engine-level matrix (locked / unreadable / absent-stash) is proven
+        // in `swap::tests::adopt_target_aborts_with_zero_writes_*`.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.50, 0.40)
+            .ok("u-B", 0.10, 0.20) // a viable target exists — so only the unreadable canonical aborts
+            .ok("u-C", 0.15, 0.25);
+        let mut daemon = three_account_daemon(poller).await;
+        warmed_tick(&mut daemon).await;
+        let readings = daemon.decision_readings(Some(0));
+        let at = daemon.clock.now();
+
+        daemon.store.set_unreadable(true);
+        let mut events = Vec::new();
+        let outcome = daemon
+            .recover_scrubbed_canonical(Some(0), &readings, at, &mut events)
+            .await;
+
+        assert_eq!(outcome, None, "an unreadable canonical aborts the adopt");
+        assert!(
+            events.is_empty(),
+            "no false recovery event on an aborted adopt: {events:?}"
+        );
+        assert_eq!(
+            daemon.state.scrub_adopt_count, 0,
+            "an adopt that never landed is not counted toward the churn bound"
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no state change on an aborted adopt"
+        );
+        // Clearing the unreadable flag shows the canonical still holds the PRE-adopt token — the
+        // abort wrote nothing (ADR-0003 / #212 "locked ≠ gone").
+        daemon.store.set_unreadable(false);
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "zero writes: the canonical is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrubbed_canonical_recovery_is_bounded_then_resumes_after_the_window() {
+        // Issue #467 AC4: the recovery is BOUNDED against a re-auth churn loop. When the canonical
+        // keeps getting re-scrubbed right after each adopt, the daemon heals at most SCRUB_ADOPT_MAX
+        // times per window, then BACKS OFF (one durable `canonical_recovery_exhausted`, no more
+        // adopts) — leaving the scrub signal up for the operator — and RESUMES once the window
+        // elapses. A frozen clock holds every tick inside one window until we advance it.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.20, 0.30)
+            .ok("u-B", 0.10, 0.20)
+            .ok("u-C", 0.15, 0.25); // all viable, all below trigger → a target always exists
+        let mut daemon = three_account_daemon(poller).await;
+        warmed_tick(&mut daemon).await;
+
+        // Up to the bound: each re-scrub heals (a different viable account each time as the active
+        // rotates — `pick_target` excludes the current active).
+        let mut adopts = 0;
+        for _ in 0..SCRUB_ADOPT_MAX {
+            daemon.store.set_not_found(true);
+            let outcome = daemon.tick().await;
+            if matches!(outcome.action, TickAction::CanonicalAdopted { .. }) {
+                adopts += 1;
+                assert!(
+                    outcome
+                        .events
+                        .iter()
+                        .any(|e| matches!(e, Event::CanonicalRecovered { .. })),
+                    "each landed adopt emits a recovery event"
+                );
+            }
+        }
+        assert_eq!(
+            adopts, SCRUB_ADOPT_MAX,
+            "every scrub within the bound is healed"
+        );
+        assert_eq!(daemon.state.scrub_adopt_count, SCRUB_ADOPT_MAX);
+
+        // The (MAX+1)th re-scrub in the same window BACKS OFF: no adopt, one back-off signal.
+        daemon.store.set_not_found(true);
+        let backoff = daemon.tick().await;
+        assert!(
+            !matches!(backoff.action, TickAction::CanonicalAdopted { .. }),
+            "the churn bound stops the adopt: {:?}",
+            backoff.action
+        );
+        assert!(
+            backoff
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalRecoveryExhausted { .. })),
+            "the back-off is surfaced durably: {:?}",
+            backoff.events
+        );
+
+        // A further re-scrub in the same window stays backed off AND does not re-emit (edge-triggered).
+        daemon.store.set_not_found(true);
+        let still = daemon.tick().await;
+        assert!(!matches!(still.action, TickAction::CanonicalAdopted { .. }));
+        assert!(
+            !still
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalRecoveryExhausted { .. })),
+            "the back-off signal is edge-triggered, not repeated per held tick"
+        );
+
+        // Once the churn window elapses, recovery RESUMES — an isolated later scrub heals at once.
+        daemon
+            .clock
+            .advance(SCRUB_ADOPT_WINDOW + Duration::from_secs(1));
+        daemon.store.set_not_found(true);
+        let resumed = daemon.tick().await;
+        assert!(
+            matches!(resumed.action, TickAction::CanonicalAdopted { .. }),
+            "recovery resumes after the window resets: {:?}",
+            resumed.action
+        );
+    }
+
+    /// Extract the #475 yank marker (`rotated_from`) from a `diag=canonical` diagnostic, panicking
+    /// on any other variant — a focused reader for the yank-detection assertions below.
+    fn rotated_from_of(d: &Diagnostic) -> Option<String> {
+        match d {
+            Diagnostic::Canonical { rotated_from, .. } => rotated_from.clone(),
+            other => panic!("expected a diag=canonical, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_marks_a_present_to_present_rotation_as_a_yank() {
+        // Issue #475: a Present→Present canonical fingerprint CHANGE is a rotation-YANK — the
+        // frequent, RECOVERABLE "Not logged in" mode. The FIRST Present seeds the anchor silently; a
+        // later Present with a DIFFERENT refresh token carries `rotated_from = Some(prior-fingerprint)`
+        // (rendered `mode=yank prev=…`); an UNCHANGED Present carries none; a scrub CLEARS the anchor
+        // so the recovery Present re-seeds WITHOUT a false yank across the restore edge. Derived
+        // purely from the observed present/valid state + fingerprint delta (AC1: "not guessed").
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let rt1 = cred(
+            br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt-1","expiresAt":1782777600000}}"#,
+        );
+        let rt2 = cred(
+            br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"rt-2","expiresAt":1782777600000}}"#,
+        );
+
+        // (1) First Present: seed the anchor, no yank marker.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt1), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            None,
+            "the first Present observation seeds the anchor without a yank"
+        );
+
+        // (2) Present with a DIFFERENT token: a rotation → yank carrying rt-1's fingerprint.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt2), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            Some(canonical_fingerprint(b"rt-1")),
+            "a Present→Present token change marks a yank carrying the PRIOR fingerprint"
+        );
+
+        // (3) Present with the SAME token: no rotation, no marker.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt2), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            None,
+            "an unchanged Present marks no yank"
+        );
+
+        // (4) A scrub CLEARS the anchor.
+        daemon.note_canonical_liveness(None, true, Some(0), &mut Vec::new(), &mut Vec::new());
+        assert_eq!(
+            daemon.state.prev_canonical_fingerprint, None,
+            "a scrub clears the yank anchor"
+        );
+
+        // (5) Recovery Present: re-seeds silently — a restore is NOT a yank.
+        let mut diags = Vec::new();
+        daemon.note_canonical_liveness(Some(&rt1), false, Some(0), &mut Vec::new(), &mut diags);
+        assert_eq!(
+            rotated_from_of(&diags[0]),
+            None,
+            "the Present that recovers a scrub re-seeds without a false yank"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_canonical_liveness_omits_the_handle_when_no_active_is_resolved() {
+        // Issue #464: a daemon that first reads an already-scrubbed item has no active to name —
+        // the scrub still fires (the state is real), with the handle absent rather than fabricated.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_canonical_liveness(None, true, None, &mut events, &mut Vec::new());
+        assert_eq!(events, vec![Event::CanonicalScrubbed { account: None }]);
+    }
+
+    #[tokio::test]
+    async fn a_tick_observing_a_scrubbed_canonical_emits_the_edge_triggered_scrub_event() {
+        // Issue #464 AC-1 END-TO-END through the real poll path: when a tick's canonical read
+        // returns `CredentialNotFound` (Claude Code's `invalid_grant` scrub empties the item —
+        // ADR-0018), the tick emits exactly one durable `canonical_scrubbed` carrying the
+        // last-known active handle — even though no `credential_dead` fires (the observability
+        // gap the umbrella closes). Exercises the `Err(CredentialNotFound)` → `canonical_absent`
+        // → `Event::CanonicalScrubbed` wiring the direct-call tests reach only in halves.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // First tick: the canonical is readable (opaque `A-token`), active resolves to `work`,
+        // and no scrub is signalled.
+        let before = daemon.tick().await;
+        assert!(
+            !before
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalScrubbed { .. })),
+            "a readable canonical emits no scrub: {:?}",
+            before.events
+        );
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(!daemon.state.signaled_canonical_scrubbed);
+
+        // Claude Code scrubs the shared item to empty → the next read is `CredentialNotFound`.
+        daemon.store.set_not_found(true);
+        let scrubbed = daemon.tick().await;
+        assert_eq!(
+            scrubbed
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::CanonicalScrubbed { .. }))
+                .collect::<Vec<_>>(),
+            vec![&Event::CanonicalScrubbed {
+                account: Some("work".to_owned())
+            }],
+            "the poll that observes the emptied canonical emits exactly one scrub event: {:?}",
+            scrubbed.events
+        );
+        assert!(daemon.state.signaled_canonical_scrubbed);
+
+        // A second scrubbed tick re-signals nothing (edge-triggered, not level-triggered).
+        let still = daemon.tick().await;
+        assert!(
+            !still
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanonicalScrubbed { .. })),
+            "a persisting scrub re-signals nothing: {:?}",
+            still.events
+        );
+    }
+
+    #[test]
+    fn redaction_meter_covers_the_canonical_snapshot_fields() {
+        use crate::redaction::meter::{assert_clean, Secrets};
+        // Issue #464 / #475 / #15: the per-poll canonical snapshot + its scrub/restore events must
+        // leak no secret. Build the log lines with a fingerprint derived from the fixture's REAL
+        // refresh token — so a path that emitted the token (or its raw/hashed blob) rather than
+        // the truncated per-token hash would surface here — and prove the value-based meter reads
+        // clean. The Present line ALSO carries the #475 `mode=yank prev=<fingerprint>` marker with a
+        // real-token-derived prior fingerprint, so a bug rendering the raw prior token in the `prev=`
+        // slot (rather than its hash prefix) would surface here too.
+        let secrets = Secrets::meter_fixture();
+        let blob = secrets.blob();
+        let rt = crate::refresh::refresh_token(blob).expect("fixture blob carries a refresh token");
+        let fingerprint = canonical_fingerprint(&rt);
+        let expires_at = crate::refresh::expires_at(blob).map(millis_to_secs);
+
+        let mut corpus = String::new();
+        corpus.push_str(
+            &Diagnostic::Canonical {
+                state: CanonicalLiveness::Present,
+                fingerprint: Some(fingerprint.clone()),
+                account: Some("work".to_owned()),
+                expires_at,
+                rotated_from: Some(fingerprint.clone()),
+            }
+            .to_log_line(std::time::SystemTime::UNIX_EPOCH),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &Event::CanonicalScrubbed {
+                account: Some("work".to_owned()),
+            }
+            .to_log_line(std::time::SystemTime::UNIX_EPOCH),
+        );
+        corpus.push('\n');
+        corpus.push_str(
+            &Event::CanonicalRestored {
+                account: Some("work".to_owned()),
+            }
+            .to_log_line(std::time::SystemTime::UNIX_EPOCH),
+        );
+        corpus.push('\n');
+
+        // Cardinality (#15 non-vacuous gate): the fingerprint derived from the REAL fixture token
+        // actually reached the scanned corpus, and it is the 16-hex prefix — so the clean verdict
+        // below is not vacuously true on an empty/degraded corpus.
+        assert_eq!(fingerprint.len(), 16);
+        assert!(corpus.contains(&format!("fingerprint={fingerprint}")));
+        // …and the raw refresh token never rode alongside it.
+        assert!(!corpus.contains(std::str::from_utf8(&rt).unwrap()));
+        assert_clean(&corpus, &secrets, &[]);
     }
 
     #[test]
@@ -9280,6 +13803,9 @@ mod tests {
 
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -9318,7 +13844,7 @@ mod tests {
         );
         assert!(reply.contains("\"label\":\"work\""));
         assert!(reply.contains("\"session_pct\":50"));
-        assert!(!reply.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&reply, &[]).is_empty());
     }
 
     #[tokio::test]
@@ -9453,6 +13979,9 @@ mod tests {
     fn watch_snapshot(label: &str, generated_at: i64, session: f64) -> StatusSnapshot {
         StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at,
             refresh_enabled: false,
             next_swap: None,
@@ -9504,7 +14033,10 @@ mod tests {
                 assert_eq!(v.generated_at, 100);
                 assert_eq!(v.status.accounts[0].label, "work");
                 assert_eq!(v.status.accounts[0].session_pct, Some(20));
-                assert!(!initial.contains('@'), "no email can travel (issue #15)");
+                assert!(
+                    crate::redaction::meter::unauthored_emails(&initial, &[]).is_empty(),
+                    "no non-authored email can travel (#15/#444)"
+                );
             }
             other => panic!("expected an initial snapshot, got {other:?}"),
         }
@@ -9636,7 +14168,88 @@ mod tests {
             ServeOutcome::Capture(..) => {
                 panic!("a watch command must route to a watch stream, not a capture handoff")
             }
+            ServeOutcome::Stats(..) => {
+                panic!("a watch command must route to a watch stream, not a stats handoff")
+            }
+            ServeOutcome::ConfigGet(_) => {
+                panic!("a watch command must route to a watch stream, not a config-get handoff")
+            }
+            ServeOutcome::ConfigSet(..) => {
+                panic!("a watch command must route to a watch stream, not a config-set handoff")
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_a_stats_command_to_a_handoff_unauthenticated() {
+        use tokio::io::AsyncWriteExt;
+        // A `stats` command is a non-secret READ (issue #356): like `watch`, it is UN-auth-gated
+        // (peer `false`) and NOT answered inline — it hands the connection back so the caller
+        // computes the series in a SPAWNED task, off the run loop. The `period` rides the handoff to
+        // the task verbatim.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"stats\",\"period\":\"week\"}\n")
+            .await
+            .unwrap();
+        let (_stream, request) = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap()
+            .stats();
+        assert_eq!(
+            request.period.as_deref(),
+            Some("week"),
+            "the stats period rides the handoff to the spawned task verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_a_periodless_stats_command() {
+        use tokio::io::AsyncWriteExt;
+        // A `stats` command with no `period` is well-formed — the task defaults it to `week` (the
+        // 7-day daily-bucket window), so the handoff carries `None` and there is no inline rejection.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"cmd\":\"stats\"}\n").await.unwrap();
+        let (_stream, request) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .stats();
+        assert!(
+            request.period.is_none(),
+            "a periodless stats request hands off None (defaulted to week in the task)"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_stats_writes_exactly_one_json_line() {
+        use tokio::io::AsyncBufReadExt;
+        // End-to-end of the spawned answer path (issue #356): `serve_stats` computes off the runtime
+        // thread (`spawn_blocking`) and writes ONE newline-delimited JSON reply, then closes. The
+        // store state is environment-dependent (a real store, or none → an `{"error":…}` envelope),
+        // so assert the request/response FRAMING (AC3), not the payload: a single line that parses as
+        // one JSON object, then EOF. Exercises the `spawn_blocking` + `write_line` + timeout glue.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        serve_stats(
+            server,
+            StatsRequest {
+                period: Some("week".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.ends_with('\n'), "the stats reply is newline-delimited");
+        let value: serde_json::Value =
+            serde_json::from_str(line.trim_end()).expect("the stats reply is one JSON object");
+        assert!(
+            value.is_object(),
+            "the reply is a JSON object — a StatsWire or an {{\"error\":…}} envelope"
+        );
+        let mut extra = String::new();
+        let n = reader.read_line(&mut extra).await.unwrap();
+        assert_eq!(n, 0, "stats is a one-shot reply, not a stream");
     }
 
     #[tokio::test]
@@ -9773,6 +14386,20 @@ mod tests {
         encode_snapshot_frame(&versioned_status_response(&snapshot))
     }
 
+    /// A snapshot frame whose `canonical_scrub` carries the #516 daemon-level rollup — the basic
+    /// golden OMITS the field entirely (a healthy snapshot, `skip_serializing_if`), so the
+    /// [`CanonicalScrub`] discriminant (the whole point of #516) has NO byte-drift coverage without
+    /// this. Freezes the `{…,"canonical_scrub":{"state":"exhausted"}}` shape (the residual
+    /// un-recoverable state #469 renders with the `claude /login` remedy), so the cross-language guard
+    /// fails if the Rust rollup encoder and the Swift mirror ever diverge. Built as the basic frame
+    /// with the scrub field set, so it differs from `wire_golden_snapshot_frame` in exactly that one
+    /// ADDED key. Mirrored by Swift `Fixtures.snapshotCanonicalScrubExhausted`.
+    fn wire_golden_snapshot_canonical_scrub_frame() -> String {
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.canonical_scrub = Some(CanonicalScrub::Exhausted);
+        encode_snapshot_frame(&versioned_status_response(&snapshot))
+    }
+
     /// One-time emitter for the committed wire goldens. `#[ignore]` — NOT part of the suite; it
     /// WRITES the bytes the pin test and the Swift fixtures consume. Run it ONLY alongside a
     /// deliberate wire-contract change:
@@ -9799,6 +14426,11 @@ mod tests {
             wire_golden_snapshot_next_swap_frame(),
         )
         .expect("write wire-snapshot-next-swap golden");
+        std::fs::write(
+            dir.join("wire-snapshot-canonical-scrub.json"),
+            wire_golden_snapshot_canonical_scrub_frame(),
+        )
+        .expect("write wire-snapshot-canonical-scrub golden");
     }
 
     /// The committed snapshot-frame golden — the exact bytes Swift `Fixtures.snapshotBasic` is
@@ -9821,6 +14453,13 @@ mod tests {
     const WIRE_SNAPSHOT_NEXT_SWAP_GOLDEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/build/fixtures/wire-snapshot-next-swap.json"
+    ));
+
+    /// The committed canonical-scrub snapshot golden (issue #516) — the exact bytes Swift
+    /// `Fixtures.snapshotCanonicalScrubExhausted` is pinned to.
+    const WIRE_SNAPSHOT_CANONICAL_SCRUB_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-snapshot-canonical-scrub.json"
     ));
 
     #[test]
@@ -9853,6 +14492,49 @@ mod tests {
             "the committed wire-snapshot-next-swap golden drifted from the next_swap reason encoder \
              (issue #393) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, then update \
              the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
+        );
+        assert_eq!(
+            wire_golden_snapshot_canonical_scrub_frame(),
+            WIRE_SNAPSHOT_CANONICAL_SCRUB_GOLDEN,
+            "the committed wire-snapshot-canonical-scrub golden drifted from the canonical_scrub \
+             rollup encoder (issue #516) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, \
+             then update the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
+        );
+    }
+
+    #[test]
+    fn snapshot_frame_encodes_recent_blind_preempt_swap_only_when_present() {
+        // Issue #479 (surface 2): the ADDITIVE `recent_blind_preempt_swap` wire field (schema 1.7).
+        // The 4 committed goldens all carry it as `None` (it is
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`), so THEY prove the omit-when-
+        // absent half — an older client and every unaffected frame stay byte-identical — but NONE of
+        // them exercise the POPULATED shape. This locks the wire bytes the field emits when a recent
+        // preemptive swap IS present, so a later `#[serde(rename)]` / reorder / retype of
+        // `BlindPreemptSwap`'s fields (which the CLI render test would NOT catch — it constructs the
+        // struct in Rust, never round-trips the JSON keys) drifts this test. The menubar mirror is out
+        // of scope for #479 (#169/#485 own it), so this stays a Rust-side byte-lock rather than a fifth
+        // cross-language golden; the Swift decoder's forward-compatible tolerance of the new unknown
+        // top-level key is already covered by the `future_top` fixture (apps/menubar Fixtures.swift).
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.recent_blind_preempt_swap = Some(BlindPreemptSwap {
+            from_label: "work".to_owned(),
+            to_label: "spare".to_owned(),
+            last_known_session_pct: 68,
+        });
+        let frame = encode_snapshot_frame(&versioned_status_response(&snapshot));
+        assert!(
+            frame.contains(
+                r#""recent_blind_preempt_swap":{"from_label":"work","to_label":"spare","last_known_session_pct":68}"#
+            ),
+            "the populated preemptive-swap narration serializes its exact wire shape: {frame}"
+        );
+
+        // Absent → the key is omitted entirely (the additive-minor discipline the goldens rely on).
+        let healthy = watch_snapshot("work", 42, 0.60);
+        let frame = encode_snapshot_frame(&versioned_status_response(&healthy));
+        assert!(
+            !frame.contains("recent_blind_preempt_swap"),
+            "the field is omitted when there is no recent preemptive swap: {frame}"
         );
     }
 
@@ -10317,7 +14999,10 @@ mod tests {
         );
         // …and its SERIALIZED bytes leak neither the credential (named `*-token`) nor an email (#15).
         let wire = serde_json::to_string(&ack).unwrap();
-        assert!(!wire.contains('@'), "the ack leaks no email: {wire}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&wire, &[]).is_empty(),
+            "the ack leaks no non-authored email (#15/#444): {wire}"
+        );
         assert!(
             !wire.to_lowercase().contains("token"),
             "the ack leaks no credential: {wire}",
@@ -10693,7 +15378,10 @@ mod tests {
         );
         // …and its SERIALIZED bytes leak neither the credential (named `*-token`) nor an email (#15).
         let wire = serde_json::to_string(&ack).unwrap();
-        assert!(!wire.contains('@'), "the ack leaks no email: {wire}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&wire, &[]).is_empty(),
+            "the ack leaks no non-authored email (#15/#444): {wire}"
+        );
         assert!(
             !wire.to_lowercase().contains("token"),
             "the ack leaks no credential: {wire}",
@@ -10897,6 +15585,435 @@ mod tests {
             .matches(&cred(b"A-token")));
     }
 
+    // --- socket `config-get` / `config-set` command (issue #268) ------------
+
+    #[tokio::test]
+    async fn perform_config_set_is_unavailable_without_a_wired_config_path() {
+        // A hermetic daemon with NO `config_path` wired cannot persist an edit — config-set is
+        // `Unavailable` (fails closed, exactly like `capture` with no path to persist to), a TRUE
+        // no-op with ZERO writes.
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::Unavailable,
+                detail: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_reports_no_config_for_an_absent_file() {
+        // A wired path whose FILE does not exist → `NoConfig` (capture the first account via the CLI
+        // first), never a fabricated empty config — and ZERO writes.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml"); // never written
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::NoConfig,
+                detail: None,
+            }
+        );
+        assert!(
+            !config_path.exists(),
+            "a rejected config-set writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_applies_a_tunable_and_reports_restart_required() {
+        // AC (tunable edit → persisted, reload-by-restart): a tunable change is written to disk and
+        // reported `RestartRequired` (the daemon derives its strategy fields once at construction —
+        // no hot-reload), leaving the in-memory roster untouched (a tunable is not a live adopt).
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]); // default poll_secs = 300
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::RestartRequired,
+            }
+        );
+        // The edit landed on disk (a restart picks it up)…
+        assert_eq!(
+            Config::load_path(&config_path).unwrap().tunables.poll_secs,
+            120
+        );
+        // …but the in-memory roster is untouched — a tunable change is NOT a live reconcile.
+        assert_eq!(daemon.roster[0].label, "work");
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_adopts_a_label_live_and_reconciles_the_roster() {
+        // AC (label edit → adopted LIVE): a non-credential label change is persisted AND reconciled
+        // into the in-memory roster within the same call (the SAME #139 core), so `status` reflects
+        // it without a restart — reported `Live`.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables::default(),
+                labels: BTreeMap::from([("u-A".to_owned(), "day-job".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Live,
+            }
+        );
+        // Adopted LIVE: the in-memory roster carries the new label (reconciled in-process)…
+        assert_eq!(daemon.roster[0].label, "day-job");
+        // …and it is persisted (a restart keeps it), keyed by the immutable uuid.
+        let on_disk = Config::load_path(&config_path).unwrap();
+        assert_eq!(on_disk.roster[0].account_uuid, "u-A");
+        assert_eq!(on_disk.roster[0].label, "day-job");
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_reports_unchanged_for_a_noop() {
+        // Submitting the CURRENT values (poll_secs 300 = the default the file carries, and no label
+        // edit) changes nothing → `Unchanged`, and nothing is rewritten.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(300),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::from([("u-A".to_owned(), "work".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Unchanged,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a no-op config-set rewrites nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_rejects_an_out_of_range_tunable_and_writes_nothing() {
+        // AC (range/cross-field violation → refused, ZERO writes): an out-of-range tunable fails the
+        // WHOLE-config revalidation → `Invalid` carrying the non-secret field-named `detail`, and
+        // the old file is left byte-for-byte intact.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    session_trigger: Some(200), // a usage percent > 100 is out of range
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+
+        match ack {
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::Invalid,
+                detail: Some(msg),
+            } => assert!(
+                !msg.is_empty(),
+                "the invalid reason names the offending field"
+            ),
+            other => panic!("expected an Invalid rejection with detail, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a rejected config-set writes nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_rejects_an_unknown_account_uuid_and_writes_nothing() {
+        // AC (stale label target → refused): a label edit naming a uuid no roster account has (a
+        // stale settings client — the account was `remove`d since its `config-get`) → `UnknownAccount`,
+        // ZERO writes.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables::default(),
+                labels: BTreeMap::from([("u-does-not-exist".to_owned(), "x".to_owned())]),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::UnknownAccount,
+                detail: None,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a rejected config-set writes nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_config_set_refuses_a_malformed_on_disk_config_and_writes_nothing() {
+        // AC (refuse rather than clobber — the safety half of the read path): if `config.toml` is
+        // hand-broken WHILE the daemon runs, a config-set refuses with `ConfigUnreadable` and leaves
+        // the unreadable file byte-for-byte intact — it never overwrites a file it cannot re-render.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        std::fs::write(&config_path, "this is not toml [[[").unwrap();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let mut daemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::new(),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::ConfigUnreadable,
+                detail: None,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a malformed config is refused, never clobbered",
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_routes_config_get_to_a_handoff_unauthenticated() {
+        use tokio::io::AsyncWriteExt;
+        // A `config-get` is a non-secret READ (tunables + redacted labels, like `status` / `stats`),
+        // so it is NOT auth-gated: even an unauthenticated peer gets the handoff to the spawned
+        // reader (the blocking `config.toml` read runs off the run loop, ADR-0001).
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"config-get\"}\n")
+            .await
+            .unwrap();
+        let _stream = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap()
+            .config_get();
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_unauthenticated_config_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // AC (peer-credential authN): a `config-set` is STATE-AFFECTING (it writes `config.toml`),
+        // so a non-owner peer is rejected BEFORE any handoff — the edit never reaches the run loop
+        // (`one_shot()` proves there is NO `ConfigSet` handoff) and the peer gets `unauthorized`.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"config-set\",\"tunables\":{\"poll_secs\":120}}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), false)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "an unauthenticated config-set must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.contains("unauthorized"), "got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_control_rejects_an_authenticated_config_set_with_a_forbidden_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // SAFETY (issue #268 structural boundary): even an AUTHENTICATED `config-set` carrying a
+        // forbidden top-level key — here a `credential` — is a hard `malformed request` via
+        // `ConfigSetRequest`'s `deny_unknown_fields`, with NO handoff. The credential/roster-structure
+        // boundary cannot be crossed through config-set: a forbidden key never reaches the run loop,
+        // so the daemon never even attempts to interpret it.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"config-set\",\"credential\":\"secret\"}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "a forbidden-key config-set must not hand off to the run loop",
+        );
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.contains("malformed"), "got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_control_hands_back_an_authenticated_config_set() {
+        use tokio::io::AsyncWriteExt;
+        // An AUTHENTICATED, well-formed `config-set` is NOT answered inline: like `swap` / `capture`,
+        // it hands the OPEN connection back (with the parsed edits) so the run loop applies them
+        // against `&mut Daemon` and writes the redacted ack from the REAL outcome.
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(
+                b"{\"cmd\":\"config-set\",\"tunables\":{\"poll_secs\":120},\"labels\":{\"u-A\":\"day-job\"}}\n",
+            )
+            .await
+            .unwrap();
+        let (_stream, command) = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+            .config_set();
+        assert_eq!(
+            command,
+            ConfigSetCommand {
+                tunables: SetTunables {
+                    poll_secs: Some(120),
+                    ..SetTunables::default()
+                },
+                labels: BTreeMap::from([("u-A".to_owned(), "day-job".to_owned())]),
+            }
+        );
+    }
+
+    #[test]
+    fn config_get_reply_maps_read_outcomes_to_non_secret_envelopes() {
+        // The `config-get` read path: a valid file → a serialized `ConfigView` (tunables + redacted
+        // roster), an absent file → `{"error":"no config"}`, a malformed one → `{"error":"config
+        // unreadable"}` — never a leak, never a panic.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+
+        // Absent → a `no config` envelope (nothing captured yet).
+        assert!(config_get_reply(&config_path).contains("no config"));
+
+        // Valid → a `ConfigView` naming the redacted account handle, decodable by the client.
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let reply = config_get_reply(&config_path);
+        let view: crate::config::ConfigView = serde_json::from_str(&reply).unwrap();
+        assert_eq!(view.accounts.len(), 1);
+        assert_eq!(view.accounts[0].account_uuid, "u-A");
+        assert_eq!(view.accounts[0].label, "work");
+
+        // Malformed → a `config unreadable` envelope (refuse rather than guess).
+        std::fs::write(&config_path, "this is not toml [[[").unwrap();
+        assert!(config_get_reply(&config_path).contains("config unreadable"));
+    }
+
+    #[test]
+    fn config_set_ack_serializes_to_the_non_secret_wire_shape() {
+        // The ack the settings client decodes (issue #268): an internally-tagged `result`, a
+        // snake_case `effect` on success, a kebab-case `reason` on refusal, and `detail` OMITTED when
+        // absent — non-secret by construction (#15). Round-trips so the client reads back what the
+        // daemon wrote.
+        let applied = ConfigSetAck::Applied {
+            effect: ConfigSetEffect::RestartRequired,
+        };
+        let wire = serde_json::to_string(&applied).unwrap();
+        assert_eq!(wire, r#"{"result":"applied","effect":"restart_required"}"#);
+        assert_eq!(
+            serde_json::from_str::<ConfigSetAck>(&wire).unwrap(),
+            applied
+        );
+
+        let invalid = ConfigSetAck::Rejected {
+            reason: ConfigSetRejection::Invalid,
+            detail: Some("poll_secs must be in 60..=600".to_owned()),
+        };
+        let wire = serde_json::to_string(&invalid).unwrap();
+        assert!(wire.contains(r#""result":"rejected""#), "got {wire}");
+        assert!(wire.contains(r#""reason":"invalid""#), "got {wire}");
+        assert!(
+            wire.contains(r#""detail":"poll_secs must be in 60..=600""#),
+            "got {wire}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ConfigSetAck>(&wire).unwrap(),
+            invalid
+        );
+
+        // A reason WITHOUT detail omits the key entirely (no `"detail":null` noise).
+        let no_config = ConfigSetAck::Rejected {
+            reason: ConfigSetRejection::NoConfig,
+            detail: None,
+        };
+        let wire = serde_json::to_string(&no_config).unwrap();
+        assert_eq!(wire, r#"{"result":"rejected","reason":"no-config"}"#);
+        assert_eq!(
+            serde_json::from_str::<ConfigSetAck>(&wire).unwrap(),
+            no_config
+        );
+    }
+
     // --- next_swap candidate (issue #88) + swap report ---------------------
 
     #[test]
@@ -10923,7 +16040,7 @@ mod tests {
             "got {json}"
         );
         // #15: a label only — never an email or token sigil.
-        assert!(!json.contains('@'));
+        assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
         assert!(!json.to_lowercase().contains("token"));
 
         // The two no-candidate verdicts project without a label, so the client can tell
@@ -11013,6 +16130,192 @@ mod tests {
     }
 
     #[test]
+    fn a_blind_active_account_serializes_its_projection_and_a_normal_one_omits_it() {
+        // Issue #479: `blind_active` rides the wire as an additive OPTIONAL field — present (with its
+        // three sub-fields) for a blind active account, OMITTED (`skip_serializing_if`) for a
+        // non-blind one, so a non-blind frame's per-line bytes stay unchanged across the 1.3 → 1.4
+        // minor bump. Round-trips back to the same projection.
+        let snapshot = StatusSnapshot {
+            generated_at: 42,
+            accounts: vec![
+                AccountReading {
+                    label: "work".to_owned(),
+                    active: true,
+                    blind_active: Some(BlindActive {
+                        blind_secs: 480,
+                        last_known_session_pct: 87,
+                        auto_protection_degraded: true,
+                    }),
+                    ..Default::default()
+                },
+                AccountReading {
+                    label: "spare".to_owned(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(
+            json.contains(
+                r#""blind_active":{"blind_secs":480,"last_known_session_pct":87,"auto_protection_degraded":true}"#
+            ),
+            "the blind active account carries its projection on the wire: {json}",
+        );
+        // The non-blind peer omits the field entirely (`skip_serializing_if`).
+        let spare_tail = json.split(r#""label":"spare""#).nth(1).unwrap();
+        assert!(
+            !spare_tail.contains("blind_active"),
+            "a non-blind account omits `blind_active` from the wire: {json}",
+        );
+        // Round-trip: the projection decodes back unchanged (a current client reads it).
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        let work = parsed.accounts.iter().find(|a| a.active).unwrap();
+        assert_eq!(
+            work.blind_active,
+            Some(BlindActive {
+                blind_secs: 480,
+                last_known_session_pct: 87,
+                auto_protection_degraded: true,
+            }),
+        );
+        assert!(
+            parsed
+                .accounts
+                .iter()
+                .find(|a| !a.active)
+                .unwrap()
+                .blind_active
+                .is_none(),
+            "the omitted field decodes back to None (serde default)",
+        );
+    }
+
+    #[test]
+    fn canonical_scrub_rides_the_wire_as_an_additive_rollup_and_a_healthy_snapshot_omits_it() {
+        // Issue #516 / schema 1.4 → 1.5: the daemon-level `canonical_scrub` rollup rides the wire as
+        // an additive OPTIONAL field — present as a `{"state":…}` discriminant while the shared
+        // canonical is scrubbed, OMITTED (`skip_serializing_if`) when healthy, so a non-scrub frame's
+        // bytes stay unchanged (mirroring `blind_active`). Round-trips back to the same rollup, and
+        // carries a bare STATE discriminant only — never a token or email (#15).
+        for (scrub, wire) in [
+            (
+                CanonicalScrub::Recovering,
+                r#""canonical_scrub":{"state":"recovering"}"#,
+            ),
+            (
+                CanonicalScrub::Exhausted,
+                r#""canonical_scrub":{"state":"exhausted"}"#,
+            ),
+        ] {
+            let snapshot = StatusSnapshot {
+                canonical_scrub: Some(scrub),
+                accounts: vec![AccountReading {
+                    label: "work".to_owned(),
+                    active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+            assert!(
+                json.contains(wire),
+                "the scrub rollup rides the wire: {json}"
+            );
+            // #15: a bare state discriminant — never an email or token sigil. Non-vacuous: the label
+            // "work" reaches the scanned corpus (a real handle rode the wire), so the clean verdict
+            // is not vacuously true on an empty payload.
+            assert!(json.contains("\"label\":\"work\""), "got {json}");
+            assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
+            assert!(!json.to_lowercase().contains("token"));
+            // Round-trip: the rollup decodes back unchanged (a current client reads it).
+            let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.canonical_scrub, Some(scrub));
+        }
+
+        // A HEALTHY snapshot omits the field ENTIRELY (`skip_serializing_if`), so its bytes are
+        // byte-for-byte unchanged across the additive minor bump — the property the golden pins.
+        let healthy = StatusSnapshot {
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&healthy)).unwrap();
+        assert!(
+            !json.contains("canonical_scrub"),
+            "a healthy snapshot omits the field: {json}"
+        );
+        // …and the omitted field decodes back to None (serde default) — a current client reads a
+        // pre-#516 / healthy frame as "no scrub".
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.canonical_scrub.is_none());
+    }
+
+    #[test]
+    fn keychain_locked_rides_the_wire_as_an_additive_flag_and_an_unlocked_snapshot_omits_it() {
+        // Issue #498 / schema 1.5 → 1.6: the daemon-level `keychain_locked` flag rides the wire as an
+        // additive OPTIONAL field — present as `"keychain_locked":true` while the login keychain is
+        // LOCKED (the shared credential is UNREADABLE), OMITTED (`skip_serializing_if`) when unlocked,
+        // so a non-locked frame's bytes stay unchanged (mirroring `canonical_scrub`). Round-trips back
+        // to the same flag, and carries a bare BINARY state discriminant only — never a token or email
+        // (#15). Distinct from `canonical_scrub`: an UNREADABLE item (keychain locked) vs a readable-
+        // but-scrubbed one.
+        let snapshot = StatusSnapshot {
+            keychain_locked: true,
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(
+            json.contains(r#""keychain_locked":true"#),
+            "the keychain-locked flag rides the wire: {json}"
+        );
+        // #15: a bare boolean discriminant — never an email or token sigil. Non-vacuous: the label
+        // "work" reaches the scanned corpus (a real handle rode the wire), so the clean verdict is
+        // not vacuously true on an empty payload.
+        assert!(json.contains("\"label\":\"work\""), "got {json}");
+        assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
+        assert!(!json.to_lowercase().contains("token"));
+        // Round-trip: the flag decodes back unchanged (a current client reads it).
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.keychain_locked);
+
+        // An UNLOCKED snapshot omits the field ENTIRELY (`skip_serializing_if`), so its bytes are
+        // byte-for-byte unchanged across the additive minor bump — the property the golden pins.
+        let unlocked = StatusSnapshot {
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&unlocked)).unwrap();
+        assert!(
+            !json.contains("keychain_locked"),
+            "an unlocked snapshot omits the field: {json}"
+        );
+        // …and the omitted field decodes back to `false` (serde default) — a current client reads an
+        // unlocked frame as "not locked".
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.keychain_locked);
+
+        // Explicit forward/back-compat: a pre-#498 (schema 1.5) frame that never carried the key
+        // decodes to `false` — the `#[serde(default)]` tolerate-by-ignoring contract a current client
+        // relies on (mirrors the Swift `decodeIfPresent(Bool.self) ?? false` path).
+        let pre_498 = r#"{"accounts":[],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":null}"#;
+        let parsed: StatusResponse = serde_json::from_str(pre_498).unwrap();
+        assert!(!parsed.keychain_locked);
+    }
+
+    #[test]
     fn the_status_wire_is_flat_and_carries_the_frozen_meta() {
         // AC-1: the snapshot carries `schema_version` + `generated_at`, and the payload stays
         // FLAT at the top level (the settled #137–#143 shape, only prefixed with the two meta
@@ -11027,7 +16330,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":3}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":7}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -11064,6 +16367,9 @@ mod tests {
         // backward-compat guarantee the flatten design rests on.
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 1_782_777_600,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -11155,7 +16461,10 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
-        assert!(!json.contains('@'), "got {json}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "got {json}"
+        );
         assert!(!json.to_lowercase().contains("token"), "got {json}");
     }
 
@@ -11187,7 +16496,7 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
-        let tun = tunables(95, 80, 0); // target-max-usage 0.80
+        let tun = tunables(95, 80, 0); // target-max-session-usage 0.80
         let mut daemon: FakeDaemon = Daemon::new(
             roster,
             FakeRosterPoller::new(),
@@ -11249,6 +16558,9 @@ mod tests {
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -11291,6 +16603,12 @@ mod tests {
         assert_eq!(
             swap_report(&outcome(TickAction::EmergencySwapped { from: 0, to: 1 })).as_deref(),
             Some("emergency-swapped off work onto spare (dead credential)"),
+        );
+        // #467: the autonomous scrubbed-canonical recovery echoes too, named distinctly so the
+        // operator sees the daemon self-healed the shared item back onto a live account.
+        assert_eq!(
+            swap_report(&outcome(TickAction::CanonicalAdopted { to: 1 })).as_deref(),
+            Some("recovered scrubbed canonical onto spare (was Not-logged-in)"),
         );
         assert_eq!(swap_report(&outcome(TickAction::Held)), None);
         assert_eq!(swap_report(&outcome(TickAction::SkippedCooldown)), None);
@@ -11386,7 +16704,7 @@ mod tests {
     async fn next_swap_classifies_the_candidate_from_the_readings() {
         // The daemon-side candidate (#88) IS `pick_target` mapped to a label, plus the
         // two no-candidate verdicts the wire must distinguish. Reuses the 3-account
-        // harness (work=0, spare=1, backup=2; target_max_usage 0.80, weekly_trigger_base
+        // harness (work=0, spare=1, backup=2; target_max_session_usage 0.80, weekly_trigger_base
         // 0.98). This pins the projection/classification wrapper — `pick_target`'s own
         // selection logic is covered by its dedicated suite above.
         let daemon = three_account_daemon(FakeRosterPoller::new()).await;
@@ -11416,7 +16734,7 @@ mod tests {
             }),
         );
 
-        // Readings in hand but none viable (both over the 0.80 target-max-usage) → a
+        // Readings in hand but none viable (both over the 0.80 target-max-session-usage) → a
         // genuine no-viable-target verdict, NOT awaiting-data. Both spares are weekly-VIABLE
         // (0.10 < 0.98) yet over the session ceiling (`min(0.95, 0.80)` = 0.80), so the fleet
         // is blocked only by SESSION — the footer relief carries `Session` (issue #405). No
@@ -11707,8 +17025,8 @@ mod tests {
         );
         // #15: the wire ack leaks neither the credential (named `*-token`) nor an email.
         assert!(
-            !reply.contains('@'),
-            "the ack wire leaks no email: {reply:?}"
+            crate::redaction::meter::unauthored_emails(&reply, &[]).is_empty(),
+            "the ack wire leaks no non-authored email (#15/#444): {reply:?}"
         );
         assert!(
             !reply.to_lowercase().contains("token"),
@@ -11811,8 +17129,8 @@ mod tests {
         );
         // #15: the wire ack leaks neither the credential (named `*-token`) nor an email.
         assert!(
-            !reply.contains('@'),
-            "the ack wire leaks no email: {reply:?}"
+            crate::redaction::meter::unauthored_emails(&reply, &[]).is_empty(),
+            "the ack wire leaks no non-authored email (#15/#444): {reply:?}"
         );
         assert!(
             !reply.to_lowercase().contains("token"),
@@ -13239,7 +18557,10 @@ mod tests {
             "spare verified healthy once polled after the swap (#137): {logged:?}"
         );
         assert!(logged.starts_with("ts="), "stamped: {logged:?}");
-        assert!(!logged.contains('@'), "no email: {logged:?}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty(),
+            "no non-authored email (#15/#444): {logged:?}"
+        );
     }
 
     #[tokio::test]
@@ -13430,7 +18751,10 @@ mod tests {
             logged.lines().all(|l| l.starts_with("ts=")),
             "stamped: {logged:?}"
         );
-        assert!(!logged.contains('@'), "no email: {logged:?}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty(),
+            "no non-authored email (#15/#444): {logged:?}"
+        );
 
         // The 401 streak is per-occurrence and climbs across ticks.
         assert!(
@@ -14319,7 +19643,10 @@ mod tests {
                 calls: calls.clone(),
             }),
             Duration::from_secs(3600),
-        );
+        )
+        // Issue #468: opt the proactive path IN for the seam tests (default is off) so the
+        // existing proactive assertions still exercise it; the new gate test overrides to `false`.
+        .with_proactive_keep_warm(true);
         (daemon, outcomes, calls)
     }
 
@@ -14594,6 +19921,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_proactive_promote_reconciles_the_rollup_expiry_to_the_fresh_canonical() {
+        // Issue #477 (AC-1 / AC-3): after a proactive keep-warm PROMOTES a fresh token to the
+        // canonical, the rollup's staleness input (`access_expires_at`) must reflect that fresh
+        // canonical — NOT the un-restashed stash the keep-warm deliberately leaves behind
+        // (`refreshed_not_restashed`). The 2026-07-11 forensic case: a fresh canonical (7+ h to
+        // expiry) beside an EXPIRED stash false-fired `stale`, because the rollup judged staleness
+        // off the stale stash-sourced expiry the parked sweep last folded (the active account is
+        // excluded from that sweep, so the field froze there and keep-warm never bumped it).
+        let now_ms = 1_800_000_000_000;
+        let now_secs = now_ms / 1000;
+        // Active canonical 60 s from expiry → inside the near-expiry horizon, so the mint fires.
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live");
+        // The promoted token is fresh: 7 h to expiry (the observed case).
+        let fresh_expiry_ms = now_ms + 7 * 3_600_000;
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(warm_canonical(fresh_expiry_ms, "rt-live")),
+            canonical.clone(),
+        )
+        .await;
+        // The un-restashed stash the parked sweep last folded is already EXPIRED — the
+        // false-staleness source the keep-warm leaves behind.
+        daemon.state.health[0].access_expires_at = Some(now_secs - 100);
+
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the near-expiry active token is minted proactively"
+        );
+        // The fresh token reached the canonical the live sessions read…
+        assert_eq!(
+            crate::refresh::expires_at(daemon.store.read().await.unwrap().expose()),
+            Some(fresh_expiry_ms),
+            "the fresh token is promoted to the canonical item",
+        );
+        // …and the rollup's staleness input is reconciled to it (the #477 fix). Before the fix this
+        // stayed pinned to the expired stash → a false `stale`.
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(fresh_expiry_ms / 1000),
+            "the rollup expiry reflects the promoted canonical, not the stale stash",
+        );
+        // The verdict is judged off the fresh canonical → NOT `stale`. `has_fresh_reading = false`
+        // isolates the expiry-driven verdict: it proves the FIX (not a masking fresh poll) cleared
+        // the false stale — the Stale branch precedes the Healthy branch, so a stale expiry would
+        // still read `stale` here regardless of a fresh reading.
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                now_secs,
+            ),
+            CredentialHealth::Healthy,
+            "a fresh promoted canonical reads healthy, not a false stale",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_promote_keep_warm_leaves_a_genuinely_stale_canonical_stale() {
+        // Issue #477 (AC-2): the #477 reconcile bumps `access_expires_at` ONLY on a real promote. A
+        // genuinely dead / server-rejected canonical (an empty refresh token CC cannot exchange)
+        // never mints and never promotes, so the stale expiry is preserved and the account still
+        // reads `stale` — the real signal #464/#465 depend on is not lost.
+        let now_ms = 1_800_000_000_000;
+        let now_secs = now_ms / 1000;
+        // Near expiry (inside the horizon) but a DEAD (empty) refresh token → `has_live_refresh_token`
+        // false → no mint, no promote (the invariant-4 case the keep-warm must not try to revive).
+        let canonical = warm_canonical(now_ms + 60_000, "");
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(warm_canonical(now_ms + 7 * 3_600_000, "rt-live")),
+            canonical.clone(),
+        )
+        .await;
+        // A genuinely expired canonical expiry.
+        daemon.state.health[0].access_expires_at = Some(now_secs - 100);
+
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(calls.get(), 0, "a dead refresh token is never minted");
+        // The stale expiry is UNTOUCHED — the reconcile only fires on a real promote.
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(now_secs - 100),
+            "no promote → the rollup expiry is not bumped",
+        );
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                now_secs,
+            ),
+            CredentialHealth::Stale,
+            "a genuinely stale / rejected canonical still reads stale",
+        );
+    }
+
+    #[tokio::test]
     async fn the_proactive_path_skips_far_from_expiry_and_when_quarantined() {
         // AC-1 (negative) / no storm: a token far from expiry is NOT minted (nothing to warm yet),
         // and a quarantined active account is never re-warmed (the #42 streak owns it).
@@ -14627,6 +20072,63 @@ mod tests {
             "a quarantined active account is never re-warmed"
         );
         assert!(events.is_empty(), "no mint → no event");
+    }
+
+    #[tokio::test]
+    async fn proactive_keep_warm_gated_off_is_inert_but_the_reactive_backstop_still_fires() {
+        // Issue #468 / finding #476 predicate C. With `proactive_keep_warm = false` (the production
+        // DEFAULT) the proactive path is INERT even for a near-expiry active token — the pre-emptive
+        // live-canonical mint (~44 % of daemon canonical churn, #476) no longer fires, so the shared
+        // token is not rotated pre-emptively. The REACTIVE backstop is a SEPARATE consumer of the
+        // same seam and is UNAFFECTED: an active 401 still routes to `should_keep_warm_retry`, so the
+        // active token is kept warm exactly when a session needs it (predicate C leans on this + the
+        // #467 autonomous adopt-target for the residual scrub window).
+        let now_ms = 1_800_000_000_000;
+        // 60 s to expiry — INSIDE the near-expiry horizon, so ONLY the #468 gate can suppress the
+        // mint (isolating this gate from the far-from-expiry / quarantine / throttle gates).
+        let canonical = warm_canonical(now_ms + 60_000, "rt-live");
+        let (daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            canonical.clone(),
+        )
+        .await;
+        // The seam-test helper opts proactive IN; override back to the production default (OFF).
+        let mut daemon = daemon.with_proactive_keep_warm(false);
+
+        let mut events = Vec::new();
+        daemon
+            .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
+            .await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "proactive gated off → a near-expiry active token is NOT pre-emptively minted",
+        );
+        assert!(
+            events.is_empty(),
+            "no proactive mint → no keep_warm event: {events:?}",
+        );
+        assert!(
+            daemon.state.health[0].last_keep_warm_attempt.is_none(),
+            "no mint attempted → the proactive throttle stamp is untouched",
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            canonical.expose(),
+            "proactive gated off → the shared canonical token is left un-rotated (#468 AC-1)",
+        );
+
+        // #468 AC-3: the REACTIVE backstop keys off the seam alone, NOT the proactive flag — an active
+        // 401 still triggers keep-warm, so active-expiry mid-use is still prevented.
+        daemon.state.active = Some(0);
+        assert!(
+            daemon.should_keep_warm_retry(0, &Err(Error::UsageUnauthorized)),
+            "the reactive backstop is unaffected by the proactive #468 gate",
+        );
     }
 
     #[tokio::test]
@@ -14975,7 +20477,7 @@ mod tests {
 
     #[tokio::test]
     async fn emergency_swap_escapes_a_dead_active_ignoring_the_floor() {
-        // #398 atomicity: the emergency path drops the target-max-usage reserve. A
+        // #398 atomicity: the emergency path drops the target-max-session-usage reserve. A
         // confirmed-dead ACTIVE account must escape to the ONLY live target even when
         // that target sits OVER the default-on floor (0.80) — liveness beats the
         // reserve. Without the floor-drop (emergency passes `None`, not the configured
@@ -15387,7 +20889,10 @@ mod tests {
         let json = serde_json::to_string(&status_response(&outcome.snapshot)).unwrap();
         assert!(json.contains(r#""quarantined":true"#), "got {json}");
         assert!(json.contains(r#""recovering":false"#), "got {json}");
-        assert!(!json.contains('@'), "no email on the wire: {json}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "no non-authored email on the wire (#15/#444): {json}"
+        );
         assert!(!json.to_lowercase().contains("token"));
     }
 
@@ -15430,7 +20935,10 @@ mod tests {
         // The wire carries the derived flag but never a secret.
         let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
         assert!(json.contains(r#""recovering":true"#), "got {json}");
-        assert!(!json.contains('@'), "no email on the wire: {json}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&json, &[]).is_empty(),
+            "no non-authored email on the wire (#15/#444): {json}"
+        );
         assert!(!json.to_lowercase().contains("token"));
     }
 
@@ -15776,8 +21284,8 @@ mod tests {
             Error::RosterEmpty,
             Error::ConfigParse("expected `=` at line 3".to_owned()),
             Error::ConfigInvalid("session_trigger must be in 50..=99, got 120".to_owned()),
-            Error::ConfigTargetMaxAboveTrigger {
-                target_max_usage: 95,
+            Error::ConfigTargetMaxSessionAboveTrigger {
+                target_max_session_usage: 95,
                 trigger: 90,
             },
             Error::ClaudeStateNotFound {
@@ -15977,7 +21485,7 @@ mod tests {
             &Diagnostic::Start {
                 accounts: 3,
                 poll_secs: 30,
-                target_max_usage: 70,
+                target_max_session_usage: 70,
                 session_trigger: 90,
                 weekly_trigger: 98,
                 monitor_401_n: 5,
@@ -16301,7 +21809,70 @@ mod tests {
         // The METER: no token prefix, no known token, no blob fingerprint (leading
         // bytes or sha256), no email shape, and no high-entropy run — on ANY of the
         // channels above.
-        assert_clean(&corpus, &secrets);
+        assert_clean(&corpus, &secrets, &[]);
+    }
+
+    #[tokio::test]
+    async fn redaction_meter_permits_an_operator_authored_email_label_across_channels() {
+        use crate::redaction::meter::{assert_clean, scan, Finding, Secrets};
+        // #444: the operator may label an account with their OWN email. That authored
+        // label legitimately reaches EVERY operator-facing channel (the event log, the
+        // `status` render — colored and not —, the UDS wire, the swap echo). The METER
+        // must PERMIT it there — while STILL failing on the credential-read email, which
+        // is never a label. Proves the relaxation is uniform (no panel/CLI divergence)
+        // AND provenance-scoped: the allow-set is the capture-input label, never the
+        // credential-read email.
+        let secrets = Secrets::meter_fixture();
+        const EMAIL_LABEL: &str = "me@my-own.example"; // the operator's own choice (capture-input)
+        const A: (&str, &str) = ("11111111-1111-1111-1111-111111111111", EMAIL_LABEL);
+        const B: (&str, &str) = ("22222222-2222-2222-2222-222222222222", "spare");
+
+        let poller = FakeRosterPoller::new()
+            .ok(A.0, 0.97, 0.40) // active, over the session trigger
+            .ok(B.0, 0.10, 0.20); // the viable target
+        let tun = tunables(95, 80, 0);
+        let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+
+        let mut corpus = String::new();
+        harvest_channels(&outcome, &mut corpus);
+
+        // The authored email label DID reach a channel (else the test is vacuous).
+        assert!(
+            corpus.contains(EMAIL_LABEL),
+            "the authored email label reached an operator-facing channel: {corpus}"
+        );
+        // The credential-read email is seeded into the stashes + `~/.claude.json` only —
+        // it must NEVER surface on a harvested channel (#444 AC2).
+        assert!(
+            !corpus.contains(secrets.email()),
+            "the credential-read email must not leak onto any channel"
+        );
+
+        // With the label in the capture-input allow-set, the METER PASSES — the
+        // relaxation applies uniformly to EVERY channel the corpus spans.
+        assert_clean(&corpus, &secrets, &[EMAIL_LABEL]);
+        // Provenance seam: the label classifies as a permitted KnownEmail, never leak.
+        let findings = scan(&corpus, &secrets, &[EMAIL_LABEL]);
+        assert!(
+            findings.iter().any(|f| matches!(f, Finding::KnownEmail)),
+            "the authored label classifies as a permitted KnownEmail: {findings:#?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::EmailShape { .. })),
+            "no unauthored email shape on any channel: {findings:#?}"
+        );
+        // Divergence guard: WITHOUT authoring it, the SAME corpus fails — proving it is
+        // the allow-set (not an accident of the fixture) that permits the label.
+        assert!(
+            scan(&corpus, &secrets, &[])
+                .iter()
+                .any(|f| matches!(f, Finding::EmailShape { matched } if matched == EMAIL_LABEL)),
+            "an un-authored email label is a leak on the strict scan"
+        );
     }
 
     /// The 0.1.0 "done-when" acceptance, driven end-to-end through the four seams
@@ -16541,7 +22112,7 @@ mod tests {
         // The METER gate (#15): no token prefix, known token, blob fingerprint (leading
         // bytes or sha256), email shape, or high-entropy run leaked onto ANY channel
         // across the whole acceptance loop.
-        assert_clean(&corpus, &secrets);
+        assert_clean(&corpus, &secrets, &[]);
     }
 
     // --- Usage-sample collector (issue #156) ------------------------------
@@ -16577,13 +22148,61 @@ mod tests {
         assert_eq!(s.severity.as_deref(), Some("critical"), "severity retained");
         assert_eq!(s.spend, None, "no spend producer yet (forward slot)");
 
-        // Redaction: the persisted line carries no email/token shape (issue #15).
+        // Redaction: a handle fixture carries no email at all — with an empty
+        // allow-set that is the strict bar (any `@`-shape would be UNAUTHORED and
+        // fail), now in the provenance vocabulary rather than a blanket no-`@`
+        // (issue #15, relaxed provenance-scoped by #444/#447).
         let raw = std::fs::read_to_string(&samples_path).unwrap();
-        assert!(!raw.contains('@'), "no email may reach the store: {raw}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&raw, &[]).is_empty(),
+            "no unauthored email may reach the store: {raw}"
+        );
         assert!(
             !raw.contains("sk-ant"),
             "no token may reach the store: {raw}"
         );
+    }
+
+    /// #447: an operator-authored email label flows through the collector into the
+    /// store verbatim (`append_sample_for_poll` copies the roster label into
+    /// `Sample.acct`) and is PERMITTED under the provenance-scoped waiver — while a
+    /// stray unauthored email would still fail. Companion to the handle-fixture case
+    /// above; guards that the store bar tracks the label's provenance, not the mere
+    /// presence of an `@`.
+    #[test]
+    fn collector_carries_an_operator_authored_email_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: 0.42,
+                weekly: 0.88,
+                weekly_resets_at: Some(1_700_600_000),
+                session_resets_at: Some(1_700_003_600),
+            },
+            severity: Some("critical".to_owned()),
+        });
+        let authored = "alice@example.com";
+
+        append_sample_for_poll(&samples_path, authored, &reading, 1_700_000_000);
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(samples[0].acct, authored, "the authored label, verbatim");
+
+        let raw = std::fs::read_to_string(&samples_path).unwrap();
+        // Permitted WHEN authored…
+        assert!(
+            crate::redaction::meter::unauthored_emails(&raw, &[authored]).is_empty(),
+            "an operator-authored email label is permitted: {raw}"
+        );
+        // …but the very same bytes surface as a leak WITHOUT the provenance allow-set
+        // (the assertion is not vacuous).
+        assert_eq!(
+            crate::redaction::meter::unauthored_emails(&raw, &[]),
+            vec![authored.to_owned()],
+            "without provenance the label reads as an unauthored email: {raw}"
+        );
+        assert!(!raw.contains("sk-ant"), "no token: {raw}");
     }
 
     /// A reading whose optional `severity` is absent still yields a valid sample
@@ -16831,7 +22450,10 @@ mod tests {
         // NO PII on the rendered gap line — handle + timestamp only.
         let line = e3[0].to_log_line(std::time::UNIX_EPOCH);
         assert!(line.contains("event=usage_gap acct=work"), "got: {line}");
-        assert!(!line.contains('@'), "no email: {line}");
+        assert!(
+            crate::redaction::meter::unauthored_emails(&line, &[]).is_empty(),
+            "no non-authored email (#15/#444): {line}"
+        );
         assert!(!line.contains("sk-ant"), "no token: {line}");
     }
 

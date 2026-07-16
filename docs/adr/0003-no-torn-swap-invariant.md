@@ -86,7 +86,10 @@ four mechanisms, not one:
   in-flight request is unaffected and the next request picks up the incoming account.
   Proven in CI by the `tests::mid_turn_live` oracle — a concurrent reader re-reading
   across a forced swap sees outgoing, then incoming, and never anything between; the
-  assertions fail on an absent or torn read.
+  assertions fail on a torn read or a *reproducibly*-absent item — a real
+  delete-then-add recurs on every swap, whereas a lone `CredentialNotFound` is
+  the file-keychain's benign cross-process artifact, not the forbidden window
+  (issue #457).
 - The keychain token is the single **authoritative bearer**, so the best-effort
   display co-write (`oauthAccount`) may be clobbered and simply self-heals on the next
   reconcile (last-writer-wins) — the invariant does not depend on it.

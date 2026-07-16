@@ -89,4 +89,36 @@ final class WireGoldenTests: XCTestCase {
                 + "this fixture in lockstep"
         )
     }
+
+    /// The `canonical_scrub` = exhausted frame carrying the #516 daemon-level rollup: the Swift
+    /// `snapshotCanonicalScrubExhausted` fixture must be byte-identical to the Rust-emitted
+    /// `wire-snapshot-canonical-scrub.json` golden — this is what puts the `CanonicalScrub` discriminant
+    /// under the cross-language byte-drift guard (the basic golden omits `canonical_scrub` when healthy,
+    /// so it never exercises the rollup encoder/mirror).
+    func testCanonicalScrubFixtureMatchesRustGolden() throws {
+        XCTAssertEqual(
+            Fixtures.snapshotCanonicalScrubExhausted,
+            try golden("wire-snapshot-canonical-scrub.json"),
+            "snapshotCanonicalScrubExhausted drifted from the Rust wire golden — the daemon's "
+                + "canonical_scrub rollup wire type changed; regenerate the golden (cargo test -- "
+                + "--ignored emit_wire_golden_fixtures) and update the Swift mirror "
+                + "(Sources/WireModel.swift) + this fixture in lockstep"
+        )
+    }
+
+    /// The daemon `stats` socket reply (issue #356): the Swift `statsBasic` fixture must be
+    /// byte-identical to the Rust-emitted `wire-stats-basic.json` golden — this is what puts
+    /// `StatsWire` (the bounded per-account daily series the Stats tab reads) under the
+    /// cross-language byte-drift guard. Emitted + pinned Rust-side in `src/stats.rs`
+    /// (`emit_wire_stats_golden_fixture` / `the_committed_stats_wire_golden_still_matches_the_socket_encoder`).
+    func testStatsFixtureMatchesRustGolden() throws {
+        XCTAssertEqual(
+            Fixtures.statsBasic,
+            try golden("wire-stats-basic.json"),
+            "statsBasic drifted from the Rust wire golden — the daemon's StatsWire type changed; "
+                + "regenerate the golden (cargo test -- --ignored emit_wire_stats_golden_fixture) and "
+                + "update this fixture (and, once it exists, the Sources/WireModel.swift stats decoder "
+                + "landing with #446) in lockstep"
+        )
+    }
 }
