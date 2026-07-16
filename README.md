@@ -1016,6 +1016,29 @@ cargo build --release
 ./target/release/sessiometer --help
 ```
 
+### Install with Homebrew (CLI / headless channel)
+
+The [`Formula/sessiometer.rb`](Formula/sessiometer.rb) Homebrew formula builds the
+crate from source and installs the `sessiometer` CLI + daemon — the headless,
+scripting channel for terminal and automation use. It is locally compiled, with no
+notarization or code-signing; those belong to the parallel GUI channel — the notarized
+`.app` (#171: sign + notarize + staple) delivered as a Homebrew cask (#172), not yet
+shipped. This channel is off that critical path.
+
+The crate is still pre-release (no tagged release yet), so install the formula from
+`HEAD` (the `main` branch):
+
+```sh
+brew install --HEAD --build-from-source ./Formula/sessiometer.rb
+```
+
+That compiles the crate at the repo root — with the committed `Cargo.lock`, via
+`--locked`, for a reproducible build — and puts `sessiometer` on your `PATH`. From
+there the swap/monitor loop runs headless: `sessiometer run` for a foreground daemon,
+or `sessiometer service install` to keep one running at login (see
+[Quickstart](#quickstart)). Once a stable release is tagged, the formula gains a
+`url` + `sha256` stanza and also installs without `--HEAD`.
+
 The macOS menu-bar app lives in [`apps/menubar/`](apps/menubar/) — a Swift/XcodeGen
 sibling to the Rust crate at the repo root, not a Cargo workspace member (see
 [ADR-0010](docs/adr/0010-macos-app-repo-topology.md)).
