@@ -30,6 +30,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: StatusItemController?
     private var transport: WatchTransport?
     private var accountEventNotifier: AccountEventNotifier?
+    /// The Settings window's app-retained controller (issue #268) — one titled window reused across opens,
+    /// opened from the status item's secondary-click menu. Held here so it (and its `SettingsModel`) outlive
+    /// each open/close cycle.
+    private var settingsWindowController: SettingsWindowController?
     #if DEBUG
     /// Retains the debug glyph-gallery status items (the issue #437 `SESSIOMETER_GLYPH_GALLERY` harness) so
     /// they are not deallocated while the gallery-only app runs; empty in normal operation.
@@ -129,6 +133,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statsClient = nil
         }
 
+        // The Settings window's config read/write path (issue #268): the SAME short-lived control-command
+        // transport for the one-shot config-get / config-set exchanges. A 5 s budget — config-set validates
+        // + atomically writes config.toml off the daemon's run loop (no swap.lock), clearing a slower disk
+        // write without the swap path's 15 s lock headroom. A resolve failure degrades to a nil client → the
+        // Settings window shows an honest "not connected" and never writes config locally (AC 7).
+        let configClient: ControlCommandClient?
+        switch ControlCommandClient.production(timeout: .seconds(5)) {
+        case .success(let client):
+            configClient = client
+        case .failure(let error):
+            appLog.error("config client unavailable: \(String(describing: error), privacy: .public)")
+            configClient = nil
+        }
+
         let controller = StatusItemController(store: store,
                                               captureClient: captureClient,
                                               swapClient: swapClient,
@@ -136,16 +154,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.start()
         statusItemController = controller
 
+        // Notification preference + presenter — ONE source of truth shared by the #267 notifier below and
+        // the #268 Settings toggle, so the toggle and the live notifier never drift (both bind the same
+        // UserDefaults key) and the presenter's OS-authorization request is issued from one place.
+        let notificationPreferences = NotificationPreferences()
+        let notificationPresenter = UserNotificationPresenter()
+
+        // The Settings window (issue #268): an app-retained controller owning one titled window over the
+        // daemon config + the notification toggle, opened from the status item's secondary-click menu via the
+        // injected `onOpenSettings` seam. Enabling the toggle asks the shared presenter for OS authorization.
+        let settingsModel = SettingsModel(
+            client: configClient,
+            preferences: notificationPreferences,
+            onRequestAuthorization: { notificationPresenter.requestAuthorization() })
+        let settingsController = SettingsWindowController(model: settingsModel)
+        self.settingsWindowController = settingsController
+        controller.onOpenSettings = { [weak settingsController] in settingsController?.show() }
+
         // Native swap / all-accounts-exhausted notifications (issue #267, REQ-MBR-B-017): a thin
         // observer over the SAME redacted store the panel renders. It posts a GENERIC macOS
         // notification (the EVENT, never the account — no label / email / credential, the redaction AC)
         // when the active account changes or the fleet runs out of viable targets. A `UserDefaults`
-        // on/off toggle (default on) is the persisted home #268's settings UI will later surface;
-        // authorization + display are OS-bound (a manual pre-release step). Zero egress:
-        // `UNUserNotificationCenter` is a local OS call, no network. Installed BEFORE `store.start(...)`
-        // below so the observer never misses the first snapshot's transition.
-        let notifier = AccountEventNotifier(preferences: NotificationPreferences(),
-                                            presenter: UserNotificationPresenter())
+        // on/off toggle (default on) is the persisted home the #268 Settings toggle now surfaces — this run
+        // shares the ONE `notificationPreferences` + `notificationPresenter` built above between this notifier
+        // and that toggle, so they read one source of truth and enabling the toggle drives OS authorization.
+        // Zero egress: `UNUserNotificationCenter` is a local OS call, no network. Installed BEFORE
+        // `store.start(...)` below so the observer never misses the first snapshot's transition.
+        let notifier = AccountEventNotifier(preferences: notificationPreferences,
+                                            presenter: notificationPresenter)
         notifier.start(observing: store)
         accountEventNotifier = notifier
 

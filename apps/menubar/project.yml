@@ -83,6 +83,16 @@ targets:
       # branches — is driven hermetically by the in-process fake connector. No socket, no live daemon. The
       # `StatsWire` decoder it routes on is already compiled via WireModel.swift above.
       - path: Sources/PanelStatsModel.swift
+      # Settings UI (#268): the config-get/set wire codecs — the config-editing sibling of WireModel's
+      # watch/stats decoders. Pure Codable (no AppKit), so the decode/encode contract — including the
+      # `encodeIfPresent` nil-omission the #268 safety boundary rests on — is exercised hermetically here.
+      - path: Sources/ConfigWire.swift
+      # Settings UI (#268) model: the pure @MainActor load/apply/draft-diff shell (idle→loading→loaded→failed
+      # + idle→applying→applied/rejected/invalidInput). Compiled here (NOT SettingsView/SettingsWindowController
+      # — those are SwiftUI/AppKit the headless bundle can't drive) so config-get load, the batched config-set of
+      # only-dirty keys, client-side format validation, and the notification-toggle write-through are exercised
+      # against the same fake connector as AccountSwapModel — no socket, no live daemon, never a real config write.
+      - path: Sources/SettingsModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
       # Native swap / all-accounts-exhausted notifications (#267): the pure event deriver + neutral
