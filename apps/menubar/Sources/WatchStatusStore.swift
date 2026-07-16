@@ -131,12 +131,38 @@ final class WatchStatusStore: ObservableObject {
     /// The in-flight start-grace timer, re-armed whenever the pure core bumps its grace generation (#499).
     private var graceTask: Task<Void, Never>?
 
+    /// The default warm dwell (#526): how long a WARM drop shows as the transient `.reconnecting` (the calm
+    /// "…") before escalating to the durable `.disconnected` (the loud "!"). 8 s — chosen to CLEAR the
+    /// transport's exponential-backoff reconnect schedule rather than fall inside it. `WatchStateMachine`'s
+    /// `ExponentialBackoff.default` (base 1 s, ×2) lands reconnect ATTEMPTS at cumulative t ≈ 1 s, 3 s, and
+    /// 7 s after the drop (delays 1 s → 2 s → 4 s). A shorter dwell (e.g. 6 s) falls in the DEAD-ZONE between
+    /// the t ≈ 3 s and t ≈ 7 s attempts: a daemon that rebinds in that gap is not re-probed until t ≈ 7 s, so
+    /// the dwell would elapse first and briefly flash Attention on a restart that was already back. 8 s sits
+    /// just PAST the t ≈ 7 s attempt, so a routine daemon restart caught by any of the first three attempts
+    /// reconnects INSIDE the window and does not flash Attention — the t ≈ 7 s attempt being the tight case,
+    /// leaving ~1 s for the reconnect + first snapshot, which is precisely what the on-device calibration
+    /// below settles — yet it stays short enough that a genuinely-dead daemon reaches the actionable
+    /// Attention promptly (Attention is a next-break state, not urgent). It is longer
+    /// than #499's 3 s cold start grace precisely because the warm path rides this backoff whereas a cold
+    /// socket-bind does not. Injected so tests drive it deterministically; the on-device p99-restart
+    /// calibration is an owner verification step (#526).
+    /// `nonisolated` for the `init` default-argument expression, as the other windows.
+    nonisolated static let defaultWarmDwellWindow: Duration = .seconds(8)
+
+    /// How long the store holds a warm drop as `.reconnecting` before escalating to `.disconnected` —
+    /// injected so tests drive the dwell timer deterministically (as `startGraceWindow`).
+    private let warmDwellWindow: Duration
+    /// The in-flight warm-dwell timer, re-armed whenever the pure core bumps its dwell generation (#526).
+    private var dwellTask: Task<Void, Never>?
+
     init(validFrameWindow: Duration = WatchStatusStore.defaultValidFrameWindow,
          stabilityWindow: Duration = WatchStatusStore.defaultStabilityWindow,
-         startGraceWindow: Duration = WatchStatusStore.defaultStartGraceWindow) {
+         startGraceWindow: Duration = WatchStatusStore.defaultStartGraceWindow,
+         warmDwellWindow: Duration = WatchStatusStore.defaultWarmDwellWindow) {
         self.validFrameWindow = validFrameWindow
         self.stabilityWindow = stabilityWindow
         self.startGraceWindow = startGraceWindow
+        self.warmDwellWindow = warmDwellWindow
         (presentations, presentationsContinuation) =
             AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
         // Seed the glance with the initial `.connecting` so a consumer attaching before the first
@@ -158,6 +184,7 @@ final class WatchStatusStore: ObservableObject {
             self?.watchdogTask?.cancel()          // teardown: drop the in-flight valid-frame watchdog
             self?.stabilityTask?.cancel()         // teardown: drop the in-flight stability timer (#169)
             self?.graceTask?.cancel()             // teardown: drop the in-flight start-grace timer (#499)
+            self?.dwellTask?.cancel()             // teardown: drop the in-flight warm-dwell timer (#526)
         }
     }
 
@@ -165,21 +192,24 @@ final class WatchStatusStore: ObservableObject {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
         let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
         let outcome = machine.apply(event)
         log(outcome)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
         publish()
     }
 
     /// Re-arm / cancel each real timer to match the pure core's intent, but ONLY when its generation
     /// token changed across the mutation — the token changes exactly when the timer should (re)start or
-    /// stop, so a routine event that touches none leaves all three counting down untouched. Shared by
-    /// event ingestion AND every timer-fired path so a cross-timer effect (e.g. the valid-frame watchdog
-    /// tripping `.stale`, which also ends a stabilization hold) re-syncs ALL (#344, #169, #499).
-    private func resyncTimers(watchdogBefore: Int, stabilityBefore: Int, graceBefore: Int) {
+    /// stop, so a routine event that touches none leaves all four counting down untouched. Shared by
+    /// event ingestion, every timer-fired path, AND the sleep/wake handlers so a cross-timer effect (e.g.
+    /// the valid-frame watchdog tripping `.stale`, which also ends a stabilization hold) re-syncs ALL
+    /// (#344, #169, #499, #526).
+    private func resyncTimers(watchdogBefore: Int, stabilityBefore: Int, graceBefore: Int, dwellBefore: Int) {
         if machine.watchdogGeneration != watchdogBefore { rearmValidFrameWatchdog() }
         if machine.stabilityGeneration != stabilityBefore { rearmStabilityTimer() }
         if machine.graceGeneration != graceBefore { rearmGraceTimer() }
+        if machine.dwellGeneration != dwellBefore { rearmDwellTimer() }
     }
 
     /// Mirror the pure core's derived state onto the published surface + the glance stream. Shared by
@@ -222,8 +252,9 @@ final class WatchStatusStore: ObservableObject {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
         let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
         machine.watchdogElapsed(generation: generation)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
         publish()
     }
 
@@ -251,8 +282,9 @@ final class WatchStatusStore: ObservableObject {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
         let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
         machine.stabilityElapsed(generation: generation)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
         publish()
     }
 
@@ -282,8 +314,76 @@ final class WatchStatusStore: ObservableObject {
         let watchdogBefore = machine.watchdogGeneration
         let stabilityBefore = machine.stabilityGeneration
         let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
         machine.graceElapsed(generation: generation)
-        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
+        publish()
+    }
+
+    // MARK: - Store-side warm-dwell timer (#526)
+
+    /// (Re)arm — or cancel — the store-side warm-dwell timer to match the pure core's current intent, the
+    /// reconnecting-split analogue of `rearmGraceTimer`: while a WARM drop is held as `.reconnecting`
+    /// (`machine.isAwaitingWarmDwell`), sleep the dwell then feed the (generation-guarded) elapse back, which
+    /// escalates the held `.reconnecting` to the durable `.disconnected`. The daemon reconnecting before the
+    /// dwell elapses supersedes the token (the pure core bumps `dwellGeneration` on the `.reconnecting`→`.live`
+    /// transition), so a routine restart / wake blip that comes back inside the window never reaches the
+    /// escalate — it goes straight back to connected. System sleep also supersedes it (`systemWillSleep`
+    /// suspends the dwell → `isAwaitingWarmDwell` false → this cancels), so a lid-close never escalates.
+    private func rearmDwellTimer() {
+        dwellTask?.cancel()
+        guard machine.isAwaitingWarmDwell else { dwellTask = nil; return }
+        let generation = machine.dwellGeneration
+        let window = warmDwellWindow
+        dwellTask = Task { [weak self] in
+            do { try await Task.sleep(for: window) } catch { return }   // cancelled → drop
+            self?.warmDwellElapsed(generation: generation)
+        }
+    }
+
+    /// The warm dwell fired: fold the elapse into the machine (a superseded token — the daemon reconnected,
+    /// or the system slept, mid-dwell — is ignored there) and re-publish, in case it escalated `.reconnecting`
+    /// to `.disconnected` (the calm "…" → the loud "!").
+    private func warmDwellElapsed(generation: Int) {
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
+        machine.dwellElapsed(generation: generation)
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
+        publish()
+    }
+
+    // MARK: - Sleep/wake gating of the warm dwell (#526)
+
+    /// The system is about to sleep — SUSPEND the warm dwell so a benign sleep-time disconnect cannot
+    /// escalate to Attention (the BLOCKING falsifier: a lid closed overnight is a long, 100%-benign
+    /// disconnect resolving in ~1 s on wake — running the dwell through sleep would open on a FALSE
+    /// Attention every morning). Folds `machine.systemWillSleep()` in and re-syncs so the in-flight dwell
+    /// timer is cancelled. Wired to `NSWorkspace.willSleepNotification` in `main.swift`; callable directly
+    /// from tests (hermetic, no real sleep). `internal` (not `private`) for that test access.
+    func systemWillSleep() {
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
+        machine.systemWillSleep()
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
+        publish()
+    }
+
+    /// The system just woke — RESUME the warm dwell, RESET afresh (treat wake as a fresh connect). Folds
+    /// `machine.systemDidWake()` in and re-syncs so a still-`.reconnecting` drop re-arms a FULL fresh dwell
+    /// window from wake (a genuinely-benign wake blip resolves inside it; a truly-dead daemon reaches
+    /// Attention one dwell after wake). Wired to `NSWorkspace.didWakeNotification` in `main.swift`; callable
+    /// directly from tests (hermetic, no real wake). `internal` (not `private`) for that test access.
+    func systemDidWake() {
+        let watchdogBefore = machine.watchdogGeneration
+        let stabilityBefore = machine.stabilityGeneration
+        let graceBefore = machine.graceGeneration
+        let dwellBefore = machine.dwellGeneration
+        machine.systemDidWake()
+        resyncTimers(watchdogBefore: watchdogBefore, stabilityBefore: stabilityBefore, graceBefore: graceBefore, dwellBefore: dwellBefore)
         publish()
     }
 

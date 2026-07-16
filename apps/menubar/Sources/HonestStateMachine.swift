@@ -33,8 +33,13 @@
 // PLUS the #499 not-running / daemon-starting split: a COLD connect-refused (no live connection EVER
 // held this session — discriminated by `hasEverConnected`, NOT by transport enrichment) reads as the
 // transient `.starting` within a short start grace, then escalates to the durable `.notRunning` once
-// the grace elapses still refused — both distinct from a WARM `.disconnected` drop (a live connection
-// held, then lost). The REMAINING degraded-state-map facets are tracked siblings, NOT this file: the
+// the grace elapses still refused. The WARM drop gets the SAME grace-then-escalate discipline (#526,
+// the mirror of the cold split): a live connection held then lost reads as the transient `.reconnecting`
+// within a bounded warm-dwell window (so a routine daemon restart / wake-from-sleep socket blip rides the
+// calm `…` self-resolving glance), then escalates to the durable `.disconnected` once the dwell elapses
+// still dropped (the loud `!`, for a genuinely-dead daemon). The dwell timer SUSPENDS across system sleep
+// (`systemWillSleep` / `systemDidWake`) so a lid-closed-overnight disconnect never opens on a false
+// Attention. The REMAINING degraded-state-map facets are tracked siblings, NOT this file: the
 // rich version-skew upgrade UX, plus the daemon-level PAYLOAD faults that ride alongside a `.connected`
 // roster — of which the two "act now" ones (keychain-locked, canonical-scrub-`exhausted`) now project
 // to the `.noRunway` glyph via `PresentationState.make` (issue #520); relogin, scrub-`recovering`, and
@@ -75,8 +80,22 @@ enum ConnectionState: Equatable, Sendable {
     /// `.stale`). Last-good data is shown MARKED stale, never as live.
     case stale
 
-    /// The connection dropped (transport `.disconnected`). Last-good data is shown MARKED stale,
-    /// never as live; the transport reconnects with backoff on its own.
+    /// A WARM drop (a live connection WAS held, then the socket dropped) that is still WITHIN a bounded
+    /// warm-dwell window (issue #526) — the transient "reconnecting" state that reads as self-resolving,
+    /// because a routine daemon restart / wake-from-sleep socket blip passes THROUGH here on its way back
+    /// up. The warm sibling of `.starting` (same benign forming glance, the `…` connecting glyph) and the
+    /// transient half of the warm-drop split: it escalates to `.disconnected` once the dwell elapses still
+    /// dropped, reserving the loud `!` for a genuinely-dead daemon. Distinct from `.starting` (a COLD
+    /// connect-refused — no live connection EVER held) and `.connecting` (a bare reconnect whose socket is
+    /// already back, awaiting a fresh snapshot). Last-good data is retained, shown dimmed. NEVER healthy.
+    case reconnecting(reason: String)
+
+    /// A WARM drop that has PERSISTED past the warm-dwell window (issue #526) — the durable "daemon not
+    /// responding" state, reached from `.reconnecting` once the dwell elapses still dropped (a warm drop
+    /// ALWAYS enters `.reconnecting` first; it lands here only by escalation). Last-good data is shown
+    /// MARKED stale, never as live; the transport keeps reconnecting with backoff on its own, but the drop
+    /// has outlived the dwell so the honest glance is the loud `!` — a hand-launched daemon that dies
+    /// mid-session and never returns parks here indefinitely. NEVER healthy.
     case disconnected(reason: String)
 
     /// The daemon speaks a wire contract this client cannot safely read (`schema_version.major`
@@ -145,7 +164,8 @@ enum StatusGlyph: Equatable, Sendable, CaseIterable {
     /// Honest uncertainty: we cannot vouch for the data YET, and the state is expected to resolve with no
     /// operator action. Load-bearing property: only states whose self-resolution is BOUNDED belong here
     /// (`.connecting` is superseded by the next frame; `.starting` is bounded by the start grace, which
-    /// escalates to `.notRunning`). An UNBOUNDED "…" would be a promise the app cannot keep.
+    /// escalates to `.notRunning`; `.reconnecting` is bounded by the warm dwell, which escalates to
+    /// `.disconnected` — #526). An UNBOUNDED "…" would be a promise the app cannot keep.
     case connecting
     /// The collapse bucket: the tool needs something from the operator, and it is not urgent. Ratified
     /// members reachable from this axis: version-skew (`.unsupported`) and crash-loop (`.crashLooping`),
@@ -243,17 +263,22 @@ struct PresentationState: Equatable, Sendable {
         case .starting:
             return PresentationState(glyph: .connecting,
                                      accessibilityLabel: "Sessiometer: the daemon is starting…")
+        case .reconnecting:
+            // A WARM drop still within the warm dwell (#526): bounded self-resolution — the dwell escalates
+            // it to `.disconnected` — so it rides the calm "…", letting a routine daemon restart / wake blip
+            // pass through quietly rather than flashing the loud "!" it would have before #526.
+            return PresentationState(glyph: .connecting,
+                                     accessibilityLabel: "Sessiometer: reconnecting to the daemon…")
 
         // TIER 2 — not vouched, and NOT self-resolving: the operator is needed → the collapse bucket.
         // `.stale` and `.disconnected` land here rather than under "…" because neither is pre-verdict:
         // `.stale` is reached only AFTER the 32 s liveness window has already elapsed with no valid frame
-        // (the debounce has run — it is a verdict, not a wait), and a `.disconnected` daemon that never
-        // returns parks here indefinitely (a warm drop does not escalate — `hasEverConnected` is set once
-        // and never cleared), which an unbounded "…" would misreport as "hold on, self-resolving" forever.
-        // Since this daemon is launched by hand (no launchd relaunch), that dead-forever case is ordinary,
-        // not exotic — so the honest failure mode here is LOUD, not silent. See issue #526: adding a warm
-        // dwell escalation would let a routine restart ride under "…" and reserve "!" for the durable
-        // case; it is gated on a sleep/wake falsifier and is deliberately NOT this item's scope.
+        // (the debounce has run — it is a verdict, not a wait), and a `.disconnected` drop has already
+        // outlived the warm dwell (#526: the in-window transient rides `.reconnecting` above; only the
+        // ESCALATED drop reaches here), so an unbounded "…" would misreport a genuinely-dead daemon as
+        // "hold on, self-resolving" forever. Since this daemon is launched by hand (no launchd relaunch),
+        // that dead-forever case is ordinary, not exotic — so the honest failure mode here is LOUD, not
+        // silent. The warm dwell is what buys the transient its calm "…" WITHOUT softening this durable "!".
         case .stale:
             return PresentationState(glyph: .attention,
                                      accessibilityLabel: "Sessiometer: data may be stale — the daemon has gone quiet")
@@ -378,7 +403,8 @@ struct HonestStateMachine {
         case notRunning                   // cold connect-refused past the start grace, no live connection ever held (#499)
         case live                         // connected and delivering valid frames
         case stale                        // connection open, daemon silent past the liveness window
-        case disconnected(reason: String) // the socket dropped (a live connection was held, then lost)
+        case reconnecting(reason: String) // a warm drop (a live connection held, then lost) within the warm dwell (#526)
+        case disconnected(reason: String) // a warm drop escalated past the warm dwell — the durable "not responding" state (#526)
     }
 
     /// What the last decoded SNAPSHOT said. Reset to `.none` on every (re)connect so a healthy verdict
@@ -395,9 +421,9 @@ struct HonestStateMachine {
 
     /// Whether a LIVE connection has ever been held this session (any transition of `liveness` to `.live`).
     /// It discriminates a COLD connect-refused (never connected → the daemon-absent `.starting`/`.notRunning`
-    /// track, #499) from a WARM drop (a connection WAS held, then lost → `.disconnected`, the socket-dropped
-    /// track). Set once, never cleared: a session that has ever reached the daemon is past the cold-start
-    /// question for good, so a later refused reconnect reads as a drop, not "never running".
+    /// track, #499) from a WARM drop (a connection WAS held, then lost → the `.reconnecting`/`.disconnected`
+    /// socket-dropped track, #526). Set once, never cleared: a session that has ever reached the daemon is
+    /// past the cold-start question for good, so a later refused reconnect reads as a drop, not "never running".
     private var hasEverConnected = false
 
     /// The store-side valid-frame watchdog token (#344), mirroring `WatchStateMachine`'s
@@ -468,6 +494,35 @@ struct HonestStateMachine {
         return false
     }
 
+    // MARK: - Warm dwell: split reconnecting (transient) from disconnected (durable) (#526)
+
+    /// The warm-dwell timer token (#526), mirroring `graceGeneration`: bumped whenever a WARM drop first
+    /// enters `.reconnecting` (ARM the dwell), whenever that dwell is LEFT — the daemon reconnected
+    /// (`apply(.connected)`), or the dwell elapsed to the durable `.disconnected` (`dwellElapsed`) — and
+    /// whenever system sleep SUSPENDS or wake RESUMES it (`systemWillSleep` / `systemDidWake`). A fired
+    /// `dwellElapsed` whose `generation` ≠ this is a superseded timer and is ignored. The shell re-arms its
+    /// real `Task.sleep` timer whenever this value changes across a mutation.
+    private(set) var dwellGeneration = 0
+
+    /// Whether the warm dwell is SUSPENDED because the system is asleep (#526). Set by `systemWillSleep`,
+    /// cleared by `systemDidWake`, so it is `true` only for the sleep interval. It gates `isAwaitingWarmDwell`
+    /// to `false` while asleep — the BLOCKING sleep/wake falsifier: a lid closed overnight is a very long,
+    /// 100%-benign disconnect that resolves in ~1 s on wake, so if the dwell ran during sleep the app would
+    /// open on a FALSE Attention every morning (the tool's most-seen moment). Suspending the dwell across
+    /// sleep, and RESETTING it on wake (`systemDidWake` re-arms a fresh window — "treat wake as a fresh
+    /// connect"), keeps a genuinely-benign wake blip on the calm "…" it deserves.
+    private var dwellSuspended = false
+
+    /// Whether a WARM drop is currently within the warm dwell (liveness `.reconnecting`) AND not suspended by
+    /// sleep: the shell runs the real dwell `Task.sleep` exactly while this is `true`. Every connected / stale
+    /// / cold / already-`.disconnected` state — and a `.reconnecting` state while the system is asleep — is
+    /// NOT awaiting, so the shell cancels (not re-arms) its dwell timer when this is `false`. The sleep guard
+    /// is what makes the timer suspend across a lid-close without any clock-type trickery.
+    var isAwaitingWarmDwell: Bool {
+        if case .reconnecting = liveness, !dwellSuspended { return true }
+        return false
+    }
+
     /// The derived view outputs (mirrored into the store's `@Published` surface).
     private(set) var rows: [AccountRow] = []
     private(set) var nextSwap: NextSwap?
@@ -495,6 +550,8 @@ struct HonestStateMachine {
     /// never-healthy-when-dead invariant lives: `.connected` is returned on exactly one combination.
     var connectionState: ConnectionState {
         switch liveness {
+        case .reconnecting(let reason):
+            return .reconnecting(reason: reason)
         case .disconnected(let reason):
             return .disconnected(reason: reason)
         case .starting:
@@ -556,6 +613,10 @@ struct HonestStateMachine {
         // transition (first cold refusal) and cancelled on true→false (connected), never re-armed on a
         // repeat refusal within one grace — mirroring the `wasStabilizing` transition-guard (#499).
         let wasAwaitingStartGrace = isAwaitingStartGrace
+        // And the pre-event warm-dwell state, on the SAME transition-only discipline (#526): the false→true
+        // first warm drop arms the dwell; a true→false reconnect / escalation cancels it; a repeat drop
+        // within one dwell leaves it counting so the dwell alone owns reconnecting → disconnected.
+        let wasAwaitingWarmDwell = isAwaitingWarmDwell
         let outcome: LineOutcome?
         switch event {
         case .connected:
@@ -575,20 +636,30 @@ struct HonestStateMachine {
             // AND a drop of an established connection. Split them on lineage (#499): a live connection ever
             // held ⇒ WARM drop; never held ⇒ COLD connect-refused, the daemon-absent track.
             if hasEverConnected {
-                // WARM: a live connection was held, then lost — the socket-dropped state (unchanged). A
-                // drop while a held snapshot was still stabilizing = an UNSTABLE reconnect: the clock-free
-                // crash-loop signal (#169). Count it BEFORE mutating liveness (which flips `isStabilizing`).
-                if wasStabilizing { consecutiveUnstableReconnects += 1 }
-                // Last-good rows/nextSwap/generatedAt are RETAINED but the state is now `.disconnected`
-                // (never live). The transport reconnects with backoff on its own. Also reset the snapshot
-                // classification: the roster is no longer confirmed, so healthy must be re-earned by a
-                // FRESH snapshot — this makes the never-healthy invariant hold STRUCTURALLY even if a
-                // heartbeat were somehow to arrive before the reconnect `.connected` (the transport orders
-                // `.connected` first, but the invariant must not depend on that).
-                liveness = .disconnected(reason: reason)
-                snapshotClass = .none
-                hasEverDisconnected = true     // ARM the debounce for every subsequent reconnect (#169)
-                watchdogGeneration += 1        // INVALIDATE: already non-live, no watchdog needed (#344)
+                // WARM: a live connection was held, then lost. Split the in-window transient (`.reconnecting`,
+                // the calm "…") from the escalated durable drop (`.disconnected`, the loud "!") — the warm
+                // mirror of the cold `.starting` → `.notRunning` split (#526). Enter `.reconnecting` on the
+                // FIRST drop; STAY put on repeat drops within the backoff loop (already `.reconnecting`, or
+                // already escalated to `.disconnected`) so the dwell timer ALONE owns the escalation — a
+                // repeat drop must not reset the window (mirrors the cold path staying in `.starting`).
+                switch liveness {
+                case .reconnecting, .disconnected:
+                    break                      // already in the warm-drop track — the dwell owns reconnecting → disconnected
+                default:
+                    // A genuine drop of an established (or gone-quiet) connection. A drop while a held snapshot
+                    // was still stabilizing = an UNSTABLE reconnect: the clock-free crash-loop signal (#169).
+                    // Count it BEFORE mutating liveness (which flips `isStabilizing`).
+                    if wasStabilizing { consecutiveUnstableReconnects += 1 }
+                    // Last-good rows/nextSwap/generatedAt are RETAINED but the state is now non-live. Also reset
+                    // the snapshot classification: the roster is no longer confirmed, so healthy must be re-earned
+                    // by a FRESH snapshot — this makes the never-healthy invariant hold STRUCTURALLY even if a
+                    // heartbeat were somehow to arrive before the reconnect `.connected` (the transport orders
+                    // `.connected` first, but the invariant must not depend on that).
+                    liveness = .reconnecting(reason: reason)
+                    snapshotClass = .none
+                    hasEverDisconnected = true     // ARM the debounce for every subsequent reconnect (#169)
+                    watchdogGeneration += 1        // INVALIDATE: already non-live, no watchdog needed (#344)
+                }
             } else {
                 // COLD: no live connection has EVER been held this session — the connect is being REFUSED
                 // (daemon absent, or still coming up), NOT a drop. Enter `.starting` on the FIRST refusal
@@ -627,6 +698,10 @@ struct HonestStateMachine {
         // Likewise arm (false→true, first cold refusal) or cancel (true→false, the daemon connected) the
         // start grace ONLY on a transition — a repeat refusal within one grace leaves it counting (#499).
         if isAwaitingStartGrace != wasAwaitingStartGrace { graceGeneration += 1 }
+        // And the warm dwell (#526), same transition-only arm/cancel: false→true on the first warm drop arms
+        // it; true→false when the daemon reconnects (`.connected` → `.live`) cancels it; a repeat drop within
+        // one dwell leaves it counting toward the `.disconnected` escalation.
+        if isAwaitingWarmDwell != wasAwaitingWarmDwell { dwellGeneration += 1 }
         return outcome
     }
 
@@ -677,6 +752,49 @@ struct HonestStateMachine {
         guard case .starting = liveness else { return } // only a still-starting connection escalates
         liveness = .notRunning
         graceGeneration += 1     // consume: the grace is over (`isAwaitingStartGrace` is now false)
+    }
+
+    /// Fold in an elapsed warm dwell (#526): a WARM drop has stayed dropped for the WHOLE dwell with the
+    /// daemon never reconnecting — so it is a durable outage, not a routine restart / wake blip. Escalate the
+    /// transient `.reconnecting` to the durable `.disconnected` (`.connecting` "…" → `.attention` "!"),
+    /// carrying the original drop reason forward. Generation-guarded exactly like `graceElapsed` (a token
+    /// superseded by the daemon reconnecting, by any later re-arm, or by a sleep suspend / wake reset is
+    /// ignored) and gated on actually still reconnecting, so it can never manufacture `.disconnected` from a
+    /// connected / cold / already-disconnected state, nor fire twice. The clock lives in the `WatchStatusStore`
+    /// shell, which performs the real `Task.sleep` and feeds the elapse back — the pure core stays clock-free.
+    mutating func dwellElapsed(generation: Int) {
+        guard generation == dwellGeneration else { return }             // superseded (e.g. the daemon reconnected) → ignore
+        guard case .reconnecting(let reason) = liveness else { return } // only a still-reconnecting drop escalates
+        liveness = .disconnected(reason: reason)
+        dwellGeneration += 1     // consume: the dwell is over (`isAwaitingWarmDwell` is now false)
+    }
+
+    // MARK: - Sleep/wake gating of the warm dwell (#526)
+
+    /// The system is about to sleep: SUSPEND the warm dwell so it cannot escalate a benign sleep-time
+    /// disconnect. This is the BLOCKING falsifier — a lid closed overnight is a long, 100%-benign disconnect
+    /// that resolves in ~1 s on wake; if the dwell ran during sleep the app would open on a FALSE Attention
+    /// every morning. Setting `dwellSuspended` flips `isAwaitingWarmDwell` to `false` (a true→false
+    /// transition), so the shell cancels the in-flight dwell timer; the liveness stays `.reconnecting`, so the
+    /// dwell merely pauses rather than losing the drop. A no-op when no warm drop is dwelling. The shell wires
+    /// this to `NSWorkspace.willSleepNotification`; tests call it directly (hermetic, no real sleep).
+    mutating func systemWillSleep() {
+        let wasAwaiting = isAwaitingWarmDwell
+        dwellSuspended = true
+        if isAwaitingWarmDwell != wasAwaiting { dwellGeneration += 1 }  // suspend: cancel the in-flight dwell timer
+    }
+
+    /// The system just woke: RESUME the warm dwell, RESET afresh — "treat wake as a fresh connect". Clearing
+    /// `dwellSuspended` flips `isAwaitingWarmDwell` back to `true` if the drop is still dwelling (a false→true
+    /// transition), so the shell re-arms a FULL fresh dwell window from wake — a genuinely-benign wake blip
+    /// (the socket returns in ~1 s) resolves well inside it and never escalates, while a truly-dead daemon
+    /// reaches Attention one dwell after wake. If the daemon already reconnected across the sleep boundary
+    /// (liveness left `.reconnecting`), this is a no-op. The shell wires this to `NSWorkspace.didWakeNotification`;
+    /// tests call it directly (hermetic, no real wake).
+    mutating func systemDidWake() {
+        let wasAwaiting = isAwaitingWarmDwell
+        dwellSuspended = false
+        if isAwaitingWarmDwell != wasAwaiting { dwellGeneration += 1 }  // resume: re-arm a FRESH dwell if still reconnecting
     }
 
     // MARK: - Line handling (decode-defensive)

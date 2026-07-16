@@ -243,11 +243,14 @@ struct StatusPanelView: View {
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
                 .padding(.horizontal, 14).padding(.vertical, 14)
 
-        case .disconnected:
-            // Dropped connection: an explicit honest strip over the DIMMED last-known roster — never
-            // frozen-as-live (#137). No swap callout (swaps are paused while dropped), and the roster
-            // rows are NOT switchable: a retained last-known row is not a live target, and a click over
-            // a dead socket would be a dead click (#169's honest-affordance rule).
+        case .disconnected, .reconnecting:
+            // A warm drop: an explicit honest strip over the DIMMED last-known roster — never frozen-as-live
+            // (#137). No swap callout (swaps are paused while dropped), and the roster rows are NOT switchable:
+            // a retained last-known row is not a live target, and a click over a dead socket would be a dead
+            // click (#169's honest-affordance rule). `.reconnecting` (#526, still within the warm dwell) shares
+            // this exact treatment — the retained roster stays informative — and the strip's copy auto-derives
+            // from `state`, so the dwell reads calm ("Reconnecting…") while the escalation reads loud ("Daemon
+            // not responding"), both off the single `banner(for:)` switch.
             HonestStrip(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count,
                                                          ageText: ageText, ageStale: ageStale))
             if !store.rows.isEmpty {
