@@ -1039,6 +1039,10 @@ or `sessiometer service install` to keep one running at login (see
 [Quickstart](#quickstart)). Once a stable release is tagged, the formula gains a
 `url` + `sha256` stanza and also installs without `--HEAD`.
 
+> **Unofficial.** `sessiometer` is not affiliated with or endorsed by Anthropic (see the
+> [notice at the top of this README](#sessiometer)) and is distributed under the
+> [MIT license](LICENSE). "Claude Code" is referenced only nominatively.
+
 The macOS menu-bar app lives in [`apps/menubar/`](apps/menubar/) — a Swift/XcodeGen
 sibling to the Rust crate at the repo root, not a Cargo workspace member (see
 [ADR-0010](docs/adr/0010-macos-app-repo-topology.md)).
