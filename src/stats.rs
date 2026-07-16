@@ -1006,28 +1006,60 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 // --- rendering: numeric text ------------------------------------------------
 
 /// The per-account table header, sized to the handle column. Shared by the live-account
-/// table and the "not in roster" section (issue #314) so both foot identical columns.
-fn text_table_header(handle_w: usize) -> String {
-    format!(
-        "{}  cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share\n",
+/// table and the "not in roster" section (issue #314) so both foot identical columns. The
+/// numeric text view is the WIDER surface (design-stats.md §D-STA-5): it carries `signal` and the
+/// full `session` / `weekly` `m/p/p95` triples alongside the compact TTY chart table's peaks. The
+/// `velocity` / `runway` columns are shown only when at least one account HAS the datum
+/// (`show_velocity` / `show_runway`) — the empty-column elision, honest degradation over a fleet
+/// with no computable rate.
+fn text_table_header(handle_w: usize, show_velocity: bool, show_runway: bool) -> String {
+    let mut h = format!(
+        "{}  signal     cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share",
         pad_end("account", handle_w),
-    )
+    );
+    if show_velocity {
+        h.push_str("  velocity");
+    }
+    if show_runway {
+        h.push_str("  runway");
+    }
+    h.push('\n');
+    h
 }
 
 /// One per-account table row, sized to the handle column. Shared by the live-account table
 /// and the orphan section, so an orphan row is column-identical to a live one — the ONLY
-/// difference is which section it sits under.
-fn text_account_row(handle: &str, a: &AccountStats, handle_w: usize) -> String {
-    format!(
-        "{}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%\n",
+/// difference is which section it sits under. `signal` is the neutral class word (`—` for an
+/// unobserved account — gap honesty); `velocity` / `runway` render only when their column is
+/// shown, `—` for an account without the datum. `v` is this account's velocity overlay (an orphan
+/// with no overlay renders `—`).
+fn text_account_row(
+    handle: &str,
+    a: &AccountStats,
+    v: Option<&AccountVelocity>,
+    handle_w: usize,
+    show_velocity: bool,
+    show_runway: bool,
+) -> String {
+    let mut row = format!(
+        "{}  {:<9}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%",
         pad_end(handle, handle_w),
+        signal_cell(a),
         pct(a.coverage),
         triple(&a.session),
         triple(&a.weekly),
         a.cap_hits,
         fmt_dur(a.time_at_cap_secs),
         pct(a.contribution_share),
-    )
+    );
+    if show_velocity {
+        row.push_str(&format!("  {:>8}", velocity_cell(v)));
+    }
+    if show_runway {
+        row.push_str(&format!("  {:>6}", runway_cell(v)));
+    }
+    row.push('\n');
+    row
 }
 
 /// Render the numeric text view: the window echo, the per-account summary table, an optional
@@ -1060,10 +1092,30 @@ fn render_text(report: &Report) -> String {
             .max()
             .unwrap_or(0)
             .max(display_width("account"));
+        // Optional-column elision for the numeric view (§D-STA-5): `velocity` / `runway` render
+        // only when at least one shown account (live OR orphan) HAS the datum. A fleet with no
+        // computable rate foots exactly as it did before the columns existed — honest degradation,
+        // not a wall of `—`. Computed across BOTH sections so the two tables carry the same columns.
+        let any_account_has = |has: fn(&AccountVelocity) -> bool| {
+            summary
+                .per_account
+                .keys()
+                .chain(report.orphans.keys())
+                .any(|h| report.velocity.get(h).is_some_and(has))
+        };
+        let show_velocity = any_account_has(|v| v.session_rate.is_some());
+        let show_runway = any_account_has(|v| v.session_runway_secs.is_some());
         if has_live {
-            out.push_str(&text_table_header(handle_w));
+            out.push_str(&text_table_header(handle_w, show_velocity, show_runway));
             for (handle, a) in &summary.per_account {
-                out.push_str(&text_account_row(handle, a, handle_w));
+                out.push_str(&text_account_row(
+                    handle,
+                    a,
+                    report.velocity.get(handle),
+                    handle_w,
+                    show_velocity,
+                    show_runway,
+                ));
             }
         }
         // Non-roster handles (issue #314): a clearly-labelled, self-contained section so an
@@ -1074,17 +1126,25 @@ fn render_text(report: &Report) -> String {
                 out.push('\n');
             }
             out.push_str(&format!("not in roster ({}):\n", report.orphans.len()));
-            out.push_str(&text_table_header(handle_w));
+            out.push_str(&text_table_header(handle_w, show_velocity, show_runway));
             for (handle, a) in &report.orphans {
-                out.push_str(&text_account_row(handle, a, handle_w));
+                out.push_str(&text_account_row(
+                    handle,
+                    a,
+                    report.velocity.get(handle),
+                    handle_w,
+                    show_velocity,
+                    show_runway,
+                ));
             }
         }
     }
 
     out.push('\n');
-    // The neutral summary band (issue #160), then the roster line. The numeric text is the
-    // NON-TTY surface, so the band renders WITHOUT colour (zero ANSI on a pipe).
-    let band = render_summary(report, false);
+    // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
+    // fleet-runway), then the roster line — ONE contiguous block, no blank line between. The
+    // summary carries no trailing newline, so the terminating `\n` here abuts the roster line.
+    let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
@@ -1216,17 +1276,21 @@ impl SignalBand {
     }
 }
 
-/// The neutral summary band for the human views (issue #160): a per-account symmetric
-/// signal line, then the lowest-utilisation callout. Returns an EMPTY string when there is
-/// nothing to summarise (an empty roster), so a caller can append it unconditionally. Pure
-/// over `color` (the shared gate), so the band is golden-testable with and without ANSI.
-/// Facts only — magnitudes and neutral descriptors, never a recommendation or forecast.
-fn render_summary(report: &Report, color: bool) -> String {
+/// The neutral roster block for the human views: the aggregate-only foot beneath the one
+/// per-account table (design-stats.md §D-STA-5). Per-account facts — `signal` / `velocity` /
+/// `runway` — are COLUMNS of that table now, NOT band lists (the #543/#544 stacked
+/// `handle value · …` walls are retired); what remains here is strictly roster/fleet-level:
+/// the lowest-utilisation callout and the fleet-runway aggregate. Returns an EMPTY string when
+/// there is nothing to summarise (no observed account), so a caller appends it unconditionally.
+/// Lines are 2-space indented (the §D-STA-5 render) and carry NO trailing newline, so the caller
+/// terminates the block and the roster line foots it contiguously. Facts only — magnitudes and
+/// neutral descriptors, never a recommendation or forecast (issue #160).
+fn render_summary(report: &Report) -> String {
     // OBSERVED accounts only — gap honesty. An account can be in the summary with `seen ==
     // 0` (it held the active credential but the daemon polled a different one), its readings
-    // zeroed rather than measured; banding that as "underused" or ranking its fabricated 0%
-    // as the lowest would invent a low reading the aggregator deliberately never does. The
-    // band summarises what was MEASURED, so an unmeasured account is simply not in it.
+    // zeroed rather than measured; ranking its fabricated 0% as the lowest would invent a low
+    // reading the aggregator deliberately never does. The block summarises what was MEASURED,
+    // so an unmeasured account is simply not in it.
     let observed: Vec<(&String, &AccountStats)> = report
         .summary
         .per_account
@@ -1237,92 +1301,42 @@ fn render_summary(report: &Report, color: bool) -> String {
         return String::new();
     }
 
-    // Per-account signal, symmetric emphasis. The band is keyed on the session PEAK — the
-    // same basis as the wire's #159 `band` — so the two views classify a reading alike.
-    let signals: Vec<String> = observed
-        .iter()
-        .map(|(handle, a)| {
-            let band = SignalBand::of(a.session.peak);
-            let word = band.label();
-            match (color, band.sgr()) {
-                (true, sgr) if !sgr.is_empty() => format!("{handle} \x1b[{sgr}m{word}\x1b[0m"),
-                _ => format!("{handle} {word}"),
-            }
-        })
-        .collect();
+    let mut lines: Vec<String> = Vec::new();
 
     // Lowest-utilisation account: the smallest session MEAN among the observed — a
     // magnitude, not a verdict. The handle breaks ties, so the pick is deterministic.
-    let lowest = observed
-        .iter()
-        .min_by(|a, b| {
-            a.1.session
-                .mean
-                .total_cmp(&b.1.session.mean)
-                .then_with(|| a.0.cmp(b.0))
-        })
-        .map(|(handle, a)| {
-            format!(
-                "lowest utilisation: {handle} (session mean {}%)",
-                pct(a.session.mean)
-            )
-        });
-
-    let mut out = format!("signal  {}\n", signals.join(" · "));
-    if let Some(lowest) = lowest {
-        out.push_str(&format!("        {lowest}\n"));
+    if let Some((handle, a)) = observed.iter().min_by(|a, b| {
+        a.1.session
+            .mean
+            .total_cmp(&b.1.session.mean)
+            .then_with(|| a.0.cmp(b.0))
+    }) {
+        lines.push(format!(
+            "  lowest utilisation: {handle} (session mean {}%)",
+            pct(a.session.mean)
+        ));
     }
 
-    // Velocity + runway readout (issue #543), footing the band beneath the signal: a NEUTRAL
-    // per-account rate and the APPROXIMATE head-room to the swap trigger — facts only (a `%/min`
-    // rate, `~Xh to trigger`), never advice, so the render passes the amended framing guard
-    // (#542). Each line renders ONLY when at least one observed account HAS the datum; within it,
-    // an unknown / zero / stale value is `—` (honest degradation), never a fabricated number. A
-    // report without the velocity overlay (a bare aggregate) carries an empty map, so BOTH lines
-    // are absent and the band foots exactly as it did pre-#543.
-    let vel = |handle: &str| report.velocity.get(handle);
-    let has_velocity = observed
-        .iter()
-        .any(|(h, _)| vel(h).and_then(|v| v.session_rate).is_some());
-    if has_velocity {
-        // The velocity line (session `%/min` per account) and — PAIRED beneath it — the runway
-        // line (session `~Xh to trigger`, plus weekly `~Yd` where meaningful). An account whose
-        // rate / head-room is unknown renders `—` on both, so the degradation is EXPLICIT rather
-        // than a silently missing figure.
-        let rates: Vec<String> = observed
-            .iter()
-            .map(|(h, _)| match vel(h).and_then(|v| v.session_rate) {
-                Some(rate) => format!("{h} {}", fmt_pct_per_min(rate)),
-                None => format!("{h} —"),
-            })
-            .collect();
-        out.push_str(&format!("velocity  {}\n", rates.join(" · ")));
-        let runways: Vec<String> = observed
-            .iter()
-            .map(|(h, _)| format!("{h} {}", fmt_runway(vel(h).copied().unwrap_or_default())))
-            .collect();
-        out.push_str(&format!("runway  {}\n", runways.join(" · ")));
-    }
-
-    // The FLEET/roster runway aggregate (issue #544), footing the band: ONE approximate figure for
-    // "across all my accounts, how long do I last?" — the roster's combined weekly head-room drained
-    // at its combined weekly burn, days-scale (`fmt_runway_days`). NEUTRAL and APPROXIMATE (a `~`
-    // figure, framed "at the current combined rate"), so it clears the amended #542 guard. Rendered
-    // ONLY when the pool has a finite runway; the counted-account cardinality `(n of m counted)` is
-    // ALWAYS shown alongside it, so an excluded (unknown / stale) account is surfaced as a fact, not
-    // silently folded in as zero-burn.
+    // The FLEET/roster runway aggregate (issue #544): ONE approximate figure for "across all my
+    // accounts, how long do I last?" — the roster's combined weekly head-room drained at its
+    // combined weekly burn, days-scale (`fmt_runway_days`). NEUTRAL and APPROXIMATE (a `~` figure,
+    // framed "at the current combined rate"), so it clears the amended #542 guard. Rendered ONLY
+    // when the pool has a finite runway; the counted-account cardinality `(n of m counted)` is
+    // ALWAYS shown alongside it, so an excluded (unknown / stale) account is surfaced as a fact,
+    // not silently folded in as zero-burn.
     if let Some(FleetRunway {
         runway_secs: Some(secs),
         counted,
         observed,
     }) = fleet_runway(report)
     {
-        out.push_str(&format!(
-            "fleet  accounts last {} at the current combined rate ({counted} of {observed} counted)\n",
+        lines.push(format!(
+            "  accounts last {} at the current combined rate ({counted} of {observed} counted)",
             fmt_runway_days(secs),
         ));
     }
-    out
+
+    lines.join("\n")
 }
 
 /// A usage rate in the sample's native fraction-per-SECOND, scaled to percent-per-minute
@@ -1338,24 +1352,6 @@ fn pct_per_min(rate_frac_per_sec: f64) -> f64 {
 /// reading, not a gap.
 fn fmt_pct_per_min(rate_frac_per_sec: f64) -> String {
     format!("{:.1}%/min", pct_per_min(rate_frac_per_sec))
-}
-
-/// This account's runway entry for the human band: the session head-room `~Xh to trigger`, and
-/// the weekly head-room `weekly ~Yd` where meaningful (issue #543). `—` when neither is known
-/// (unknown / zero / stale velocity, or already at/over the trigger) — never a fabricated or
-/// infinite number. The `~` marks every figure APPROXIMATE; the trigger is the neutral reference
-/// (the point the daemon acts), stated as a fact, not advice — so the entry clears the #542 guard.
-fn fmt_runway(v: AccountVelocity) -> String {
-    match (v.session_runway_secs, v.weekly_runway_secs) {
-        (Some(s), Some(w)) => format!(
-            "{} to trigger, weekly {}",
-            fmt_runway_hours(s),
-            fmt_runway_days(w)
-        ),
-        (Some(s), None) => format!("{} to trigger", fmt_runway_hours(s)),
-        (None, Some(w)) => format!("weekly {}", fmt_runway_days(w)),
-        (None, None) => "—".to_owned(),
-    }
 }
 
 /// An APPROXIMATE hours-scale runway, e.g. `~4h`, `~45m`, `~30s` — rounded to the coarsest
@@ -1385,6 +1381,70 @@ fn fmt_runway_days(secs: i64) -> String {
         format!("~{} {}", d, if d == 1 { "day" } else { "days" })
     } else {
         fmt_runway_hours(secs)
+    }
+}
+
+// --- rendering: per-account COLUMN cells (issue #556) ------------------------
+//
+// The per-account signal / velocity / runway are COLUMNS of the one per-account table now
+// (design-stats.md §D-STA-5), not lists in the neutral band — a new per-account metric is a
+// column addition, never a footer list keyed per account. These formatters render one account's
+// cell for each; they foot BOTH the numeric text table and the TTY chart table with the identical
+// value, and the gap sentinel `—` is honest degradation, never a fabricated figure.
+
+/// This account's SIGNAL cell — the neutral symmetric class word for an OBSERVED account
+/// (`seen > 0`), or the gap sentinel `—` for an unobserved one (its readings were zeroed, not
+/// measured; classifying a fabricated 0% as "underused" would invent a reading the aggregator
+/// never made — the per-cell form of the band's observed-only filter). Keyed on the session PEAK,
+/// the same basis as the wire [`Band`], so the word and the session tint classify one reading alike.
+fn signal_cell(a: &AccountStats) -> &'static str {
+    if a.seen > 0 {
+        SignalBand::of(a.session.peak).label()
+    } else {
+        "—"
+    }
+}
+
+/// The SIGNAL cell's SYMMETRIC emphasis SGR (issue #160 / §D-STA-6): `Some("33")` for BOTH
+/// deviations from the balanced middle (equal weight — underuse is not "good", saturation not
+/// "alarm"), `None` for the balanced middle and for an unobserved `—` (no colour wrap). The
+/// descriptor WORD carries the full signal, so a NO_COLOR reader loses nothing.
+fn signal_sgr(a: &AccountStats) -> Option<&'static str> {
+    if a.seen == 0 {
+        return None;
+    }
+    match SignalBand::of(a.session.peak).sgr() {
+        "" => None,
+        sgr => Some(sgr),
+    }
+}
+
+/// This account's compact SESSION cell — `mean/peak` in whole percents (e.g. `42/100`), so a
+/// lowest-by-MEAN account reads self-consistently even while `saturated` by PEAK (the signal is
+/// banded on peak). The wider numeric table keeps the full `mean/peak/p95` [`triple`]; this is the
+/// compact TTY form.
+fn session_cell(a: &AccountStats) -> String {
+    format!("{}/{}", pct(a.session.mean), pct(a.session.peak))
+}
+
+/// This account's compact VELOCITY cell — the neutral session `%/min` rate, or `—` when the rate
+/// is unknown (too few samples, stale, or no velocity overlay on the report). The COLUMN form of
+/// the retired band's velocity list; `0.0%/min` for an idle-but-known account is a reading, `—` a gap.
+fn velocity_cell(v: Option<&AccountVelocity>) -> String {
+    match v.and_then(|v| v.session_rate) {
+        Some(rate) => fmt_pct_per_min(rate),
+        None => "—".to_owned(),
+    }
+}
+
+/// This account's compact RUNWAY cell — the APPROXIMATE session head-room to the swap trigger
+/// (`~Xh`), or `—` when unknown / already at the trigger. The `~` marks it approximate and the
+/// trigger is the neutral reference (a fact, not advice), so the cell clears the #542 guard. The
+/// weekly per-account head-room is not shown per row — it feeds the aggregate `fleet` line instead.
+fn runway_cell(v: Option<&AccountVelocity>) -> String {
+    match v.and_then(|v| v.session_runway_secs) {
+        Some(secs) => fmt_runway_hours(secs),
+        None => "—".to_owned(),
     }
 }
 
@@ -1522,7 +1582,7 @@ struct PeriodWire {
 }
 
 /// The fleet/roster weekly runway aggregate on the `--json` wire (issue #544) — the machine peer of
-/// the human band's `fleet` line. `runway_secs` is explicit `null` (NEVER a sentinel like `0` /
+/// the human band's fleet-runway line. `runway_secs` is explicit `null` (NEVER a sentinel like `0` /
 /// `999`) when the counted accounts have no combined burn; `counted` / `observed` carry the `n of m`
 /// cardinality so a reader sees exactly how many accounts the figure rests on — and that
 /// `observed − counted` accounts were EXCLUDED for an unknown / stale velocity (honest degradation,
@@ -1561,7 +1621,7 @@ struct AccountWire {
 }
 
 /// The per-account velocity + runway readout on the `--json` wire (issue #543) — the machine peer
-/// of the human band's `velocity` / `runway` lines. A KNOWN object carries the session rate as a
+/// of the human table's `velocity` / `runway` columns. A KNOWN object carries the session rate as a
 /// real number; an individually-unknown figure (a zero-rate or at/over-trigger runway, a flat
 /// weekly) is explicit `null`, NEVER a sentinel like `0` or `999`. Rates are `%/min`; runways are
 /// whole seconds (the reader scales to whatever unit it renders).
@@ -1959,11 +2019,18 @@ fn render_line(
     format!("{}\n", line.trim_end())
 }
 
-/// Render a header row plus one line per data row, dropping the lowest-priority droppable
-/// columns until the table fits `w` — or only always-keep columns remain, in which case the
-/// table is allowed to OVERFLOW rather than WRAP a row (issue #159: never wrap). Colour is
-/// applied per cell only when `color` is set.
+/// Render a header row plus one line per data row. An EMPTY-COLUMN ELISION pre-pass first drops
+/// any DROPPABLE column that is uniformly the gap sentinel `—` (design-stats.md §D-STA-5 — a
+/// column with no datum on any row carries nothing; this is what self-drops `velocity` / `runway`
+/// on a fleet with no computable rate). Then the lowest-priority droppable columns are dropped
+/// until the table fits `w` — or only always-keep columns remain, in which case the table is
+/// allowed to OVERFLOW rather than WRAP a row (issue #159: never wrap). Colour is applied per cell
+/// only when `color` is set.
 fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
+    // Empty-column elision: a droppable column uniformly `—` across every row is omitted before
+    // the width fit. A keep-column (`priority == None`, the `account · session · signal` floor) is
+    // never elided, even if every cell is a gap.
+    columns.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != "—"));
     while table_width(&columns) > w {
         match columns.iter().filter_map(|c| c.priority).min() {
             Some(p) => columns.retain(|c| c.priority != Some(p)),
@@ -1988,11 +2055,15 @@ fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
     out
 }
 
-/// The per-account chart table: `account`, the whole-window `session` and `weekly` peak %,
-/// and a `trend` sparkline of the per-bucket session peak. Priority column-drop under a
-/// narrow terminal — `trend` drops FIRST, then `weekly`; `account` + `session` (the most
-/// actionable signal) are always kept — never wrapping. Colour tints each `%` by its
-/// neutral utilisation band; the sparkline glyphs carry their own magnitude.
+/// The per-account chart table (design-stats.md §D-STA-5): `account`, the neutral `signal` word,
+/// the compact `session` mean/peak %, the `weekly` peak %, the session `runway` and `velocity`,
+/// and a `trend` sparkline of the per-bucket session peak. Priority column-drop under a narrow
+/// terminal — `trend` sheds FIRST, then `velocity`, `runway`, `weekly` (a populated rate
+/// out-informs the sparkline; an empty one is already gone via elision) — while the
+/// `account · session · signal` FLOOR is always kept, never wrapping (issue #159). A `velocity` /
+/// `runway` column that is uniformly `—` is elided before the width fit ([`render_table`]). Colour
+/// tints each magnitude by its neutral utilisation band and the signal word symmetrically; the
+/// sparkline glyphs carry their own magnitude.
 fn render_chart_table(
     report: &Report,
     accounts: &[&String],
@@ -2002,26 +2073,43 @@ fn render_chart_table(
 ) -> String {
     let summary = &report.summary;
     let n = accounts.len();
-    let (mut acct, mut sess, mut sess_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut week, mut week_c, mut trend) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut acct, mut sig, mut sig_c) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut sess, mut sess_c, mut week, mut week_c) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut runway, mut velocity, mut trend) = (Vec::new(), Vec::new(), Vec::new());
     for &h in accounts {
         let a = &summary.per_account[h];
+        let v = report.velocity.get(h);
         acct.push(h.clone());
-        sess.push(format!("{}%", pct(a.session.peak)));
+        sig.push(signal_cell(a).to_owned());
+        sig_c.push(signal_sgr(a));
+        sess.push(session_cell(a));
         sess_c.push(Some(Band::of(a.session.peak).sgr()));
         week.push(format!("{}%", pct(a.weekly.peak)));
         week_c.push(Some(Band::of(a.weekly.peak).sgr()));
+        runway.push(runway_cell(v));
+        velocity.push(velocity_cell(v));
         trend.push(render_sparkline(
             &account_series(&report.series, h, session_peak),
             ascii,
         ));
     }
+    // Column ORDER is the §D-STA-5 render; drop PRIORITY (lowest `Some(n)` shed first) is the
+    // corrected order `trend → velocity → runway → weekly`. The `account · session · signal`
+    // floor is `priority: None` — never dropped.
     let columns = vec![
         ChartCol {
             header: "account",
             cells: acct,
             colors: vec![None; n],
             lead_gap: 0,
+            priority: None,
+        },
+        ChartCol {
+            header: "signal",
+            cells: sig,
+            colors: sig_c,
+            lead_gap: 2,
             priority: None,
         },
         ChartCol {
@@ -2035,6 +2123,20 @@ fn render_chart_table(
             header: "weekly",
             cells: week,
             colors: week_c,
+            lead_gap: 2,
+            priority: Some(4),
+        },
+        ChartCol {
+            header: "runway",
+            cells: runway,
+            colors: vec![None; n],
+            lead_gap: 2,
+            priority: Some(3),
+        },
+        ChartCol {
+            header: "velocity",
+            cells: velocity,
+            colors: vec![None; n],
             lead_gap: 2,
             priority: Some(2),
         },
@@ -2226,10 +2328,12 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
         out.push_str(&block);
     }
     out.push('\n');
-    // The neutral summary band (issue #160), the "not in roster" line (issue #314), then the
-    // roster line. Honours the shared colour gate (symmetric emphasis when open; the
-    // descriptor word still carries the signal when closed).
-    let band = render_summary(report, color);
+    // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
+    // fleet-runway — per-account signal/velocity/runway are TABLE COLUMNS now, not band lists),
+    // the "not in roster" line (issue #314), then the roster line — ONE contiguous block. The
+    // summary is colour-free: it reports roster-level magnitudes, and the per-account `signal`
+    // colour lives in the table cell (issue #160 symmetric emphasis, unchanged).
+    let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
@@ -2388,12 +2492,15 @@ mod tests {
 
     #[test]
     fn chart_table_golden_wide() {
+        // §D-STA-5 columns: `account · signal · session(mean/peak) · weekly · trend`. The fixture
+        // carries no velocity overlay, so `velocity` / `runway` are uniformly `—` and elide before
+        // the width fit — the sparse-fleet default. `session` is mean/peak (`50/99`) not peak-only.
         let r = two_account_charts();
         assert_eq!(
             render_chart_table(&r, &keys(&r), 60, false, false),
-            "account  session  weekly  trend\n\
-             alpha    99%      40%     ▃▅█\n\
-             beta     20%      5%      ▂ ▂\n",
+            "account  signal     session  weekly  trend\n\
+             alpha    saturated  50/99    40%     ▃▅█\n\
+             beta     underused  10/20    5%      ▂ ▂\n",
         );
     }
 
@@ -2526,7 +2633,7 @@ mod tests {
         let r = two_account_charts();
         let out = render_charts(&r, 60, false, false);
         assert!(out.starts_with("usage — last 24h (Jun 30–Jul 1)\n\n"));
-        assert!(out.contains("account  session  weekly  trend\n"));
+        assert!(out.contains("account  signal     session  weekly  trend\n"));
         assert!(out.contains("contribution share\n"));
         assert!(out.contains("session pattern — hourly mean\n"));
         assert!(out.contains("session distribution — mean · p95 · peak\n"));
@@ -2541,8 +2648,8 @@ mod tests {
         // run and carries no Unicode block glyph.
         let r = two_account_charts();
         let table = render_chart_table(&r, &keys(&r), 60, false, true);
-        assert!(table.contains("alpha    99%      40%     -+@\n"));
-        assert!(table.contains("beta     20%      5%      : :\n"));
+        assert!(table.contains("alpha    saturated  50/99    40%     -+@\n"));
+        assert!(table.contains("beta     underused  10/20    5%      : :\n"));
         for glyph in ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '░', '▒', '▓'] {
             assert!(!table.contains(glyph), "no Unicode block survives --ascii");
         }
@@ -2553,30 +2660,35 @@ mod tests {
     #[test]
     fn narrow_terminal_drops_trend_then_weekly_keeping_session_never_wrapping() {
         let r = two_account_charts();
-        // Just too narrow for the trend column → it drops FIRST; weekly stays.
-        let w25 = render_chart_table(&r, &keys(&r), 25, false, false);
+        // The floor is `account · signal · session` (§D-STA-5); `velocity` / `runway` are elided
+        // (this fixture has no overlay), so the priority drop reduces to `trend → weekly`. Just too
+        // narrow for the trend column → it drops FIRST; signal + session + weekly stay.
+        let w40 = render_chart_table(&r, &keys(&r), 40, false, false);
         assert_eq!(
-            w25,
-            "account  session  weekly\n\
-             alpha    99%      40%\n\
-             beta     20%      5%\n",
+            w40,
+            "account  signal     session  weekly\n\
+             alpha    saturated  50/99    40%\n\
+             beta     underused  10/20    5%\n",
         );
-        // Narrower still → weekly drops NEXT; account + session are always kept, even when
-        // that overflows the width — the row is never wrapped.
+        // Narrower still → weekly drops NEXT; the `account · signal · session` floor is always kept.
+        let w30 = render_chart_table(&r, &keys(&r), 30, false, false);
+        assert_eq!(
+            w30,
+            "account  signal     session\n\
+             alpha    saturated  50/99\n\
+             beta     underused  10/20\n",
+        );
+        // Below the floor width the floor OVERFLOWS rather than wrapping — nothing more drops, so
+        // the render is byte-identical to the floor at any narrower width, one line per account.
         let w15 = render_chart_table(&r, &keys(&r), 15, false, false);
-        assert_eq!(
-            w15,
-            "account  session\n\
-             alpha    99%\n\
-             beta     20%\n",
-        );
+        assert_eq!(w15, w30, "below the floor width nothing more drops");
         assert_eq!(
             w15.lines().count(),
             3,
             "one header + one line per account: no wrap"
         );
         assert!(
-            w15.contains("99%") && w15.contains("20%"),
+            w15.contains("50/99") && w15.contains("10/20"),
             "the session signal is kept"
         );
     }
@@ -2622,15 +2734,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn piped_numeric_table_golden_with_the_folded_columns() {
+        // A frozen byte-golden of the piped numeric view (issue #556) — the unversioned de-facto
+        // contract (#159): the window echo, the per-account table with the FOLDED `signal` /
+        // `velocity` / `runway` columns (§D-STA-5), and the contiguous aggregate roster block. `aa`
+        // carries a velocity overlay (populated cells); `bb` has none (`—`). This pins the exact
+        // piped column layout so a silent reflow (reordered / re-spaced columns) is caught — the
+        // existing `piped == render_text` check is circular and cannot see a layout regression.
+        let mut r = charts_report(
+            &[
+                ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
+                ("bb", stat(3, ds(0.10, 0.15, 0.12), 0.20, 0.40)),
+            ],
+            &[],
+        );
+        r.velocity.insert(
+            "aa".to_string(),
+            AccountVelocity {
+                session_rate: Some(0.00015),
+                session_runway_secs: Some(7200),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            render_text(&r),
+            "usage — last 24h (Jun 30–Jul 1)\n\n\
+             account  signal     cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share  velocity  runway\n\
+             aa       saturated  100%  30/90/85         0/40/0              0     0s    60%  0.9%/min     ~2h\n\
+             bb       underused  100%  10/15/12         0/20/0              0     0s    40%         —       —\n\
+             \n  lowest utilisation: bb (session mean 10%)\n\
+             roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)\n",
+        );
+    }
+
     // --- issue #159 AC: NO_COLOR / --no-color → zero ANSI, full signal in text --------
 
     #[test]
     fn color_gate_governs_every_ansi_byte() {
         let r = two_account_charts();
-        // Gate open → the utilisation bands tint the `%` cells (alpha's 99% is red).
+        // Gate open → the utilisation bands tint the cells (alpha's hot 50/99 session reads red).
         let colored = render_chart_table(&r, &keys(&r), 60, true, false);
         assert!(
-            colored.contains("\x1b[31m99%\x1b[0m"),
+            colored.contains("\x1b[31m50/99\x1b[0m"),
             "hot session reads red"
         );
         assert!(
@@ -2642,9 +2788,249 @@ mod tests {
         let plain = render_charts(&r, 60, false, false);
         assert!(!plain.contains('\x1b'), "no ANSI when the gate is closed");
         assert!(
-            plain.contains("99%") && plain.contains("▃▅█"),
+            plain.contains("50/99") && plain.contains("▃▅█"),
             "full signal without colour"
         );
+    }
+
+    // --- issue #556 AC: per-account columns, empty-column elision, floor, roster block -----
+
+    #[test]
+    fn priority_drop_sheds_trend_then_velocity_then_runway_then_weekly_keeping_the_floor() {
+        // With a velocity overlay PRESENT (so `velocity` + `runway` do NOT elide), the narrow-width
+        // priority drop sheds `trend → velocity → runway → weekly` in that exact order (§D-STA-5),
+        // while the `account · signal · session` floor is always kept and OVERFLOWS, never wrapping.
+        let mut r = two_account_charts();
+        for h in ["alpha", "beta"] {
+            r.velocity.insert(
+                h.to_string(),
+                AccountVelocity {
+                    session_rate: Some(0.001),
+                    session_runway_secs: Some(7200),
+                    ..Default::default()
+                },
+            );
+        }
+        let header_cols = |w: usize| -> Vec<String> {
+            render_chart_table(&r, &keys(&r), w, false, false)
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        // Wide → the full §D-STA-5 catalog order.
+        assert_eq!(
+            header_cols(200),
+            ["account", "signal", "session", "weekly", "runway", "velocity", "trend"]
+        );
+        // Walk the width down and record the order in which columns vanish.
+        let mut prev = header_cols(200);
+        let mut shed: Vec<String> = Vec::new();
+        for w in (5..200).rev() {
+            let now = header_cols(w);
+            for c in &prev {
+                if !now.contains(c) {
+                    shed.push(c.clone());
+                }
+            }
+            prev = now;
+        }
+        assert_eq!(shed, ["trend", "velocity", "runway", "weekly"]);
+        // The floor is `account · signal · session`, never wrapped — one header + one line per
+        // account even when it overflows a very narrow width.
+        assert_eq!(header_cols(5), ["account", "signal", "session"]);
+        assert_eq!(
+            render_chart_table(&r, &keys(&r), 5, false, false)
+                .lines()
+                .count(),
+            3,
+            "one header + one line per account: no wrap"
+        );
+    }
+
+    #[test]
+    fn the_signal_cell_is_a_dash_for_an_unobserved_account_never_a_fabricated_class() {
+        // Gap honesty at the CELL level (§D-STA-5): an OBSERVED account carries its neutral class
+        // word; an unobserved one (`seen == 0`, zeroed readings) shows `—`, never a fabricated
+        // "underused". `signal_sgr` leaves both the gap and the balanced middle un-emphasised (an
+        // empty SGR would emit a bare reset), colouring only the two symmetric deviations alike.
+        assert_eq!(
+            signal_cell(&stat(3, ds(0.10, 0.15, 0.12), 0.0, 0.5)),
+            "underused"
+        );
+        assert_eq!(
+            signal_cell(&stat(3, ds(0.40, 0.60, 0.50), 0.0, 0.5)),
+            "balanced"
+        );
+        assert_eq!(signal_cell(&stat(0, ds(0.00, 0.00, 0.00), 0.0, 0.5)), "—");
+        assert_eq!(signal_sgr(&stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.5)), None);
+        assert_eq!(signal_sgr(&stat(3, ds(0.4, 0.6, 0.5), 0.0, 0.5)), None);
+        assert_eq!(
+            signal_sgr(&stat(3, ds(0.1, 0.15, 0.12), 0.0, 0.5)),
+            Some("33")
+        );
+        assert_eq!(
+            signal_sgr(&stat(3, ds(0.7, 0.95, 0.9), 0.0, 0.5)),
+            Some("33")
+        );
+    }
+
+    #[test]
+    fn the_roster_block_is_one_contiguous_indented_aggregate_beneath_the_table() {
+        // §D-STA-5: the aggregate summary (lowest-utilisation [+ fleet]) and the roster line form
+        // ONE block beneath the table — the aggregate lines 2-space indented, and NO blank line
+        // separating them from the roster line (they read as a single foot).
+        let text = render_text(&report_fixture());
+        let lines: Vec<&str> = text.lines().collect();
+        let lu = lines
+            .iter()
+            .position(|l| l.contains("lowest utilisation:"))
+            .expect("a lowest-utilisation line");
+        let roster = lines
+            .iter()
+            .position(|l| l.starts_with("roster:"))
+            .expect("a roster line");
+        assert!(
+            lines[lu].starts_with("  lowest utilisation:"),
+            "the aggregate line is 2-space indented: {:?}",
+            lines[lu]
+        );
+        assert!(lu < roster, "the aggregate precedes the roster line");
+        assert!(
+            lines[lu..=roster].iter().all(|l| !l.is_empty()),
+            "the bottom block is contiguous — no blank line within it: {:?}",
+            &lines[lu..=roster]
+        );
+    }
+
+    #[test]
+    fn velocity_and_runway_columns_elide_when_empty_and_appear_when_any_account_has_them() {
+        // Empty-column elision (§D-STA-5): a fleet with NO computable rate shows neither column; a
+        // fleet where AT LEAST ONE account has a rate shows the column, with `—` for the accounts
+        // lacking it (an explicit gap, never a fabricated 0).
+        let sparse = two_account_charts(); // no velocity overlay
+        let text = render_text(&sparse);
+        assert!(
+            !text.contains("velocity") && !text.contains("runway"),
+            "both columns elide on a sparse fleet: {text}"
+        );
+
+        let mut mixed = two_account_charts();
+        mixed.velocity.insert(
+            "alpha".to_string(),
+            AccountVelocity {
+                session_rate: Some(0.001),
+                session_runway_secs: Some(7200),
+                ..Default::default()
+            },
+        );
+        let text = render_text(&mixed);
+        assert!(
+            text.contains("velocity") && text.contains("runway"),
+            "the columns appear when one account has the datum: {text}"
+        );
+        assert!(
+            text.contains("6.0%/min") && text.contains("~2h"),
+            "alpha's populated velocity + runway cells: {text}"
+        );
+        assert!(
+            text.contains('—'),
+            "beta's missing datum is an explicit gap, not a fabricated 0: {text}"
+        );
+    }
+
+    #[test]
+    fn full_email_labels_degrade_within_80_and_70_columns_never_wrapping() {
+        // AC (#556 width-fit falsifier): the reporter's 6-account fleet with FULL operator email
+        // labels (~29 cols — the wide account column, never shortened). SPARSE (no velocity overlay)
+        // → `velocity` / `runway` elide and the table fits 80 and 70. DENSE (every account has a
+        // rate) → at 80 the lowest-priority `trend` sheds, by 70 `velocity` too — strictly by
+        // priority — while the `account · signal · session` floor is one line per row, never wrapped.
+        let emails = [
+            "oleksii@pelykh-consulting.com",
+            "oleksii@pelykh.com",
+            "oleksii@pelykh.consulting",
+            "oleksii@pelykhconsulting.com",
+            "oleksii@pelykhconsulting.eu",
+            "oleksii@pelykhconsulting.fr",
+        ];
+        let accts: Vec<(&str, AccountStats)> = emails
+            .iter()
+            .enumerate()
+            .map(|(i, &e)| {
+                let base = 0.30 + i as f64 * 0.10;
+                (e, stat(3, ds(base, base + 0.05, base), 0.40, 1.0 / 6.0))
+            })
+            .collect();
+
+        // SPARSE: velocity + runway elide (all `—`); the table fits 80 and 70 with no wrap.
+        let sparse = charts_report(&accts, &[]);
+        for w in [80, 70] {
+            let t = render_chart_table(&sparse, &keys(&sparse), w, false, false);
+            assert_eq!(t.lines().count(), 7, "header + 6 rows, no wrap at {w}");
+            assert!(
+                !t.contains("velocity") && !t.contains("runway"),
+                "a sparse fleet elides both columns at {w}: {t}"
+            );
+            assert!(
+                t.lines().all(|l| l.chars().count() <= w),
+                "the sparse table fits within {w}: {t}"
+            );
+        }
+
+        // DENSE: give every account a rate + runway so neither column elides.
+        let mut dense = charts_report(&accts, &[]);
+        for &e in &emails {
+            dense.velocity.insert(
+                e.to_string(),
+                AccountVelocity {
+                    session_rate: Some(0.001),
+                    session_runway_secs: Some(7200),
+                    ..Default::default()
+                },
+            );
+        }
+        let header = |w: usize| -> Vec<String> {
+            render_chart_table(&dense, &keys(&dense), w, false, false)
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        // At 80 the lowest-priority `trend` sheds; `velocity` is still shown. By 70, `velocity` too.
+        assert!(
+            !header(80).contains(&"trend".to_string()),
+            "trend sheds first at 80: {:?}",
+            header(80)
+        );
+        assert!(
+            header(80).contains(&"velocity".to_string()),
+            "velocity survives at 80: {:?}",
+            header(80)
+        );
+        assert!(
+            !header(70).contains(&"velocity".to_string()),
+            "velocity sheds by 70: {:?}",
+            header(70)
+        );
+        // The `account · signal · session` floor is always kept, one line per account, never wrapped.
+        for w in [80, 70, 40] {
+            assert_eq!(
+                render_chart_table(&dense, &keys(&dense), w, false, false)
+                    .lines()
+                    .count(),
+                7,
+                "one header + 6 rows at {w}: no wrap"
+            );
+            let hdr = header(w);
+            assert_eq!(hdr[0], "account");
+            assert_eq!(hdr[1], "signal");
+            assert_eq!(hdr[2], "session");
+        }
     }
 
     // --- issue #159: --json wire stays byte-stable vs #158 (no chart glyphs) ----------
@@ -3468,13 +3854,16 @@ mod tests {
     // --- AC: symmetric emphasis, facts only, deterministic render --------------------
 
     #[test]
-    fn summary_band_is_neutral_symmetric_and_deterministic() {
-        // The whole band, frozen: a per-account signal line (underused · balanced ·
-        // saturated) then the lowest-utilisation callout — MAGNITUDES and neutral
-        // descriptors only, no imperative, no forecast, no verdict.
+    fn summary_band_is_neutral_and_deterministic() {
+        // The bottom roster block, frozen: AGGREGATE-ONLY (§D-STA-5). Per-account signal /
+        // velocity / runway are TABLE COLUMNS now, never band lists — what remains is the
+        // lowest-utilisation callout, a MAGNITUDE and neutral descriptor (no imperative, no
+        // forecast, no verdict). `three_band_report` carries no velocity overlay and no weekly
+        // head-room, so there is no fleet line; the block is the single lowest-util line, 2-space
+        // indented and WITHOUT a trailing newline (the caller foots it with the roster line).
         assert_eq!(
-            render_summary(&three_band_report(), false),
-            "signal  aa underused · bb balanced · cc saturated\n        lowest utilisation: aa (session mean 10%)\n",
+            render_summary(&three_band_report()),
+            "  lowest utilisation: aa (session mean 10%)",
         );
     }
 
@@ -3494,13 +3883,16 @@ mod tests {
         );
         assert!(SignalBand::Balanced.sgr().is_empty(), "the middle is not");
 
-        // And in the rendered band: both deviation words are wrapped in the identical SGR,
-        // the middle word is plain — proof the colour half is symmetric too.
-        let colored = render_summary(&three_band_report(), true);
-        assert!(colored.contains("aa \x1b[33munderused\x1b[0m"));
-        assert!(colored.contains("cc \x1b[33msaturated\x1b[0m"));
+        // And in the rendered SIGNAL column: both deviation words are wrapped in the identical
+        // SGR, the balanced middle is plain — proof the colour half is symmetric too. The signal
+        // is a TABLE COLUMN now (§D-STA-5), so the emphasis is asserted on the chart-table cell,
+        // not on the (now aggregate-only) band.
+        let three = three_band_report();
+        let table = render_chart_table(&three, &keys(&three), 80, true, false);
+        assert!(table.contains("\x1b[33munderused\x1b[0m"));
+        assert!(table.contains("\x1b[33msaturated\x1b[0m"));
         assert!(
-            colored.contains("· bb balanced ·"),
+            table.contains("balanced") && !table.contains("\x1b[33mbalanced"),
             "balanced is not colour-wrapped"
         );
     }
@@ -3523,17 +3915,16 @@ mod tests {
 
     #[test]
     fn summary_band_shows_in_both_human_views_but_never_on_the_json_wire() {
-        // Human surfaces (numeric text + charts) both foot with the band.
+        // Human surfaces (numeric text + charts) both foot with the aggregate roster block.
         let text = render_text(&report_fixture());
         assert!(
-            text.contains("signal  "),
-            "the numeric text carries the band"
+            text.contains("lowest utilisation:"),
+            "the numeric text carries the roster block"
         );
-        assert!(text.contains("lowest utilisation:"));
         let charts = render_charts(&two_account_charts(), 60, false, false);
         assert!(
-            charts.contains("signal  "),
-            "the charts view carries the band"
+            charts.contains("lowest utilisation:"),
+            "the charts view carries the roster block"
         );
 
         // The band is HUMAN-only — none of its vocabulary reaches the schema:1 wire (which
@@ -3565,8 +3956,7 @@ mod tests {
         let all_gap = charts_report(&[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))], &[]);
         for report in [&three, &single, &all_gap] {
             for surface in [
-                render_summary(report, false),
-                render_summary(report, true),
+                render_summary(report),
                 render_text(report),
                 render_charts(report, 80, true, false),
             ] {
@@ -3584,9 +3974,11 @@ mod tests {
         json_keys(&serde_json::from_str(&json).unwrap(), &mut keys);
         assert_eq!(scan_banned(&keys.join(" ")), None, "json keys are neutral");
 
-        // The guard BITES: inject a banned word into a real render and it is caught — proof
-        // the test would FAIL if editorialising copy ever slipped into the band.
-        let poisoned = render_summary(&three, false).replace("balanced", "upgrade");
+        // The guard BITES: inject a banned word into a real render and it is caught — proof the
+        // test would FAIL if editorialising copy ever slipped in. Injected into the numeric text
+        // (which carries the `signal` column word `balanced`), the aggregate band having no
+        // per-account signal list to poison.
+        let poisoned = render_text(&three).replace("balanced", "upgrade");
         assert_eq!(
             scan_banned(&poisoned),
             Some("upgrade"),
@@ -3666,15 +4058,16 @@ mod tests {
             now,
         );
 
-        // Human: the numeric text foots with a neutral velocity + runway line — facts, no advice.
+        // Human: velocity + runway are TABLE COLUMNS now (§D-STA-5) — the header carries both and
+        // the `work` row its neutral %/min rate + approximate SESSION head-room (`~2h`), facts not
+        // advice. (The weekly head-room feeds the aggregate fleet line, not the per-row cell.)
         let text = render_text(&report);
+        assert!(text.contains("velocity"), "velocity column header: {text}");
+        assert!(text.contains("runway"), "runway column header: {text}");
+        assert!(text.contains("0.2%/min"), "the neutral rate cell: {text}");
         assert!(
-            text.contains("velocity  work 0.2%/min"),
-            "velocity line: {text}"
-        );
-        assert!(
-            text.contains("runway  work ~2h to trigger"),
-            "runway line: {text}"
+            text.contains("~2h"),
+            "the approximate session head-room cell: {text}"
         );
         assert_eq!(scan_banned(&text), None, "the real render is neutral");
 
@@ -3706,9 +4099,12 @@ mod tests {
             now,
         );
         let text = render_text(&report);
+        // The per-row runway cell is the SESSION head-room (`~2h`); the WEEKLY head-room feeds the
+        // aggregate fleet line (§D-STA-5 — weekly per-account is not a per-row cell), on day scale.
+        assert!(text.contains("~2h"), "session head-room cell: {text}");
         assert!(
-            text.contains("runway  work ~2h to trigger, weekly ~2 days"),
-            "session hours + weekly days on one entry: {text}"
+            text.contains("accounts last ~2 days at the current combined rate"),
+            "weekly head-room on the fleet line: {text}"
         );
         assert_eq!(scan_banned(&text), None, "the days render is neutral");
 
@@ -3737,13 +4133,12 @@ mod tests {
             now,
         );
         let text = render_text(&report);
+        // The velocity cell reads the KNOWN zero; the runway column — uniformly `—` across the
+        // fleet (no finite head-room) — elides entirely (§D-STA-5 empty-column elision).
+        assert!(text.contains("0.0%/min"), "known zero rate cell: {text}");
         assert!(
-            text.contains("velocity  work 0.0%/min"),
-            "known zero rate: {text}"
-        );
-        assert!(
-            text.contains("runway  work —"),
-            "unknown runway shown as —: {text}"
+            !text.contains("runway"),
+            "the all-unknown runway column elides: {text}"
         );
 
         let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
@@ -3768,8 +4163,8 @@ mod tests {
             "the account still appears in the table"
         );
         assert!(
-            !text.contains("velocity  "),
-            "no velocity line without a rate: {text}"
+            !text.contains("velocity"),
+            "no velocity column without a rate (elided): {text}"
         );
 
         let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
@@ -3802,8 +4197,8 @@ mod tests {
         );
         let text = render_text(&report);
         assert!(
-            !text.contains("velocity  "),
-            "a stale reading shows no velocity: {text}"
+            !text.contains("velocity"),
+            "a stale reading shows no velocity column (elided): {text}"
         );
 
         let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
@@ -3838,16 +4233,18 @@ mod tests {
             ],
             now,
         );
+        // The readout lives in the TABLE now (§D-STA-5). The piped numeric view always carries the
+        // velocity column (it is not width-degraded); every surface — the aggregate band included —
+        // stays neutral.
+        assert!(
+            render_text(&report).contains("velocity"),
+            "the piped table carries the velocity column"
+        );
         for surface in [
-            render_summary(&report, false),
-            render_summary(&report, true),
+            render_summary(&report),
             render_text(&report),
             render_charts(&report, 80, true, false),
         ] {
-            assert!(
-                surface.contains("velocity  "),
-                "the readout is present on the surface under test: {surface:?}"
-            );
             assert_eq!(
                 scan_banned(&surface),
                 None,
@@ -3882,7 +4279,6 @@ mod tests {
         assert_eq!(fmt_runway_days(432_000), "~5 days");
         assert_eq!(fmt_runway_days(86_400), "~1 day");
         assert_eq!(fmt_runway_days(18_000), "~5h"); // under a day falls back to hours
-        assert_eq!(fmt_runway(AccountVelocity::default()), "—"); // all-unknown → em dash
     }
 
     // --- AC (issue #544): fleet/roster runway aggregate ("accounts last ~X days") ------
@@ -3926,12 +4322,11 @@ mod tests {
             "pooled runway ≈ 164 400 s: {secs}"
         );
 
-        // Human: the band foots with ONE approximate, neutral fleet figure + the n-of-m cardinality.
+        // Human: the roster block foots with ONE approximate, neutral fleet figure + the n-of-m
+        // cardinality (§D-STA-5 — an aggregate line, 2-space indented, no per-account `fleet` prefix).
         let text = render_text(&report);
         assert!(
-            text.contains(
-                "fleet  accounts last ~2 days at the current combined rate (2 of 3 counted)"
-            ),
+            text.contains("  accounts last ~2 days at the current combined rate (2 of 3 counted)"),
             "fleet line: {text}"
         );
         assert_eq!(
@@ -4172,25 +4567,26 @@ mod tests {
         // Empty roster → the band is empty (nothing to summarise); the views print their
         // own "no per-account usage" line, never a panic.
         let empty = charts_report(&[], &[]);
-        assert_eq!(render_summary(&empty, false), "");
-        assert_eq!(render_summary(&empty, true), "");
+        assert_eq!(render_summary(&empty), "");
         let _ = render_text(&empty);
         let _ = render_charts(&empty, 80, true, false);
 
-        // A single account bands off its one reading and is its own lowest-utilisation pick.
+        // A single account is its own lowest-utilisation pick. The band is AGGREGATE-ONLY now
+        // (§D-STA-5) — the per-account `signal` word is a table column, not a band entry.
         let single = charts_report(&[("solo", stat(1, ds(0.5, 0.5, 0.5), 0.0, 1.0))], &[]);
-        let band = render_summary(&single, false);
-        assert!(band.contains("solo balanced"));
-        assert!(band.contains("lowest utilisation: solo"));
+        assert_eq!(
+            render_summary(&single),
+            "  lowest utilisation: solo (session mean 50%)"
+        );
 
-        // An all-gap account (present in the summary, absent from every bucket) still bands
-        // its summary reading — no panic, no fabricated data, still neutral.
+        // An all-gap account (present in the summary, absent from every bucket) still ranks as the
+        // lowest — no panic, no fabricated data, still neutral.
         let all_gap = charts_report(
             &[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))],
             &[&[], &[]],
         );
-        let band = render_summary(&all_gap, false);
-        assert!(band.contains("ghost underused"));
+        let band = render_summary(&all_gap);
+        assert!(band.contains("lowest utilisation: ghost"));
         assert_eq!(scan_banned(&band), None);
     }
 
@@ -4207,11 +4603,10 @@ mod tests {
             ],
             &[],
         );
-        let band = render_summary(&report, false);
-        assert!(band.contains("live balanced"));
+        let band = render_summary(&report);
         assert!(
             !band.contains("dark"),
-            "an unsampled account is not banded: {band:?}"
+            "an unsampled account is not in the aggregate block: {band:?}"
         );
         assert!(
             band.contains("lowest utilisation: live"),
@@ -4220,7 +4615,7 @@ mod tests {
 
         // A roster of ONLY unsampled accounts has nothing measured to summarise → empty band.
         let all_dark = charts_report(&[("dark", stat(0, ds(0.0, 0.0, 0.0), 0.0, 1.0))], &[]);
-        assert_eq!(render_summary(&all_dark, false), "");
+        assert_eq!(render_summary(&all_dark), "");
     }
 
     // --- issue #314: non-roster ("orphan") handle partition --------------------------
