@@ -48,6 +48,11 @@ final class StatusItemController {
     private let panelGap: CGFloat = 6
     /// The outside-click monitor installed WHILE the panel is open (see `openPanel`). `nil` when closed.
     private var dismissMonitor: Any?
+    /// Injected by `main.swift` to open the Settings window (issue #268). The controller owns the menu ENTRY
+    /// only; the window's lifecycle is the app's (a single app-retained `SettingsWindowController`), so this
+    /// is a closure seam — the same pattern as `captureModel.panelKeyRequest` — not a window reference held
+    /// here. `nil` (unwired) simply makes the menu item inert, exactly like the app degrading without it.
+    var onOpenSettings: (@MainActor () -> Void)?
 
     init(store: WatchStatusStore,
          captureClient: ControlCommandClient?,
@@ -201,6 +206,9 @@ final class StatusItemController {
         let addItem = NSMenuItem(title: "Add account…", action: #selector(addAccount), keyEquivalent: "")
         addItem.target = self
         menu.addItem(addItem)
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit Sessiometer", action: #selector(quit), keyEquivalent: "")
         quitItem.target = self
@@ -218,6 +226,15 @@ final class StatusItemController {
     @objc private func addAccount() {
         captureModel.requestCaptureSurface()
         openPanel()
+    }
+
+    /// Open the Settings window (issue #268) from the secondary-click menu — the OFF-PANEL home for cold-path
+    /// actions (the panel stays a pure display + manual-swap surface, C-005). Editing daemon tunables + roster
+    /// labels only; add / remove / re-auth stay in the CLI (never a GUI credential write). The window is owned
+    /// + lifecycle-managed by the app via the injected `onOpenSettings` seam, so an unwired controller simply
+    /// no-ops rather than reaching across into window management it does not own.
+    @objc private func openSettings() {
+        onOpenSettings?()
     }
 
     /// Quit the menu-bar app (a pure-client control). The daemon keeps running — its lifecycle is #170.

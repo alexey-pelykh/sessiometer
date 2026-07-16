@@ -292,4 +292,48 @@ enum Fixtures {
     static let noTypeTag = #"{"nope":1}"#
     /// A line that is not JSON — a hard error.
     static let notJSON = "not json"
+
+    // ---- config-get / config-set wire (issue #268) ------------------------------------------
+    // The `config-get` reply is a BARE `ConfigView` (or an `{"error":…}` envelope); the `config-set`
+    // reply is a `ConfigSetAck`. Hand-built to the `src/config.rs` / `src/daemon/socket.rs` contract:
+    // the `ConfigView` field order matches the Rust struct declaration, and every tunable carries a
+    // DISTINCT value so a swapped `CodingKey` is caught. Semantic decoders assert values order-
+    // independently, so these need not be byte-frozen (no golden guard, unlike the `watch` frames).
+
+    /// A `config-get` reply: the bare `ConfigView` — the 14 effective tunables (each a distinct value)
+    /// plus a two-account roster (one enabled, one parked). Mirrors `Config::view` (`src/config.rs`).
+    static let configViewBasic = #"""
+    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_trigger":90,"weekly_trigger":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"22222222-2222-2222-2222-222222222222","label":"personal","enabled":false}]}
+    """#
+
+    /// A drifted-daemon `config-get`: a well-formed `ConfigView` whose roster carries a DUPLICATE
+    /// `account_uuid`. It decodes cleanly (the wire types cannot forbid it), so the model must reject it at
+    /// adoption — degrade loudly as `.undecodable`, NEVER trap building the uuid→label map.
+    static let configViewDuplicateAccount = #"""
+    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_trigger":90,"weekly_trigger":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"duplicate","enabled":false}]}
+    """#
+
+    /// `config-get` when `config.toml` does not exist — the redacted `{"error":"no config"}` envelope.
+    static let configGetNoConfig = #"{"error":"no config"}"#
+
+    /// `config-get` when `config.toml` exists but does not parse — `{"error":"config unreadable"}`.
+    static let configGetUnreadable = #"{"error":"config unreadable"}"#
+
+    /// `config-set` applied, a tunable changed → effective on restart.
+    static let configSetAppliedRestart = #"{"result":"applied","effect":"restart_required"}"#
+
+    /// `config-set` applied, only a label changed → adopted live.
+    static let configSetAppliedLive = #"{"result":"applied","effect":"live"}"#
+
+    /// `config-set` applied, submitted values equalled current → no-op.
+    static let configSetAppliedUnchanged = #"{"result":"applied","effect":"unchanged"}"#
+
+    /// `config-set` rejected: a tunable out of range / cross-field violation; `detail` names the field.
+    static let configSetRejectedInvalid = #"""
+    {"result":"rejected","reason":"invalid","detail":"exhausted_poll_secs (3600) must be >= poll_secs (7200)"}
+    """#
+
+    /// `config-set` rejected: a label edit named an `account_uuid` no longer in the roster (stale client);
+    /// no `detail` (absent for every reason but `invalid`).
+    static let configSetRejectedUnknownAccount = #"{"result":"rejected","reason":"unknown-account"}"#
 }
