@@ -31,6 +31,17 @@
 //!     and stashes them under the swap lock (the #357 `capture_locked` primitive), reconciles the
 //!     in-memory roster, and returns a REDACTED ack (label + count, or a bare machine reason). The
 //!     client never touches a credential (the panel-originates-no-seam invariant, REQ-MBR-C-005).
+//!   - `config-get` (#268) — a non-secret READ projecting the effective config for the settings UI:
+//!     the scalar tunables + each roster account's `account_uuid` / `label` / `enabled`, never a
+//!     credential (issue #15). Un-auth-gated like `stats`, and answered OFF the run loop in a SPAWNED
+//!     task because the `config.toml` read is blocking `std::fs` (ADR-0001).
+//!   - `config-set` (#268) — the daemon-routed settings write, mirroring `swap` / `capture`: a
+//!     state-affecting command the daemon performs ITSELF (load→validate→save via the tested
+//!     `Config::apply_settings`), returning a REDACTED ack whose `effect` tells the UI whether the
+//!     change is live (a label, adopted via a roster reconcile) or needs a restart (a tunable). The
+//!     editable surface is tunables + existing-account LABELS only — never a credential or a roster
+//!     add/remove (structurally: `{"cmd":"config-set","tunables":{…},"labels":{"<uuid>":"<label>"}}`
+//!     re-parses under `deny_unknown_fields`, so a forbidden key is a hard `malformed request`).
 //!
 //! [`UnixControl`] is the production [`Control`] seam the run loop's idle select drives between
 //! polls; [`serve_control`] is its core, testable over an in-memory duplex and bounded in space
@@ -41,11 +52,16 @@
 //! `crate::daemon::*`, so relocating them is source-compatible for cli / capture and the
 //! in-module test suite (`mod tests`' `use super::*`).
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
 use super::*;
+
+use crate::config::SetTunables;
 
 /// A side effect a served control connection asks the run loop to apply after the
 /// reply is sent. `status` produces none (a pure read); each state-affecting command
@@ -119,6 +135,11 @@ pub(crate) enum ControlYield {
     /// run loop to perform the capture (needs `&mut Daemon`) and write the redacted ack — the
     /// daemon-routed sibling of `swap`, mirroring it 1:1.
     Capture(UnixStream, CaptureCommand),
+    /// A `config-set` command (issue #268): the open connection + the parsed edits, handed to the
+    /// run loop to apply them (needs `&mut Daemon` to reconcile a live label change) and write the
+    /// redacted ack — the config-editing sibling of `swap` / `capture`. (`config-get` is a spawned
+    /// read, like `stats`, so it never yields here — it produces a bare [`Signal(None)`](ControlYield::Signal).)
+    ConfigSet(UnixStream, Box<ConfigSetCommand>),
 }
 
 /// Control seam: serve control-socket connections. The production impl
@@ -227,6 +248,26 @@ impl Control for UnixControl {
                             let _ = serve_stats(stream, request).await;
                         });
                         ControlYield::Signal(None)
+                    }
+                    // A `config-get` command (issue #268): like `stats`, a non-secret READ answered
+                    // in a SPAWNED task so the blocking `config.toml` read never stalls the run loop's
+                    // idle select (ADR-0001). Un-auth-gated; it never mutates daemon state, so it
+                    // produces no signal.
+                    Ok(ServeOutcome::ConfigGet(stream)) => {
+                        tokio::spawn(async move {
+                            // Best-effort: a disconnected client or any I/O error just ends the
+                            // exchange (the reply carries nothing secret) — never affects the daemon.
+                            let _ = serve_config_get(stream).await;
+                        });
+                        ControlYield::Signal(None)
+                    }
+                    // A `config-set` command (issue #268): an authenticated, well-formed request whose
+                    // ack must reflect the REAL apply outcome (applied / rejected). Like `swap` /
+                    // `capture`, a stranger / malformed request was already answered inline; here the
+                    // OPEN connection is handed back so the run loop applies the edits where
+                    // `&mut Daemon` is available and writes the redacted ack itself.
+                    Ok(ServeOutcome::ConfigSet(stream, command)) => {
+                        ControlYield::ConfigSet(stream, command)
                     }
                     Err(_) => ControlYield::Signal(None),
                 }
@@ -361,6 +402,98 @@ pub(crate) struct CaptureCommand {
     /// The operator's label for the account, or `None` to auto-derive it from the account uuid
     /// (never the email — #15/#134).
     pub(crate) label: Option<String>,
+}
+
+/// A parsed `config-set` control request (issue #268): the tunable + label edits the settings UI
+/// submits, and NOTHING else — never a credential, never a roster add/remove. Handed from
+/// [`serve_control`] to the run loop (via [`ServeOutcome::ConfigSet`] → [`ControlYield::ConfigSet`])
+/// so the daemon applies them where `&mut Daemon` is available: load→validate→save through the
+/// tested [`Config::apply_settings`](crate::config::Config::apply_settings), then adopt a label
+/// change live (a tunable change is reload-by-restart). The safety boundary is STRUCTURAL —
+/// [`SetTunables`] and the uuid-keyed label map cannot express a credential or a roster structure change.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ConfigSetCommand {
+    /// The scalar `[tunables]` edits (each `None` = unedited); the allow-list is the type itself.
+    pub(crate) tunables: SetTunables,
+    /// `account_uuid` → new label, applied only to EXISTING accounts (an unmatched uuid rejects).
+    pub(crate) labels: BTreeMap<String, String>,
+}
+
+/// The STRICT wire schema for a `config-set` request (issue #268): re-parsed from the raw line AFTER
+/// the generic [`ControlRequest`] identified the command, with `#[serde(deny_unknown_fields)]` so a
+/// forbidden top-level key (a credential, a roster field, a mistyped section) is a hard parse error
+/// → `{"error":"malformed request"}`, never a silent no-op. The `tunables` sub-object is itself a
+/// deny-unknown allow-list ([`SetTunables`]); `labels` maps `account_uuid` → new label. Both default
+/// to empty, so a request may edit only tunables, only labels, or both.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigSetRequest {
+    /// Present and equal to `"config-set"` (already matched on the generic parse); declared so
+    /// `deny_unknown_fields` accepts the line. Not read again after the re-parse.
+    #[allow(dead_code)]
+    cmd: String,
+    #[serde(default)]
+    tunables: SetTunables,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+/// The redacted acknowledgement the daemon returns for a `config-set` control command (issue #268) —
+/// the ONLY thing a settings client learns about the outcome. Non-secret by construction (issue #15):
+/// a machine `result` tag plus, on success, an `effect` telling the UI whether the change is live (a
+/// label, adopted immediately), needs a restart (a tunable — the daemon derives its strategy fields
+/// once at construction), or was a no-op. Internally tagged on `result`, mirroring [`SwapAck`].
+/// Derives `Serialize` (the daemon writes it) + `Deserialize` (the client / tests read it back).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result")]
+pub(crate) enum ConfigSetAck {
+    /// The edits VALIDATED and were persisted (or were a no-op). `effect` says what the operator
+    /// must do for them to take effect.
+    Applied { effect: ConfigSetEffect },
+    /// The daemon REFUSED — ZERO writes. `detail` carries the non-secret validation message for the
+    /// `invalid` reason (the field-named range / cross-field error), absent for the others.
+    Rejected {
+        reason: ConfigSetRejection,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        detail: Option<String>,
+    },
+}
+
+/// What a successful `config-set` (issue #268) requires for its edits to take effect — the `effect`
+/// the UI renders (a "restart the daemon" hint vs nothing). Serialized snake_case. A batch that
+/// changes BOTH a tunable and a label reports `restart_required` (the operative action), even though
+/// the label is also adopted live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigSetEffect {
+    /// Only label(s) changed — adopted LIVE (the daemon reconciled its roster in-process); no restart.
+    Live,
+    /// A tunable changed — persisted, effective on the NEXT daemon start (no hot-reload). Restart hint.
+    RestartRequired,
+    /// The submitted values equalled the current ones — nothing was written.
+    Unchanged,
+}
+
+/// Why the daemon refused a `config-set` (issue #268) — a redacted, stable machine code (never a
+/// secret, never free-form). Serialized kebab-case. Mirrors [`SwapRejection`]'s stable-code contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ConfigSetRejection {
+    /// A tunable was out of range, or a cross-field rule failed (e.g. `exhausted_poll_secs < poll_secs`,
+    /// `target_max_session_usage > session_trigger`). The ack's `detail` names the offending field.
+    Invalid,
+    /// A label edit named an `account_uuid` matching no roster account (a stale client — the account
+    /// was `remove`d since its `config-get`).
+    UnknownAccount,
+    /// `config.toml` does not exist — nothing to edit (capture the first account via the CLI first).
+    NoConfig,
+    /// `config.toml` exists but could not be read / parsed — refused rather than overwrite a file the
+    /// daemon cannot understand.
+    ConfigUnreadable,
+    /// The validated config could not be persisted (an atomic-write failure) — the OLD file is intact.
+    SaveFailed,
+    /// The daemon has no wired config path (a hermetic default) — config-set is unavailable.
+    Unavailable,
 }
 
 /// A parsed `stats` control request (issue #356): the operator's OPTIONAL period selector, and
@@ -555,6 +688,17 @@ pub(crate) enum ServeOutcome<RW> {
     /// non-secret read, so an authenticated peer is NOT required, and the request is ALWAYS
     /// well-formed (the period is optional and validated in the task).
     Stats(RW, StatsRequest),
+    /// A `config-get` command (issue #268); the connection is handed back — NO reply written yet —
+    /// for the caller to answer in a SPAWNED task ([`serve_config_get`]), like `stats`, so the
+    /// blocking `config.toml` read runs OFF the run loop (ADR-0001). UN-auth-gated (a non-secret
+    /// read) and param-less, so ALWAYS well-formed.
+    ConfigGet(RW),
+    /// An authenticated, well-formed `config-set` command (issue #268); the connection is handed
+    /// back — NO reply written yet — for the caller (the run loop) to apply the edits (needs
+    /// `&mut Daemon` to reconcile a live label change) via [`Config::apply_settings`](crate::config::Config::apply_settings)
+    /// and write the redacted ack from the real outcome. An unauthenticated peer or an unparseable /
+    /// forbidden-key request is answered inline (a `OneShot(None)`).
+    ConfigSet(RW, Box<ConfigSetCommand>),
 }
 
 /// Serve one control exchange: read one newline-delimited JSON request and either write one
@@ -658,6 +802,43 @@ where
                     },
                 ));
             }
+            // A `config-get` command (issue #268): a non-secret READ of the effective config
+            // (tunables + redacted roster labels, like `status` / `stats`), so — unlike `config-set`
+            // below — it is NOT auth-gated. Hand the connection to the spawned `serve_config_get`
+            // task so the blocking `config.toml` read runs OFF the run loop (ADR-0001), exactly like
+            // `stats`. It carries no params, so an authenticated peer is never required and there is
+            // no malformed-inline case.
+            Ok(request) if request.cmd == "config-get" => {
+                return Ok(ServeOutcome::ConfigGet(buffered.into_inner()));
+            }
+            // A `config-set` command (issue #268): STATE-AFFECTING (it writes `config.toml`), so
+            // authenticate FIRST (like `swap` / `capture`). An unauthenticated peer gets
+            // `{"error":"unauthorized"}` and NO handoff — the edit never reaches the run loop, and a
+            // stranger learns nothing past the rejection. Then RE-PARSE the line STRICTLY
+            // (`deny_unknown_fields`) so a forbidden top-level key (a credential, a roster field) is a
+            // loud `malformed request`, never a silent no-op; the `tunables` sub-object is itself a
+            // deny-unknown allow-list. A well-formed authenticated request hands the OPEN connection
+            // back so the run loop applies the edits (needs `&mut Daemon`) and writes the redacted ack
+            // from the REAL outcome — an outcome this pure serve cannot know.
+            Ok(request) if request.cmd == "config-set" => {
+                if !peer_authenticated {
+                    write_line(&mut buffered, r#"{"error":"unauthorized"}"#).await?;
+                    return Ok(ServeOutcome::OneShot(None));
+                }
+                return match serde_json::from_str::<ConfigSetRequest>(trimmed) {
+                    Ok(set_request) => Ok(ServeOutcome::ConfigSet(
+                        buffered.into_inner(),
+                        Box::new(ConfigSetCommand {
+                            tunables: set_request.tunables,
+                            labels: set_request.labels,
+                        }),
+                    )),
+                    Err(_) => {
+                        write_line(&mut buffered, r#"{"error":"malformed request"}"#).await?;
+                        Ok(ServeOutcome::OneShot(None))
+                    }
+                };
+            }
             _ => {}
         }
         let (reply, signal) = control_reply(trimmed, snapshot, peer_authenticated);
@@ -703,6 +884,12 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Stats(..) => {
                 panic!("expected a one-shot reply, got a stats handoff")
             }
+            ServeOutcome::ConfigGet(_) => {
+                panic!("expected a one-shot reply, got a config-get handoff")
+            }
+            ServeOutcome::ConfigSet(..) => {
+                panic!("expected a one-shot reply, got a config-set handoff")
+            }
         }
     }
 
@@ -715,6 +902,12 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Watch(_) => panic!("expected a swap handoff, got a watch subscription"),
             ServeOutcome::Capture(..) => panic!("expected a swap handoff, got a capture handoff"),
             ServeOutcome::Stats(..) => panic!("expected a swap handoff, got a stats handoff"),
+            ServeOutcome::ConfigGet(_) => {
+                panic!("expected a swap handoff, got a config-get handoff")
+            }
+            ServeOutcome::ConfigSet(..) => {
+                panic!("expected a swap handoff, got a config-set handoff")
+            }
         }
     }
 
@@ -730,6 +923,12 @@ impl<RW> ServeOutcome<RW> {
             }
             ServeOutcome::Swap(..) => panic!("expected a capture handoff, got a swap handoff"),
             ServeOutcome::Stats(..) => panic!("expected a capture handoff, got a stats handoff"),
+            ServeOutcome::ConfigGet(_) => {
+                panic!("expected a capture handoff, got a config-get handoff")
+            }
+            ServeOutcome::ConfigSet(..) => {
+                panic!("expected a capture handoff, got a config-set handoff")
+            }
         }
     }
 
@@ -742,6 +941,57 @@ impl<RW> ServeOutcome<RW> {
             ServeOutcome::Watch(_) => panic!("expected a stats handoff, got a watch subscription"),
             ServeOutcome::Swap(..) => panic!("expected a stats handoff, got a swap handoff"),
             ServeOutcome::Capture(..) => panic!("expected a stats handoff, got a capture handoff"),
+            ServeOutcome::ConfigGet(_) => {
+                panic!("expected a stats handoff, got a config-get handoff")
+            }
+            ServeOutcome::ConfigSet(..) => {
+                panic!("expected a stats handoff, got a config-set handoff")
+            }
+        }
+    }
+
+    /// The handed-back stream of a [`ConfigGet`](ServeOutcome::ConfigGet) outcome, panicking on any
+    /// other — for the issue-#268 config-get-handoff tests, which always expect a config-get.
+    pub(crate) fn config_get(self) -> RW {
+        match self {
+            ServeOutcome::ConfigGet(stream) => stream,
+            ServeOutcome::OneShot(_) => {
+                panic!("expected a config-get handoff, got a one-shot reply")
+            }
+            ServeOutcome::Watch(_) => {
+                panic!("expected a config-get handoff, got a watch subscription")
+            }
+            ServeOutcome::Swap(..) => panic!("expected a config-get handoff, got a swap handoff"),
+            ServeOutcome::Capture(..) => {
+                panic!("expected a config-get handoff, got a capture handoff")
+            }
+            ServeOutcome::Stats(..) => panic!("expected a config-get handoff, got a stats handoff"),
+            ServeOutcome::ConfigSet(..) => {
+                panic!("expected a config-get handoff, got a config-set handoff")
+            }
+        }
+    }
+
+    /// The handed-back stream + parsed command of a [`ConfigSet`](ServeOutcome::ConfigSet) outcome,
+    /// panicking on any other — for the issue-#268 config-set-handoff tests, which always expect a
+    /// config-set.
+    pub(crate) fn config_set(self) -> (RW, ConfigSetCommand) {
+        match self {
+            ServeOutcome::ConfigSet(stream, command) => (stream, *command),
+            ServeOutcome::OneShot(_) => {
+                panic!("expected a config-set handoff, got a one-shot reply")
+            }
+            ServeOutcome::Watch(_) => {
+                panic!("expected a config-set handoff, got a watch subscription")
+            }
+            ServeOutcome::Swap(..) => panic!("expected a config-set handoff, got a swap handoff"),
+            ServeOutcome::Capture(..) => {
+                panic!("expected a config-set handoff, got a capture handoff")
+            }
+            ServeOutcome::Stats(..) => panic!("expected a config-set handoff, got a stats handoff"),
+            ServeOutcome::ConfigGet(_) => {
+                panic!("expected a config-set handoff, got a config-get handoff")
+            }
         }
     }
 }
@@ -913,6 +1163,67 @@ where
 {
     let line = serde_json::to_string(ack)
         .unwrap_or_else(|_| r#"{"result":"rejected","reason":"failed"}"#.to_owned());
+    write_line(&mut stream, &line).await
+}
+
+/// Answer one `config-get` control request (issue #268) in a SPAWNED task: project the effective
+/// `config.toml` to the non-secret [`ConfigView`](crate::config::ConfigView) and write it as one
+/// newline-delimited JSON reply, then close. Spawned (like `stats`, [`UnixControl::serve`]) so the
+/// blocking `config.toml` read never stalls the run loop's idle select — the read is blocking
+/// `std::fs` inside [`config_get_reply`], so it runs in [`tokio::task::spawn_blocking`], OFF the
+/// single runtime thread (ADR-0001). Non-secret by construction: the view carries only tunables +
+/// already-redacted roster labels (issue #15), never a credential. Best-effort + time-boxed
+/// ([`SWAP_ACK_WRITE_TIMEOUT`]): a disconnected / wedged client just drops the reply. Generic over the
+/// stream so it is testable over an in-memory duplex, exactly like [`serve_stats`].
+pub(crate) async fn serve_config_get<RW>(mut stream: RW) -> Result<()>
+where
+    RW: tokio::io::AsyncWrite + Unpin,
+{
+    // The config read is blocking `std::fs`; move it OFF the runtime thread (ADR-0001), exactly like
+    // `serve_stats`. A join error (the closure panicked) degrades to the same non-secret envelope.
+    let reply = tokio::task::spawn_blocking(|| match crate::paths::config_file() {
+        Ok(path) => config_get_reply(&path),
+        Err(_) => r#"{"error":"config unreadable"}"#.to_owned(),
+    })
+    .await
+    .unwrap_or_else(|_| r#"{"error":"config unreadable"}"#.to_owned());
+    // The reply carries nothing secret, so a disconnected client just drops it; time-box the write so
+    // a wedged client can never park the spawned task indefinitely (mirrors `serve_stats`).
+    let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_line(&mut stream, &reply)).await;
+    Ok(())
+}
+
+/// Build the `config-get` reply (issue #268): read `path`, project the effective config to the
+/// non-secret [`ConfigView`](crate::config::ConfigView), and serialize it COMPACT for the newline
+/// frame. A missing file → `{"error":"no config"}` (capture the first account via the CLI first); an
+/// unreadable / invalid one → `{"error":"config unreadable"}`. Blocking `std::fs`, so the caller runs
+/// it in `spawn_blocking`. Non-secret: the view carries only tunables + redacted labels (issue #15).
+pub(crate) fn config_get_reply(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match crate::config::Config::view_from_text(&text) {
+            Ok(view) => serde_json::to_string(&view)
+                .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.to_owned()),
+            Err(_) => r#"{"error":"config unreadable"}"#.to_owned(),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            r#"{"error":"no config"}"#.to_owned()
+        }
+        Err(_) => r#"{"error":"config unreadable"}"#.to_owned(),
+    }
+}
+
+/// Write a redacted [`ConfigSetAck`] as one newline-delimited JSON line to a `config-set` client
+/// (issue #268) — the run loop's counterpart of `serve_control`'s one-shot reply, written AFTER the
+/// edits are applied (the ack must reflect the real outcome). The exact sibling of
+/// [`write_swap_ack`] / [`write_capture_ack`], sharing [`SWAP_ACK_WRITE_TIMEOUT`] in the run loop.
+/// Non-secret: a `result` tag + effect / reason (issue #15). Takes the stream BY VALUE so it closes
+/// on return; a write failure propagates so the caller drops it best-effort.
+pub(crate) async fn write_config_set_ack<W>(mut stream: W, ack: &ConfigSetAck) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(ack)
+        .unwrap_or_else(|_| r#"{"result":"rejected","reason":"save-failed"}"#.to_owned());
     write_line(&mut stream, &line).await
 }
 
