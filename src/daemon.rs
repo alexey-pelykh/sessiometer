@@ -290,6 +290,32 @@ const BLIND_GATE_RISK_BAND: f64 = 0.60;
 /// horizon / guard / α; this floor is an internal soundness bound on the smoothing, not a policy dial.
 const MIN_VELOCITY_SAMPLES: u32 = 2;
 
+/// Trailing window over which the #582 circuit-breaker counts server-`Retry-After`-driven
+/// preemptive swaps to detect a THROTTLE WALK — the roster-wide failure mode where the throttle
+/// follows the ACTIVE ROLE rather than any one account, so each swap merely hands the `429` to the
+/// next account (observed 2026-07-17: three distinct accounts each took an `RA:3600` within
+/// minutes of taking the slot — at +12m, +4m22s and +2m43s — while their peers never got one).
+///
+/// Scaled at the pathological directive that motivates the path (`Retry-After: 3600`): the window
+/// must span the throttle it is detecting, or the walk resets its own counter between hops and the
+/// breaker never trips. The observed hop spacing (≤ 12m) sits well inside it.
+///
+/// A compile-time internal soundness bound, NOT an operator dial (the same standing as
+/// [`BLIND_GATE_SECS`] / [`MIN_VELOCITY_SAMPLES`]): the kill-switch for the whole path remains the
+/// existing `session_blind_swap_secs` tunable, so this adds no config surface (issue #582 AC).
+const RETRY_AFTER_WALK_WINDOW: Duration = Duration::from_secs(3600);
+
+/// How many server-`Retry-After`-driven preemptive swaps inside [`RETRY_AFTER_WALK_WINDOW`] trip
+/// the #582 circuit-breaker: at/over this count the path HOLDS POSITION and alarms rather than
+/// keep rotating, because holding a blind-but-low account beats walking a 3600 s throttle onto the
+/// last good one.
+///
+/// `2` is the smallest count that can distinguish a WALK from a single unlucky throttle: one
+/// server-throttled account is a local event (swap away from it), whereas a SECOND one — on the
+/// account we just swapped TO — is the roster-wide pattern itself, and evidence the next hop would
+/// only move the throttle again. So the breaker permits at most two hops per window, then stops.
+const RETRY_AFTER_WALK_MAX: usize = 2;
+
 /// The ADR-0017 preemptive-gate ARMING predicate on the retained pre-blind anchor: blind past the
 /// interim [`BLIND_GATE_SECS`] (strict `>`) AND the anchor at/over the interim [`BLIND_GATE_RISK_BAND`]
 /// (`>=`). The SINGLE source of truth for "the gate is armed", so [`blind_active_view`]'s
@@ -298,6 +324,27 @@ const MIN_VELOCITY_SAMPLES: u32 = 2;
 /// negation) rather than re-encoding the two comparisons independently.
 fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
     blind_secs > BLIND_GATE_SECS && anchor_session >= BLIND_GATE_RISK_BAND
+}
+
+/// The RAW server-advised `Retry-After` (pre-cap, issue #295) STILL holding `health`'s account off
+/// its usage poll at `at` (issue #582), or `None` when the account's back-off window is the daemon's
+/// own self-capped exponential, has lapsed, or was never armed. The SINGLE source of truth for "the
+/// server is still enforcing a directive on this account", so [`blind_swap`](Daemon::blind_swap)'s
+/// server-directed arm (which decides the swap) and [`blind_active_view`]'s
+/// `auto_protection_degraded` projection (which reports it to `status`) cannot drift apart — exactly
+/// as [`blind_gate_armed`] is the shared predicate for the anchor arm.
+///
+/// Requires the window to still be OPEN (`poll_backoff_until > at`), not merely that a directive was
+/// once seen: a lapsed window means the daemon may re-poll the account NOW, so it may be about to
+/// recover on its own and a swap-away would be premature — only a directive the server is STILL
+/// enforcing is evidence the blindness will persist. Cheap conservatism, not a coverage gap: the
+/// pathological case this path exists for (`Retry-After: 3600`) holds its window open across the
+/// whole episode, and a short directive that lapses simply re-polls and either recovers (clearing
+/// the retained value) or re-arms. A pure read of `health`.
+fn server_retry_after_holding(health: &AccountHealth, at: Instant) -> Option<Duration> {
+    let retry_after = health.poll_backoff_retry_after?;
+    let until = health.poll_backoff_until?;
+    (until > at).then_some(retry_after)
 }
 
 /// How long (seconds) `status` NARRATES a #452 bounded-blindness preemptive swap (issue #479) after
@@ -332,13 +379,24 @@ const BLIND_PREEMPT_NOTICE_SECS: u64 = 300;
 /// - a retained anchor exists (`anchor` is `Some`, #450) — never a spurious projection on a
 ///   genuinely-unknown account with no reading to key off.
 ///
-/// `auto_protection_degraded` is the shared [`blind_gate_armed`] predicate — the SAME arming test
-/// [`Daemon::note_blind_gate_eligibility`] gates on (there as its negation), so the two projections
-/// cannot drift apart.
+/// `auto_protection_degraded` is `true` when EITHER preemptive-swap arm is active on this blind
+/// account: the anchor arm ([`blind_gate_armed`] — the SAME arming test
+/// [`Daemon::note_blind_gate_eligibility`] gates on, there as its negation), OR the #582
+/// server-directed arm (`server_retry_after_hold` AND blind past the interim [`BLIND_GATE_SECS`]).
+/// Both projections mirror the DECISION arms so `status` cannot claim "auto-protection OK" while the
+/// daemon has actually stopped protecting the account — the exact episode issue #582 was filed about
+/// (a below-band account blind behind a `Retry-After: 3600`, burning, while `status` said OK).
+///
+/// `server_retry_after_hold` is [`server_retry_after_holding`]`.is_some()` for THIS account — the
+/// same shared predicate `blind_swap` decides on, so the report and the decision cannot drift. The
+/// interim-const duration gate (not the config `session_blind_swap_secs`) matches the anchor arm's:
+/// the status reflects the TRUE degraded state even when the kill-switch has disabled the swap,
+/// exactly as `blind_gate_armed` does for the SLIs.
 fn blind_active_view(
     anchor: Option<LastGood>,
     active_is_blind: bool,
     quarantined: bool,
+    server_retry_after_hold: bool,
     at: Instant,
 ) -> Option<BlindActive> {
     if quarantined || !active_is_blind {
@@ -349,7 +407,8 @@ fn blind_active_view(
     Some(BlindActive {
         blind_secs,
         last_known_session_pct: to_pct(anchor.session),
-        auto_protection_degraded: blind_gate_armed(blind_secs, anchor.session),
+        auto_protection_degraded: blind_gate_armed(blind_secs, anchor.session)
+            || (blind_secs > BLIND_GATE_SECS && server_retry_after_hold),
     })
 }
 
@@ -1458,6 +1517,28 @@ pub(crate) struct AccountHealth {
     /// first throttle; on the same monotonic clock as
     /// [`last_keep_warm_attempt`](Self::last_keep_warm_attempt).
     poll_backoff_until: Option<Instant>,
+    /// The RAW server-advised `Retry-After` that armed this account's CURRENT back-off window
+    /// (issue #582), or `None` when the window is the daemon's OWN self-capped exponential (the
+    /// server sent no header, OR sent a ZERO one — which contributes nothing to the wait, so it is
+    /// normalized to `None` here per the issue's `ra > 0` classification) or no window is armed at
+    /// all. So a `Some` means exactly "a server directive is holding this account off, and it is
+    /// the reason the window is as long as it is". Written and cleared in exact lockstep
+    /// with [`poll_backoff_until`](Self::poll_backoff_until) by
+    /// [`note_account_backoff`](Daemon::note_account_backoff), so the pair is never torn: a `Some`
+    /// here always describes the window `poll_backoff_until` is currently holding open.
+    ///
+    /// RETAINED (rather than left riding the tick-local `TickBackoff` / the durable
+    /// [`Event::UsageBackoff`]) because the #582 swap-away arm must read it at DECISION time, on a
+    /// later tick than the throttled poll that armed it: the active account is polled only every
+    /// ~2 sub-intervals (the #366 interleave) and is SKIPPED entirely while backing off, so the
+    /// tick that decides is almost never the tick that observed the `429`. `Option<Duration>`, not
+    /// a bool: the raw value is what the swap-away path reports (`retry_after_secs=`), and it is
+    /// the pre-cap server directive (#295) — never the clamped effective wait.
+    ///
+    /// Diagnostic / decision state ONLY. It arms no back-off and floors no wait — the #453
+    /// absolute-floor arithmetic in `note_account_backoff` reads `signal.retry_after` directly and
+    /// is untouched by this field's existence.
+    poll_backoff_retry_after: Option<Duration>,
     /// The monotonic-[`Clock`] instant before which this NON-active account's poll is SKIPPED
     /// because it is OUT OF ROTATION — weekly- or session-exhausted (issue #537). Armed by a
     /// SUCCESSFUL poll whose reading is out of rotation
@@ -1500,6 +1581,28 @@ struct DecisionState {
     /// [`BlindPreemptSwapRecord`]. `None` by default (no preemptive swap yet). DEDICATED, kept off the
     /// cooldown-bearing `last_swap` above.
     last_blind_preempt_swap: Option<BlindPreemptSwapRecord>,
+    /// Monotonic-[`Clock`] instants of recent server-`Retry-After`-driven preemptive swaps (issue
+    /// #582) — the #582 circuit-breaker's evidence that the throttle is WALKING the roster rather
+    /// than afflicting one account. Appended by [`Daemon::blind_swap`] on each swap it fires away
+    /// from a server-throttled active, and pruned to [`RETRY_AFTER_WALK_WINDOW`] on read, so the
+    /// vector holds at most a handful of entries (one per swap, and the path swaps at most
+    /// [`RETRY_AFTER_WALK_MAX`] times per window before it stops).
+    ///
+    /// Records EVERY server-throttled preemptive swap — including one the ratified #452 anchor
+    /// band would have fired anyway — because the walk is a property of the THROTTLE moving, not
+    /// of which arm authorised the move. Only the #582 arm ever CONSULTS the record, so a #452
+    /// anchor-band swap is never blocked by it (its ratified behaviour is preserved exactly);
+    /// counting those swaps only ever makes the newer, more speculative arm more conservative.
+    retry_after_swaps: Vec<Instant>,
+    /// Edge-trigger guard for the #582 reserve hold: set when the "would spend the LAST viable
+    /// target" event is emitted, and cleared on any tick where the active is no longer blind, or
+    /// on any swap. So the signal fires once per episode rather than on each of the ~240 ticks a
+    /// 3600 s blind window spans. Mirrors the `signaled_all_exhausted` idiom.
+    signaled_retry_after_reserve: bool,
+    /// Edge-trigger guard for the #582 throttle-walk alarm, cleared exactly like
+    /// [`signaled_retry_after_reserve`](Self::signaled_retry_after_reserve) above. Mirrors the
+    /// `signaled_all_exhausted` idiom.
+    signaled_retry_after_walk: bool,
     /// Per-account health carried across ticks (issue #42), indexed by roster
     /// position: the consecutive-401 streak (feeding the `monitor_401` log event and
     /// the dead-credential threshold), the quarantine flag, and the recovery-probe
@@ -3658,6 +3761,12 @@ where
         let Some(active_usage) = readings[active_idx] else {
             return self.blind_swap(at, active_idx, readings, events).await;
         };
+        // The active is READING again, so any #582 blind episode is over: re-arm the
+        // circuit-breaker's edge-trigger guards (the LEAVE edge, mirroring `signaled_all_exhausted`)
+        // so a LATER episode reports its holds afresh instead of being silenced by a stale guard.
+        // The swap paths re-arm them too, via `record_swap`; this covers recovery WITHOUT a swap.
+        self.state.signaled_retry_after_reserve = false;
+        self.state.signaled_retry_after_walk = false;
         // Draw this cycle's swap-away triggers (issues #38, #41): each jittered +
         // clamped to 50..=99 percent, then to a fraction for the decision. The
         // session and weekly triggers are independent — swap when EITHER dimension
@@ -3819,6 +3928,12 @@ where
         // shared swap path); a blind-preempt swap re-sets its OWN notice right after this call, and a
         // differently-targeted swap self-invalidates the notice at projection time anyway.
         self.state.last_blind_preempt_swap = None;
+        // Issue #582: a swap ENDS the blind episode the circuit-breaker's holds were reported
+        // against (the active account is changing), so re-arm both edge-trigger guards here — the
+        // shared swap path — and a hold taken against the NEW active reports afresh rather than
+        // being swallowed as a duplicate of the old one's.
+        self.state.signaled_retry_after_reserve = false;
+        self.state.signaled_retry_after_walk = false;
         if let Ok(incoming_stashed) = self.stash.read(incoming).await {
             self.state
                 .canonical_watch
@@ -4567,11 +4682,60 @@ where
     /// anchor (`last_good`, #450), NEVER the missing reading, and swaps only when ALL hold:
     ///
     /// - blind past the config `session_blind_swap_secs` (strict `>`), AND
-    /// - the anchor sat at/over the config `session_blind_risk_band`, AND
+    /// - EITHER the anchor sat at/over the config `session_blind_risk_band` (the ratified #452
+    ///   arm) OR a nonzero server `Retry-After` is still holding the account off its usage poll
+    ///   (the #582 arm, below), AND
     /// - a viable target exists — a peer under `target_max_session_usage` (ADR-0013), chosen via
-    ///   [`pick_target`] with the BASE (un-jittered) triggers, exactly as
+    ///   [`pick_target_with_reason`] with the BASE (un-jittered) triggers, exactly as
     ///   [`note_blind_gate_eligibility`](Self::note_blind_gate_eligibility)'s premise SLI (#482)
-    ///   previews it, so the swap fires where the SLI recorded the gate eligible.
+    ///   previews it. For the ANCHOR arm the swap therefore fires where that SLI recorded the gate
+    ///   eligible; the #582 server arm fires BELOW the band, where the anchor-keyed
+    ///   `note_blind_gate_eligibility` deliberately records nothing (it measures the #451/#484
+    ///   anchor-band premise, not this one) — the #582 holds are surfaced by their own durable
+    ///   events instead ([`Event::BlindPreemptReserveHold`] / [`Event::RetryAfterWalk`]).
+    ///
+    /// # The server-`Retry-After` arm (issue #582)
+    ///
+    /// A `429` carrying a long `Retry-After` on the ACTIVE account arms an UN-CLAMPED back-off
+    /// (issue #453 makes the server directive an absolute floor) and the failed poll clears the
+    /// reading — so the consumed credential goes blind for the directive's whole duration while
+    /// Claude Code keeps burning it. Below the risk band that blindness was unreachable by EVERY
+    /// swap path: the reactive `session_trigger` and the #539 velocity projection both need a
+    /// FRESH reading, and the #452 arm above needs `anchor >= session_blind_risk_band` (observed
+    /// 2026-07-17: an anchor of `0.29` burned to exhaustion behind a `Retry-After: 3600`).
+    ///
+    /// So a nonzero server `Retry-After` on the active account is treated as a swap-away SIGNAL in
+    /// its own right, wherever the anchor sat: a known ≥1 h unobservability on the credential
+    /// being consumed is per se unacceptable, and a swap needs no usage poll, so it works while
+    /// blind. Clamping the directive instead was rejected — it is outcome-identical to doing
+    /// nothing (every clamped re-poll 429s and re-clears the reading, so the account stays blind)
+    /// and would invert issue #453's ratified absolute-floor AC. This arm changes NO back-off
+    /// arithmetic; it reads the retained directive
+    /// ([`server_retry_after_holding`]) purely as a decision
+    /// input, and reuses `reason=blind_preempt` + the `session_blind_swap_secs` bound (so the
+    /// documented kill-switch still disables BOTH arms, and no new tunable is introduced).
+    ///
+    /// # The circuit-breaker (issue #582)
+    ///
+    /// The throttle follows the ACTIVE ROLE, not the account: each account observed took its
+    /// `RA:3600` within minutes of TAKING the slot, while peers never got one. An unbounded
+    /// swap-away therefore WALKS the throttle around the roster, so this arm is bounded twice —
+    /// and both bounds apply ONLY when it is firing on its own authority (a server directive with
+    /// the anchor BELOW the band). A swap the ratified #452 arm would have fired anyway is left
+    /// exactly as it was; the breaker can only ever make the newer, more speculative arm yield:
+    ///
+    /// - **Never spend the LAST viable target.** This swap acts on a directive, not on observed
+    ///   near-limit usage, so it must yield the final target to a CONFIRMED-exhaustion swap rather
+    ///   than consume it on a guess. Detected via [`NextSwapReason::OnlyCandidate`] (the existing
+    ///   `candidate_count < 2` verdict) and reported as [`Event::BlindPreemptReserveHold`] — the
+    ///   AC's "reported, not hidden".
+    /// - **Stop the walk.** At/over `RETRY_AFTER_WALK_MAX` server-throttled preemptive swaps
+    ///   inside `RETRY_AFTER_WALK_WINDOW`, rotation STOPS and [`Event::RetryAfterWalk`] alarms:
+    ///   holding a blind-but-low account beats walking a 3600 s throttle onto the last good one.
+    ///
+    /// Both holds are edge-triggered (once per blind episode, not per tick — a 3600 s window spans
+    /// hundreds of ticks) and both fall through to the historical
+    /// [`TickAction::SkippedActiveUnavailable`].
     ///
     /// Unlike [`emergency_swap`](Self::emergency_swap) (dead active, #42) this does NOT drop the
     /// target reserve to `f64::INFINITY` and does NOT bypass cooldown — ADR-0017 keeps the
@@ -4600,11 +4764,22 @@ where
         // without blinding #484's ratification SLIs): blind past `session_blind_swap_secs` AND
         // the anchor at/over `session_blind_risk_band`.
         let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
+        let anchor_armed = anchor.session >= self.session_blind_risk_band;
+        // Issue #582: the server-directed arm. A nonzero `Retry-After` STILL holding the active
+        // account off its poll arms the gate on its OWN, wherever the anchor sat — below the band
+        // that blindness is otherwise unreachable by every swap path (see the doc comment). Shares
+        // condition 1 (`session_blind_swap_secs`), so the kill-switch disables both arms.
+        let retry_after = server_retry_after_holding(&self.state.health[active_idx], at);
         if !(blind_elapsed > self.session_blind_swap_secs
-            && anchor.session >= self.session_blind_risk_band)
+            && (anchor_armed || retry_after.is_some()))
         {
             return TickAction::SkippedActiveUnavailable;
         }
+        // The #582 circuit-breaker's subject: the server-directed arm firing on its OWN authority —
+        // a directive with the anchor BELOW the band. When the anchor IS armed the ratified #452
+        // swap fires regardless of the directive, so bounding it there would regress a ratified AC;
+        // `None` here leaves that path byte-for-byte unchanged.
+        let speculative = retry_after.filter(|_| !anchor_armed);
         // #80 warm-up: until the staggered loop has polled every rotation account once, the
         // carried readings are partial — a viable-target verdict off them could be spurious, so
         // hold (skip) until the first cycle completes. Mirrors the reactive path + the SLI guard.
@@ -4623,13 +4798,44 @@ where
                 return TickAction::SkippedCooldown;
             }
         }
+        // Prune the walk record UNCONDITIONALLY (issue #582), even on the anchor-armed path that
+        // appends to it but is not subject to the breaker below: the append keys on
+        // `retry_after.is_some()` (any server-throttled swap) while the breaker consults only
+        // `speculative`, so without a prune here an anchor-armed episode would grow the vector
+        // without bound (its own doc invariant). Pruning always keeps the count honest and the
+        // vector at most a handful of entries whichever arm fired.
+        let recent_retry_after_swaps = self.retry_after_walk_count(at);
+        // #582 circuit-breaker 1 — STOP THE WALK. Checked before target selection: this is a
+        // "rotation itself is counter-productive" verdict, so it holds whatever targets exist.
+        // At/over the limit, each further swap would only hand the throttle to the next account
+        // (it follows the ACTIVE ROLE, not the credential), so hold position and alarm.
+        if let Some(ra) = speculative {
+            let swaps = recent_retry_after_swaps;
+            if swaps >= RETRY_AFTER_WALK_MAX {
+                if !self.state.signaled_retry_after_walk {
+                    events.push(Event::RetryAfterWalk {
+                        account: self.roster[active_idx].account_uuid.clone(),
+                        swaps,
+                        window_secs: RETRY_AFTER_WALK_WINDOW.as_secs(),
+                        retry_after_secs: ra.as_secs(),
+                    });
+                    self.state.signaled_retry_after_walk = true;
+                }
+                return TickAction::SkippedActiveUnavailable;
+            }
+        }
         // Gate condition 3 (ADR-0017): a viable target — a peer under `target_max_session_usage`
         // (ADR-0013), the reserve HONORED (NOT the emergency `None` / `f64::INFINITY` bypass).
         // BASE (un-jittered) triggers, the same preview `note_blind_gate_eligibility` /
         // `next_swap` use, so the fired swap matches the recorded premise. None → the SLI
         // already logged a no-viable-target episode; fall through to the historical skip (never
         // swap among saturated / exhausted peers).
-        let Some(target_idx) = pick_target(
+        //
+        // `pick_target_with_reason` rather than `pick_target` (issue #582): selection is IDENTICAL
+        // (the index-only projection just discards the reason), but the RETAINED reason carries the
+        // viable-set cardinality the reserve breaker below needs — so the #452 path picks exactly
+        // the target it always did, and #582 reads the count without a second, driftable filter.
+        let Some((target_idx, target_reason)) = pick_target_with_reason(
             active_idx,
             readings,
             &self.enabled_mask(),
@@ -4639,6 +4845,24 @@ where
         ) else {
             return TickAction::SkippedActiveUnavailable;
         };
+        // #582 circuit-breaker 2 — NEVER SPEND THE LAST VIABLE TARGET. `OnlyCandidate` is
+        // `pick_target_with_reason`'s existing `candidate_count < 2` verdict, and we hold a `Some`,
+        // so it means EXACTLY one viable target remains. This swap is speculative (a directive, not
+        // observed near-limit usage), so it yields that last target to a confirmed-exhaustion swap
+        // — and says so, rather than going quietly blind.
+        if let Some(ra) = speculative {
+            if matches!(target_reason, NextSwapReason::OnlyCandidate) {
+                if !self.state.signaled_retry_after_reserve {
+                    events.push(Event::BlindPreemptReserveHold {
+                        account: self.roster[active_idx].account_uuid.clone(),
+                        retry_after_secs: ra.as_secs(),
+                        blind_secs: blind_elapsed,
+                    });
+                    self.state.signaled_retry_after_reserve = true;
+                }
+                return TickAction::SkippedActiveUnavailable;
+            }
+        }
         // Run the swap through the SAME single-writer, no-torn-swap primitive (#6 / #64,
         // ADR-0003) the reactive + emergency paths use — an error (incl. a fail-closed
         // contended lock) leaves the canonical + both stashes coherent and the anchor intact
@@ -4671,6 +4895,14 @@ where
                     last_known_session_pct,
                     at,
                 });
+                // Issue #582: record a swap fired away from a SERVER-THROTTLED active — the
+                // evidence the walk breaker above counts. Recorded on `retry_after` (any swap the
+                // directive was live for), NOT on `speculative`: the throttle moved whichever arm
+                // authorised the move, and the walk is a property of the throttle, not the
+                // authorisation. `record_swap` above already re-armed the edge-trigger guards.
+                if retry_after.is_some() {
+                    self.state.retry_after_swaps.push(at);
+                }
                 TickAction::PreemptivelySwapped {
                     from: active_idx,
                     to: target_idx,
@@ -4678,6 +4910,20 @@ where
             }
             Err(_) => TickAction::SwapFailed,
         }
+    }
+
+    /// How many server-`Retry-After`-driven preemptive swaps fired inside the trailing
+    /// [`RETRY_AFTER_WALK_WINDOW`] ending at `at` (issue #582) — the #582 walk breaker's count.
+    ///
+    /// PRUNES the record of entries that have aged out, so the window slides and the vector cannot
+    /// grow without bound across a long-lived daemon (hence `&mut self` for what reads as a query).
+    /// Pruning on read rather than on a timer keeps the record's only mutation points the swap that
+    /// appends and the count that consumes it.
+    fn retry_after_walk_count(&mut self, at: Instant) -> usize {
+        self.state.retry_after_swaps.retain(|&swapped_at| {
+            at.saturating_duration_since(swapped_at) < RETRY_AFTER_WALK_WINDOW
+        });
+        self.state.retry_after_swaps.len()
     }
 
     /// Fold one poll interval into account `i`'s retained session-velocity EMA (issue #539,
@@ -5470,6 +5716,11 @@ where
                                 self.state.last_good,
                                 self.state.last_readings[i].is_none(),
                                 health.quarantined,
+                                // Issue #582: a server `Retry-After` still holding the blind active
+                                // off its poll degrades auto-protection too — read from the SAME
+                                // shared predicate `blind_swap` decides on, so `status` never claims
+                                // "auto-protection OK" during a #582 hold. `health` is this account's.
+                                server_retry_after_holding(health, blind_at).is_some(),
                                 blind_at,
                             )
                         } else {
@@ -5749,6 +6000,10 @@ where
             let was_backing_off = health.poll_backoff_until.is_some();
             health.poll_backoff_streak = 0;
             health.poll_backoff_until = None;
+            // Issue #582: the retained server directive dies with the window it described — a
+            // non-throttling poll means the account is READABLE again, so a stale `Retry-After`
+            // must never outlive it and re-arm the swap-away path on a recovered account.
+            health.poll_backoff_retry_after = None;
             if was_backing_off {
                 events.push(Event::UsageBackoffCleared {
                     account: account_uuid,
@@ -5797,6 +6052,23 @@ where
             .checked_add(wait)
             .unwrap_or_else(|| now + POLL_BACKOFF_CAP);
         self.state.health[i].poll_backoff_until = Some(until);
+        // Issue #582: retain the RAW (pre-cap #295) server directive alongside the window it just
+        // armed, so the bounded-blindness swap-away path can read it on a LATER tick — the active
+        // account is skipped while backing off, so the deciding tick never re-observes this `429`.
+        // Written here, in lockstep with `poll_backoff_until` above, and cleared with it on any
+        // non-throttling poll.
+        //
+        // A ZERO `Retry-After` is normalized to `None` — the issue's `ra > 0` classification, and
+        // load-bearing, not cosmetic. `widened.max(0) == widened`, so a zero directive contributes
+        // NOTHING: the window is the daemon's OWN self-capped exponential, which is exactly the
+        // bounded blindness the ratified #452 anchor gate already governs (ADR-0017's S1 spike:
+        // ALL 181 observed 429s carried `retry_after_secs=0`, so this is the DOMINANT real case,
+        // not a corner). Retaining it would fire the #582 below-band arm on ordinary self-backoff
+        // blindness the anchor gate deliberately leaves alone, and let the walk alarm claim a
+        // "server throttle" that does not exist. The raw zero still rides the `UsageBackoff` event
+        // + tick diagnostic below (#295) — this normalization is for the DECISION, not the report.
+        self.state.health[i].poll_backoff_retry_after =
+            signal.retry_after.filter(|ra| !ra.is_zero());
         let armed = until.saturating_duration_since(now);
         // Durable ENTER (issue #399): make the previously stderr-only 429 / back-off signal durable
         // — the account UUID, the throttle class (`429` vs transient), the running streak, the RAW
@@ -9979,6 +10251,483 @@ mod tests {
         );
     }
 
+    // --- #582 server-`Retry-After` swap-away + circuit-breaker (ADR-0017) ---------------------
+
+    /// A warmed three-account daemon replaying the 2026-07-17 incident: u-A active with a
+    /// BELOW-band anchor (`anchor_session`, 29 % observed) that then `429`s carrying a long server
+    /// `Retry-After`, with u-B / u-C at `peer_session` as candidate targets. Returns it blind, with
+    /// the clock advanced just past the gate bound, on the tick the #582 arm decides.
+    ///
+    /// The peers' session usage is the knob the reserve tests turn: at 10 % BOTH are viable (two
+    /// candidates, the reserve satisfied); pushing one over the 80 % `target_max` leaves exactly one
+    /// and arms [`NextSwapReason::OnlyCandidate`].
+    async fn blind_retry_after_daemon(
+        anchor_session: f64,
+        peer_c_session: f64,
+        retry_after: Duration,
+    ) -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", anchor_session, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", peer_c_session, 0.10),
+        )
+        .await;
+        // Arm the SWAP bound at the interim T (`tunables()` parks it at the kill-switch ceiling so
+        // baseline tests stay inert). The risk band stays at its 0.60 default — every test here
+        // keeps the anchor BELOW it, so ONLY the #582 server-directed arm can fire.
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A active before the throttle"
+        );
+
+        // Throttle the active with a LONG server directive: its reading clears (the #582 blindness)
+        // while the below-band anchor is retained, and the un-clamped floor (#453) arms a window far
+        // longer than the gate bound.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", Some(retry_after))
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", peer_c_session, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        // Cross the gate bound. The directive's window (3600 s) still has hours to run, so the
+        // server is STILL holding u-A off — the signal the #582 arm keys on.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        daemon
+    }
+
+    #[tokio::test]
+    async fn a_server_retry_after_swaps_the_blind_active_away_below_the_risk_band() {
+        // AC 1 (issue #582): the 2026-07-17 replay. u-A `429`'d carrying `Retry-After: 3600` at a
+        // 29 % anchor and went blind for the whole directive while Claude Code burned it to
+        // exhaustion (+12pp weekly behind the blindness). At 29 % it fell through EVERY swap path:
+        // the reactive trigger and the #539 projection both need a fresh reading, and #452's arm
+        // needs anchor >= 60 %. The server directive is now itself the swap-away signal — a swap
+        // needs no usage poll, so it works while blind.
+        let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(3600)).await;
+
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "a long server Retry-After swaps the blind active away, not a blind wait: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the throttled u-A"
+        );
+        // REUSES `reason=blind_preempt` (issue #582): no new reason token, so `reliability.rs`'s
+        // `parse_swap_events` folds it into the existing #452 counter and the `_ => continue`
+        // catch-all is never reached. `session_pct` is the stale below-band anchor (29) — the only
+        // session signal available while blind.
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    session_pct: 29,
+                    ..
+                }
+            )),
+            "the swap reuses reason=blind_preempt carrying the stale anchor pct: {:?}",
+            swapped.events,
+        );
+        // The swap is recorded as walk evidence — the counter the circuit-breaker reads.
+        assert_eq!(
+            daemon.state.retry_after_swaps.len(),
+            1,
+            "the server-throttled swap is counted toward the walk breaker",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retry_after_swap_is_disabled_by_the_existing_kill_switch() {
+        // AC 5 (issue #582): NO new tunable. The arm shares condition 1 with #452, so parking
+        // `session_blind_swap_secs` at the documented kill-switch ceiling (ADR-0017) disables the
+        // server-directed arm exactly as it disables the anchor one — the operator keeps ONE dial.
+        let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(3600)).await;
+        daemon.session_blind_swap_secs = u64::MAX;
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "the kill-switch disables the server-directed arm too: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — path disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_retry_after_does_not_arm_the_swap_away() {
+        // Issue #582: the arm keys on a directive the server is STILL enforcing, not on one merely
+        // once seen. A window that has LAPSED means the daemon may re-poll now — the account may be
+        // about to recover on its own — so a swap-away would be premature. (The anchor stays below
+        // the band, so #452 cannot fire either and the historical skip stands.)
+        let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(60)).await;
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "a lapsed Retry-After window does not arm the swap-away: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — directive spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_retry_after_does_not_arm_the_below_band_swap_away() {
+        // Issue #582 classifies `ra > 0` — NOT merely "a header was present". A zero directive
+        // contributes nothing to the wait (`widened.max(0) == widened`), so the window is the
+        // daemon's OWN self-capped exponential: precisely the bounded blindness the ratified #452
+        // anchor gate already governs, and which below the band it deliberately leaves alone.
+        //
+        // This is the DOMINANT real case, not a corner — ADR-0017's S1 spike records that ALL 181
+        // observed 429s carried `retry_after_secs=0` (the blind window there was the daemon's own
+        // back-off, #453-capped, not a server directive). Gating on mere presence would swap
+        // below-band accounts away on ordinary self-backoff and let the walk alarm claim a "server
+        // throttle" that never existed.
+        // Deliberately NOT `blind_retry_after_daemon`: that helper takes ONE 429 then jumps the
+        // clock, so the self-backoff window has already LAPSED by the decision and the swap-away
+        // would be declined by the lapse check — passing without ever exercising the zero-filter.
+        // This drives S1's real shape instead: SUSTAINED zero-directive 429s, each re-poll
+        // re-arming the account's own 120 s cap (#453), so the window stays OPEN while blindness
+        // accumulates far past the 300 s gate. That is precisely the state that WOULD swap if a
+        // zero were mistaken for a server directive — so this test can actually fail.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.29, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", Some(Duration::ZERO))
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+
+        // Advance in sub-window steps so u-A is re-polled (and re-429'd) throughout, holding its
+        // self-backoff window open the whole way — never a single lapse the gate could decline on.
+        let mut fired = None;
+        for _ in 0..40 {
+            daemon.clock.advance(Duration::from_secs(60));
+            let out = daemon.tick().await;
+            if matches!(out.action, TickAction::PreemptivelySwapped { .. }) {
+                fired = Some(out.action);
+                break;
+            }
+        }
+        assert!(
+            fired.is_none(),
+            "a zero Retry-After never arms the below-band swap-away, however long blind: {fired:?}",
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — no server directive"
+        );
+
+        // The scenario is NOT degenerate: it really did reach (far past) the gate while blind, so
+        // the non-fire above is the zero-filter's doing, not a gate that never armed.
+        let anchor = daemon
+            .state
+            .last_good
+            .expect("the pre-blind anchor is retained");
+        let blind_secs = daemon
+            .clock
+            .now()
+            .saturating_duration_since(anchor.at)
+            .as_secs();
+        assert!(
+            blind_secs > BLIND_GATE_SECS,
+            "the episode must cross the gate for this to test anything: blind_secs={blind_secs}",
+        );
+        assert!(
+            daemon.state.last_readings[0].is_none(),
+            "u-A is genuinely blind throughout",
+        );
+        // The mechanism, pinned at the field: a zero is normalized away, so no directive is ever
+        // "holding" u-A — even though its self-backoff window IS open (the lapse check is NOT what
+        // declined the swap here).
+        assert_eq!(
+            daemon.state.health[0].poll_backoff_retry_after, None,
+            "a zero Retry-After is normalized to None — it is not a server directive",
+        );
+        assert!(
+            daemon.state.health[0]
+                .poll_backoff_until
+                .is_some_and(|until| until > daemon.clock.now()),
+            "the self-backoff window is OPEN — so only the zero-filter can be declining the swap",
+        );
+        assert!(
+            daemon.state.retry_after_swaps.is_empty(),
+            "a self-backoff blind window is not walk evidence",
+        );
+        // ...and `status` does not over-claim either: below the band with no server directive, the
+        // anchor arm is the only authority and it says OK (the #479 projection is unchanged here).
+        let snapshot = daemon.tick().await.snapshot;
+        assert_eq!(
+            snapshot.accounts[0]
+                .blind_active
+                .as_ref()
+                .map(|b| b.auto_protection_degraded),
+            Some(false),
+            "no server directive → the below-band projection is unchanged from #479",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_poll_clears_the_retained_retry_after() {
+        // Issue #582: the retained directive dies with the window it described. A non-throttling
+        // poll means the account is READABLE again, so a stale `Retry-After` must never outlive it
+        // and re-arm the swap-away on a recovered account.
+        let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(3600)).await;
+        assert_eq!(
+            daemon.state.health[0].poll_backoff_retry_after,
+            Some(Duration::from_secs(3600)),
+            "the directive is retained while its window holds u-A off",
+        );
+
+        // u-A answers again. The clock is past the armed window's start by T+1 only, so move it
+        // past the directive itself, then let the recovered poll land.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.29, 0.20)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(3600));
+        while daemon.state.last_readings[0].is_none() {
+            daemon.tick().await;
+        }
+        assert_eq!(
+            daemon.state.health[0].poll_backoff_retry_after, None,
+            "a clean poll clears the retained directive with its window",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retry_after_swap_never_spends_the_last_viable_target() {
+        // AC 2 (issue #582): the swap-away is SPECULATIVE — it acts on a server directive, not on
+        // observed near-limit usage — so it must yield the LAST viable target to a confirmed-
+        // exhaustion swap rather than consume it on a guess. u-C is pushed over the 80 % target_max
+        // reserve, leaving u-B as the sole candidate: the path holds, and SAYS SO.
+        let mut daemon = blind_retry_after_daemon(0.29, 0.90, Duration::from_secs(3600)).await;
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "no swap when it would spend the last viable target: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A held — the target is reserved"
+        );
+        // "Reported, not hidden": the hold is a deliberate choice, and an operator watching an
+        // account go dark deserves to see it made.
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                Event::BlindPreemptReserveHold {
+                    retry_after_secs: 3600,
+                    ..
+                }
+            )),
+            "the reserve hold is reported: {:?}",
+            out.events,
+        );
+        // Issue #582's NAMED regression: `status` must NOT report "auto-protection OK" while the
+        // daemon sits on a below-band account blind behind a server directive. The wire projection
+        // shows `auto_protection_degraded` even at the 29 % anchor the anchor arm alone would call
+        // OK — the surface the issue said "reported auto-protection OK for the whole episode".
+        assert_eq!(
+            out.snapshot.accounts[0].blind_active,
+            Some(BlindActive {
+                blind_secs: BLIND_GATE_SECS + 1,
+                last_known_session_pct: 29,
+                auto_protection_degraded: true,
+            }),
+            "status reports auto-protection DEGRADED during a #582 reserve hold, not OK",
+        );
+        assert!(
+            daemon.state.retry_after_swaps.is_empty(),
+            "a held swap is not walk evidence",
+        );
+        // Edge-triggered: a 3600 s window spans hundreds of ticks, so the line fires once per
+        // episode — not once per held tick.
+        let again = daemon.tick().await;
+        assert!(
+            !again
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindPreemptReserveHold { .. })),
+            "the reserve hold is edge-triggered, not re-emitted per held tick: {:?}",
+            again.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reserve_does_not_bound_the_ratified_anchor_band_swap() {
+        // Issue #582 (regression guard): the circuit-breaker binds ONLY the new server-directed arm
+        // firing on its own authority. With the anchor INSIDE the band (68 %) the ratified #452 swap
+        // fires on a sole viable target exactly as it always has — bounding it there would regress a
+        // ratified AC, so `speculative` is `None` whenever the anchor is armed.
+        let mut daemon = blind_retry_after_daemon(0.68, 0.90, Duration::from_secs(3600)).await;
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::PreemptivelySwapped { from: 0, .. }),
+            "the #452 anchor-band swap still fires on its last viable target: {:?}",
+            out.action,
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::BlindPreemptReserveHold { .. })),
+            "the reserve never reports against a ratified anchor-band swap: {:?}",
+            out.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_retry_after_swaps_stop_the_rotation_and_alarm() {
+        // AC 3 (issue #582): the throttle follows the ACTIVE ROLE — each account observed took its
+        // `RA:3600` within minutes of TAKING the slot, while peers never got one — so an unbounded
+        // swap-away WALKS the throttle around the roster. At the limit, rotation stops: holding a
+        // blind-but-low account beats walking a 3600 s throttle onto the last good one.
+        let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(3600)).await;
+        // The state two prior server-throttled swaps leave behind (the previous test proves a fired
+        // swap appends exactly this), both inside the trailing window.
+        let now = daemon.clock.now();
+        daemon.state.retry_after_swaps = vec![now, now];
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "the walk breaker stops the rotation: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "position held — the walk stopped"
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                Event::RetryAfterWalk {
+                    swaps: 2,
+                    window_secs: 3600,
+                    retry_after_secs: 3600,
+                    ..
+                }
+            )),
+            "the walk raises an alarm naming the count and window: {:?}",
+            out.events,
+        );
+        // Same #582 regression guard as the reserve hold: a stopped walk leaves the account blind
+        // and burning, so `status` must report DEGRADED, never "auto-protection OK".
+        assert_eq!(
+            out.snapshot.accounts[0]
+                .blind_active
+                .as_ref()
+                .map(|b| b.auto_protection_degraded),
+            Some(true),
+            "status reports auto-protection DEGRADED while the walk breaker holds a blind account",
+        );
+        // Edge-triggered, like the reserve hold.
+        let again = daemon.tick().await;
+        assert!(
+            !again
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::RetryAfterWalk { .. })),
+            "the walk alarm is edge-triggered, not re-emitted per held tick: {:?}",
+            again.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_swaps_outside_the_window_do_not_stop_the_rotation() {
+        // AC 3 (issue #582), the "within a window" half: the breaker counts a trailing window, not
+        // a daemon lifetime. Two swaps that have AGED OUT are not a walk — a throttle that recurred
+        // hours later is a fresh episode, and refusing to protect the active on that history would
+        // strand it blind. The aged entries are pruned on read, so the record cannot grow unbounded.
+        let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(3600)).await;
+        let stale = daemon.clock.now() - (RETRY_AFTER_WALK_WINDOW + Duration::from_secs(1));
+        daemon.state.retry_after_swaps = vec![stale, stale];
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::PreemptivelySwapped { from: 0, .. }),
+            "swaps outside the window are not a walk — the swap-away still fires: {:?}",
+            out.action,
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::RetryAfterWalk { .. })),
+            "no alarm on aged-out history: {:?}",
+            out.events,
+        );
+        assert_eq!(
+            daemon.state.retry_after_swaps.len(),
+            1,
+            "the aged entries were pruned; only THIS swap remains",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_anchor_armed_path_still_prunes_the_walk_record() {
+        // Issue #582 (regression guard): the walk record is appended by ANY server-throttled swap
+        // (`retry_after.is_some()`), including a ratified #452 anchor-band one — but the breaker
+        // consults it only on the speculative arm. If the prune rode the breaker, an anchor-armed
+        // episode (anchor 68 %, in-band) would grow the vector without bound. It must prune anyway.
+        let mut daemon = blind_retry_after_daemon(0.68, 0.10, Duration::from_secs(3600)).await;
+        // Seed aged-out entries an anchor-armed episode would otherwise never clear.
+        let stale = daemon.clock.now() - (RETRY_AFTER_WALK_WINDOW + Duration::from_secs(1));
+        daemon.state.retry_after_swaps = vec![stale, stale, stale];
+
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::PreemptivelySwapped { from: 0, .. }),
+            "the in-band anchor arm fires (the breaker never bounds it): {:?}",
+            out.action,
+        );
+        // The prune ran despite the swap being anchor-armed (not speculative): the three aged
+        // entries are gone and only THIS swap's instant remains — the vector stays bounded.
+        assert_eq!(
+            daemon.state.retry_after_swaps.len(),
+            1,
+            "the anchor-armed path prunes the walk record; it does not grow unbounded",
+        );
+    }
+
     // --- #539 velocity-projection preemptive swap (ADR-0017) ---------------------------------
 
     /// A warmed three-account daemon with u-A active at `active_session` (kept below the 95 %
@@ -10427,10 +11176,11 @@ mod tests {
         };
 
         // Blind, anchor in-band, but at EXACTLY T → OK: the gate arms on a strict `>` (matching
-        // `note_blind_gate_eligibility`), so at T it is not yet armed.
+        // `note_blind_gate_eligibility`), so at T it is not yet armed. No server hold either.
         let ok = blind_active_view(
             Some(near_band),
             true,
+            false,
             false,
             base + Duration::from_secs(BLIND_GATE_SECS),
         )
@@ -10447,6 +11197,7 @@ mod tests {
             Some(near_band),
             true,
             false,
+            false,
             base + Duration::from_secs(BLIND_GATE_SECS + 1),
         )
         .expect("still projects a state past T");
@@ -10456,8 +11207,9 @@ mod tests {
         );
         assert_eq!(degraded.blind_secs, BLIND_GATE_SECS + 1);
 
-        // Long past T but the anchor sat BELOW the risk band → OK: the gate would never arm on it,
-        // so auto-protection is nominally intact regardless of how long the account has been blind.
+        // Long past T, the anchor BELOW the band, and NO server hold → OK: the anchor arm would
+        // never arm on it. (Issue #582 adds the server arm below; absent a directive the below-band
+        // account is still nominally protected, so this half of the old invariant stands.)
         let below_band = LastGood {
             session: BLIND_GATE_RISK_BAND - 0.01,
             weekly: 0.10,
@@ -10467,12 +11219,42 @@ mod tests {
             Some(below_band),
             true,
             false,
+            false,
             base + Duration::from_secs(BLIND_GATE_SECS + 100),
         )
         .expect("blind with an anchor still projects");
         assert!(
             !ok_below.auto_protection_degraded,
-            "a below-band anchor is never DEGRADED, however long it is blind",
+            "a below-band anchor with no server hold is not DEGRADED, however long it is blind",
+        );
+
+        // Issue #582: the SAME below-band anchor, past T, but a server `Retry-After` IS holding it
+        // off → DEGRADED. This is the regression the issue named — `status` must NOT report
+        // "auto-protection OK" while the daemon sits on a below-band account blind behind a
+        // directive. At exactly T the strict `>` gate is not yet armed, mirroring the anchor arm.
+        let degraded_below = blind_active_view(
+            Some(below_band),
+            true,
+            false,
+            true,
+            base + Duration::from_secs(BLIND_GATE_SECS + 1),
+        )
+        .expect("blind with an anchor still projects");
+        assert!(
+            degraded_below.auto_protection_degraded,
+            "a below-band anchor held by a server Retry-After past T IS DEGRADED (issue #582)",
+        );
+        let ok_below_at_t = blind_active_view(
+            Some(below_band),
+            true,
+            false,
+            true,
+            base + Duration::from_secs(BLIND_GATE_SECS),
+        )
+        .expect("blind with an anchor still projects");
+        assert!(
+            !ok_below_at_t.auto_protection_degraded,
+            "the server arm shares the strict `>` T gate — not yet armed at exactly T",
         );
     }
 
@@ -10485,13 +11267,15 @@ mod tests {
             at: base,
         };
         let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
-        // A live reading (not blind) → no projection, even with an in-band anchor past T.
-        assert!(blind_active_view(Some(anchor), false, false, past_t).is_none());
-        // Blind but NO retained anchor (a genuinely-unknown active) → no spurious projection (#450).
-        assert!(blind_active_view(None, true, false, past_t).is_none());
+        // A live reading (not blind) → no projection, even with an in-band anchor past T. (A server
+        // hold cannot exist without blindness anyway; `false` here, and it makes no difference.)
+        assert!(blind_active_view(Some(anchor), false, false, false, past_t).is_none());
+        // Blind but NO retained anchor (a genuinely-unknown active) → no spurious projection (#450),
+        // even with a server hold — the #582 arm keys off the anchor too, exactly like `blind_swap`.
+        assert!(blind_active_view(None, true, false, true, past_t).is_none());
         // Blind WITH an anchor but QUARANTINED (dead, #42) → the emergency_swap path owns it, not
         // bounded blindness (ADR-0017 keeps the two separate).
-        assert!(blind_active_view(Some(anchor), true, true, past_t).is_none());
+        assert!(blind_active_view(Some(anchor), true, true, false, past_t).is_none());
     }
 
     #[test]
