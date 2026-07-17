@@ -1261,6 +1261,42 @@ struct LastGood {
     at: Instant,
 }
 
+/// A per-account PRE-BLIND anchor (issue #583): the account's last successful reading, captured on
+/// the live→blind ENTRY edge and held for the whole blind episode, so the uncensored blind-episode
+/// pair ([`Event::BlindEnter`] / [`Event::BlindExit`]) can be measured for ANY account regardless of
+/// whether it recovers and regardless of whether the daemon swaps away from it.
+///
+/// DELIBERATELY SEPARATE from [`LastGood`], which cannot serve this purpose despite carrying similar
+/// fields: `last_good` is a single ACTIVE-only slot that every swap-away / active-loss site RESETS to
+/// `None` (by design — it must always describe the CURRENT active account, which is why it carries no
+/// account handle). Those resets are exactly the second censoring tail #583 fixes, so this anchor is
+/// held one-per-roster-slot and is touched by NOTHING but its own episode edges — no swap path, no
+/// active resolution. Keeping the two separate leaves #450/#452's anchor semantics byte-for-byte
+/// unchanged, exactly as `last_good` itself is kept separate from `last_readings`.
+///
+/// Carries BOTH usage windows: the session window resets on its own 5 h cadence, so a session-only
+/// anchor cannot distinguish a mid-blindness reset from a quiet account — the failure that hid a real
+/// weekly burn in production (see [`Event::BlindExit`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlindAnchor {
+    /// Session-window fraction (`[0.0, 1.0]`) of the last reading before the account went blind.
+    session: f64,
+    /// Weekly-window fraction (`[0.0, 1.0]`) of the last reading before the account went blind.
+    weekly: f64,
+    /// When that reading was observed — monotonic ([`Instant`]), carried over from the account's
+    /// `last_reading_at` slot, so the episode duration is measured against the SAME clock as the
+    /// #450 anchor and the swap cooldown. Process-local: never serialized.
+    at: Instant,
+    /// Whether this account was the ACTIVE one at the moment it went blind — context the episode
+    /// carries to both edges (and the input to [`Event::BlindExit`]'s `swapped_away`), never a
+    /// filter on whether the episode is recorded.
+    was_active: bool,
+    /// Whether the anchor sat at/over the session trigger (the risk band) when the account went
+    /// blind — the same tag [`Event::BlindWindow`] carries, evaluated ONCE at entry (the anchor is
+    /// fixed for a whole episode) and carried through to the exit.
+    near_limit: bool,
+}
+
 /// The most recent #452 bounded-blindness PREEMPTIVE swap, retained so `status` can NARRATE it
 /// (issue #479). Set in [`Daemon::blind_swap`] on a successful swap-away from a BLIND active account;
 /// projected onto the wire ([`BlindPreemptSwap`]) by [`recent_blind_preempt_swap_view`] only while
@@ -1567,6 +1603,18 @@ struct DecisionState {
     /// in lockstep by [`reconcile_roster`](Daemon::reconcile_roster). Sized to the roster in
     /// [`Daemon::new`]. See [`VelocityEma`].
     session_velocity: Vec<Option<VelocityEma>>,
+    /// The PER-ACCOUNT pre-blind anchor (issue #583), indexed in lockstep with
+    /// [`last_readings`](Self::last_readings) — `Some` exactly while that account is inside a blind
+    /// episode whose entry the daemon actually witnessed. Set on the live→blind ENTRY edge (which
+    /// emits [`Event::BlindEnter`]), read and cleared on the blind→live EXIT edge (which emits
+    /// [`Event::BlindExit`]), and touched by nothing else — no swap path, no active resolution — so
+    /// neither censoring tail of `blind_window` can reach it. `None` for an account that is reading
+    /// live, and for one whose blindness the daemon never saw begin (a first-ever poll that fails, or
+    /// one already blind at startup): with no anchor there is no baseline to difference against, so
+    /// no episode is claimed. Rebuilt in lockstep by
+    /// [`reconcile_roster`](Daemon::reconcile_roster) and sized to the roster in [`Daemon::new`], like
+    /// every other per-account vec. See [`BlindAnchor`]; contrast [`last_good`](Self::last_good).
+    blind_anchor: Vec<Option<BlindAnchor>>,
     /// The ACTIVE account's retained pre-blind anchor (issue #450): its last
     /// SUCCESSFUL reading (`session` / `weekly` fractions) plus the monotonic time it
     /// was observed, kept ACROSS a `429` / `5xx` blindness window that clears
@@ -1877,6 +1925,9 @@ where
         // Per-account session-velocity EMA (issue #539), parallel to `last_readings` — `None` until
         // each account has a usable two-reading interval, so no projection off an unwarmed signal.
         let session_velocity = vec![None; roster.len()];
+        // Per-account pre-blind anchor (issue #583), parallel to `last_readings` — `None` until an
+        // account is seen going live→blind, so a never-witnessed episode claims no baseline.
+        let blind_anchor = vec![None; roster.len()];
         let polled_once = vec![false; roster.len()];
         Self {
             roster,
@@ -1960,6 +2011,7 @@ where
                 last_readings,
                 last_reading_at,
                 session_velocity,
+                blind_anchor,
                 polled_once,
                 ..DecisionState::default()
             },
@@ -2414,6 +2466,14 @@ where
                     });
                 }
             }
+            // The UNCENSORED blind-episode pair (issue #583): `blind_enter` on this account's
+            // live→blind edge, `blind_exit` on its blind→live one, off a PER-ACCOUNT anchor. Both
+            // tails the `blind_window` close above cannot reach — an episode that never recovers, and
+            // one the daemon swaps away from — are recorded here instead, so #484's promotion bar
+            // reads a distribution that is not censored at exactly its tail. Runs AFTER the
+            // `blind_window` block (whose recovery-edge semantics stay untouched) and BEFORE the slot
+            // assignment below (it anchors off the PRE-poll reading + its timestamp).
+            self.note_blind_episode(i, active, &result, now, &mut events);
             self.state.last_readings[i] = result.ok();
             // Track WHEN this reading was observed, in lockstep with `last_readings` (issue #449):
             // `now` on a live reading, cleared on a failed poll — so the velocity interval above
@@ -2696,6 +2756,98 @@ where
                 }
             })
             .collect()
+    }
+
+    /// Record the UNCENSORED blind-episode edges for the account just polled (issue #583, umbrella
+    /// #363 Path B): [`Event::BlindEnter`] on its live→blind transition and [`Event::BlindExit`] on
+    /// its blind→live one, measured from a PER-ACCOUNT anchor ([`blind_anchor`](DecisionState::blind_anchor)).
+    ///
+    /// This exists because [`Event::BlindWindow`] (#449) is censored at BOTH tails of the very
+    /// distribution #484's promotion bar reads to ratify [`BLIND_GATE_SECS`] / [`BLIND_GATE_RISK_BAND`]:
+    ///
+    /// - It fires only on the `None → live` RECOVERY edge, so an account that goes dark and never
+    ///   comes back emits NOTHING. Recording on ENTRY instead makes the episode durable the moment it
+    ///   starts — the worst episodes stop being the silent ones.
+    /// - It is guarded by `active == Some(i)` and built from `last_good`, the ACTIVE-only anchor every
+    ///   swap-away site drops. Anchoring per-account — in state no swap path touches — records the
+    ///   episode whether or not the daemon stays on the account, and tags the swap-away case
+    ///   (`swapped_away`) that was previously unobservable. This matters most in combination with the
+    ///   swap-away-on-blindness fix (issue #582): swapping away is precisely what made an episode
+    ///   invisible, so that fix would otherwise INCREASE the censoring.
+    ///
+    /// `blind_window` is left byte-for-byte unchanged and keeps its recovery-edge semantics — it is
+    /// the retrospective duration histogram for SLO reporting, which is a fine purpose; it was merely
+    /// assigned the wrong one (detection).
+    ///
+    /// The entry edge requires a PRIOR LIVE reading (`last_readings[i]` still `Some` here, before the
+    /// caller's assignment clears it): an account whose first-ever poll fails, or one already blind at
+    /// startup, has no baseline to difference against, so no anchor is taken and no episode is claimed
+    /// — the same never-fabricate-an-anchor reasoning as `blind_window`'s `last_good.is_some()` guard.
+    /// Both edges are level-safe: a held blind tick and an ordinary live poll each match no edge and
+    /// emit nothing, so the log carries exactly two lines per witnessed episode.
+    ///
+    /// MUST be called BEFORE the caller writes `last_readings[i]` / `last_reading_at[i]` for this poll
+    /// — the entry anchor is read out of the PRE-poll slots. `now` is the tick's monotonic clock, the
+    /// SAME [`Instant`] the #450 anchor and the swap cooldown use.
+    fn note_blind_episode(
+        &mut self,
+        i: usize,
+        active: Option<usize>,
+        result: &Result<Usage>,
+        now: Instant,
+        events: &mut Vec<Event>,
+    ) {
+        match (self.state.blind_anchor[i], result) {
+            // ENTRY edge — the account had a live reading and this poll failed. Anchor its last
+            // reading (BOTH windows) and open the episode.
+            (None, Err(_)) => {
+                let (Some(prev), Some(prev_at)) =
+                    (self.state.last_readings[i], self.state.last_reading_at[i])
+                else {
+                    return; // No prior live reading → no baseline → claim no episode.
+                };
+                let was_active = active == Some(i);
+                // The risk-band tag is a property of the ANCHOR, fixed for the whole episode. The
+                // entry line has to carry it regardless (no exit exists yet), so caching it makes
+                // both lines of one episode agree BY CONSTRUCTION rather than by two derivations
+                // that happen to coincide. Keys off the BASE (un-jittered) trigger, matching
+                // `blind_window`'s tag so the two families filter alike.
+                let near_limit = prev.session >= self.session_trigger_base;
+                self.state.blind_anchor[i] = Some(BlindAnchor {
+                    session: prev.session,
+                    weekly: prev.weekly,
+                    at: prev_at,
+                    was_active,
+                    near_limit,
+                });
+                events.push(Event::BlindEnter {
+                    account: self.roster[i].account_uuid.clone(),
+                    session_pct: to_pct(prev.session),
+                    weekly_pct: to_pct(prev.weekly),
+                    was_active,
+                    near_limit,
+                });
+            }
+            // EXIT edge — an episode was open and this poll read live. Close it with the anchor, the
+            // fresh reading in BOTH windows (the burn the log line derives), and the swap-away tag.
+            (Some(anchor), Ok(fresh)) => {
+                events.push(Event::BlindExit {
+                    account: self.roster[i].account_uuid.clone(),
+                    duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
+                    session_pct: to_pct(anchor.session),
+                    session_at_recovery: to_pct(fresh.session),
+                    weekly_pct: to_pct(anchor.weekly),
+                    weekly_at_recovery: to_pct(fresh.weekly),
+                    was_active: anchor.was_active,
+                    // The tail `blind_window` cannot see: active when it went blind, not active now.
+                    swapped_away: anchor.was_active && active != Some(i),
+                    near_limit: anchor.near_limit,
+                });
+                self.state.blind_anchor[i] = None;
+            }
+            // Held blind (episode already open) or an ordinary live poll — no edge, stay silent.
+            (Some(_), Err(_)) | (None, Ok(_)) => {}
+        }
     }
 
     /// Record the #452 gate-premise SLI (issue #482): at the moment the bounded-blindness preemptive
@@ -4244,6 +4396,12 @@ where
         // vec never drifts out of length/index sync with the roster (a projective read would
         // otherwise index the wrong account or panic out of bounds).
         let mut session_velocity = Vec::with_capacity(new_roster.len());
+        // Issue #583: the per-account pre-blind anchor is re-keyed in lockstep with `last_readings`
+        // for the same reason — kept for a persisting account (an in-flight blind episode survives a
+        // reconcile of OTHER accounts, so a `remove` elsewhere cannot silently truncate it), started
+        // fresh (`None`) for a new one, so the vec never drifts out of length/index sync with the
+        // roster (an episode edge would otherwise anchor off the wrong account or panic out of bounds).
+        let mut blind_anchor = Vec::with_capacity(new_roster.len());
         let mut polled_once = Vec::with_capacity(new_roster.len());
         for account in &new_roster {
             match self
@@ -4256,6 +4414,7 @@ where
                     last_readings.push(self.state.last_readings[old_idx]);
                     last_reading_at.push(self.state.last_reading_at[old_idx]);
                     session_velocity.push(self.state.session_velocity[old_idx]);
+                    blind_anchor.push(self.state.blind_anchor[old_idx]);
                     polled_once.push(self.state.polled_once[old_idx]);
                 }
                 None => {
@@ -4263,6 +4422,7 @@ where
                     last_readings.push(None);
                     last_reading_at.push(None);
                     session_velocity.push(None);
+                    blind_anchor.push(None);
                     polled_once.push(false);
                 }
             }
@@ -4282,6 +4442,7 @@ where
         self.state.last_readings = last_readings;
         self.state.last_reading_at = last_reading_at;
         self.state.session_velocity = session_velocity;
+        self.state.blind_anchor = blind_anchor;
         self.state.polled_once = polled_once;
         self.state.active = active;
         // Issue #450: `last_good` belongs to the active account by identity; reconcile
@@ -9128,6 +9289,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blind_episode_that_never_recovers_is_still_recorded_once() {
+        // Issue #583 AC #1 — the FIRST censoring tail. `blind_window` fires only on the None→live
+        // RECOVERY edge, so an account that goes dark and STAYS dark emits nothing at all: the
+        // distribution #484's promotion bar reads is censored at exactly its tail. The episode is
+        // recorded on ENTRY instead, so it is durable the moment it starts — no recovery required.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.96, 0.30)).await;
+        daemon.tick().await; // the live reading that becomes the anchor: 96% session, 30% weekly
+
+        // The 429 that blinds it — and it never reads live again.
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        let entered = daemon.tick().await;
+        assert!(
+            entered.events.contains(&Event::BlindEnter {
+                account: "u-A".to_owned(),
+                session_pct: 96,
+                weekly_pct: 30,
+                was_active: true,
+                // The anchor sat at/over the 95% trigger — the risk band, tagged at entry.
+                near_limit: true,
+            }),
+            "the entry edge must record the episode the moment it starts: {:?}",
+            entered.events,
+        );
+
+        // Stay dark for an hour of ticks. The episode is already recorded; `blind_window` — correctly,
+        // per its retained recovery-edge semantics — never closes, which is precisely why it could
+        // not see this episode at all before the entry edge existed.
+        let mut later = Vec::new();
+        for _ in 0..12 {
+            daemon.clock.advance(Duration::from_secs(300));
+            later.extend(daemon.tick().await.events);
+        }
+        assert!(
+            !later
+                .iter()
+                .any(|e| matches!(e, Event::BlindWindow { .. } | Event::BlindExit { .. })),
+            "an episode that never recovers closes nothing — that is the tail #583 fixes: {:?}",
+            later,
+        );
+        assert!(
+            !later.iter().any(|e| matches!(e, Event::BlindEnter { .. })),
+            "a held blind tick must not re-open the episode — exactly one entry per episode: {:?}",
+            later,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_episode_the_daemon_swaps_away_from_is_still_recorded() {
+        // Issue #583 AC #2 — the SECOND censoring tail, and the one that interacts adversely with
+        // issue #582. `blind_window` is guarded by `active == Some(i)` AND built from `last_good`, the
+        // ACTIVE-only anchor `record_swap` DROPS — so once the #452 gate swaps off a blind account,
+        // its later recovery is unrecoverable. Swapping away on blindness is precisely what makes an
+        // episode invisible, so the swap-away fix would otherwise INCREASE the censoring. The
+        // per-account anchor no swap path touches records it anyway, and tags the case.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.68, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        // Arm the #452 preemptive swap at the interim T (the `tunables()` helper parks it at the
+        // kill-switch ceiling so baseline tests stay inert), as `blind_swap_fires_past_t_*` does.
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert_eq!(daemon.state.active, Some(0), "u-A active before the swap");
+
+        // Blind the active. The clock is frozen through this loop, so the gate never arms yet.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        let mut entry = Vec::new();
+        while daemon.state.last_readings[0].is_some() {
+            entry.extend(daemon.tick().await.events);
+        }
+        assert!(
+            entry.contains(&Event::BlindEnter {
+                account: "u-A".to_owned(),
+                session_pct: 68,
+                weekly_pct: 20,
+                was_active: true,
+                // 68% is inside the interim 60% risk band but below the 95% reactive trigger, so the
+                // `near_limit` tag (which keys off the trigger, matching `blind_window`) is false.
+                near_limit: false,
+            }),
+            "the blind entry is recorded while u-A is still the active account: {:?}",
+            entry,
+        );
+
+        // Cross the interim T: the bounded-blindness gate swaps the blind u-A away.
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the gate must swap the blind active away for this test to exercise the tail: {:?}",
+            swapped.action,
+        );
+        assert_ne!(daemon.state.active, Some(0), "the active moved off u-A");
+
+        // u-A — now an out-of-rotation PEER — reads live again 10 minutes later.
+        daemon.clock.advance(Duration::from_secs(600));
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.71, 0.22)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        let mut exit = Vec::new();
+        while daemon.state.last_readings[0].is_none() {
+            exit.extend(daemon.tick().await.events);
+        }
+        assert!(
+            exit.contains(&Event::BlindExit {
+                account: "u-A".to_owned(),
+                // The anchor was stamped on the last live reading (frozen clock), so the episode
+                // spans the two explicit advances: the gate crossing plus the 10 min out of rotation.
+                duration_secs: BLIND_GATE_SECS + 1 + 600,
+                session_pct: 68,
+                session_at_recovery: 71,
+                weekly_pct: 20,
+                weekly_at_recovery: 22,
+                was_active: true,
+                swapped_away: true,
+                near_limit: false,
+            }),
+            "the swapped-away account's recovery must still close its episode, off the per-account \
+             anchor and with the swap-away tagged: {exit:?}",
+        );
+        // The censoring this fixes, pinned: `blind_window` stays silent for this whole episode —
+        // `active == Some(0)` is false at recovery and `record_swap` dropped its `last_good`. It is
+        // not broken; it is retained for SLO reporting (AC #4) and simply cannot see this case.
+        assert!(
+            !exit
+                .iter()
+                .any(|e| matches!(e, Event::BlindWindow { .. })),
+            "blind_window structurally cannot close a swapped-away episode — that is the tail: {exit:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_exit_exposes_a_weekly_burn_that_a_session_reset_masks() {
+        // Issue #583 AC #3 — "did it burn?", answerable from the log alone. This replays the exact
+        // production episode from the issue: on 2026-07-17 u-A was last seen at session 0.29 / weekly
+        // 0.050, went blind for ~2 h, and read back at session 0.00 / weekly 0.170. The SESSION window
+        // had reset behind the blindness, so a session-only record (all `blind_window` carries) reads
+        // 29 → 0 — indistinguishable from "never burned" — while the WEEKLY window had in fact burned
+        // +12 pp. Carrying BOTH windows is what makes the burn question answerable at all; the answer
+        // had to be dug out of `usage-samples.jsonl` by hand.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.29, 0.050)).await;
+        daemon.tick().await; // 08:26:01Z — the last live reading before the blindness
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // the 429 that blinds it
+        daemon.clock.advance(Duration::from_secs(7512)); // ~2h05m dark
+
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.00, 0.170);
+        let mut recovered = Vec::new();
+        while daemon.state.last_readings[0].is_none() {
+            recovered.extend(daemon.tick().await.events);
+        }
+        let exit = recovered
+            .iter()
+            .find(|e| matches!(e, Event::BlindExit { .. }))
+            .expect("the recovery must close the episode");
+        assert_eq!(
+            *exit,
+            Event::BlindExit {
+                account: "u-A".to_owned(),
+                duration_secs: 7512,
+                // The session dimension alone tells the WRONG story: 29 → 0 reads as a quiet reset.
+                session_pct: 29,
+                session_at_recovery: 0,
+                // The weekly dimension carries the truth: 5 → 17 is the +12 pp that actually burned.
+                weekly_pct: 5,
+                weekly_at_recovery: 17,
+                was_active: true,
+                swapped_away: false,
+                near_limit: false,
+            },
+            "the episode must carry BOTH windows or the burn stays invisible: {recovered:?}",
+        );
+        // And the rendered line answers it directly, without a query-time join.
+        assert!(
+            exit.to_log_line(std::time::UNIX_EPOCH)
+                .contains("weekly_burn_pct=12"),
+            "the line must state the burn: {}",
+            exit.to_log_line(std::time::UNIX_EPOCH),
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_keeps_its_recovery_edge_semantics_alongside_the_episode_pair() {
+        // Issue #583 AC #4: the episode pair is ADDITIVE. On the one case `blind_window` can see — an
+        // active account that recovers while still active — it still emits exactly one event with
+        // exactly its old fields, unchanged. It is the retrospective duration histogram for SLO
+        // reporting; it was only ever assigned the wrong PURPOSE (detection), so it is not touched.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.96, 0.30)).await;
+        daemon.tick().await;
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await;
+        daemon.clock.advance(Duration::from_secs(300));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.97, 0.31);
+        let recovered = daemon.tick().await;
+
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 96,
+                session_at_recovery: 97,
+                near_limit: true,
+            }),
+            "blind_window keeps its #449/#482 recovery-edge semantics verbatim: {:?}",
+            recovered.events,
+        );
+        assert_eq!(
+            recovered
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::BlindWindow { .. }))
+                .count(),
+            1,
+            "still exactly one blind_window per episode: {:?}",
+            recovered.events,
+        );
+        // Both instruments describe the SAME episode from the same anchor, so their shared fields
+        // must agree — a divergence here would mean the two anchors had drifted apart.
+        assert!(
+            recovered.events.contains(&Event::BlindExit {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 96,
+                session_at_recovery: 97,
+                weekly_pct: 30,
+                weekly_at_recovery: 31,
+                was_active: true,
+                swapped_away: false,
+                near_limit: true,
+            }),
+            "the episode pair closes the same window with the weekly dimension added: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_ever_failed_poll_claims_no_blind_episode() {
+        // The never-fabricate-an-anchor negative: an account whose FIRST poll fails was never seen
+        // live, so there is no baseline to difference a burn against — no episode is claimed, and no
+        // later "recovery" invents one. Mirrors `blind_window`'s `last_good.is_some()` guard.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().rate_limited("u-A", None)).await;
+        let first = daemon.tick().await;
+        assert!(
+            !first
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindEnter { .. })),
+            "a first-ever failed poll has no anchor, so it opens no episode: {:?}",
+            first.events,
+        );
+        assert!(daemon.state.blind_anchor[0].is_none());
+
+        daemon.clock.advance(Duration::from_secs(600));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.40, 0.10);
+        let mut live = Vec::new();
+        while daemon.state.last_readings[0].is_none() {
+            live.extend(daemon.tick().await.events);
+        }
+        assert!(
+            !live.iter().any(|e| matches!(e, Event::BlindExit { .. })),
+            "the first live reading closes no episode that was never opened: {live:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_re_poll_emits_no_blind_episode_edges() {
+        // The level-safety negative: two consecutive LIVE readings cross neither edge, so the pair is
+        // silent. Blindness is rare; the log must not gain a line per ordinary poll.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.50, 0.30)).await;
+        daemon.tick().await;
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.55, 0.30);
+        let second = daemon.tick().await;
+        assert!(
+            !second
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindEnter { .. } | Event::BlindExit { .. })),
+            "a clean re-poll crosses no blind edge: {:?}",
+            second.events,
+        );
+        assert!(daemon.state.blind_anchor[0].is_none());
+    }
+
+    #[tokio::test]
     async fn blind_gate_eligible_signals_a_viable_target_once_past_the_interim_t() {
         // Issue #482 SLI #1 (umbrella #363 Path B): the #452 preemptive-swap gate's premise falsifier.
         // The active account's retained anchor sits at 70 % — inside the interim risk band (≥ 60 %,
@@ -9896,6 +10361,56 @@ mod tests {
         assert!(
             daemon.state.session_velocity[1].is_none(),
             "the onboarded account starts with no velocity",
+        );
+    }
+
+    #[test]
+    fn reconcile_roster_preserves_an_in_flight_blind_anchor_in_lockstep() {
+        // Issue #583: the per-account pre-blind anchor is a parallel vec, so a reconcile MUST re-key
+        // it by uuid for the same reason the #539 EMA above must — an episode edge would otherwise
+        // anchor off the wrong account or panic out of bounds. It also carries a liveness stake the
+        // EMA does not: an in-flight blind episode must SURVIVE a reconcile triggered by an unrelated
+        // account, or a `remove` elsewhere silently truncates it and the episode is censored again by
+        // a third route. Here u-A is REMOVED (index shift) and u-C is ONBOARDED while u-B is blind.
+        let base = Instant::now();
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.blind_anchor[0] = Some(BlindAnchor {
+            session: 0.96,
+            weekly: 0.40,
+            at: base,
+            was_active: true,
+            near_limit: true,
+        });
+        daemon.state.blind_anchor[1] = Some(BlindAnchor {
+            session: 0.30,
+            weekly: 0.10,
+            at: base,
+            was_active: false,
+            near_limit: false,
+        });
+
+        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+
+        // The vec stays length- and index-aligned with the new roster.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
+        assert_eq!(daemon.state.blind_anchor.len(), 2);
+        // u-B's in-flight episode survives whole, re-indexed from slot 1 to slot 0 — its eventual
+        // recovery still closes against the anchor it went blind on.
+        assert_eq!(
+            daemon.state.blind_anchor[0],
+            Some(BlindAnchor {
+                session: 0.30,
+                weekly: 0.10,
+                at: base,
+                was_active: false,
+                near_limit: false,
+            }),
+            "an unrelated roster change must not truncate an in-flight blind episode",
+        );
+        // u-C onboards with no anchor — the removed u-A's 96% anchor must not leak into its slot.
+        assert!(
+            daemon.state.blind_anchor[1].is_none(),
+            "the onboarded account starts inside no episode",
         );
     }
 

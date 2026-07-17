@@ -846,6 +846,19 @@ mod tests {
     /// Swap lines carry real-shaped account **emails** in `from=`/`to=` — exactly as the production
     /// log does — so `readout_carries_no_pii` genuinely exercises the email-leak guard instead of
     /// passing vacuously on non-email handles.
+    ///
+    /// The `blind_enter` / `blind_exit` pair (issue #583) is here as a BLAST-RADIUS guard, not as an
+    /// input: this readout aggregates `blind_window` and must stay on it (that event's recovery-edge
+    /// semantics are retained for exactly this SLO purpose), so the uncensored pair MUST fall through
+    /// the `_ => {}` arm and perturb NOTHING. Their fields are deliberately adversarial — a
+    /// `near_limit=true` u-D episode with a 999 s `duration_secs` and its own `session_pct`, and u-D
+    /// has no `blind_window` line of its own — so any arm that ever picks them up fails the
+    /// assertions below LOUDLY rather than silently corrupting the SLI the #484 promotion bar reads:
+    /// `time_blind_near_limit_secs` would read 1899 against the asserted 900, and
+    /// `near_limit_reconciliations` would gain a spurious third pair against the two it pins.
+    /// Whether this readout should ever aggregate the uncensored pair instead is a separate,
+    /// unfiled decision — the guard pins today's answer either way, so making that change has to
+    /// be deliberate.
     const FIXTURE_LOG: &str = "\
 ts=2026-07-11T00:00:00Z event=swap from=oleksii@pelykh.com to=oleksii@pelykhconsulting.fr reason=session session_pct=96
 ts=2026-07-11T00:05:00Z event=swap from=oleksii@pelykhconsulting.fr to=oleksii@pelykh.com reason=weekly session_pct=42
@@ -855,6 +868,8 @@ ts=2026-07-11T00:08:00Z event=emergency_swap from=oleksii@pelykh.com to=oleksii@
 ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=300 session_pct=97 session_at_recovery=99 near_limit=true
 ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pct=96 session_at_recovery=40 near_limit=true
 ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=120 session_pct=50 session_at_recovery=51 near_limit=false
+ts=2026-07-11T00:31:00Z event=blind_enter acct=u-D session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:32:00Z event=blind_exit acct=u-D duration_secs=999 session_burn_pct=-97 weekly_burn_pct=12 session_pct=97 session_at_recovery=0 weekly_pct=40 weekly_at_recovery=52 was_active=true swapped_away=true near_limit=true
 ts=2026-07-11T00:40:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=1 backoff_secs=60
 ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=2 backoff_secs=120 retry_after_secs=120
 ts=2026-07-11T00:42:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
