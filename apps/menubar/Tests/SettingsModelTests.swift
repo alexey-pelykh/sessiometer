@@ -193,6 +193,22 @@ final class SettingsModelTests: XCTestCase {
             #"{"cmd":"config-set","labels":{"\#(uuidWork)":"day job"},"tunables":{}}"# + "\n")
     }
 
+    /// A genuinely-changed label carrying a TRAILING SPACE rebaselines to its trimmed form after apply — the
+    /// round-trip leaves the form CLEAN (the stray space is not re-flagged dirty) and canonicalizes the draft
+    /// itself to the trimmed value. Pins `rebaselineFromDrafts`' label path directly (previously only indirect).
+    func testChangedLabelWithTrailingSpaceIsCleanAfterApply() async {
+        let (model, _) = makeModel(replies: [Fixtures.configViewBasic, Fixtures.configSetAppliedLive])
+        await model.load()
+        model.setLabelDraft("day-job ", for: uuidWork)  // changed (work → day-job) AND a trailing space
+        XCTAssertTrue(model.isDirty, "a genuine label change is dirty before apply")
+
+        await model.apply()
+
+        XCTAssertEqual(model.applyPhase, .applied(effect: .live))
+        XCTAssertFalse(model.isDirty, "after apply the trimmed label is the baseline — the stray space isn't re-dirty")
+        XCTAssertEqual(model.labelDraft(for: uuidWork), "day-job", "the draft is canonicalized to its trimmed form")
+    }
+
     /// AC 4: an out-of-range / cross-field edit is the DAEMON's to reject — the model renders `invalid` + the
     /// field-naming `detail`, keeps the edit for a retry, and (the daemon wrote nothing) the form stays dirty.
     func testApplyDaemonRejectsInvalidWithDetailAndNoWrite() async {
@@ -240,6 +256,21 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(connector.sentLines.count, 1)
     }
 
+    /// A draft in `(Int64.max, UInt64.max]` parses as a whole `UInt64` but overflows the `Int64` wire — it is
+    /// blocked client-side with its OWN "too large" message (NOT the misleading "0 or greater" format error),
+    /// and, like every client-side rejection, never reaches the wire (`UInt64.max` here — 20 digits).
+    func testOverlargeDraftIsTooLargeAndNotSent() async {
+        let (model, connector) = makeModel(replies: [Fixtures.configViewBasic, Fixtures.configSetAppliedLive])
+        await model.load()
+        model.setDraft("18446744073709551615", for: .pollSecs)  // UInt64.max — a whole number, but > Int64.max
+        await model.apply()
+
+        XCTAssertEqual(model.applyPhase, .invalidInput)
+        XCTAssertEqual(model.fieldErrors[.pollSecs], "That number is too large.")
+        XCTAssertEqual(connector.sentLines.count, 1, "the over-large config-set never left the client")
+        XCTAssertTrue(connector.sentLines.allSatisfy { $0.contains("config-get") })
+    }
+
     /// Editing a flagged field clears its inline error immediately (fix-as-you-type) AND, once the last error
     /// is gone, drops the `invalidInput` banner so it never lingers pointing at nothing.
     func testEditingAFlaggedFieldClearsItsError() async {
@@ -269,6 +300,37 @@ final class SettingsModelTests: XCTestCase {
         model.setDraft("120", for: .pollSecs)
         await model.apply()
         XCTAssertEqual(model.applyPhase, .failed(.undecodable))
+    }
+
+    /// Re-entrancy (mirrors `AccountSwapModel.swap`): two OVERLAPPING `apply()` calls collapse to a SINGLE
+    /// `config-set`. `apply` latches `.applying` in its synchronous prefix — before its first `await` — so on
+    /// the serial `@MainActor` the second submit observes the in-flight guard and is a no-op. A
+    /// `GatedApplyConnector` PINS the first apply in that in-flight window (its `send` blocks until released),
+    /// making the overlap deterministic rather than a race against the synchronous fake. Guards a rapid double
+    /// Cmd-S from spawning two writes before the view's `saveEnabled` disable (an async re-render) lands.
+    func testOverlappingApplyCollapsesToASingleConfigSet() async {
+        let connector = GatedApplyConnector(loadReply: Fixtures.configViewBasic,
+                                            applyReply: Fixtures.configSetAppliedLive)
+        let model = SettingsModel(
+            client: ControlCommandClient(connector: connector, timeout: .seconds(5)),
+            preferences: ephemeralPreferences())
+        await model.load()
+        model.setDraft("120", for: .pollSecs)
+
+        // The gated `send` holds the first apply in `.applying` and will NOT advance until released, so
+        // yielding until we observe `.applying` converges (no transient-state miss on the serial actor).
+        async let firstApply: Void = model.apply()
+        while model.applyPhase != .applying { await Task.yield() }
+
+        await model.apply()  // the overlapping submit — observes `.applying`, returns immediately (the guard)
+        XCTAssertEqual(model.applyPhase, .applying, "the second apply neither superseded nor cleared the first")
+
+        connector.release()  // let the one in-flight config-set complete
+        await firstApply
+
+        XCTAssertEqual(model.applyPhase, .applied(effect: .live))
+        XCTAssertFalse(model.isDirty, "the single apply rebaselined")
+        XCTAssertEqual(connector.connectCount, 2, "load + exactly ONE config-set connect — the overlap was a no-op")
     }
 
     // MARK: - safety boundary (AC 5/6): only tunables + labels can travel
@@ -393,4 +455,68 @@ private final class ScriptedCommandConnector: WatchConnector, @unchecked Sendabl
 
     /// Every command line sent across all connections, in order (each includes its trailing newline).
     var sentLines: [String] { state.withLock { $0.connections.flatMap { $0.sentStrings } } }
+}
+
+/// A `WatchConnector` for the re-entrancy test: the FIRST connect (the load) answers immediately; the SECOND
+/// (the apply) hands back a connection whose `send` BLOCKS until `release()` — pinning that `apply()` in its
+/// in-flight `.applying` window so an overlapping `apply()` is provably a no-op, WITHOUT racing the scheduler.
+/// `connectCount` lets the test assert exactly one config-set reached the transport (a leaked second send
+/// would be a third connect). The gate blocks the client's detached connect task, never the `@MainActor`.
+private final class GatedApplyConnector: WatchConnector, @unchecked Sendable {
+    private let loadReply: String?
+    private let applyReply: String?
+    private let gate = DispatchSemaphore(value: 0)
+    private let state = OSAllocatedUnfairLock(initialState: 0)  // connect count
+
+    init(loadReply: String?, applyReply: String?) {
+        self.loadReply = loadReply
+        self.applyReply = applyReply
+    }
+
+    func connect() throws -> WatchConnection {
+        let index = state.withLock { count -> Int in defer { count += 1 }; return count }
+        return index == 0
+            ? CommandFakeConnection(ackOnSend: loadReply)          // load: answers immediately
+            : GatedCommandConnection(ack: applyReply, gate: gate)  // apply: `send` blocks until release()
+    }
+
+    /// Open the gate so the pinned apply's `send` proceeds and the exchange completes.
+    func release() { gate.signal() }
+
+    /// How many connections were opened — load + one per apply that actually reached the wire.
+    var connectCount: Int { state.withLock { $0 } }
+}
+
+/// A one-shot control-command connection whose `send` BLOCKS on a gate until the test releases it — used to
+/// pin an `apply()` in its `.applying` window (see `GatedApplyConnector`). After the gate opens it records the
+/// bytes and answers with its scripted ack, exactly like `CommandFakeConnection`. `send` runs on the client's
+/// DETACHED connect task, so the blocking wait never stalls the `@MainActor` under test.
+private final class GatedCommandConnection: WatchConnection, @unchecked Sendable {
+    let lines: AsyncStream<String>
+    private let continuation: AsyncStream<String>.Continuation
+    private let ack: String?
+    private let gate: DispatchSemaphore
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private struct State { var sent: [[UInt8]] = []; var finished = false }
+
+    init(ack: String?, gate: DispatchSemaphore) {
+        self.ack = ack
+        self.gate = gate
+        (lines, continuation) = AsyncStream<String>.makeStream()
+    }
+
+    func send(_ bytes: [UInt8]) throws {
+        gate.wait()  // hold the exchange open until release() — on the detached connect task, not the @MainActor
+        state.withLock { $0.sent.append(bytes) }
+        if let ack { continuation.yield(ack) }
+    }
+
+    func close() {
+        let finish = state.withLock { st -> Bool in
+            if st.finished { return false }
+            st.finished = true
+            return true
+        }
+        if finish { continuation.finish() }
+    }
 }

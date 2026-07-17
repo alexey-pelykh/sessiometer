@@ -95,11 +95,15 @@ enum ConfigGetReply: Equatable {
 }
 
 /// The literal `error` reasons `config_get_reply` emits (`src/daemon/socket.rs`), named so the view can match
-/// the actionable "no config" case without an inline string literal — giving the READ side the same single
-/// source of truth the config-SET side already has in `ConfigSetRejection`. A reworded daemon string simply
-/// falls through to the view's generic "configuration unavailable" copy (graceful degradation, never a crash).
+/// each ACTIONABLE case without an inline string literal — giving the READ side the same single source of
+/// truth the config-SET side already has in `ConfigSetRejection`. Both are matched by `SettingsView` for
+/// tailored, operator-actionable copy (issue #573). A reason with no remedy to offer (`encode failed`) is
+/// deliberately unnamed, and a reworded / new daemon string simply falls through to the view's generic
+/// "Configuration unavailable" copy (graceful degradation, never a crash).
 enum ConfigGetErrorReason {
+    /// No `config.toml` yet — capture the first account with the CLI.
     static let noConfig = "no config"
+    /// `config.toml` exists but does not parse — the daemon left it untouched.
     static let unreadable = "config unreadable"
 }
 

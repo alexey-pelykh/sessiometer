@@ -7,6 +7,12 @@
 // only renders phases and binds drafts. AppKit/SwiftUI, so it stays in the app target (untested), the
 // counterpart split to `PanelStatsModel` (tested) vs `StatusPanelView` (app-only).
 //
+// LAYERING (issue #573, load-bearing): the two surfaces here have DIFFERENT dependencies, so they sit on
+// different sides of the load-phase gate. The Notifications toggle is app-local (`UserDefaults`, nil-client
+// safe) and renders ALWAYS, above the gate; only the daemon-config surface (tunables + accounts) is gated on
+// `config-get` and renders below it. Nesting the toggle inside the gated form — as #268 shipped — made an
+// app preference unreachable whenever the daemon was stopped or unconfigured, a diff-invisible UX gap.
+//
 // Scope (RATIFIED, prd-menubar.md:25 — "edits tunables + labels, never account capture/credentials"): the
 // accounts section edits LABELS only; add / remove / capture stay in the CLI (a pointer, never a GUI
 // keychain write — AC 5/6). macOS 13 floor: `ObservableObject` (not `@Observable`), `.formStyle(.grouped)`
@@ -19,7 +25,14 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            content
+            // ONE always-present grouped Form: the app-local Notifications section on top (daemon-independent,
+            // so it renders in every load phase — issue #573), then the daemon-config surface conditionally
+            // below it (loading / honest-disconnected / loaded).
+            Form {
+                notificationsSection
+                daemonConfig
+            }
+            .formStyle(.grouped)
             Divider()
             footer
         }
@@ -28,41 +41,83 @@ struct SettingsView: View {
         // AND reopens), so the form never races two config-get fetches on first open.
     }
 
-    // MARK: - Load phases
+    // MARK: - Notifications (app-local, always visible — independent of the daemon load phase)
 
-    @ViewBuilder
-    private var content: some View {
-        switch model.loadPhase {
-        case .idle, .loading:
-            centered { ProgressView("Loading settings…") }
-        case .failed(let failure):
-            centered { loadFailure(failure) }
-        case .loaded:
-            form
+    /// The app-local notification toggle (issue #267). A pure `UserDefaults` preference — fully
+    /// daemon-independent (`SettingsModel` supports a nil client) — so it sits ABOVE the load-phase gate and
+    /// renders in EVERY phase (loading / honest-disconnected / no-config / loaded): the one control an
+    /// operator can always reach, even with the daemon stopped or on a fresh install (issue #573).
+    private var notificationsSection: some View {
+        Section {
+            Toggle("Notify on account swaps and exhaustion", isOn: $model.notificationsEnabled)
+        } header: {
+            Text("Notifications")
+        } footer: {
+            Text("A local macOS notification when the active account changes or every account is exhausted. "
+                + "This is an app preference — it isn’t part of the daemon configuration below.")
         }
     }
 
-    /// The honest-disconnected / no-config states (AC 7) — never a blank or fabricated form.
+    // MARK: - Daemon configuration (load-phase gated, shown BELOW the always-present Notifications section)
+
+    /// The daemon-config surface (tunables + accounts), gated on the `config-get` load phase and rendered
+    /// below the always-present Notifications section (issue #573): a loading placeholder, the honest-
+    /// disconnected / no-config states (AC 7), or the editable tunables + accounts.
     @ViewBuilder
-    private func loadFailure(_ failure: ConfigFailure) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
-            Text(loadFailureHeadline(failure)).font(.headline)
-            Text(loadFailureDetail(failure))
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Try Again") { Task { await model.load() } }
-                .padding(.top, 4)
+    private var daemonConfig: some View {
+        switch model.loadPhase {
+        case .idle, .loading:
+            loadingSection
+        case .failed(let failure):
+            loadFailureSection(failure)
+        case .loaded:
+            tunableSections
+            accountsSection
         }
-        .padding(32)
+    }
+
+    /// The loading placeholder — headed "Daemon Configuration" so a slow first fetch reads as the daemon
+    /// area filling in below the (already usable) Notifications toggle, not a stalled window.
+    private var loadingSection: some View {
+        Section("Daemon Configuration") {
+            HStack(spacing: 8) {
+                Spacer()
+                ProgressView().controlSize(.small)
+                Text("Loading settings…").foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.vertical, 8)
+        }
+    }
+
+    /// The honest-disconnected / no-config states (AC 7) — never a blank or fabricated form. Headed "Daemon
+    /// Configuration" so the failure clearly scopes to the daemon surface below Notifications (the toggle
+    /// stays live), matching the Notifications footer's "the daemon configuration below".
+    @ViewBuilder
+    private func loadFailureSection(_ failure: ConfigFailure) -> some View {
+        Section("Daemon Configuration") {
+            VStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.largeTitle)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)  // decorative — the headline + detail carry the state for VoiceOver
+                Text(loadFailureHeadline(failure)).font(.headline)
+                Text(loadFailureDetail(failure))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Try Again") { Task { await model.load() } }
+                    .padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+        }
     }
 
     private func loadFailureHeadline(_ failure: ConfigFailure) -> String {
         switch failure {
         case .daemonError(ConfigGetErrorReason.noConfig): return "No configuration yet"
+        case .daemonError(ConfigGetErrorReason.unreadable): return "Configuration unreadable"
         case .daemonError: return "Configuration unavailable"
         case .transport, .unavailable: return "Sessiometer isn’t connected"
         case .undecodable: return "Unexpected response"
@@ -73,6 +128,9 @@ struct SettingsView: View {
         switch failure {
         case .daemonError(ConfigGetErrorReason.noConfig):
             return "Capture your first account with the sessiometer CLI, then reopen Settings."
+        case .daemonError(ConfigGetErrorReason.unreadable):
+            return "Sessiometer’s configuration file exists but couldn’t be read — it may be malformed. "
+                + "Fix or re-capture it with the sessiometer CLI, then reopen Settings."
         case .daemonError(let reason):
             return "The daemon reported: \(reason)."
         case .transport, .unavailable:
@@ -82,39 +140,31 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - The form
+    // MARK: - Daemon tunables + accounts (the `.loaded` daemon-config sections)
 
-    private var form: some View {
-        Form {
-            Section {
-                Toggle("Notify on account swaps and exhaustion", isOn: $model.notificationsEnabled)
-            } header: {
-                Text("Notifications")
-            } footer: {
-                Text("A local macOS notification when the active account changes or every account is exhausted. "
-                    + "This is an app preference — it isn’t part of the daemon configuration below.")
-            }
-
-            ForEach(TunableField.Section.allCases) { section in
-                Section(section.title) {
-                    ForEach(section.fields) { field in
-                        tunableRow(field)
-                    }
+    /// The five grouped tunable sections (issue #268), in display order.
+    private var tunableSections: some View {
+        ForEach(TunableField.Section.allCases) { section in
+            Section(section.title) {
+                ForEach(section.fields) { field in
+                    tunableRow(field)
                 }
-            }
-
-            Section {
-                ForEach(model.accounts, id: \.accountUuid) { account in
-                    accountRow(account)
-                }
-            } header: {
-                Text("Accounts")
-            } footer: {
-                Text("Rename accounts here. Add, remove, or re-authenticate accounts with the sessiometer CLI — "
-                    + "the settings window never touches credentials.")
             }
         }
-        .formStyle(.grouped)
+    }
+
+    /// The roster label-edit section (issue #268) — LABELS only; add / remove / capture stay in the CLI.
+    private var accountsSection: some View {
+        Section {
+            ForEach(model.accounts, id: \.accountUuid) { account in
+                accountRow(account)
+            }
+        } header: {
+            Text("Accounts")
+        } footer: {
+            Text("Rename accounts here. Add, remove, or re-authenticate accounts with the sessiometer CLI — "
+                + "the settings window never touches credentials.")
+        }
     }
 
     private func tunableRow(_ field: TunableField) -> some View {
@@ -226,7 +276,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Bindings + layout helpers
+    // MARK: - Bindings
 
     private func tunableBinding(_ field: TunableField) -> Binding<String> {
         Binding(get: { model.draft(for: field) }, set: { model.setDraft($0, for: field) })
@@ -234,10 +284,6 @@ struct SettingsView: View {
 
     private func labelBinding(_ uuid: String) -> Binding<String> {
         Binding(get: { model.labelDraft(for: uuid) }, set: { model.setLabelDraft($0, for: uuid) })
-    }
-
-    private func centered<V: View>(@ViewBuilder _ inner: () -> V) -> some View {
-        inner().frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Inferred per-field copy
