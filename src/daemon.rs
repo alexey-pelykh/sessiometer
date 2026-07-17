@@ -225,8 +225,8 @@ const POLL_BACKOFF_MAX_SHIFT: u32 = 6;
 /// [`ACTIVE_POLL_BACKOFF_CAP`] and honours `Retry-After` as an un-clamped floor instead
 /// (issue #453).
 const POLL_BACKOFF_CAP: Duration = Duration::from_secs(3600);
-/// Ceiling on the ACTIVE account's OWN rate-limit / transient poll back-off (issue #453,
-/// the `active_backoff_cap_secs` tunable — default 120 s). Much tighter than the peer
+/// Ceiling on the ACTIVE account's OWN rate-limit / transient poll back-off (issue #453),
+/// a compile-time constant fixed at 120 s. Much tighter than the peer
 /// [`POLL_BACKOFF_CAP`]: a `429` on the active account blinds the very account being
 /// consumed, so its self-backoff (the exponential arm, when the server gives NO
 /// `Retry-After`) is clamped here to recover observability fast, rather than letting the

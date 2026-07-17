@@ -163,21 +163,23 @@ longer globally waits for a rate-limit.
 - **An astronomically-large `Retry-After` is bounded, not honoured literally.** The
   `checked_add` safety floor clamps a monotonic-instant overflow to
   `POLL_BACKOFF_CAP` rather than panicking; a deliberate **policy** cap on
-  pathological server values is deferred to **#294** (open). Accepted: the
-  long-running daemon must never panic on overflow, and policy bounding is a
-  separate, tracked concern.
+  pathological server values was deferred to **#294** (shipped, closed at
+  `f56f2f1`). Accepted: the long-running daemon must never panic on overflow,
+  and policy bounding was a separate, tracked concern.
 
 ## Related
 
 - Issues: **#297** (this ADR). Shipped as **#293** (scope the back-off per-account
   — closed at `3d08218`). Supersedes the endpoint-global framing of **#76** (poll
   cadence + jitter + rate-limit back-off — closed), which was never formalised in
-  an ADR. **#294** (cap the honoured `Retry-After` — **open**; the policy bound the
-  `checked_add` arithmetic-safety floor defers to). **#453** later **re-parameterises
-  the ACTIVE account's arm** without changing the per-account *scoping* this ADR
-  decides: the active account self-caps at `ACTIVE_POLL_BACKOFF_CAP` = 120 s (vs the
-  peer `POLL_BACKOFF_CAP`) and honours `Retry-After` as an **un-clamped floor** (never
-  re-poll before it), so a throttle on the *consumed* account recovers observability
+  an ADR. **#294** (cap the honoured `Retry-After` — shipped, closed at
+  `f56f2f1`; the policy bound the `checked_add` arithmetic-safety floor defers
+  to) — its clamp binds **peers only**. **#453** later **re-parameterises the
+  ACTIVE account's arm** and **exempts it from that clamp**, without changing
+  the per-account *scoping* this ADR decides: the active account self-caps at
+  `ACTIVE_POLL_BACKOFF_CAP` = 120 s (vs the peer `POLL_BACKOFF_CAP`) and honours
+  `Retry-After` as an **un-clamped floor** (never re-poll before it), so a
+  throttle on the *consumed* account recovers observability
   fast — the `note_account_backoff` `is_active` branch; peers stay exactly as decided
   here. Prior art: **#282** (the
   monotonic-deadline keep-warm idiom this back-off mirrors — closed), **#38**
