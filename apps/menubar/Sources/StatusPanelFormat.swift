@@ -942,17 +942,85 @@ enum StatusPanelFormat {
                       kind: .error)
     }
 
+    // MARK: - `systemic_refresh_failure` banner (issue #523 — the refresh-MECHANISM-down signal)
+
+    /// The honest-state BANNER for the daemon's `systemic_refresh_failure` count (`WireModel.swift`
+    /// `systemicRefreshFailure`, wire #378), or `nil` when the refresh mechanism is healthy (the wire key is
+    /// absent → no banner, same single-cardinality as `canonicalScrubBanner(nil)`). `consecutive` refresh
+    /// SWEEPS in a row have failed with `outcome=error` for EVERY eligible account — the refresh MECHANISM
+    /// is down (a stale pinned `claude` path #375, a wedged spawn), not one account's credentials.
+    ///
+    /// The third daemon-level payload fault, and the one no per-account `auth` cell reflects even in
+    /// PRINCIPLE: the other two are lockouts the rows merely fail to mention, but this one is visible
+    /// BEFORE any account dies — that is the entire point of #378 (the #375 incident kept a total refresh
+    /// outage invisible for ~4.5 h, until a token finally expired and the account was quarantined 🔴). So a
+    /// connected panel with a full green roster is EXACTLY the state this banner exists to contradict.
+    ///
+    /// `.warning`, not `.error` — the deliberate severity split from its two `.error` siblings: a scrubbed
+    /// or unreadable vault means the operator is blocked NOW, while a down refresh mechanism is PRE-DEATH
+    /// (every account still works; they will lapse later if it stays down). It cannot self-heal either, so
+    /// it is a real next-break task — never dismissible chrome. The same "act at your next break" rung the
+    /// menu-bar glyph gives it (`!` `.attention`, issue #520), the two vault faults getting `⊘` `.noRunway`.
+    ///
+    /// Content-parity with the CLI's `refresh mechanism: DOWN — …` line (`src/cli.rs` `render_status`): the
+    /// SAME state, the SAME count, and the SAME diagnostic remedy, each medium phrasing it its own way (R-2
+    /// STATE-parity, as ADR-0016 did for `ActiveDeadNoTarget` / `nextSwapFooter`) — the CLI spells the
+    /// remedy out for a terminal reader; the panel keeps it to the one line a popover affords. The noun
+    /// agreement matches the CLI's at the `n=1` floor (a threshold of 1 fires on the first all-error sweep
+    /// → "1 consecutive sweep"). Carries only the COUNT — never a token, path, or email (issue #15).
+    static func systemicRefreshFailureBanner(_ consecutive: UInt32?) -> Banner? {
+        guard let consecutive else { return nil }
+        let sweeps = consecutive == 1 ? "sweep" : "sweeps"
+        return Banner(title: "Refresh mechanism down",
+                      detail: "\(consecutive) consecutive \(sweeps) failed for every eligible account — check the daemon log.",
+                      kind: .warning)
+    }
+
     /// The single worst-first daemon-level fault banner for the `.connected` / `.stale` body — the panel
-    /// shows ONE banner even when multiple daemon-level faults are set. Priority: keychain-locked (#498)
-    /// OUTRANKS canonical-scrub (#469) — an UNREADABLE shared item (the daemon cannot read it at all) is
-    /// at least as severe as a readable-but-SCRUBBED one, and its remedy (unlock the keychain) must reach
-    /// the operator before the scrub's `claude /login`, which cannot help while the keychain is locked. In
-    /// practice the two are daemon-mutually-exclusive (a locked keychain can't be read to know
-    /// scrubbed-ness), so this is a deterministic tiebreak, not a common composite. `nil` when both are
-    /// healthy (no banner). Keeps the worst-first order a testable pure function rather than a `??` buried
-    /// in the View.
-    static func daemonFaultBanner(keychainLocked: Bool, scrub: CanonicalScrub?) -> Banner? {
-        keychainLockedBanner(keychainLocked) ?? canonicalScrubBanner(scrub)
+    /// shows ONE banner even when multiple daemon-level faults are set. Four ranks over three faults,
+    /// because canonical-scrub splits by VARIANT rather than occupying one slot:
+    ///
+    ///   1. **keychain-locked** (#498) — `.error`, act now
+    ///   2. **canonical-scrub `exhausted`** (#469) — `.error`, act now
+    ///   3. **systemic-refresh-failure** (#523) — `.warning`, next break
+    ///   4. **canonical-scrub `recovering`** (#469) — `.info`, calm; no action needed
+    ///
+    /// Ranks 1-2 are the "act now" vault pair, ordered so the remedy that CAN work reaches the operator
+    /// first: an UNREADABLE shared item (the daemon cannot read it at all) is at least as severe as a
+    /// readable-but-SCRUBBED one, and unlock-the-keychain must precede the scrub's `claude /login`, which
+    /// cannot help while the keychain is locked. Systemic-refresh ranks under both because it is PRE-DEATH —
+    /// the vault pair blocks the operator now, while a down refresh mechanism leaves every account still
+    /// working (a next-break task, `.warning` not `.error`; the glyph draws the same rank as `!` vs `⊘`,
+    /// issue #520). This arm really arbitrates rather than merely tie-breaking: unlike the vault pair
+    /// (daemon-mutually-exclusive in practice — a locked keychain can't be read to know scrubbed-ness),
+    /// systemic-refresh CAN genuinely coincide with either, since the refresh mechanism spawns `claude`
+    /// while the vault is a keychain item.
+    ///
+    /// **Why `recovering` ranks LAST, below systemic — the load-bearing subtlety.** The scrub's two variants
+    /// are NOT one severity: `exhausted` is an act-now lockout, but `recovering` is the calm self-healing
+    /// state whose whole message is "no action needed". Ranking canonical-scrub as ONE slot (its variants
+    /// sharing rank 2) silently promoted `recovering` above systemic — so a `recovering` scrub coinciding
+    /// with a down refresh mechanism made the two surfaces CONTRADICT each other: `make` ignores
+    /// `recovering` (only `exhausted` is a `⊘` input), so the glance correctly shouted `!` at the systemic
+    /// fault, while this resolver short-circuited on the non-nil `recovering` banner and the panel answered
+    /// the click with a grey "Recovering automatically — no action needed." over a green roster — with a
+    /// total refresh outage running. Strictly worse than the false-healthy it replaced: it does not merely
+    /// fail to explain the `!`, it actively contradicts it. Severity must therefore rank by (fault, VARIANT),
+    /// never by fault identity alone — a self-healing state can never outrank one that cannot self-heal.
+    ///
+    /// `nil` when all three are healthy (no banner). Keeps the worst-first order a testable pure function
+    /// rather than a `??` chain buried in the View.
+    static func daemonFaultBanner(keychainLocked: Bool,
+                                  scrub: CanonicalScrub?,
+                                  systemicRefreshFailure: UInt32? = nil) -> Banner? {
+        // Ranks 1-2 — the "act now" vault pair.
+        if let locked = keychainLockedBanner(keychainLocked) { return locked }
+        if case .exhausted = scrub { return canonicalScrubBanner(scrub) }
+        // Rank 3 — the "next break" mechanism fault, ABOVE the calm scrub variant below.
+        if let systemic = systemicRefreshFailureBanner(systemicRefreshFailure) { return systemic }
+        // Rank 4 — `recovering` (or nothing): the calm self-healing state has the lowest claim on the one
+        // banner slot, precisely because it is the one that says no action is needed.
+        return canonicalScrubBanner(scrub)
     }
 
     // MARK: - Header identity + swap callout (issue #355 — design-reference parity)

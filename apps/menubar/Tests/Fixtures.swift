@@ -138,6 +138,19 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":7},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"keychain_locked":true}
     """#
 
+    /// The daemon-level `systemic_refresh_failure` count (issue #378): the refresh MECHANISM is down — 3
+    /// consecutive sweeps in which EVERY eligible account's cycle failed `outcome=error` (a stale pinned
+    /// `claude` path #375, a wedged spawn), not one account's credentials. The THIRD daemon-level payload
+    /// fault (#520 glyph-half / #523 panel-half), and the only one visible BEFORE any account dies — note
+    /// the roster here reads perfectly HEALTHY (`auth":"healthy"`, a live `session_pct`), which is exactly
+    /// the false-healthy state the banner + `!` glance exist to contradict. NOT byte-pinned to a Rust golden
+    /// — the goldens cover the healthy frame, which carries `"systemic_refresh_failure":null`, so this
+    /// hand-built frame gives the non-null COUNT decode coverage (mirrors `snapshotKeychainLocked` /
+    /// `snapshotCanonicalScrubRecovering`). Carries only the count, never a token or path (issue #15).
+    static let snapshotSystemicRefreshFailure = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":7},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3}
+    """#
+
     /// The active account's bounded-blindness projection (issues #479/#485) — auto-protection OK. The
     /// active account's usage poll is blind (429 / ADR-0017): `session_pct` / `weekly_pct` are null (the
     /// daemon's `usage: None`), and `blind_active` carries the SEMANTIC line — blind duration, the retained

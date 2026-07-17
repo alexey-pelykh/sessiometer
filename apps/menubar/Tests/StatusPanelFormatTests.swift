@@ -615,6 +615,97 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertNil(StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil))
     }
 
+    // MARK: - systemicRefreshFailureBanner (issue #523 — the refresh-MECHANISM-down signal)
+
+    // The panel-half of #520/#523: the refresh mechanism is down (#378) while every account is still ALIVE,
+    // so nothing in the roster carries it — only this banner does. `.warning`, not `.error`: it is
+    // pre-death (the vault pair blocks NOW; this lapses later), the same next-break rung the glyph gives it.
+    func testSystemicRefreshFailureBannerNamesTheCountAndTheDiagnosticRemedy() throws {
+        let banner = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(3))
+        XCTAssertEqual(banner.title, "Refresh mechanism down")
+        XCTAssertEqual(banner.detail, "3 consecutive sweeps failed for every eligible account — check the daemon log.")
+        XCTAssertEqual(banner.kind, .warning, "pre-death → next-break .warning, not the vault pair's .error")
+    }
+
+    // Healthy mechanism → no banner (the wire key is absent), the same single-cardinality as its siblings.
+    func testSystemicRefreshFailureBannerIsAbsentWhenTheMechanismIsHealthy() {
+        XCTAssertNil(StatusPanelFormat.systemicRefreshFailureBanner(nil))
+    }
+
+    // Noun agreement at the n=1 floor — a configured threshold of 1 fires on the FIRST all-error sweep, so
+    // "1 consecutive sweep" is reachable. Matches the CLI line's own agreement (`src/cli.rs` render_status).
+    func testSystemicRefreshFailureBannerAgreesAtTheSingleSweepFloor() throws {
+        let one = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(1))
+        XCTAssertEqual(one.detail, "1 consecutive sweep failed for every eligible account — check the daemon log.")
+    }
+
+    // Issue #15: the banner carries only the COUNT — never a token, path, or email. The CLI line names the
+    // `[refresh] claude binary` because a terminal reader can act on it; the panel keeps to the daemon log.
+    func testSystemicRefreshFailureBannerCarriesNoSecret() throws {
+        let banner = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(7))
+        let text = banner.title + " " + banner.detail
+        for forbidden in ["@", "sk-", "token", "Bearer", "/Users/", ".json"] {
+            XCTAssertFalse(text.contains(forbidden), "#15: the banner must not carry \(forbidden): \(text)")
+        }
+    }
+
+    // The 3-way worst-first rank: the two "act now" vault faults outrank the pre-death mechanism fault.
+    // Unlike the vault pair (daemon-mutually-exclusive — a locked keychain can't be read to know
+    // scrubbed-ness), systemic-refresh CAN genuinely coincide with either, so this arm really arbitrates.
+    func testDaemonFaultBannerRanksTheVaultPairOverSystemicRefresh() throws {
+        // Each vault fault + systemic → the vault fault wins (the operator is blocked NOW).
+        let keychainAndSystemic = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: true, scrub: nil, systemicRefreshFailure: 3))
+        XCTAssertEqual(keychainAndSystemic.title, "Keychain locked", "act-now keychain outranks systemic")
+
+        let scrubAndSystemic = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .exhausted, systemicRefreshFailure: 3))
+        XCTAssertEqual(scrubAndSystemic.title, "Shared login scrubbed", "act-now scrub outranks systemic")
+
+        // Systemic alone → it finally surfaces (the vault is healthy, so it falls through).
+        let systemicOnly = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil, systemicRefreshFailure: 3))
+        XCTAssertEqual(systemicOnly.title, "Refresh mechanism down")
+
+        // All healthy → no banner.
+        XCTAssertNil(StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil, systemicRefreshFailure: nil))
+    }
+
+    // The scrub's two variants are NOT one severity — `recovering` ranks LAST, BELOW systemic. Ranking
+    // canonical-scrub as one slot made the surfaces contradict each other: `PresentationState.make` ignores
+    // `recovering` (only `exhausted` is a ⊘ input), so the glance shouts `!` at the systemic fault, while a
+    // fault-identity rank answered the resulting click with a calm "no action needed" over a green roster —
+    // during a total refresh outage. That is strictly worse than the false-healthy it replaced: it does not
+    // merely fail to explain the `!`, it CONTRADICTS it. A self-healing state can never outrank one that
+    // cannot self-heal.
+    func testCalmRecoveringScrubNeverOutranksTheSystemicFaultTheGlyphIsShouting() throws {
+        let recoveringAndSystemic = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .recovering, systemicRefreshFailure: 3))
+        XCTAssertEqual(recoveringAndSystemic.title, "Refresh mechanism down",
+                       "the calm self-healing scrub must not bury the fault that cannot self-heal")
+        XCTAssertEqual(recoveringAndSystemic.kind, .warning)
+
+        // The exact cross-surface invariant, asserted end-to-end rather than per-resolver: whenever the
+        // glance shows a fault glyph, the panel's one banner must EXPLAIN that fault — never contradict it.
+        let glance = PresentationState.make(for: .connected, accountCount: 3,
+                                            canonicalScrub: .recovering, systemicRefreshFailure: 3)
+        XCTAssertEqual(glance.glyph, .attention, "the glance shouts at the systemic fault")
+        XCTAssertFalse(recoveringAndSystemic.detail.contains("no action needed"),
+                       "the panel must not answer a shouting glyph with 'no action needed'")
+
+        // `recovering` alone still surfaces its calm banner — it is ranked last, not dropped.
+        let recoveringAlone = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .recovering, systemicRefreshFailure: nil))
+        XCTAssertEqual(recoveringAlone.title, "Shared login scrubbed")
+        XCTAssertEqual(recoveringAlone.kind, .info)
+
+        // And an `exhausted` scrub still outranks systemic — only the CALM variant moved.
+        let exhaustedAndSystemic = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .exhausted, systemicRefreshFailure: 3))
+        XCTAssertEqual(exhaustedAndSystemic.title, "Shared login scrubbed")
+        XCTAssertEqual(exhaustedAndSystemic.kind, .error)
+    }
+
     // MARK: - captureCommand (the CLI-equivalent subcommand; in-app capture affordance is #360)
 
     func testCaptureCommandIsTheExactSubcommand() {

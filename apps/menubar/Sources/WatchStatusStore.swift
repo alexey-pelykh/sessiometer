@@ -62,6 +62,16 @@ final class WatchStatusStore: ObservableObject {
     /// the roster (worst-first over `canonicalScrub`); `false` when the keychain is unlocked (or a
     /// pre-#498 daemon omits the wire key). Its remedy is UNLOCK the keychain, not `claude /login`.
     @Published private(set) var keychainLocked: Bool = false
+    /// The daemon-level SYSTEMIC refresh-failure count (#378, wire since schema 1.1) — the refresh
+    /// MECHANISM is down (N consecutive sweeps in which EVERY eligible account's cycle errored: a stale
+    /// pinned `claude` path, a wedged spawn), which no per-account `auth` cell reflects even in principle
+    /// because it is visible BEFORE any account dies. The panel renders it as an honest banner above the
+    /// roster, ranked UNDER the two "act now" faults (`keychainLocked`, `canonicalScrub` = `exhausted`)
+    /// but OVER the calm self-healing `canonicalScrub` = `recovering` — severity ranks by (fault, VARIANT),
+    /// never by fault identity, or a "no action needed" banner would answer a glance that is shouting
+    /// (see `StatusPanelFormat.daemonFaultBanner`). `nil` when the mechanism is healthy (or a pre-#378
+    /// daemon omits the wire key). A COUNT only, never a token or path (issue #15).
+    @Published private(set) var systemicRefreshFailure: UInt32?
 
     // MARK: - The glance presentation stream (the status item consumes this)
 
@@ -222,6 +232,7 @@ final class WatchStatusStore: ObservableObject {
         generatedAt = machine.generatedAt
         canonicalScrub = machine.canonicalScrub
         keychainLocked = machine.keychainLocked
+        systemicRefreshFailure = machine.systemicRefreshFailure
         presentationsContinuation.yield(machine.presentation)
     }
 
@@ -413,7 +424,8 @@ extension WatchStatusStore {
     static func preview(state: ConnectionState, rows: [AccountRow],
                         nextSwap: NextSwap?, generatedAt: Int64?,
                         canonicalScrub: CanonicalScrub? = nil,
-                        keychainLocked: Bool = false) -> WatchStatusStore {
+                        keychainLocked: Bool = false,
+                        systemicRefreshFailure: UInt32? = nil) -> WatchStatusStore {
         let store = WatchStatusStore()
         store.connectionState = state
         store.rows = rows
@@ -421,6 +433,7 @@ extension WatchStatusStore {
         store.generatedAt = generatedAt
         store.canonicalScrub = canonicalScrub
         store.keychainLocked = keychainLocked
+        store.systemicRefreshFailure = systemicRefreshFailure
         return store
     }
 }

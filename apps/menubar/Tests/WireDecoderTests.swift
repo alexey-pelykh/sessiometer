@@ -224,6 +224,24 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.accounts[0].auth, .healthy)
     }
 
+    // AC (#520/#523): the daemon-level `systemic_refresh_failure` COUNT decodes when non-null — the refresh
+    // MECHANISM being down (#378), the third daemon-level payload fault. `null` → nil is already pinned by
+    // `testDecodesRealSnapshotFrame`; this pins the present-and-set case, the wire prerequisite for the
+    // menubar glyph + banner surfaces. Note the roster alongside it reads HEALTHY: that combination is the
+    // whole reason the signal exists (#378 is visible before any account dies).
+    func testDecodesSystemicRefreshFailureCount() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshFailure) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 7))
+        XCTAssertEqual(v.systemicRefreshFailure, 3)
+        // Independent of the vault pair — the mechanism can be down while the shared item is fine.
+        XCTAssertNil(v.canonicalScrub)
+        XCTAssertFalse(v.keychainLocked)
+        XCTAssertEqual(v.accounts.count, 1)
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
     // AC: "`auth` → CredentialHealth including `null`".
     func testAuthNullIsTolerated() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotAuthNull) else {

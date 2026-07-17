@@ -57,6 +57,30 @@ final class WatchStatusStoreTests: XCTestCase {
         continuation.finish()
     }
 
+    // MARK: - AC (#520/#523): a daemon-level payload fault reaches BOTH surfaces off one snapshot
+
+    // The shell-level proof that the third daemon-level payload fault is actually MIRRORED, not just
+    // derived: `systemic_refresh_failure` (#378) must reach the `@Published` projection (which the panel's
+    // `daemonFaultBanner` reads) AND the glance stream (the `!` glyph) from the same snapshot. Both halves
+    // matter together — the locked glyph taxonomy collapses every fault to one silhouette on the promise
+    // that "the *which* is one click away in the panel" (#524), so a glyph that shouts while the published
+    // field stays nil would be an alarm with no explanation behind the click. A pure-core `publish()` mirror
+    // is exactly the kind of one-line drop `HonestStateMachineTests` cannot catch.
+    func testSystemicRefreshFailurePublishesToBothSurfaces() async throws {
+        let (store, continuation, recorder) = makeStoreUnderTest()
+        continuation.yield(.connected)
+        continuation.yield(.line(Fixtures.snapshotSystemicRefreshFailure))
+
+        try await waitForGlyph(recorder, .attention)
+        XCTAssertEqual(store.connectionState, .connected)
+        XCTAssertEqual(store.systemicRefreshFailure, 3, "the panel's banner input is published")
+        XCTAssertEqual(store.currentPresentation.glyph, .attention, "the glance shows the next-break !")
+        // The roster alongside it reads healthy — the exact false-healthy state the pair exists to correct.
+        XCTAssertEqual(store.rows.first?.auth, .healthy)
+
+        continuation.finish()
+    }
+
     // MARK: - AC (#526): a warm drop reconnects within the dwell, then escalates — never live
 
     // The store-level proof of the warm-drop split: a WARM drop (a live socket dropped) is shown as the
