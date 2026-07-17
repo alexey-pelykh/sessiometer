@@ -24,8 +24,8 @@ jobs:
   # a workflow-level path filter makes the required status contexts stop reporting on any
   # PR that misses the filter, which wedges branch protection forever. Instead each real
   # job runs conditionally on these outputs, and `ci-ok` (below) is the single always-running
-  # required check. A change to this workflow file re-runs BOTH toolchains — it is
-  # listed in both filters — so CI edits are always validated end to end.
+  # required check. A change to this workflow file re-runs EVERY filtered job — it is
+  # listed in every filter — so CI edits are always validated end to end.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -35,6 +35,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       swift: ${{ steps.filter.outputs.swift }}
+      formula: ${{ steps.filter.outputs.formula }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
@@ -62,6 +63,14 @@ jobs:
               - 'rust-toolchain'
               - 'rustfmt.toml'
               - 'clippy.toml'
+              - '.github/workflows/ci.yml'
+            # Canonical Homebrew formula (issue #567). Static-only checks, so this
+            # filter is narrow: the formula itself, its guard, and this workflow.
+            # `scripts/**` is already in the `rust` filter above, so a guard edit also
+            # re-runs the Rust jobs — broad but conservative-safe, and deliberate there.
+            formula:
+              - 'Formula/**'
+              - 'scripts/check-formula.sh'
               - '.github/workflows/ci.yml'
             swift:
               - 'apps/menubar/**'
@@ -175,6 +184,27 @@ jobs:
             -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO
 
+  # Canonical Homebrew formula (issue #567). `Formula/sessiometer.rb` is the source the
+  # published tap mirrors (ADR-0021), and until now nothing here checked it — the gap ADR-0021
+  # records as "No CI covers the formula — on either side", and the root cause of #566: a
+  # stanza-order defect reached the tap because the canonical formula was never audited.
+  # Static-only (`brew style` + `brew audit --strict`) — no install/`test do`/bottle, none of
+  # which this side should pay for: the crate build belongs to the tap's own test-bot CI
+  # (#560 / sessiometer/homebrew-tap#1). That keeps this job cheap enough to run on every
+  # `Formula/**` touch. macos-latest because the formula is `depends_on :macos`; the checks are
+  # seconds (no compile), and macOS runners are free for this public repo. Guard logic lives in
+  # scripts/check-formula.sh — like the `deny` and `swift` jobs' guards, runnable locally, with
+  # a falsifier peer (scripts/check-formula.test.sh) proving it goes RED on #566's defect.
+  formula:
+    name: formula
+    needs: changes
+    if: needs.changes.outputs.formula == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: brew style + brew audit --strict (canonical formula)
+        run: ./scripts/check-formula.sh
+
   # Meta-check (issue #318): assert `ci-ok.needs` names every other job, so a new job can't be
   # added to this workflow and silently sit outside the merge gate's `needs.*.result` rollup.
   # GitHub exposes no "all jobs in this workflow" context, so the parse lives in a script — like
@@ -217,13 +247,13 @@ jobs:
   # Single always-running summary gate. This is the ONE check branch protection should
   # require: it runs on every PR/push regardless of path filters, and passes only when every
   # real job either succeeded or was legitimately path-skipped. That way a path-skipped
-  # `test`/`msrv`/`deny`/`swift` can never wedge a merge, while a genuine failure (or a
-  # failed `changes` job) still blocks. Keep `test`/`msrv`/`deny` as named contexts for
+  # `test`/`msrv`/`deny`/`swift`/`formula` can never wedge a merge, while a genuine failure (or
+  # a failed `changes` job) still blocks. Keep `test`/`msrv`/`deny` as named contexts for
   # history/visibility, but make `ci-ok` the required one.
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, test, msrv, deny, swift, ci-ok-needs-complete, gate-change-ack]
+    needs: [changes, test, msrv, deny, swift, formula, ci-ok-needs-complete, gate-change-ack]
     runs-on: ubuntu-latest
     steps:
       # `needs.*.result` auto-covers every job in `needs:` above — and the `ci-ok-needs-complete`
