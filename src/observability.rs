@@ -962,6 +962,78 @@ pub(crate) enum Event {
         session_at_recovery: u8,
         near_limit: bool,
     },
+    /// An account ENTERED a blind window (issue #583, umbrella #363 Path B): the poll that just
+    /// cleared its [`crate::daemon`] `last_readings` slot took it from a live reading to none — a
+    /// `429` / `5xx` / network failure. The OPENING half of the uncensored blind-episode pair
+    /// ([`Event::BlindExit`] closes it), and the answer to `blind_window`'s FIRST censoring tail:
+    /// `blind_window` fires only on the `None -> live` RECOVERY edge, so an account that goes dark
+    /// and STAYS dark emits nothing at all — the episode is invisible precisely when it is worst.
+    /// This fires on the ENTRY edge instead, so the episode is durable the moment it starts,
+    /// whether or not it ever recovers.
+    ///
+    /// Per-ACCOUNT, deliberately NOT scoped to the active account: `blind_window`'s `active ==
+    /// Some(i)` guard is its SECOND censoring tail (once the daemon swaps off a blind account the
+    /// episode stops being recorded), and this pair is anchored per-account so a swap-away can
+    /// neither suppress the entry nor drop the anchor the exit is measured from. `was_active` tags
+    /// which case this was — it is CONTEXT for the episode, never a filter on it.
+    ///
+    /// `session_pct` / `weekly_pct` are the pre-blind anchor's rounded usage in BOTH windows — the
+    /// baseline [`Event::BlindExit`] differences against to answer "did it burn behind the
+    /// blindness?". `near_limit` tags whether the anchor sat at/over the session trigger (the risk
+    /// band), matching [`Event::BlindWindow`]'s tag so the two families filter alike. `account` is
+    /// the account UUID (#15) — matching the usage-family `acct=` (never the free-form label);
+    /// every other field a bare number / bool, never a token or email.
+    BlindEnter {
+        account: String,
+        session_pct: u8,
+        weekly_pct: u8,
+        was_active: bool,
+        near_limit: bool,
+    },
+    /// An account LEFT a blind window (issue #583, umbrella #363 Path B): a poll read it live again
+    /// after [`Event::BlindEnter`] opened the episode. The CLOSING half of the uncensored pair, and
+    /// the SLI that answers "did it burn behind the blindness?" from the log alone.
+    ///
+    /// DISTINCT from [`Event::BlindWindow`], which is retained UNCHANGED as the recovery-edge
+    /// duration histogram for SLO reporting (it is not wrong for that purpose — it was assigned the
+    /// wrong purpose, detection). Two differences make this the uncensored instrument:
+    ///
+    /// - **Not active-scoped.** `blind_window` requires `active == Some(i)` AND is built from the
+    ///   ACTIVE-only anchor (`last_good`, #450) that every swap-away site DROPS, so an episode the
+    ///   daemon swaps off is unrecoverable even when the account later reads live as a peer. This
+    ///   is measured from a per-account anchor no swap touches, so it fires for any account.
+    ///   `swapped_away` tags the case `blind_window` structurally could not see.
+    /// - **Both usage windows, not just session.** `blind_window` carries session only. The session
+    ///   window RESETS on its own 5 h cadence, so a session-only record reads a reset as
+    ///   `29 -> 0` — indistinguishable from "never burned", and the exact reading that hid a real
+    ///   +12 pp WEEKLY burn behind a 2 h blindness in production on 2026-07-17. Carrying the weekly
+    ///   anchor + its recovery value is what makes the burn question answerable at all.
+    ///
+    /// `duration_secs` is how long the account was blind (anchor → this recovery). `session_pct` /
+    /// `weekly_pct` are the pre-blind anchor; `session_at_recovery` / `weekly_at_recovery` the
+    /// FRESH readings at this poll. [`to_log_line`](Event::to_log_line) DERIVES the signed burn in
+    /// each window from those pairs and renders it alongside the raw ingredients — the same
+    /// store-the-ingredients-derive-the-view idiom as [`Event::UsageVelocity`]'s `%/min` rate — so
+    /// the line answers the burn question at a glance without a query-time join. RAW pcts are
+    /// stored, NOT a baked burned/not-burned classification: that THRESHOLD is #451/#484's to
+    /// derive against production, exactly as with `blind_window`'s `session_at_recovery`.
+    ///
+    /// `was_active` is whether the account was active when it went blind, `swapped_away` whether it
+    /// was active at entry but is no longer active now (the #582 interaction — swapping away on
+    /// blindness is precisely what made an episode invisible). `near_limit` carries the anchor's
+    /// risk-band tag through from the entry. `account` is the account UUID (#15) — matching the
+    /// usage-family `acct=`; every other field a bare number / bool, never a token or email.
+    BlindExit {
+        account: String,
+        duration_secs: u64,
+        session_pct: u8,
+        session_at_recovery: u8,
+        weekly_pct: u8,
+        weekly_at_recovery: u8,
+        was_active: bool,
+        swapped_away: bool,
+        near_limit: bool,
+    },
     /// The #452 bounded-blindness preemptive-swap GATE became ELIGIBLE for the ACTIVE account
     /// (issue #482, umbrella #363 Path B) — the no-viable-target-at-gate-fire SLI, the FALSIFIER for
     /// the ADR-0017 cost-asymmetry premise ("firing early on a stale anchor is cheap because a
@@ -1410,6 +1482,50 @@ impl Event {
                 // the usage-family lines.
                 format!(
                     "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}"
+                )
+            }
+            Event::BlindEnter {
+                account,
+                session_pct,
+                weekly_pct,
+                was_active,
+                near_limit,
+            } => {
+                // The blind-episode OPEN (issue #583) — emitted the moment the account goes dark, so
+                // a never-recovering episode is still durable. All bare numbers + bools (#15): the
+                // pre-blind anchor's usage in BOTH windows (the baseline `blind_exit` differences
+                // against), whether the account was the active one, and whether the anchor sat in the
+                // risk band. `acct=` is the UUID, matching the usage-family lines.
+                format!(
+                    "ts={ts} event=blind_enter acct={account} session_pct={session_pct} weekly_pct={weekly_pct} was_active={was_active} near_limit={near_limit}"
+                )
+            }
+            Event::BlindExit {
+                account,
+                duration_secs,
+                session_pct,
+                session_at_recovery,
+                weekly_pct,
+                weekly_at_recovery,
+                was_active,
+                swapped_away,
+                near_limit,
+            } => {
+                // The blind-episode CLOSE (issue #583) — the uncensored counterpart of
+                // `blind_window`: fires for ANY account (not just the still-active one) and carries
+                // BOTH usage windows. The signed per-window burn is DERIVED here from the stored
+                // anchor/recovery pairs and rendered FIRST — the same store-the-ingredients-
+                // derive-the-view idiom as `usage_velocity`'s %/min rate — so "did it burn behind the
+                // blindness?" reads straight off the line; the raw pcts trail it so the exact
+                // measurement stays recoverable and the necessary/wasted threshold stays a query-time
+                // view (#451/#484). `weekly_burn_pct` is the dimension a session-only record misses
+                // entirely when the 5 h session window resets mid-blindness. Both burns are signed —
+                // NEGATIVE across a window reset — and a `-` renders as a `key=val` token existing
+                // parsers read as-is. All bare numbers + bools (#15); `acct=` is the UUID.
+                let session_burn_pct = i16::from(*session_at_recovery) - i16::from(*session_pct);
+                let weekly_burn_pct = i16::from(*weekly_at_recovery) - i16::from(*weekly_pct);
+                format!(
+                    "ts={ts} event=blind_exit acct={account} duration_secs={duration_secs} session_burn_pct={session_burn_pct} weekly_burn_pct={weekly_burn_pct} session_pct={session_pct} session_at_recovery={session_at_recovery} weekly_pct={weekly_pct} weekly_at_recovery={weekly_at_recovery} was_active={was_active} swapped_away={swapped_away} near_limit={near_limit}"
                 )
             }
             Event::BlindGateEligible {
@@ -3489,6 +3605,84 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
+    fn blind_enter_line_opens_the_episode_with_both_windows() {
+        // The uncensored pair's OPEN (issue #583): emitted the instant the account goes dark, so an
+        // episode that never recovers — the tail `blind_window`'s recovery edge structurally cannot
+        // see — is still durable. Carries the pre-blind anchor in BOTH windows (the baseline
+        // `blind_exit` differences against) and tags whether this was the active account.
+        let line = Event::BlindEnter {
+            account: "u-A".to_owned(),
+            session_pct: 96,
+            weekly_pct: 30,
+            was_active: true,
+            near_limit: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_enter acct=u-A session_pct=96 weekly_pct=30 was_active=true near_limit=true"
+            )
+        );
+    }
+
+    #[test]
+    fn blind_exit_line_derives_the_burn_in_both_windows() {
+        // The uncensored pair's CLOSE (issue #583), replaying the production episode the issue was
+        // filed on: last seen at session 29 / weekly 5, dark for ~2 h, back at session 0 / weekly 17.
+        // The SESSION window reset behind the blindness, so `session_burn_pct=-29` reads as a quiet
+        // reset — exactly the wrong story, and the only one `blind_window` (session-only) can tell.
+        // `weekly_burn_pct=12` is the burn that actually happened. Both are DERIVED here from the
+        // stored anchor/recovery pairs and rendered first, with the raw pcts trailing, so the line
+        // answers "did it burn?" at a glance while the exact measurement stays recoverable.
+        let line = Event::BlindExit {
+            account: "u-A".to_owned(),
+            duration_secs: 7512,
+            session_pct: 29,
+            session_at_recovery: 0,
+            weekly_pct: 5,
+            weekly_at_recovery: 17,
+            was_active: true,
+            swapped_away: true,
+            near_limit: false,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_exit acct=u-A duration_secs=7512 session_burn_pct=-29 weekly_burn_pct=12 session_pct=29 session_at_recovery=0 weekly_pct=5 weekly_at_recovery=17 was_active=true swapped_away=true near_limit=false"
+            )
+        );
+    }
+
+    #[test]
+    fn blind_exit_line_reports_a_zero_burn_when_nothing_moved() {
+        // The negative the SLI needs just as much: an account that went blind and came back with both
+        // windows untouched burned NOTHING (`session_burn_pct=0 weekly_burn_pct=0`) — a bounded
+        // blindness that cost nothing, and the case #484's bar must be able to tell apart from the
+        // one above when it re-derives the gate constants. `swapped_away=false` on an episode the
+        // daemon stayed on throughout.
+        let line = Event::BlindExit {
+            account: "u-B".to_owned(),
+            duration_secs: 120,
+            session_pct: 40,
+            session_at_recovery: 40,
+            weekly_pct: 12,
+            weekly_at_recovery: 12,
+            was_active: true,
+            swapped_away: false,
+            near_limit: false,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_exit acct=u-B duration_secs=120 session_burn_pct=0 weekly_burn_pct=0 session_pct=40 session_at_recovery=40 weekly_pct=12 weekly_at_recovery=12 was_active=true swapped_away=false near_limit=false"
+            )
+        );
+    }
+
+    #[test]
     fn blind_gate_eligible_line_carries_viable_target_blind_secs_and_anchor_pct() {
         // The #452 preemptive gate turned eligible for the active account after 360 s blind with its
         // anchor at 70 % (in the interim risk band) — and a viable swap target WAS present, so the
@@ -3549,6 +3743,26 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 duration_secs: 300,
                 session_pct: 97,
                 session_at_recovery: 99,
+                near_limit: true,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::BlindEnter {
+                account: "u-A".to_owned(),
+                session_pct: 97,
+                weekly_pct: 40,
+                was_active: true,
+                near_limit: true,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::BlindExit {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: 97,
+                session_at_recovery: 99,
+                weekly_pct: 40,
+                weekly_at_recovery: 44,
+                was_active: true,
+                swapped_away: true,
                 near_limit: true,
             }
             .to_log_line(at_epoch(0)),
