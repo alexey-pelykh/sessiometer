@@ -30,12 +30,33 @@ out = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else caps_dir / "design-vs-
 html = MOCK.read_text()
 style = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
 
-# Every `.pop` block, in document order, by balanced-<div> slicing. Source order is stable:
-#  0 healthy-status-L · 1 healthy-status-D · 2/3 stats(skip) · 4 daemon-starting · 5/6/7 not-running(skip)
-#  · 8 disconnected · 9 stale · 10/11 keychain(skip) · 12 version-skew · 13 empty-L · 14 empty-D
-#  · 15 capture-states(skip) · 16 blind-ok-L · 17 blind-degraded-L · 18 blind-ok-D · 19 blind-degraded-D (#571)
-pops = []
-for m in re.finditer(r'<div class="pop theme-(?:light|dark)">', html):
+# Every `.pop` block, keyed by the `data-frame` name the mock gives it, sliced by balanced <div>.
+# Frames are selected BY NAME, never by position: inserting, removing, or reordering a frame in the
+# mock cannot silently re-pair this page, so a mock frame and its Swift fixture no longer have to land
+# in one commit. Every failure below is loud — this is a verification tool, and one that quietly
+# reports the wrong answer is worse than one that fails (#581, superseding #571's count tripwire).
+def line_of(pos):
+    """The mock's 1-based line number at `pos` — so a failure can point at the offending block."""
+    return html.count("\n", 0, pos) + 1
+
+
+pops = {}
+for m in re.finditer(r'<div class="pop theme-(?:light|dark)"[^>]*>', html):
+    tag = m.group()
+    named = re.search(r'\bdata-frame="([^"]+)"', tag)
+    if not named:
+        raise SystemExit(
+            f"{MOCK.name}: the `.pop` block on line {line_of(m.start())} has no `data-frame` name — "
+            f"every frame needs one, it is how this page selects them. Name it after its `fcap` "
+            f"caption:\n  → {tag}"
+        )
+    name = named.group(1)
+    if name in pops:
+        raise SystemExit(
+            f'{MOCK.name}: duplicate `data-frame="{name}"` on line {line_of(m.start())} — names are '
+            f"this page's selector, so a duplicate would silently pair a state against the wrong "
+            f"panel. Give each frame a unique name."
+        )
     start, depth = m.start(), 0
     end = start
     for tok in re.finditer(r"<div\b|</div>", html[start:]):
@@ -43,17 +64,18 @@ for m in re.finditer(r'<div class="pop theme-(?:light|dark)">', html):
         if depth == 0:
             end = start + tok.end()
             break
-    pops.append(html[start:end])
+    pops[name] = html[start:end]
 
-# The `design=` indices in STATES are POSITIONAL, and this script is not in CI — so the index map above
-# is the ONLY guard, and it has already drifted once (it stopped at 14 while the mock held 16 blocks).
-# A frame inserted ABOVE index 16 silently re-pairs every blind capture against the wrong design block:
-# the page still builds and still looks plausible — wrong output from the verification tool itself.
-# Fail loudly instead. (#571 — a named-selector fix that dissolves the coupling is tracked separately.)
-assert len(pops) == 20, (
-    f"mock has {len(pops)} .pop blocks, expected 20 — the index map above and every STATES `design=` "
-    f"index are stale; re-derive them against menubar-preview.html before trusting this page"
-)
+
+def design(name):
+    """The mock's live `.pop` block for `name` — or a loud failure listing what the mock does carry."""
+    if name not in pops:
+        raise SystemExit(
+            f'STATES design="{name}": {MOCK.name} carries no such frame — re-point this entry, or '
+            f"name the frame in the mock. Frames it does carry:\n"
+            f"  {', '.join(pops)}"
+        )
+    return pops[name]
 
 
 def cap(name):
@@ -61,7 +83,7 @@ def cap(name):
 
 
 STATES = [
-    dict(title="1 · Healthy — Status", theme="light", design=0, capture="panel-healthy-light.png",
+    dict(title="1 · Healthy — Status", theme="light", design="healthy-status-light", capture="panel-healthy-light.png",
          note="The steady state. Mock adds four things the panel intentionally reconciles away: the "
               "Status/Stats toggle (Stats has no socket data path — spike #356), the provider line under "
               "each name (no <code>provider</code> wire field yet — #173), the “Last swap …” footer "
@@ -74,28 +96,28 @@ STATES = [
               "duration form too (“2h14m” / “3d”), and its usage meters carry the CLI’s 75/90 bands. "
               "Capture is now reconciled too: the populated panel carries no capture bar, matching the "
               "mock — capture is empty-roster / first-run only, with Add account in the status-item menu (#394)."),
-    dict(title="1 · Healthy — Status (dark)", theme="dark", design=1, capture="panel-healthy-dark.png",
+    dict(title="1 · Healthy — Status (dark)", theme="dark", design="healthy-status-dark", capture="panel-healthy-dark.png",
          note="Same state, dark appearance — system semantic colours, not the mock’s hex."),
-    dict(title="2 · Connecting / daemon-starting", theme="light", design=4, capture="panel-connecting-light.png",
+    dict(title="2 · Connecting / daemon-starting", theme="light", design="daemon-starting-light", capture="panel-connecting-light.png",
          note="Awaiting the first snapshot: an honest banner, no roster — never a false “healthy”. The "
               "mock’s separate <b>not-running</b> and <b>crash-looping</b> shapes are the fuller 9-state "
               "map (#169); the panel currently folds them into this / disconnected."),
-    dict(title="3 · Disconnected (UDS drop)", theme="light", design=8, capture="panel-disconnected-light.png",
+    dict(title="3 · Disconnected (UDS drop)", theme="light", design="disconnected-light", capture="panel-disconnected-light.png",
          note="Dropped connection: a loud strip over the <b>dimmed last-known</b> roster — retained, "
               "never frozen-as-live (#137) — and an amber “updated Nm ago” footer."),
-    dict(title="4 · Stale snapshot", theme="light", design=9, capture="panel-stale-light.png",
+    dict(title="4 · Stale snapshot", theme="light", design="stale-snapshot-light", capture="panel-stale-light.png",
          note="Connection open but the daemon went quiet: the roster stays full-strength, the header "
               "sub-line and footer carry the “stale” mark (amber), so numbers are never read as live."),
-    dict(title="5 · Version skew / unsupported", theme="light", design=12, capture="panel-unsupported-light.png",
+    dict(title="5 · Version skew / unsupported", theme="light", design="version-skew-light", capture="panel-unsupported-light.png",
          note="The daemon speaks a wire contract this client can’t safely read → numbers refused, a plain "
               "honest message. The mock’s richer “brew upgrade” affordance is #169."),
-    dict(title="6 · Empty roster / first run", theme="light", design=13, capture="panel-empty-roster-light.png",
+    dict(title="6 · Empty roster / first run", theme="light", design="empty-roster-light", capture="panel-empty-roster-light.png",
          note="Connected, zero accounts — an onboarding card distinct from daemon-down. First run "
               "captures the active account <b>in-app</b> (operator-label field + button over the #358 "
               "control socket, honest pending → done → error) — not a copied command (#360)."),
-    dict(title="6 · Empty roster / first run (dark)", theme="dark", design=14, capture="panel-empty-roster-dark.png",
+    dict(title="6 · Empty roster / first run (dark)", theme="dark", design="empty-roster-dark", capture="panel-empty-roster-dark.png",
          note="Onboarding, dark appearance."),
-    dict(title="Modifier · Active blind — OK", theme="light", design=16, capture="panel-blind-ok-light.png",
+    dict(title="Modifier · Active blind — OK", theme="light", design="blind-ok-light", capture="panel-blind-ok-light.png",
          note="The ACTIVE account’s /usage poll is rate-limited (429): the daemon holds a bounded anchor and "
               "pushes <code>blind_active</code>. The two live meters are replaced by a HELD session bar "
               "(<b>dashed</b> = last-known, never a live fill — #137), the <code>blind {dur}</code> chip, the "
@@ -106,15 +128,15 @@ STATES = [
               "the panel’s SF Symbols (<code>eye.slash</code>, <code>checkmark.shield.fill</code>) as OUTLINE "
               "approximations of filled marks — a mock-fidelity limit, not a parity claim: mock↔panel is ONE "
               "medium, so R-2 (the CLI↔panel STATE-parity anchor) does not license the difference."),
-    dict(title="Modifier · Active blind — OK (dark)", theme="dark", design=18, capture="panel-blind-ok-dark.png",
+    dict(title="Modifier · Active blind — OK (dark)", theme="dark", design="blind-ok-dark", capture="panel-blind-ok-dark.png",
          note="Same state, dark appearance."),
-    dict(title="Modifier · Active blind — DEGRADED", theme="light", design=17, capture="panel-blind-degraded-light.png",
+    dict(title="Modifier · Active blind — DEGRADED", theme="light", design="blind-degraded-light", capture="panel-blind-degraded-light.png",
          note="Auto-protection DEGRADED — the ADR-0017 gate is armed but acting on a STALE anchor (last-known "
               "88%, amber). The row gains an at-risk ORANGE leading rule + orange eye-slash + orange verdict — a "
               "non-colour-redundant locality tell. The menu-bar glance escalates to attention “!” (one rung "
               "below no-runway). The CLI emphasises this line in red; the panel uses orange by design — a "
               "per-medium colour choice under R-2 STATE-parity (the shared STATE is DEGRADED)."),
-    dict(title="Modifier · Active blind — DEGRADED (dark)", theme="dark", design=19, capture="panel-blind-degraded-dark.png",
+    dict(title="Modifier · Active blind — DEGRADED (dark)", theme="dark", design="blind-degraded-dark", capture="panel-blind-degraded-dark.png",
          note="Degraded, dark appearance."),
 ]
 
@@ -125,7 +147,7 @@ sections = "".join(f"""
       <div class="pair">
         <figure class="side">
           <figcaption>Design — mock (live)</figcaption>
-          <div class="stage-bg {s['theme']}">{pops[s['design']]}</div>
+          <div class="stage-bg {s['theme']}">{design(s['design'])}</div>
         </figure>
         <figure class="side">
           <figcaption>Capture — built panel</figcaption>
@@ -180,4 +202,4 @@ page = f"""<!doctype html>
 </body></html>"""
 
 out.write_text(page)
-print(f"wrote {out} ({len(page)//1024} KB, {len(pops)} pop blocks)")
+print(f"wrote {out} ({len(page)//1024} KB, {len(STATES)} states from {len(pops)} frames)")
