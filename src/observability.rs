@@ -1061,6 +1061,48 @@ pub(crate) enum Event {
         blind_secs: u64,
         session_pct: u8,
     },
+    /// The #582 server-`Retry-After` swap-away path was ARMED on the active account but HELD
+    /// because firing would have spent the LAST viable target (issue #582). The swap-away is
+    /// speculative — it acts on a server directive, not on an observed near-limit reading — so it
+    /// must yield the final target to a CONFIRMED-exhaustion swap (the reactive `session_trigger`
+    /// path, which fires on evidence) rather than consume it on a guess.
+    ///
+    /// The AC's "reported, not hidden" surface: without this line the daemon would sit silently
+    /// blind on a server-throttled account, exactly the invisibility the issue is about — the hold
+    /// is a DELIBERATE choice, and an operator watching an account go dark deserves to see it made.
+    /// Distinct from [`Self::AllExhausted`], which reports having no viable target at all; here a
+    /// viable target EXISTS and is deliberately being preserved.
+    ///
+    /// Edge-triggered: emitted once per blind episode (on the tick the hold is first taken), never
+    /// per held tick — a 3600 s window spans hundreds of ticks. `retry_after_secs` is the RAW
+    /// (pre-cap) server directive that armed the path; `blind_secs` how long the active had been
+    /// blind at that moment. `account` is the account UUID (#15), matching the usage-family
+    /// `acct=`; every other field a bare number, never a token or email.
+    BlindPreemptReserveHold {
+        account: String,
+        retry_after_secs: u64,
+        blind_secs: u64,
+    },
+    /// ALARM (issue #582): the server `Retry-After` throttle is WALKING the roster — it follows
+    /// the ACTIVE ROLE rather than any one account, so repeated preemptive swaps inside the
+    /// daemon's walk window have each merely handed the `429` to the next account. Rotation STOPS
+    /// here: holding a blind-but-low account beats walking a 3600 s throttle onto the last good
+    /// one. (The count and window live as `RETRY_AFTER_WALK_MAX` / `RETRY_AFTER_WALK_WINDOW` in
+    /// the daemon module, which owns the decision; this event only reports what they resolved to.)
+    ///
+    /// The loudest line this path emits, and the one that wants an operator: unlike the reserve
+    /// hold (a routine, self-correcting yield), a detected walk means the daemon has exhausted its
+    /// automatic remedy and is now deliberately sitting on a throttled account. `swaps` is how
+    /// many server-throttled preemptive swaps were counted inside `window_secs`;
+    /// `retry_after_secs` the RAW server directive on the account being held. Edge-triggered like
+    /// [`Self::BlindPreemptReserveHold`]. `account` is the account UUID (#15); every other field a
+    /// bare number, never a token or email.
+    RetryAfterWalk {
+        account: String,
+        swaps: usize,
+        window_secs: u64,
+        retry_after_secs: u64,
+    },
 }
 
 impl Event {
@@ -1541,6 +1583,32 @@ impl Event {
                 // usage-family lines.
                 format!(
                     "ts={ts} event=blind_gate_eligible acct={account} viable_target={viable_target} blind_secs={blind_secs} session_pct={session_pct}"
+                )
+            }
+            Event::BlindPreemptReserveHold {
+                account,
+                retry_after_secs,
+                blind_secs,
+            } => {
+                // The #582 reserve hold (issue #582): the swap-away was armed by a server
+                // `Retry-After` but held to preserve the LAST viable target for a confirmed-
+                // exhaustion swap. All bare numbers (#15); `acct=` is the UUID, matching the
+                // usage-family lines.
+                format!(
+                    "ts={ts} event=blind_preempt_reserve_hold acct={account} retry_after_secs={retry_after_secs} blind_secs={blind_secs}"
+                )
+            }
+            Event::RetryAfterWalk {
+                account,
+                swaps,
+                window_secs,
+                retry_after_secs,
+            } => {
+                // The #582 throttle-walk alarm (issue #582): rotation stopped because the server
+                // throttle is following the ACTIVE ROLE around the roster. All bare numbers (#15);
+                // `acct=` is the UUID, matching the usage-family lines.
+                format!(
+                    "ts={ts} event=retry_after_walk acct={account} swaps={swaps} window_secs={window_secs} retry_after_secs={retry_after_secs}"
                 )
             }
         }
@@ -3711,6 +3779,82 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             absent,
             format!("{TS0} event=blind_gate_eligible acct=u-B viable_target=false blind_secs=900 session_pct=88")
         );
+    }
+
+    #[test]
+    fn blind_preempt_reserve_hold_line_carries_the_directive_and_blind_duration() {
+        // Issue #582: the swap-away was armed by a `Retry-After: 3600` on the active account but
+        // HELD — firing would have spent the last viable target, which a speculative swap must
+        // yield to a confirmed-exhaustion one. The line is the AC's "reported, not hidden".
+        let line = Event::BlindPreemptReserveHold {
+            account: "u-A".to_owned(),
+            retry_after_secs: 3600,
+            blind_secs: 301,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_preempt_reserve_hold acct=u-A retry_after_secs=3600 blind_secs=301"
+            )
+        );
+    }
+
+    #[test]
+    fn retry_after_walk_line_carries_the_swap_count_and_window() {
+        // Issue #582: the throttle is following the ACTIVE ROLE around the roster — two
+        // server-throttled preemptive swaps inside the hour — so rotation STOPPED. The alarm names
+        // the evidence (`swaps` inside `window_secs`) and the directive on the account being held.
+        let line = Event::RetryAfterWalk {
+            account: "u-A".to_owned(),
+            swaps: 2,
+            window_secs: 3600,
+            retry_after_secs: 3600,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=retry_after_walk acct=u-A swaps=2 window_secs=3600 retry_after_secs=3600"
+            )
+        );
+    }
+
+    #[test]
+    fn the_durable_582_lines_carry_no_pii() {
+        // The #15 guarantee for the #582 signals, mirroring `the_durable_399_lines_carry_no_pii`:
+        // every field is a UUID or a bare number — never an email, token, or the free-form operator
+        // `label`. The identity is `acct=<uuid>`, secret-free BY CONSTRUCTION.
+        let lines = [
+            Event::BlindPreemptReserveHold {
+                account: "u-A".to_owned(),
+                retry_after_secs: 3600,
+                blind_secs: 301,
+            }
+            .to_log_line(at_epoch(0)),
+            Event::RetryAfterWalk {
+                account: "u-A".to_owned(),
+                swaps: 2,
+                window_secs: 3600,
+                retry_after_secs: 3600,
+            }
+            .to_log_line(at_epoch(0)),
+        ];
+        for line in &lines {
+            // A positive identity check the sibling PII tests omit: the account handle is present.
+            assert!(line.contains("acct=u-A"), "identity is the UUID: {line}");
+            // The SAME battery as `the_durable_399_lines_carry_no_pii`, so the two genuinely mirror:
+            // the project's real email detector (#444), then the credential-field probes, then the
+            // structural check that no free-form `label=` field exists to leak an operator handle.
+            assert!(
+                crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+                "no non-authored email may appear (#15/#444): {line}"
+            );
+            assert!(!line.contains("token"), "no token may appear: {line}");
+            assert!(!line.contains("Bearer"), "no bearer may appear: {line}");
+            assert!(!line.contains("sk-ant"), "no api key may appear: {line}");
+            assert!(!line.contains("label="), "no operator label: {line}");
+        }
     }
 
     #[test]
