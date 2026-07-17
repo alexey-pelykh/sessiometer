@@ -118,11 +118,15 @@ pub(crate) struct BlindActive {
     /// (`last_good.session`, #450) — the last-known reading before the account went blind. This is
     /// why the row stops reporting "no data": the daemon DID retain a reading.
     pub(crate) last_known_session_pct: u8,
-    /// Whether ADR-0017 preemptive auto-protection is DEGRADED — the gate is armed but acting on a
-    /// STALE anchor: `blind_secs > BLIND_GATE_SECS` AND the anchor sat at/over `BLIND_GATE_RISK_BAND`
-    /// (the gate's first two ADR-0017 conditions, mirroring [`Daemon::note_blind_gate_eligibility`]
-    /// exactly). `false` = OK: the account is blind, but not yet past the gate threshold, or the
-    /// anchor sat below the risk band — auto-protection is nominally intact.
+    /// Whether ADR-0017 preemptive auto-protection is DEGRADED for this blind account — `true` when ANY
+    /// of the daemon's three report arms is active (see `blind_active_view`): the ANCHOR arm (blind past
+    /// `BLIND_GATE_SECS` AND the anchor at/over `BLIND_GATE_RISK_BAND` — the #452 swap's premise), the
+    /// #582 SERVER-directed arm (a `Retry-After` still holding the account off its poll), or the #584
+    /// VELOCITY-projection arm (the anchor, projected forward over the blind window at its retained #539
+    /// rate, could plausibly reach the trigger — a below-band burn the anchor arm cannot see). `false` =
+    /// OK: blind, but not yet past the gate threshold and with no arm tripped — auto-protection is
+    /// nominally intact. The first two arms front a swap the daemon fires; the velocity arm is
+    /// report-only (issue #584), so DEGRADED here means "compromised", not always "a swap is acting".
     pub(crate) auto_protection_degraded: bool,
 }
 
