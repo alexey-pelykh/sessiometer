@@ -39,6 +39,27 @@ covered/poll-gap residual split with **#540** and the shipped mechanism are reco
 Consequences and Related below. The core **#452** decision and the header-observation
 rejection are unchanged.
 
+**Amended 2026-07-17 (#584)**: the **REPORT** side of this ADR (the `status`
+`auto_protection_degraded` projection, not the swap decision) gains a third arm. The
+original arming predicate compares a *level to a level* — the frozen pre-blind anchor
+against the `risk_band` — and so is blind to **velocity** and **blind-window length**:
+on 2026-07-17 an account sat at anchor `0.29` (below the `0.60` band) while climbing
+2.7–4.14 %/min, went blind past the interim `T`, and burned to exhaustion while `status`
+reported `auto-protection OK`. At long blind windows there is no anchor low enough for the
+level-vs-level comparison to stay safe, so re-tuning the band cannot fix it — the predicate
+*shape* is wrong. The new arm projects the anchor forward over the blind window at the
+retained **#539** EMA rate and reports DEGRADED when
+`anchor + rate × k × blind_secs >= session_trigger`. Because the blind horizon runs 5–8×
+past the #538-validated `H ≈ 150 s` envelope, it projects on a **bias-HIGH bound**, not the
+point estimate: `k = BLIND_VELOCITY_RATE_INFLATION` (interim **1.75**, basis `4.14/2.7 ≈ 1.53`
+rounded up, recorded on the const, ratification-pending on the **#583**-uncensored
+distribution). It is **REPORT-ONLY** — the first `auto_protection_degraded` arm that fronts no
+swap: acting on a deliberately-inflated projection off a stale anchor is a higher-confidence
+decision than an honest status line needs, and the same swap-timing asymmetry that justifies
+biasing the *report* HIGH argues against *acting* on it (a false swap thrashes a good target —
+the cost the #582 breaker bounds). Whether the blind arm should ever *swap* on velocity is left
+as a separate design. The core **#452** decision and the constants it ratified are unchanged.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active by rotating across a
