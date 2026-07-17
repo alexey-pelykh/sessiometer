@@ -27,13 +27,26 @@
 //!    counts, so a regression that raises the usage-poll 429 rate is caught. (Per-active-
 //!    account attribution needs the swap timeline the readout forgoes; a roster-wide count
 //!    is the v1 indicator — precise active attribution is a follow-up.)
+//! 5. **landing-point swap-out overshoot** (issue #595) — the peak `session_pct` the OUTGOING
+//!    account actually reaches within a bounded (~15 min) window AFTER a `reason=session` swap
+//!    parks it. SLI 1 measures the swap DECISION point (where the daemon fired); this measures
+//!    where the parked account LANDED — in-flight work keeps billing the outgoing credential
+//!    after the swap redirects new requests, so an on-target 95 swap can still land ≥99 unseen.
+//!    Attribution found 46% of ≥99 breaches are this post-swap tail, invisible to SLI 1. Excludes
+//!    any window minutes after the account is re-activated (`active_at != acct`), and splits the
+//!    measured episodes into the three breach classes (post-swap tail / gap-crossing / blind-burn).
+//!    Reconstructed offline by joining the event log's swaps with the daemon's per-account usage
+//!    samples — the two-source recipe spike #596 used; it neither adds an event nor changes the
+//!    swap mechanism it measures (the #449 → #452 precedent: expose the SLI before the fix).
 //!
-//! Like `stats` (issue #158) this is an OFFLINE reader: it reads the log file directly and
-//! makes no live control-socket / keychain / usage-API call, so it renders when the daemon
-//! is down. The daemon is the sole WRITER of the log, this verb one READER. The readout is
-//! roster-wide (no per-account breakdown), so it emits no account identifier at all — every
-//! output line is bare numbers and fixed labels, secret-free by construction (issue #15);
-//! the durable-line redaction test in this module asserts it.
+//! Like `stats` (issue #158) this is an OFFLINE reader: it reads the daemon's durable files
+//! directly — the event log for SLIs 1-4, plus (for SLI 5) the `usage-samples.jsonl` store
+//! (issue #155) — and makes no live control-socket / keychain / usage-API call, so it renders
+//! when the daemon is down. The daemon is the sole WRITER of both files, this verb one READER.
+//! The readout is roster-wide (no per-account breakdown), so it emits no account identifier at
+//! all — the sample store's `acct` roster label is a join key used INTERNALLY only; every output
+//! line is bare numbers and fixed labels, secret-free by construction (issue #15); the
+//! durable-line redaction test in this module asserts it over both the event-log and sample paths.
 //!
 //! The targets are INTERIM constants with in-code provenance, matching the SLI interim
 //! constants in [`crate::daemon`] (`BLIND_GATE_SECS` / `BLIND_GATE_RISK_BAND`): a config
@@ -52,6 +65,7 @@
 
 use crate::error::{Error, Result};
 use crate::usage::epoch_from_rfc3339;
+use crate::usage_store::Sample;
 use std::collections::BTreeMap;
 
 /// SLO target: swap-out `session_pct` **P100 must be `< 99`** — no `reason=session` swap fires
@@ -89,13 +103,24 @@ const SLO_PROJECTED_SWAP_P50_MAX: u8 = 94;
 /// verdict.
 const PREEMPT_WASTED_MARGIN_PCT: u8 = 20;
 
+/// The bounded post-swap observation window (issue #595): the peak `session_pct` the OUTGOING
+/// (parked) account reaches within this many seconds of a `reason=session` swap is its LANDING
+/// point. `~15 min` per the issue — generously above the spike #596-measured tail settling (the
+/// post-swap climb settled `≤ 455 s` after the swap), so the peak is captured with margin without
+/// bleeding into the next session cycle. INTERIM per issue #595 — a config surface is premature
+/// until the #451/#484 production gate finalizes it, the same interim-const-with-provenance stance
+/// as [`SLO_SWAP_P100_MAX`]. The landing point is measured against that same `< 99` ceiling: SLI 1
+/// checks it on the swap DECISION reading, this on where the parked account actually LANDED.
+const LANDING_WINDOW_SECS: i64 = 15 * 60;
+
 /// The stable `--json` schema version. Owned by this readout, independent of `stats`'
 /// schema. Named to match [`crate::stats`]'s own `JSON_SCHEMA_VERSION`. Bumped `1 → 2` when
 /// the `--since` window (issue #494) added the top-level `window` object; bumped `2 → 3` when
 /// the #539 velocity-projection trigger added the `projected_swap_overshoot` + `false_projection`
-/// objects — both ADDITIVE (always-present new fields), so a `--json` consumer of the #363
-/// acceptance gate that ignores unknown fields still parses every prior field unchanged.
-const JSON_SCHEMA_VERSION: u32 = 3;
+/// objects; bumped `3 → 4` when the #595 landing-point SLI added the `landing` object — every
+/// bump ADDITIVE (always-present new fields), so a `--json` consumer of the #363 acceptance gate
+/// that ignores unknown fields still parses every prior field unchanged.
+const JSON_SCHEMA_VERSION: u32 = 4;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -125,7 +150,11 @@ pub(crate) fn run(args: ReliabilityArgs) -> Result<()> {
         None => None,
     };
     let cutoff = window.as_ref().map(|w| w.cutoff_epoch);
-    let report = aggregate(&parse_events(&text, cutoff), window);
+    // The SECOND daemon-written source (issue #595): the raw usage samples, joined with the event
+    // log's swap anchors to reconstruct the landing point. Read whole (the join windows per anchor);
+    // an absent store reads as empty, so the landing SLI degrades to "no episodes", never an error.
+    let samples = read_usage_samples()?;
+    let report = aggregate(&parse_events(&text, cutoff), &samples, window);
     let out = if args.json {
         render_json(&report)?
     } else {
@@ -220,6 +249,43 @@ fn read_event_log() -> Result<String> {
     }
 }
 
+/// The daemon's raw usage samples (`usage-samples.jsonl`, issue #155) — the second durable file
+/// this offline reader folds, for the #595 landing-point SLI. An absent store reads as empty (the
+/// same NotFound→empty tolerance [`read_event_log`] and [`crate::usage_store::read_samples`] use),
+/// so the landing SLI renders "no episodes" before the store exists rather than failing the verb.
+fn read_usage_samples() -> Result<Vec<Sample>> {
+    crate::usage_store::read_samples(&crate::paths::usage_samples()?)
+}
+
+/// A `reason=session` swap-out anchor for the landing-point reconstruction (issue #595): the
+/// instant a parked account's post-swap window opens, plus the join key and the decision reading.
+#[derive(Debug, Clone, PartialEq)]
+struct SwapOut {
+    /// The swap instant (epoch seconds) — the window origin; landing samples are `> ts`.
+    ts: i64,
+    /// The OUTGOING account's roster label (`from=`) — the join key into `usage-samples.jsonl`'s
+    /// `acct`. Used INTERNALLY only; never rendered (the #15 roster-wide-numbers invariant).
+    acct: String,
+    /// The decision-point `session_pct` logged at the swap — separates a gap-crossing (already
+    /// ≥ ceiling here) from a post-swap tail (fired below, landed at/over).
+    decision_pct: u8,
+}
+
+/// A re-activation edge for the landing filter (issue #595): the instant `acct` becomes the ACTIVE
+/// account again, closing that account's parked landing window (`active_at != acct`). Four durable
+/// events revive an account: any `event=swap` (whose `to=` names it) and an `event=emergency_swap`
+/// (the dead-active escape, also `to=`), plus an `event=restash` (out-of-band `claude /login`
+/// reconciled onto a roster account) and an `event=canonical_recovered` (the scrub-adopt recovery),
+/// both naming it in `account=`. Collected across all four — re-activation is not swap-kind-specific.
+#[derive(Debug, Clone, PartialEq)]
+struct Reactivation {
+    /// The instant `acct` is re-activated (epoch seconds).
+    ts: i64,
+    /// The re-activated account's roster label (`to=` on a swap/emergency_swap, `account=` on a
+    /// restash) — matched against a [`SwapOut::acct`].
+    acct: String,
+}
+
 /// The raw SLI ingredients pulled out of the event log, before aggregation.
 #[derive(Debug, Default, PartialEq)]
 struct Inputs {
@@ -249,12 +315,49 @@ struct Inputs {
     /// actually observed; the false-projection SLI's real numerator (counted by the `reason` field,
     /// so a malformed-`session_pct` line still counts even if it is dropped from the distribution).
     velocity_preempt_swaps: u32,
+    /// `reason=session` swap-out anchors for the landing-point SLI (issue #595): the (ts, outgoing
+    /// account, decision reading) triples the reconstruction windows forward from. A superset of the
+    /// WHO/WHEN that `swap_out_pcts` discards — a swap line missing a parseable `ts=`/`from=` still
+    /// feeds `swap_out_pcts` but cannot be an anchor (there is no window to open), so it is dropped
+    /// here (the tolerant-drop precedent).
+    session_swaps: Vec<SwapOut>,
+    /// Every re-activation edge (issue #595): the (ts, re-activated account) of any `event=swap`,
+    /// `event=emergency_swap`, `event=restash`, or `event=canonical_recovered`, so the landing window
+    /// of a previously-parked account can be closed at the instant it becomes active again
+    /// (`active_at != acct`). All four revival paths count — re-activation is not swap-reason- or
+    /// swap-kind-specific.
+    reactivations: Vec<Reactivation>,
+}
+
+/// Record a re-activation edge (issue #595): the account named by `{acct_field}=` on this log line
+/// becomes the ACTIVE account at `ts=`, closing that account's parked landing window
+/// (`active_at != acct`). Four durable events revive a roster account — the complete set found by
+/// tracing every daemon active-account setter (each caller of `record_swap`, plus the reconcile
+/// re-resolve): `event=swap` (any reason) and `event=emergency_swap` name the revived account in
+/// `to=`; `event=restash` (an out-of-band `claude /login` the daemon reconciles onto a roster
+/// account) and `event=canonical_recovered` (the scrub-adopt recovery re-adopting one, its session
+/// gate bypassed so a just-parked account is eligible) name it in `account=`. Passing the field name
+/// keeps one edge-recorder over all four. (A re-activation with NO durable event — a cross-restart
+/// out-of-band re-login silently adopted at first-tick startup — is invisible to this reader-side
+/// reconstruction; an accepted bound of the approach, like the raw-sample retention window.) A line
+/// missing a parseable `ts=` or `{acct_field}=` is skipped (unplaceable — the tolerant-drop
+/// precedent).
+fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, acct_field: &str) {
+    if let (Some(ts), Some(acct)) = (
+        fields.get("ts").copied().and_then(epoch_from_rfc3339),
+        fields.get(acct_field).copied(),
+    ) {
+        inputs.reactivations.push(Reactivation {
+            ts,
+            acct: acct.to_owned(),
+        });
+    }
 }
 
 /// Parse the SLI ingredients out of the structured event-log `text`.
 ///
 /// Tolerant, forward-only, self-contained: it reads the flat `key=val` grammar
-/// ([`crate::observability`]) line by line and folds the four relevant event families into
+/// ([`crate::observability`]) line by line and folds the relevant event families into
 /// [`Inputs`], skipping blank lines, other event kinds, and any line missing a field it needs
 /// or carrying an unparseable value (the same tolerant-drop the `stats` swap parser uses).
 ///
@@ -293,6 +396,11 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
 
         match fields.get("event").copied() {
             Some("swap") => {
+                // Re-activation edge (issue #595): ANY swap re-activates its INCOMING account, so
+                // record its `to=` BEFORE the reason-specific `continue`s below — a previously-parked
+                // account's landing window closes the instant it becomes active again
+                // (`active_at != acct`), whatever the reason of the swap that revives it.
+                record_reactivation_edge(&mut inputs, &fields, "to");
                 // #452 preemptive swaps (reason=blind_preempt, ADR-0017): count each observed one
                 // for the false-preempt SLI's REAL numerator, then skip the session-overshoot
                 // accounting below — a preemptive swap fires on a STALE anchor, not a fresh reading,
@@ -325,6 +433,19 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 }
                 if let Some(pct) = fields.get("session_pct").and_then(|v| v.parse::<u8>().ok()) {
                     inputs.swap_out_pcts.push(f64::from(pct));
+                    // Landing anchor (issue #595): the reconstruction needs the WHO (`from=`) and
+                    // WHEN (`ts=`) to window this parked account's post-swap samples. A line missing
+                    // either still fed the pct above, but cannot open a window — not an anchor.
+                    if let (Some(ts), Some(from)) = (
+                        fields.get("ts").copied().and_then(epoch_from_rfc3339),
+                        fields.get("from").copied(),
+                    ) {
+                        inputs.session_swaps.push(SwapOut {
+                            ts,
+                            acct: from.to_owned(),
+                            decision_pct: pct,
+                        });
+                    }
                 }
             }
             Some("blind_window") => {
@@ -354,6 +475,27 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 _ => {}
             },
             Some("usage_backoff_cleared") => inputs.cleared = inputs.cleared.saturating_add(1),
+            // An emergency swap (issue #405 dead-active escape) is a DISTINCT event token, but it too
+            // moves the active account onto `to=` — so it is a re-activation edge for the #595 landing
+            // filter, exactly like a normal swap-in. It is NOT a session overshoot, so — unlike the
+            // `swap` arm — it contributes no landing ANCHOR, only the re-activation edge.
+            Some("emergency_swap") => record_reactivation_edge(&mut inputs, &fields, "to"),
+            // A restash (issue #595) is the out-of-band `claude /login` path: the daemon's canonical
+            // watch detects a foreign credential, reconciles it onto its roster account, and
+            // re-resolves THAT account active (`reconcile_canonical_change`). So it too revives a
+            // possibly-parked account — a re-activation edge for the landing filter — but names it in
+            // `account=` (not `to=`), and like emergency_swap it is no session overshoot, so it
+            // contributes only the edge, no anchor.
+            Some("restash") => record_reactivation_edge(&mut inputs, &fields, "account"),
+            // A canonical recovery (issue #595) is the fourth revival door: when the shared canonical
+            // credential is scrubbed and the daemon re-adopts a roster account to keep the fleet live
+            // (the scrub-adopt path, its session gate bypassed so a just-parked near-limit account is
+            // eligible), it calls the same `record_swap` — re-activating that account — and emits
+            // event=canonical_recovered account={label}. So it too is a re-activation edge, keyed off
+            // `account=` like restash, and contributes only the edge (it is no session overshoot).
+            Some("canonical_recovered") => {
+                record_reactivation_edge(&mut inputs, &fields, "account")
+            }
             _ => {}
         }
     }
@@ -407,6 +549,124 @@ impl ProjectedSwapOvershoot {
     /// P100 `< 99` of [`SwapOvershoot::p100_met`].
     fn p100_met(&self) -> Option<bool> {
         self.p100.map(|v| v <= SLO_PROJECTED_SWAP_P100_MAX)
+    }
+}
+
+/// The landing-point swap-out overshoot SLI (issue #595): where each `reason=session` swap-out
+/// ACTUALLY landed — the peak `session_pct` its OUTGOING account reached within
+/// [`LANDING_WINDOW_SECS`] after being parked, EXCLUDING any window minutes past a re-activation
+/// (`active_at != acct`). Reconstructed by joining the event log's swap anchors with the daemon's
+/// `usage-samples.jsonl` per-account readings (spike #596's two-source recipe), so it surfaces the
+/// post-swap committed tail SLI 1 (the swap DECISION point) is blind to. Percentiles are `None` when
+/// no swap had a post-swap sample — cardinality-zero is not a passing 0 (the [`SwapOvershoot`]
+/// discipline). `p90` is the tail-calibration input the trigger-redesign sibling (issue #597) reads.
+#[derive(Debug, PartialEq)]
+struct Landing {
+    /// `reason=session` swap anchors in view (already `--since`-windowed) — the coverage denominator.
+    swaps_total: usize,
+    /// Anchors with ≥1 post-swap sample of the parked account — the subject the percentiles summarize.
+    n_measured: usize,
+    /// Anchors with NO post-swap sample in the window: a sample-coverage gap, reported honestly
+    /// rather than fabricated as a `0` landing (a swap the store cannot reconstruct is UNMEASURED,
+    /// not on-target).
+    n_unmeasured: usize,
+    p50: Option<u8>,
+    /// The 90th-percentile landing — the tail the #597 trigger redesign calibrates against.
+    p90: Option<u8>,
+    p100: Option<u8>,
+    /// Measured episodes whose DECISION reading was already `>= SLO_SWAP_P100_MAX`: the swap fired
+    /// late, so the overshoot is already visible in SLI 1 (gap-crossing — issue #595 breach class 2).
+    gap_crossing: usize,
+    /// Measured episodes that fired BELOW the ceiling but LANDED at/over it: the post-swap committed
+    /// tail — the invisible ~46% this SLI exists to expose (issue #595 breach class 1).
+    post_swap_tail: usize,
+}
+
+impl Landing {
+    /// Whether the worst landing meets the strict `< SLO_SWAP_P100_MAX` ceiling (`None` with no
+    /// measured episode). The SAME ceiling [`SwapOvershoot::p100_met`] checks on the decision
+    /// reading — the issue's thesis is that the SLO belongs on THIS event, so the readout flags it
+    /// here too.
+    fn p100_met(&self) -> Option<bool> {
+        self.p100.map(|v| v < SLO_SWAP_P100_MAX)
+    }
+}
+
+/// Reconstruct the landing-point SLI (issue #595) by joining the parsed swap anchors with the raw
+/// usage samples. Pure and total: no clock, no I/O — the samples are read once in [`run`] and passed
+/// in, so the whole aggregation stays a function of the two file contents (and the `--since` cutoff,
+/// already applied to `inputs`).
+fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
+    // Index the samples by roster label once, so each anchor scans only ITS account's readings
+    // rather than re-sweeping the whole store. The label is the join key (swap `from=` ↔
+    // `Sample.acct`) and stays INTERNAL — no label reaches the rendered output. Group order is
+    // irrelevant: the peak below is an order-independent filter + `reduce(f64::max)` over the window.
+    let mut by_acct: BTreeMap<&str, Vec<&Sample>> = BTreeMap::new();
+    for s in samples {
+        by_acct.entry(s.acct.as_str()).or_default().push(s);
+    }
+
+    let mut landing_pcts: Vec<f64> = Vec::new();
+    let mut n_unmeasured = 0usize;
+    let mut gap_crossing = 0usize;
+    let mut post_swap_tail = 0usize;
+
+    for swap in &inputs.session_swaps {
+        let window_end = swap.ts.saturating_add(LANDING_WINDOW_SECS);
+        // The parked window closes at the earliest re-activation of THIS account after the swap, when
+        // one falls inside the window — samples at/after it read the now-ACTIVE account, not the
+        // parked tail (`active_at != acct`). No re-activation ⇒ the full bounded window.
+        let effective_end = inputs
+            .reactivations
+            .iter()
+            .filter(|si| si.acct == swap.acct && si.ts > swap.ts)
+            .map(|si| si.ts.saturating_sub(1)) // strictly before the re-activation instant
+            .min()
+            .map_or(window_end, |before_reactivation| {
+                window_end.min(before_reactivation)
+            });
+        // Peak absolute session over the parked window (readings strictly after the swap, through the
+        // effective end). The `is_finite` guard drops a NaN/inf reading, which would otherwise clamp to
+        // the u8 cap (255) below and fabricate a max-value breach (and poison the issue #597 tail
+        // calibration). `None` ⇒ no reading of the parked account in view — an unmeasured anchor.
+        let peak = by_acct
+            .get(swap.acct.as_str())
+            .into_iter()
+            .flatten()
+            .filter(|s| s.ts > swap.ts && s.ts <= effective_end && s.session.is_finite())
+            .map(|s| s.session)
+            .reduce(f64::max);
+        match peak {
+            Some(peak) => {
+                // Fraction → percent, matching the swap event's u8 `session_pct` so the decision and
+                // landing readings are directly comparable. Readings can exceed 1.0 (the store doc), so
+                // clamp into u8 without wrapping — an over-100 landing keeps its true rounded value up to
+                // the u8 cap (255), clamping only an implausibly huge reading rather than overflowing.
+                let landing_pct = (peak * 100.0).round().clamp(0.0, u8::MAX as f64) as u8;
+                landing_pcts.push(f64::from(landing_pct));
+                if swap.decision_pct >= SLO_SWAP_P100_MAX {
+                    gap_crossing += 1;
+                } else if landing_pct >= SLO_SWAP_P100_MAX {
+                    post_swap_tail += 1;
+                }
+            }
+            None => n_unmeasured += 1,
+        }
+    }
+
+    let n = landing_pcts.len();
+    let pct = |p: f64| -> Option<u8> {
+        (n > 0).then(|| crate::percentile::percentile(&landing_pcts, p) as u8)
+    };
+    Landing {
+        swaps_total: inputs.session_swaps.len(),
+        n_measured: n,
+        n_unmeasured,
+        p50: pct(0.50),
+        p90: pct(0.90),
+        p100: pct(1.0),
+        gap_crossing,
+        post_swap_tail,
     }
 }
 
@@ -465,6 +725,9 @@ struct Report {
     swap_overshoot: SwapOvershoot,
     /// The #539 velocity-projection covered-swap overshoot (`reason=velocity_preempt` percentiles).
     projected_swap_overshoot: ProjectedSwapOvershoot,
+    /// The #595 landing-point overshoot — where `reason=session` swaps actually landed (post-swap
+    /// peak of the parked account), reconstructed from the usage-sample store.
+    landing: Landing,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreempt,
     /// The #539 false-projection SLI (velocity-projection swaps observed; real rate pending).
@@ -475,8 +738,9 @@ struct Report {
 /// Fold the parsed [`Inputs`] into a [`Report`], attaching the active `window` for display.
 /// Pure and total: the windowing already happened in [`parse_events`] (the `inputs` are the
 /// filtered subset); `window` is carried through untouched, only so the renderers can document
-/// the bound.
-fn aggregate(inputs: &Inputs, window: Option<Window>) -> Report {
+/// the bound. `samples` are the daemon's raw usage readings (`usage-samples.jsonl`), joined with
+/// the swap anchors in [`compute_landing`] to reconstruct the #595 landing-point SLI.
+fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Report {
     let n = inputs.swap_out_pcts.len();
     // percentile() returns one of the input samples, each an integer-valued `f64::from(u8)`,
     // so `as u8` is exact (values are 0..=100). `None` when there is nothing to summarize.
@@ -517,6 +781,7 @@ fn aggregate(inputs: &Inputs, window: Option<Window>) -> Report {
         window,
         swap_overshoot,
         projected_swap_overshoot,
+        landing: compute_landing(inputs, samples),
         time_blind_near_limit_secs: inputs.time_blind_near_limit_secs,
         false_preempt: FalsePreempt {
             preemptive_swaps_observed: inputs.preemptive_swaps,
@@ -549,7 +814,7 @@ fn ok_flag(met: bool) -> &'static str {
 fn render_human(r: &Report) -> String {
     let mut out = String::new();
     out.push_str(
-        "sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log)\n\n",
+        "sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log + usage samples)\n\n",
     );
 
     // Active window (issue #494) — documents the bound so the numbers below are read in
@@ -616,6 +881,39 @@ fn render_human(r: &Report) -> String {
     }
     out.push('\n');
 
+    // SLI 1c — LANDING-point session_pct (issue #595): the peak the OUTGOING account actually reached
+    // after a reason=session swap parked it, reconstructed from usage-samples.jsonl. This is where the
+    // #455 ceiling belongs — SLI 1's decision-point reading is blind to the post-swap committed tail.
+    match (r.landing.p50, r.landing.p90, r.landing.p100) {
+        (Some(p50), Some(p90), Some(p100)) => {
+            out.push_str(&format!(
+                "landing-point session_pct (post-swap peak of the outgoing account, window <= {LANDING_WINDOW_SECS}s)\n"
+            ));
+            out.push_str(&format!(
+                "  measured n={} of {} reason=session swaps ({} with no post-swap sample)\n",
+                r.landing.n_measured, r.landing.swaps_total, r.landing.n_unmeasured
+            ));
+            out.push_str(&format!("  P50  = {p50}\n"));
+            out.push_str(&format!("  P90  = {p90}  (issue #597 tail-calibration input)\n"));
+            out.push_str(&format!(
+                "  P100 = {p100}  vs ceiling < {SLO_SWAP_P100_MAX}  {}\n",
+                ok_flag(p100 < SLO_SWAP_P100_MAX)
+            ));
+            out.push_str(&format!(
+                "  breach classes: {} post-swap tail (fired < {SLO_SWAP_P100_MAX}, landed >= {SLO_SWAP_P100_MAX}); {} gap-crossing (decision >= {SLO_SWAP_P100_MAX}); blind-burn: see time-blind SLI (issue #583)\n",
+                r.landing.post_swap_tail, r.landing.gap_crossing
+            ));
+        }
+        _ if r.landing.swaps_total == 0 => out.push_str(
+            "landing-point session_pct (post-swap peak of the outgoing account): no reason=session swaps observed\n",
+        ),
+        _ => out.push_str(&format!(
+            "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window ({} of {} reason=session swaps unmeasured)\n",
+            r.landing.n_unmeasured, r.landing.swaps_total
+        )),
+    }
+    out.push('\n');
+
     // SLI 2 — time blind & near-limit.
     out.push_str(&format!(
         "time blind & near-limit: {}s (sum of blind_window duration_secs where near_limit=true)\n\n",
@@ -667,6 +965,8 @@ struct ReliabilityWire {
     swap_overshoot: SwapOvershootWire,
     /// The #539 velocity-projection covered-swap overshoot (schema:3, additive).
     projected_swap_overshoot: ProjectedSwapOvershootWire,
+    /// The #595 landing-point overshoot — where reason=session swaps actually landed (schema:4, additive).
+    landing: LandingWire,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreemptWire,
     /// The #539 false-projection SLI (schema:3, additive).
@@ -730,6 +1030,42 @@ struct ProjectedSwapOvershootWire {
 struct ProjectedSwapTargetsWire {
     p50_max: u8,
     p100_max: u8,
+}
+
+/// Landing-point overshoot block (issue #595): where reason=session swaps actually landed — the
+/// post-swap peak of the parked account, reconstructed from the usage-sample store. `p50`/`p90`/
+/// `p100`/`p100_met` are `null` when no swap had a post-swap sample (an empty subject is not a
+/// passing `0`).
+#[derive(serde::Serialize)]
+struct LandingWire {
+    /// reason=session swap anchors in view (the coverage denominator).
+    swaps_total: usize,
+    /// Anchors with >= 1 post-swap sample — the measured subject the percentiles summarize.
+    n_measured: usize,
+    /// Anchors with no post-swap sample in the window — a coverage gap, not a `0` landing.
+    n_unmeasured: usize,
+    p50: Option<u8>,
+    /// The 90th-percentile landing — the #597 tail-calibration input.
+    p90: Option<u8>,
+    p100: Option<u8>,
+    /// The bounded post-swap window these landings were measured over (seconds).
+    window_secs: i64,
+    /// The strict-`<` ceiling this landing is checked against — the SAME #455 ceiling SLI 1 uses.
+    ceiling: u8,
+    /// Whether the worst landing meets `< ceiling` (`null` with no measured episode).
+    p100_met: Option<bool>,
+    /// The issue #595 breach-class split over the measured episodes.
+    classes: LandingClassesWire,
+}
+
+/// The landing-point breach classes (issue #595): the two the readout computes directly; blind-burn
+/// is the separate blind-episode record (issue #583 / the time-blind SLI), referenced not recomputed.
+#[derive(serde::Serialize)]
+struct LandingClassesWire {
+    /// Fired below the ceiling but landed at/over it — the post-swap committed tail (class 1).
+    post_swap_tail: usize,
+    /// Decision reading already at/over the ceiling — visible in SLI 1 (gap-crossing, class 2).
+    gap_crossing: usize,
 }
 
 /// False-preempt block: the real (pending) rate plus the labeled interim proxy.
@@ -804,6 +1140,21 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 p100: r.projected_swap_overshoot.p100_met(),
             },
         },
+        landing: LandingWire {
+            swaps_total: r.landing.swaps_total,
+            n_measured: r.landing.n_measured,
+            n_unmeasured: r.landing.n_unmeasured,
+            p50: r.landing.p50,
+            p90: r.landing.p90,
+            p100: r.landing.p100,
+            window_secs: LANDING_WINDOW_SECS,
+            ceiling: SLO_SWAP_P100_MAX,
+            p100_met: r.landing.p100_met(),
+            classes: LandingClassesWire {
+                post_swap_tail: r.landing.post_swap_tail,
+                gap_crossing: r.landing.gap_crossing,
+            },
+        },
         time_blind_near_limit_secs: r.time_blind_near_limit_secs,
         false_preempt: FalsePreemptWire {
             preemptive_swaps_observed: r.false_preempt.preemptive_swaps_observed,
@@ -865,6 +1216,8 @@ ts=2026-07-11T00:05:00Z event=swap from=oleksii@pelykhconsulting.fr to=oleksii@p
 ts=2026-07-11T00:06:00Z event=swap from=oleksii@pelykh.com to=oleksii@pelykhconsulting.fr reason=session session_pct=100 late=true
 ts=2026-07-11T00:07:00Z event=swap from=oleksii@pelykh.com to=oleksii@pelykhconsulting.fr reason=manual session_pct=0
 ts=2026-07-11T00:08:00Z event=emergency_swap from=oleksii@pelykh.com to=oleksii@pelykhconsulting.fr
+ts=2026-07-11T00:09:00Z event=restash account=oleksii@pelykh.com
+ts=2026-07-11T00:09:30Z event=canonical_recovered account=oleksii@pelykhconsulting.fr
 ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=300 session_pct=97 session_at_recovery=99 near_limit=true
 ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pct=96 session_at_recovery=40 near_limit=true
 ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=120 session_pct=50 session_at_recovery=51 near_limit=false
@@ -878,7 +1231,17 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
 ";
 
     fn fixture_report() -> Report {
-        aggregate(&parse_events(FIXTURE_LOG, None), None)
+        // The event-log fixture carries reason=session swaps but NO usage samples, so the landing
+        // SLI reconstructs zero measured episodes (both swaps unmeasured) — the landing-specific
+        // fixtures below supply samples. Passing `&[]` keeps every prior assertion unchanged.
+        aggregate(&parse_events(FIXTURE_LOG, None), &[], None)
+    }
+
+    /// A usage [`Sample`] at `ts` for roster label `acct` with absolute `session` as a fraction
+    /// (`weekly` is fixed at 0.10 — the landing join reads only `session`) — the landing-SLI join
+    /// input, a trimmed form of `stats`' own `sample` test helper.
+    fn sample(ts: i64, acct: &str, session: f64) -> Sample {
+        Sample::new(ts, "claude", acct, session, 0.10)
     }
 
     #[test]
@@ -916,7 +1279,7 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
 
     #[test]
     fn empty_log_yields_no_swaps_and_zeroed_slis() {
-        let r = aggregate(&parse_events("", None), None);
+        let r = aggregate(&parse_events("", None), &[], None);
         assert_eq!(r.swap_overshoot.n, 0);
         // Cardinality-zero: percentiles are None (not a passing 0), so no target is asserted met.
         assert_eq!(r.swap_overshoot.p50, None);
@@ -935,7 +1298,7 @@ ts=2026-07-11T00:00:00Z event=swap from=a to=b reason=session session_pct=95
 ts=2026-07-11T00:01:00Z event=swap from=a to=b reason=session session_pct=96
 ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
 ";
-        let r = aggregate(&parse_events(log, None), None);
+        let r = aggregate(&parse_events(log, None), &[], None);
         assert_eq!(r.swap_overshoot.p50, Some(96));
         assert_eq!(r.swap_overshoot.p100, Some(97));
         assert_eq!(r.swap_overshoot.p50_met(), Some(true));
@@ -948,7 +1311,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
         assert_eq!(
             out,
             concat!(
-                "sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log)\n",
+                "sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log + usage samples)\n",
                 "\n",
                 "swap-out session_pct (reason=session), n=2\n",
                 "  P50  = 96  target <= 97  [ok]\n",
@@ -956,6 +1319,8 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "  P100 = 100  target < 99   [OVER]\n",
                 "\n",
                 "projected swap-out session_pct (reason=velocity_preempt): no projective swaps observed\n",
+                "\n",
+                "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window (2 of 2 reason=session swaps unmeasured)\n",
                 "\n",
                 "time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)\n",
                 "\n",
@@ -973,7 +1338,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
 
     #[test]
     fn human_render_handles_no_swaps() {
-        let out = render_human(&aggregate(&parse_events("", None), None));
+        let out = render_human(&aggregate(&parse_events("", None), &[], None));
         assert!(
             out.contains("swap-out session_pct (reason=session): no swaps observed"),
             "cardinality-zero must not print a fabricated P100: {out}"
@@ -981,18 +1346,18 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     }
 
     #[test]
-    fn json_render_is_stable_schema_3() {
+    fn json_render_is_stable_schema_4() {
         // The whole-log default: `window` is null and every PRIOR field is byte-identical to
-        // schema:1/2 — the additive contract (#494/#539). The #539 `projected_swap_overshoot` +
-        // `false_projection` objects are new-but-always-present (null percentiles here — the fixture
-        // has no `reason=velocity_preempt` swap). A `--since` document is asserted separately in
+        // schema:1/2/3 — the additive contract (#494/#539/#595). The #595 `landing` object is
+        // new-but-always-present (null percentiles here — the fixture has no usage samples, so both
+        // reason=session swaps are unmeasured). A `--since` document is asserted separately in
         // `json_documents_the_active_window`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 3,\n",
+                "  \"schema\": 4,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -1022,6 +1387,21 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "      \"p100\": null\n",
                 "    }\n",
                 "  },\n",
+                "  \"landing\": {\n",
+                "    \"swaps_total\": 2,\n",
+                "    \"n_measured\": 0,\n",
+                "    \"n_unmeasured\": 2,\n",
+                "    \"p50\": null,\n",
+                "    \"p90\": null,\n",
+                "    \"p100\": null,\n",
+                "    \"window_secs\": 900,\n",
+                "    \"ceiling\": 99,\n",
+                "    \"p100_met\": null,\n",
+                "    \"classes\": {\n",
+                "      \"post_swap_tail\": 0,\n",
+                "      \"gap_crossing\": 0\n",
+                "    }\n",
+                "  },\n",
                 "  \"time_blind_near_limit_secs\": 900,\n",
                 "  \"false_preempt\": {\n",
                 "    \"preemptive_swaps_observed\": 0,\n",
@@ -1048,7 +1428,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
 
     #[test]
     fn json_no_data_serializes_nulls_not_a_passing_zero() {
-        let out = render_json(&aggregate(&parse_events("", None), None)).expect("serializes");
+        let out = render_json(&aggregate(&parse_events("", None), &[], None)).expect("serializes");
         assert!(
             out.contains("\"p100\": null"),
             "no-data P100 must be null: {out}"
@@ -1214,7 +1594,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         let window = Window::resolve("1s", epoch("2026-07-11T00:00:00Z") + 1).unwrap();
         assert_eq!(window.cutoff_epoch, epoch("2026-07-11T00:00:00Z")); // after the Jul-10 swaps
         let inputs = parse_events(WINDOW_LOG, Some(window.cutoff_epoch));
-        let r = aggregate(&inputs, Some(window));
+        let r = aggregate(&inputs, &[], Some(window));
         assert_eq!(r.swap_overshoot.n, 0);
         assert_eq!(r.swap_overshoot.p50, None);
         assert_eq!(r.swap_overshoot.p100, None);
@@ -1238,7 +1618,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
     fn human_documents_the_active_window() {
         let window = Window::resolve("7d", epoch("2026-07-12T00:00:00Z")).unwrap();
         let inputs = parse_events(WINDOW_LOG, Some(window.cutoff_epoch));
-        let out = render_human(&aggregate(&inputs, Some(window)));
+        let out = render_human(&aggregate(&inputs, &[], Some(window)));
         assert!(
             out.contains(
                 "window: since 2026-07-05T00:00:00Z (7d) — all SLIs bounded to events at/after the cutoff"
@@ -1255,10 +1635,11 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         let cutoff = window.cutoff_epoch;
         let out = render_json(&aggregate(
             &parse_events(WINDOW_LOG, Some(cutoff)),
+            &[],
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 3,"), "schema bumped to 3: {out}");
+        assert!(out.contains("\"schema\": 4,"), "schema bumped to 4: {out}");
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",
@@ -1287,10 +1668,19 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         // Cover BOTH output paths: the whole-log default AND a windowed readout (#494), the
         // latter built over the same email-bearing fixture so the window line + JSON `window`
         // block are exercised on real swap data — the window metadata (a duration + a bare
-        // cutoff instant) must itself stay secret-free.
-        let whole = fixture_report();
+        // cutoff instant) must itself stay secret-free. Samples carry the SAME email roster
+        // labels as the swap `from=` (as production does), so the #595 landing join runs over
+        // email-bearing data — the leak guard then genuinely covers the landing path, not just SLI 1.
+        let samples = [
+            // Two readings of the account parked by the 00:00 reason=session swap (from=…pelykh.com),
+            // inside its window and before its 00:05 re-activation, so a landing episode is measured.
+            sample(epoch("2026-07-11T00:02:00Z"), "oleksii@pelykh.com", 0.99),
+            sample(epoch("2026-07-11T00:03:00Z"), "oleksii@pelykh.com", 1.00),
+        ];
+        let whole = aggregate(&parse_events(FIXTURE_LOG, None), &samples, None);
         let windowed = aggregate(
             &parse_events(FIXTURE_LOG, Some(epoch("2026-07-11T00:00:00Z"))),
+            &samples,
             Some(Window::resolve("30m", epoch("2026-07-11T00:30:00Z")).unwrap()),
         );
         // Non-degeneracy: the window must retain the fixture's swaps, else the windowed render
@@ -1298,6 +1688,12 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         assert!(
             windowed.swap_overshoot.n > 0,
             "windowed report must fold the fixture swaps"
+        );
+        // Non-degeneracy for the #595 landing path: the email-acct join must produce a measured
+        // episode, else the landing render is empty and its leak guard proves nothing.
+        assert!(
+            whole.landing.n_measured > 0,
+            "landing join must fold the email-acct samples so the leak guard is a real catch"
         );
         for r in [&whole, &windowed] {
             for out in [render_human(r), render_json(r).expect("serializes")] {
@@ -1312,5 +1708,337 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
                 assert!(!out.contains("acct="), "no account uuid: {out}");
             }
         }
+    }
+
+    // --- issue #595: the landing-point SLI ------------------------------------
+
+    #[test]
+    fn parse_collects_session_swap_anchors_and_reactivation_edges() {
+        // The landing reconstruction needs two new extractions from the swap stream: reason=session
+        // ANCHORS (ts + outgoing acct + decision pct) and re-activation EDGES (every swap's `to=`).
+        let inputs = parse_events(FIXTURE_LOG, None);
+        // Anchors: only the two reason=session swaps (96 @ 00:00, 100 @ 00:06); weekly/manual excluded.
+        assert_eq!(
+            inputs.session_swaps,
+            vec![
+                SwapOut {
+                    ts: epoch("2026-07-11T00:00:00Z"),
+                    acct: "oleksii@pelykh.com".to_owned(),
+                    decision_pct: 96,
+                },
+                SwapOut {
+                    ts: epoch("2026-07-11T00:06:00Z"),
+                    acct: "oleksii@pelykh.com".to_owned(),
+                    decision_pct: 100,
+                },
+            ]
+        );
+        // Edges: every event=swap `to=` (ANY reason), the event=emergency_swap `to=`, the
+        // event=restash `account=`, AND the event=canonical_recovered `account=` — all four move the
+        // active account onto that label, so all four re-activate their target (issue #595 AC2). The
+        // restash and canonical_recovered carry `account=`, not `to=`.
+        assert_eq!(
+            inputs.reactivations,
+            vec![
+                Reactivation {
+                    ts: epoch("2026-07-11T00:00:00Z"),
+                    acct: "oleksii@pelykhconsulting.fr".to_owned(),
+                },
+                Reactivation {
+                    ts: epoch("2026-07-11T00:05:00Z"),
+                    acct: "oleksii@pelykh.com".to_owned(),
+                },
+                Reactivation {
+                    ts: epoch("2026-07-11T00:06:00Z"),
+                    acct: "oleksii@pelykhconsulting.fr".to_owned(),
+                },
+                Reactivation {
+                    ts: epoch("2026-07-11T00:07:00Z"),
+                    acct: "oleksii@pelykhconsulting.fr".to_owned(),
+                },
+                // The 00:08 emergency_swap `to=` — a re-activation edge too (regression: issue #595).
+                Reactivation {
+                    ts: epoch("2026-07-11T00:08:00Z"),
+                    acct: "oleksii@pelykhconsulting.fr".to_owned(),
+                },
+                // The 00:09 restash `account=` — the out-of-band `claude /login` re-activation, keyed
+                // off `account=` not `to=` (regression: issue #595).
+                Reactivation {
+                    ts: epoch("2026-07-11T00:09:00Z"),
+                    acct: "oleksii@pelykh.com".to_owned(),
+                },
+                // The 00:09:30 canonical_recovered `account=` — the scrub-adopt recovery re-activation,
+                // the fourth revival door, also keyed off `account=` (regression: issue #595).
+                Reactivation {
+                    ts: epoch("2026-07-11T00:09:30Z"),
+                    acct: "oleksii@pelykhconsulting.fr".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn landing_reconstructs_the_post_swap_peak() {
+        // A reason=session swap fires ON TARGET at 96; the parked account then climbs to 100 within
+        // the window. SLI 1 sees only the 96 decision; the landing SLI catches the 100 it reached.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:01:00Z"), "work", 0.97),
+            sample(epoch("2026-07-11T00:05:00Z"), "work", 1.00),
+            sample(epoch("2026-07-11T00:10:00Z"), "work", 0.98), // past the peak; peak stays 100
+            sample(epoch("2026-07-11T00:03:00Z"), "spare", 0.50), // the INCOMING account — never joined
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.swaps_total, 1);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(r.landing.n_unmeasured, 0);
+        assert_eq!(r.landing.p100, Some(100));
+        assert_eq!(r.landing.p50, Some(100)); // n=1 → every percentile is the one peak
+                                              // Fired at 96 (< 99) but landed at 100 (>= 99): the invisible post-swap committed tail.
+        assert_eq!(r.landing.post_swap_tail, 1);
+        assert_eq!(r.landing.gap_crossing, 0);
+        assert_eq!(r.landing.p100_met(), Some(false));
+    }
+
+    #[test]
+    fn landing_excludes_samples_after_reactivation() {
+        // work is parked at 00:00, then RE-ACTIVATED at 00:04 (a later swap names it `to=`). The 100
+        // reading at 00:06 is AFTER re-activation — the account is active again, so it is NOT part of
+        // the parked tail (`active_at != acct`). The peak before re-activation is 97.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+ts=2026-07-11T00:04:00Z event=swap from=spare to=work reason=weekly session_pct=40
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", 0.97), // parked → counts
+            sample(epoch("2026-07-11T00:06:00Z"), "work", 1.00), // post-reactivation → excluded
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(
+            r.landing.p100,
+            Some(97),
+            "peak must exclude the post-reactivation 100 reading"
+        );
+        assert_eq!(
+            r.landing.post_swap_tail, 0,
+            "97 landed below the ceiling once the re-activation reading is excluded"
+        );
+    }
+
+    #[test]
+    fn landing_excludes_samples_after_emergency_reactivation() {
+        // The re-activation that closes a parked window need not be a normal swap: on a 2-account
+        // roster the freshly-active account can DIE, and an event=emergency_swap revives the parked
+        // account. A reading AFTER that emergency swap is an ACTIVE reading, NOT the parked tail — so
+        // it must be excluded exactly as a normal re-activation would (issue #595 AC2). Regression: an
+        // earlier cut collected only `event=swap` edges, so an emergency revival fabricated a breach.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+ts=2026-07-11T00:03:00Z event=emergency_swap from=spare to=work
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", 0.97), // parked → counts
+            sample(epoch("2026-07-11T00:05:00Z"), "work", 1.00), // post-emergency-reactivation → excluded
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(
+            r.landing.p100,
+            Some(97),
+            "an emergency swap re-activates work; its post-reactivation 100 reading must not fold in"
+        );
+        assert_eq!(
+            r.landing.post_swap_tail, 0,
+            "excluding the post-emergency reading, work landed at 97 (< 99) — no fabricated breach"
+        );
+    }
+
+    #[test]
+    fn landing_excludes_samples_after_restash_reactivation() {
+        // The third revival door: an operator runs `claude /login` as the JUST-PARKED account. The
+        // daemon's canonical watch reconciles that credential onto its roster account and re-resolves
+        // it active, emitting event=restash account=work (issue #595 AC2). A reading AFTER the restash
+        // is an ACTIVE reading, not the parked tail — it must be excluded exactly as a swap re-activation
+        // is. Regression: restash carries `account=`, not `to=`, so an edge-recorder keyed only on `to=`
+        // would miss it and fold work's post-relogin climb into a fabricated post-swap-tail breach.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+ts=2026-07-11T00:03:00Z event=restash account=work
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", 0.97), // parked → counts
+            sample(epoch("2026-07-11T00:05:00Z"), "work", 1.00), // post-restash-reactivation → excluded
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(
+            r.landing.p100,
+            Some(97),
+            "a restash re-activates work; its post-reactivation 100 reading must not fold in"
+        );
+        assert_eq!(
+            r.landing.post_swap_tail, 0,
+            "excluding the post-restash reading, work landed at 97 (< 99) — no fabricated breach"
+        );
+    }
+
+    #[test]
+    fn landing_excludes_samples_after_canonical_recovery_reactivation() {
+        // The fourth revival door: the shared canonical credential is scrubbed, and the daemon's
+        // scrub-adopt recovery RE-ADOPTS the just-parked account to keep the fleet live — its session
+        // gate bypassed, so a near-limit parked account is a fully eligible re-adopt target. That calls
+        // record_swap (active := work) and emits event=canonical_recovered account=work. A reading
+        // AFTER it is an ACTIVE reading, not the parked tail, and must be excluded (issue #595 AC2).
+        // Regression: canonical_recovered carries `account=` (like restash), and an edge-recorder that
+        // stopped at swap/emergency_swap/restash would fold work's post-recovery climb into a fabricated
+        // post-swap-tail breach — and INFLATE p90/p100, the #597 tail-calibration input.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+ts=2026-07-11T00:03:00Z event=canonical_recovered account=work
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", 0.97), // parked → counts
+            sample(epoch("2026-07-11T00:05:00Z"), "work", 1.00), // post-recovery-reactivation → excluded
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(
+            r.landing.p100,
+            Some(97),
+            "a canonical recovery re-adopts work; its post-reactivation 100 reading must not fold in"
+        );
+        assert_eq!(
+            r.landing.post_swap_tail, 0,
+            "excluding the post-recovery reading, work landed at 97 (< 99) — no fabricated breach"
+        );
+    }
+
+    #[test]
+    fn landing_bounded_window_excludes_late_samples() {
+        // A 100 reading arrives AFTER the window closes — too late to attribute to this swap's
+        // landing (a fresh session cycle by then). The in-window peak is 98.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:10:00Z"), "work", 0.98), // 600s in → counts
+            sample(epoch("2026-07-11T00:20:00Z"), "work", 1.00), // 1200s in > 900 → excluded
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(
+            r.landing.p100,
+            Some(98),
+            "a reading past the {LANDING_WINDOW_SECS}s window is not this swap's landing"
+        );
+    }
+
+    #[test]
+    fn landing_classifies_gap_crossing_when_decision_already_over_ceiling() {
+        // The daemon's OWN reading was already 100 at the swap — the overshoot is a gap-crossing,
+        // visible in SLI 1 already, NOT a post-swap tail (even though the parked account stays >= 99).
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=100
+";
+        let samples = [sample(epoch("2026-07-11T00:02:00Z"), "work", 1.00)];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(r.landing.gap_crossing, 1);
+        assert_eq!(r.landing.post_swap_tail, 0);
+    }
+
+    #[test]
+    fn landing_swap_without_a_post_swap_sample_is_unmeasured_not_zero() {
+        // A session swap with NO usage sample of the parked account in the window: the store cannot
+        // reconstruct where it landed. That is UNMEASURED (a coverage gap), never a fabricated 0.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        let samples = [
+            sample(epoch("2026-07-10T23:59:00Z"), "work", 0.96), // BEFORE the swap → not a landing
+            sample(epoch("2026-07-11T00:05:00Z"), "other", 1.00), // wrong account → never joined
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.swaps_total, 1);
+        assert_eq!(r.landing.n_measured, 0);
+        assert_eq!(r.landing.n_unmeasured, 1);
+        assert_eq!(
+            r.landing.p100, None,
+            "no measured episode → percentile is None, not a passing 0"
+        );
+        assert_eq!(r.landing.p100_met(), None);
+    }
+
+    #[test]
+    fn landing_render_surfaces_measured_episodes_and_classes() {
+        // Two session swaps: one fires at 96 and lands 100 (post-swap tail), one fires at 99 and
+        // stays 100 (gap-crossing). The human + JSON both surface the distribution and the split.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+ts=2026-07-11T01:00:00Z event=swap from=spare to=work reason=session session_pct=99
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", 1.00), // landing for the 00:00 swap
+            sample(epoch("2026-07-11T01:02:00Z"), "spare", 1.00), // landing for the 01:00 swap
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 2);
+        assert_eq!(r.landing.post_swap_tail, 1);
+        assert_eq!(r.landing.gap_crossing, 1);
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "landing-point session_pct (post-swap peak of the outgoing account, window <= 900s)"
+            ),
+            "{human}"
+        );
+        assert!(
+            human.contains("measured n=2 of 2 reason=session swaps (0 with no post-swap sample)"),
+            "{human}"
+        );
+        assert!(
+            human.contains("P100 = 100  vs ceiling < 99  [OVER]"),
+            "{human}"
+        );
+        // Pin the full operator-facing breach-classes line (pluralization, the parenthetical
+        // thresholds, and the blind-burn → time-blind pointer) — the measured human block is otherwise
+        // only substring-checked, whereas the no-data block is byte-golden'd elsewhere.
+        assert!(
+            human.contains(
+                "  breach classes: 1 post-swap tail (fired < 99, landed >= 99); 1 gap-crossing \
+                 (decision >= 99); blind-burn: see time-blind SLI (issue #583)"
+            ),
+            "{human}"
+        );
+        let json = render_json(&r).expect("serializes");
+        assert!(json.contains("\"n_measured\": 2,"), "{json}");
+        assert!(json.contains("\"post_swap_tail\": 1,"), "{json}");
+        assert!(json.contains("\"gap_crossing\": 1"), "{json}");
+        assert!(json.contains("\"p100_met\": false,"), "{json}");
+    }
+
+    #[test]
+    fn landing_anchors_are_bounded_by_the_since_window() {
+        // The landing SLI shares SLI 1's `--since` bound: a swap BEFORE the cutoff contributes no
+        // landing anchor even if its samples exist. Only the in-window swap is reconstructed.
+        let log = "\
+ts=2026-07-01T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        let samples = [
+            sample(epoch("2026-07-01T00:02:00Z"), "work", 1.00), // for the pre-cutoff swap
+            sample(epoch("2026-07-10T00:02:00Z"), "work", 1.00), // for the in-window swap
+        ];
+        let cutoff = epoch("2026-07-05T00:00:00Z");
+        let r = aggregate(&parse_events(log, Some(cutoff)), &samples, None);
+        assert_eq!(
+            r.landing.swaps_total, 1,
+            "only the Jul-10 swap is in the --since window"
+        );
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(r.landing.post_swap_tail, 1);
     }
 }
