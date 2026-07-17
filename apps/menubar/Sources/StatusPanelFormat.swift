@@ -421,7 +421,7 @@ enum StatusPanelFormat {
         case .yellow:  return .asset("UtilAmber")   // mock --ut-a (stale)
         case .orange:  return .asset("UtilOrange")  // mock --ut-o (atRisk)
         case .red:     return .asset("UtilRed")     // mock --ut-r (dead)
-        case .neutral: return .secondary            // mock --text-3 (unknown)
+        case .neutral: return .secondary            // mock --text-2 (unknown)
         }
     }
 

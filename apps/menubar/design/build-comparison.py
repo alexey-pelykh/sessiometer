@@ -33,6 +33,7 @@ style = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
 # Every `.pop` block, in document order, by balanced-<div> slicing. Source order is stable:
 #  0 healthy-status-L · 1 healthy-status-D · 2/3 stats(skip) · 4 daemon-starting · 5/6/7 not-running(skip)
 #  · 8 disconnected · 9 stale · 10/11 keychain(skip) · 12 version-skew · 13 empty-L · 14 empty-D
+#  · 15 capture-states(skip) · 16 blind-ok-L · 17 blind-degraded-L · 18 blind-ok-D · 19 blind-degraded-D (#571)
 pops = []
 for m in re.finditer(r'<div class="pop theme-(?:light|dark)">', html):
     start, depth = m.start(), 0
@@ -43,6 +44,16 @@ for m in re.finditer(r'<div class="pop theme-(?:light|dark)">', html):
             end = start + tok.end()
             break
     pops.append(html[start:end])
+
+# The `design=` indices in STATES are POSITIONAL, and this script is not in CI — so the index map above
+# is the ONLY guard, and it has already drifted once (it stopped at 14 while the mock held 16 blocks).
+# A frame inserted ABOVE index 16 silently re-pairs every blind capture against the wrong design block:
+# the page still builds and still looks plausible — wrong output from the verification tool itself.
+# Fail loudly instead. (#571 — a named-selector fix that dissolves the coupling is tracked separately.)
+assert len(pops) == 20, (
+    f"mock has {len(pops)} .pop blocks, expected 20 — the index map above and every STATES `design=` "
+    f"index are stale; re-derive them against menubar-preview.html before trusting this page"
+)
 
 
 def cap(name):
@@ -84,6 +95,27 @@ STATES = [
               "control socket, honest pending → done → error) — not a copied command (#360)."),
     dict(title="6 · Empty roster / first run (dark)", theme="dark", design=14, capture="panel-empty-roster-dark.png",
          note="Onboarding, dark appearance."),
+    dict(title="Modifier · Active blind — OK", theme="light", design=16, capture="panel-blind-ok-light.png",
+         note="The ACTIVE account’s /usage poll is rate-limited (429): the daemon holds a bounded anchor and "
+              "pushes <code>blind_active</code>. The two live meters are replaced by a HELD session bar "
+              "(<b>dashed</b> = last-known, never a live fill — #137), the <code>blind {dur}</code> chip, the "
+              "LAST-KNOWN·RATE-LIMITED caption, and the auto-protection verdict. Health slot → an eye-slash "
+              "(usage visibility lost — a distinct shape). OK stays calm; the menu-bar glance reads healthy "
+              "(bounded, self-resolving — no cry-wolf). Header + footer stay FRESH: the fault is THIS row’s "
+              "(locality), the tell that it is not a whole-snapshot “stale”. Per #479/#485. The mock hand-draws "
+              "the panel’s SF Symbols (<code>eye.slash</code>, <code>checkmark.shield.fill</code>) as OUTLINE "
+              "approximations of filled marks — a mock-fidelity limit, not a parity claim: mock↔panel is ONE "
+              "medium, so R-2 (the CLI↔panel STATE-parity anchor) does not license the difference."),
+    dict(title="Modifier · Active blind — OK (dark)", theme="dark", design=18, capture="panel-blind-ok-dark.png",
+         note="Same state, dark appearance."),
+    dict(title="Modifier · Active blind — DEGRADED", theme="light", design=17, capture="panel-blind-degraded-light.png",
+         note="Auto-protection DEGRADED — the ADR-0017 gate is armed but acting on a STALE anchor (last-known "
+              "88%, amber). The row gains an at-risk ORANGE leading rule + orange eye-slash + orange verdict — a "
+              "non-colour-redundant locality tell. The menu-bar glance escalates to attention “!” (one rung "
+              "below no-runway). The CLI emphasises this line in red; the panel uses orange by design — a "
+              "per-medium colour choice under R-2 STATE-parity (the shared STATE is DEGRADED)."),
+    dict(title="Modifier · Active blind — DEGRADED (dark)", theme="dark", design=19, capture="panel-blind-degraded-dark.png",
+         note="Degraded, dark appearance."),
 ]
 
 sections = "".join(f"""
@@ -137,10 +169,12 @@ page = f"""<!doctype html>
        is pixel-accurate. <b>Capture</b> = the <i>built</i> SwiftUI panel, drawn to PNG by
        <code>RenderPanelTool</code> (<code>--render-panel</code>, SwiftUI <code>ImageRenderer</code> — no
        screen capture).</p>
-    <p>These are the <b>6 states the panel implements</b>. The mock’s <code>not-running</code>,
-       <code>crash-looping</code>, and <code>keychain-locked</code> shapes are the fuller 9-state map
-       (#169). The mock uses <code>backdrop-filter</code> vibrancy (semi-transparent); the app uses an
-       opaque window background for contrast — a deliberate native translation.</p>
+    <p>These are the <b>6 connection-states the panel implements</b>, plus the active-account
+       <b>blind</b> modifier (OK / DEGRADED, #479/#485) — a per-row modifier on a connected snapshot,
+       not a 10th daemon-state. The mock’s <code>not-running</code>, <code>crash-looping</code>, and
+       <code>keychain-locked</code> shapes are the fuller 9-state map (#169). The mock uses
+       <code>backdrop-filter</code> vibrancy (semi-transparent); the app uses an opaque window
+       background for contrast — a deliberate native translation.</p>
   </header>{sections}
 </div>
 </body></html>"""
