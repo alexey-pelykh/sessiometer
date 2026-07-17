@@ -94,7 +94,11 @@ pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
 // silent runtime gap — and because `daemon::COOLDOWN_SECS_LO` derives from this
 // constant, the guard covers the per-cycle jitter clamp too.
 const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
-/// Default `session_trigger` percent.
+/// Default `session_trigger` percent. 95 is not a free constant: a *correct* swap
+/// at this value can still overshoot by a post-swap committed tail (up to +5 pp,
+/// issue #595 — the parked account keeps billing in-flight work), and its safe
+/// setting is coupled to `poll_secs` and `session_velocity_horizon_secs`. See
+/// ADR-0022 (`session_trigger` is one predicate on two estimators, not two knobs).
 const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// Default `target_max_session_usage` percent (issue #398): the default-on swap-target
 /// reserve — only swap TO an account whose session usage is below this. Sits
@@ -338,7 +342,23 @@ pub(crate) struct Tunables {
     /// independently.
     pub(crate) target_max_session_usage: u8,
     /// Swap *away* from the active account at or above this session percent
-    /// (`50..=99`).
+    /// (`50..=99`). ONE swap-away predicate on TWO estimators of the same quantity
+    /// (ADR-0022): the reactive `observed >= session_trigger` and the issue #539
+    /// projection `observed + velocity × H >= session_trigger` share this trigger BY
+    /// DESIGN — the projection is a strict early-fire of the reactive decision (the
+    /// daemon's `velocity_swap`), not a differently-calibrated one — so this is one
+    /// knob, never two.
+    ///
+    /// NOT the landing point: a swap firing *correctly* at this value can still
+    /// overshoot, because in-flight work keeps billing the PARKED account after the
+    /// swap redirects only new requests (measured post-swap committed tail mean
+    /// +1.08 pp, max +5 pp, issue #595 — real in-flight drain, issue #596). And the
+    /// SAFE value is COUPLED to `poll_secs` (the reactive re-observation gap) and
+    /// `session_velocity_horizon_secs` (the projection horizon `H`): change either and
+    /// the safe trigger shifts, with nothing validating it today (no `v_peak` constant
+    /// exists to compute the margin). Full rationale + the tail/coupling evidence:
+    /// ADR-0022 (a point-in-time truth of the current reach-the-trigger semantics —
+    /// superseded by the issue #597 ceiling redesign if that lands).
     pub(crate) session_trigger: u8,
     /// Swap *away* from the active account at or above this WEEKLY percent
     /// (`50..=99`) — the second, independent trigger dimension (issue #41).
@@ -1677,7 +1697,12 @@ impl Config {
             t.target_max_session_usage
         ));
         out.push_str(
-            "# Swap AWAY from the active account at or above this session percent (50..=99).\n",
+            "# Swap AWAY from the active account at or above this session percent (50..=99).\n\
+             # ONE trigger, two estimators (reactive + projected) — not two separate knobs.\n\
+             # NOT the landing point: a correct swap here can still overshoot by up to +5 pp,\n\
+             # because in-flight work keeps billing the parked account after the swap. Its\n\
+             # safe value is coupled to poll_secs and session_velocity_horizon_secs. See\n\
+             # ADR-0022 (docs/adr) for the tail + coupling rationale.\n",
         );
         out.push_str(&format!("session_trigger = {}\n", t.session_trigger));
         out.push_str(
