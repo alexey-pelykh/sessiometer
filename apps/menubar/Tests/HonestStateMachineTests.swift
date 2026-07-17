@@ -200,6 +200,93 @@ final class HonestStateMachineTests: XCTestCase {
                        "Sessiometer: no account has capacity right now — action needed")
     }
 
+    // MARK: - `systemic_refresh_failure` → the ! attention rung (issue #520 / #523)
+
+    // The #520 AC line PR #534 left open: the refresh MECHANISM being down (#378) must not read healthy.
+    // Note the fixture's roster is perfectly HEALTHY (auth healthy, live session_pct) — that is the point:
+    // #378 fires BEFORE any account dies, so no per-account cell carries it and the glance would otherwise
+    // show ✓ over a total refresh outage (the #375 incident: invisible ~4.5 h until a token expired).
+    func testSystemicRefreshFailureProjectsAttentionGlyph() {
+        let m = machine([.connected, .line(Fixtures.snapshotSystemicRefreshFailure)])
+        XCTAssertEqual(m.connectionState, .connected)
+        XCTAssertEqual(m.systemicRefreshFailure, 3, "the count is projected off the snapshot")
+        XCTAssertEqual(m.presentation.glyph, .attention,
+                       "#520: a down refresh mechanism is a next-break ! — never healthy ✓")
+        XCTAssertEqual(m.presentation.accessibilityLabel,
+                       "Sessiometer: refresh mechanism down — 3 consecutive sweeps failed for every eligible account")
+    }
+
+    // The severity SPLIT from the vault pair, and the reason it is `!` not `⊘`: #378 is PRE-DEATH — every
+    // account still works, so "the tool can't keep you working, act NOW" would over-state it. `⊘` stays
+    // reserved for the vault pair + quota; when a vault fault coincides, it outranks systemic on BOTH the
+    // glyph and the label. Exercised on `make` directly — no single wire fixture carries both.
+    func testSystemicRefreshFailureRanksUnderTheNoRunwayVaultFaults() {
+        let withKeychain = PresentationState.make(for: .connected, accountCount: 2,
+                                                  keychainLocked: true, systemicRefreshFailure: 3)
+        XCTAssertEqual(withKeychain.glyph, .noRunway, "an act-now vault fault outranks the next-break !")
+        XCTAssertEqual(withKeychain.accessibilityLabel,
+                       "Sessiometer: keychain locked — unlock it to keep working")
+
+        let withScrub = PresentationState.make(for: .connected, accountCount: 2,
+                                               canonicalScrub: .exhausted, systemicRefreshFailure: 3)
+        XCTAssertEqual(withScrub.glyph, .noRunway, "scrub-exhausted outranks the next-break ! too")
+
+        let withQuota = PresentationState.make(for: .connected, accountCount: 2,
+                                               hasNoViableTarget: true, systemicRefreshFailure: 3)
+        XCTAssertEqual(withQuota.glyph, .noRunway, "no-viable-target outranks the next-break ! too")
+    }
+
+    // Both are `!`, so the rank only picks which root cause the LABEL names: systemic is a FLEET-wide
+    // mechanism verdict, the blind modifier is one account's — the same daemon-level-outranks-per-account
+    // order `daemonFaultBanner` keeps.
+    func testSystemicRefreshFailureOutranksTheBlindDegradedLabel() {
+        let both = PresentationState.make(for: .connected, accountCount: 2,
+                                          activeBlindDegraded: true, systemicRefreshFailure: 2)
+        XCTAssertEqual(both.glyph, .attention, "one ! either way")
+        XCTAssertEqual(both.accessibilityLabel,
+                       "Sessiometer: refresh mechanism down — 2 consecutive sweeps failed for every eligible account",
+                       "the fleet-wide mechanism verdict names the label over the per-account modifier")
+    }
+
+    // Noun agreement at the n=1 floor — a configured threshold of 1 fires on the FIRST all-error sweep, so
+    // "1 consecutive sweep" is reachable, not hypothetical. Matches the CLI's own agreement (`src/cli.rs`).
+    func testSystemicRefreshFailureLabelAgreesAtTheSingleSweepFloor() {
+        let one = PresentationState.make(for: .connected, accountCount: 1, systemicRefreshFailure: 1)
+        XCTAssertEqual(one.accessibilityLabel,
+                       "Sessiometer: refresh mechanism down — 1 consecutive sweep failed for every eligible account")
+    }
+
+    // The vouched-only GATE, extended to the third payload fault: the count is RETAINED across a drop /
+    // stale (like the vault bits and the roster), but `make` reads it ONLY in the `.connected` arm. Under a
+    // dropped socket the actionable problem is the SOCKET — the label must say so, not the retained
+    // mechanism fault we can no longer vouch for.
+    func testRetainedSystemicRefreshFailureUnderStaleShowsTheSocketFault() {
+        let staleAfterSystemic = machine([.connected, .line(Fixtures.snapshotSystemicRefreshFailure), .stale])
+        XCTAssertEqual(staleAfterSystemic.systemicRefreshFailure, 3, "the count is retained into stale")
+        XCTAssertEqual(staleAfterSystemic.presentation.accessibilityLabel,
+                       "Sessiometer: data may be stale — the daemon has gone quiet",
+                       "a retained mechanism fault under a stale socket shows the staleness, not itself")
+    }
+
+    // Refused with the other numbers on an unsupported major: a fault read through a contract we cannot
+    // safely parse is not trustworthy either (mirrors the `canonicalScrub` / `keychainLocked` refusal).
+    func testUnsupportedMajorRefusesTheSystemicRefreshFailureCount() {
+        let m = machine([.connected, .line(Fixtures.snapshotSystemicRefreshFailure),
+                         .line(Fixtures.snapshotUnsupportedMajor)])
+        XCTAssertEqual(m.connectionState, .unsupported)
+        XCTAssertNil(m.systemicRefreshFailure, "refused with the rest of the unsupported-major payload")
+    }
+
+    // The refusal's HEARTBEAT twin: `applyHeartbeat` carries its own unsupported-major reset, so the
+    // count must be refused on a skewed BEAT too — a beat is the other frame that can first reveal the
+    // skew, and a retained count under it would outlive the contract it was read through.
+    func testUnsupportedHeartbeatRefusesTheSystemicRefreshFailureCount() {
+        let m = machine([.connected, .line(Fixtures.snapshotSystemicRefreshFailure),
+                         .line(Fixtures.heartbeatPreFreeze)])
+        XCTAssertEqual(m.connectionState, .unsupported)
+        XCTAssertNil(m.systemicRefreshFailure, "refused on a skewed beat, as on a skewed snapshot")
+    }
+
     // MARK: - AC: empty accounts → empty-roster (DISTINCT from daemon-down)
 
     func testEmptyAccountsGoesEmptyRosterNotDisconnectedNotHealthy() {

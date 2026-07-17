@@ -41,9 +41,11 @@
 // (`systemWillSleep` / `systemDidWake`) so a lid-closed-overnight disconnect never opens on a false
 // Attention. The REMAINING degraded-state-map facets are tracked siblings, NOT this file: the
 // rich version-skew upgrade UX, plus the daemon-level PAYLOAD faults that ride alongside a `.connected`
-// roster — of which the two "act now" ones (keychain-locked, canonical-scrub-`exhausted`) now project
-// to the `.noRunway` glyph via `PresentationState.make` (issue #520); relogin, scrub-`recovering`, and
-// `systemic_refresh_failure` (#523) stay unmapped on the glyph.
+// roster — which now ALL project to the glance via `PresentationState.make`: the two "act now" vault
+// faults (keychain-locked, canonical-scrub-`exhausted`) to `.noRunway` `⊘`, and the "next break"
+// mechanism fault (`systemic_refresh_failure`, issue #378) to `.attention` `!` (issue #520).
+// Scrub-`recovering` stays deliberately unmapped — it may self-heal with no operator action, so
+// alarming the glance would cry wolf.
 //
 // STORE-SIDE STALENESS WATCHDOG (#344): staleness must NOT depend solely on the transport's
 // byte-level liveness timer. The transport re-arms that timer on ANY non-empty line — garbage,
@@ -171,10 +173,16 @@ enum StatusGlyph: Equatable, Sendable, CaseIterable {
     /// members reachable from this axis: version-skew (`.unsupported`) and crash-loop (`.crashLooping`),
     /// plus the daemon-liveness faults that cannot self-resolve (`.stale`, `.disconnected`, `.notRunning`)
     /// and the un-configured tool (`.emptyRoster`). Daemon-level PAYLOAD faults do NOT flow through
-    /// `ConnectionState` — they ride alongside a `.connected` roster — so the two that mean "act now"
-    /// (keychain-locked and canonical-scrub-`exhausted`) map to `.noRunway`, NOT here (issue #520,
-    /// projected in `make` off the vouched snapshot). The still-unmapped payload faults — relogin,
-    /// canonical-scrub-`recovering`, `systemic_refresh_failure` — remain #520's / #523's, not this axis's.
+    /// `ConnectionState` — they ride alongside a `.connected` roster — so they are projected in `make` off
+    /// the vouched snapshot: the two that mean "act now" (keychain-locked and canonical-scrub-`exhausted`)
+    /// map to `.noRunway`, while `systemic_refresh_failure` (the refresh MECHANISM down, issue #378) maps
+    /// HERE — it is PRE-DEATH by construction (#378 fires while every account is still alive), so the tool
+    /// IS still keeping the operator working and `⊘`'s "act NOW" would over-state it; but it cannot
+    /// self-heal (the mechanism keeps failing until an operator intervenes), so `…` would be a promise the
+    /// app cannot keep. That is exactly "act at your next break" — and it sits with `.crashLooping`, this
+    /// bucket's other "the daemon's own machinery is broken" member (issue #520).
+    /// Canonical-scrub-`recovering` stays deliberately unmapped: it MAY self-heal, so it stays healthy-`✓`
+    /// (the panel still shows its calm banner) — alarming the glance would cry wolf.
     case attention
     /// The no-runway state (issue #524): the tool cannot keep the operator working, so act now. THREE
     /// vouched inputs converge here — issue #520 added the daemon-level vault pair to #524's fleet verdict:
@@ -202,10 +210,13 @@ struct PresentationState: Equatable, Sendable {
     /// The rule is two-tier, and it is what makes gated-Healthy STRUCTURAL rather than conventional:
     ///
     ///   1. **Vouched?** (`.connected` — live ∧ fresh ∧ schema-supported ∧ ≥ 1 account) → the FLEET/VAULT
-    ///      speaks: `.noRunway` when the operator must act now — keychain LOCKED, shared canonical
-    ///      scrubbed-`exhausted`, or no viable swap target left (checked worst-first in that order, the
-    ///      panel's `daemonFaultBanner` rank; the glyph is one `⊘` regardless — the order only picks which
-    ///      root cause the a11y label names) — else `.healthy`. Healthy and every `⊘` share one evidence bar.
+    ///      speaks, worst-first: `.noRunway` when the operator must act NOW — keychain LOCKED, shared
+    ///      canonical scrubbed-`exhausted`, or no viable swap target left; then `.attention` when the tool
+    ///      still works but needs the operator at their next break — the refresh MECHANISM down (#378), or
+    ///      the active account's auto-protection DEGRADED (#485); else `.healthy`. Within a glyph the order
+    ///      only picks which root cause the a11y label names (the silhouette is one `⊘` / one `!`
+    ///      regardless); ACROSS glyphs it is the severity rank itself. Healthy and every fault here share
+    ///      one evidence bar.
     ///   2. **Not vouched?** → the CONNECTION speaks, and it may only claim what it can observe:
     ///      `.connecting` while self-resolution is BOUNDED, `.attention` otherwise.
     ///
@@ -233,13 +244,17 @@ struct PresentationState: Equatable, Sendable {
                      hasNoViableTarget: Bool = false,
                      keychainLocked: Bool = false,
                      canonicalScrub: CanonicalScrub? = nil,
-                     activeBlindDegraded: Bool = false) -> PresentationState {
+                     activeBlindDegraded: Bool = false,
+                     systemicRefreshFailure: UInt32? = nil) -> PresentationState {
         switch state {
         case .connected:
-            // TIER 1 — vouched: the fleet/vault speaks. Every `⊘` no-runway path first (worst-first, the
-            // panel's `daemonFaultBanner` rank: keychain-locked ▸ scrub-`exhausted` ▸ no-viable-target —
-            // one `⊘` glyph regardless, the order only picks which root cause the label names), then the
-            // sole healthy path. `.recovering` scrub is NOT here: it may self-heal with no operator action,
+            // TIER 1 — vouched: the fleet/vault speaks. Every `⊘` no-runway path first (worst-first:
+            // keychain-locked ▸ scrub-`exhausted` ▸ no-viable-target — one `⊘` glyph regardless, the order
+            // only picks which root cause the label names), then the sole healthy path. The two surfaces
+            // share this severity ordering but NOT their input sets, so neither doc may claim the other's
+            // rank verbatim: quota is a glance-only input (`daemonFaultBanner` never sees it), and the
+            // calm scrub-`recovering` is a banner-only rank (it is no input at all here — see below).
+            // `.recovering` scrub is NOT here: it may self-heal with no operator action,
             // so alarming would cry wolf (issue #520 defers the recovering-glyph call).
             if keychainLocked {
                 return PresentationState(glyph: .noRunway,
@@ -252,6 +267,16 @@ struct PresentationState: Equatable, Sendable {
             if hasNoViableTarget {
                 return PresentationState(glyph: .noRunway,
                                          accessibilityLabel: "Sessiometer: no account has capacity right now — action needed")
+            }
+            // TIER 1 — the `!` next-break rung, worst-first: the FLEET-wide mechanism verdict (#520, the
+            // refresh mechanism down) before the per-account modifier (#485), mirroring the panel, which
+            // rides its daemon-level banner ABOVE the roster. The glyph is one `!` either way, so the order
+            // only picks which root cause the a11y label names. Why a down refresh mechanism belongs on `!`
+            // rather than the `⊘` above or the `…` of a self-resolving state: see `StatusGlyph.attention`.
+            if let consecutive = systemicRefreshFailure {
+                let sweeps = consecutive == 1 ? "sweep" : "sweeps"
+                return PresentationState(glyph: .attention,
+                                         accessibilityLabel: "Sessiometer: refresh mechanism down — \(consecutive) consecutive \(sweeps) failed for every eligible account")
             }
             // #485: a blind ACTIVE account whose ADR-0017 auto-protection is DEGRADED (armed but acting on a
             // STALE anchor) is a next-break the operator should see — ratified 2026-07-16 as the honest "!"
@@ -563,6 +588,19 @@ struct HonestStateMachine {
     /// a healthy/legacy daemon never renders a keychain-locked banner.
     private(set) var keychainLocked: Bool = false
 
+    /// The daemon-level SYSTEMIC REFRESH-FAILURE count (#378, wire since schema 1.1), carried from the last
+    /// applied snapshot exactly as `canonicalScrub` / `keychainLocked` are: the number of consecutive refresh
+    /// SWEEPS in which EVERY eligible account's cycle failed with `outcome=error` — the refresh MECHANISM is
+    /// down (a stale pinned `claude` path, a wedged spawn), not one account's credentials. The third
+    /// daemon-level payload fault, and the one NO per-account `auth` cell reflects even in principle: it is
+    /// visible BEFORE any account dies (that is the whole point of #378 — the #375 incident kept a total
+    /// refresh outage invisible for ~4.5 h until a token finally expired). RETAINED across a drop (shown
+    /// under the dimmed last-known render, like its siblings) and REFUSED with the other numbers on an
+    /// unsupported-major frame. `nil` when the mechanism is healthy — or a pre-#378 daemon omits the wire key
+    /// (`decodeIfPresent`), so a healthy/legacy daemon never alarms. A COUNT only, never a token, path, or
+    /// email (issue #15).
+    private(set) var systemicRefreshFailure: UInt32?
+
     /// The honest connection state — a PURE function of `(liveness, snapshotClass)`. This is where the
     /// never-healthy-when-dead invariant lives: `.connected` is returned on exactly one combination.
     var connectionState: ConnectionState {
@@ -609,7 +647,8 @@ struct HonestStateMachine {
                                hasNoViableTarget: hasNoViableTarget,
                                keychainLocked: keychainLocked,
                                canonicalScrub: canonicalScrub,
-                               activeBlindDegraded: activeBlindDegraded)
+                               activeBlindDegraded: activeBlindDegraded,
+                               systemicRefreshFailure: systemicRefreshFailure)
     }
 
     /// Whether the retained `nextSwap` reports the fleet has no viable swap target left — the
@@ -863,6 +902,7 @@ struct HonestStateMachine {
             refreshEnabled = nil
             canonicalScrub = nil
             keychainLocked = false
+            systemicRefreshFailure = nil
             return .unsupportedSchema
         }
         snapshotClass = status.accounts.isEmpty ? .empty : .healthy
@@ -872,6 +912,7 @@ struct HonestStateMachine {
         generatedAt = status.generatedAt
         canonicalScrub = status.canonicalScrub
         keychainLocked = status.keychainLocked
+        systemicRefreshFailure = status.systemicRefreshFailure
         return .appliedSnapshot
     }
 
@@ -885,6 +926,7 @@ struct HonestStateMachine {
             refreshEnabled = nil
             canonicalScrub = nil
             keychainLocked = false
+            systemicRefreshFailure = nil
             return .unsupportedSchema
         }
         // Liveness/keepalive ONLY — a heartbeat carries no roster, so it must NOT be treated as a
