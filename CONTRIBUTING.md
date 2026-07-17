@@ -135,6 +135,18 @@ Before adding a dependency, weigh:
   and fails the build if any job other than `ci-ok` is missing from `ci-ok.needs`,
   so a newly added job cannot silently escape the `ci-ok` summary gate's rollup
   (issue #318).
+- [`scripts/check-formula.sh`](scripts/check-formula.sh)
+  — a CI guard (the `formula` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that runs `brew style` and
+  `brew audit --strict` against the canonical
+  [`Formula/sessiometer.rb`](Formula/sessiometer.rb) — the source the published tap
+  mirrors ([ADR-0021](docs/adr/0021-homebrew-tap-topology.md)). It stages the formula
+  into a throwaway tap first, because `brew audit` refuses a file path outright and
+  `brew style` mis-lints a loose `.rb` as ordinary Ruby. Static-only: the install +
+  `test do` + bottle build belong to the tap's own CI (issue #560), keeping this cheap
+  enough to run on every `Formula/**` touch (issue #567). Its falsifier,
+  [`scripts/check-formula.test.sh`](scripts/check-formula.test.sh), proves the guard
+  goes RED on the stanza-order defect of issue #566.
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing

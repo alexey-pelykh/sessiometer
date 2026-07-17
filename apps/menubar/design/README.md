@@ -104,6 +104,17 @@ python3 design/build-comparison.py /tmp/panelcaps /tmp/design-vs-capture.html
 open /tmp/design-vs-capture.html
 ```
 
+Frames are paired **by name**, never by position: every `.pop` block carries a `data-frame` (e.g.
+`blind-ok-light`), and each `STATES` entry names the frame it pairs with. So add, remove, or reorder
+frames freely — a mock frame and its Swift fixture no longer have to land in one commit (#581).
+
+Name a new frame when you add it: kebab-case the `fcap` caption down to what distinguishes the frame —
+state, then variant — and always suffix the theme (`Active blind · OK · Light` → `blind-ok-light`;
+"Active" is filler, so it goes). That last step is judgment, not a transform, so match the neighbours —
+nothing enforces the convention. What the script *does* enforce is presence and uniqueness: it exits
+non-zero on an untagged block, a duplicate name, or a `STATES` entry pointing at a name the mock no
+longer carries — naming the frame, or the line for an untagged block.
+
 ## It's a mock, not code
 
 The mock approximates native treatments in HTML/CSS. When building the SwiftUI panel, translate
