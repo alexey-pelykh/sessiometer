@@ -34,7 +34,8 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0019](0019-slow-poll-out-of-rotation-peers.md) | Out-of-rotation (exhausted) peers are slow-polled on a widened, reset-aware cadence | Accepted |
 | [0020](0020-stats-framing-guard-permits-neutral-runway.md) | The `stats` framing guard permits a neutral runway, bans the acquisitive call | Accepted |
 | [0021](0021-homebrew-tap-topology.md) | Homebrew tap topology — an org-owned distribution repo, not a second product repo | Accepted |
-| [0022](0022-session-trigger-one-predicate-two-estimators.md) | `session_trigger` is one predicate on two estimators of the same quantity, not two knobs | Accepted |
+| [0022](0022-session-trigger-one-predicate-two-estimators.md) | `session_trigger` is one predicate on two estimators of the same quantity, not two knobs | Superseded by [0023](0023-session-trigger-ceiling-semantics.md) |
+| [0023](0023-session-trigger-ceiling-semantics.md) | `session_trigger` is a settled ceiling both swap arms derive their fire point backward from | Accepted |
 
 ## Conventions
 

@@ -3867,11 +3867,14 @@ where
         // The swap paths re-arm them too, via `record_swap`; this covers recovery WITHOUT a swap.
         self.state.signaled_retry_after_reserve = false;
         self.state.signaled_retry_after_walk = false;
-        // Draw this cycle's swap-away triggers (issues #38, #41): each jittered +
-        // clamped to 50..=99 percent, then to a fraction for the decision. The
-        // session and weekly triggers are independent — swap when EITHER dimension
-        // reaches its own; below BOTH → hold. Both are drawn every cycle (a fixed
-        // strategy consumes no RNG), keeping the per-cycle draw order deterministic.
+        // Draw this cycle's swap-away thresholds — the session CEILING and the weekly trigger
+        // (issues #38, #41; #597): each jittered + clamped to 50..=99 percent, then to a fraction.
+        // Since #597 the two are DIFFERENT KINDS of value: `session_trigger` is the session CEILING
+        // (the settled line the account must not cross), NOT a fire-at trigger — the reactive fire
+        // threshold is derived BACKWARD from it below; `weekly_trigger` (#41) is still a fire-AT
+        // trigger. The session and weekly dimensions are independent — swap when EITHER reaches its
+        // own fire point; below BOTH → hold. Both are drawn every cycle (a fixed strategy consumes no RNG), keeping the
+        // per-cycle draw order deterministic.
         let session_trigger =
             self.trigger_strategy
                 .draw(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
@@ -3881,15 +3884,47 @@ where
             WEEKLY_TRIGGER_PCT_LO,
             WEEKLY_TRIGGER_PCT_HI,
         ) / 100.0;
-        if swap::decide(&active_usage, session_trigger, weekly_trigger) == SwapDecision::Hold {
-            // Reactive says HOLD — the observed reading is below both triggers. Before holding,
-            // consult the #539 velocity-projection peer (ADR-0017): if the active account's PROJECTED
-            // session usage (last + retained velocity × horizon) crosses the session trigger within
-            // the horizon, swap it away NOW — ahead of the observed reading tripping the reactive
-            // trigger — closing the observed reactive overshoot (#363) that #452's blind-window path
-            // does not address. Not eligible (kill-switch off, no sustained velocity, below the guard,
-            // projection short, or no viable target) → the historical Held. This is the ONLY new call
-            // into the reactive decision; every other branch below is byte-for-byte unchanged.
+        // #597 ceiling derivation: the reactive arm fires BACKWARD from the effective ceiling
+        // (ceiling − tail margin) so the outgoing account lands below the ceiling even after its
+        // post-swap committed tail (#595). A `velocity × lookahead` term pulls the fire earlier so
+        // the account is AT the effective ceiling by the time the swap executes — one poll gap
+        // later, having climbed at the retained EMA rate. The velocity is gated by the same
+        // `>= MIN_VELOCITY_SAMPLES` criterion as the projection peer; here an unwarmed EMA reads 0
+        // (the peer instead holds outright), so an idle account fires exactly at the effective
+        // ceiling — never early — and the two arms stay coupled (the strict early-fire invariant
+        // lives in `swap::reactive_session_threshold`).
+        let effective_ceiling = swap::effective_ceiling(session_trigger);
+        let velocity = self.state.session_velocity[active_idx]
+            .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
+            .map_or(0.0, |v| v.rate);
+        // The reactive re-observation gap: the active near-limit poll cadence round-trips at ~2× its
+        // interval (a reading is up to one interval stale, plus one interval until the next poll —
+        // the measured active gap, ~112 s at the default 60 s cadence). When fast-poll is DISABLED
+        // (`near_limit_poll_secs == 0`) there is no tight near-limit gap for the reactive arm to look
+        // ahead over, so `poll_gap` is 0 and the reactive threshold collapses to the bare effective
+        // ceiling — the #539 projection is then the sole velocity-aware estimator (the pre-#597
+        // division of labour, now landing-margined). At the default cadence (60 s) `poll_gap` is 120 s
+        // ≈ the horizon `H`, so the two estimators converge on `eff − v·H` and the reactive arm, being
+        // checked first, is the one that fires; the projection is the earlier fire only where `H`
+        // exceeds this gap.
+        let poll_gap = 2.0 * self.near_limit_poll_secs as f64;
+        let session_threshold = swap::reactive_session_threshold(
+            effective_ceiling,
+            velocity,
+            poll_gap,
+            self.session_velocity_horizon_secs as f64,
+        );
+        if swap::decide(&active_usage, session_threshold, weekly_trigger) == SwapDecision::Hold {
+            // Reactive says HOLD — the observed reading is below both fire points (the #597
+            // velocity-derived session threshold + the weekly trigger). Before holding, consult the
+            // #539 velocity-projection peer (ADR-0017): if the active account's PROJECTED session
+            // usage (last + retained velocity × horizon) crosses the effective ceiling within the
+            // horizon, swap it away NOW — ahead of the observed reading tripping the reactive
+            // threshold — closing the observed reactive overshoot (#363) that #452's blind-window
+            // path does not address. Not eligible (kill-switch off, no sustained velocity, below the
+            // guard, projection short, or no viable target) → the historical Held. Every branch below
+            // this projection call is unchanged; only the reactive threshold + this call now derive
+            // from the ceiling (#597).
             return self
                 .velocity_swap(
                     at,
@@ -3982,10 +4017,12 @@ where
                 self.record_swap(target_idx, &incoming, at).await;
                 // Log the swap (issue #9). `swap::decide` returns only a binary
                 // verdict, so the reason is re-derived here from the active reading:
-                // session-first when BOTH dimensions are over their (this-cycle)
-                // triggers. `session_pct` reuses `to_pct` so the log agrees with the
-                // percentage `status` shows for the same reading.
-                let reason = if active_usage.session >= session_trigger {
+                // session-first when BOTH dimensions are over their (this-cycle) fire
+                // points — the session dimension against the #597 velocity-derived
+                // `session_threshold` (NOT the raw ceiling), so a velocity-early session
+                // swap is attributed to Session, never mis-logged as Weekly. `session_pct`
+                // reuses `to_pct` so the log agrees with the percentage `status` shows.
+                let reason = if active_usage.session >= session_threshold {
                     SwapReason::Session
                 } else {
                     SwapReason::Weekly
@@ -5075,21 +5112,23 @@ where
     /// swap-target reserve ([`target_max_session_usage`](Self::target_max_session_usage), ADR-0013),
     /// and routes through the no-torn-swap primitive ([`locked_swap`](Self::locked_swap), ADR-0003).
     ///
-    /// Fires only when ALL hold (else `Held` — the reading is present and below the trigger, so the
+    /// Fires only when ALL hold (else `Held` — the reading is present and below the fire point, so the
     /// non-fire outcome is a genuine hold, not the "unavailable" skip `blind_swap` returns):
     /// - the horizon is non-zero (`0` is the config kill-switch — the projection would reduce to the
-    ///   observed reading, which already held below the trigger), **and**
+    ///   observed reading, which already held below the effective ceiling), **and**
     /// - a retained velocity EMA exists with `>= MIN_VELOCITY_SAMPLES` samples (SUSTAINED — never a
     ///   single-interval spike, and never a missing/`None` signal), **and**
     /// - the observed reading is at/over `session_velocity_min_project_above` (the free guard), **and**
-    /// - `observed + rate × horizon >= session_trigger` (the projection crosses), **and**
+    /// - `observed + rate × horizon >= effective_ceiling` (the projection crosses the ceiling minus
+    ///   the tail margin, issue #597), **and**
     /// - the roster is warmed up, the cooldown has elapsed (else `SkippedCooldown`), and a viable
     ///   target exists (a peer under the reserve).
     ///
-    /// `session_trigger` / `weekly_trigger` are the SAME per-cycle jittered draws the reactive path
-    /// used this tick, so the projection crosses the very trigger the reactive path just held below
-    /// and `pick_target` sees the same reserve — the projective peer is a strict early-fire of the
-    /// reactive decision, not a differently-calibrated one.
+    /// `session_trigger` is the session CEILING draw (`weekly_trigger` the weekly one) the reactive
+    /// path used this tick; this arm derives the SAME effective ceiling (ceiling − tail margin) the
+    /// reactive threshold does, and `pick_target` sees the same reserve — so the projective peer is a
+    /// strict early-fire of the reactive decision (it fires at `effective_ceiling − velocity × H`,
+    /// never above the reactive threshold), not a differently-calibrated one.
     async fn velocity_swap(
         &mut self,
         at: Instant,
@@ -5100,7 +5139,7 @@ where
         events: &mut Vec<Event>,
     ) -> TickAction {
         // Kill-switch: horizon 0 → the projection is just the observed reading, which the reactive
-        // path already held below the trigger, so it can never cross. Cheap early exit.
+        // path already held below the effective ceiling, so it can never cross. Cheap early exit.
         let horizon = self.session_velocity_horizon_secs;
         if horizon == 0 {
             return TickAction::Held;
@@ -5128,11 +5167,16 @@ where
         if active_usage.session < self.session_velocity_min_project_above {
             return TickAction::Held;
         }
-        // Project `last + velocity × H` and require it to reach the trigger (the SAME jittered draw
-        // the reactive path held below this tick). Below → the velocity is not steep enough to
-        // overshoot within the horizon → hold and let the reactive path catch it if it climbs.
+        // #597: project `last + velocity × H` and require it to reach the EFFECTIVE CEILING (the
+        // ceiling minus the tail margin — the same landing target the reactive arm derives its
+        // threshold from this tick). Below → the velocity is not steep enough to reach the effective
+        // ceiling within the horizon → hold and let the reactive path catch it if it climbs. Firing
+        // at the effective ceiling (not the raw ceiling) keeps the projected landing under the ceiling
+        // after the post-swap tail, and keeps this arm a strict early-fire of the reactive threshold
+        // (`swap::reactive_session_threshold`): `effective_ceiling − velocity × H` is never above it.
+        let effective_ceiling = swap::effective_ceiling(session_trigger);
         let projected = active_usage.session + vel.rate * horizon as f64;
-        if projected < session_trigger {
+        if projected < effective_ceiling {
             return TickAction::Held;
         }
         // #80 warm-up: the carried readings are partial until the staggered loop has polled every
@@ -10837,13 +10881,19 @@ mod tests {
 
     // --- #539 velocity-projection preemptive swap (ADR-0017) ---------------------------------
 
-    /// A warmed three-account daemon with u-A active at `active_session` (kept below the 95 %
-    /// reactive trigger so the reactive path HOLDS and the projective peer is the only thing that
-    /// can fire) and u-B / u-C viable targets at 10 % (under the 80 % reserve). The velocity gate is
-    /// left INERT (`session_velocity_horizon_secs == 0`, the `tunables()` default) and the EMA slot
-    /// is `None` — each direct-call test arms the horizon and seeds `state.session_velocity[0]` to
-    /// the exact signal it exercises, then calls [`Daemon::velocity_swap`] with a cloned reading set
-    /// (so `self` is free for the `&mut` swap path). Peer readings default to viable targets.
+    /// A warmed three-account daemon with u-A active at `active_session` (kept below the 0.93
+    /// effective ceiling — the 99 % ceiling minus the 6 pp tail margin, issue #597 — so the reactive
+    /// path HOLDS and the projective peer is the only thing that can fire) and u-B / u-C viable targets
+    /// at 10 % (under the 80 % reserve). The velocity gate is left INERT
+    /// (`session_velocity_horizon_secs == 0`, the `tunables()` default) and the EMA slot is `None` —
+    /// each direct-call test arms the horizon and seeds `state.session_velocity[0]` to the exact signal
+    /// it exercises, then calls [`Daemon::velocity_swap`] with a cloned reading set (so `self` is free
+    /// for the `&mut` swap path). Peer readings default to viable targets.
+    ///
+    /// The ceiling is raised to 99 (from the `three_account_daemon` default of 95) so the effective
+    /// ceiling is 0.93: with `near_limit_poll_secs == 0` the reactive `poll_gap` is 0, so the reactive
+    /// threshold is exactly 0.93 and in-band readings in `[0.85, 0.93)` hold reactively while the
+    /// projection can still cross 0.93.
     async fn warmed_velocity_daemon(active_session: f64) -> FakeDaemon {
         let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
@@ -10852,6 +10902,11 @@ mod tests {
                 .ok("u-C", 0.10, 0.10),
         )
         .await;
+        // #597: the reactive arm now fires at the effective ceiling (ceiling − tail margin), so at the
+        // 95 default that is 0.89 — too tight a band above the 0.85 projection floor. Raise the ceiling
+        // to 99 (effective ceiling 0.93) so the in-band climbing readings hold reactively.
+        daemon.trigger_strategy = Strategy::fixed(99.0);
+        daemon.session_trigger_base = 0.99;
         for _ in 0..4 {
             daemon.tick().await;
         }
@@ -10873,11 +10928,13 @@ mod tests {
     #[tokio::test]
     async fn velocity_swap_fires_past_the_projected_trigger() {
         // Issue #539 (ADR-0017): the headline acceptance, end-to-end through the real `decide_action`
-        // hook. u-A climbs inside the guard band (86 % → 90 % → 92 %, all below the 95 % reactive
-        // trigger so the reactive path HOLDS every tick) at a SUSTAINED rate. Once two intervals have
-        // been blended (samples ≥ MIN_VELOCITY_SAMPLES), the projection `last + rate × H` crosses the
-        // trigger within the horizon and the active swaps AWAY — ahead of the observed reading
-        // tripping the reactive trigger — closing the observed reactive overshoot (#363).
+        // hook. u-A climbs inside the guard band (86 % → 90 % → 92 %, all below the 0.93 effective
+        // ceiling — the 99 % ceiling minus the 6 pp tail margin, #597 — so the reactive path HOLDS
+        // every tick; `near_limit_poll_secs == 0` makes the reactive poll_gap 0, so the reactive
+        // threshold is exactly 0.93) at a SUSTAINED rate. Once two intervals have been blended
+        // (samples ≥ MIN_VELOCITY_SAMPLES), the projection `last + rate × H` crosses the effective
+        // ceiling within the horizon and the active swaps AWAY — ahead of the observed reading
+        // tripping the reactive threshold — closing the observed reactive overshoot (#363).
         // Warmed on a frozen clock (u-A at 86 %, schedule A, B, A, C): the helper asserts warmed-up,
         // u-A active, and — since no interval elapsed — an unseeded (`None`) EMA. Same fixture the
         // five direct-call velocity_swap tests route through.
@@ -10906,7 +10963,8 @@ mod tests {
 
         // Second climbing interval (90 % → 92 % over 60 s): tick 6 polls the peer u-B (no active
         // update), tick 7 re-polls u-A and blends the second interval (samples = 2 → SUSTAINED). The
-        // projection 0.92 + rate × 150 now clears the 0.95 trigger, so the projective swap fires.
+        // projection 0.92 + rate × 150 now clears the 0.93 effective ceiling, so the projective swap
+        // fires.
         daemon.poller = FakeRosterPoller::new()
             .ok("u-A", 0.92, 0.20)
             .ok("u-B", 0.10, 0.10)
@@ -10924,7 +10982,7 @@ mod tests {
                 swapped.action,
                 TickAction::VelocityPreemptivelySwapped { from: 0, .. }
             ),
-            "the projected usage crosses the trigger within the horizon → preemptive swap: {:?}",
+            "the projected usage crosses the effective ceiling within the horizon → preemptive swap: {:?}",
             swapped.action,
         );
         assert_ne!(
@@ -10935,11 +10993,11 @@ mod tests {
         // The swap logged a `velocity_preempt` reason carrying the FRESH observed reading (92 %, the
         // live swap-out point — the projected-swap-out-overshoot SLI sample), never a stale anchor.
         // The projective peer runs ONLY where the reactive path HELD (observed strictly below the
-        // session trigger in fraction space), so a swap-out is always below the trigger — here 92 <
-        // the 95 % trigger. In the default/validated trigger regime that keeps the ROUNDED swap-out
-        // pct under the P100 ≤ 98 acceptance; the ≤ 98 is an empirically-measured SLO (the #538 spike,
-        // not a hard invariant): a trigger set above ~98.5 % could round an in-band swap-out up to 99,
-        // which the reliability readout then surfaces honestly rather than silently masks.
+        // effective ceiling in fraction space), so a swap-out is always below the effective ceiling —
+        // here 92 < the 0.93 effective ceiling. With the effective ceiling sitting a 6 pp tail margin
+        // below the 99 % ceiling, the ROUNDED swap-out pct stays well under the P100 ≤ 98
+        // projected-overshoot acceptance (the #538 spike's empirically-measured SLO) — the very margin
+        // the #597 ceiling redesign buys, which the reliability readout then surfaces honestly.
         assert!(
             swapped.events.iter().any(|e| matches!(
                 e,
@@ -11021,8 +11079,9 @@ mod tests {
     #[tokio::test]
     async fn velocity_swap_holds_when_the_projection_falls_short() {
         // Issue #539: an in-band, SUSTAINED, but SHALLOW velocity whose `rate × H` reach stays under
-        // the gap to the trigger does NOT fire — the projection is short, so hold and let the reactive
-        // path catch it if it keeps climbing. (0.90 + 0.0001 × 150 = 0.915 < 0.95.)
+        // the gap to the effective ceiling does NOT fire — the projection is short, so hold and let the
+        // reactive path catch it if it keeps climbing. (0.90 + 0.0001 × 150 = 0.915 < 0.93, the
+        // effective ceiling for the 0.99 ceiling passed below.)
         let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.session_velocity_horizon_secs = 150;
         daemon.state.session_velocity[0] = Some(VelocityEma {
@@ -11033,11 +11092,11 @@ mod tests {
         let readings = daemon.state.last_readings.clone();
         let mut events = Vec::new();
         let action = daemon
-            .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
+            .velocity_swap(at, 0, 0.99, 0.98, &readings, &mut events)
             .await;
         assert!(
             matches!(action, TickAction::Held),
-            "a shallow projection that stays under the trigger holds: {action:?}",
+            "a shallow projection that stays under the effective ceiling holds: {action:?}",
         );
         assert_eq!(daemon.state.active, Some(0));
         assert!(events.is_empty());
@@ -11047,9 +11106,9 @@ mod tests {
     async fn velocity_swap_kill_switch_horizon_zero_never_fires() {
         // Issue #539 (ADR-0005): the config kill-switch. `session_velocity_horizon_secs == 0` reduces
         // the projection to the observed reading — which the reactive path already held below the
-        // trigger — so even a steep, sustained, in-band velocity (94 %, one point under the trigger)
-        // can never cross. The disabled projective path is a plain `Held`.
-        let mut daemon = warmed_velocity_daemon(0.94).await;
+        // effective ceiling — so even a steep, sustained, in-band velocity (90 %, under the 0.93
+        // effective ceiling) can never cross. The disabled projective path is a plain `Held`.
+        let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.session_velocity_horizon_secs = 0;
         daemon.state.session_velocity[0] = Some(VelocityEma {
             rate: 0.01,

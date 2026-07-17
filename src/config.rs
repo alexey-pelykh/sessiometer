@@ -94,12 +94,16 @@ pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
 // silent runtime gap — and because `daemon::COOLDOWN_SECS_LO` derives from this
 // constant, the guard covers the per-cycle jitter clamp too.
 const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
-/// Default `session_trigger` percent. 95 is not a free constant: a *correct* swap
-/// at this value can still overshoot by a post-swap committed tail (up to +5 pp,
-/// issue #595 — the parked account keeps billing in-flight work), and its safe
-/// setting is coupled to `poll_secs` and `session_velocity_horizon_secs`. See
-/// ADR-0022 (`session_trigger` is one predicate on two estimators, not two knobs).
-const DEFAULT_SESSION_TRIGGER: u8 = 95;
+/// Default `session_trigger` percent — the CEILING (issue #597): the settled session line
+/// the active account must not cross, NOT a fire-at trigger. Both swap arms (the reactive
+/// `observed` estimator and the issue #539 projection) derive their fire point BACKWARD from
+/// it — `ceiling − tail_margin − velocity × lookahead` — so a swap lands the outgoing account
+/// BELOW the ceiling even after its post-swap committed tail (up to +5 pp, issue #595 — the
+/// parked account keeps billing in-flight work). 99 makes the strict `P100 < 99` landing SLO
+/// (issue #455 / #595) reachable: the ceiling is the SLO boundary and the tail margin
+/// (`swap::TAIL_MARGIN`, 6 pp) keeps the landing under it. See ADR-0023 (the ceiling redesign,
+/// superseding ADR-0022).
+const DEFAULT_SESSION_TRIGGER: u8 = 99;
 /// Default `target_max_session_usage` percent (issue #398): the default-on swap-target
 /// reserve — only swap TO an account whose session usage is below this. Sits
 /// below `session_trigger` so a swapped-to target keeps runway before the next
@@ -132,7 +136,8 @@ const DEFAULT_SESSION_BLIND_SWAP_SECS: u64 = 300;
 const DEFAULT_SESSION_BLIND_RISK_BAND: u8 = 60;
 /// Default `session_velocity_horizon_secs` (issue #539, ADR-0017): the projection horizon `H`
 /// (seconds) for the velocity-projection preemptive trigger — the active account swaps away when
-/// its PROJECTED session usage (`last + velocity × H`) crosses the trigger, before the observed
+/// its PROJECTED session usage (`last + velocity × H`) crosses the effective ceiling
+/// (`session_trigger` minus the tail margin, issue #597), before the observed
 /// reading does. 120 s ≈ one active poll interval (the post-#366 interleave cadence, NOT the
 /// `poll_secs=300` peer cadence), the horizon the #538 spike validated on 22,022 real samples
 /// (P50=94 / P100=98 covered-swap, 0 over-fire at H ≤ 150 s). Setting it to `0` disables the path
@@ -341,24 +346,25 @@ pub(crate) struct Tunables {
     /// (`session < session_trigger`, [`crate::daemon`]) still prevents oscillation
     /// independently.
     pub(crate) target_max_session_usage: u8,
-    /// Swap *away* from the active account at or above this session percent
-    /// (`50..=99`). ONE swap-away predicate on TWO estimators of the same quantity
-    /// (ADR-0022): the reactive `observed >= session_trigger` and the issue #539
-    /// projection `observed + velocity × H >= session_trigger` share this trigger BY
-    /// DESIGN — the projection is a strict early-fire of the reactive decision (the
-    /// daemon's `velocity_swap`), not a differently-calibrated one — so this is one
-    /// knob, never two.
+    /// The session CEILING (issue #597): the settled session percent (`50..=99`) the active
+    /// account must not cross — NOT a fire-at trigger. ONE ceiling; BOTH swap-away estimators
+    /// of the same quantity derive their fire point BACKWARD from it, so neither is a separate
+    /// knob:
+    ///   - the reactive arm fires at `observed >= ceiling − tail_margin − velocity × poll_gap`;
+    ///   - the issue #539 projection fires at `observed + velocity × H >= ceiling − tail_margin`.
     ///
-    /// NOT the landing point: a swap firing *correctly* at this value can still
-    /// overshoot, because in-flight work keeps billing the PARKED account after the
-    /// swap redirects only new requests (measured post-swap committed tail mean
-    /// +1.08 pp, max +5 pp, issue #595 — real in-flight drain, issue #596). And the
-    /// SAFE value is COUPLED to `poll_secs` (the reactive re-observation gap) and
-    /// `session_velocity_horizon_secs` (the projection horizon `H`): change either and
-    /// the safe trigger shifts, with nothing validating it today (no `v_peak` constant
-    /// exists to compute the margin). Full rationale + the tail/coupling evidence:
-    /// ADR-0022 (a point-in-time truth of the current reach-the-trigger semantics —
-    /// superseded by the issue #597 ceiling redesign if that lands).
+    /// The projection is a strict EARLY-FIRE of the reactive decision (the daemon's
+    /// `velocity_swap`) — it can fire no later — so this stays ONE knob, never two. The name is
+    /// retained for compatibility; a rename to `session_ceiling` is a tracked follow-up.
+    ///
+    /// This IS (near) the landing point now — the point of the redesign: the `tail_margin`
+    /// (`swap::TAIL_MARGIN`, 6 pp) is subtracted so the outgoing account lands BELOW the ceiling
+    /// even after its post-swap committed tail (measured mean +1.08 pp, max +5 pp, issue #595 —
+    /// real in-flight drain, issue #596), and a `velocity × lookahead` term absorbs the climb
+    /// during the reactive re-observation gap / the projection horizon
+    /// `session_velocity_horizon_secs` (`H`). With the ceiling at 99 this makes the strict
+    /// `P100 < 99` landing SLO (issue #455 / #595) reachable. Full rationale + the tail/coupling
+    /// evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022).
     pub(crate) session_trigger: u8,
     /// Swap *away* from the active account at or above this WEEKLY percent
     /// (`50..=99`) — the second, independent trigger dimension (issue #41).
@@ -379,8 +385,9 @@ pub(crate) struct Tunables {
     pub(crate) session_blind_risk_band: u8,
     /// Velocity-projection preemptive-trigger horizon `H` (issue #539, ADR-0017), in seconds:
     /// the active account swaps away when its PROJECTED session usage (`last + velocity × H`,
-    /// keyed off the #399 usage-velocity signal) crosses the trigger, before the observed reading
-    /// does — closing the OBSERVED reactive overshoot (#363) #452's blind-window path does not.
+    /// keyed off the #399 usage-velocity signal) crosses the effective ceiling (`session_trigger`
+    /// minus the tail margin, issue #597), before the observed reading does — closing the OBSERVED
+    /// reactive overshoot (#363) #452's blind-window path does not.
     /// `0` disables the path (projection reduces to `last`, never crosses) — the kill-switch.
     pub(crate) session_velocity_horizon_secs: u64,
     /// Velocity-projection guard (issue #539, ADR-0017), as a session-usage percent: the projective
@@ -1254,10 +1261,11 @@ impl Config {
         Duration::from_secs(self.tunables.poll_secs)
     }
 
-    /// The usage fraction in `[0.0, 1.0]` at or above which the active account
-    /// is considered exhausted — `session_trigger` as a fraction.
+    /// The session CEILING as a fraction in `[0.0, 1.0]` (issue #597) — `session_trigger`
+    /// / 100. The settled line the active account must not cross; the daemon's swap arms
+    /// derive their fire point backward from it (see the `session_trigger` field).
     ///
-    /// The daemon derives its own trigger / floor / cooldown uniformly from
+    /// The daemon derives its own ceiling / floor / cooldown uniformly from
     /// [`Tunables`] (issue #7), so this Config-level accessor is currently a
     /// tested seam for the `status` view (#9) rather than the run loop.
     #[allow(dead_code)]
@@ -1697,12 +1705,14 @@ impl Config {
             t.target_max_session_usage
         ));
         out.push_str(
-            "# Swap AWAY from the active account at or above this session percent (50..=99).\n\
-             # ONE trigger, two estimators (reactive + projected) — not two separate knobs.\n\
-             # NOT the landing point: a correct swap here can still overshoot by up to +5 pp,\n\
-             # because in-flight work keeps billing the parked account after the swap. Its\n\
-             # safe value is coupled to poll_secs and session_velocity_horizon_secs. See\n\
-             # ADR-0022 (docs/adr) for the tail + coupling rationale.\n",
+            "# The session CEILING (50..=99): the settled line the active account must not\n\
+             # cross, NOT a fire-at trigger. Both swap estimators (reactive + projected) derive\n\
+             # their fire point BACKWARD from it — ceiling minus a tail margin minus\n\
+             # velocity*lookahead — so the account lands BELOW the ceiling even after its\n\
+             # post-swap committed tail (up to +5 pp: in-flight work keeps billing the parked\n\
+             # account). 99 makes the strict P100<99 landing SLO reachable. One knob, two\n\
+             # estimators (the projection is a strict early-fire of the reactive decision) —\n\
+             # not two knobs. See ADR-0023 (docs/adr) for the ceiling redesign.\n",
         );
         out.push_str(&format!("session_trigger = {}\n", t.session_trigger));
         out.push_str(
@@ -1733,8 +1743,9 @@ impl Config {
         out.push_str(
             "# Velocity-projection preemptive swap (issue #539, ADR-0017): swap the active\n\
              # account away when its PROJECTED session usage (last + velocity * H) crosses the\n\
-             # trigger before the observed reading does — H is this horizon in seconds\n\
-             # (~ the active poll cadence; 120 validated by #538). Set to 0 to disable.\n",
+             # effective ceiling (session_trigger minus the tail margin, issue #597) before the\n\
+             # observed reading does — H is this horizon in seconds (~ the active poll cadence;\n\
+             # 120 validated by #538). Set to 0 to disable.\n",
         );
         out.push_str(&format!(
             "session_velocity_horizon_secs = {}\n",
@@ -2950,7 +2961,9 @@ label = "personal"
                     label = \"only\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
-        assert_eq!(config.tunables.session_trigger, 95);
+        // Issue #597: the default session_trigger is the CEILING, 99 (was 95) — the value
+        // that makes the strict P100 < 99 landing SLO reachable via backward derivation.
+        assert_eq!(config.tunables.session_trigger, 99);
         // #398: the target_max_session_usage reserve is default-on at 80.
         assert_eq!(
             config.tunables.target_max_session_usage,
@@ -3022,13 +3035,17 @@ label = "personal"
     }
 
     #[test]
-    fn weekly_trigger_defaults_higher_than_session_when_absent() {
-        // An absent weekly_trigger takes its (higher-than-session) default.
+    fn weekly_trigger_takes_its_default_when_absent() {
+        // An absent weekly_trigger takes its compiled-in default, independent of session_trigger.
+        // (Since issue #597 their magnitudes are NOT comparable: session_trigger is a CEILING both
+        // swap arms derive backward from — effective fire ~0.93 at the default 99 — while
+        // weekly_trigger is still a fire-AT trigger, so the old raw "weekly > session" comparison is
+        // apples-to-oranges and false for the current defaults, 98 < 99. The two dimensions stay
+        // independent; this test only pins the absent-field default.)
         let t = Config::parse(&with_tunables("session_trigger = 95"))
             .unwrap()
             .tunables;
         assert_eq!(t.weekly_trigger, DEFAULT_WEEKLY_TRIGGER);
-        assert!(t.weekly_trigger > t.session_trigger);
         assert_eq!(
             t.weekly_trigger_strategy.base,
             f64::from(DEFAULT_WEEKLY_TRIGGER)
@@ -3132,7 +3149,7 @@ label = "personal"
         // parse rejects the config with ConfigTargetMaxSessionAboveTrigger — bricking a valid config
         // after any save/export round-trip (enable/disable/remove account, capture
         // write-back, export→import). The existing round-trip test above only covers the
-        // default trigger = 95 (where 80 < 95), so it never reached this corner.
+        // default trigger = 99 (where 80 < 99), so it never reached this corner.
         let toml = with_tunables("session_trigger = 70"); // no target_max_session_usage key
         let config = Config::parse(&toml).unwrap();
         // The default is clamped to the trigger — the maximally-permissive inert value
