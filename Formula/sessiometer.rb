@@ -14,9 +14,11 @@
 # cask's user-facing metadata is a distribution surface too.
 #
 # HEAD-only for now. The crate is pre-release (version 0.1.0) with no tagged release, so
-# there is no stable versioned source tarball to anchor `url`/`sha256` at yet. Install with:
+# there is no stable versioned source tarball to anchor `url`/`sha256` at yet. Install from
+# the live tap — `sessiometer/homebrew-tap`, tapped as `sessiometer/tap` (ADR-0021):
 #
-#     brew install --HEAD --build-from-source ./Formula/sessiometer.rb
+#     brew tap sessiometer/tap
+#     brew install --HEAD sessiometer/tap/sessiometer
 #
 # STABLE-RELEASE TODO — when the first release is tagged (e.g. v0.1.0), add the stable `url`
 # + `sha256` stanzas (see the commented block below) so `brew install sessiometer` works

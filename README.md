@@ -1025,16 +1025,17 @@ notarization or code-signing; those belong to the parallel GUI channel — the n
 `.app` (#171: sign + notarize + staple) delivered as a Homebrew cask (#172), not yet
 shipped. This channel is off that critical path.
 
-The crate is still pre-release (no tagged release yet), so install the formula from
-`HEAD` (the `main` branch):
+The crate is still pre-release (no tagged release yet), so tap the formula repo and
+install from `HEAD` (the `main` branch):
 
 ```sh
-brew install --HEAD --build-from-source ./Formula/sessiometer.rb
+brew tap sessiometer/tap
+brew install --HEAD sessiometer/tap/sessiometer
 ```
 
-That compiles the crate at the repo root — with the committed `Cargo.lock`, via
-`--locked`, for a reproducible build — and puts `sessiometer` on your `PATH`. From
-there the swap/monitor loop runs headless: `sessiometer run` for a foreground daemon,
+That compiles the crate — with the committed `Cargo.lock`, via `--locked`, for a
+reproducible build — and puts `sessiometer` on your `PATH`. From there the
+swap/monitor loop runs headless: `sessiometer run` for a foreground daemon,
 or `sessiometer service install` to keep one running at login (see
 [Quickstart](#quickstart)). Once a stable release is tagged, the formula gains a
 `url` + `sha256` stanza and also installs without `--HEAD`.
