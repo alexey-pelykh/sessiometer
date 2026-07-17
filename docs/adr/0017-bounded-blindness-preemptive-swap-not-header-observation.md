@@ -60,6 +60,50 @@ biasing the *report* HIGH argues against *acting* on it (a false swap thrashes a
 the cost the #582 breaker bounds). Whether the blind arm should ever *swap* on velocity is left
 as a separate design. The core **#452** decision and the constants it ratified are unchanged.
 
+**Amended 2026-07-17 (#586)**: the **bounded-blindness premise itself** — this ADR's
+foundation, that the active blind window is capped at 120s by **#453**, its length set by the
+daemon's *own* back-off and never a server `Retry-After` — is **falsified**. On 2026-07-17
+`429`s on **active** accounts carried `retry_after_secs=3600`, the **first non-zero** values
+among 581 logged back-offs (579 of which carried `0`); the window ran a self-renewing **hour**
+(`consecutive=2` a full hour after the first), not 120s, and the constants this ADR calibrated
+(`T=300`, `risk_band=60%`) were fitted to a distribution whose *maximum* window was the S1
+spike's 755s. It was **not a decayed fact but an artifact of a dormant branch**: the active
+`Retry-After` floor in `note_account_backoff` (`Some(ra) if is_active => widened.max(ra)`,
+**#453**) reduces to `widened.max(0) == widened` (≤ `ACTIVE_POLL_BACKOFF_CAP` = 120s) whenever
+`ra == 0`, which held for 579 of those 581 — so the un-clamped branch had **never once fired**.
+The ADR generalised the 120s windows it had observed into "the window is bounded at 120s,"
+calibrating on a sample that **structurally excluded** the failure mode; the branch woke and
+the premise died the same second.
+
+This **resolves the #453 record contradiction in this ADR's favour**: **#453's own body** calls
+the 2026-07-10→11 window "Retry-After-dominated (server dictated 755s)," while this ADR records
+all 181 of that window's `429`s at `retry_after_secs=0`. The event log settles it — 579/581
+back-offs were `0`, the first non-zero was 2026-07-17 — so **this ADR read the telemetry
+correctly and #453's body is the incorrect record**, which is exactly why the un-clamped floor
+#453 shipped sat dormant and unvalidated for 581 back-offs. The guard is inverted where it
+counts: **#294** (cap the honoured `Retry-After` so a pathological value can't dark the daemon
+— closed, `f56f2f1`) clamps **peers only** (`POLL_BACKOFF_CAP` = 3600s), and #453 **exempts**
+the active account, so every account is bounded except the one whose blindness matters — and
+the peer clamp is **inert at this very value** (`widened.max(3600).min(POLL_BACKOFF_CAP = 3600)`
+is `3600`), so at the server's chosen `3600` neither peer nor active is bounded. The throttle
+**follows the active role**, not the poll rate — each `3600` landed within minutes of an account
+taking the active slot, while a full day at `poll_secs=150` drew 267 `429`s and **zero** `3600`s.
+
+**The decision stands — vindicated, not superseded.** A server-dictated hour-long blind window
+makes "spend the swap lever, not the observation lever" *more* urgent and leaves the
+header-observation rejection untouched, so nothing is reversed. Boundedness is **restored by
+acting**, not by re-asserting the premise: **#582** treats a nonzero active `Retry-After` as a
+swap-away signal in its own right — a swap needs no usage poll, so it fires while blind —
+reusing `reason=blind_preempt` and the `session_blind_swap_secs` bound (whose kill-switch now
+disables both arms) and changing **no** back-off arithmetic; the report side of the same
+episode is the **#584** velocity-projection arm recorded above. Keeping the active floor
+*honoured* rather than clamping it (as #582 weighed and rejected) is an engineering call, not
+conformance: clamping does not restore sight — every clamped re-poll `429`s and re-clears the
+reading, outcome-identical to doing nothing, and would invert #453's ratified absolute-floor AC
+(the server is within spec — RFC 9110 §10.2.3 scopes `Retry-After` to 503/3xx as "ought to
+wait," RFC 6585 §4 lets a `429` carry it). The core **#452** decision and its constants are
+unchanged.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active by rotating across a
@@ -74,7 +118,8 @@ latency matters.
 on its `/oauth/usage` poll at session usage `0.68`, went **blind for 755s**
 (daemon-back-off-dominated: all 181 observed `429`s carried `retry_after_secs=0`,
 so the blind window is the daemon's *own* back-off — per-poll-capped at 120s by
-**#453** — not a server-dictated `Retry-After`), and Claude Code burned it to `0.98`
+**#453** — not a server-dictated `Retry-After` — **but see Amended 2026-07-17 (#586)**), and
+Claude Code burned it to `0.98`
 before any fresh reading returned. The reactive `session_trigger=95` swap **never fired** — it keys
 off an *observation*, and no observation crossed the trigger because the account was
 blind across the entire swap-away band.
@@ -89,7 +134,9 @@ more observation:
   unchanged; its *consequence for the active account* is a blindness window whose
   length is set by the daemon's own back-off — the S1 `429`s all carried
   `retry_after_secs=0`, so that floor contributed nothing and the window was the
-  back-off policy's (capped at 120s per poll by **#453**), not the server's.
+  back-off policy's (capped at 120s per poll by **#453**), not the server's — but see
+  **Amended 2026-07-17 (#586)** for the nonzero-`Retry-After` case the active floor is exempt
+  from.
 - **Interleave, not harder polling ([ADR-0012](0012-active-reobservation-via-schedule-interleave.md)).**
   Interleaving re-reads the active account more often, but it cannot re-read a
   *backing-off* account — and lowering `poll_secs` to poll harder was already
@@ -271,10 +318,19 @@ The path honours the **#369** cautions on a reactive fast-path:
   that validated the projection parameters). **#451** (the
   premise-confirmation + constants finalisation gate for `T` / `risk_band`, now
   satisfied on two weeks of real telemetry). **#484** (ratified the conservative 60%
-  `risk_band` over the interim 65%). **#453** (the active-account back-off cap —
-  120s per poll — that bounds the blind window; all S1 `429`s carried
-  `retry_after_secs=0`, so the window is the daemon's own back-off, not a server
-  `Retry-After`). **#450** (the retained `last_good` pre-blind anchor the path keys
+  `risk_band` over the interim 65%). **#453** (the active-account back-off — its 120s
+  `ACTIVE_POLL_BACKOFF_CAP` bounds only the *exponential self-backoff* arm; a server
+  `Retry-After` is an **un-clamped floor** for the active account, so the window is **not**
+  120s-bounded when the server sends one. The S1 window was the daemon's own back-off only
+  because all 181 of its `429`s carried `retry_after_secs=0`; #453's *body* misrecords that
+  same window as "Retry-After-dominated (server dictated 755s)" — the incorrect record, per
+  **Amended 2026-07-17 (#586)**). **#294** (cap the honoured `Retry-After` so a pathological
+  value can't dark the daemon — closed; its `POLL_BACKOFF_CAP` = 3600s clamp binds **peers
+  only**, #453 exempting the active account, so the one account whose blindness matters is
+  unprotected — the inversion the 2026-07-17 amendment records). **#582** (the resolution — a
+  nonzero active `Retry-After` now triggers swap-away, `reason=blind_preempt`, restoring
+  boundedness by *acting* while blind; changes no back-off arithmetic). **#450** (the retained
+  `last_good` pre-blind anchor the path keys
   off). **#363**
   (the reaction-latency umbrella). **#369** (the reactive fast-path open question
   whose cautions this honours). **#42** (the dead-vs-exhausted model the separate
@@ -304,6 +360,14 @@ The path honours the **#369** cautions on a reactive fast-path:
   swap-out pct; `src/reliability.rs` folds it into the projected-swap-out-overshoot
   percentiles (`P100 ≤ 98 / P50 ≤ 94`) + the false-projection count (schema `2 → 3`). Same
   single `/oauth/usage` source — no header probe.
+- Code (**#582**): the server-`Retry-After` swap-away arm folds into the existing `blind_swap`
+  path in `src/daemon.rs` — the gate becomes `blind_elapsed > session_blind_swap_secs &&
+  (anchor_armed || retry_after.is_some())`, keyed off the retained RAW pre-cap directive
+  (`poll_backoff_retry_after`, armed/cleared in lockstep with `poll_backoff_until`; a `0`
+  directive normalises to `None`). `server_retry_after_holding` is the single shared predicate
+  for the swap AND the `status` projection, so they cannot drift. Reuses `reason=blind_preempt`
+  and the `session_blind_swap_secs` bound (one kill-switch, both arms); **no** back-off
+  arithmetic changes and no header probe is added.
 - ADRs: [ADR-0009](0009-rate-limit-backoff-per-account.md) (per-account `429`
   back-off — **extended** here: the same per-account scoping that correctly bounds a
   throttle is what leaves the *active* account carrying a stale reading = bounded
