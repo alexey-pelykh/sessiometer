@@ -54,6 +54,30 @@ enum RenderPanelTool {
                        weeklyExhausted: false, isNextSwapTarget: true, blindActive: nil),
         ]
 
+        // The active-account bounded-blindness rosters (#479/#485) — the ACTIVE "Work" row carries a
+        // `blind_active` projection (its live meters are replaced by the SEMANTIC held-state block); the
+        // siblings stay healthy. These give the mock's blind frames (`menubar-preview.html`, #571) a matching
+        // built-panel capture, so the design-vs-capture harness can cover the blind row. The whole-snapshot
+        // stays `.connected` — blindness is a per-row modifier, NOT a 10th daemon-state, and the header +
+        // footer stay fresh (the locality that distinguishes it from a whole-snapshot `stale`, #137).
+        // Only `blind.lastKnownSessionPct` drives the render (the held bar) — while blind, BOTH live meters
+        // are replaced by the held block, so the row's own `sessionPct` / `weeklyPct` are inert. `sessionPct`
+        // mirrors the blind anchor (so a non-blind read of the row agrees with the held bar instead of
+        // contradicting it); `weeklyPct` stays at the healthy-Work value.
+        func blindWork(_ blind: BlindActive) -> AccountRow {
+            AccountRow(label: "Work", isActive: true, isEnabled: true, isQuarantined: false,
+                       isRecovering: false, auth: .healthy, sessionPct: blind.lastKnownSessionPct,
+                       weeklyPct: 88, sessionResetsAt: now + 2 * 3600 + 14 * 60, weeklyResetsAt: now + 3 * day,
+                       weeklyExhausted: false, isNextSwapTarget: false, blindActive: blind)
+        }
+        // OK: last-known session 58% (green band), blind 3m, auto-protection self-resolving.
+        let blindOKRows = [blindWork(BlindActive(blindSecs: 180, lastKnownSessionPct: 58,
+                                                 autoProtectionDegraded: false)), rows[1], rows[2]]
+        // DEGRADED: last-known session 88% (amber band), blind 11m, auto-protection acting on a stale anchor
+        // → orange eye-slash + orange leading rule + orange verdict.
+        let blindDegradedRows = [blindWork(BlindActive(blindSecs: 660, lastKnownSessionPct: 88,
+                                                       autoProtectionDegraded: true)), rows[1], rows[2]]
+
         // The panel-rendered states (the fuller 9-state fidelity's remaining facets are #169 siblings).
         // `stale` and `disconnected` retain the last-good roster (disconnected dims it); the account-less
         // states — including `crashLooping` (#169), which refuses the held snapshot's numbers behind an
@@ -76,6 +100,14 @@ enum RenderPanelTool {
             Fixture(name: "crash-looping", state: .crashLooping, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "unsupported", state: .unsupported, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "empty-roster", state: .emptyRoster, rows: [], nextSwap: nil, generatedAt: nil),
+            // #571: the active-account blind row, OK + DEGRADED — a per-row modifier on a `.connected`
+            // snapshot (fresh header/footer), rendered as the held session bar + auto-protection verdict.
+            Fixture(name: "blind-ok", state: .connected, rows: blindOKRows,
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 12),
+            Fixture(name: "blind-degraded", state: .connected, rows: blindDegradedRows,
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 12),
         ]
 
         for fixture in fixtures {
