@@ -201,8 +201,9 @@ final class SettingsModel: ObservableObject {
     /// The loaded roster (uuid, current label, enabled) the accounts section renders, in daemon order.
     @Published private(set) var accounts: [AccountView] = []
 
-    /// Per-field CLIENT-side format errors (a draft that is not a whole number ≥ 0). Shown inline; cleared as
-    /// soon as the operator edits that field. Distinct from the daemon's `rejected` banner.
+    /// Per-field CLIENT-side format errors (a draft that is not a whole number ≥ 0, or that is too large for
+    /// the wire). Shown inline; cleared as soon as the operator edits that field. Distinct from the daemon's
+    /// `rejected` banner.
     @Published private(set) var fieldErrors: [TunableField: String] = [:]
 
     /// Latches true when an applied edit needs a daemon restart to take effect (`restart_required`), for the
@@ -367,10 +368,11 @@ final class SettingsModel: ObservableObject {
     // MARK: Apply
 
     /// Validate the dirty drafts client-side, then submit ONE batched `config-set` of only the edited keys
-    /// (tunables + labels) and render its outcome. A non-numeric dirty draft is a CLIENT format error
-    /// (`invalidInput` + inline `fieldErrors`, NO command sent — no partial write); everything that parses is
-    /// the daemon's to accept or `reject` (it owns range + cross-field validation). A missing client
-    /// short-circuits to `.failed(.unavailable)` — honest-disconnected, never a silent local config write.
+    /// (tunables + labels) and render its outcome. A dirty draft that is not a whole number ≥ 0 — or that is
+    /// too large to ride the Int64 wire — is a CLIENT format error (`invalidInput` + inline `fieldErrors`, NO
+    /// command sent — no partial write); everything that parses is the daemon's to accept or `reject` (it owns
+    /// range + cross-field validation). A missing client short-circuits to `.failed(.unavailable)` —
+    /// honest-disconnected, never a silent local config write.
     func apply() async {
         // Re-entrancy guard (mirrors `AccountSwapModel.swap`): a second submit while one is in flight is
         // ignored, so a rapid double Cmd-S — before the view's `saveEnabled` disable (an async SwiftUI
@@ -388,11 +390,18 @@ final class SettingsModel: ObservableObject {
         var formatErrors: [TunableField: String] = [:]
         for field in dirtyTunableFields {
             let raw = normalizedDraft(field)
-            if let unsigned = UInt64(raw), let signed = Int64(exactly: unsigned) {
-                field.set(signed, in: &edited)
-            } else {
+            guard let unsigned = UInt64(raw) else {
                 formatErrors[field] = "Enter a whole number (0 or greater)."
+                continue
             }
+            // A draft in (Int64.max, UInt64.max] IS a whole number ≥ 0 — it just overflows `SetTunables`'
+            // Int64 wire — so it is refused with its OWN message rather than mis-reported as a format error.
+            // Pathological (~19 digits; no real tunable is that large), but the copy must not lie.
+            guard let signed = Int64(exactly: unsigned) else {
+                formatErrors[field] = "That number is too large."
+                continue
+            }
+            field.set(signed, in: &edited)
         }
 
         guard formatErrors.isEmpty else {
