@@ -1005,62 +1005,15 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 
 // --- rendering: numeric text ------------------------------------------------
 
-/// The per-account table header, sized to the handle column. Shared by the live-account
-/// table and the "not in roster" section (issue #314) so both foot identical columns. The
-/// numeric text view is the WIDER surface (design-stats.md §D-STA-5): it carries `signal` and the
-/// full `session` / `weekly` `m/p/p95` triples alongside the compact TTY chart table's peaks. The
-/// `velocity` / `runway` columns are shown only when at least one account HAS the datum
-/// (`show_velocity` / `show_runway`) — the empty-column elision, honest degradation over a fleet
-/// with no computable rate.
-fn text_table_header(handle_w: usize, show_velocity: bool, show_runway: bool) -> String {
-    let mut h = format!(
-        "{}  signal     cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share",
-        pad_end("account", handle_w),
-    );
-    if show_velocity {
-        h.push_str("  velocity");
-    }
-    if show_runway {
-        h.push_str("  runway");
-    }
-    h.push('\n');
-    h
-}
-
-/// One per-account table row, sized to the handle column. Shared by the live-account table
-/// and the orphan section, so an orphan row is column-identical to a live one — the ONLY
-/// difference is which section it sits under. `signal` is the neutral class word (`—` for an
-/// unobserved account — gap honesty); `velocity` / `runway` render only when their column is
-/// shown, `—` for an account without the datum. `v` is this account's velocity overlay (an orphan
-/// with no overlay renders `—`).
-fn text_account_row(
-    handle: &str,
-    a: &AccountStats,
-    v: Option<&AccountVelocity>,
-    handle_w: usize,
-    show_velocity: bool,
-    show_runway: bool,
-) -> String {
-    let mut row = format!(
-        "{}  {:<9}  {:>3}%  {:<15}  {:<15}  {:>4}  {:>5}  {:>4}%",
-        pad_end(handle, handle_w),
-        signal_cell(a),
-        pct(a.coverage),
-        triple(&a.session),
-        triple(&a.weekly),
-        a.cap_hits,
-        fmt_dur(a.time_at_cap_secs),
-        pct(a.contribution_share),
-    );
-    if show_velocity {
-        row.push_str(&format!("  {:>8}", velocity_cell(v)));
-    }
-    if show_runway {
-        row.push_str(&format!("  {:>6}", runway_cell(v)));
-    }
-    row.push('\n');
-    row
-}
+// The per-account NUMERIC-text table is the WIDER surface (design-stats.md §D-STA-5): it carries
+// `signal`, `cov`, the full `session` / `weekly` `m/p/p95` triples, `caps` / `t@cap` / `share`, and
+// the shared `velocity` / `runway`. Since issue #557 it is NOT laid out by its own renderer —
+// [`render_text`] builds one [`AccountRow`] per account and renders the [`piped_columns`] subset
+// through the ONE [`render_account_table`] at `w = usize::MAX`, `color = false`, so the piped and
+// TTY tables share the elision / width / drop machinery and can no longer silently diverge in
+// column shape. A per-account column now lives in exactly one [`Column`] catalog entry, shown on
+// each surface by subset choice; the former hand-built `text_table_header` / `text_account_row`
+// (fixed-width, right-aligned) are gone.
 
 /// Render the numeric text view: the window echo, the per-account summary table, an optional
 /// "not in roster" section (issue #314), the neutral summary band (issue #160), and the
@@ -1079,65 +1032,34 @@ fn render_text(report: &Report) -> String {
     if !has_live && !has_orphans {
         out.push_str("  no per-account usage in this window\n");
     } else {
-        // Size the label column on DISPLAY width, not `String::len()` bytes (issue #249):
-        // a wide glyph spans fewer bytes than its terminal footprint, so byte sizing AND
-        // char-count `{:<hw$}` padding both mis-aligned the numeric columns. Those numeric
-        // fields stay literal `{:>N}` / `{:<15}` fills — they are ASCII-only. Sized across
-        // BOTH the live table and the orphan section so the two align under one column width.
-        let handle_w = summary
-            .per_account
-            .keys()
-            .chain(report.orphans.keys())
-            .map(|handle| display_width(handle))
-            .max()
-            .unwrap_or(0)
-            .max(display_width("account"));
-        // Optional-column elision for the numeric view (§D-STA-5): `velocity` / `runway` render
-        // only when at least one shown account (live OR orphan) HAS the datum. A fleet with no
-        // computable rate foots exactly as it did before the columns existed — honest degradation,
-        // not a wall of `—`. Computed across BOTH sections so the two tables carry the same columns.
-        let any_account_has = |has: fn(&AccountVelocity) -> bool| {
-            summary
-                .per_account
-                .keys()
-                .chain(report.orphans.keys())
-                .any(|h| report.velocity.get(h).is_some_and(has))
-        };
-        let show_velocity = any_account_has(|v| v.session_rate.is_some());
-        let show_runway = any_account_has(|v| v.session_runway_secs.is_some());
+        // The numeric view is the WIDER surface: one [`AccountRow`] per account, rendered through
+        // the ONE [`render_account_table`] over the [`piped_columns`] subset at `w = usize::MAX`
+        // (never priority-drops — the pipe is the full-width table) and `color = false` (zero ANSI,
+        // issue #159). The live table and the #314 "not in roster" section are sibling SECTIONS of
+        // one call, so they foot IDENTICAL column widths and the empty-column `velocity` / `runway`
+        // elision is decided across BOTH — the cross-section discipline the hand-built renderer
+        // carried, now shared with the TTY chart table (issue #557). The `account` column is sized
+        // on DISPLAY width by the renderer (issue #249). ASCII is irrelevant here (the piped subset
+        // omits `trend`); `true` is a harmless placeholder.
+        let mut sections: Vec<AccountSection> = Vec::new();
         if has_live {
-            out.push_str(&text_table_header(handle_w, show_velocity, show_runway));
-            for (handle, a) in &summary.per_account {
-                out.push_str(&text_account_row(
-                    handle,
-                    a,
-                    report.velocity.get(handle),
-                    handle_w,
-                    show_velocity,
-                    show_runway,
-                ));
-            }
+            sections.push(AccountSection {
+                heading: None,
+                rows: account_rows(report, summary.per_account.iter(), true),
+            });
         }
-        // Non-roster handles (issue #314): a clearly-labelled, self-contained section so an
-        // orphan is never read as a live account. Shown, not hidden — this is reconciliation,
-        // not deletion (a store `gc` that DROPS them is issue #314 option (c), out of scope).
         if has_orphans {
-            if has_live {
-                out.push('\n');
-            }
-            out.push_str(&format!("not in roster ({}):\n", report.orphans.len()));
-            out.push_str(&text_table_header(handle_w, show_velocity, show_runway));
-            for (handle, a) in &report.orphans {
-                out.push_str(&text_account_row(
-                    handle,
-                    a,
-                    report.velocity.get(handle),
-                    handle_w,
-                    show_velocity,
-                    show_runway,
-                ));
-            }
+            sections.push(AccountSection {
+                heading: Some(format!("not in roster ({}):", report.orphans.len())),
+                rows: account_rows(report, report.orphans.iter(), true),
+            });
         }
+        out.push_str(&render_account_table(
+            &sections,
+            &piped_columns(),
+            usize::MAX,
+            false,
+        ));
     }
 
     out.push('\n');
@@ -2019,38 +1941,314 @@ fn render_line(
     format!("{}\n", line.trim_end())
 }
 
-/// Render a header row plus one line per data row. An EMPTY-COLUMN ELISION pre-pass first drops
-/// any DROPPABLE column that is uniformly the gap sentinel `—` (design-stats.md §D-STA-5 — a
-/// column with no datum on any row carries nothing; this is what self-drops `velocity` / `runway`
-/// on a fleet with no computable rate). Then the lowest-priority droppable columns are dropped
-/// until the table fits `w` — or only always-keep columns remain, in which case the table is
-/// allowed to OVERFLOW rather than WRAP a row (issue #159: never wrap). Colour is applied per cell
-/// only when `color` is set.
-fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
-    // Empty-column elision: a droppable column uniformly `—` across every row is omitted before
-    // the width fit. A keep-column (`priority == None`, the `account · session · signal` floor) is
-    // never elided, even if every cell is a gap.
-    columns.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != "—"));
-    while table_width(&columns) > w {
-        match columns.iter().filter_map(|c| c.priority).min() {
-            Some(p) => columns.retain(|c| c.priority != Some(p)),
+/// One per-account row's source for the table catalog (issue #557): the handle, its stats, its
+/// optional velocity overlay, and the pre-rendered `trend` sparkline (built with the surface's
+/// ASCII ramp, since a [`Column`] extractor cannot itself reach `report.series`). BOTH surfaces
+/// build the same `AccountRow`; each renders its declared [`Column`] subset over it, so a
+/// per-account metric can no longer diverge in shape between the two renderers.
+struct AccountRow<'a> {
+    handle: &'a str,
+    stats: &'a AccountStats,
+    velocity: Option<&'a AccountVelocity>,
+    trend: String,
+}
+
+/// One column of the per-account table catalog (issue #557), generalising the [`ChartCol`] idea to
+/// a reusable SPEC: a header, the spaces BEFORE it, the drop `priority` (`None` = the
+/// `account · signal · session` floor, `Some(n)` sheds lowest-first under a narrow terminal), and
+/// pure extractors for the cell string and its optional per-row colour SGR from an [`AccountRow`].
+/// There is ONE catalog; each surface renders its declared ordered subset ([`piped_columns`] /
+/// [`tty_columns`]). A new per-account metric is a single `Column` that appears on both surfaces by
+/// subset choice — the convergence that kills the latent shape-drift #556 left between the two
+/// renderers.
+struct Column {
+    header: &'static str,
+    lead_gap: usize,
+    priority: Option<u8>,
+    cell: fn(&AccountRow) -> String,
+    color: fn(&AccountRow) -> Option<&'static str>,
+}
+
+// --- the per-account column catalog (issue #557) ----------------------------
+//
+// Each column is ONE constructor, composed into the two declared subsets below. The SHARED
+// columns (`account` / `signal` / `velocity` / `runway`) are the SAME constructor on both
+// surfaces, so they cannot diverge; the surface-specific ones differ only in which subset lists
+// them. `account` leads with no gap; every other column is preceded by two spaces.
+
+/// The `account` handle — the floor's first column, sized on DISPLAY width by the renderer.
+fn col_account() -> Column {
+    Column {
+        header: "account",
+        lead_gap: 0,
+        priority: None,
+        cell: |r| r.handle.to_owned(),
+        color: |_| None,
+    }
+}
+/// The neutral `signal` class word (`—` for an unobserved account — gap honesty), tinted by its
+/// symmetric emphasis SGR when colour is on (the tint is dropped on the piped surface).
+fn col_signal() -> Column {
+    Column {
+        header: "signal",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| signal_cell(r.stats).to_owned(),
+        color: |r| signal_sgr(r.stats),
+    }
+}
+/// `cov` — observed-window coverage as a whole percent (piped-only wide column).
+fn col_cov() -> Column {
+    Column {
+        header: "cov",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| format!("{}%", pct(r.stats.coverage)),
+        color: |_| None,
+    }
+}
+/// The full `session` `mean/peak/p95` triple (the WIDE piped surface; the TTY keeps the compact
+/// [`col_session_compact`]). Part of the `account · signal · session` floor — never dropped.
+fn col_session_triple() -> Column {
+    Column {
+        header: "session m/p/p95",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| triple(&r.stats.session),
+        color: |_| None,
+    }
+}
+/// The compact `session` `mean/peak` (the TTY surface), tinted by the session-peak band.
+fn col_session_compact() -> Column {
+    Column {
+        header: "session",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| session_cell(r.stats),
+        color: |r| Some(Band::of(r.stats.session.peak).sgr()),
+    }
+}
+/// The full `weekly` `mean/peak/p95` triple (the WIDE piped surface).
+fn col_weekly_triple() -> Column {
+    Column {
+        header: "weekly m/p/p95",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| triple(&r.stats.weekly),
+        color: |_| None,
+    }
+}
+/// The compact `weekly` peak percent (the TTY surface), tinted by the weekly-peak band; drops
+/// after `trend` / `velocity` / `runway` under a narrow terminal.
+fn col_weekly_peak() -> Column {
+    Column {
+        header: "weekly",
+        lead_gap: 2,
+        priority: Some(4),
+        cell: |r| format!("{}%", pct(r.stats.weekly.peak)),
+        color: |r| Some(Band::of(r.stats.weekly.peak).sgr()),
+    }
+}
+/// `caps` — cap-hit count (piped-only wide column).
+fn col_caps() -> Column {
+    Column {
+        header: "caps",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| r.stats.cap_hits.to_string(),
+        color: |_| None,
+    }
+}
+/// `t@cap` — coarse time-at-cap duration (piped-only wide column).
+fn col_time_at_cap() -> Column {
+    Column {
+        header: "t@cap",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| fmt_dur(r.stats.time_at_cap_secs),
+        color: |_| None,
+    }
+}
+/// `share` — whole-window contribution share as a whole percent (piped-only wide column).
+fn col_share() -> Column {
+    Column {
+        header: "share",
+        lead_gap: 2,
+        priority: None,
+        cell: |r| format!("{}%", pct(r.stats.contribution_share)),
+        color: |_| None,
+    }
+}
+/// `velocity` — the neutral session `%/min` rate, `—` when unknown. SHARED by both surfaces;
+/// droppable (elides when uniformly `—`; sheds before `runway` under a narrow terminal).
+fn col_velocity() -> Column {
+    Column {
+        header: "velocity",
+        lead_gap: 2,
+        priority: Some(2),
+        cell: |r| velocity_cell(r.velocity),
+        color: |_| None,
+    }
+}
+/// `runway` — approximate session head-room `~Xh`, `—` when unknown. SHARED by both surfaces;
+/// droppable (elides when uniformly `—`).
+fn col_runway() -> Column {
+    Column {
+        header: "runway",
+        lead_gap: 2,
+        priority: Some(3),
+        cell: |r| runway_cell(r.velocity),
+        color: |_| None,
+    }
+}
+/// `trend` — the per-bucket session-peak sparkline (the TTY surface); the lowest-priority column,
+/// shedding FIRST under a narrow terminal (a populated rate out-informs the sparkline).
+fn col_trend() -> Column {
+    Column {
+        header: "trend",
+        lead_gap: 2,
+        priority: Some(1),
+        cell: |r| r.trend.clone(),
+        color: |_| None,
+    }
+}
+
+/// The NUMERIC-text (piped, issue #159) column subset — the WIDER surface (design-stats.md
+/// §D-STA-5): `account · signal · cov · session(m/p/p95) · weekly(m/p/p95) · caps · t@cap · share`
+/// plus the shared `velocity` / `runway`. Rendered at `w = usize::MAX`, so it never priority-drops.
+fn piped_columns() -> Vec<Column> {
+    vec![
+        col_account(),
+        col_signal(),
+        col_cov(),
+        col_session_triple(),
+        col_weekly_triple(),
+        col_caps(),
+        col_time_at_cap(),
+        col_share(),
+        col_velocity(),
+        col_runway(),
+    ]
+}
+
+/// The TTY chart-table column subset (design-stats.md §D-STA-5): `account · signal ·
+/// session(mean/peak) · weekly(peak) · runway · velocity · trend`. Priority column-drop order
+/// (lowest `Some(n)` first) is `trend → velocity → runway → weekly`; the `account · signal ·
+/// session` floor never drops.
+fn tty_columns() -> Vec<Column> {
+    vec![
+        col_account(),
+        col_signal(),
+        col_session_compact(),
+        col_weekly_peak(),
+        col_runway(),
+        col_velocity(),
+        col_trend(),
+    ]
+}
+
+/// Build one [`AccountRow`] per `(handle, stats)` (in the given order), pre-rendering each `trend`
+/// sparkline with `ascii`. Shared by the piped and TTY renderers, so both foot ONE row model.
+fn account_rows<'a>(
+    report: &'a Report,
+    accounts: impl IntoIterator<Item = (&'a String, &'a AccountStats)>,
+    ascii: bool,
+) -> Vec<AccountRow<'a>> {
+    accounts
+        .into_iter()
+        .map(|(handle, stats)| AccountRow {
+            handle: handle.as_str(),
+            stats,
+            velocity: report.velocity.get(handle),
+            trend: render_sparkline(&account_series(&report.series, handle, session_peak), ascii),
+        })
+        .collect()
+}
+
+/// One SECTION of the per-account table: an optional heading (the #314 "not in roster (N):" label)
+/// and its rows. The TTY view is a single un-headed section; the piped view is the live section
+/// plus an optional orphan section. Sibling sections are footed by one [`render_account_table`]
+/// call so they share column widths and one elision decision.
+struct AccountSection<'a> {
+    heading: Option<String>,
+    rows: Vec<AccountRow<'a>>,
+}
+
+/// THE per-account table renderer (issue #557) — the ONE layout both the piped numeric view and
+/// the TTY chart table route through. Renders every `section` over the given `columns` catalog
+/// subset. EMPTY-COLUMN ELISION (a droppable column uniformly the gap sentinel `—` across every
+/// section's rows is dropped — self-drops `velocity` / `runway` on a fleet with no computable rate,
+/// design-stats.md §D-STA-5) and PRIORITY COLUMN-DROP (lowest `Some(n)` sheds first until the table
+/// fits `w`, the floor never dropping and the row OVERFLOWING rather than wrapping, issue #159) are
+/// both computed across the COMBINED cohort, and column widths are SHARED across sections — so the
+/// live and orphan tables foot identical columns (issue #314), sized on DISPLAY width (issue #249).
+/// Colour is applied per cell only when `color`. The piped surface passes `w = usize::MAX` (never
+/// drops) and `color = false` (zero ANSI); the TTY passes the real terminal width and its colour.
+fn render_account_table(
+    sections: &[AccountSection],
+    columns: &[Column],
+    w: usize,
+    color: bool,
+) -> String {
+    // Each section's row span within the concatenated cohort — so elision + widths are computed
+    // across ALL sections (sibling tables stay column-identical), while each section still renders
+    // its own rows under its own heading.
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::with_capacity(sections.len());
+    let mut start = 0;
+    for s in sections {
+        spans.push(start..start + s.rows.len());
+        start += s.rows.len();
+    }
+    let all_rows: Vec<&AccountRow> = sections.iter().flat_map(|s| s.rows.iter()).collect();
+
+    // One ChartCol per catalog column over the WHOLE cohort — the row model is now the [`Column`]
+    // extractors, not two hand-built layouts.
+    let mut cols: Vec<ChartCol> = columns
+        .iter()
+        .map(|c| ChartCol {
+            header: c.header,
+            cells: all_rows.iter().map(|&r| (c.cell)(r)).collect(),
+            colors: all_rows.iter().map(|&r| (c.color)(r)).collect(),
+            lead_gap: c.lead_gap,
+            priority: c.priority,
+        })
+        .collect();
+
+    // Empty-column elision, then priority column-drop to fit `w` — the discipline the former
+    // `render_table` carried, now over the combined cohort. A keep-column (`priority == None`, the
+    // floor) is never elided even if every cell is a gap. The piped view (`w = usize::MAX`) never
+    // enters the drop loop.
+    cols.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != "—"));
+    while table_width(&cols) > w {
+        match cols.iter().filter_map(|c| c.priority).min() {
+            Some(p) => cols.retain(|c| c.priority != Some(p)),
             None => break, // only keep-columns left → accept overflow, never wrap
         }
     }
-    let widths: Vec<usize> = columns.iter().map(ChartCol::width).collect();
-    let gaps: Vec<usize> = columns.iter().map(|c| c.lead_gap).collect();
-    let n_rows = columns.first().map_or(0, |c| c.cells.len());
 
-    let headers: Vec<&str> = columns.iter().map(|c| c.header).collect();
-    let no_color: Vec<Option<&str>> = vec![None; columns.len()];
-    let mut out = render_line(&headers, &widths, &no_color, &gaps);
-    for r in 0..n_rows {
-        let cells: Vec<&str> = columns.iter().map(|c| c.cells[r].as_str()).collect();
-        let colors: Vec<Option<&str>> = columns
-            .iter()
-            .map(|c| if color { c.colors[r] } else { None })
-            .collect();
-        out.push_str(&render_line(&cells, &widths, &colors, &gaps));
+    let widths: Vec<usize> = cols.iter().map(ChartCol::width).collect();
+    let gaps: Vec<usize> = cols.iter().map(|c| c.lead_gap).collect();
+    let headers: Vec<&str> = cols.iter().map(|c| c.header).collect();
+    let no_color: Vec<Option<&str>> = vec![None; cols.len()];
+
+    let mut out = String::new();
+    for (s, span) in sections.iter().zip(&spans) {
+        if !out.is_empty() {
+            out.push('\n'); // a blank line separates sibling sections (live | "not in roster")
+        }
+        if let Some(heading) = &s.heading {
+            out.push_str(heading);
+            out.push('\n');
+        }
+        out.push_str(&render_line(&headers, &widths, &no_color, &gaps));
+        for r in span.clone() {
+            let cells: Vec<&str> = cols.iter().map(|c| c.cells[r].as_str()).collect();
+            let colors: Vec<Option<&str>> = cols
+                .iter()
+                .map(|c| if color { c.colors[r] } else { None })
+                .collect();
+            out.push_str(&render_line(&cells, &widths, &colors, &gaps));
+        }
     }
     out
 }
@@ -2061,9 +2259,10 @@ fn render_table(mut columns: Vec<ChartCol>, w: usize, color: bool) -> String {
 /// terminal — `trend` sheds FIRST, then `velocity`, `runway`, `weekly` (a populated rate
 /// out-informs the sparkline; an empty one is already gone via elision) — while the
 /// `account · session · signal` FLOOR is always kept, never wrapping (issue #159). A `velocity` /
-/// `runway` column that is uniformly `—` is elided before the width fit ([`render_table`]). Colour
-/// tints each magnitude by its neutral utilisation band and the signal word symmetrically; the
-/// sparkline glyphs carry their own magnitude.
+/// `runway` column that is uniformly `—` is elided before the width fit. Colour tints each
+/// magnitude by its neutral utilisation band and the signal word symmetrically; the sparkline
+/// glyphs carry their own magnitude. Since issue #557 this is just the [`tty_columns`] subset over
+/// the shared [`render_account_table`] — one un-headed section of live accounts.
 fn render_chart_table(
     report: &Report,
     accounts: &[&String],
@@ -2072,83 +2271,16 @@ fn render_chart_table(
     ascii: bool,
 ) -> String {
     let summary = &report.summary;
-    let n = accounts.len();
-    let (mut acct, mut sig, mut sig_c) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut sess, mut sess_c, mut week, mut week_c) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let (mut runway, mut velocity, mut trend) = (Vec::new(), Vec::new(), Vec::new());
-    for &h in accounts {
-        let a = &summary.per_account[h];
-        let v = report.velocity.get(h);
-        acct.push(h.clone());
-        sig.push(signal_cell(a).to_owned());
-        sig_c.push(signal_sgr(a));
-        sess.push(session_cell(a));
-        sess_c.push(Some(Band::of(a.session.peak).sgr()));
-        week.push(format!("{}%", pct(a.weekly.peak)));
-        week_c.push(Some(Band::of(a.weekly.peak).sgr()));
-        runway.push(runway_cell(v));
-        velocity.push(velocity_cell(v));
-        trend.push(render_sparkline(
-            &account_series(&report.series, h, session_peak),
-            ascii,
-        ));
-    }
-    // Column ORDER is the §D-STA-5 render; drop PRIORITY (lowest `Some(n)` shed first) is the
-    // corrected order `trend → velocity → runway → weekly`. The `account · session · signal`
-    // floor is `priority: None` — never dropped.
-    let columns = vec![
-        ChartCol {
-            header: "account",
-            cells: acct,
-            colors: vec![None; n],
-            lead_gap: 0,
-            priority: None,
-        },
-        ChartCol {
-            header: "signal",
-            cells: sig,
-            colors: sig_c,
-            lead_gap: 2,
-            priority: None,
-        },
-        ChartCol {
-            header: "session",
-            cells: sess,
-            colors: sess_c,
-            lead_gap: 2,
-            priority: None,
-        },
-        ChartCol {
-            header: "weekly",
-            cells: week,
-            colors: week_c,
-            lead_gap: 2,
-            priority: Some(4),
-        },
-        ChartCol {
-            header: "runway",
-            cells: runway,
-            colors: vec![None; n],
-            lead_gap: 2,
-            priority: Some(3),
-        },
-        ChartCol {
-            header: "velocity",
-            cells: velocity,
-            colors: vec![None; n],
-            lead_gap: 2,
-            priority: Some(2),
-        },
-        ChartCol {
-            header: "trend",
-            cells: trend,
-            colors: vec![None; n],
-            lead_gap: 2,
-            priority: Some(1),
-        },
-    ];
-    render_table(columns, w, color)
+    let rows = account_rows(
+        report,
+        accounts.iter().map(|&h| (h, &summary.per_account[h])),
+        ascii,
+    );
+    let sections = [AccountSection {
+        heading: None,
+        rows,
+    }];
+    render_account_table(&sections, &tty_columns(), w, color)
 }
 
 /// The cross-account horizontal-bar chart: each account's whole-window contribution share
@@ -2736,12 +2868,16 @@ mod tests {
 
     #[test]
     fn piped_numeric_table_golden_with_the_folded_columns() {
-        // A frozen byte-golden of the piped numeric view (issue #556) — the unversioned de-facto
-        // contract (#159): the window echo, the per-account table with the FOLDED `signal` /
-        // `velocity` / `runway` columns (§D-STA-5), and the contiguous aggregate roster block. `aa`
-        // carries a velocity overlay (populated cells); `bb` has none (`—`). This pins the exact
-        // piped column layout so a silent reflow (reordered / re-spaced columns) is caught — the
-        // existing `piped == render_text` check is circular and cannot see a layout regression.
+        // A frozen byte-golden of the piped numeric view — the unversioned de-facto contract
+        // (#159): the window echo, the per-account table, and the contiguous aggregate roster
+        // block. `aa` carries a velocity overlay (populated cells); `bb` has none (`—`). Since
+        // issue #557 the piped table is the shared render_account_table over piped_columns at
+        // w = usize::MAX / color = false, so this layout is CONTENT-SIZED and LEFT-ALIGNED (the
+        // §D-STA-5 impl style) — the deliberate, reviewed reflow from the former hand-built
+        // fixed-width right-aligned fields. The piped-contract risk was resolved before reflowing:
+        // no workflow parses piped column positions; `--json schema:1` is the machine contract. It
+        // still pins the exact bytes so a future SILENT reflow (reordered / re-spaced columns) is
+        // caught — the circular `piped == render_text` check cannot see a layout regression.
         let mut r = charts_report(
             &[
                 ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
@@ -2760,12 +2896,124 @@ mod tests {
         assert_eq!(
             render_text(&r),
             "usage — last 24h (Jun 30–Jul 1)\n\n\
-             account  signal     cov   session m/p/p95   weekly m/p/p95    caps  t@cap   share  velocity  runway\n\
-             aa       saturated  100%  30/90/85         0/40/0              0     0s    60%  0.9%/min     ~2h\n\
-             bb       underused  100%  10/15/12         0/20/0              0     0s    40%         —       —\n\
+             account  signal     cov   session m/p/p95  weekly m/p/p95  caps  t@cap  share  velocity  runway\n\
+             aa       saturated  100%  30/90/85         0/40/0          0     0s     60%    0.9%/min  ~2h\n\
+             bb       underused  100%  10/15/12         0/20/0          0     0s     40%    —         —\n\
              \n  lowest utilisation: bb (session mean 10%)\n\
              roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)\n",
         );
+    }
+
+    // --- issue #557 AC: the piped + TTY tables carry their declared column subsets ------
+
+    /// Whether each header in `headers` occurs in `line`, IN ORDER (a later header found only after
+    /// the previous one ends). Robust against a header being a substring of another (`session`
+    /// inside `session m/p/p95`), which a naive `contains` set-check would miss.
+    fn headers_appear_in_order(line: &str, headers: &[&str]) -> bool {
+        let mut pos = 0;
+        for h in headers {
+            match line[pos..].find(h) {
+                Some(i) => pos += i + h.len(),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn piped_and_tty_tables_carry_their_declared_column_subsets() {
+        // #557 column-parity golden: the piped (w = MAX) and TTY tables render from ONE catalog,
+        // each its own declared subset. This pins each surface's columns AND order, so a future edit
+        // that diverges one renderer's shape from the catalog — the latent drift #556 left between
+        // the two former hand-built layouts — is caught. `aa` carries a velocity overlay so nothing
+        // elides and the full declared subsets render; the TTY renders wide so nothing drops.
+        let mut r = charts_report(
+            &[
+                ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
+                ("bb", stat(3, ds(0.10, 0.15, 0.12), 0.20, 0.40)),
+            ],
+            &[],
+        );
+        r.velocity.insert(
+            "aa".to_string(),
+            AccountVelocity {
+                session_rate: Some(0.00015),
+                session_runway_secs: Some(7200),
+                ..Default::default()
+            },
+        );
+
+        // The declared subsets — the catalog constructors' headers, in render order.
+        let piped_headers: Vec<&str> = piped_columns().iter().map(|c| c.header).collect();
+        let tty_headers: Vec<&str> = tty_columns().iter().map(|c| c.header).collect();
+        assert_eq!(
+            piped_headers,
+            [
+                "account",
+                "signal",
+                "cov",
+                "session m/p/p95",
+                "weekly m/p/p95",
+                "caps",
+                "t@cap",
+                "share",
+                "velocity",
+                "runway",
+            ],
+            "the piped subset is the wide numeric catalog"
+        );
+        assert_eq!(
+            tty_headers,
+            ["account", "signal", "session", "weekly", "runway", "velocity", "trend"],
+            "the TTY subset is the compact chart catalog"
+        );
+
+        // Each surface's RENDERED header row carries its declared subset, in order.
+        let piped = render_text(&r);
+        let tty = render_chart_table(&r, &keys(&r), 200, false, false);
+        let piped_header_line = piped
+            .lines()
+            .find(|l| l.starts_with("account"))
+            .expect("a piped header row");
+        let tty_header_line = tty.lines().next().expect("a tty header row");
+        assert!(
+            headers_appear_in_order(piped_header_line, &piped_headers),
+            "piped header carries its declared subset in order: {piped_header_line:?}"
+        );
+        assert!(
+            headers_appear_in_order(tty_header_line, &tty_headers),
+            "tty header carries its declared subset in order: {tty_header_line:?}"
+        );
+
+        // The SHARED columns (`account · signal · velocity · runway`) are ONE catalog entry, so they
+        // head both surfaces AND produce the same cell CONTENT for a given account (the same
+        // extractor runs on both) — the anti-drift guarantee. `aa`'s shared cell strings therefore
+        // appear verbatim on both surfaces (a content check; each surface pads them to its own
+        // column width, so position differs).
+        for shared in ["account", "signal", "velocity", "runway"] {
+            assert!(
+                piped_header_line.contains(shared) && tty_header_line.contains(shared),
+                "`{shared}` heads both surfaces"
+            );
+        }
+        for cell in ["saturated", "0.9%/min", "~2h"] {
+            assert!(
+                piped.contains(cell) && tty.contains(cell),
+                "aa's shared `{cell}` renders identically on both surfaces"
+            );
+        }
+
+        // Neither surface leaks the OTHER's exclusive columns.
+        assert!(
+            !piped_header_line.contains("trend"),
+            "piped omits the tty-only `trend`: {piped_header_line:?}"
+        );
+        for piped_only in ["cov", "caps", "t@cap", "share"] {
+            assert!(
+                !tty_header_line.contains(piped_only),
+                "tty omits the piped-only `{piped_only}`: {tty_header_line:?}"
+            );
+        }
     }
 
     // --- issue #159 AC: NO_COLOR / --no-color → zero ANSI, full signal in text --------
