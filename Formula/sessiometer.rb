@@ -37,8 +37,8 @@ class Sessiometer < Formula
   license "MIT"
   head "https://github.com/alexey-pelykh/sessiometer.git", branch: "main"
 
-  depends_on :macos
   depends_on "rust" => :build
+  depends_on :macos
 
   def install
     # The crate is a single `[package]` at the repo root (ADR-0010) with a committed
