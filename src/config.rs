@@ -1756,7 +1756,15 @@ impl Config {
         out.push_str("# sessiometer configuration.\n");
         out.push_str(
             "# The roster is managed by `sessiometer capture`; the [tunables] block is\n\
-             # safe to hand-edit. Percentages are of the rolling session window.\n\n",
+             # safe to hand-edit. Percentages are of the rolling session window.\n\
+             #\n\
+             # Single-machine boundary (issue #613): sessiometer coordinates only WITHIN one\n\
+             # machine — the single-owner lock is a per-machine flock. Running this same roster\n\
+             # on a second machine at once is possible, and each daemon is blind to the other's\n\
+             # usage: two machines can co-consume an account (the swap tail margin is\n\
+             # single-machine-calibrated) and a landing can overshoot unseen by the local\n\
+             # signal. Velocity-spike detection reads the account-global usage and reduces —\n\
+             # does not remove — this exposure. Prefer one roster per machine.\n\n",
         );
 
         out.push_str("[tunables]\n");

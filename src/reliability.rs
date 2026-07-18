@@ -62,6 +62,16 @@
 //! crate's existing civil-date primitives ([`crate::usage::epoch_from_rfc3339`] and
 //! [`crate::observability::rfc3339`]) rather than a second calendar routine. The default (no
 //! flag) is unchanged and backward-compatible.
+//!
+//! **Single-machine-sync boundary (issue #613).** Every SLI here is PER-MACHINE: this
+//! reader folds only THIS daemon's own durable files, so it can never see a second
+//! machine co-consuming the same roster (Sessiometer has no shared backend; the full
+//! treatment is in [`crate::swap`]'s boundary note). SLI 5 above is the sharpest case — a
+//! parked account another machine pushed past the ceiling never lands in this machine's
+//! samples, so that overshoot goes unmeasured here. [`crate::landing`] is the RUNTIME
+//! mirror of SLI 5 and carries the identical per-machine bound; velocity-spike detection
+//! (which reads the account-global `/oauth/usage` signal that DOES reflect both machines'
+//! combined burn) is the partial mitigation, not a fix.
 
 use crate::error::{Error, Result};
 use crate::usage::epoch_from_rfc3339;
@@ -72,7 +82,11 @@ use std::collections::BTreeMap;
 /// at or above 99%. INTERIM per issue #455 (the extended #363 acceptance); the source of
 /// truth until the #451/#484 confirmation gate finalizes it against production — the
 /// interim-const-with-provenance stance of [`crate::daemon`]'s `BLIND_GATE_*`.
-const SLO_SWAP_P100_MAX: u8 = 99;
+///
+/// `pub(crate)` so the RUNTIME landing-overshoot detector ([`crate::landing`], issue #613) checks
+/// the SAME ceiling this OFFLINE reader does — one SLO line, referenced from both, so the runtime
+/// and offline signals cannot drift.
+pub(crate) const SLO_SWAP_P100_MAX: u8 = 99;
 
 /// SLO target: swap-out `session_pct` **P50 must be `<= 97`** (median swap-out lands in the
 /// [95, 97] band, not later). INTERIM per issue #455; see [`SLO_SWAP_P100_MAX`] for the
@@ -111,7 +125,10 @@ const PREEMPT_WASTED_MARGIN_PCT: u8 = 20;
 /// until the #451/#484 production gate finalizes it, the same interim-const-with-provenance stance
 /// as [`SLO_SWAP_P100_MAX`]. The landing point is measured against that same `< 99` ceiling: SLI 1
 /// checks it on the swap DECISION reading, this on where the parked account actually LANDED.
-const LANDING_WINDOW_SECS: i64 = 15 * 60;
+///
+/// `pub(crate)` so the RUNTIME landing-overshoot detector ([`crate::landing`], issue #613) bounds
+/// its live watch to the SAME window this OFFLINE reconstruction does — tied so the two cannot drift.
+pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 
 /// The stable `--json` schema version. Owned by this readout, independent of `stats`'
 /// schema. Named to match [`crate::stats`]'s own `JSON_SCHEMA_VERSION`. Bumped `1 → 2` when

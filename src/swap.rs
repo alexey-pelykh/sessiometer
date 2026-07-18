@@ -64,6 +64,33 @@
 //!     credential-cut half in CI, this is the target-behaviour half;
 //!   - the `apple-tool:`-ride version check — the CLI write still rides the
 //!     `apple-tool:` ACL entry on the current Claude Code version (#2).
+//!
+//! ## Single-machine-sync boundary (issue #613)
+//!
+//! Every lock this crate takes is a *per-machine* `flock`: the single-owner roster
+//! lock, and [`SwapLock`] serialising this engine against a concurrent `/login`. Nothing
+//! coordinates ACROSS machines — Sessiometer has no shared backend — so two machines each
+//! running `sessiometer` against the SAME account roster is possible, and each daemon is
+//! blind to the other's consumption. Two consequences follow, and they are load-bearing
+//! for the swap math above:
+//!   - **Co-consumption.** Both machines bill one account's session/weekly quota at the
+//!     same time. [`TAIL_MARGIN`] is calibrated for a SINGLE machine's post-swap
+//!     committed tail; two machines' tails stacked on one parked account can exceed it,
+//!     landing the account past its ceiling even when each machine swapped on target.
+//!   - **Per-machine visibility.** The landing check is per-machine — the offline SLI 5
+//!     in [`crate::reliability`] and its runtime mirror [`crate::landing`] (issue #613)
+//!     both only see what THIS daemon observed. A second machine pushing a parked account
+//!     over the ceiling is invisible to them.
+//!
+//! The one guard that DOES cross the boundary is velocity-spike detection (the reactive
+//! arm [`reactive_session_threshold`] and the daemon's projection arm `velocity_swap`):
+//! both read each account's usage from the account-global `/oauth/usage` endpoint, which
+//! already reflects BOTH machines' combined burn, so a co-consumption spike shows up as a
+//! faster-than-modelled climb and can fire an earlier swap. It REDUCES the exposure — it
+//! does not remove it: the committed tail and the shared per-account rate limits still
+//! apply, and two machines can briefly stack usage between polls. Running one roster per
+//! machine avoids the boundary entirely; spanning two treats velocity spikes as the
+//! safety net, not a guarantee.
 
 use std::fs::OpenOptions;
 use std::path::Path;
