@@ -63,7 +63,12 @@ impl SplitMix64 {
     }
 
     /// Advance the state and return the next raw 64-bit output.
-    fn next_u64(&mut self) -> u64 {
+    ///
+    /// `pub(crate)` so the daemon can draw a raw per-process seed from
+    /// [`from_entropy`](Self::from_entropy) for the issue-#612 per-daemon target-selection
+    /// tie-break, and derive a stable per-(seed, index) hash key from it — both want the full
+    /// 64 bits, not the `[0, 1)` float [`Rng::next_unit`] exposes.
+    pub(crate) fn next_u64(&mut self) -> u64 {
         // SplitMix64: a fixed odd increment, then an avalanche finalizer.
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;

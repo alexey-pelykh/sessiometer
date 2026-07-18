@@ -2014,6 +2014,18 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// Jitter RNG seam — process entropy in production, a fixed seed in tests
     /// (`with_seed`) so per-cycle draws are deterministic.
     rng: SplitMix64,
+    /// The per-daemon TARGET-SELECTION seed (issue #612), threaded to
+    /// [`pick_target_ranked`] / [`pick_target_with_reason_ranked`] inside a [`SelectionTiebreak`]
+    /// (built by [`selection_tiebreak`](Self::selection_tiebreak)). `Some` (a
+    /// once-drawn process-entropy value, set at production boot via
+    /// [`with_tiebreak_seed`](Self::with_tiebreak_seed)) activates the enhanced selection: a
+    /// velocity-aware preference then a per-daemon-stable jitter that disperses the cross-machine
+    /// co-selection herd. `None` — the [`new`](Self::new) default, so every hermetic test keeps the
+    /// deterministic pre-#612 soonest-reset + roster-index order — leaves selection velocity-blind
+    /// and un-jittered. A single value held for the daemon's lifetime (NOT re-drawn per tick), so a
+    /// daemon's tie-break order is STABLE across ticks (no selection flapping). Orthogonal to the
+    /// per-cycle [`rng`](Self::rng) jitter and to the downward-only swap-ceiling jitter (issue #609).
+    tiebreak_seed: Option<u64>,
     /// Consecutive non-scope 401s before an account's stored credential is treated
     /// as DEAD and quarantined (issue #42; config `monitor_401_n`, `1..=20`).
     monitor_401_n: u8,
@@ -2187,6 +2199,10 @@ where
             cooldown_base: Duration::from_secs(tunables.cooldown_secs),
             poll_strategy: tunables.poll_strategy,
             rng: SplitMix64::from_entropy(),
+            // Enhanced target selection (issue #612) is OFF by default so every hermetic-test daemon
+            // keeps the deterministic pre-#612 soonest-reset + roster-index order; production opts in
+            // via `with_tiebreak_seed(SplitMix64::from_entropy().next_u64())`.
+            tiebreak_seed: None,
             monitor_401_n: tunables.monitor_401_n,
             monitor_recovery_m: tunables.monitor_recovery_m,
             // No cross-process swap lock by default; production opts in via
@@ -2377,6 +2393,31 @@ where
     pub(crate) fn with_proactive_keep_warm(mut self, enabled: bool) -> Self {
         self.proactive_keep_warm = enabled;
         self
+    }
+
+    /// Arm the per-daemon TARGET-SELECTION seed (issue #612): enable the enhanced selection —
+    /// velocity-aware preference + per-daemon jitter — with `seed` as its stable per-daemon key.
+    /// Production draws a once-per-process entropy value
+    /// (`with_tiebreak_seed(SplitMix64::from_entropy().next_u64())`) so independent daemons over the
+    /// same roster disperse instead of co-selecting one target; left unset (`new`'s `None` default),
+    /// a hermetic-test daemon keeps the deterministic pre-#612 order. Builder-style to mirror
+    /// `with_swap_lock` / `with_config_path` and keep `new`'s args stable. See
+    /// [`tiebreak_seed`](Self::tiebreak_seed).
+    pub(crate) fn with_tiebreak_seed(mut self, seed: u64) -> Self {
+        self.tiebreak_seed = Some(seed);
+        self
+    }
+
+    /// The issue-#612 tie-break inputs, as every live selection site passes them: the retained
+    /// per-account velocity EMAs plus this daemon's seed. One accessor rather than the literal
+    /// repeated at each call site, so a site cannot thread the velocities while forgetting the seed
+    /// (which compiles, and silently drops that path back to the pre-#612 order). Inert until
+    /// production arms the seed — see [`tiebreak_seed`](Self::tiebreak_seed).
+    fn selection_tiebreak(&self) -> SelectionTiebreak<'_> {
+        SelectionTiebreak {
+            velocity: &self.state.session_velocity,
+            seed: self.tiebreak_seed,
+        }
     }
 
     /// Replace the jitter RNG with a deterministically-seeded one — the test seam
@@ -3167,7 +3208,11 @@ where
         }
         // The gate's THIRD condition IS the SLI: a viable swap target — a peer under
         // `target_max_session_usage` (ADR-0013) — chosen exactly as #452's gate would, via the shared
-        // `pick_target` with the BASE (un-jittered) triggers (the same preview `next_swap` uses).
+        // `pick_target` with the BASE (un-jittered) triggers. DELIBERATELY the velocity-blind,
+        // un-jittered projection (issue #612): this asks only WHETHER a viable peer exists, and the
+        // #612 axes re-order the viable set without changing its MEMBERSHIP (they enter the
+        // comparator, never the filters), so they cannot move `.is_some()`. Threading the seed here
+        // would add churn to a measurement that is invariant under it.
         let viable_target = pick_target(
             active_idx,
             readings,
@@ -4052,13 +4097,17 @@ where
         // weekly-exhausted this returns `None`. A disabled account, even with weekly
         // headroom, never counts, so it cannot hold the daemon out of the
         // all-exhausted terminal state (#11).
-        let Some(target_idx) = pick_target(
+        let Some(target_idx) = pick_target_ranked(
             active_idx,
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
             session_trigger,
             weekly_trigger,
+            // Enhanced target selection (issue #612): prefer a lower-velocity peer on a reset tie,
+            // then break a remaining tie by the per-daemon jitter — dispersing the cross-machine
+            // co-selection herd.
+            self.selection_tiebreak(),
         ) else {
             // No viable target — every other account is weekly-exhausted, session-
             // saturated (over the always-on session gate), or over the default-on floor.
@@ -4836,7 +4885,7 @@ where
             WEEKLY_TRIGGER_PCT_LO,
             WEEKLY_TRIGGER_PCT_HI,
         ) / 100.0;
-        let Some(target_idx) = pick_target(
+        let Some(target_idx) = pick_target_ranked(
             active_idx,
             readings,
             &self.enabled_mask(),
@@ -4853,6 +4902,9 @@ where
             // escape even to an account over the session trigger.
             f64::INFINITY,
             weekly_trigger,
+            // Enhanced selection (issue #612): even in escape, disperse two dead-active daemons off
+            // one target and prefer a calmer peer.
+            self.selection_tiebreak(),
         ) else {
             // No live spare to escape to — the dead active is STRANDED (issue #405). The
             // reserve and the session gate were both bypassed above, so reaching here means
@@ -5064,17 +5116,20 @@ where
         // already logged a no-viable-target episode; fall through to the historical skip (never
         // swap among saturated / exhausted peers).
         //
-        // `pick_target_with_reason` rather than `pick_target` (issue #582): selection is IDENTICAL
-        // (the index-only projection just discards the reason), but the RETAINED reason carries the
-        // viable-set cardinality the reserve breaker below needs — so the #452 path picks exactly
-        // the target it always did, and #582 reads the count without a second, driftable filter.
-        let Some((target_idx, target_reason)) = pick_target_with_reason(
+        // `pick_target_with_reason_ranked` rather than `pick_target_ranked` (issue #582): selection
+        // is IDENTICAL (the index-only projection just discards the reason), but the RETAINED reason
+        // carries the viable-set cardinality the reserve breaker below needs — read without a second,
+        // driftable filter. The enhanced #612 axes (velocity + per-daemon jitter) apply here exactly
+        // as they do to `next_swap`'s preview (same daemon seed), so the fired target still matches
+        // the surfaced one; the reserve breaker keys off cardinality, which the tie-break never moves.
+        let Some((target_idx, target_reason)) = pick_target_with_reason_ranked(
             active_idx,
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
             self.session_trigger_base,
             self.weekly_trigger_base,
+            self.selection_tiebreak(),
         ) else {
             return TickAction::SkippedActiveUnavailable;
         };
@@ -5345,13 +5400,17 @@ where
         // (NOT the emergency `None` bypass). The SAME jittered triggers the reactive path used, so the
         // projective peer selects exactly as the reactive swap it front-runs would. None → hold (never
         // swap among saturated / exhausted peers; the reactive path owns the all-exhausted signal).
-        let Some(target_idx) = pick_target(
+        let Some(target_idx) = pick_target_ranked(
             active_idx,
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
             session_trigger,
             weekly_trigger,
+            // Enhanced target selection (issue #612), same as the reactive path this front-runs, so
+            // the projective peer selects exactly as the swap it precedes: velocity-preferred + herd-
+            // dispersed.
+            self.selection_tiebreak(),
         ) else {
             return TickAction::Held;
         };
@@ -5459,13 +5518,16 @@ where
             WEEKLY_TRIGGER_PCT_LO,
             WEEKLY_TRIGGER_PCT_HI,
         ) / 100.0;
-        let target_idx = pick_target(
+        let target_idx = pick_target_ranked(
             active.unwrap_or(usize::MAX),
             readings,
             &self.enabled_mask(),
             None,
             f64::INFINITY,
             weekly_trigger,
+            // Enhanced selection (issue #612): disperse the fleet-locked scrub-recovery target and
+            // prefer a calmer peer.
+            self.selection_tiebreak(),
         )?;
 
         // Install the target into the scrubbed canonical, lock-wrapped (#64). SAFETY holds inside the
@@ -5500,18 +5562,22 @@ where
     }
 
     /// The forward-looking next-swap candidate for the `status` display (issue #88):
-    /// who [`pick_target`] would choose right now, or why there is no candidate. THE
-    /// candidate is computed daemon-side — the CLI never re-derives the selection rule
-    /// (it cannot: the wire carries only rounded percents, not the raw `Usage` /
-    /// `target_max_session_usage` / triggers `pick_target` consumes). Uses the BASE (un-jittered)
-    /// session and weekly triggers ([`Self::session_trigger_base`],
-    /// [`Self::weekly_trigger_base`]) — the same thresholds the snapshot's per-account
-    /// exhaustion flags key off — so the candidate and the displayed exhaustion state
-    /// can never disagree, and the candidate does not flicker with the per-cycle
-    /// swap-decision jitter.
+    /// who the daemon's live selection would choose right now, or why there is no
+    /// candidate. THE candidate is computed daemon-side — the CLI never re-derives the
+    /// selection rule (it cannot: the wire carries only rounded percents, not the raw
+    /// `Usage` / `target_max_session_usage` / triggers the selection consumes). Runs the
+    /// SAME enhanced selection as the live swap paths (issue #612: velocity-preferred,
+    /// then per-daemon jittered, off this daemon's seed) so the surfaced candidate matches
+    /// what the daemon would actually promote. Uses the BASE (un-jittered) session and
+    /// weekly triggers ([`Self::session_trigger_base`], [`Self::weekly_trigger_base`]) —
+    /// the same thresholds the snapshot's per-account exhaustion flags key off — so the
+    /// candidate and the displayed exhaustion state can never disagree, and the candidate
+    /// does not flicker with the per-cycle swap-decision jitter. The #612 seed is likewise
+    /// fixed per daemon and adds no flicker; its velocity axis, however, DOES track the
+    /// retained EMAs — see the call site below for what that legitimately moves.
     ///
     /// `None` only when there is no active account to swap FROM (no anchor). Otherwise
-    /// the three cases mirror `pick_target`'s verdict: a viable [`NextSwap::Target`]; a
+    /// the three cases mirror the selection's verdict: a viable [`NextSwap::Target`]; a
     /// [`NextSwap::NoViableTarget`] when readings are in hand but none qualifies (or no
     /// other enabled, non-quarantined account exists at all); and
     /// [`NextSwap::AwaitingData`] for the post-restart moment when such an account exists
@@ -5519,13 +5585,20 @@ where
     fn next_swap(&self, active: Option<usize>, readings: &[Option<Usage>]) -> Option<NextSwap> {
         let active_idx = active?;
         let enabled = self.enabled_mask();
-        if let Some((target, reason)) = pick_target_with_reason(
+        if let Some((target, reason)) = pick_target_with_reason_ranked(
             active_idx,
             readings,
             &enabled,
             Some(self.target_max_session_usage),
             self.session_trigger_base,
             self.weekly_trigger_base,
+            // The same enhanced #612 selection (velocity + per-daemon jitter) the live swap paths
+            // use, so the surfaced candidate matches what the daemon would pick from these readings.
+            // The per-daemon SEED is fixed, so — like the base triggers above — it contributes no
+            // flicker; the velocity axis does TRACK the EMAs, so a reset-tied pair whose velocities
+            // cross can legitimately move the surfaced candidate between ticks (a real change in the
+            // better landing, not jitter noise).
+            self.selection_tiebreak(),
         ) {
             // Carry the daemon's own selection rationale (issue #393) alongside the label, so the
             // panel + `sessiometer status` render the reason the daemon actually used rather than a
@@ -5599,7 +5672,7 @@ where
     /// from the authoritative swap state (the tick has none of its own):
     ///
     ///   - the **active** account (the live session's credential — never touch it), and
-    ///   - the **imminent swap target** ([`pick_target`]'s current choice, the same account
+    ///   - the **imminent swap target** (the live selection's current choice, the same account
     ///     `next_swap` shows): a swap that promotes it reads its stash WITHOUT rewriting it
     ///     (#6), so the engine's CAS re-stash cannot observe the promotion (#102) — exclude it
     ///     ahead of time. The mid-swap window itself is covered by the swap lock the engine
@@ -5621,16 +5694,23 @@ where
         if let Some(active) = self.state.active {
             excluded.push(self.roster[active].account_uuid.clone());
             // The imminent swap target from the latest carried readings — the same selection
-            // `next_swap` surfaces. `pick_target` already excludes the active account.
+            // `next_swap` surfaces (enhanced #612 axes, same per-daemon seed). A BEST-EFFORT
+            // prediction, never a guarantee: this runs on POST-tick state, so any input that moves
+            // before the next tick's `decide` — a changed reading or viable set, and since #612 a
+            // reset-tied pair whose velocity EMAs cross — can promote a peer this did not exclude.
+            // That residual is what the swap lock covers (#64/#102, per this fn's docs: "the mid-swap
+            // window itself is covered by the swap lock"); excluding the predictable target only
+            // narrows the exposure. `pick_target_ranked` already excludes the active account.
             let readings = self.decision_readings(Some(active));
             let enabled = self.enabled_mask();
-            if let Some(target) = pick_target(
+            if let Some(target) = pick_target_ranked(
                 active,
                 &readings,
                 &enabled,
                 Some(self.target_max_session_usage),
                 self.session_trigger_base,
                 self.weekly_trigger_base,
+                self.selection_tiebreak(),
             ) {
                 excluded.push(self.roster[target].account_uuid.clone());
             }
@@ -6742,13 +6822,81 @@ fn pick_target(
     .map(|(i, _)| i)
 }
 
+/// The issue-#612 enhanced-selection inputs threaded into [`pick_target_ranked`] /
+/// [`pick_target_with_reason_ranked`] beyond the base viability + #37 arguments. Bundled into one
+/// struct so the ranked selectors stay within the repo's 7-argument clippy bound (this repo never
+/// `#[allow]`s `too_many_arguments`).
+#[derive(Clone, Copy)]
+struct SelectionTiebreak<'a> {
+    /// Per-account retained session-velocity EMA (issue #539), indexed in lockstep with `readings`;
+    /// `&[]` — or any absent slot — reads as "no observed climb" (see [`velocity_rate`]).
+    velocity: &'a [Option<VelocityEma>],
+    /// The per-daemon selection seed (see [`Daemon::tiebreak_seed`]). `Some` activates BOTH enhanced
+    /// axes (velocity preference, then per-daemon jitter); `None` degrades selection to exactly the
+    /// pre-#612 soonest-reset + roster-index order (velocity ignored, un-jittered).
+    seed: Option<u64>,
+}
+
+/// Like [`pick_target`], but velocity-aware and per-daemon jittered (issue #612): the index-only
+/// projection of [`pick_target_with_reason_ranked`]. A `None` [`SelectionTiebreak::seed`] degrades
+/// to exactly [`pick_target`].
+fn pick_target_ranked(
+    active: usize,
+    readings: &[Option<Usage>],
+    enabled: &[bool],
+    floor: Option<f64>,
+    session_trigger: f64,
+    weekly_trigger: f64,
+    sel: SelectionTiebreak,
+) -> Option<usize> {
+    pick_target_with_reason_ranked(
+        active,
+        readings,
+        enabled,
+        floor,
+        session_trigger,
+        weekly_trigger,
+        sel,
+    )
+    .map(|(i, _)| i)
+}
+
+/// The retained session-velocity EMA rate (issue #612) for roster account `idx`, or `0.0` when there
+/// is no TRUSTED signal — the slot is absent (`None`, or an out-of-range / empty slice, as the
+/// un-jittered projection passes `&[]`), OR its EMA is not yet SUSTAINED
+/// ([`samples`](VelocityEma::samples) `< MIN_VELOCITY_SAMPLES`). Gating on sustained-ness mirrors the
+/// #539 projective trigger: a single-sample spike is noise, so it reads as "no observed climb"
+/// rather than deprioritising a target on one unstable interval. A missing/untrusted signal thus
+/// treats an un-warmed or just-reset account as the safest (lowest-velocity) landing rather than
+/// penalising it for lack of data. See [`VelocityEma`].
+fn velocity_rate(velocity: &[Option<VelocityEma>], idx: usize) -> f64 {
+    velocity
+        .get(idx)
+        .copied()
+        .flatten()
+        .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
+        .map_or(0.0, |v| v.rate)
+}
+
+/// A per-(daemon seed, roster index) tie-break key (issue #612): decorrelate the index into the
+/// seed with the [`SplitMix64`] golden-ratio odd increment, then avalanche it. Stable for a fixed
+/// seed (so a daemon's selection never flaps across ticks) and well-distributed across seeds (so two
+/// daemons over the same roster disperse instead of herding onto one co-selected target). Reuses the
+/// existing jitter PRNG — no new dependency, so `cargo deny` stays green.
+fn selection_tiebreak_key(seed: u64, index: usize) -> u64 {
+    SplitMix64::new(seed.wrapping_add((index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)))
+        .next_u64()
+}
+
 /// Like [`pick_target`], but also returns WHY the winner was chosen ([`NextSwapReason`], issue
 /// #393) — the rationale [`Daemon::next_swap`] carries on the wire so the panel + `sessiometer
-/// status` render the ONE reason the daemon actually used. Selection is IDENTICAL to
-/// [`pick_target`] (same viability filters, same #37 soonest-weekly-reset `min_by_key`); this
-/// variant merely RETAINS the sort axis instead of discarding it. Kept as the shared core (rather
-/// than re-deriving the reason in `next_swap`) so the filter set can never drift between the
-/// selection and its stated reason.
+/// status` render the ONE reason the daemon actually used. The un-jittered, velocity-blind
+/// projection: exactly [`pick_target_with_reason_ranked`] with no velocity signal and no per-daemon
+/// seed, so it keeps the pre-#612 soonest-reset + roster-index order — the standing measurement the
+/// blind-gate SLI (via [`pick_target`]) and the unit tests want. The `status` preview is NO LONGER a
+/// consumer: since #612 `next_swap` runs the enhanced selection, so that what it surfaces is what the
+/// daemon would promote. Kept as the shared core (rather than re-deriving the reason in
+/// `next_swap`) so the filter set can never drift between the selection and its stated reason.
 fn pick_target_with_reason(
     active: usize,
     readings: &[Option<Usage>],
@@ -6756,6 +6904,66 @@ fn pick_target_with_reason(
     floor: Option<f64>,
     session_trigger: f64,
     weekly_trigger: f64,
+) -> Option<(usize, NextSwapReason)> {
+    pick_target_with_reason_ranked(
+        active,
+        readings,
+        enabled,
+        floor,
+        session_trigger,
+        weekly_trigger,
+        SelectionTiebreak {
+            velocity: &[],
+            seed: None,
+        },
+    )
+}
+
+/// The single source of selection truth (issue #612): [`pick_target_with_reason`] extended with the
+/// two enhanced-selection axes, applied ONLY when [`sel.seed`](SelectionTiebreak::seed) is `Some`
+/// (a live per-daemon seed).
+///
+/// The viability FILTER and the dominant #37 axis are UNCHANGED — a known weekly reset sorts ahead
+/// of an unknown one, then by soonest reset epoch. Two axes refine a tie AMONG equally-soon targets,
+/// in order:
+///
+/// 1. **Velocity**: prefer the target with the LOWER retained session-velocity EMA (`velocity`,
+///    indexed in lockstep with `readings`) — a steeply-climbing peer would re-trip
+///    [`swap::decide`]'s session dimension soon after a swap TO it (a wasted swap + near-term
+///    re-swap), so a calmer peer with the same time-to-reset is the better landing. An absent signal
+///    reads as `0.0` (see [`velocity_rate`]).
+/// 2. **Per-daemon jitter**: break a remaining tie by a per-daemon-stable hashed order
+///    ([`selection_tiebreak_key`]) instead of roster index, so two daemons over the same roster —
+///    which see identical server-side `weekly_resets_at` and would otherwise deterministically
+///    co-select and hammer ONE target — disperse. Stable within a daemon (fixed seed), so the jitter
+///    itself never flaps across ticks (the velocity axis above legitimately tracks its EMAs).
+///
+/// Dispersal is BOUNDED to the tie case by design: where one account holds a strictly-soonest reset,
+/// every daemon still co-selects it — #37 dominance is preserved above. That is exactly the herd the
+/// issue describes (independent daemons reading the same server-side `weekly_resets_at`), so the
+/// jitter engages precisely where the collision arises and never at the cost of the #37 axis. It
+/// lowers the PROBABILITY of co-selection; it does not fix the 2×-billing case where two machines are
+/// already on one account (that is the shared-signal velocity mitigation, tracked separately).
+///
+/// The final fallback stays the earliest roster index, so selection is always total + deterministic.
+/// With [`sel.seed`](SelectionTiebreak::seed) `None` BOTH axes are skipped and this is byte-identical
+/// to the pre-#612 behaviour
+/// — the contract the un-jittered projection and every existing selection test rely on. Distinct
+/// from the downward-only swap-CEILING jitter (issue #609): that perturbs the fire THRESHOLD; this
+/// perturbs the target CHOICE among tied candidates.
+///
+/// The reason is computed from the WINNER exactly as before: velocity / jitter are sub-tie-breaks
+/// WITHIN a reset-axis class, never a new axis, so the wire [`NextSwapReason`] set is unchanged (a
+/// velocity/jitter-broken reset tie is still `SoonestReset`; a positional choice among unknown-reset
+/// targets is still `RosterOrder`, the per-daemon key just refining it before roster index).
+fn pick_target_with_reason_ranked(
+    active: usize,
+    readings: &[Option<Usage>],
+    enabled: &[bool],
+    floor: Option<f64>,
+    session_trigger: f64,
+    weekly_trigger: f64,
+    sel: SelectionTiebreak,
 ) -> Option<(usize, NextSwapReason)> {
     // The viable set — the same exclusions `pick_target` applies (issue #11/#36/#37, the
     // always-on session anti-thrash gate, the opt-in `floor`), collected so its CARDINALITY can
@@ -6775,18 +6983,36 @@ fn pick_target_with_reason(
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         .collect();
     let candidate_count = viable.len();
-    // Soonest weekly reset (issue #37). The key sorts a known reset ahead of an
-    // unknown one (`false` < `true`), then by the reset epoch ascending;
-    // `min_by_key` keeps the first of equal keys, so an exact tie — or an
-    // all-unknown field — falls to the earliest roster index, matching
-    // [`soonest_weekly_reset`]'s tie-break (#11).
-    let (idx, usage) =
-        viable
-            .into_iter()
-            .min_by_key(|&(_, usage)| match usage.weekly_resets_at {
-                Some(resets_at) => (false, resets_at),
-                None => (true, i64::MAX),
-            })?;
+    // Soonest weekly reset (issue #37) is the DOMINANT axis: a known reset sorts ahead of an
+    // unknown one (`false` < `true`), then by the reset epoch ascending. Issue #612 refines a tie
+    // AMONG equally-soon targets — first by velocity (lower retained session-velocity EMA), then by
+    // a per-daemon jitter key — with the earliest roster index the final fallback (matching
+    // [`soonest_weekly_reset`]'s tie-break, #11, when the enhanced axes also tie or are inactive).
+    // Both #612 axes are inert unless `sel.seed` is `Some`, so the un-jittered projection keeps the
+    // exact pre-#612 order. `min_by` keeps the first of equal-comparing elements, but the roster-
+    // index step is a strict order over distinct indices, so the winner is always unique.
+    let (idx, usage) = viable.into_iter().min_by(|&(a_idx, a), &(b_idx, b)| {
+        let a_reset = a.weekly_resets_at.map_or((true, i64::MAX), |r| (false, r));
+        let b_reset = b.weekly_resets_at.map_or((true, i64::MAX), |r| (false, r));
+        a_reset
+            .cmp(&b_reset)
+            // Both #612 axes, gated ONCE on the per-daemon seed: velocity first (a lower retained
+            // session-velocity EMA wins a reset tie — a steep climber would re-trip the session
+            // dimension soon after a swap TO it), then the jitter key to disperse the cross-machine
+            // co-selection herd on a remaining tie (a fixed per-daemon seed keeps it stable across
+            // ticks). `None` is the legacy path: both inert, straight to the roster index below.
+            .then_with(|| match sel.seed {
+                Some(seed) => velocity_rate(sel.velocity, a_idx)
+                    .total_cmp(&velocity_rate(sel.velocity, b_idx))
+                    .then_with(|| {
+                        selection_tiebreak_key(seed, a_idx)
+                            .cmp(&selection_tiebreak_key(seed, b_idx))
+                    }),
+                None => std::cmp::Ordering::Equal,
+            })
+            // The earliest roster index — the pre-#612 tie-break, and the only one legacy uses.
+            .then_with(|| a_idx.cmp(&b_idx))
+    })?;
     // The reason names the axis that ACTUALLY discriminated the winner — never a rule the daemon
     // did not apply (that inversion is the #393 bug itself). Three genuinely distinct states.
     let reason = if candidate_count < 2 {
@@ -6798,8 +7024,10 @@ fn pick_target_with_reason(
         NextSwapReason::SoonestReset { resets_at }
     } else {
         // ≥2 viable, and the winner reported NO reset — a `Some` would have sorted ahead of it, so
-        // NONE did. No reset-time tiebreak existed; the earliest roster index won. Reporting
-        // `OnlyCandidate` here would assert "only viable target" while other targets were viable.
+        // NONE did. No reset-time tiebreak existed; a positional tie-break won (roster index, or —
+        // under enhanced selection — the per-daemon jitter key ahead of it: still positional, not a
+        // reset axis). Reporting `OnlyCandidate` here would assert "only viable target" while other
+        // targets were viable; `SoonestReset` would fabricate an epoch none of them carried.
         NextSwapReason::RosterOrder
     };
     Some((idx, reason))
@@ -8307,6 +8535,206 @@ mod tests {
         ];
         let enabled = [true, true, false];
         assert_eq!(pick_target(0, &readings, &enabled, None, SESS, WK), None);
+    }
+
+    // --- pick_target_ranked: velocity-aware + per-daemon jitter (pure, #612) ----------
+
+    /// A reading builder for the #612 selection tests — `session`, `weekly`, and the weekly reset;
+    /// the session reset is always absent (these tests never key off it).
+    fn ranked_reading(session: f64, weekly: f64, weekly_resets_at: Option<i64>) -> Option<Usage> {
+        Some(Usage {
+            session,
+            weekly,
+            weekly_resets_at,
+            session_resets_at: None,
+        })
+    }
+
+    /// A retained velocity EMA for the #612 selection tests. `samples` is explicit because it is
+    /// load-bearing: at or above [`MIN_VELOCITY_SAMPLES`] the rate is TRUSTED and the velocity axis
+    /// acts on it; below, `velocity_rate` reads it as no signal.
+    fn ema(rate: f64, samples: u32) -> Option<VelocityEma> {
+        Some(VelocityEma { rate, samples })
+    }
+
+    /// [`pick_target_ranked`] with the frame every #612 case shares held fixed — account 0 active,
+    /// the 0.80 reserve floor (ADR-0013), the base triggers — so each call shows only its
+    /// discriminator: the readings, the velocity EMAs, and the per-daemon seed (`None` = the legacy,
+    /// velocity-blind, un-jittered path).
+    fn pick_ranked(
+        readings: &[Option<Usage>],
+        velocity: &[Option<VelocityEma>],
+        seed: Option<u64>,
+    ) -> Option<usize> {
+        pick_target_ranked(
+            0,
+            readings,
+            &all_on(readings),
+            Some(0.80),
+            SESS,
+            WK,
+            SelectionTiebreak { velocity, seed },
+        )
+    }
+
+    /// Two viable targets tied on their weekly reset ("headroom is close") but climbing at different
+    /// session velocities: the enhanced #612 selection prefers the CALMER (lower-velocity) one, since
+    /// a steeply-climbing peer would re-trip the session dimension soon after a swap TO it. Velocity
+    /// outranks the jitter, so the choice is seed-independent — and the un-jittered projection is
+    /// velocity-blind (keeps the pre-#612 roster-order winner).
+    #[test]
+    fn pick_target_prefers_lower_velocity_when_headroom_is_close() {
+        // "Headroom is close" (the issue's framing, and this test's AC-pinned name) is modelled
+        // literally: indices 1 and 2 carry IDENTICAL headroom (0.30 session / 0.20 weekly) and reset
+        // at the same instant (200), so every axis above velocity ties and velocity is what
+        // mechanically discriminates. Roster order — and the legacy path — would take index 1.
+        let readings = vec![
+            ranked_reading(0.97, 0.10, Some(100)), // active (excluded)
+            ranked_reading(0.30, 0.20, Some(200)), // tied reset, steep climber
+            ranked_reading(0.30, 0.20, Some(200)), // tied reset, gentle climber → better landing
+        ];
+        let velocity = [None, ema(0.010, 3), ema(0.001, 3)];
+        // Velocity outranks the jitter, so the calmer index 2 wins for EVERY seed.
+        for seed in [1_u64, 7, 4242, u64::MAX] {
+            assert_eq!(
+                pick_ranked(&readings, &velocity, Some(seed)),
+                Some(2),
+                "lower velocity wins the reset tie, independent of the daemon seed {seed}",
+            );
+        }
+        // Legacy (no seed) is velocity-blind → the pre-#612 roster-index winner (index 1).
+        assert_eq!(pick_ranked(&readings, &velocity, None), Some(1));
+        // The winner still won on the (tied) soonest reset — velocity is a sub-tie-break WITHIN that
+        // axis, so the wire reason is unchanged.
+        assert_eq!(
+            pick_target_with_reason_ranked(
+                0,
+                &readings,
+                &all_on(&readings),
+                Some(0.80),
+                SESS,
+                WK,
+                SelectionTiebreak {
+                    velocity: &velocity,
+                    seed: Some(9),
+                },
+            ),
+            Some((2, NextSwapReason::SoonestReset { resets_at: 200 })),
+        );
+    }
+
+    /// Two viable targets tied on BOTH reset and velocity: only the per-daemon jitter can break the
+    /// tie, so across a range of daemon seeds the winner is NOT always the same account — the herd
+    /// disperses (two daemons over the same roster no longer converge on one co-selected target). The
+    /// un-jittered legacy path, by contrast, is the deterministic roster-order pick.
+    #[test]
+    fn pick_target_jitter_disperses_the_co_selection_herd_across_daemon_seeds() {
+        let readings = vec![
+            ranked_reading(0.97, 0.10, Some(100)), // active (excluded)
+            ranked_reading(0.20, 0.20, Some(200)),
+            ranked_reading(0.20, 0.20, Some(200)),
+        ];
+        // No velocity signal anywhere (`&[]`) → the velocity axis ties (0.0 == 0.0), so ONLY the
+        // per-daemon jitter can break the reset tie.
+        let winners: std::collections::BTreeSet<usize> = (0..24_u64)
+            .map(|s| pick_ranked(&readings, &[], Some(s)).expect("a viable target exists"))
+            .collect();
+        assert!(
+            winners.len() > 1,
+            "per-daemon jitter must disperse the herd: over 24 seeds the winner was always {winners:?}",
+        );
+        assert!(
+            winners.iter().all(|&i| i == 1 || i == 2),
+            "only the two tied candidates can win: {winners:?}",
+        );
+        // Legacy (no seed) never disperses — the deterministic roster-order pick.
+        assert_eq!(pick_ranked(&readings, &[], None), Some(1));
+    }
+
+    /// A daemon's tie-break is STABLE: for a fixed seed the same tied set yields the same winner on
+    /// every call (successive ticks), and an unrelated reading drift elsewhere never moves it — so
+    /// the jitter disperses ACROSS daemons without flapping WITHIN one.
+    #[test]
+    fn pick_target_jitter_is_stable_within_a_daemon_across_ticks() {
+        // The tied winner set (index 1, 2) plus a fourth, later-reset viable account whose reading
+        // drifts across "ticks" but can never enter the tied set.
+        let make = |drift: f64| {
+            vec![
+                ranked_reading(0.97, 0.10, Some(100)), // active (excluded)
+                ranked_reading(0.20, 0.20, Some(200)),
+                ranked_reading(0.20, 0.20, Some(200)),
+                ranked_reading(drift, 0.20, Some(500)),
+            ]
+        };
+        let seed = Some(0x00C0_FFEE_u64);
+        let pick = |readings: &[Option<Usage>]| pick_ranked(readings, &[], seed);
+        let first = pick(&make(0.10));
+        assert!(matches!(first, Some(1) | Some(2)));
+        // Repeated ticks with the same seed + same tied set → identical winner (no flapping)…
+        for _ in 0..5 {
+            assert_eq!(
+                pick(&make(0.10)),
+                first,
+                "same daemon seed must not flap the winner across ticks",
+            );
+        }
+        // …and an unrelated reading drift elsewhere never moves the tie-break winner.
+        assert_eq!(
+            pick(&make(0.55)),
+            first,
+            "an unrelated reading change must not move the per-daemon tie-break winner",
+        );
+    }
+
+    /// Neither #612 axis disturbs the dominant #37 soonest-reset rule: a strictly-sooner reset wins
+    /// even when it is the STEEPER-climbing account, and across every daemon seed — velocity and
+    /// jitter only ever break a reset TIE, never re-order distinct resets.
+    #[test]
+    fn pick_target_enhanced_axes_never_override_a_strictly_sooner_reset() {
+        let readings = vec![
+            ranked_reading(0.97, 0.10, Some(100)), // active (excluded)
+            ranked_reading(0.30, 0.20, Some(200)), // soonest viable — but steep
+            ranked_reading(0.30, 0.20, Some(500)), // flat, but resets LATER
+        ];
+        let velocity = [
+            None,
+            ema(0.050, 4), // index 1 climbing FAST…
+            ema(0.000, 4), // …index 2 flat, but resets later
+        ];
+        for seed in [0_u64, 3, 88, u64::MAX] {
+            assert_eq!(
+                pick_ranked(&readings, &velocity, Some(seed)),
+                Some(1),
+                "the strictly-soonest reset wins regardless of velocity or the seed {seed}",
+            );
+        }
+    }
+
+    /// An UN-sustained velocity — a single-sample spike (`samples < MIN_VELOCITY_SAMPLES`) — reads as
+    /// no signal (0.0), mirroring the #539 gate, so it does NOT deprioritise a target on one unstable
+    /// interval: a reset tie against a zero-velocity sibling falls through to the jitter and
+    /// disperses, exactly as if the spike were absent (a trusted spike would instead force the
+    /// zero-velocity sibling to win for every seed).
+    #[test]
+    fn pick_target_ignores_an_unsustained_velocity_spike() {
+        let readings = vec![
+            ranked_reading(0.97, 0.10, Some(100)), // active (excluded)
+            ranked_reading(0.30, 0.20, Some(200)), // steep, but only ONE sample → untrusted
+            ranked_reading(0.30, 0.20, Some(200)), // no signal
+        ];
+        // One sample only — BELOW `MIN_VELOCITY_SAMPLES`, so the rate is untrusted.
+        let spike = [None, ema(0.050, 1), None];
+        let winners: std::collections::BTreeSet<usize> = (0..24_u64)
+            .map(|s| pick_ranked(&readings, &spike, Some(s)).expect("a viable target exists"))
+            .collect();
+        assert!(
+            winners.contains(&1),
+            "an unsustained spike must not force index 1 out of the winning set: {winners:?}",
+        );
+        assert!(
+            winners.len() > 1,
+            "with the spike ignored the tie disperses via jitter: {winners:?}",
+        );
     }
 
     // --- soonest_weekly_reset (pure, #11) ---------------------------------
@@ -19019,6 +19447,94 @@ mod tests {
         assert!(!excluded.contains(&"u-D".to_owned()));
         // The dead account is reported for the RESTORE path instead (#106).
         assert_eq!(quarantined, vec!["u-C".to_owned()]);
+    }
+
+    /// Issue #612 arming: the enhanced selection is OFF until a `tiebreak_seed` is set, and setting
+    /// it is what turns it on. That is the invariant the whole gating design rests on — `Daemon::new`
+    /// leaves it `None`, so every hermetic daemon test keeps the deterministic pre-#612 order, and
+    /// production opts in explicitly (`cli.rs`, one entropy draw per process). Asserted THROUGH
+    /// `refresh_exclusions`, a real consumer of the selection, so it pins the field being threaded
+    /// and consumed — not merely stored.
+    ///
+    /// The `cli.rs` arming line itself sits inside the runtime `run` entry (real keychain, poller
+    /// and socket) and is no more unit-reachable than its sibling `with_refresh_enabled` /
+    /// `with_systemic_failure_n` calls in the same builder chain; this pins the switch those flip.
+    #[tokio::test]
+    async fn tiebreak_seed_is_unarmed_by_default_and_arms_the_enhanced_selection() {
+        // `spare` and `backup` TIE on their weekly reset (200), so #37's dominant axis cannot
+        // separate them and the tie-break decides. `backup` is the calmer climber, so the enhanced
+        // selection lands there while the legacy path keeps roster order (`spare`).
+        async fn tied_pair_daemon() -> (tempfile::TempDir, FakeDaemon) {
+            let roster = vec![
+                account("u-A", "work"),   // active
+                account("u-B", "spare"),  // tied reset, steep climber
+                account("u-C", "backup"), // tied reset, gentle climber
+            ];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+                ("Sessiometer/u-C", b"C-token", "u-C"),
+            ])
+            .await;
+            let (dir, json) = claude_json("u-A");
+            let tun = tunables(95, 80, 0); // target-max-session-usage 0.80
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                FakeRosterPoller::new(),
+                store,
+                stash,
+                FakeClock::frozen(),
+                json,
+                &tun,
+            );
+            daemon.state.active = Some(0);
+            daemon.state.last_readings = vec![
+                Some(Usage {
+                    session: 0.97,
+                    weekly: 0.10,
+                    weekly_resets_at: Some(100), // soonest overall — but it is the active account
+                    session_resets_at: None,
+                }),
+                Some(Usage {
+                    session: 0.50, // below the 0.80 floor -> viable
+                    weekly: 0.10,
+                    weekly_resets_at: Some(200), // tied…
+                    session_resets_at: None,
+                }),
+                Some(Usage {
+                    session: 0.50, // also viable…
+                    weekly: 0.10,
+                    weekly_resets_at: Some(200), // …tied, so the tie-break decides
+                    session_resets_at: None,
+                }),
+            ];
+            daemon.state.session_velocity = vec![None, ema(0.010, 3), ema(0.001, 3)];
+            (dir, daemon)
+        }
+
+        // Unarmed — `Daemon::new`'s default. The reset tie falls through to roster order exactly as
+        // it did pre-#612: `spare` wins despite climbing ten times faster than `backup`.
+        let (_dir, unarmed) = tied_pair_daemon().await;
+        assert_eq!(
+            unarmed.tiebreak_seed, None,
+            "new() must leave the enhanced selection OFF — every hermetic daemon test depends on it"
+        );
+        assert_eq!(
+            unarmed.refresh_exclusions(),
+            vec!["u-A".to_owned(), "u-B".to_owned()]
+        );
+
+        // Armed — what production does. The velocity axis engages and prefers the calmer `backup`,
+        // so the seed demonstrably reaches the selection rather than sitting unread on the daemon.
+        let (_dir, armed) = tied_pair_daemon().await;
+        let armed = armed.with_tiebreak_seed(0x5EED);
+        assert_eq!(armed.tiebreak_seed, Some(0x5EED));
+        assert_eq!(
+            armed.refresh_exclusions(),
+            vec!["u-A".to_owned(), "u-C".to_owned()],
+            "an armed daemon must take the enhanced path"
+        );
     }
 
     #[test]
