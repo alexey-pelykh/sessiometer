@@ -119,8 +119,10 @@ const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// the #539 velocity-projection trigger added the `projected_swap_overshoot` + `false_projection`
 /// objects; bumped `3 → 4` when the #595 landing-point SLI added the `landing` object — every
 /// bump ADDITIVE (always-present new fields), so a `--json` consumer of the #363 acceptance gate
-/// that ignores unknown fields still parses every prior field unchanged.
-const JSON_SCHEMA_VERSION: u32 = 4;
+/// that ignores unknown fields still parses every prior field unchanged; bumped `4 → 5` when the
+/// #608 observed session-velocity SLI added the `observed_peak` object (the live peak vs the assumed
+/// `v_peak` the coupling bound is calibrated on) — additive, same as every prior bump.
+const JSON_SCHEMA_VERSION: u32 = 5;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -327,6 +329,13 @@ struct Inputs {
     /// (`active_at != acct`). All four revival paths count — re-activation is not swap-reason- or
     /// swap-kind-specific.
     reactivations: Vec<Reactivation>,
+    /// Every observed POSITIVE `session_pct_per_min` from an `event=usage_velocity` line (issue
+    /// #608) — the live session-climb distribution the assumed peak constant
+    /// (`swap::V_PEAK_SESSION_PCT_PER_MIN`) is measured against. Roster-wide (no per-account split,
+    /// like every other SLI here); negatives (window resets) and malformed values are dropped at
+    /// parse. Keeps the constant honest: when the real peak outruns it, the `v_peak` coupling bound
+    /// is silently too loose, exactly as `TAIL_MARGIN` is kept honest by the #595 landing SLI.
+    session_velocities: Vec<f64>,
 }
 
 /// Record a re-activation edge (issue #595): the account named by `{acct_field}=` on this log line
@@ -496,6 +505,23 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
             Some("canonical_recovered") => {
                 record_reactivation_edge(&mut inputs, &fields, "account")
             }
+            // The observed session-velocity distribution (issue #608): every `usage_velocity` line
+            // carries the account's climb rate between its last two readings, already normalized to
+            // %/min by the emitter (issue #449). NEGATIVE rates are dropped: a negative delta is a
+            // session-window RESET (usage fell because the 5 h window rolled), not a climb — folding
+            // it in would drag the distribution down and understate the peak this SLI exists to
+            // catch. Zero is likewise not a climb, and the emitter is already silent on a flat
+            // account, so the filter is `> 0`. A malformed value is dropped (the tolerant-drop
+            // precedent the sibling arms use), never defaulted to 0.
+            Some("usage_velocity") => {
+                if let Some(rate) = fields
+                    .get("session_pct_per_min")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                {
+                    inputs.session_velocities.push(rate);
+                }
+            }
             _ => {}
         }
     }
@@ -589,6 +615,40 @@ impl Landing {
     /// here too.
     fn p100_met(&self) -> Option<bool> {
         self.p100.map(|v| v < SLO_SWAP_P100_MAX)
+    }
+}
+
+/// The observed session-velocity distribution SLI (issue #608): the live `session_pct_per_min`
+/// percentiles, measured against the assumed peak constant [`crate::swap::V_PEAK_SESSION_PCT_PER_MIN`]
+/// that the `v_peak` coupling bound ([`crate::swap::peak_runway_reserve_bound`]) is calibrated on.
+/// Its job is to keep that constant HONEST: the bound assumes no account climbs faster than `v_peak`,
+/// so if the real peak (`p100`) outruns it, the config-load coupling is silently too loose and the
+/// constant needs re-calibrating — the same "measure, don't trust the constant" discipline the #595
+/// landing SLI provides for `TAIL_MARGIN`.
+///
+/// Percentiles are `None` when no positive velocity sample was observed — cardinality-zero is not a
+/// passing distribution (the [`SwapOvershoot`] discipline), so the readout never asserts the constant
+/// is honest on an empty subject. Rates are `f64` %/min (rounded for display only), not the `u8`
+/// percents the swap-out SLIs carry.
+#[derive(Debug, PartialEq)]
+struct ObservedPeak {
+    /// Count of positive `session_pct_per_min` samples in view.
+    n: usize,
+    p50: Option<f64>,
+    p90: Option<f64>,
+    /// The observed MAXIMUM climb rate — the value compared against `v_peak`.
+    p100: Option<f64>,
+}
+
+impl ObservedPeak {
+    /// Whether the assumed peak still bounds the observed one: `Some(true)` when the measured max
+    /// (`p100`) is at or below [`crate::swap::V_PEAK_SESSION_PCT_PER_MIN`], `Some(false)` when the
+    /// real peak has OUTRUN the constant (the coupling bound is too loose — re-calibrate), `None`
+    /// with no data. A tiny epsilon absorbs the display-rounding + `%/min → frac/s → %/min` round
+    /// trips so a sample recorded at exactly `v_peak` is not flagged by float dust.
+    fn v_peak_honest(&self) -> Option<bool> {
+        self.p100
+            .map(|v| v <= crate::swap::V_PEAK_SESSION_PCT_PER_MIN + 1e-9)
     }
 }
 
@@ -728,6 +788,9 @@ struct Report {
     /// The #595 landing-point overshoot — where `reason=session` swaps actually landed (post-swap
     /// peak of the parked account), reconstructed from the usage-sample store.
     landing: Landing,
+    /// The #608 observed session-velocity distribution — the live peak climb rate vs the assumed
+    /// `v_peak` constant the coupling bound is calibrated on.
+    observed_peak: ObservedPeak,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreempt,
     /// The #539 false-projection SLI (velocity-projection swaps observed; real rate pending).
@@ -777,11 +840,25 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         .filter(|(anchor, recovery)| anchor.saturating_sub(*recovery) > PREEMPT_WASTED_MARGIN_PCT)
         .count() as u32;
 
+    // The #608 observed session-velocity distribution — its own cardinality gate (percentiles
+    // `None` on an empty subject), so `v_peak_honest` is never asserted on zero samples.
+    let velocity_n = inputs.session_velocities.len();
+    let velocity_pct = |p: f64| -> Option<f64> {
+        (velocity_n > 0).then(|| crate::percentile::percentile(&inputs.session_velocities, p))
+    };
+    let observed_peak = ObservedPeak {
+        n: velocity_n,
+        p50: velocity_pct(0.50),
+        p90: velocity_pct(0.90),
+        p100: velocity_pct(1.0),
+    };
+
     Report {
         window,
         swap_overshoot,
         projected_swap_overshoot,
         landing: compute_landing(inputs, samples),
+        observed_peak,
         time_blind_near_limit_secs: inputs.time_blind_near_limit_secs,
         false_preempt: FalsePreempt {
             preemptive_swaps_observed: inputs.preemptive_swaps,
@@ -914,6 +991,45 @@ fn render_human(r: &Report) -> String {
     }
     out.push('\n');
 
+    // SLI 1d — OBSERVED session velocity (issue #608): the live session_pct_per_min distribution vs
+    // the assumed v_peak the swap-target reserve coupling bound is calibrated on. Keeps that constant
+    // honest — if the real peak outruns v_peak, the config-load bound is silently too loose.
+    match (
+        r.observed_peak.p50,
+        r.observed_peak.p90,
+        r.observed_peak.p100,
+    ) {
+        (Some(p50), Some(p90), Some(p100)) => {
+            out.push_str(
+                "observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)\n",
+            );
+            out.push_str(&format!(
+                "  measured n={} usage_velocity samples\n",
+                r.observed_peak.n
+            ));
+            out.push_str(&format!("  P50  = {p50:.2} %/min\n"));
+            out.push_str(&format!("  P90  = {p90:.2} %/min\n"));
+            out.push_str(&format!(
+                "  P100 = {p100:.2} %/min  vs assumed v_peak {:.2} %/min  {}\n",
+                crate::swap::V_PEAK_SESSION_PCT_PER_MIN,
+                // Distinct label from the swap-out SLIs' [ok]/[OVER]: this is not an SLO breach but
+                // a calibration signal — the constant is too loose, not the daemon too slow.
+                // `v_peak_honest()` is `Some` here (this arm has `p100 = Some`, its sole input), so
+                // the `== Some(false)` test — with any other value reading `[ok]` — carries no dead
+                // arm; it stays the single source of truth the JSON path (`v_peak_honest`) also uses.
+                if r.observed_peak.v_peak_honest() == Some(false) {
+                    "[RECALIBRATE]"
+                } else {
+                    "[ok]"
+                }
+            ));
+        }
+        _ => out.push_str(
+            "observed session velocity (session_pct_per_min): no usage_velocity samples observed\n",
+        ),
+    }
+    out.push('\n');
+
     // SLI 2 — time blind & near-limit.
     out.push_str(&format!(
         "time blind & near-limit: {}s (sum of blind_window duration_secs where near_limit=true)\n\n",
@@ -967,6 +1083,8 @@ struct ReliabilityWire {
     projected_swap_overshoot: ProjectedSwapOvershootWire,
     /// The #595 landing-point overshoot — where reason=session swaps actually landed (schema:4, additive).
     landing: LandingWire,
+    /// The #608 observed session-velocity distribution vs the assumed `v_peak` (schema:5, additive).
+    observed_peak: ObservedPeakWire,
     time_blind_near_limit_secs: u64,
     false_preempt: FalsePreemptWire,
     /// The #539 false-projection SLI (schema:3, additive).
@@ -1068,6 +1186,23 @@ struct LandingClassesWire {
     gap_crossing: usize,
 }
 
+/// Observed session-velocity block (issue #608): the live `session_pct_per_min` percentiles vs the
+/// assumed peak constant the `v_peak` coupling bound is calibrated on. `p50`/`p90`/`p100`/`met.*` are
+/// `null` with no positive velocity sample (an empty subject is not a passing distribution). Rates
+/// are rounded to two decimals for the wire, matching the `usage_velocity` log line's own precision.
+#[derive(serde::Serialize)]
+struct ObservedPeakWire {
+    n: usize,
+    p50: Option<f64>,
+    p90: Option<f64>,
+    p100: Option<f64>,
+    /// The assumed peak the bound is calibrated on (`swap::V_PEAK_SESSION_PCT_PER_MIN`), %/min.
+    v_peak_pct_per_min: f64,
+    /// Whether the observed max (`p100`) is still at/below `v_peak` — `false` means the constant is
+    /// too loose and the coupling bound needs re-calibrating; `null` with no data.
+    v_peak_honest: Option<bool>,
+}
+
 /// False-preempt block: the real (pending) rate plus the labeled interim proxy.
 #[derive(serde::Serialize)]
 struct FalsePreemptWire {
@@ -1154,6 +1289,14 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 post_swap_tail: r.landing.post_swap_tail,
                 gap_crossing: r.landing.gap_crossing,
             },
+        },
+        observed_peak: ObservedPeakWire {
+            n: r.observed_peak.n,
+            p50: r.observed_peak.p50,
+            p90: r.observed_peak.p90,
+            p100: r.observed_peak.p100,
+            v_peak_pct_per_min: crate::swap::V_PEAK_SESSION_PCT_PER_MIN,
+            v_peak_honest: r.observed_peak.v_peak_honest(),
         },
         time_blind_near_limit_secs: r.time_blind_near_limit_secs,
         false_preempt: FalsePreemptWire {
@@ -1288,6 +1431,87 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         assert_eq!(r.swap_overshoot.p100_met(), None);
         assert_eq!(r.time_blind_near_limit_secs, 0);
         assert_eq!(r.false_preempt.near_limit_windows, 0);
+        // #608 observed-peak SLI: no usage_velocity samples → None percentiles, v_peak_honest None
+        // (never asserted honest on an empty subject).
+        assert_eq!(r.observed_peak.n, 0);
+        assert_eq!(r.observed_peak.p100, None);
+        assert_eq!(r.observed_peak.v_peak_honest(), None);
+    }
+
+    // --- issue #608: the observed session-velocity SLI ------------------------
+
+    /// A usage_velocity fixture spanning the p50/p90/max shape of the real distribution PLUS the
+    /// two lines that must be DROPPED: a window-reset NEGATIVE rate, and a flat 0.00 climb. The
+    /// positive samples are 0.63 / 1.86 / 6.95 (the ADR's p50/p90/max) so the percentiles land on
+    /// recognizable values.
+    const VELOCITY_LOG: &str = "\
+ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=0.63 weekly_pct_per_min=0.01 elapsed_secs=60 session_delta_pct=1 weekly_delta_pct=0
+ts=2026-07-11T00:01:00Z event=usage_velocity acct=u-A session_pct_per_min=1.86 weekly_pct_per_min=0.02 elapsed_secs=60 session_delta_pct=2 weekly_delta_pct=0
+ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=6.95 weekly_pct_per_min=0.03 elapsed_secs=60 session_delta_pct=7 weekly_delta_pct=0
+ts=2026-07-11T00:03:00Z event=usage_velocity acct=u-A session_pct_per_min=-92.00 weekly_pct_per_min=0.00 elapsed_secs=60 session_delta_pct=-92 weekly_delta_pct=0
+ts=2026-07-11T00:04:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 weekly_pct_per_min=0.00 elapsed_secs=60 session_delta_pct=0 weekly_delta_pct=0
+";
+
+    #[test]
+    fn observed_peak_folds_positive_climbs_and_drops_resets_and_flats() {
+        let inputs = parse_events(VELOCITY_LOG, None);
+        // Only the three POSITIVE climbs — the −92 window-reset and the 0.00 flat are dropped so
+        // they cannot drag the distribution down and hide a real peak.
+        assert_eq!(inputs.session_velocities, vec![0.63, 1.86, 6.95]);
+        let r = aggregate(&inputs, &[], None);
+        assert_eq!(r.observed_peak.n, 3);
+        // n=3 sorted [0.63,1.86,6.95]: P50=ceil(.5·3)=2→1.86, P90=ceil(.9·3)=3→6.95, P100→6.95.
+        assert_eq!(r.observed_peak.p50, Some(1.86));
+        assert_eq!(r.observed_peak.p90, Some(6.95));
+        assert_eq!(r.observed_peak.p100, Some(6.95));
+        // The observed max EQUALS the assumed v_peak (6.95), so the constant is still honest — the
+        // epsilon absorbs the display-rounding round trip so equality is not flagged by float dust.
+        assert_eq!(r.observed_peak.v_peak_honest(), Some(true));
+    }
+
+    #[test]
+    fn observed_peak_flags_a_real_peak_that_outruns_the_assumed_v_peak() {
+        // A single sample above v_peak (6.95) trips the recalibrate signal — the SLI's entire
+        // purpose: when the live peak outruns the constant, the config-load coupling bound is
+        // silently too loose and the constant needs re-calibrating (the "measure, don't trust the
+        // constant" discipline TAIL_MARGIN has via the #595 landing SLI).
+        let log = "ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=8.40 weekly_pct_per_min=0.01 elapsed_secs=60 session_delta_pct=8 weekly_delta_pct=0\n";
+        let r = aggregate(&parse_events(log, None), &[], None);
+        assert_eq!(r.observed_peak.p100, Some(8.40));
+        assert_eq!(
+            r.observed_peak.v_peak_honest(),
+            Some(false),
+            "a peak above the assumed v_peak must flag the constant as too loose"
+        );
+        // The human render surfaces the distinct calibration marker, NOT the swap-out [OVER].
+        let human = render_human(&r);
+        assert!(
+            human.contains("[RECALIBRATE]"),
+            "the too-loose constant must surface a calibration signal: {human}"
+        );
+        // And the JSON exposes the machine-readable flag for a gate.
+        let json = render_json(&r).expect("serializes");
+        assert!(
+            json.contains("\"v_peak_honest\": false"),
+            "json must carry the recalibrate flag: {json}"
+        );
+    }
+
+    #[test]
+    fn observed_peak_is_bounded_by_the_active_window() {
+        // The #494 `--since` window bounds this SLI like every other: a cutoff after the early
+        // samples drops them. Two samples days apart, cut between them.
+        let log = "\
+ts=2026-07-01T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=5.00 weekly_pct_per_min=0.01 elapsed_secs=60 session_delta_pct=5 weekly_delta_pct=0
+ts=2026-07-10T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=1.00 weekly_pct_per_min=0.01 elapsed_secs=60 session_delta_pct=1 weekly_delta_pct=0
+";
+        let cutoff = epoch("2026-07-05T00:00:00Z");
+        let inputs = parse_events(log, Some(cutoff));
+        assert_eq!(
+            inputs.session_velocities,
+            vec![1.00],
+            "the pre-cutoff 5.00 sample is dropped; only the Jul-10 1.00 remains"
+        );
     }
 
     #[test]
@@ -1322,6 +1546,12 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "\n",
                 "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window (2 of 2 reason=session swaps unmeasured)\n",
                 "\n",
+                "observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)\n",
+                "  measured n=1 usage_velocity samples\n",
+                "  P50  = 0.20 %/min\n",
+                "  P90  = 0.20 %/min\n",
+                "  P100 = 0.20 %/min  vs assumed v_peak 6.95 %/min  [ok]\n",
+                "\n",
                 "time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)\n",
                 "\n",
                 "false-preempt (preemptive swap whose target turned out unnecessary)\n",
@@ -1346,18 +1576,18 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     }
 
     #[test]
-    fn json_render_is_stable_schema_4() {
+    fn json_render_is_stable_schema_5() {
         // The whole-log default: `window` is null and every PRIOR field is byte-identical to
-        // schema:1/2/3 — the additive contract (#494/#539/#595). The #595 `landing` object is
-        // new-but-always-present (null percentiles here — the fixture has no usage samples, so both
-        // reason=session swaps are unmeasured). A `--since` document is asserted separately in
-        // `json_documents_the_active_window`.
+        // schema:1/2/3/4 — the additive contract (#494/#539/#595/#608). The #608 `observed_peak`
+        // object is new-but-always-present (n=1 here — the FIXTURE_LOG's single usage_velocity line
+        // at 0.20 %/min, well under the 6.95 v_peak, so v_peak_honest=true). A `--since` document is
+        // asserted separately in `json_documents_the_active_window`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 4,\n",
+                "  \"schema\": 5,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -1401,6 +1631,14 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "      \"post_swap_tail\": 0,\n",
                 "      \"gap_crossing\": 0\n",
                 "    }\n",
+                "  },\n",
+                "  \"observed_peak\": {\n",
+                "    \"n\": 1,\n",
+                "    \"p50\": 0.2,\n",
+                "    \"p90\": 0.2,\n",
+                "    \"p100\": 0.2,\n",
+                "    \"v_peak_pct_per_min\": 6.95,\n",
+                "    \"v_peak_honest\": true\n",
                 "  },\n",
                 "  \"time_blind_near_limit_secs\": 900,\n",
                 "  \"false_preempt\": {\n",
@@ -1639,7 +1877,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 4,"), "schema bumped to 4: {out}");
+        assert!(out.contains("\"schema\": 5,"), "schema bumped to 5: {out}");
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",

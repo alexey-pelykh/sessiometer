@@ -38,6 +38,22 @@ unseen window. The **ceiling-semantics decision** (settled ceiling, one predicat
 tail margin, reserve) is **unchanged**; only *how the reactive arm derives its fire point* changed.
 ADR-0024 also lands the downward-only ceiling jitter this ADR's § Decision left symmetric.
 
+**Amended 2026-07-18 (#608) — § Alternatives 3's `v_peak` coupling is now shipped.** The
+peak-velocity constant `v_peak` (`swap::V_PEAK_SESSION_PCT_PER_MIN = 6.95`, the measured **max**
+`session_pct_per_min`) exists, and with it `swap::peak_runway_reserve_bound` =
+`effective_ceiling − v_peak × max(poll_gap, H)` (the post-#609 `max`-window form, not the bare
+`poll_gap` § Alternatives 3 wrote before #609). Enforcement is **severity-split**, NOT the full hard
+bound § Alternatives 3 sketched — because the shipped default deliberately sits in the loose band
+(target_max 80 vs a ~52 bound at the default ceiling), so a hard bound would brick every stock
+install: `Config::validate` hard-rejects ONLY the **unsatisfiable** stack (bound ≤ 0 — no reserve in
+`1..=session_trigger` keeps peak-velocity runway; `Error::ConfigPeakRunwayUnsatisfiable`), which is
+this ADR's own "absurd-config corner" (§ Consequences, Negative); the merely-exceeded-but-satisfiable
+case is a **non-fatal advisory** in `sessiometer config validate`. The constant is kept honest by the
+**observed-peak SLI** (`sessiometer reliability`: the live `session_pct_per_min` distribution vs
+`v_peak`, flagging when the real peak outruns it) — the "measure, don't trust the constant" discipline
+`TAIL_MARGIN` has via the #595 landing SLI. The **ceiling-semantics decision is unchanged**; this
+discharges a deferred follow-up.
+
 ## Context
 
 **The SLO ADR-0022's tail makes unreachable.** The swap-out overshoot SLO is
@@ -171,7 +187,9 @@ range `50..=99` unchanged). Under ceiling semantics the reserve now sits below t
 *ceiling* — a correct, if loose, bound (a swapped-to target keeps runway below the line
 the newly-active account is judged against). The tighter coupling
 `target_max <= effective_ceiling − v_peak × poll_gap` needs a peak-velocity constant
-that does not exist yet; introducing it is deferred (§ Alternatives 3).
+that does not exist yet; introducing it is deferred (§ Alternatives 3). *(Now shipped by
+#608 — see the amendment above; the tight bound is a `config validate` advisory, and only
+its unsatisfiable extreme is a hard load error.)*
 
 ### Calibration
 
@@ -211,12 +229,17 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
    holds by construction.
 
 3. **Add the peak-velocity coupling validator now**
-   (`target_max_session_usage <= effective_ceiling − v_peak × poll_gap`) — **deferred to
-   a follow-up**. The honest coupling needs an assumed `v_peak` constant that does not
-   exist today (ADR-0022 § Consequences flagged exactly this). Introducing it, plus an
+   (`target_max_session_usage <= effective_ceiling − v_peak × poll_gap`) — was **deferred to
+   a follow-up**, now **shipped by #608**. The honest coupling needs an assumed `v_peak` constant
+   that did not exist at #597 (ADR-0022 § Consequences flagged exactly this). Introducing it, plus an
    observed-peak-exceeds-`v_peak` SLI to keep it honest, is its own scoped change;
-   shipping it inside #597 would bundle an unrelated config-surface decision. The interim
-   protection is the unchanged loose reserve bound plus the #595 landing SLI.
+   shipping it inside #597 would have bundled an unrelated config-surface decision. The interim
+   protection was the unchanged loose reserve bound plus the #595 landing SLI. **#608 lands it**
+   (`swap::V_PEAK_SESSION_PCT_PER_MIN` / `swap::peak_runway_reserve_bound`, the post-#609
+   `max(poll_gap, H)` form): a hard load error only for the *unsatisfiable* stack
+   (`Error::ConfigPeakRunwayUnsatisfiable`), a non-fatal `config validate` advisory for the
+   merely-exceeded case — because the shipped default deliberately sits in that loose band, so a
+   full hard bound would brick it — plus the observed-peak SLI in `sessiometer reliability`.
 
 4. **Rename `session_trigger` → `session_ceiling` in this change** — **deferred to a
    follow-up**. A literal-token rename touches ~187 sites, including golden-pinned log
@@ -263,10 +286,13 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
 - **`TAIL_MARGIN` is a calibrated constant, not runtime-adaptive.** A shift in the tail
   distribution needs a code change plus re-verification against the #595 SLI. The SLI
   *surfaces* such a shift after the fact; it does not auto-retune the margin.
-- **The `target_max` coupling stays documented-not-enforced** until the `v_peak`
-  follow-up (§ Alternatives 3). An operator can still set
+- **The `target_max` coupling stayed documented-not-enforced** until the `v_peak`
+  follow-up (§ Alternatives 3) — **now shipped by #608**. An operator could set
   `poll_secs` / `session_velocity_horizon_secs` / `session_trigger` into a silently-loose
-  combination; the loose reserve bound and the #595 landing SLI are the interim guard.
+  combination; the loose reserve bound and the #595 landing SLI were the interim guard.
+  #608 now hard-rejects the *unsatisfiable* extreme of that stack at config load and
+  surfaces the merely-loose case as a `config validate` advisory (the default's loose band
+  is deliberate, so it is not a load error), with the observed-peak SLI keeping `v_peak` honest.
 - **Name/semantics mismatch until the rename lands.** `session_trigger` *means* ceiling;
   a reader must trust the reframed doc-comment until the follow-up rename (§ Alternatives
   4) makes the name say it.
@@ -287,12 +313,14 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
   lookahead can legitimately cross from a lower reading and so is not). The residual cost is a
   retained-EMA staleness window (a just-ended burst can still fire a swap at moderate usage for a
   few EMA-decay ticks) — an accepted property of the council-chosen runtime EMA, bounded and
-  self-correcting. A config-**load** bound on the absurd combinations is folded into the deferred
-  `v_peak` coupling validator (§ Alternatives 3); until then it is documented in
-  `reactive_session_threshold`'s doc-comment and asserted as intended by a unit test. Surfaced by
-  the #597 validation pass as a robustness observation (ratification-pending — the operator may
-  elect to add a reactive observed-usage floor, at the cost of the landing math the current design
-  preserves).
+  self-correcting. A config-**load** bound on the absurd combinations is now the shipped `v_peak`
+  coupling validator (§ Alternatives 3, **#608**): the *unsatisfiable* extreme of that stack (fire
+  point to/below 0 — no reserve keeps runway) is a hard load error, while this intended runtime
+  unbounded-below reach stays intact (it is a property of *live* velocity, not a config the operator
+  set). It remains documented in `reactive_session_threshold`'s doc-comment and asserted as intended
+  by a unit test. Surfaced by the #597 validation pass as a robustness observation
+  (ratification-pending — the operator may elect to add a reactive observed-usage floor, at the cost
+  of the landing math the current design preserves).
 
 ## Related
 
@@ -308,10 +336,10 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
   loose-coupling risks, mitigated here by honest doc-comments). **#41**
   (`weekly_trigger` — the *genuinely* separate second knob; it estimates a *different*
   quantity and is untouched). **#398/#417** (the `target_max_session_usage` reserve and
-  its clamp to `session_trigger`). Follow-ups to file: the pure `session_trigger →
-  session_ceiling` rename (§ Alternatives 4); the `v_peak` coupling validator plus an
-  observed-peak SLI (§ Alternatives 3); the gap-percentile `poll_gap` calibration that could
-  return the ceiling to the SLO line (§ Alternatives 6).
+  its clamp to `session_trigger`). **#608** (the shipped `v_peak` coupling validator + observed-peak
+  SLI — § Alternatives 3). Follow-ups still open: the pure `session_trigger → session_ceiling` rename
+  (§ Alternatives 4). Shipped: the `v_peak` coupling validator + observed-peak SLI (§ Alternatives 3,
+  #608); the gap-percentile `poll_gap` calibration (§ Alternatives 6, #609/ADR-0024).
 - Code: `swap::effective_ceiling`, `swap::reactive_session_threshold`, and
   `swap::TAIL_MARGIN` (`src/swap.rs`) — the ceiling derivation and the strict-early-fire
   `max` clamp, with the exhaustive-grid + falsifier unit tests. The reactive draw +

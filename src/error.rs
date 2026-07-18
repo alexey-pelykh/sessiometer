@@ -182,6 +182,34 @@ pub(crate) enum Error {
         trigger: i64,
     },
 
+    /// The peak-velocity runway coupling is UNSATISFIABLE (issue #608, discharging ADR-0023
+    /// § Alternatives 3): the config stacks its swap lookahead — `near_limit_poll_secs`
+    /// (via the reactive re-observation gap) and/or `session_velocity_horizon_secs` — so wide
+    /// against so low a `session_trigger` ceiling that at the assumed peak velocity
+    /// (`swap::V_PEAK_SESSION_PCT_PER_MIN`) NO `target_max_session_usage` in its legal
+    /// `1..=session_trigger` range keeps a swapped-to account any runway. Equivalently: the
+    /// composed fire point sits at or below 0, so every account would swap at any usage —
+    /// ADR-0023 § Consequences' "absurd-config corner". Distinct from
+    /// [`Error::ConfigTargetMaxSessionAboveTrigger`] (which bounds the reserve by the CEILING,
+    /// a looser rule that this stack can satisfy while still being unswappable) and from
+    /// [`Error::ConfigInvalid`], so the corner can be matched specifically. Carries the three
+    /// offending tunables — all bare integers, never secrets (issue #15).
+    #[error(
+        "invalid config: no target_max_session_usage can keep runway — at peak session velocity \
+         ({v_peak_pct_per_min} %/min) an account climbs past the session_trigger ceiling ({trigger}) \
+         within the {window_secs}s swap lookahead, so the reserve bound is {bound_pct} (not positive). \
+         Lower near_limit_poll_secs ({near_limit_poll_secs}) or session_velocity_horizon_secs \
+         ({horizon_secs}), or raise session_trigger."
+    )]
+    ConfigPeakRunwayUnsatisfiable {
+        trigger: i64,
+        near_limit_poll_secs: u64,
+        horizon_secs: u64,
+        window_secs: u64,
+        bound_pct: i64,
+        v_peak_pct_per_min: f64,
+    },
+
     /// Claude Code's state file (`~/.claude.json`) does not exist — Claude Code
     /// has not run / no account is logged in, so there is nothing to capture.
     /// Carries the path (a filesystem location, never a secret).

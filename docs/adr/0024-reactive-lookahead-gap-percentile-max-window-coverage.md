@@ -158,7 +158,8 @@ cheap-early-swap asymmetry.
    *intended* early-protective mechanism (it covers the full re-observation gap and can legitimately
    cross from a lower reading); a floor would re-censor exactly the fast-climbing accounts the widening
    exists to catch, at the cost of the landing math. Ratification-pending per ADR-0023 § Consequences;
-   the config-load bound folds into the deferred `v_peak` validator (ADR-0023 § Alternatives 3).
+   the config-load bound is the `v_peak` validator, now shipped by #608 (ADR-0023 § Alternatives 3) —
+   it rejects only the *unsatisfiable* stack, leaving this intended runtime unbounded-below intact.
 
 4. **Also raise the default ceiling 95 → 99 in this change** — **rejected**. The widening *enables* it,
    the operator *chooses* it (on live-SLI evidence). Bundling two independent levers against one SLI
@@ -217,9 +218,9 @@ cheap-early-swap asymmetry.
   whose horizon is kept inside its #538-validated envelope by this design). **#540 / #538** (near-limit
   poll coverage and the source of the p50 112 / p90 313 / max 972 s gap measurement).
   [ADR-0012](0012-active-reobservation-via-schedule-interleave.md) (the interleave the gap is measured
-  over). **#605** (where the downward-only ceiling jitter was deferred). Follow-ups still open: the
-  `session_trigger → session_ceiling` rename (ADR-0023 § Alternatives 4) and the `v_peak` coupling
-  validator (ADR-0023 § Alternatives 3).
+  over). **#605** (where the downward-only ceiling jitter was deferred). **#608** (the shipped `v_peak`
+  coupling validator + observed-peak SLI — ADR-0023 § Alternatives 3). Follow-up still open: the
+  `session_trigger → session_ceiling` rename (ADR-0023 § Alternatives 4).
 - Code: `swap::REACTIVE_REOBSERVATION_GAP_SECS`, `swap::reactive_poll_gap_secs` (the `max`-floor
   poll_gap derivation), and the reworked `swap::reactive_session_threshold` (`src/swap.rs`) — the
   gap-percentile constant and the max-window (`H`-independent) reactive threshold, with the

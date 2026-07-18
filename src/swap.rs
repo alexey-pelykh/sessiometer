@@ -266,14 +266,115 @@ pub(crate) fn reactive_poll_gap_secs(near_limit_poll_secs: u64) -> f64 {
 /// `session_velocity_min_project_above` observed-usage floor (its small ≤~14 pp lookahead makes a
 /// low reading unable to cross, so a low-usage projection is spurious), whereas the reactive arm's
 /// lookahead spans the full re-observation gap and CAN legitimately cross from a lower reading — so
-/// it carries no such floor. A config-LOAD bound on the absurd combos is deferred to the `v_peak`
-/// coupling validator follow-up (issue #597 / ADR-0023 § Alternatives 3).
+/// it carries no such floor. The config-LOAD bound on the absurd combos is
+/// [`peak_runway_reserve_bound`] (issue #608, discharging ADR-0023 § Alternatives 3): a config whose
+/// bound is UNSATISFIABLE — the peak-velocity fire point at/below 0, i.e. every account swapping at
+/// any usage — is rejected at load, so the unbounded-below reach documented here stays a runtime
+/// property of *live* velocity and never a stacked-config pathology.
 pub(crate) fn reactive_session_threshold(
     effective_ceiling: f64,
     velocity: f64,
     poll_gap_secs: f64,
 ) -> f64 {
     effective_ceiling - velocity * poll_gap_secs
+}
+
+/// The assumed PEAK session velocity, in the measurement's own unit (percent per minute) — the
+/// worst climb rate a config's swap-target reserve must keep runway against (issue #608).
+///
+/// # Provenance (issue #608, discharging ADR-0023 § Alternatives 3)
+///
+/// Calibrated from the measured `session_pct_per_min` distribution (the durable log's
+/// `event=usage_velocity` line, issue #399/#449): **p50 0.63 / p90 1.86 / max 6.95 %/min** — an ~11×
+/// spread, the same distribution ADR-0022 § Context cited to reject a single fire-*at* trigger.
+///
+/// **max, not p90** — the opposite of the [`REACTIVE_REOBSERVATION_GAP_SECS`] choice, and for the
+/// reason that constant states. p90 was chosen *there* because `max` "over-fits to the worst gap ever
+/// seen yet **would apply every cycle**": that constant is a RUNTIME term in the fire point, so
+/// over-fitting spends real early swaps on every account forever. `v_peak` is a CONFIG-LOAD bound —
+/// evaluated once per config parse, never in the fire path — so over-conservatism costs nothing at
+/// runtime and the p90-rejection rationale does not transfer. What DOES transfer is
+/// [`TAIL_MARGIN`]'s: the quantity guarded is a `P100` SLO, "defined by the MAX, not the median",
+/// under an error asymmetry where buying margin is cheap. A bound calibrated at p90 would call a
+/// config safe that a single observed-peak burst empties.
+///
+/// Kept honest by the observed-peak SLI (`sessiometer reliability`, issue #608): it re-measures the
+/// live `session_pct_per_min` distribution against this constant and flags when the real peak
+/// outruns it — the "measure, don't trust the constant" discipline [`TAIL_MARGIN`] has via the #595
+/// landing SLI. A sustained breach means re-calibrate this value, not widen the bound silently.
+pub(crate) const V_PEAK_SESSION_PCT_PER_MIN: f64 = 6.95;
+
+/// [`V_PEAK_SESSION_PCT_PER_MIN`] in the fire-point math's unit: a usage FRACTION per SECOND, the
+/// same unit as the `velocity` [`reactive_session_threshold`] multiplies by a lookahead in seconds.
+///
+/// Derived from the percent-per-minute constant rather than written as a literal `0.00115833…`, so
+/// the unit conversion is auditable and the two forms can never drift: the SLI compares observed
+/// `%/min` against the former, the bound multiplies seconds by the latter, and both name one
+/// calibrated number.
+pub(crate) const V_PEAK_SESSION_FRAC_PER_SEC: f64 = V_PEAK_SESSION_PCT_PER_MIN / 100.0 / 60.0;
+
+/// The tighter swap-target reserve bound (issue #608, discharging ADR-0023 § Alternatives 3): the
+/// highest `target_max_session_usage` — as a usage FRACTION — that still leaves a swapped-to account
+/// runway when it is climbing at the assumed peak velocity [`V_PEAK_SESSION_FRAC_PER_SEC`].
+///
+/// ```text
+/// effective_ceiling(ceiling) − V_PEAK × max(reactive_poll_gap_secs(near_limit), horizon_secs)
+/// ```
+///
+/// # Why this is tighter than the ADR-0013 reserve invariant
+///
+/// `Config::validate` enforces `target_max_session_usage <= session_trigger`
+/// (`Error::ConfigTargetMaxSessionAboveTrigger`, ADR-0013). Under the issue #597 ceiling semantics
+/// that bound is correct but **loose**: it bounds the reserve by the CEILING, whereas the newly
+/// active account is judged against the composed *fire point*, which sits a whole lookahead below the
+/// ceiling. `target_max_session_usage`'s own doc promises a swapped-to target "keeps runway before
+/// the next poll" — this function is that promise stated in arithmetic.
+///
+/// # Why `max(poll_gap, horizon)` and not `poll_gap` alone
+///
+/// ADR-0023 § Alternatives 3 wrote the coupling as `… − v_peak × poll_gap`, but that predates issue
+/// #609 / ADR-0024, which DECOUPLED the reactive arm from the horizon `H`. Post-#609 the two arms
+/// cover different unseen windows and the composed swap fires at the EARLIER of the two thresholds —
+/// `effective_ceiling − velocity × max(poll_gap, H)` (see [`reactive_session_threshold`]
+/// § Max-window coverage). Bounding against `poll_gap` alone would therefore MISS the projection arm
+/// entirely whenever `H > poll_gap`, and completely when the near-limit fast-poll is disabled
+/// (`near_limit_poll_secs == 0` → `poll_gap == 0`, while `H` may be up to its 600 s ceiling) — which
+/// is precisely the `session_velocity_horizon_secs` half of the stacking issue #608 names. The
+/// composed `max` is the honest post-#609 restatement of the same coupling.
+///
+/// # Unsatisfiable is the enforced case
+///
+/// The result can go to/below 0 — the config stacks lookahead so wide that at peak velocity NO
+/// reserve in the legal `1..=session_trigger` range keeps runway. That is ADR-0023 § Consequences'
+/// "absurd-config corner" (a config pairing a high `near_limit_poll_secs` with `horizon_secs` at its
+/// ceiling pulls the reactive fire point to/below 0 — every account swapping at any usage), and it is
+/// what `Config::validate` REJECTS (`Error::ConfigPeakRunwayUnsatisfiable`). A merely EXCEEDED bound
+/// (positive, but below the configured reserve) is NOT rejected — the shipped default is in exactly
+/// that state by deliberate design (ADR-0023 recorded the looseness), so rejecting it would brick
+/// every stock install; it surfaces as a non-fatal advisory in `sessiometer config validate`.
+///
+/// `ceiling` is a fraction in `[0.0, 1.0]` (`session_trigger` / 100), matching
+/// [`effective_ceiling`]. Pure and total — no clamping, so the caller can distinguish
+/// "unsatisfiable" (`<= 0`) from "tight" (a small positive).
+pub(crate) fn peak_runway_reserve_bound(
+    ceiling: f64,
+    near_limit_poll_secs: u64,
+    horizon_secs: u64,
+) -> f64 {
+    let window = composed_swap_lookahead_secs(near_limit_poll_secs, horizon_secs);
+    effective_ceiling(ceiling) - V_PEAK_SESSION_FRAC_PER_SEC * window
+}
+
+/// The composed swap lookahead, in seconds: how long the active account climbs UNSEEN before EITHER
+/// arm fires — `max(reactive re-observation gap, velocity horizon)` (issue #608, the post-#609
+/// max-window form). The single source of truth for the window: [`peak_runway_reserve_bound`]
+/// *computes* the bound over it, and `Config::validate` / `Config::peak_runway_advisory` *report* it
+/// to the operator (the `window_secs` in the load error and the advisory). Extracted so those
+/// reporting sites cannot drift from the value the bound was actually derived over — if the
+/// composition ever gains a third term, all three move together. See [`reactive_session_threshold`]
+/// § Max-window coverage for why the two arms' windows compose by `max`.
+pub(crate) fn composed_swap_lookahead_secs(near_limit_poll_secs: u64, horizon_secs: u64) -> f64 {
+    reactive_poll_gap_secs(near_limit_poll_secs).max(horizon_secs as f64)
 }
 
 /// The highest SESSION fraction observed within ONE session window (issue #614) — the
@@ -1030,8 +1131,8 @@ mod tests {
         // land at the effective ceiling), the CHEAP error under #597's asymmetry. A below-0 value is
         // behaviourally identical to 0 in `decide` (`session >= threshold`, session never negative),
         // so it is left unclamped. Documented here so the unbounded-below is read as design, not an
-        // oversight (the config-load bound on the absurd combos is the deferred `v_peak` validator,
-        // ADR-0023 § Alternatives 3).
+        // oversight (the config-load bound on the absurd combos is now `peak_runway_reserve_bound`,
+        // issue #608 — which rejects only the UNSATISFIABLE stack, leaving this runtime reach intact).
         let eff = effective_ceiling(0.50); // 0.44 — a low ceiling maximises the below-0 reach
         let v = 0.00116; // ~6.95 %/min, the observed peak
         let thr = reactive_session_threshold(eff, v, 7200.0);
@@ -1044,6 +1145,86 @@ mod tests {
         assert!(
             thr_default_ceiling < 0.85,
             "peak-velocity reactive fire ({thr_default_ceiling}) is below the projection floor, by design"
+        );
+    }
+
+    // --- #608 peak-velocity runway coupling bound ---
+
+    #[test]
+    fn v_peak_fraction_per_second_is_the_percent_per_minute_constant_converted() {
+        // The two forms name ONE calibrated number: the SLI compares observed %/min against the
+        // former, the bound multiplies seconds by the latter. Assert the conversion so they cannot
+        // drift — 6.95 %/min ÷ 100 ÷ 60 ≈ 0.0011583 frac/s.
+        assert!(
+            (V_PEAK_SESSION_FRAC_PER_SEC - 6.95 / 100.0 / 60.0).abs() < 1e-15,
+            "the frac/s form must be the %/min constant converted, got {V_PEAK_SESSION_FRAC_PER_SEC}"
+        );
+        // And the sanity magnitude the ADR cites (~0.00116 frac/s at the observed peak).
+        assert!((V_PEAK_SESSION_FRAC_PER_SEC - 0.00116).abs() < 1e-4);
+    }
+
+    #[test]
+    fn peak_runway_bound_at_the_defaults_is_positive_but_below_the_default_reserve() {
+        // The SHIPPED default (ceiling 0.95 → effective 0.89, near_limit 60 → poll_gap 313, H 120 →
+        // window max(313,120)=313): the bound is 0.89 − 0.00116×313 ≈ 0.527. Positive (so the
+        // default LOADS — no unsatisfiable rejection), yet below the default reserve 0.80 — exactly
+        // the exceeded-but-satisfiable state ADR-0023 recorded as deliberate. This is the anchor
+        // fact the whole severity split rests on: erroring here would brick every stock install.
+        let bound = peak_runway_reserve_bound(0.95, 60, 120);
+        assert!(
+            bound > 0.0,
+            "the default config must remain loadable: {bound}"
+        );
+        assert!(
+            (bound * 100.0).floor() < 80.0,
+            "the default reserve 80 must sit ABOVE the bound (the advisory case): {bound}"
+        );
+        // Concretely ~52 pp.
+        assert_eq!((bound * 100.0).floor() as i64, 52);
+    }
+
+    #[test]
+    fn peak_runway_bound_uses_the_max_of_poll_gap_and_horizon_not_poll_gap_alone() {
+        // Post-#609 the composed fire point is `effective_ceiling − v × max(poll_gap, H)` — the
+        // reactive arm decoupled from H (ADR-0024). A bound against poll_gap ALONE would miss the
+        // projection arm whenever H > poll_gap, and entirely when fast-poll is off (poll_gap == 0).
+        // With fast-poll disabled (near_limit 0 → poll_gap 0) but a wide horizon, the bound MUST
+        // still tighten by H, not collapse to the bare effective ceiling.
+        let eff = effective_ceiling(0.95); // 0.89
+        let wide_h = peak_runway_reserve_bound(0.95, 0, 600);
+        assert!(
+            (wide_h - (eff - V_PEAK_SESSION_FRAC_PER_SEC * 600.0)).abs() < 1e-12,
+            "with poll_gap 0 the bound must still tighten by the 600 s horizon, got {wide_h}"
+        );
+        // And where poll_gap dominates (near_limit 200 → poll_gap 400 > H 120), the bound uses 400.
+        let gap_dominant = peak_runway_reserve_bound(0.95, 200, 120);
+        assert!(
+            (gap_dominant - (eff - V_PEAK_SESSION_FRAC_PER_SEC * 400.0)).abs() < 1e-12,
+            "where poll_gap 400 > H 120 the bound must use 400, got {gap_dominant}"
+        );
+    }
+
+    #[test]
+    fn peak_runway_bound_goes_nonpositive_at_the_absurd_stack() {
+        // ADR-0023 § Consequences' absurd corner: near_limit toward its 3600 s max pulls the
+        // reactive poll_gap to 7200 s; at peak velocity 0.00116×7200 ≈ 8.3 ≫ any effective ceiling,
+        // so the bound is deeply negative — no reserve keeps runway. This is the UNSATISFIABLE case
+        // `Config::validate` rejects.
+        assert!(
+            peak_runway_reserve_bound(0.95, 3600, 120) < 0.0,
+            "the absurd near-limit stack must yield a non-positive bound"
+        );
+        // The threshold where it crosses 0 at the default ceiling: window = 0.89 / 0.0011583 ≈
+        // 768.4 s, i.e. near_limit ≈ 384 (2×near_limit = poll_gap once it clears the 313 floor).
+        // 384 → window 768 stays barely satisfiable; 385 → window 770 goes unsatisfiable — the
+        // boundary is real and granular, not all-or-nothing.
+        assert!(
+            peak_runway_reserve_bound(0.95, 384, 120) > 0.0,
+            "near_limit 384 (window 768) is just satisfiable at the default ceiling"
+        );
+        assert!(
+            peak_runway_reserve_bound(0.95, 385, 120) < 0.0,
+            "near_limit 385 (window 770) crosses into unsatisfiable"
         );
     }
 
