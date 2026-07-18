@@ -2041,4 +2041,62 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
         assert_eq!(r.landing.n_measured, 1);
         assert_eq!(r.landing.post_swap_tail, 1);
     }
+
+    #[test]
+    fn landing_stays_under_the_slo_for_a_burst_across_the_reobservation_gap() {
+        // Issue #610 (AC2): the landing-overshoot magnitude for a burst-across-gap swap. Post-#609
+        // (ADR-0024) the reactive arm looks ahead over the measured p90 re-observation gap
+        // (`swap::REACTIVE_REOBSERVATION_GAP_SECS` = 313 s), so a burst that climbs across the gap is
+        // caught by the effective ceiling (`ceiling − TAIL_MARGIN`) and the post-swap committed tail
+        // (issue #595, measured max +5 pp) then lands the parked account BELOW the ceiling — under the
+        // `P100 < SLO_SWAP_P100_MAX` (99) landing SLO. Pre-#609 the 120 s lookahead under-modeled the
+        // real gap, so a burst climbed past the effective ceiling before re-observation and the tail
+        // carried the landing to/over 99 (the residual #609 closed); the issue expected this test to
+        // fail at ceiling 99 before that fix, and to hold after it.
+        const MAX_COMMITTED_TAIL: f64 = 0.05; // issue #595: measured max post-swap committed tail (+5 pp)
+        let slo = f64::from(SLO_SWAP_P100_MAX) / 100.0; // 0.99
+
+        // Part 1 — the bound holds BY CONSTRUCTION across the operator ceiling range: the effective
+        // ceiling plus the measured max committed tail stays under the SLO. TAIL_MARGIN (0.06) is set
+        // strictly above the measured tail, so the landing lands below the ceiling; the ceiling being
+        // < 1.0 keeps it under the SLO. Fails if TAIL_MARGIN regresses below the measured tail.
+        for ceiling_pct in 95..=99u8 {
+            let ceiling = f64::from(ceiling_pct) / 100.0;
+            let worst_landing = crate::swap::effective_ceiling(ceiling) + MAX_COMMITTED_TAIL;
+            assert!(
+                worst_landing < slo,
+                "ceiling {ceiling_pct}: worst landing {worst_landing} must stay under the P100<{SLO_SWAP_P100_MAX} SLO",
+            );
+        }
+
+        // Part 2 — the landing SLI agrees for a concrete burst-across-gap swap at the DEFAULT ceiling
+        // (95, ADR-0024 §5). The account rode the burst up to the effective ceiling (89) before the
+        // bare-ceiling fire caught it (the cold-EMA / gap-beyond-lookahead worst case), then the
+        // committed tail peaked at 94 — under the SLO, with the sub-SLO ceiling headroom to spare.
+        let eff95 = crate::swap::effective_ceiling(0.95); // 0.89
+        let decision_pct = (eff95 * 100.0).round() as u8; // 89
+        let landing = eff95 + MAX_COMMITTED_TAIL; // 0.94
+        let log = format!(
+            "ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct={decision_pct}\n"
+        );
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", eff95 + 0.01), // climbing across the gap (90)
+            sample(epoch("2026-07-11T00:05:00Z"), "work", landing),      // committed-tail peak (94)
+            sample(epoch("2026-07-11T00:12:00Z"), "work", landing - 0.02), // settling back below (92)
+        ];
+        let r = aggregate(&parse_events(&log, None), &samples, None);
+        assert_eq!(r.landing.n_measured, 1);
+        assert_eq!(
+            r.landing.p100,
+            Some(94),
+            "the burst-across-gap landing peaks at 94"
+        );
+        assert_eq!(r.landing.gap_crossing, 0, "fired at 89, below the SLO");
+        assert_eq!(r.landing.post_swap_tail, 0, "94 landed below the SLO");
+        assert_eq!(
+            r.landing.p100_met(),
+            Some(true),
+            "P100 < 99 holds post-#609 for a burst across the re-observation gap",
+        );
+    }
 }
