@@ -3868,52 +3868,53 @@ where
         self.state.signaled_retry_after_reserve = false;
         self.state.signaled_retry_after_walk = false;
         // Draw this cycle's swap-away thresholds — the session CEILING and the weekly trigger
-        // (issues #38, #41; #597): each jittered + clamped to 50..=99 percent, then to a fraction.
-        // Since #597 the two are DIFFERENT KINDS of value: `session_trigger` is the session CEILING
-        // (the settled line the account must not cross), NOT a fire-at trigger — the reactive fire
-        // threshold is derived BACKWARD from it below; `weekly_trigger` (#41) is still a fire-AT
-        // trigger. The session and weekly dimensions are independent — swap when EITHER reaches its
-        // own fire point; below BOTH → hold. Both are drawn every cycle (a fixed strategy consumes no RNG), keeping the
-        // per-cycle draw order deterministic.
+        // (issues #38, #41; #597, #609): each jittered + clamped to 50..=99 percent, then to a
+        // fraction. Since #597 the two are DIFFERENT KINDS of value: `session_trigger` is the session
+        // CEILING (the settled line the account must not cross), NOT a fire-at trigger — the reactive
+        // fire threshold is derived BACKWARD from it below; `weekly_trigger` (#41) is still a fire-AT
+        // trigger. Because the ceiling is a not-cross line set BELOW the SLO for margin, its per-cycle
+        // jitter is DOWNWARD-ONLY (#609): a configured jitter may only ever pull the ceiling LOWER
+        // (more margin), never above the operator-set value (which would erode the sub-SLO headroom).
+        // `weekly_trigger`, a fire-AT trigger, keeps SYMMETRIC jitter (`draw`). The session and weekly
+        // dimensions are independent — swap when EITHER reaches its own fire point; below BOTH → hold.
+        // Both are drawn every cycle (a fixed strategy consumes no RNG, and `draw_downward` consumes
+        // the same per-mode RNG count as `draw`), keeping the per-cycle draw order deterministic.
         let session_trigger =
             self.trigger_strategy
-                .draw(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
+                .draw_downward(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
                 / 100.0;
         let weekly_trigger = self.weekly_trigger_strategy.draw(
             &mut self.rng,
             WEEKLY_TRIGGER_PCT_LO,
             WEEKLY_TRIGGER_PCT_HI,
         ) / 100.0;
-        // #597 ceiling derivation: the reactive arm fires BACKWARD from the effective ceiling
+        // #597/#609 ceiling derivation: the reactive arm fires BACKWARD from the effective ceiling
         // (ceiling − tail margin) so the outgoing account lands below the ceiling even after its
-        // post-swap committed tail (#595). A `velocity × lookahead` term pulls the fire earlier so
-        // the account is AT the effective ceiling by the time the swap executes — one poll gap
+        // post-swap committed tail (#595). A `velocity × poll_gap` term pulls the fire earlier so the
+        // account is AT the effective ceiling by the time the swap executes — one re-observation gap
         // later, having climbed at the retained EMA rate. The velocity is gated by the same
         // `>= MIN_VELOCITY_SAMPLES` criterion as the projection peer; here an unwarmed EMA reads 0
         // (the peer instead holds outright), so an idle account fires exactly at the effective
-        // ceiling — never early — and the two arms stay coupled (the strict early-fire invariant
-        // lives in `swap::reactive_session_threshold`).
+        // ceiling — never early. The two arms cover DIFFERENT unseen windows (this one the
+        // re-observation gap, the projection peer the velocity horizon `H`); the composed swap fires
+        // at `eff − v·max(poll_gap, H)`, the max-window coverage in `swap::reactive_session_threshold`.
         let effective_ceiling = swap::effective_ceiling(session_trigger);
         let velocity = self.state.session_velocity[active_idx]
             .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
             .map_or(0.0, |v| v.rate);
-        // The reactive re-observation gap: the active near-limit poll cadence round-trips at ~2× its
-        // interval (a reading is up to one interval stale, plus one interval until the next poll —
-        // the measured active gap, ~112 s at the default 60 s cadence). When fast-poll is DISABLED
-        // (`near_limit_poll_secs == 0`) there is no tight near-limit gap for the reactive arm to look
-        // ahead over, so `poll_gap` is 0 and the reactive threshold collapses to the bare effective
-        // ceiling — the #539 projection is then the sole velocity-aware estimator (the pre-#597
-        // division of labour, now landing-margined). At the default cadence (60 s) `poll_gap` is 120 s
-        // ≈ the horizon `H`, so the two estimators converge on `eff − v·H` and the reactive arm, being
-        // checked first, is the one that fires; the projection is the earlier fire only where `H`
-        // exceeds this gap.
-        let poll_gap = 2.0 * self.near_limit_poll_secs as f64;
-        let session_threshold = swap::reactive_session_threshold(
-            effective_ceiling,
-            velocity,
-            poll_gap,
-            self.session_velocity_horizon_secs as f64,
-        );
+        // The reactive re-observation gap: how long the active account climbs UNSEEN between the
+        // daemon's successive observations of it. `swap::reactive_poll_gap_secs` looks ahead over the
+        // LARGER of the measured p90 gap (`swap::REACTIVE_REOBSERVATION_GAP_SECS`, 313 s) and the
+        // cadence-scaled `2 × near_limit_poll_secs` — an unconditional widening of the pre-#609
+        // theoretical round-trip, so the account lands under the ceiling even across the gap tail (#609,
+        // implementing ADR-0023 § Alternatives 6; the floor / `max` rationale is on
+        // `reactive_poll_gap_secs`). When fast-poll is DISABLED (`near_limit_poll_secs == 0`) there is
+        // no tight near-limit gap to look ahead over, so `poll_gap` is 0 and the reactive threshold
+        // collapses to the bare effective ceiling — the #539 projection is then the sole velocity-aware
+        // estimator (#584; the pre-#597 division of labour, now landing-margined).
+        let poll_gap = swap::reactive_poll_gap_secs(self.near_limit_poll_secs);
+        let session_threshold =
+            swap::reactive_session_threshold(effective_ceiling, velocity, poll_gap);
         if swap::decide(&active_usage, session_threshold, weekly_trigger) == SwapDecision::Hold {
             // Reactive says HOLD — the observed reading is below both fire points (the #597
             // velocity-derived session threshold + the weekly trigger). Before holding, consult the
@@ -5126,9 +5127,11 @@ where
     ///
     /// `session_trigger` is the session CEILING draw (`weekly_trigger` the weekly one) the reactive
     /// path used this tick; this arm derives the SAME effective ceiling (ceiling − tail margin) the
-    /// reactive threshold does, and `pick_target` sees the same reserve — so the projective peer is a
-    /// strict early-fire of the reactive decision (it fires at `effective_ceiling − velocity × H`,
-    /// never above the reactive threshold), not a differently-calibrated one.
+    /// reactive threshold does, and `pick_target` sees the same reserve — so the two are coupled (one
+    /// ceiling, one reserve), not differently-calibrated triggers. This arm covers the velocity
+    /// horizon (it fires at `effective_ceiling − velocity × H`), a DIFFERENT unseen window from the
+    /// reactive arm's re-observation gap (issue #609); the composed swap fires at whichever is earlier
+    /// (`effective_ceiling − velocity × max(poll_gap, H)`), covering the larger window.
     async fn velocity_swap(
         &mut self,
         at: Instant,
@@ -5172,8 +5175,9 @@ where
         // threshold from this tick). Below → the velocity is not steep enough to reach the effective
         // ceiling within the horizon → hold and let the reactive path catch it if it climbs. Firing
         // at the effective ceiling (not the raw ceiling) keeps the projected landing under the ceiling
-        // after the post-swap tail, and keeps this arm a strict early-fire of the reactive threshold
-        // (`swap::reactive_session_threshold`): `effective_ceiling − velocity × H` is never above it.
+        // after the post-swap tail. This arm covers the velocity horizon `H`; the reactive arm covers
+        // the re-observation gap (#609); the composed swap fires at `eff − v·max(poll_gap, H)` (see
+        // `swap::reactive_session_threshold`), so whichever window is larger sets the fire point.
         let effective_ceiling = swap::effective_ceiling(session_trigger);
         let projected = active_usage.session + vel.rate * horizon as f64;
         if projected < effective_ceiling {

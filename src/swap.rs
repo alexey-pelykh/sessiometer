@@ -124,70 +124,156 @@ pub(crate) fn effective_ceiling(ceiling: f64) -> f64 {
     (ceiling - TAIL_MARGIN).max(0.0)
 }
 
-/// The reactive arm's session fire threshold (issue #597): the OBSERVED session fraction at
-/// or above which [`decide`] should swap away, derived BACKWARD from `effective_ceiling` so
-/// the account lands AT the effective ceiling by the time the swap actually executes — one
-/// poll gap later, having climbed at `velocity`.
+/// The reactive arm's re-observation-gap lookahead, in seconds: how long the active account can
+/// climb UNSEEN between the daemon's successive observations of it. The measured **p90** of the
+/// active-account re-observation gap.
 ///
-/// # The strict-early-fire invariant
+/// # Provenance (issue #609, implementing ADR-0023 § Alternatives 6)
 ///
-/// The projection arm (the daemon's `velocity_swap`) fires when `observed + velocity ×
-/// horizon_secs >= effective_ceiling`, i.e. at observed `effective_ceiling − velocity ×
-/// horizon_secs`. This function returns
+/// The active-account re-observation gap — swap-decision to next reading, over the #366 staggered
+/// interleave (ADR-0012) — was measured at **p50 112 s / p90 313 s / max 972 s**. The pre-#609
+/// reactive lookahead used the THEORETICAL near-limit round-trip `2 × near_limit_poll_secs` (~120 s
+/// at the default cadence), which UNDER-models that real gap: on the p90 tail the account climbs
+/// ~200 s longer than modeled — past `effective_ceiling` before the next poll — and the post-swap
+/// committed tail (#595) then lands it over the `P100 < 99` SLO. That under-modeling is precisely
+/// why ADR-0023 set the default ceiling BELOW the SLO (a second, gap-independent margin). Widening
+/// the reactive lookahead to the p90 gap makes the reactive arm honest about how long it is blind,
+/// so the margin is earned by the lookahead rather than by a sub-SLO ceiling and the ceiling could
+/// return to the SLO line (issue #609 leaves the DEFAULT ceiling at 95 — the operator's lever —
+/// while making 99 reachable).
+///
+/// **p90, not max.** `max` (972 s) over-fits to the worst gap ever seen (a backoff outlier) yet
+/// would apply every cycle: at the observed peak velocity (~6.95 %/min ≈ 0.00116 frac/s) a 972 s
+/// lookahead pulls the fire point down by `0.00116 × 972 ≈ 1.13` — to/below 0, a swap at any usage —
+/// while even the MEDIAN account (0.63 %/min) fires ~10 pp early. p90 keeps the median's early-fire
+/// to ~3 pp while still pulling the fast tail in; the gap beyond p90 is absorbed by the
+/// defence-in-depth already present ([`TAIL_MARGIN`] plus the sub-SLO ceiling headroom). The error
+/// asymmetry favours it: an early swap is the CHEAP error (`all_exhausted` fired 2× in 17 days —
+/// capacity is not binding), an overshoot the expensive one.
+///
+/// A calibrated CONSTANT, not a runtime-adaptive estimate — the same discipline as [`TAIL_MARGIN`].
+/// The re-observation gap is a slow-moving property of the polling architecture, not a fast signal;
+/// a runtime percentile would close an adaptive loop with its own failure modes (a transient backoff
+/// incident inflating the observed gap would make every account swap far too early exactly when
+/// capacity is tightest). Re-verify against the #595 landing SLI if the gap distribution is suspected
+/// to have shifted (re-measure the active re-observation gap; the #538/#540 replay recipe).
+///
+/// Used as the measured **floor** beneath the cadence-scaled proxy in [`reactive_poll_gap_secs`]
+/// (the daemon looks ahead over `max(2 × near_limit_poll_secs, this)`), not as the lookahead
+/// outright — so a slower configured near-limit poll only WIDENS the lookahead past this gap, never
+/// shrinks below it.
+pub(crate) const REACTIVE_REOBSERVATION_GAP_SECS: f64 = 313.0;
+
+/// The reactive arm's re-observation-gap lookahead window fed to [`reactive_session_threshold`], in
+/// seconds, derived from the near-limit poll cadence (issue #609):
 ///
 /// ```text
-/// max(effective_ceiling − velocity × poll_gap_secs,
-///     effective_ceiling − velocity × horizon_secs)
-///   = effective_ceiling − velocity × min(poll_gap_secs, horizon_secs)
+/// near_limit_poll_secs == 0  →  0    (fast-poll disabled — no near-limit gap to cover; the #539
+///                                     projection is then the sole velocity-aware estimator, #584)
+/// near_limit_poll_secs  > 0  →  max(2 × near_limit_poll_secs, REACTIVE_REOBSERVATION_GAP_SECS)
 /// ```
 ///
-/// The `max` form makes the reactive threshold ALWAYS `>=` the projection fire point
-/// (`effective_ceiling − velocity × horizon_secs`), so the projection NEVER fires at a higher
-/// observed value than the reactive arm — i.e. it never fires LATER. This holds STRUCTURALLY
-/// for every `velocity >= 0` and every `(poll_gap_secs, horizon_secs)` pairing, with no
-/// runtime branch:
-///   - `horizon_secs >= poll_gap_secs` (the normal case, incl. the default where
-///     `poll_gap_secs == horizon_secs`): the `poll_gap` term wins, so the reactive arm fires
-///     one poll gap early (correct landing) and the projection fires earlier still.
-///   - `horizon_secs < poll_gap_secs` (a short-horizon misconfiguration): the `horizon` term
-///     wins, clamping the reactive threshold UP to the projection fire point so the two
-///     coincide rather than invert. The un-clamped `effective_ceiling − velocity ×
-///     poll_gap_secs` alone WOULD invert here — the falsifier test documents exactly this.
+/// The window is the LARGER of two lower bounds on the true re-observation gap: the measured p90
+/// FLOOR ([`REACTIVE_REOBSERVATION_GAP_SECS`], 313 s — the scheduling / back-off / interleave
+/// overhead that dominates at the default cadence) and the cadence-scaled round-trip `2 ×
+/// near_limit_poll_secs` (a slower configured poll widens the real gap proportionally — the pre-#609
+/// model kept as the scaling term, not discarded). Taking the `max` keeps the #609 substitution an
+/// UNCONDITIONAL widening of the pre-#609 lookahead `min(2 × near_limit_poll_secs, H)` — `max(2c,
+/// floor) ≥ 2c ≥ min(2c, H)` for every cadence `c` and horizon `H` — so the reactive `poll_gap` never
+/// SHRINKS versus before, and (the composed fire point being monotone non-increasing in `poll_gap`,
+/// see [`reactive_session_threshold`] § Max-window coverage) the landing point never rises: the
+/// `P100 < 99` SLO stays reachable BY CONSTRUCTION for ALL configs, not only those where the bare
+/// floor already exceeds the prior lookahead. A bare `poll_gap = REACTIVE_REOBSERVATION_GAP_SECS`
+/// would NARROW the lookahead — a latent SLO regression — whenever `2 × near_limit_poll_secs > 313`
+/// (`near_limit_poll_secs > 156`) with `H > 313`; the `max` closes that corner (ADR-0024 § Decision 1
+/// / § Alternatives 6).
+pub(crate) fn reactive_poll_gap_secs(near_limit_poll_secs: u64) -> f64 {
+    if near_limit_poll_secs == 0 {
+        0.0
+    } else {
+        (2.0 * near_limit_poll_secs as f64).max(REACTIVE_REOBSERVATION_GAP_SECS)
+    }
+}
+
+/// The reactive arm's session fire threshold (issues #597, #609): the OBSERVED session fraction at
+/// or above which [`decide`] should swap away, derived BACKWARD from `effective_ceiling` so the
+/// account lands AT the effective ceiling by the time the swap actually executes — one
+/// re-observation gap later, having climbed at `velocity`:
+///
+/// ```text
+/// effective_ceiling − velocity × poll_gap_secs
+/// ```
+///
+/// `poll_gap_secs` is how long the active account climbs UNSEEN between successive observations —
+/// the reactive re-observation-gap lookahead ([`reactive_poll_gap_secs`]): `max(2 ×
+/// near_limit_poll_secs, REACTIVE_REOBSERVATION_GAP_SECS)` (the measured p90 313 s as a floor) when
+/// the near-limit fast-poll is on, or `0` when it is disabled (`near_limit_poll_secs == 0`),
+/// collapsing the threshold to the bare `effective_ceiling` so the #539 projection is then the sole
+/// velocity-aware estimator (the pre-#597 division of labour, now landing-margined).
+///
+/// # Max-window coverage (issue #609, superseding #597's strict-early-fire framing)
+///
+/// The reactive arm covers ONE unseen window — the **re-observation gap** (`poll_gap_secs`: how long
+/// until the account is next SEEN). The projection arm (the daemon's `velocity_swap`, #539 /
+/// ADR-0017) covers a DIFFERENT one — the **velocity horizon** `H` (`session_velocity_horizon_secs`:
+/// how far the EMA reaches), firing at observed `effective_ceiling − velocity × H`. Neither window
+/// bounds the other, so this function is deliberately INDEPENDENT of `H`. The two arms are composed
+/// by the daemon (reactive checked first in [`decide`], projection consulted on `Hold`), and the
+/// composed swap fires at the EARLIER of the two thresholds:
+///
+/// ```text
+/// min(effective_ceiling − velocity × poll_gap_secs,  effective_ceiling − velocity × H)
+///   = effective_ceiling − velocity × max(poll_gap_secs, H)
+/// ```
+///
+/// — early enough to cover the LARGER unseen window, monotone non-increasing in BOTH `poll_gap_secs`
+/// and `H` (widening either window never delays the swap, so it can only LOWER the landing point —
+/// the `P100 < 99` SLO stays reachable by construction). Which arm leads is config-dependent, and
+/// both stay live:
+///   - `poll_gap_secs > H` (the default: 313 s gap vs 120 s horizon): the reactive arm is the
+///     earlier fire — the gap-tail specialist.
+///   - `H > poll_gap_secs`, or `poll_gap_secs == 0` (fast-poll disabled): the projection arm is the
+///     earlier fire — the horizon / fast-poll-off fallback (#584).
+///
+/// This REPLACES #597's `max`-clamp form, whose "the projection never fires later than the reactive
+/// arm" (strict-early-fire) invariant capped the reactive lookahead at `H` — silently DISCARDING any
+/// widening of the re-observation gap beyond `H` (the #609 bug: the real gap runs to p90 313 s, but
+/// the clamp pinned the reactive lookahead at the 120 s horizon). The composed-min identity above is
+/// the honest generalization: each arm covers its own window; the swap covers their union.
 ///
 /// `velocity` is a FRACTION per second (matching the `session` reading). `velocity == 0` (an
-/// unwarmed / reset EMA — gated identically in both arms by `MIN_VELOCITY_SAMPLES`) collapses
-/// the threshold to the bare `effective_ceiling`, so an idle account fires AT the effective
-/// ceiling, never early.
+/// unwarmed / reset EMA — gated identically in both arms by `MIN_VELOCITY_SAMPLES`) collapses the
+/// threshold to the bare `effective_ceiling`, so an idle account fires AT the effective ceiling,
+/// never early.
 ///
 /// # Unbounded below — by design
 ///
 /// The threshold is NOT floored (unlike `effective_ceiling`, which clamps at 0): under a large
-/// `velocity × min(poll_gap_secs, horizon_secs)` it drops well below `effective_ceiling` and, at
-/// the extreme (a config stacking a large `poll_gap_secs` — `near_limit_poll_secs` up to 3600 —
-/// with `horizon_secs` at its 600 s ceiling and sustained peak velocity), to/below 0. That is the
-/// intended early-protective fire: the account is climbing so fast RELATIVE TO ITS RE-OBSERVATION
-/// GAP that it must swap now to land at `effective_ceiling` by the next poll — the CHEAP error
-/// under issue #597's asymmetry (an early swap wastes runway; an overshoot breaches the SLO, and
-/// capacity is not binding). A below-0 value is behaviourally identical to 0 in the sole consumer
-/// (`decide`'s `usage.session >= threshold`, and `session` is never negative), so it is left
-/// unclamped rather than carrying a cosmetic `.max(0.0)` that would fix no behaviour.
+/// `velocity × poll_gap_secs` it drops well below `effective_ceiling` and, at the extreme (sustained
+/// peak velocity over the p90-or-wider gap), to/below 0. That is the intended early-protective fire:
+/// the account is climbing so fast RELATIVE TO ITS RE-OBSERVATION GAP that it must swap now to land
+/// at `effective_ceiling` by the next poll — the CHEAP error under issue #597's asymmetry (an early
+/// swap wastes runway; an overshoot breaches the SLO, and capacity is not binding). Widening the
+/// lookahead to the p90 gap (#609) DEEPENS this reach and correspondingly SHARPENS the disclosed
+/// retained-EMA staleness window (a burst that ended keeps the EMA high for a few decay ticks, so a
+/// swap can fire at moderate usage a current EMA would not warrant) — an accepted property of the
+/// council-chosen retained-EMA velocity, bounded and self-correcting. A below-0 value is
+/// behaviourally identical to 0 in the sole consumer (`decide`'s `usage.session >= threshold`, and
+/// `session` is never negative), so it is left unclamped rather than carrying a cosmetic `.max(0.0)`
+/// that would fix no behaviour.
 ///
 /// This is the one place the two arms deliberately DIVERGE: the projection arm carries a
 /// `session_velocity_min_project_above` observed-usage floor (its small ≤~14 pp lookahead makes a
 /// low reading unable to cross, so a low-usage projection is spurious), whereas the reactive arm's
 /// lookahead spans the full re-observation gap and CAN legitimately cross from a lower reading — so
-/// it carries no such floor. The residual cost is a retained-EMA staleness window (a burst that
-/// ended keeps the EMA high for a few decay ticks, so a swap can fire at moderate usage that a
-/// current EMA would not warrant) — an accepted property of the council-chosen retained-EMA
-/// velocity, bounded and self-correcting. A config-LOAD bound on the absurd combos is deferred to
-/// the `v_peak` coupling validator follow-up (issue #597 / ADR-0023 § Alternatives 3).
+/// it carries no such floor. A config-LOAD bound on the absurd combos is deferred to the `v_peak`
+/// coupling validator follow-up (issue #597 / ADR-0023 § Alternatives 3).
 pub(crate) fn reactive_session_threshold(
     effective_ceiling: f64,
     velocity: f64,
     poll_gap_secs: f64,
-    horizon_secs: f64,
 ) -> f64 {
-    (effective_ceiling - velocity * poll_gap_secs).max(effective_ceiling - velocity * horizon_secs)
+    effective_ceiling - velocity * poll_gap_secs
 }
 
 /// The result of a completed [`swap`]. The token reroute (the swap proper)
@@ -633,47 +719,53 @@ mod tests {
         // idle accounts early"). Both estimators gate velocity identically, so a low-signal
         // account behaves the same in either arm.
         let eff = effective_ceiling(0.99);
-        assert_eq!(reactive_session_threshold(eff, 0.0, 120.0, 120.0), eff);
-        assert_eq!(reactive_session_threshold(eff, 0.0, 240.0, 60.0), eff);
+        assert_eq!(reactive_session_threshold(eff, 0.0, 120.0), eff);
+        assert_eq!(reactive_session_threshold(eff, 0.0, 313.0), eff);
     }
 
     #[test]
-    fn reactive_threshold_fires_one_poll_gap_early_when_the_horizon_covers_it() {
-        // The normal case (horizon >= poll_gap, incl. the default poll_gap == horizon): the
-        // reactive arm fires one poll gap early, so the account is AT the effective ceiling
-        // by the time the swap executes one poll gap later, having climbed velocity*poll_gap.
+    fn reactive_threshold_fires_one_reobservation_gap_early() {
+        // Issue #609: the reactive arm fires one re-observation gap early — at `eff - v*poll_gap` —
+        // so the account is AT the effective ceiling by the time the swap executes one gap later,
+        // having climbed velocity*poll_gap. It is INDEPENDENT of the projection horizon (it takes
+        // no H): the composition with the projection arm lives in the daemon, not this function.
         let eff = effective_ceiling(0.99); // 0.93
         let v = 0.001; // fraction/sec
 
-        // horizon (200) > poll_gap (120): the poll_gap term wins.
-        let thr = reactive_session_threshold(eff, v, 120.0, 200.0);
+        // At the measured p90 gap (313 s) the reactive arm looks ahead the full gap, not the 120 s
+        // horizon the pre-#609 min-clamp would have pinned it to.
+        let thr = reactive_session_threshold(eff, v, REACTIVE_REOBSERVATION_GAP_SECS);
         assert!(
-            (thr - (eff - v * 120.0)).abs() < 1e-12,
-            "the reactive arm fires one poll gap early"
+            (thr - (eff - v * 313.0)).abs() < 1e-12,
+            "the reactive arm fires one re-observation gap early"
         );
-        // The default (poll_gap == horizon == 120) is the same term.
-        let thr_default = reactive_session_threshold(eff, v, 120.0, 120.0);
-        assert!((thr_default - (eff - v * 120.0)).abs() < 1e-12);
+        // Fast-poll disabled → poll_gap 0 → the bare effective ceiling (projection is then sole arm).
+        assert_eq!(reactive_session_threshold(eff, v, 0.0), eff);
     }
 
     #[test]
-    fn the_strict_early_fire_invariant_holds_across_the_grid() {
-        // Issue #597 INVARIANT: the projection arm (fires at observed `eff - v*H`) must
-        // NEVER fire at a higher observed value than the reactive arm (fires at
-        // `reactive_session_threshold`) — i.e. the projection never fires LATER. Exhaustive
-        // grid over ceiling, velocity, poll_gap and horizon, INCLUDING horizon < poll_gap
-        // (the clamp boundary) and the measured poll-gap percentiles (p50 112, p90 313,
-        // max 972) and peak velocity (~6.95 %/min ≈ 0.00116 frac/s).
+    fn the_composed_swap_covers_the_larger_unseen_window_across_the_grid() {
+        // Issue #609 INVARIANT (superseding #597's strict-early-fire framing): the reactive arm
+        // covers the re-observation gap and the projection arm (`eff - v*H`) covers the velocity
+        // horizon; the daemon composes them (reactive checked first, projection on Hold), so the
+        // swap fires at the EARLIER of the two — `eff - v*max(poll_gap, H)` — covering the LARGER
+        // unseen window. Exhaustive grid over ceiling, velocity, poll_gap and horizon, INCLUDING
+        // poll_gap > H (the case #597's min-clamp silently discarded) and the measured poll-gap
+        // percentiles (p50 112, p90 313, max 972) and peak velocity (~6.95 %/min ≈ 0.00116 frac/s).
         for &ceiling in &[0.50, 0.80, 0.95, 0.99] {
             let eff = effective_ceiling(ceiling);
             for &v in &[0.0, 0.0002, 0.001, 0.00116, 0.005] {
-                for &poll_gap in &[30.0, 60.0, 112.0, 120.0, 313.0, 972.0] {
+                for &poll_gap in &[0.0, 30.0, 60.0, 112.0, 120.0, 313.0, 972.0] {
+                    let reactive = reactive_session_threshold(eff, v, poll_gap);
+                    // The reactive arm is INDEPENDENT of the horizon — it is exactly `eff - v*gap`.
+                    assert!((reactive - (eff - v * poll_gap)).abs() < 1e-12);
                     for &h in &[0.0, 60.0, 120.0, 150.0, 300.0] {
-                        let reactive = reactive_session_threshold(eff, v, poll_gap, h);
                         let projection = eff - v * h; // the daemon's velocity_swap fire point
+                        let composed = reactive.min(projection); // reactive-first, projection-on-Hold
+                        let expected = eff - v * poll_gap.max(h);
                         assert!(
-                            projection <= reactive + 1e-12,
-                            "invariant violated: projection {projection} > reactive {reactive} \
+                            (composed - expected).abs() < 1e-12,
+                            "max-window coverage violated: composed {composed} != eff - v*max = {expected} \
                              (ceiling={ceiling}, v={v}, poll_gap={poll_gap}, h={h})"
                         );
                     }
@@ -683,50 +775,128 @@ mod tests {
     }
 
     #[test]
-    fn the_unclamped_reactive_threshold_would_invert_the_invariant() {
-        // FALSIFIER documenting WHY the `max` clamp exists (issue #597). With horizon <
-        // poll_gap, the bare `eff - v*poll_gap` (no clamp) sits BELOW the projection fire
-        // point `eff - v*H`, so the projection would fire at a HIGHER observed value than the
-        // reactive arm — i.e. LATER, violating the strict-early-fire invariant. The clamp
-        // raises the reactive threshold to the projection point so they coincide instead.
-        let eff = effective_ceiling(0.99);
+    fn the_old_min_clamp_would_discard_a_gap_wider_than_the_horizon() {
+        // FALSIFIER / regression-lock (issue #609). The pre-#609 form clamped the reactive lookahead
+        // to `min(poll_gap, H)`, so a re-observation gap WIDER than the horizon was silently
+        // discarded — the #609 bug (the real gap runs to p90 313 s, but the clamp pinned the
+        // lookahead at H=120). The new reactive arm fires STRICTLY EARLIER than that discarded-gap
+        // clamp when poll_gap > H, and the composed swap covers the true `max(gap, H)`.
+        let eff = effective_ceiling(0.95); // 0.89, the default ceiling
         let v = 0.001;
-        let poll_gap = 300.0;
-        let h = 60.0; // horizon < poll_gap
-        let unclamped = eff - v * poll_gap; // 0.93 - 0.30 = 0.63
-        let projection = eff - v * h; // 0.93 - 0.06 = 0.87
+        let poll_gap = REACTIVE_REOBSERVATION_GAP_SECS; // 313
+        let h = 120.0; // the default horizon; poll_gap > h
+        let new_reactive = reactive_session_threshold(eff, v, poll_gap); // eff - v*313
+        let old_clamped = eff - v * poll_gap.min(h); // the pre-#609 min-clamp form: eff - v*120
         assert!(
-            projection > unclamped,
-            "the un-clamped reactive threshold WOULD let the projection fire later"
+            new_reactive < old_clamped - 1e-12,
+            "the widened lookahead must fire earlier than the discarded-gap clamp: {new_reactive} !< {old_clamped}"
         );
-        // The clamped (shipped) form fixes it: reactive == projection here, no inversion.
-        let clamped = reactive_session_threshold(eff, v, poll_gap, h);
-        assert!(
-            (clamped - projection).abs() < 1e-12,
-            "the clamp coincides them"
-        );
-        assert!(projection <= clamped + 1e-12);
+        // The composed swap covers the LARGER window (313 s), not the horizon (120 s).
+        let projection = eff - v * h;
+        let composed = new_reactive.min(projection);
+        assert!((composed - (eff - v * poll_gap.max(h))).abs() < 1e-12);
+        assert!((composed - (eff - v * 313.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn widening_the_reobservation_gap_never_raises_the_fire_point() {
+        // Issue #609 SAFETY property: the reactive fire threshold is monotone NON-INCREASING in the
+        // re-observation gap, so widening the lookahead can only LOWER the fire point — hence lower
+        // the landing point — hence the `P100 < 99` landing SLO stays reachable BY CONSTRUCTION
+        // (widening never worsens overshoot; its only cost is earlier swaps = the cheap error under
+        // #597's asymmetry). This is why "verify against the #595 landing SLI" holds analytically.
+        for &ceiling in &[0.50, 0.95, 0.99] {
+            let eff = effective_ceiling(ceiling);
+            for &v in &[0.0, 0.001, 0.00116] {
+                let gaps = [0.0, 60.0, 112.0, 120.0, 313.0, 972.0];
+                for pair in gaps.windows(2) {
+                    let (narrower, wider) = (pair[0], pair[1]);
+                    let thr_narrow = reactive_session_threshold(eff, v, narrower);
+                    let thr_wide = reactive_session_threshold(eff, v, wider);
+                    assert!(
+                        thr_wide <= thr_narrow + 1e-12,
+                        "widening the gap raised the fire point: gap {wider} → {thr_wide} > gap {narrower} → {thr_narrow}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reactive_poll_gap_is_zero_when_the_near_limit_fast_poll_is_disabled() {
+        // #584 / #609: `near_limit_poll_secs == 0` disables the near-limit fast poll, so there is no
+        // tight re-observation gap to look ahead over — the reactive poll_gap is 0 (the threshold
+        // then collapses to the bare effective ceiling and the #539 projection is the sole
+        // velocity-aware arm). The `max`-floor MUST NOT fire here (`max(2·0, 313) = 313` would break
+        // #584); the explicit zero guard keeps the projection-only path intact.
+        assert_eq!(reactive_poll_gap_secs(0), 0.0);
+    }
+
+    #[test]
+    fn reactive_poll_gap_floors_at_the_measured_reobservation_gap() {
+        // #609: at the default (and any tight) cadence, `2 × near_limit_poll_secs` UNDER-models the
+        // real gap (the measured p90 is 313 s, dominated by scheduling / back-off / interleave
+        // overhead), so the measured floor governs. Default cadence 60 → 2·60 = 120 < 313 → 313. The
+        // floor still governs right up to the crossover (156 s: 2·156 = 312 < 313).
+        assert_eq!(reactive_poll_gap_secs(60), REACTIVE_REOBSERVATION_GAP_SECS);
+        assert_eq!(reactive_poll_gap_secs(30), REACTIVE_REOBSERVATION_GAP_SECS);
+        assert_eq!(reactive_poll_gap_secs(156), REACTIVE_REOBSERVATION_GAP_SECS);
+    }
+
+    #[test]
+    fn reactive_poll_gap_scales_past_the_floor_for_a_slower_configured_poll() {
+        // #609: a SLOWER near-limit poll widens the real re-observation gap proportionally, so above
+        // the crossover the cadence-scaled `2 × near_limit_poll_secs` governs — the lookahead tracks
+        // the operator's actual blindness rather than pinning to the default-cadence measurement.
+        assert_eq!(reactive_poll_gap_secs(157), 314.0); // 2·157 = 314 > 313
+        assert_eq!(reactive_poll_gap_secs(200), 400.0);
+        assert_eq!(reactive_poll_gap_secs(600), 1200.0);
+    }
+
+    #[test]
+    fn reactive_poll_gap_never_narrows_the_pre_609_lookahead() {
+        // #609 SAFETY regression-lock (the daemon-level counterpart of
+        // `widening_the_reobservation_gap_never_raises_the_fire_point`, which locks the property for
+        // the ISOLATED threshold in its poll_gap argument — this locks the FORMULA substitution that
+        // feeds that argument). The pre-#609 reactive lookahead was `min(2 × near_limit_poll_secs, H)`;
+        // #609 substitutes the poll_gap formula, so the substitution must never SHRINK the lookahead —
+        // a shrink would RAISE the fire point and could push a landing over the SLO. That is exactly
+        // the corner a BARE `poll_gap = 313` leaves open (`2 × near_limit_poll_secs > 313 ∧ H > 313`);
+        // `max(2c, floor) ≥ 2c ≥ min(2c, H)` closes it UNCONDITIONALLY. Grid the reachable ranges
+        // INCLUDING that corner (near_limit > 156 with H > 313).
+        for &nl in &[0_u64, 5, 30, 60, 156, 157, 200, 600, 1800, 3600] {
+            let new_gap = reactive_poll_gap_secs(nl);
+            for &h in &[0.0, 60.0, 120.0, 150.0, 313.0, 400.0, 600.0] {
+                let old_lookahead = (2.0 * nl as f64).min(h); // pre-#609 min(2c, H)
+                assert!(
+                    new_gap >= old_lookahead - 1e-12,
+                    "the #609 poll_gap narrowed the pre-#609 lookahead: near_limit={nl} H={h} → \
+                     new {new_gap} < old {old_lookahead}"
+                );
+            }
+        }
     }
 
     #[test]
     fn the_reactive_threshold_is_unbounded_below_by_design_at_an_extreme_lookahead() {
-        // Issue #597: the reactive threshold is intentionally NOT floored (unlike
-        // `effective_ceiling`). A config stacking the max lookahead — poll_gap 2*3600, horizon at
-        // its 600 s ceiling, sustained peak velocity — pulls it far below the effective ceiling and
-        // past 0. That is the intended early-protective fire (climbing too fast for the
-        // re-observation gap → swap now to land at the effective ceiling), the CHEAP error under
-        // #597's asymmetry. A below-0 value is behaviourally identical to 0 in `decide`
-        // (`session >= threshold`, session never negative), so it is left unclamped. Documented
-        // here so the unbounded-below is read as design, not an oversight (the config-load bound on
-        // the absurd combos is the deferred `v_peak` validator, ADR-0023 § Alternatives 3).
+        // Issues #597/#609: the reactive threshold is intentionally NOT floored (unlike
+        // `effective_ceiling`). A large `velocity × poll_gap` — sustained peak velocity over a wide
+        // re-observation gap — pulls it far below the effective ceiling and past 0. That is the
+        // intended early-protective fire (climbing too fast for the re-observation gap → swap now to
+        // land at the effective ceiling), the CHEAP error under #597's asymmetry. A below-0 value is
+        // behaviourally identical to 0 in `decide` (`session >= threshold`, session never negative),
+        // so it is left unclamped. Documented here so the unbounded-below is read as design, not an
+        // oversight (the config-load bound on the absurd combos is the deferred `v_peak` validator,
+        // ADR-0023 § Alternatives 3).
         let eff = effective_ceiling(0.50); // 0.44 — a low ceiling maximises the below-0 reach
         let v = 0.00116; // ~6.95 %/min, the observed peak
-        let thr = reactive_session_threshold(eff, v, 7200.0, 600.0);
+        let thr = reactive_session_threshold(eff, v, 7200.0);
         assert!(thr < 0.0, "the threshold is unbounded below: {thr}");
-        // And even at the default ceiling with peak velocity it fires well below the projection
-        // arm's ~0.85 min-project-above floor — the deliberate arm divergence.
+        // And at the default ceiling with peak velocity over the p90 gap it fires well below the
+        // projection arm's ~0.85 min-project-above floor — the deliberate arm divergence, DEEPENED by
+        // the #609 gap widening (0.89 - 0.00116*313 ≈ 0.53).
         let thr_default_ceiling =
-            reactive_session_threshold(effective_ceiling(0.99), v, 120.0, 120.0);
+            reactive_session_threshold(effective_ceiling(0.95), v, REACTIVE_REOBSERVATION_GAP_SECS);
         assert!(
             thr_default_ceiling < 0.85,
             "peak-velocity reactive fire ({thr_default_ceiling}) is below the projection floor, by design"

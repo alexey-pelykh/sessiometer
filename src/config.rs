@@ -346,27 +346,32 @@ pub(crate) struct Tunables {
     /// (`session < session_trigger`, [`crate::daemon`]) still prevents oscillation
     /// independently.
     pub(crate) target_max_session_usage: u8,
-    /// The session CEILING (issue #597): the settled session percent (`50..=99`) the active
-    /// account must not cross — NOT a fire-at trigger. ONE ceiling; BOTH swap-away estimators
-    /// of the same quantity derive their fire point BACKWARD from it, so neither is a separate
-    /// knob:
+    /// The session CEILING (issues #597, #609): the settled session percent (`50..=99`) the active
+    /// account must not cross — NOT a fire-at trigger. ONE ceiling; BOTH swap-away estimators of the
+    /// same quantity derive their fire point BACKWARD from it, so neither is a separate knob:
     ///   - the reactive arm fires at `observed >= ceiling − tail_margin − velocity × poll_gap`;
     ///   - the issue #539 projection fires at `observed + velocity × H >= ceiling − tail_margin`.
     ///
-    /// The projection is a strict EARLY-FIRE of the reactive decision (the daemon's
-    /// `velocity_swap`) — it can fire no later — so this stays ONE knob, never two. The name is
-    /// retained for compatibility; a rename to `session_ceiling` is a tracked follow-up.
+    /// The two estimators cover DIFFERENT unseen windows — the reactive arm the re-observation gap
+    /// (`poll_gap`), the projection the velocity horizon (`H`) — and the daemon composes them (fire at
+    /// the earlier), so the swap fires at `observed >= ceiling − tail_margin − velocity × max(poll_gap,
+    /// H)`, covering the larger window (issue #609, superseding #597's strict-early-fire framing). This
+    /// stays ONE knob, never two: both derive from this single ceiling and share the reserve. The name
+    /// is retained for compatibility; a rename to `session_ceiling` is a tracked follow-up.
     ///
     /// This IS (near) the landing point now — the point of the redesign: the `tail_margin`
-    /// (`swap::TAIL_MARGIN`, 6 pp) is subtracted so the outgoing account lands BELOW the ceiling
-    /// even after its post-swap committed tail (measured mean +1.08 pp, max +5 pp, issue #595 —
-    /// real in-flight drain, issue #596), and a `velocity × lookahead` term absorbs the climb
-    /// during the reactive re-observation gap / the projection horizon
-    /// `session_velocity_horizon_secs` (`H`). The default ceiling **95** sits *below* the
-    /// `P100 < 99` landing SLO (issue #455 / #595) on purpose — buying headroom over the
-    /// re-observation-gap staleness the `poll_gap` term under-models (measured active-account
-    /// gaps reach p90 313 s / max 972 s vs the modeled ~120 s). Full rationale + tail/coupling
-    /// evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022).
+    /// (`swap::TAIL_MARGIN`, 6 pp) is subtracted so the outgoing account lands BELOW the ceiling even
+    /// after its post-swap committed tail (measured mean +1.08 pp, max +5 pp, issue #595 — real
+    /// in-flight drain, issue #596), and a `velocity × lookahead` term absorbs the climb during the
+    /// reactive re-observation gap (`swap::reactive_poll_gap_secs` = `max(2 × near_limit_poll_secs,
+    /// REACTIVE_REOBSERVATION_GAP_SECS)`, the measured p90 313 s as a floor since #609) / the projection
+    /// horizon `session_velocity_horizon_secs` (`H`). The default ceiling **95** stays *below* the
+    /// `P100 < 99` landing SLO (issue #455 / #595) as a conservative lever, but #609 makes 99 REACHABLE:
+    /// the reactive `poll_gap` term now looks ahead over at least the real p90 re-observation gap (313 s
+    /// floor) rather than the theoretical ~120 s, so the margin is earned by the lookahead, and an
+    /// operator who trusts it may raise the ceiling to 99. Full rationale +
+    /// tail/coupling evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022) and ADR-0024 (the
+    /// gap-percentile lookahead + max-window coverage + downward-only ceiling jitter).
     pub(crate) session_trigger: u8,
     /// Swap *away* from the active account at or above this WEEKLY percent
     /// (`50..=99`) — the second, independent trigger dimension (issue #41).
@@ -1709,12 +1714,13 @@ impl Config {
         out.push_str(
             "# The session CEILING (50..=99): the settled line the active account must not\n\
              # cross, NOT a fire-at trigger. Both swap estimators (reactive + projected) derive\n\
-             # their fire point BACKWARD from it — ceiling minus a tail margin minus\n\
-             # velocity*lookahead — so the account lands BELOW the ceiling even after its\n\
-             # post-swap committed tail (up to +5 pp: in-flight work keeps billing the parked\n\
-             # account). The default 95 sits below the P100<99 SLO for gap-staleness headroom. One knob, two\n\
-             # estimators (the projection is a strict early-fire of the reactive decision) —\n\
-             # not two knobs. See ADR-0023 (docs/adr) for the ceiling redesign.\n",
+             # their fire point BACKWARD from it, covering the LARGER unseen window — ceiling\n\
+             # minus a tail margin minus velocity*max(poll_gap, H) — so the account lands BELOW\n\
+             # the ceiling even after its post-swap committed tail (up to +5 pp: in-flight work\n\
+             # keeps billing the parked account). The reactive arm looks ahead over the measured\n\
+             # p90 re-observation gap (313 s floor, issue #609), so the default 95 is a conservative\n\
+             # lever — 99 is reachable (raise it to spend the margin as runway). One knob, two\n\
+             # estimators (not two knobs). See ADR-0023 + ADR-0024 (docs/adr).\n",
         );
         out.push_str(&format!("session_trigger = {}\n", t.session_trigger));
         out.push_str(
