@@ -1226,7 +1226,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\ntarget_max_session_usage = 70\n",
+            b"[tunables]\npoll_secs = 120\nsession_ceiling = 90\ntarget_max_session_usage = 70\n",
         )
         .unwrap();
 
@@ -1252,7 +1252,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            b"[tunables]\npoll_secs = 120\nsession_trigger = 90\nsession_floor = 70\n",
+            b"[tunables]\npoll_secs = 120\nsession_ceiling = 90\nsession_floor = 70\n",
         )
         .unwrap();
 

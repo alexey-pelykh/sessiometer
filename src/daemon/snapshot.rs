@@ -237,7 +237,7 @@ pub(crate) struct AccountReading {
     /// instead of the alarming `needs re-login` for a healing account. Derived from the
     /// health counter (where it lives); non-secret — a plain flag, no raw count exposed.
     pub(crate) recovering: bool,
-    /// Whether the account's WEEKLY window is EXHAUSTED — `weekly >= weekly_trigger`
+    /// Whether the account's WEEKLY window is EXHAUSTED — `weekly >= weekly_ceiling`
     /// (the base, un-jittered threshold; issue #11/#37), the daemon's own viability
     /// verdict. When true the account is blocked until its weekly reset, so `status`
     /// keys its "resets in" off the weekly reset rather than the sooner session
@@ -482,7 +482,7 @@ pub(crate) struct AccountStatusLine {
     /// `null` when unknown. Non-secret — an integer.
     #[serde(default)]
     pub(crate) weekly_resets_at: Option<i64>,
-    /// Whether the account's WEEKLY window is exhausted (`weekly >= weekly_trigger`),
+    /// Whether the account's WEEKLY window is exhausted (`weekly >= weekly_ceiling`),
     /// the daemon's own viability verdict (issue #11/#37). The client keys "resets
     /// in" off this: a weekly-exhausted account is blocked until the WEEKLY reset,
     /// otherwise the sooner SESSION reset governs (issue #72). Non-secret — a flag.
@@ -633,10 +633,10 @@ pub(crate) enum NextSwapReason {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NoTargetCause {
-    /// A weekly-VIABLE account is held out only by session (over the session ceiling
-    /// `min(session_trigger, target_max_session_usage)`) — relief arrives at the sooner SESSION reset.
+    /// A weekly-VIABLE account is held out only by session (over the session block line
+    /// `min(session_ceiling, target_max_session_usage)`) — relief arrives at the sooner SESSION reset.
     Session,
-    /// Every candidate is weekly-EXHAUSTED (`weekly >= weekly_trigger`) — relief arrives at the
+    /// Every candidate is weekly-EXHAUSTED (`weekly >= weekly_ceiling`) — relief arrives at the
     /// WEEKLY reset (the #11 default, and the ONLY cause reachable on the emergency/dead-active
     /// path, which bypasses the session gate entirely).
     Weekly,

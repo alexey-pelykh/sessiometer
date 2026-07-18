@@ -154,7 +154,7 @@ pub(crate) const TAIL_MARGIN: f64 = 0.06;
 /// [`TAIL_MARGIN`]. A swap that lands the outgoing account AT this effective ceiling leaves
 /// exactly the tail margin of headroom, so the post-swap committed tail lands below the true
 /// ceiling. Clamped at 0 so a pathologically low `ceiling` can never yield a negative fire
-/// point. `ceiling` is a fraction in `[0.0, 1.0]` (`session_trigger` / 100).
+/// point. `ceiling` is a fraction in `[0.0, 1.0]` (`session_ceiling` / 100).
 pub(crate) fn effective_ceiling(ceiling: f64) -> f64 {
     (ceiling - TAIL_MARGIN).max(0.0)
 }
@@ -243,8 +243,7 @@ const _: () = assert!(WEEKLY_TAIL_MARGIN < TAIL_MARGIN);
 /// measured margin, and a single knob would invite the copy this constant's provenance rejects.
 ///
 /// Clamped at 0 so a pathologically low `ceiling` can never yield a negative fire point. `ceiling`
-/// is a fraction in `[0.0, 1.0]` (`weekly_trigger` / 100 — the config field keeps its name until
-/// the tracked rename follow-up; it MEANS a ceiling since this issue).
+/// is a fraction in `[0.0, 1.0]` (`weekly_ceiling` / 100).
 pub(crate) fn weekly_effective_ceiling(ceiling: f64) -> f64 {
     (ceiling - WEEKLY_TAIL_MARGIN).max(0.0)
 }
@@ -448,7 +447,7 @@ pub(crate) const V_PEAK_SESSION_FRAC_PER_SEC: f64 = V_PEAK_SESSION_PCT_PER_MIN /
 ///
 /// # Why this is tighter than the ADR-0013 reserve invariant
 ///
-/// `Config::validate` enforces `target_max_session_usage <= session_trigger`
+/// `Config::validate` enforces `target_max_session_usage <= session_ceiling`
 /// (`Error::ConfigTargetMaxSessionAboveTrigger`, ADR-0013). Under the issue #597 ceiling semantics
 /// that bound is correct but **loose**: it bounds the reserve by the CEILING, whereas the newly
 /// active account is judged against the composed *fire point*, which sits a whole lookahead below the
@@ -470,7 +469,7 @@ pub(crate) const V_PEAK_SESSION_FRAC_PER_SEC: f64 = V_PEAK_SESSION_PCT_PER_MIN /
 /// # Unsatisfiable is the enforced case
 ///
 /// The result can go to/below 0 — the config stacks lookahead so wide that at peak velocity NO
-/// reserve in the legal `1..=session_trigger` range keeps runway. That is ADR-0023 § Consequences'
+/// reserve in the legal `1..=session_ceiling` range keeps runway. That is ADR-0023 § Consequences'
 /// "absurd-config corner" (a config pairing a high `near_limit_poll_secs` with `horizon_secs` at its
 /// ceiling pulls the reactive fire point to/below 0 — every account swapping at any usage), and it is
 /// what `Config::validate` REJECTS (`Error::ConfigPeakRunwayUnsatisfiable`). A merely EXCEEDED bound
@@ -478,7 +477,7 @@ pub(crate) const V_PEAK_SESSION_FRAC_PER_SEC: f64 = V_PEAK_SESSION_PCT_PER_MIN /
 /// that state by deliberate design (ADR-0023 recorded the looseness), so rejecting it would brick
 /// every stock install; it surfaces as a non-fatal advisory in `sessiometer config validate`.
 ///
-/// `ceiling` is a fraction in `[0.0, 1.0]` (`session_trigger` / 100), matching
+/// `ceiling` is a fraction in `[0.0, 1.0]` (`session_ceiling` / 100), matching
 /// [`effective_ceiling`]. Pure and total — no clamping, so the caller can distinguish
 /// "unsatisfiable" (`<= 0`) from "tight" (a small positive).
 pub(crate) fn peak_runway_reserve_bound(

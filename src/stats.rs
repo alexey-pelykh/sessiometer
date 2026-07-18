@@ -306,15 +306,15 @@ struct AccountVelocity {
     /// weekly dimension (#539 retains only the session EMA; the weekly runway `#541` wants
     /// reuses the identical definition, not a divergent one). `None` on the same cases.
     weekly_rate: Option<f64>,
-    /// Approximate whole seconds until the session reading reaches `session_trigger` at the
-    /// smoothed rate: `(trigger − current) / rate`. `None` when the rate is unknown or `0`, or
-    /// the reading is already at/over the trigger (no positive head-room to state as a fact).
+    /// Approximate whole seconds until the session reading reaches `session_ceiling` at the
+    /// smoothed rate: `(ceiling − current) / rate`. `None` when the rate is unknown or `0`, or
+    /// the reading is already at/over the ceiling (no positive head-room to state as a fact).
     session_runway_secs: Option<i64>,
-    /// Approximate whole seconds until the weekly reading reaches `weekly_trigger`. `None` on
+    /// Approximate whole seconds until the weekly reading reaches `weekly_ceiling`. `None` on
     /// the same cases (commonly `None` — the weekly window moves slowly, so a flat weekly
     /// dimension has no measurable rate).
     weekly_runway_secs: Option<i64>,
-    /// The account's remaining WEEKLY head-room as a usage fraction — `max(0, weekly_trigger −
+    /// The account's remaining WEEKLY head-room as a usage fraction — `max(0, weekly_ceiling −
     /// latest weekly reading)` — the pool contribution the fleet aggregate (issue #544) sums. `Some`
     /// EXACTLY when [`Self::weekly_rate`] is `Some` (a KNOWN weekly velocity), so head-room is
     /// recorded only for an account whose burn is also known: a KNOWN-zero (flat, measured) account
@@ -596,7 +596,7 @@ fn params_from(config: Option<&Config>) -> AggregateParams {
         Some(c) => (c.tunables.poll_secs as i64, c.swap_threshold()),
         None => {
             let t = Tunables::default();
-            (t.poll_secs as i64, f64::from(t.session_trigger) / 100.0)
+            (t.poll_secs as i64, f64::from(t.session_ceiling) / 100.0)
         }
     };
     AggregateParams::new(poll_secs.max(1), cap, cap)
@@ -630,33 +630,35 @@ struct VelocityParams {
     /// — REUSED verbatim so the stats-shown rate matches the daemon's own projection, never a
     /// second, divergent rate. `1.0` = no smoothing (the raw last-interval rate).
     session_ema_alpha: f64,
-    /// The session swap trigger as a fraction — the neutral head-room reference for the session
-    /// runway (`(trigger − current) / rate`): the point the daemon acts, stated as a fact.
-    session_trigger: f64,
-    /// The weekly swap trigger as a fraction — the weekly-runway reference.
-    weekly_trigger: f64,
+    /// The session ceiling as a fraction — the neutral head-room reference for the session
+    /// runway (`(ceiling − current) / rate`): the not-cross line, stated as a fact. (The daemon
+    /// actually fires BACKWARD from it by the tail margin + lookahead, so it acts strictly below;
+    /// the runway readout deliberately references the raw ceiling, not that derived fire point.)
+    session_ceiling: f64,
+    /// The weekly ceiling as a fraction — the weekly-runway reference.
+    weekly_ceiling: f64,
 }
 
 fn velocity_params_from(config: Option<&Config>) -> VelocityParams {
     let (alpha_pct, session, weekly) = match config {
         Some(c) => (
             c.tunables.session_velocity_ema_alpha_pct,
-            c.tunables.session_trigger,
-            c.tunables.weekly_trigger,
+            c.tunables.session_ceiling,
+            c.tunables.weekly_ceiling,
         ),
         None => {
             let t = Tunables::default();
             (
                 t.session_velocity_ema_alpha_pct,
-                t.session_trigger,
-                t.weekly_trigger,
+                t.session_ceiling,
+                t.weekly_ceiling,
             )
         }
     };
     VelocityParams {
         session_ema_alpha: f64::from(alpha_pct) / 100.0,
-        session_trigger: f64::from(session) / 100.0,
-        weekly_trigger: f64::from(weekly) / 100.0,
+        session_ceiling: f64::from(session) / 100.0,
+        weekly_ceiling: f64::from(weekly) / 100.0,
     }
 }
 
@@ -749,13 +751,13 @@ fn account_velocity(
     AccountVelocity {
         session_rate,
         weekly_rate,
-        session_runway_secs: runway_secs(session_rate, last.session, vparams.session_trigger),
-        weekly_runway_secs: runway_secs(weekly_rate, last.weekly, vparams.weekly_trigger),
+        session_runway_secs: runway_secs(session_rate, last.session, vparams.session_ceiling),
+        weekly_runway_secs: runway_secs(weekly_rate, last.weekly, vparams.weekly_ceiling),
         // The pool contribution for the fleet aggregate (issue #544): raw weekly head-room from the
         // SAME latest reading and trigger the weekly runway uses, recorded ONLY when the weekly
         // velocity is known (so an unknown / stale account contributes neither head-room nor burn).
         // Clamped at `0` — an over-trigger account is exhausted (no spare capacity), never negative.
-        weekly_headroom: weekly_rate.map(|_| (vparams.weekly_trigger - last.weekly).max(0.0)),
+        weekly_headroom: weekly_rate.map(|_| (vparams.weekly_ceiling - last.weekly).max(0.0)),
     }
 }
 
@@ -812,7 +814,7 @@ struct FleetRunway {
 /// POOL of weekly head-room drained at the combined observed rate —
 ///
 /// ```text
-///   fleet runway ≈  Σ_counted max(0, weekly_trigger − weekly_now)  ÷  Σ_counted weekly_rate
+///   fleet runway ≈  Σ_counted max(0, weekly_ceiling − weekly_now)  ÷  Σ_counted weekly_rate
 /// ```
 ///
 /// — summed over the accounts with a known weekly velocity. This is what honestly answers "how long
@@ -1555,10 +1557,10 @@ struct VelocityWire {
     /// Smoothed weekly-usage rate in percent-per-minute, or `null` when the weekly dimension has
     /// no measurable rate (flat / reset / fewer than two sample intervals).
     weekly_pct_per_min: Option<f64>,
-    /// Approximate whole seconds until the session reading reaches `session_trigger`, or `null`
-    /// when the rate is `0` or the reading is already at/over the trigger (no positive head-room).
+    /// Approximate whole seconds until the session reading reaches `session_ceiling`, or `null`
+    /// when the rate is `0` or the reading is already at/over the ceiling (no positive head-room).
     session_runway_secs: Option<i64>,
-    /// Approximate whole seconds until the weekly reading reaches `weekly_trigger`, or `null`.
+    /// Approximate whole seconds until the weekly reading reaches `weekly_ceiling`, or `null`.
     weekly_runway_secs: Option<i64>,
 }
 
@@ -3351,8 +3353,8 @@ mod tests {
     fn vparams() -> VelocityParams {
         VelocityParams {
             session_ema_alpha: 0.5,
-            session_trigger: 0.80,
-            weekly_trigger: 0.95,
+            session_ceiling: 0.80,
+            weekly_ceiling: 0.95,
         }
     }
 

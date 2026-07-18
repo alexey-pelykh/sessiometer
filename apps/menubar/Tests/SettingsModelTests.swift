@@ -35,8 +35,8 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.draft(for: .nearLimitPollSecs), "120")
         XCTAssertEqual(model.draft(for: .cooldownSecs), "45")
         XCTAssertEqual(model.draft(for: .targetMaxSessionUsage), "85")
-        XCTAssertEqual(model.draft(for: .sessionTrigger), "90")
-        XCTAssertEqual(model.draft(for: .weeklyTrigger), "95")
+        XCTAssertEqual(model.draft(for: .sessionCeiling), "90")
+        XCTAssertEqual(model.draft(for: .weeklyCeiling), "95")
         XCTAssertEqual(model.draft(for: .sessionBlindSwapSecs), "900")
         XCTAssertEqual(model.draft(for: .sessionBlindRiskBand), "80")
         XCTAssertEqual(model.draft(for: .sessionVelocityHorizonSecs), "150")
@@ -154,7 +154,7 @@ final class SettingsModelTests: XCTestCase {
         let (model, connector) = makeModel(replies: [Fixtures.configViewBasic, Fixtures.configSetAppliedRestart])
         await model.load()
         model.setDraft("120", for: .pollSecs)
-        model.setDraft("88", for: .sessionTrigger)
+        model.setDraft("88", for: .sessionCeiling)
         await model.apply()
 
         XCTAssertEqual(model.applyPhase, .applied(effect: .restartRequired))
@@ -164,7 +164,7 @@ final class SettingsModelTests: XCTestCase {
         // ONLY the two edited tunables ride the wire; labels is empty. (Pins the batch-of-dirty-keys contract.)
         XCTAssertEqual(
             connector.sentLines.last,
-            #"{"cmd":"config-set","labels":{},"tunables":{"poll_secs":120,"session_trigger":88}}"# + "\n")
+            #"{"cmd":"config-set","labels":{},"tunables":{"poll_secs":120,"session_ceiling":88}}"# + "\n")
     }
 
     /// AC 3: a label edit renders `live` (no restart) and sends ONLY the labels map.

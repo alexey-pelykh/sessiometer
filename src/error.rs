@@ -171,12 +171,12 @@ pub(crate) enum Error {
     #[error("invalid config: {0}")]
     ConfigInvalid(String),
 
-    /// The cross-field rule failed: `target_max_session_usage` exceeds `session_trigger`
+    /// The cross-field rule failed: `target_max_session_usage` exceeds `session_ceiling`
     /// (no account could ever become a swap target, since the ceiling a candidate
     /// must sit below is itself above the trigger). A distinct variant from
     /// [`Error::ConfigInvalid`] so this case can be matched specifically
     /// (issue #3).
-    #[error("invalid config: target_max_session_usage ({target_max_session_usage}) must not exceed session_trigger ({trigger})")]
+    #[error("invalid config: target_max_session_usage ({target_max_session_usage}) must not exceed session_ceiling ({trigger})")]
     ConfigTargetMaxSessionAboveTrigger {
         target_max_session_usage: i64,
         trigger: i64,
@@ -185,9 +185,9 @@ pub(crate) enum Error {
     /// The peak-velocity runway coupling is UNSATISFIABLE (issue #608, discharging ADR-0023
     /// § Alternatives 3): the config stacks its swap lookahead — `near_limit_poll_secs`
     /// (via the reactive re-observation gap) and/or `session_velocity_horizon_secs` — so wide
-    /// against so low a `session_trigger` ceiling that at the assumed peak velocity
+    /// against so low a `session_ceiling` that at the assumed peak velocity
     /// (`swap::V_PEAK_SESSION_PCT_PER_MIN`) NO `target_max_session_usage` in its legal
-    /// `1..=session_trigger` range keeps a swapped-to account any runway. Equivalently: the
+    /// `1..=session_ceiling` range keeps a swapped-to account any runway. Equivalently: the
     /// composed fire point sits at or below 0, so every account would swap at any usage —
     /// ADR-0023 § Consequences' "absurd-config corner". Distinct from
     /// [`Error::ConfigTargetMaxSessionAboveTrigger`] (which bounds the reserve by the CEILING,
@@ -196,10 +196,10 @@ pub(crate) enum Error {
     /// offending tunables — all bare integers, never secrets (issue #15).
     #[error(
         "invalid config: no target_max_session_usage can keep runway — at peak session velocity \
-         ({v_peak_pct_per_min} %/min) an account climbs past the session_trigger ceiling ({trigger}) \
+         ({v_peak_pct_per_min} %/min) an account climbs past session_ceiling ({trigger}) \
          within the {window_secs}s swap lookahead, so the reserve bound is {bound_pct} (not positive). \
          Lower near_limit_poll_secs ({near_limit_poll_secs}) or session_velocity_horizon_secs \
-         ({horizon_secs}), or raise session_trigger."
+         ({horizon_secs}), or raise session_ceiling."
     )]
     ConfigPeakRunwayUnsatisfiable {
         trigger: i64,

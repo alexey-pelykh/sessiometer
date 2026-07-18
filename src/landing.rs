@@ -33,7 +33,7 @@ use std::time::Duration;
 /// The SLO ceiling a post-swap landing must stay STRICTLY BELOW — the swap-out `session_pct`
 /// `P100 < 99` target (issue #455 / #595). Referenced from the offline reader's own
 /// [`crate::reliability::SLO_SWAP_P100_MAX`] so the runtime signal and the offline SLI check the
-/// SAME line and cannot drift. Distinct from the CONFIG `session_trigger` ceiling (default 95,
+/// SAME line and cannot drift. Distinct from the CONFIG `session_ceiling` ceiling (default 95,
 /// ADR-0023), which sits deliberately BELOW this SLO — a landing overshoot means the post-swap
 /// committed tail carried the parked account past the SLO despite that sub-SLO margin.
 pub(crate) const LANDING_SLO_CEILING_PCT: u8 = crate::reliability::SLO_SWAP_P100_MAX;

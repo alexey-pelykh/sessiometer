@@ -24,8 +24,8 @@ final class ConfigWireTests: XCTestCase {
         XCTAssertEqual(t.nearLimitPollSecs, 120)
         XCTAssertEqual(t.cooldownSecs, 45)
         XCTAssertEqual(t.targetMaxSessionUsage, 85)
-        XCTAssertEqual(t.sessionTrigger, 90)
-        XCTAssertEqual(t.weeklyTrigger, 95)
+        XCTAssertEqual(t.sessionCeiling, 90)
+        XCTAssertEqual(t.weeklyCeiling, 95)
         XCTAssertEqual(t.sessionBlindSwapSecs, 900)
         XCTAssertEqual(t.sessionBlindRiskBand, 80)
         XCTAssertEqual(t.sessionVelocityHorizonSecs, 150)
@@ -129,7 +129,7 @@ final class ConfigWireTests: XCTestCase {
     func testConfigSetRequestEncodesOnlyEditedKeys() throws {
         var tunables = SetTunables()
         tunables.pollSecs = 120
-        tunables.sessionTrigger = 88
+        tunables.sessionCeiling = 88
         let command = ConfigSetCommand(
             tunables: tunables, labels: ["11111111-1111-1111-1111-111111111111": "renamed"])
 
@@ -139,7 +139,7 @@ final class ConfigWireTests: XCTestCase {
 
         XCTAssertEqual(
             json,
-            #"{"cmd":"config-set","labels":{"11111111-1111-1111-1111-111111111111":"renamed"},"tunables":{"poll_secs":120,"session_trigger":88}}"#)
+            #"{"cmd":"config-set","labels":{"11111111-1111-1111-1111-111111111111":"renamed"},"tunables":{"poll_secs":120,"session_ceiling":88}}"#)
     }
 
     /// An all-empty submit encodes to empty `tunables` / `labels` objects — the no-op path the daemon
