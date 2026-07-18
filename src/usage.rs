@@ -101,8 +101,11 @@ pub(crate) struct Usage {
     /// can show a per-account "resets in" (issue #72): in normal rotation an
     /// account is session-exhausted (out for hours) while its weekly window is
     /// fine, so the SESSION reset — not the weekly one — is when it becomes usable
-    /// again. The swap-decision loop ignores it (the terminal signal keys off the
-    /// weekly reset above); it exists purely for the `status` display.
+    /// again. The all-exhausted terminal signal ignores it (that keys off the weekly
+    /// reset above), but since issue #614 the swap-decision path DOES read it as the
+    /// session window's IDENTITY: usage is monotonic within one window, so a session
+    /// value that drops while this stamp is unchanged is a stale / cache-lagged
+    /// reading rather than real drain (see [`crate::swap::SessionHighWater`]).
     pub(crate) session_resets_at: Option<i64>,
 }
 

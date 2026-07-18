@@ -83,10 +83,13 @@ pub(crate) enum SwapReason {
     /// (`last + velocity × session_velocity_horizon_secs`, keyed off the #399 velocity signal)
     /// crossed it, so it swapped away before the observed reading would trip the reactive
     /// trigger — closing the OBSERVED reactive overshoot (#363). Unlike `BlindPreempt`,
-    /// `session_pct` carries the FRESH observed reading at swap-out (the projection is off a live
-    /// reading, never a stale anchor). Distinct from `Session` so the false-projection SLI and the
-    /// projected swap-out overshoot readout (`sessiometer reliability`) can separate the projective
-    /// swaps from the reactive residual.
+    /// `session_pct` carries the reading the projection actually fired on — a LIVE reading, never a
+    /// stale blind anchor. Since issue #614 that is the *plausibility-corrected* live reading: when
+    /// the response came back implausibly low for its own session window, the retained high-water
+    /// mark (a true lower bound on the account's usage, and the value the swap was decided on) is
+    /// reported instead of the number the daemon did not act on. Distinct from `Session` so the
+    /// false-projection SLI and the projected swap-out overshoot readout (`sessiometer reliability`)
+    /// can separate the projective swaps from the reactive residual.
     VelocityPreempt,
 }
 

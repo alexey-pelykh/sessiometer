@@ -1806,6 +1806,17 @@ struct DecisionState {
     /// in lockstep by [`reconcile_roster`](Daemon::reconcile_roster). Sized to the roster in
     /// [`Daemon::new`]. See [`VelocityEma`].
     session_velocity: Vec<Option<VelocityEma>>,
+    /// The per-account SESSION high-water mark within the current session window (issue #614),
+    /// indexed in lockstep with [`last_readings`](Self::last_readings) — the plausibility baseline
+    /// that lets both swap arms recognize a stale / cache-lagged LOW `/oauth/usage` reading (usage is
+    /// monotonic within a window, so a drop with an unchanged `session_resets_at` cannot be real).
+    /// Folded from every SUCCESSFUL poll by [`swap::SessionHighWater::fold`] (a failed poll is blindness,
+    /// not evidence the window rolled, so it leaves the mark untouched) and released automatically
+    /// when the window rolls, so it can never pin an account across windows. `None` until an account
+    /// is polled with a parseable `session_resets_at`. Rebuilt in lockstep by
+    /// [`reconcile_roster`](Daemon::reconcile_roster) and sized to the roster in [`Daemon::new`], like
+    /// every other per-account vec. See [`swap::SessionHighWater`].
+    session_high_water: Vec<Option<swap::SessionHighWater>>,
     /// The PER-ACCOUNT pre-blind anchor (issue #583), indexed in lockstep with
     /// [`last_readings`](Self::last_readings) — `Some` exactly while that account is inside a blind
     /// episode whose entry the daemon actually witnessed. Set on the live→blind ENTRY edge (which
@@ -2128,6 +2139,10 @@ where
         // Per-account session-velocity EMA (issue #539), parallel to `last_readings` — `None` until
         // each account has a usable two-reading interval, so no projection off an unwarmed signal.
         let session_velocity = vec![None; roster.len()];
+        // Per-account session high-water mark (issue #614), parallel to `last_readings` — `None`
+        // until each account is polled with a parseable `session_resets_at`, so a stale-low reading
+        // is only ever judged against evidence actually observed for its own window.
+        let session_high_water = vec![None; roster.len()];
         // Per-account pre-blind anchor (issue #583), parallel to `last_readings` — `None` until an
         // account is seen going live→blind, so a never-witnessed episode claims no baseline.
         let blind_anchor = vec![None; roster.len()];
@@ -2214,6 +2229,7 @@ where
                 last_readings,
                 last_reading_at,
                 session_velocity,
+                session_high_water,
                 blind_anchor,
                 polled_once,
                 ..DecisionState::default()
@@ -2626,9 +2642,10 @@ where
             ) {
                 let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
                 let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
-                // Copy the fraction readings out (issue #539) — `Usage` is `Copy`, so this ends the
+                // Copy the readings out (issues #539 / #614) — `Usage` is `Copy`, so this ends the
                 // `prev`/`next` borrows and frees `self` for the `&mut self` EMA update below.
-                let (prev_session, next_session) = (prev.session, next.session);
+                let (prev_usage, next_usage) = (*prev, *next);
+                let (prev_session, next_session) = (prev_usage.session, next_usage.session);
                 if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
                     events.push(Event::UsageVelocity {
                         account: self.roster[i].account_uuid.clone(),
@@ -2642,7 +2659,23 @@ where
                 // velocity event uses. Folded on EVERY interval, including a flat/zero one (which
                 // correctly decays the EMA toward "not climbing"), unlike the event above whose
                 // non-zero-delta gate keeps the log quiet for an idle account.
-                self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
+                //
+                // Issue #614: UNLESS either endpoint is an implausibly LOW reading — one below the
+                // high-water mark of the very window it claims to be in, which usage's within-window
+                // monotonicity makes impossible (a stale / cache-lagged response). Such an interval
+                // is not a measurement of anything, so it is SKIPPED entirely rather than folded:
+                // folding the drop would reset the EMA (`next < prev`) and falsely declare the
+                // climbing trend stale, while folding the RECOVERY interval off the stale-low `prev`
+                // would blend a spuriously steep rate. Skipping leaves the retained EMA untouched —
+                // the last real intervals still describe the account's climb. The mark itself is
+                // folded further below, AFTER this, so the comparison is against evidence gathered
+                // strictly BEFORE this reading (`next` cannot mask its own implausibility).
+                let stale_low_interval =
+                    swap::is_stale_low(self.state.session_high_water[i], &prev_usage)
+                        || swap::is_stale_low(self.state.session_high_water[i], &next_usage);
+                if !stale_low_interval {
+                    self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
+                }
             }
             // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
             // the active had gone blind (a `429` / `5xx` cleared `last_readings[active]` so
@@ -2677,6 +2710,15 @@ where
             // `blind_window` block (whose recovery-edge semantics stay untouched) and BEFORE the slot
             // assignment below (it anchors off the PRE-poll reading + its timestamp).
             self.note_blind_episode(i, active, &result, now, &mut events);
+            // Issue #614: fold a LIVE reading into this account's per-window session high-water mark
+            // — the plausibility baseline the swap arms measure a suspect low reading against. Only a
+            // successful poll updates it: a `429` / `5xx` is blindness, not evidence the window
+            // rolled, so a failed poll must leave the mark standing. `fold` releases the mark on its
+            // own when `session_resets_at` moves to a new window, so it never pins across windows.
+            if let Ok(fresh) = result.as_ref() {
+                self.state.session_high_water[i] =
+                    swap::SessionHighWater::fold(self.state.session_high_water[i], fresh);
+            }
             self.state.last_readings[i] = result.ok();
             // Track WHEN this reading was observed, in lockstep with `last_readings` (issue #449):
             // `now` on a live reading, cleared on a failed poll — so the velocity interval above
@@ -3861,6 +3903,19 @@ where
         let Some(active_usage) = readings[active_idx] else {
             return self.blind_swap(at, active_idx, readings, events).await;
         };
+        // Issue #614: decide on the active account's PLAUSIBLE session usage, not the raw response.
+        // A `/oauth/usage` reading that fell BELOW the high-water mark of its own (unchanged) session
+        // window is stale / cache-lagged — usage cannot fall within a window — and taking it at face
+        // value would cancel an otherwise-due swap while the account is really higher. Raising it back
+        // to the retained mark (a genuine LOWER bound on the truth, never a synthesized number) is the
+        // conservative reading under #597's asymmetry: an early swap is the cheap error, an overshoot
+        // the expensive one. A plausible reading passes through UNCHANGED, so this is a no-op on every
+        // normal tick. Deliberately scoped to this local: `readings` — and so `pick_target`, the
+        // all-exhausted relief hint, and the status snapshot — keep the VERBATIM reading, and
+        // `last_readings` is never written back over. The projection peer applies the same correction
+        // to the same account through the same helper, so both arms decide on one value (ADR-0022's
+        // one predicate, two estimators).
+        let active_usage = self.plausible_active_usage(active_idx, active_usage);
         // The active is READING again, so any #582 blind episode is over: re-arm the
         // circuit-breaker's edge-trigger guards (the LEAVE edge, mirroring `signaled_all_exhausted`)
         // so a LATER episode reports its holds afresh instead of being silenced by a stale guard.
@@ -4050,7 +4105,11 @@ where
                 // points — the session dimension against the #597 velocity-derived
                 // `session_threshold` (NOT the raw ceiling), so a velocity-early session
                 // swap is attributed to Session, never mis-logged as Weekly. `session_pct`
-                // reuses `to_pct` so the log agrees with the percentage `status` shows.
+                // is the #614 plausibility-corrected reading the swap DECIDED on (raised to
+                // the retained high-water mark on a stale-low tick), rounded via the same
+                // `to_pct` every swap line uses — so on a stale-low tick it is the value the
+                // daemon acted on, which differs from the raw reading `status` still shows
+                // (that surface stays verbatim by design — see `plausible_active_usage`).
                 let reason = if active_usage.session >= session_threshold {
                     SwapReason::Session
                 } else {
@@ -4677,6 +4736,11 @@ where
         // vec never drifts out of length/index sync with the roster (a projective read would
         // otherwise index the wrong account or panic out of bounds).
         let mut session_velocity = Vec::with_capacity(new_roster.len());
+        // Issue #614: the session high-water mark is re-keyed in lockstep with `last_readings` for
+        // the same reason — kept for a persisting account (its window's plausibility baseline is
+        // still valid; a reconcile of OTHER accounts is not a window roll), started fresh (`None`)
+        // for a new one, so the vec never drifts out of length/index sync with the roster.
+        let mut session_high_water = Vec::with_capacity(new_roster.len());
         // Issue #583: the per-account pre-blind anchor is re-keyed in lockstep with `last_readings`
         // for the same reason — kept for a persisting account (an in-flight blind episode survives a
         // reconcile of OTHER accounts, so a `remove` elsewhere cannot silently truncate it), started
@@ -4695,6 +4759,7 @@ where
                     last_readings.push(self.state.last_readings[old_idx]);
                     last_reading_at.push(self.state.last_reading_at[old_idx]);
                     session_velocity.push(self.state.session_velocity[old_idx]);
+                    session_high_water.push(self.state.session_high_water[old_idx]);
                     blind_anchor.push(self.state.blind_anchor[old_idx]);
                     polled_once.push(self.state.polled_once[old_idx]);
                 }
@@ -4703,6 +4768,7 @@ where
                     last_readings.push(None);
                     last_reading_at.push(None);
                     session_velocity.push(None);
+                    session_high_water.push(None);
                     blind_anchor.push(None);
                     polled_once.push(false);
                 }
@@ -4723,6 +4789,7 @@ where
         self.state.last_readings = last_readings;
         self.state.last_reading_at = last_reading_at;
         self.state.session_velocity = session_velocity;
+        self.state.session_high_water = session_high_water;
         self.state.blind_anchor = blind_anchor;
         self.state.polled_once = polled_once;
         self.state.active = active;
@@ -5092,6 +5159,39 @@ where
         self.state.retry_after_swaps.len()
     }
 
+    /// Account `i`'s reading as the swap arms should DECIDE on it (issue #614): the verbatim
+    /// response, except that a session fraction sitting below the high-water mark of its own
+    /// (unchanged) window is raised back to that mark.
+    ///
+    /// Usage is monotonic within a session window, so such a reading is a stale / cache-lagged
+    /// response rather than real drain, and the retained mark is a genuine LOWER bound on the true
+    /// usage — deciding on it keeps a lagging response from cancelling an otherwise-due swap. A
+    /// plausible reading (or one carrying no window evidence — see [`swap::SessionHighWater`]) is
+    /// returned unchanged, so this is a no-op on every normal tick.
+    ///
+    /// Both swap arms route through here — the reactive [`decide_action`](Self::decide_action) and
+    /// the projective [`velocity_swap`](Self::velocity_swap) — so they cannot disagree about how high
+    /// the account is (ADR-0022: one predicate, two estimators).
+    ///
+    /// # What the correction does and does not reach
+    ///
+    /// It is applied to the swap DECISION and to the record OF that decision — nothing else. The
+    /// carried [`last_readings`](DecisionState::last_readings) slot is never written back over, so
+    /// `pick_target`, the all-exhausted relief hint, the `status` snapshot, and the usage-sample store
+    /// all keep exactly what the API reported.
+    ///
+    /// The ONE surface that carries the corrected value is the `session_pct` of the
+    /// [`Event::Swap`] this decision emits (both arms), and with it the #595 / #539 landing and
+    /// swap-out-overshoot SLIs derived from it. That is deliberate, not an oversight: that field's
+    /// contract is "the usage the account was at when we swapped away", and on a stale-low tick the
+    /// raw response is precisely the number we did NOT act on — logging it would under-report the very
+    /// overshoot the SLI exists to measure. The retained mark is a true lower bound on the account's
+    /// real usage, so it is the honest estimate of the swap-out point. It is, however, a PRIOR
+    /// observation rather than this tick's fresh one, which is the caveat to read those SLIs with.
+    fn plausible_active_usage(&self, i: usize, usage: Usage) -> Usage {
+        swap::plausible_session(self.state.session_high_water[i], &usage)
+    }
+
     /// Fold one poll interval into account `i`'s retained session-velocity EMA (issue #539,
     /// ADR-0017) — the signal [`velocity_swap`](Self::velocity_swap) projects from. Called from the
     /// poll fold with the SAME `(prev, next, elapsed_secs)` the durable [`Event::UsageVelocity`]
@@ -5106,6 +5206,12 @@ where
     ///   rate on the first sample (NOT zero — a zero seed biases the EMA to asymptote BELOW the true
     ///   rate and would miss real overshoots; the single-spike case is instead gated by
     ///   [`MIN_VELOCITY_SAMPLES`], not by seed choice), and the sample count is advanced.
+    ///
+    /// The DROP branch above reads a drop as a genuine window reset / recovery, so issue #614's
+    /// plausibility guard keeps IMPLAUSIBLE drops away from here entirely: the poll fold skips this
+    /// call when either endpoint of the interval is a stale-low reading (one below its own window's
+    /// high-water mark), leaving the retained EMA untouched rather than resetting it on a reading
+    /// that never happened. This function therefore still treats every drop it is handed as real.
     fn note_session_velocity(
         &mut self,
         i: usize,
@@ -5179,7 +5285,12 @@ where
         // than threaded in as a separate arg (the `Copy` reading is already carried here, and the
         // caller only reaches this path with it present). A missing slot cannot occur on the reactive
         // Hold path that calls this, but hold defensively rather than project on absent data.
-        let Some(active_usage) = readings[active_idx] else {
+        // Issue #614: corrected to the window's high-water mark when the response came back
+        // implausibly LOW, through the SAME helper the reactive arm used this tick — so a stale
+        // reading cannot silence this arm either, and the two arms project from one value.
+        let Some(active_usage) =
+            readings[active_idx].map(|u| self.plausible_active_usage(active_idx, u))
+        else {
             return TickAction::Held;
         };
         // The retained velocity signal must exist AND be SUSTAINED (≥ MIN_VELOCITY_SAMPLES blended
@@ -5256,10 +5367,13 @@ where
                     from: self.roster[active_idx].label.clone(),
                     to: self.roster[target_idx].label.clone(),
                     reason: SwapReason::VelocityPreempt,
-                    // The FRESH observed reading at swap-out (issue #539) — the projection fired off a
-                    // live reading, so `session_pct` is the real swap-out point (the projected
-                    // swap-out overshoot SLI's #363-acceptance sample), never a stale anchor. A
-                    // percent, like every swap line; never a token / email (#15).
+                    // The reading the projection fired off (issue #539) — a LIVE reading, so
+                    // `session_pct` is the real swap-out point (the projected swap-out overshoot SLI's
+                    // #363-acceptance sample), never a stale BLIND anchor. Since #614 it is the
+                    // plausibility-corrected live reading: the retained high-water mark (a true lower
+                    // bound on the account's usage, and the value the swap decided on) when the
+                    // response came back stale-low for its own window — see `plausible_active_usage`.
+                    // A percent, like every swap line; never a token / email (#15).
                     session_pct: to_pct(active_usage.session),
                 });
                 TickAction::VelocityPreemptivelySwapped {
@@ -6041,6 +6155,12 @@ where
         let Some(active_usage) = self.state.last_readings[active_idx] else {
             return false;
         };
+        // Issue #614: through the SAME plausibility correction the two swap arms apply, because this
+        // band's whole contract (above) is that #540 and #539 key off ONE band with no drift. Without
+        // it a stale-low reading would DISENGAGE the near-limit fast-poll exactly when the account is
+        // really near the ceiling — widening the very re-observation gap the reactive arm looks ahead
+        // over, and so compounding the overshoot this guard exists to narrow.
+        let active_usage = self.plausible_active_usage(active_idx, active_usage);
         let floor = self.session_velocity_min_project_above;
         // In-band by the observed reading.
         if active_usage.session >= floor {
@@ -6483,9 +6603,11 @@ fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
 }
 
 /// The per-account usage VELOCITY between two consecutive readings (issue #399): the signed
-/// change in each dimension as a rounded percent, `to_pct(next) - to_pct(prev)`. Reuses
-/// [`to_pct`] so the delta agrees with the percents the swap line (`session_pct`) and `status`
-/// show for the same reading; a difference of two `0..=100` percents lands in `-100..=100`, well
+/// change in each dimension as a rounded percent, `to_pct(next) - to_pct(prev)`. Computed off the
+/// RAW carried readings and reusing [`to_pct`], so the delta agrees with the percents `status`
+/// shows for the same readings, and shares its rounding with the swap line (whose `session_pct`
+/// may since #614 carry a plausibility-corrected value on a stale-low tick — see
+/// `plausible_active_usage`). A difference of two `0..=100` percents lands in `-100..=100`, well
 /// inside `i16`. Positive ⇒ usage climbing; negative ⇒ a window reset dropped the reading. Pure,
 /// so the quantization is unit-tested without a daemon.
 fn usage_velocity(prev: &Usage, next: &Usage) -> (i16, i16) {
@@ -11453,6 +11575,359 @@ mod tests {
         );
     }
 
+    // --- #614 stale-reading plausibility guard (end to end through both swap arms) ---
+
+    /// An epoch-second session-window stamp for the #614 tests; `WINDOW_ROLLED` is the one the 5 h
+    /// window moves to on a legitimate reset.
+    const WINDOW: i64 = 1_800_000_000;
+    const WINDOW_ROLLED: i64 = WINDOW + 18_000;
+
+    /// [`active_session_reading`] with a SESSION window stamp on the active account (issue #614) —
+    /// the window identity the plausibility guard needs to judge a low reading.
+    fn stamped_active_reading(
+        daemon: &FakeDaemon,
+        session: f64,
+        window: Option<i64>,
+    ) -> Vec<Option<Usage>> {
+        let mut readings = daemon.state.last_readings.clone();
+        readings[0] = Some(Usage {
+            session,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: window,
+        });
+        readings
+    }
+
+    /// Install a session high-water mark of `session` in window [`WINDOW`] on the active account
+    /// (slot 0), through the real [`swap::SessionHighWater::fold`] seam rather than by hand.
+    fn seed_high_water(daemon: &mut FakeDaemon, session: f64) {
+        daemon.state.session_high_water[0] = swap::SessionHighWater::fold(
+            None,
+            &Usage {
+                session,
+                weekly: 0.20,
+                weekly_resets_at: None,
+                session_resets_at: Some(WINDOW),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_low_reading_in_an_unchanged_window_does_not_cancel_a_due_swap() {
+        // Issue #614 AC 1, end to end through `decide_action`: both swap arms trusted
+        // `active_usage.session` at face value, so a cache-lagged LOW `/oauth/usage` response sat below
+        // the fire threshold and CANCELLED an otherwise-due swap while the account was really higher —
+        // and velocity-spike detection (the designated multi-machine mitigation) is defeated with it.
+        // The account is really at 0.88 in this window; the guard decides on that retained mark rather
+        // than the 0.40 the API just echoed back.
+        let eff = swap::effective_ceiling(0.99); // 0.93
+        let rate = 0.0004;
+        let threshold =
+            swap::reactive_session_threshold(eff, rate, swap::reactive_poll_gap_secs(60)); // ~0.805
+        let real = 0.88; // above the threshold → a swap is DUE
+        let stale = 0.40; // the cache-lagged response
+        assert!(
+            real > threshold && stale < threshold,
+            "the fixture straddles the fire point"
+        );
+
+        // Control — WITHOUT a high-water mark the stale reading is taken at face value and holds. This
+        // is the pre-#614 behaviour, and it pins that the guard (not the fixture) is what changes it.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        let at = daemon.clock.now();
+        let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
+        let mut events = Vec::new();
+        let unguarded = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(unguarded, TickAction::Held),
+            "with no mark to compare against, the stale reading cancels the due swap: {unguarded:?}",
+        );
+
+        // Guarded: the same stale reading, now measured against the window's retained high-water mark,
+        // fires the swap that was actually due — attributed to Session (the velocity-derived
+        // threshold), not mis-logged as Weekly.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        seed_high_water(&mut daemon, real);
+        let at = daemon.clock.now();
+        let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
+        let mut events = Vec::new();
+        let guarded = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(guarded, TickAction::Swapped { from: 0, .. }),
+            "the stale-low reading no longer cancels the due swap: {guarded:?}",
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::Session,
+                    ..
+                }
+            )),
+            "attributed to the session dimension: {events:?}",
+        );
+        // The carried reading is left VERBATIM — the correction is applied to the DECISION only, never
+        // written back over what the API reported (so `status` / telemetry stay honest).
+        assert_eq!(
+            readings[0].expect("active reading").session,
+            stale,
+            "the decision-path correction does not mutate the carried reading",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_low_reading_does_not_silence_the_projection_arm_either() {
+        // Issue #614 AC 1 for the SECOND arm. The issue names both — `swap::decide` AND `velocity_swap`
+        // — and the reactive test above cannot reach this one (it fires reactively before the
+        // projection is consulted), so without this the projection-arm correction is untested: reverting
+        // it leaves the whole suite green.
+        //
+        // Wiring: poll_gap 0 (fast-poll off) → the reactive threshold is the bare effective ceiling
+        // 0.93, so a real 0.88 HOLDS reactively and `decide_action` consults the projection peer. The
+        // stale 0.40 would be stopped dead by the projection's own `session_velocity_min_project_above`
+        // free guard (0.85) — a distinct gate from the reactive threshold, so this exercises a
+        // genuinely different code path.
+        let rate = 0.0004; // 0.88 + 0.0004×150 = 0.94 ≥ the 0.93 effective ceiling → the projection crosses
+        let real = 0.88;
+        let stale = 0.40;
+
+        // Control: no mark → the stale reading is below the 0.85 project-above guard → the projection
+        // holds, and the account rides past the ceiling unswapped.
+        let mut daemon = warmed_velocity_daemon(0.86).await;
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        let at = daemon.clock.now();
+        let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
+        let mut events = Vec::new();
+        let unguarded = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(unguarded, TickAction::Held),
+            "unguarded, the stale reading falls under the project-above guard and holds: {unguarded:?}",
+        );
+
+        // Guarded: measured against the window's mark the projection sees 0.88, clears the guard, and
+        // the preemptive swap fires.
+        let mut daemon = warmed_velocity_daemon(0.86).await;
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        seed_high_water(&mut daemon, real);
+        let at = daemon.clock.now();
+        let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
+        let mut events = Vec::new();
+        let guarded = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(
+                guarded,
+                TickAction::VelocityPreemptivelySwapped { from: 0, .. }
+            ),
+            "the projection arm projects from the plausible reading and fires: {guarded:?}",
+        );
+        // The swap-out pct logged for the #539/#595 SLIs is the PLAUSIBLE value (88), not the stale 40
+        // the API echoed — the swap fired because the account was believed to be there, and reporting
+        // the number we did NOT act on would under-report the overshoot the SLI exists to measure.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::VelocityPreempt,
+                    session_pct: 88,
+                    ..
+                }
+            )),
+            "the swap event carries the decided-on pct, not the stale one: {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_low_usage_reading_is_not_caught_and_overshoots() {
+        // Issue #614: the RESIDUAL trust boundary, stated as a test so it is a known, deliberate gap
+        // rather than an assumed-covered one. The guard fires only on POSITIVE evidence that the window
+        // is unchanged — a `session_resets_at` the API did not report leaves no way to tell a stale
+        // reading from a legitimate reset, so the reading is still trusted at face value and the
+        // account keeps climbing UNSEEN past the fire point (the overshoot #614 narrows but does not
+        // eliminate). Closing this tail would need a different signal than the reading itself carries.
+        let rate = 0.0004;
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        seed_high_water(&mut daemon, 0.88); // a mark exists — but the reading claims no window
+        let at = daemon.clock.now();
+        let readings = stamped_active_reading(&daemon, 0.40, None);
+        let mut events = Vec::new();
+        let held = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(held, TickAction::Held),
+            "an UNSTAMPED stale-low reading is still trusted — the documented residual gap: {held:?}",
+        );
+        assert!(events.is_empty(), "no swap event on the uncaught overshoot");
+    }
+
+    #[tokio::test]
+    async fn the_plausibility_guard_does_not_misfire_on_a_legitimate_window_reset() {
+        // Issue #614 AC 2, end to end: the SAME drop that the guard catches inside one window must pass
+        // through untouched once `session_resets_at` has moved on — a post-reset account really IS at
+        // 0.40, and flooring it at the previous window's mark would swap away a freshly-reset account
+        // for no reason (and pin it there for the rest of the new window).
+        let rate = 0.0004;
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        seed_high_water(&mut daemon, 0.88); // the PREVIOUS window's mark
+        let at = daemon.clock.now();
+        let readings = stamped_active_reading(&daemon, 0.40, Some(WINDOW_ROLLED));
+        let mut events = Vec::new();
+        let held = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(held, TickAction::Held),
+            "a drop across a ROLLED window is expected — the guard must not fire: {held:?}",
+        );
+        assert!(
+            events.is_empty(),
+            "no swap event on a legitimate window reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_low_reading_leaves_the_retained_velocity_ema_intact() {
+        // Issue #614 AC 1, the velocity half — through the REAL poll fold, not the `note_session_velocity`
+        // seam. `note_session_velocity` resets the EMA on any `next < prev` (reading a drop as a window
+        // reset), so an implausible drop used to null a perfectly good climbing trend and leave BOTH
+        // arms velocity-blind (the projection holds outright; the reactive term collapses to 0). The
+        // fold now skips such an interval entirely, so the retained EMA survives untouched.
+        let mut daemon = window_stamped_climbing_daemon().await;
+        let warm = daemon.state.session_velocity[0].expect("a sustained EMA from the real climb");
+        assert!(
+            warm.samples >= MIN_VELOCITY_SAMPLES,
+            "the fixture leaves a SUSTAINED EMA ({} samples)",
+            warm.samples,
+        );
+        assert_eq!(
+            daemon.state.session_high_water[0],
+            swap::SessionHighWater::fold(
+                None,
+                &Usage {
+                    session: 0.94,
+                    weekly: 0.20,
+                    weekly_resets_at: None,
+                    session_resets_at: Some(WINDOW)
+                }
+            ),
+            "the fold accrued the window's high-water mark from the real polls",
+        );
+
+        // A stale-low response in the SAME window. The reading itself is carried verbatim, but the
+        // interval is not folded — the EMA is byte-for-byte what the real climb left.
+        poll_active_at(&mut daemon, 0.40, Some(WINDOW)).await;
+        assert_eq!(
+            daemon.state.session_velocity[0],
+            Some(warm),
+            "the implausible interval left the retained EMA untouched",
+        );
+
+        // Control: the SAME drop, but with the window rolled, IS a real reset — the EMA nulls exactly
+        // as it always did, so the guard has not disabled the reset path it narrows.
+        let mut daemon = window_stamped_climbing_daemon().await;
+        poll_active_at(&mut daemon, 0.40, Some(WINDOW_ROLLED)).await;
+        assert!(
+            daemon.state.session_velocity[0].is_none(),
+            "a legitimate window reset still resets the EMA (the climbing trend really is stale)",
+        );
+    }
+
+    /// A warmed three-account daemon whose ACTIVE account (u-A, slot 0) has really climbed
+    /// 0.86 → 0.90 → 0.94 inside session window [`WINDOW`], so the poll fold has accrued both a
+    /// SUSTAINED velocity EMA and a high-water mark of 0.94 from real polls (issue #614).
+    async fn window_stamped_climbing_daemon() -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_resets_session("u-A", 0.86, 0.20, WINDOW)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        // Ceiling 99 (effective 0.93) so the climbing readings stay reactively held, exactly as
+        // `warmed_velocity_daemon` does; the projection peer is off so no swap interrupts the climb.
+        daemon.trigger_strategy = Strategy::fixed(99.0);
+        daemon.session_trigger_base = 0.99;
+        daemon.session_velocity_horizon_secs = 0;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(daemon.state.active, Some(0), "u-A active through the climb");
+        poll_active_at(&mut daemon, 0.90, Some(WINDOW)).await; // seeds the EMA (samples = 1)
+        poll_active_at(&mut daemon, 0.94, Some(WINDOW)).await; // blends it (samples = 2 → SUSTAINED)
+        daemon
+    }
+
+    /// Advance one poll interval and tick until the staggered schedule has re-polled the ACTIVE
+    /// account (slot 0) at `session` in `window`, so the reading lands through the real fold.
+    async fn poll_active_at(daemon: &mut FakeDaemon, session: f64, window: Option<i64>) {
+        daemon.poller = match window {
+            Some(w) => FakeRosterPoller::new().ok_resets_session("u-A", session, 0.20, w),
+            None => FakeRosterPoller::new().ok("u-A", session, 0.20),
+        }
+        .ok("u-B", 0.10, 0.10)
+        .ok("u-C", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(60));
+        for _ in 0..4 {
+            daemon.tick().await;
+            if daemon.state.last_readings[0].is_some_and(|u| u.session == session) {
+                return;
+            }
+        }
+        panic!("the active account was not re-polled within one schedule cycle");
+    }
+
+    #[test]
+    fn reconcile_roster_preserves_session_high_water_in_lockstep() {
+        // Issue #614: the high-water mark is a parallel per-account vec (like `last_readings` and the
+        // #539 EMA), so a roster reconcile MUST re-key it by uuid — preserved for a persisting account
+        // (merely re-indexed), `None` for a newly-onboarded one — or the plausibility guard would judge
+        // one account's reading against ANOTHER account's mark, or panic out of bounds. Here u-A is
+        // REMOVED (index shift) and u-C is ONBOARDED.
+        let stamped = |session: f64| Usage {
+            session,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: Some(WINDOW),
+        };
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.state.session_high_water[0] = swap::SessionHighWater::fold(None, &stamped(0.95));
+        daemon.state.session_high_water[1] = swap::SessionHighWater::fold(None, &stamped(0.42));
+
+        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+
+        // The vec stays length- and index-aligned with the new roster.
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
+        assert_eq!(daemon.state.session_high_water.len(), 2);
+        // u-B's mark is preserved, re-indexed from slot 1 to slot 0 — its window's plausibility
+        // baseline is still valid (a reconcile of another account is not a window roll).
+        assert_eq!(
+            daemon.state.session_high_water[0],
+            swap::SessionHighWater::fold(None, &stamped(0.42)),
+            "u-B's mark survives the reconcile, re-indexed",
+        );
+        // u-C onboards with a fresh (`None`) mark — no stale floor leaks in from the removed u-A.
+        assert!(
+            daemon.state.session_high_water[1].is_none(),
+            "the onboarded account starts with no high-water mark",
+        );
+    }
+
     #[test]
     fn reconcile_roster_preserves_session_velocity_in_lockstep() {
         // Issue #539: the per-account EMA is a parallel vec (like `last_readings`), so a roster
@@ -12809,6 +13284,51 @@ mod tests {
         assert!(
             !daemon.near_limit_fast_poll_engaged(),
             "no active account → not engaged",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_near_limit_fast_poll_engages_on_a_plausibility_corrected_reading() {
+        // Issue #614: `active_near_limit` shares ONE band with #539's `velocity_swap` (its doc
+        // promise), so it must see the SAME plausibility correction — otherwise a stale-low response
+        // would DISENGAGE the near-limit fast-poll exactly when the account is really near the ceiling,
+        // widening the re-observation gap the reactive arm looks ahead over and compounding the
+        // overshoot the guard exists to narrow. The account is really at 0.90 (this window's mark),
+        // above the 0.85 band floor, but the response echoed a cache-lagged 0.40.
+        let mut daemon = warmed_velocity_daemon(0.90).await;
+        daemon.near_limit_poll_secs = 60; // enable the path
+        daemon.session_velocity_horizon_secs = 0; // projection OFF → isolate the OBSERVED-band arm
+        daemon.state.session_velocity[0] = None; // no velocity → only the reading can carry the band
+        let stale = Usage {
+            session: 0.40,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: Some(WINDOW),
+        };
+        daemon.state.last_readings[0] = Some(stale);
+
+        // Control: with no high-water mark the stale 0.40 is below the band → NOT engaged (pre-#614).
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "unguarded, the stale-low reading disengages the fast-poll near the ceiling",
+        );
+
+        // Guarded: the window's retained mark of 0.90 makes the plausible reading in-band → engaged.
+        seed_high_water(&mut daemon, 0.90);
+        assert!(
+            daemon.near_limit_fast_poll_engaged(),
+            "the plausibility-corrected reading keeps the near-limit fast-poll engaged",
+        );
+
+        // And the correction is scoped to the window: once it rolls, the same 0.40 really IS below the
+        // band, so the fast-poll correctly disengages (the mark does not pin the fast-poll on).
+        daemon.state.last_readings[0] = Some(Usage {
+            session_resets_at: Some(WINDOW_ROLLED),
+            ..stale
+        });
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "across a rolled window the low reading is real → not engaged",
         );
     }
 

@@ -276,6 +276,150 @@ pub(crate) fn reactive_session_threshold(
     effective_ceiling - velocity * poll_gap_secs
 }
 
+/// The highest SESSION fraction observed within ONE session window (issue #614) — the
+/// plausibility baseline both swap arms measure a suspiciously LOW reading against.
+///
+/// # Why a per-window high-water mark
+///
+/// Session usage is MONOTONIC within a window: the 5 h window only accumulates, so a reading that
+/// falls while the window is demonstrably the same one cannot be real drain — it is a stale /
+/// cache-lagged `/oauth/usage` response. Both swap arms trust `active_usage.session` at face value
+/// (`decide` here, [`crate::daemon::Daemon::velocity_swap`] there), so such a reading sits below the
+/// fire threshold and cancels an otherwise-due swap while the account is actually higher; two in a
+/// row also under-estimate the #539 velocity EMA, so BOTH arms then fire late. Retaining the window's
+/// high-water mark gives the arms a floor to fall back on, and it is a genuine LOWER BOUND on the
+/// true usage rather than a synthesized number.
+///
+/// The window is identified by `session_resets_at` — matched with a tolerance, NOT byte-equality
+/// (see [`SESSION_WINDOW_MATCH_SECS`]) — so a DROP inside one window is implausible, while a drop
+/// paired with a stamp a whole window away is the legitimate roll (the mark then restarts at the
+/// fresh reading, per [`Self::fold`]).
+///
+/// # Bounded, and fail-safe when the evidence is missing
+///
+/// The mark cannot pin an account indefinitely: it is scoped to one window and released as soon as
+/// `session_resets_at` moves a window away. And it is only ever consulted on POSITIVE evidence — a
+/// reading whose `session_resets_at` is absent (`None`, the API did not report a parseable stamp) or
+/// names a different window carries no evidence that the window is unchanged, so it is trusted as-is
+/// and the pre-#614 behaviour stands. That residual trust boundary is deliberate: the guard fires
+/// only where the drop is provably impossible, never on a guess. In practice the absent-stamp case is
+/// the COMMON one (the API omits `session_resets_at` on most zero-session readings), so a
+/// window-reset drop is usually released by the stamp VANISHING rather than by it moving.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SessionHighWater {
+    /// The session window this mark belongs to — the FIRST `Usage::session_resets_at` seen for it, in
+    /// epoch seconds. Deliberately NOT refreshed by later readings of the same window: the stamp
+    /// jitters ±1 s poll to poll (see [`SESSION_WINDOW_MATCH_SECS`]), so re-anchoring on every fold
+    /// would let the reference walk. A fixed anchor plus the match tolerance keeps every reading in
+    /// the window comparing against one stable value.
+    window: i64,
+    /// The highest `session` fraction observed within that window.
+    session: f64,
+}
+
+/// How far apart two `session_resets_at` stamps may be and still name the SAME session window, in
+/// seconds (issue #614).
+///
+/// # Provenance (measured, not assumed)
+///
+/// The stamp is NOT stable byte-for-byte within one window. Measured over the daemon's own usage
+/// sample store (24,244 samples / 6 accounts, 17,978 consecutive stamped pairs), the delta between
+/// successive stamps of the SAME window is:
+///
+/// ```text
+///    0 s   50.1%          ±1 s   49.8%          |Δ| ≤ 1 s   99.8%
+/// ```
+///
+/// The API renders `resets_at` with sub-second precision and [`crate::usage::epoch_from_rfc3339`]
+/// truncates the fraction, so a value straddling a second boundary alternates between `N` and `N+1`.
+/// A byte-equality window key would therefore have failed to match on ~HALF of all same-window polls
+/// — and worse, each mismatch would restart the mark at the very stale-low reading it exists to
+/// reject, so the guard would have fired essentially NEVER in production while every hand-pinned unit
+/// test stayed green.
+///
+/// A genuine window roll is ~5 h away: the smallest non-jitter delta observed in the same corpus is
+/// 3600 s, and the roll cluster sits at 17999–18001 s. **60 s** therefore separates the two
+/// populations with ~2 orders of magnitude of margin on BOTH sides — 60× the observed jitter, and
+/// 60× below the nearest real change. It is a calibrated constant, not a tuned knob; re-measure
+/// against the sample store if the API's `resets_at` rendering is suspected to have changed.
+pub(crate) const SESSION_WINDOW_MATCH_SECS: i64 = 60;
+
+impl SessionHighWater {
+    /// Fold one LIVE reading into the mark, returning the mark to retain.
+    ///
+    /// - No `session_resets_at` on the reading → `None`: without a window identity no later drop can
+    ///   be judged implausible, so carrying a mark forward would risk holding a floor across an
+    ///   unseen window roll.
+    /// - Same window as the current mark (within [`SESSION_WINDOW_MATCH_SECS`]) → the running
+    ///   maximum, keeping the mark's ORIGINAL anchor stamp; a stale-low reading therefore leaves the
+    ///   mark standing at the higher, plausible value instead of dragging the baseline down.
+    /// - A DIFFERENT window, or no mark yet → start fresh at this reading, which is how a legitimate
+    ///   window reset releases the previous window's floor.
+    ///
+    /// Call on successful polls ONLY. A failed poll is blindness, not evidence the window rolled, so
+    /// it must leave the mark untouched.
+    pub(crate) fn fold(mark: Option<Self>, usage: &Usage) -> Option<Self> {
+        let window = usage.session_resets_at?;
+        Some(match mark {
+            Some(prev) if prev.matches_window(window) => Self {
+                // The ORIGINAL anchor, not `window` — see the field doc: re-anchoring each fold would
+                // let the reference walk with the per-poll jitter.
+                window: prev.window,
+                session: prev.session.max(usage.session),
+            },
+            _ => Self {
+                window,
+                session: usage.session,
+            },
+        })
+    }
+
+    /// Whether `stamp` names this mark's session window, tolerating the per-poll rendering jitter
+    /// ([`SESSION_WINDOW_MATCH_SECS`]).
+    fn matches_window(self, stamp: i64) -> bool {
+        self.window.abs_diff(stamp) <= SESSION_WINDOW_MATCH_SECS.unsigned_abs()
+    }
+
+    /// The retained high-water fraction that APPLIES to `usage` — `Some` only when the mark and the
+    /// reading name the same session window, so a rolled (or unstamped) window yields `None` and the
+    /// reading stands on its own.
+    fn applies_to(self, usage: &Usage) -> Option<f64> {
+        usage
+            .session_resets_at
+            .filter(|&stamp| self.matches_window(stamp))
+            .map(|_| self.session)
+    }
+}
+
+/// Whether `usage`'s session reading is IMPLAUSIBLY LOW (issue #614): it sits BELOW the high-water
+/// mark of the very window it claims to be in. Usage cannot fall within a window, so this is a
+/// stale / cache-lagged reading, not real drain.
+///
+/// `None` mark, an unstamped reading, or a rolled window → `false` (no evidence of implausibility;
+/// see [`SessionHighWater`] § Bounded, and fail-safe when the evidence is missing).
+pub(crate) fn is_stale_low(mark: Option<SessionHighWater>, usage: &Usage) -> bool {
+    mark.and_then(|m| m.applies_to(usage))
+        .is_some_and(|high_water| usage.session < high_water)
+}
+
+/// `usage` with its SESSION fraction raised to the window's high-water mark (issue #614) — the
+/// reading the swap arms should decide on, so a stale-low response cannot cancel an otherwise-due
+/// swap. A plausible reading (at or above the mark, or carrying no window evidence) is returned
+/// UNCHANGED, so this is a no-op on every normal tick.
+///
+/// Only the `session` fraction is corrected. `weekly` has its own (weekly) window and is left
+/// verbatim, and the caller keeps the raw reading in its own carried state — the correction is
+/// applied to the swap DECISION, never written back over what the API actually reported.
+pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -> Usage {
+    match mark.and_then(|m| m.applies_to(usage)) {
+        Some(high_water) if high_water > usage.session => Usage {
+            session: high_water,
+            ..*usage
+        },
+        _ => *usage,
+    }
+}
+
 /// The result of a completed [`swap`]. The token reroute (the swap proper)
 /// succeeded; these two fields report the best-effort, display-only follow-ups so
 /// the caller (#7) can log or act without re-reading the keychain itself.
@@ -900,6 +1044,238 @@ mod tests {
         assert!(
             thr_default_ceiling < 0.85,
             "peak-velocity reactive fire ({thr_default_ceiling}) is below the projection floor, by design"
+        );
+    }
+
+    // --- #614 stale-reading plausibility guard (session high-water mark) ---
+
+    /// An epoch-second session-window stamp; `WINDOW_NEXT` is the one the 5 h window rolls to.
+    const WINDOW: i64 = 1_800_000_000;
+    const WINDOW_NEXT: i64 = WINDOW + 18_000;
+
+    /// A reading at `session` claiming session window `window` (`None` = the API reported no
+    /// parseable `resets_at`).
+    fn reading(session: f64, window: Option<i64>) -> Usage {
+        Usage {
+            session,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: window,
+        }
+    }
+
+    #[test]
+    fn session_high_water_runs_to_the_max_within_one_window() {
+        // The mark tracks the HIGHEST session fraction seen in the window, so a stale-low reading
+        // folded into it leaves the plausible value standing rather than dragging the baseline down
+        // (which would let a second stale reading look plausible relative to the first).
+        let mark = SessionHighWater::fold(None, &reading(0.70, Some(WINDOW)));
+        let mark = SessionHighWater::fold(mark, &reading(0.88, Some(WINDOW)));
+        let mark = SessionHighWater::fold(mark, &reading(0.40, Some(WINDOW))); // the stale-low one
+        assert_eq!(
+            mark.and_then(|m| m.applies_to(&reading(0.40, Some(WINDOW)))),
+            Some(0.88),
+            "the mark holds the window's maximum, not its latest reading",
+        );
+    }
+
+    #[test]
+    fn session_high_water_restarts_when_the_session_window_rolls() {
+        // Issue #614 AC 2: a NEW window is the legitimate reason usage falls. The mark restarts at the
+        // fresh reading, so the previous window's floor is released — it can never pin an account
+        // across windows.
+        let mark = SessionHighWater::fold(None, &reading(0.92, Some(WINDOW)));
+        let rolled = SessionHighWater::fold(mark, &reading(0.05, Some(WINDOW_NEXT)));
+        assert_eq!(
+            rolled.and_then(|m| m.applies_to(&reading(0.05, Some(WINDOW_NEXT)))),
+            Some(0.05),
+            "the rolled window starts a fresh mark at the post-reset reading",
+        );
+        // And the OLD window's mark no longer applies to a reading in the new window.
+        assert!(
+            !is_stale_low(rolled, &reading(0.05, Some(WINDOW_NEXT))),
+            "a post-reset reading is plausible, not stale-low",
+        );
+    }
+
+    #[test]
+    fn session_high_water_needs_a_window_stamp() {
+        // Without a `session_resets_at` there is no window identity, so no later drop could be judged
+        // implausible — carrying a mark forward would risk holding a floor across an UNSEEN roll.
+        assert_eq!(SessionHighWater::fold(None, &reading(0.90, None)), None);
+        let stamped = SessionHighWater::fold(None, &reading(0.90, Some(WINDOW)));
+        assert_eq!(
+            SessionHighWater::fold(stamped, &reading(0.95, None)),
+            None,
+            "an unstamped reading releases the mark rather than silently retaining it",
+        );
+    }
+
+    #[test]
+    fn a_drop_inside_an_unchanged_window_is_stale_low() {
+        // Issue #614 AC 1, the predicate: usage is monotonic within a session window, so a value BELOW
+        // the same window's high-water mark cannot be real drain — it is a stale / cache-lagged read.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert!(is_stale_low(mark, &reading(0.40, Some(WINDOW))));
+        // At or above the mark is plausible — the guard is strictly a below-the-mark test.
+        assert!(!is_stale_low(mark, &reading(0.88, Some(WINDOW))));
+        assert!(!is_stale_low(mark, &reading(0.91, Some(WINDOW))));
+    }
+
+    #[test]
+    fn the_window_key_survives_the_real_per_poll_stamp_jitter() {
+        // Issue #614, the defect a byte-equality window key would have shipped: `session_resets_at` is
+        // NOT stable within one window. Measured over the daemon's own sample store (17,978 consecutive
+        // stamped pairs) the same-window delta is 0 s only 50.1 % of the time and ±1 s the other 49.8 %
+        // — the API renders sub-second precision and `epoch_from_rfc3339` truncates it, so a value on a
+        // second boundary alternates. This replays a REAL captured sequence (a contiguous window whose
+        // session climbed monotonically while the stamp flipped every poll):
+        //
+        //     ts=1783139244 session=0.03 resets_at=1783156799
+        //     ts=1783139495 session=0.06 resets_at=1783156800
+        //     ts=1783139751 session=0.06 resets_at=1783156799
+        //     ts=1783140052 session=0.07 resets_at=1783156800
+        //
+        // Under exact equality every other poll restarts the mark AT the newest reading — so a
+        // stale-low reading both escapes the guard and destroys the baseline, and the guard fires
+        // essentially never in production while hand-pinned unit tests stay green.
+        let jittered = [
+            (0.03, 1_783_156_799),
+            (0.06, 1_783_156_800),
+            (0.06, 1_783_156_799),
+            (0.07, 1_783_156_800),
+        ];
+        let mark = jittered.iter().fold(None, |mark, &(session, stamp)| {
+            SessionHighWater::fold(mark, &reading(session, Some(stamp)))
+        });
+        // The mark accumulated the window's true max across the jitter, rather than being restarted.
+        assert_eq!(
+            mark.and_then(|m| m.applies_to(&reading(0.07, Some(1_783_156_800)))),
+            Some(0.07),
+            "the ±1 s stamp jitter is one window, so the mark accumulates across it",
+        );
+        // And a stale-low reading arriving on the OTHER side of the jitter is still caught.
+        assert!(
+            is_stale_low(mark, &reading(0.01, Some(1_783_156_799))),
+            "a stale-low reading is caught even when its stamp jitters against the mark's anchor",
+        );
+    }
+
+    #[test]
+    fn the_window_match_tolerance_separates_jitter_from_a_real_roll() {
+        // The tolerance must admit the ±1 s jitter WITHOUT admitting a genuine ~5 h roll. The two
+        // populations are ~2 orders of magnitude apart (observed jitter ≤ 1 s; smallest real change
+        // 3600 s; the roll cluster 17999–18001 s), so 60 s sits with wide margin on both sides.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        for delta in [
+            -1,
+            0,
+            1,
+            -SESSION_WINDOW_MATCH_SECS,
+            SESSION_WINDOW_MATCH_SECS,
+        ] {
+            assert!(
+                is_stale_low(mark, &reading(0.40, Some(WINDOW + delta))),
+                "a stamp {delta} s from the anchor is the SAME window",
+            );
+        }
+        for delta in [SESSION_WINDOW_MATCH_SECS + 1, 3600, 17_999, 18_000, 18_001] {
+            assert!(
+                !is_stale_low(mark, &reading(0.40, Some(WINDOW + delta))),
+                "a stamp {delta} s away is a DIFFERENT window — the guard must not fire",
+            );
+        }
+    }
+
+    #[test]
+    fn the_window_anchor_does_not_walk_with_the_jitter() {
+        // The mark keeps its ORIGINAL anchor stamp rather than re-anchoring on each fold: with a
+        // tolerance-based match, re-anchoring would let the reference drift one jitter step at a time
+        // and eventually walk out of the true window. Folding a long run of +1-biased stamps must leave
+        // the anchor put.
+        let mut mark = SessionHighWater::fold(None, &reading(0.10, Some(WINDOW)));
+        for step in 1..=200 {
+            mark = SessionHighWater::fold(mark, &reading(0.10, Some(WINDOW + (step % 2))));
+        }
+        assert_eq!(
+            mark.map(|m| m.window),
+            Some(WINDOW),
+            "the anchor stays at the first stamp seen for the window",
+        );
+    }
+
+    #[test]
+    fn a_drop_across_a_rolled_window_is_not_stale_low() {
+        // Issue #614 AC 2 (the no-misfire half): the SAME drop that is implausible inside one window is
+        // entirely expected once `session_resets_at` has moved on. The guard must not fire, so the
+        // velocity EMA still resets and the reading is still trusted at face value.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert!(
+            !is_stale_low(mark, &reading(0.40, Some(WINDOW_NEXT))),
+            "a drop paired with a CHANGED window stamp is a legitimate reset",
+        );
+    }
+
+    #[test]
+    fn an_unstamped_reading_is_never_judged_stale_low() {
+        // The residual trust boundary, stated as a property: the guard fires only on POSITIVE evidence
+        // that the window is unchanged. A reading the API did not stamp carries no such evidence, so it
+        // is trusted as-is — the pre-#614 behaviour, deliberately retained rather than guessed at.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert!(!is_stale_low(mark, &reading(0.40, None)));
+        assert_eq!(plausible_session(mark, &reading(0.40, None)).session, 0.40);
+    }
+
+    #[test]
+    fn plausible_session_raises_a_stale_low_reading_to_the_mark() {
+        // Issue #614 AC 1, the correction the swap arms decide on: the stale-low session fraction is
+        // raised to the window's retained high-water mark — a genuine LOWER bound on the truth — while
+        // every other field passes through verbatim (only the SESSION dimension is corrected; `weekly`
+        // has its own window).
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        let stale = reading(0.40, Some(WINDOW));
+        let corrected = plausible_session(mark, &stale);
+        assert_eq!(corrected.session, 0.88);
+        assert_eq!(corrected.weekly, stale.weekly);
+        assert_eq!(corrected.session_resets_at, stale.session_resets_at);
+        assert_eq!(corrected.weekly_resets_at, stale.weekly_resets_at);
+    }
+
+    #[test]
+    fn plausible_session_is_a_no_op_on_a_plausible_reading() {
+        // The normal tick: a reading at or above the mark (and one in a rolled window) is returned
+        // UNCHANGED, so the guard is inert outside the stale-reading case it exists for.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert_eq!(
+            plausible_session(mark, &reading(0.91, Some(WINDOW))),
+            reading(0.91, Some(WINDOW))
+        );
+        assert_eq!(
+            plausible_session(mark, &reading(0.05, Some(WINDOW_NEXT))),
+            reading(0.05, Some(WINDOW_NEXT))
+        );
+        assert_eq!(
+            plausible_session(None, &reading(0.40, Some(WINDOW))),
+            reading(0.40, Some(WINDOW))
+        );
+    }
+
+    #[test]
+    fn a_stale_low_reading_does_not_cancel_an_otherwise_due_swap() {
+        // Issue #614 AC 1, end to end through `decide` — the headline behaviour at the pure-decision
+        // layer. The account is really at 0.88 (this window's mark) and the reactive threshold is 0.85,
+        // so a swap is DUE; the cache-lagged 0.40 response would otherwise read as a Hold.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        let stale = reading(0.40, Some(WINDOW));
+        assert_eq!(
+            decide(&stale, 0.85, 0.98),
+            SwapDecision::Hold,
+            "the raw stale reading cancels the due swap — the bug this guards",
+        );
+        assert_eq!(
+            decide(&plausible_session(mark, &stale), 0.85, 0.98),
+            SwapDecision::Swap,
+            "decided on the plausible reading, the due swap still fires",
         );
     }
 
