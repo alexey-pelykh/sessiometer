@@ -118,6 +118,14 @@ pub(crate) enum SwapDecision {
 /// `session_threshold`, OR its weekly usage at/above the separate (typically
 /// higher) `weekly_threshold`. The two thresholds are independent: either
 /// crossing alone forces a swap-away, and neither subsumes the other.
+///
+/// Since issues #597 (session) and #607 (weekly), BOTH thresholds are derived
+/// BACKWARD from their own dimension's ceiling rather than being fire-*at* values:
+/// the caller passes `effective_ceiling(session_ceiling) − velocity × lookahead` and
+/// [`weekly_effective_ceiling`]`(weekly_ceiling)` respectively, so a swap LANDS each
+/// dimension below its own ceiling after that dimension's post-swap committed tail.
+/// This function stays a pure two-threshold predicate — which ceiling each threshold
+/// came from, and how far back it was derived, is the daemon's business.
 pub(crate) fn decide(usage: &Usage, session_threshold: f64, weekly_threshold: f64) -> SwapDecision {
     if usage.session >= session_threshold || usage.weekly >= weekly_threshold {
         SwapDecision::Swap
@@ -149,6 +157,96 @@ pub(crate) const TAIL_MARGIN: f64 = 0.06;
 /// point. `ceiling` is a fraction in `[0.0, 1.0]` (`session_trigger` / 100).
 pub(crate) fn effective_ceiling(ceiling: f64) -> f64 {
     (ceiling - TAIL_MARGIN).max(0.0)
+}
+
+/// The WEEKLY post-swap committed-tail margin, as a usage FRACTION — the weekly analogue of
+/// [`TAIL_MARGIN`] (issue #607). The same in-flight work that keeps billing the parked account's
+/// SESSION window after a swap bills its WEEKLY window too, so the weekly dimension has the same
+/// blind spot the session dimension lost in issue #597: a swap that fires exactly AT the weekly
+/// line still lands above it.
+///
+/// # Provenance — SCALED from the #595 session measurement under ONE stated assumption
+///
+/// The weekly tail has NOT been measured directly; no weekly landing SLI exists yet (building one
+/// is the follow-up this constant's re-verification note names). What follows is the scaling
+/// argument the value rests on, stated so the assumption is auditable rather than buried.
+///
+/// The committed tail is ONE fixed quantity of already-committed work `Δ` (issue #596 confirmed it
+/// is real in-flight drain, not a cache artifact). It bills BOTH windows, so it is the same `Δ`
+/// expressed against two different denominators:
+///
+/// ```text
+/// weekly_tail_fraction = session_tail_fraction × (session_quota / weekly_quota)
+/// ```
+///
+/// The #595 landing SLI measured the session side over 2026-07-01…07-17: mean +1.08 pp, p90 +2 pp,
+/// **max +5 pp** of the SESSION window. Writing `k = weekly_quota / session_quota` (how many full
+/// session windows the weekly budget is worth), the worst-case weekly tail is therefore `5 pp / k`,
+/// and this margin covers it exactly when:
+///
+/// ```text
+/// k >= 5      i.e. the weekly budget is worth at least five full session windows
+/// ```
+///
+/// **That inequality is the assumption — it is not derived, and it is what to re-check.** Note what
+/// this margin deliberately does NOT assume: that `k` equals the *window-duration* ratio
+/// (`168 h / 5 h ≈ 33.6`). That ratio is an upper bound on `k`, not a safe one — it describes a
+/// weekly budget large enough to run every session window back-to-back at full tilt, i.e. a weekly
+/// limit that never binds. This tool exists because the weekly limit DOES bind
+/// (`weekly_exhausted` is a reachable, surfaced state), so the real `k` is materially below 33.6
+/// and a margin justified by the duration ratio alone would be justified in the wrong direction.
+/// The `k >= 5` breakeven is the honest statement of what 1 pp buys.
+///
+/// **Why 1 pp is nonetheless the right value now.** `k >= 5` is a weak requirement — it fails only
+/// if a whole week's budget is worth under five 5-hour sessions, which would make the weekly limit
+/// bind within a single heavy day. Three further properties bound the cost of being wrong: there is
+/// no weekly SLO analogous to session's `P100 < 99` (so an under-margin degrades runway, it does
+/// not breach a committed target); the default ceiling 98 leaves 2 pp of slack to the real 100 wall
+/// beneath this margin; and the error asymmetry is the one [`TAIL_MARGIN`] cites — an early swap is
+/// the cheap error. Firing 1 pp early on a 7-day window is a small, bounded runway cost.
+///
+/// **Why not session's 6 pp.** Copying it would fire the weekly arm at 92 under the default 98
+/// ceiling — surrendering 6 pp of a 7-day window to guard a tail that is `5 pp / k` for a `k` well
+/// above 1. The two dimensions measure different quantities against different denominators (issue
+/// #41) and so carry independently-calibrated margins; that independence is the point.
+///
+/// Kept honest the same way [`TAIL_MARGIN`] is, and this constant needs it MORE because it is
+/// scaled rather than measured: build the WEEKLY landing SLI — the peak `weekly_pct` a parked
+/// account reaches within `reliability::LANDING_WINDOW_SECS` of a swap, the weekly analogue of #595
+/// — and re-calibrate against the observed distribution. Until then this value rests on the stated
+/// `k >= 5` assumption. Do not widen it silently, and do not restate the assumption as a finding.
+pub(crate) const WEEKLY_TAIL_MARGIN: f64 = 0.01;
+
+// Compile-time calibration guards (issue #607), in the style of `config::COOLDOWN_SECS_FLOOR`'s
+// (#272): both invariants below are pure constant relationships, so a regression is a BUILD
+// failure here rather than a test failure later. Neither is evidence that the VALUE is right —
+// they pin the two structural properties the derivation needs; the empirical question is the
+// `k >= 5` assumption above, which only a weekly landing SLI can settle.
+//
+// 1. The margin must stay strictly positive, or the weekly arm degenerates back to the fire-AT
+//    trigger this issue replaced (fire point == ceiling, landing above it).
+const _: () = assert!(WEEKLY_TAIL_MARGIN > 0.0);
+// 2. The two dimensions carry INDEPENDENTLY calibrated margins (issue #41), and the weekly one is
+//    necessarily the smaller: the same committed tail is a smaller fraction of the longer weekly
+//    window for any `k > 1`. Equality would mean someone copied the session constant — the
+//    specific mistake this constant's provenance rejects.
+const _: () = assert!(WEEKLY_TAIL_MARGIN < TAIL_MARGIN);
+
+/// The EFFECTIVE WEEKLY ceiling the swap decision derives its weekly fire point backward from
+/// (issue #607) — the weekly analogue of [`effective_ceiling`]: the configured weekly `ceiling`
+/// (the settled weekly line the outgoing account must not cross) less [`WEEKLY_TAIL_MARGIN`]. A
+/// swap that lands the outgoing account AT this effective ceiling leaves exactly the weekly tail
+/// margin of headroom, so the post-swap committed tail lands below the true weekly ceiling.
+///
+/// Kept a SEPARATE function from [`effective_ceiling`] rather than a shared one parameterised by
+/// margin, because the two dimensions are independent by design (issue #41): each carries its own
+/// measured margin, and a single knob would invite the copy this constant's provenance rejects.
+///
+/// Clamped at 0 so a pathologically low `ceiling` can never yield a negative fire point. `ceiling`
+/// is a fraction in `[0.0, 1.0]` (`weekly_trigger` / 100 — the config field keeps its name until
+/// the tracked rename follow-up; it MEANS a ceiling since this issue).
+pub(crate) fn weekly_effective_ceiling(ceiling: f64) -> f64 {
+    (ceiling - WEEKLY_TAIL_MARGIN).max(0.0)
 }
 
 /// The reactive arm's re-observation-gap lookahead, in seconds: how long the active account can
@@ -982,6 +1080,47 @@ mod tests {
         // Clamped at 0 for a pathologically low ceiling — never negative.
         assert_eq!(effective_ceiling(0.04), 0.0);
         assert_eq!(effective_ceiling(0.0), 0.0);
+    }
+
+    // --- #607 weekly ceiling derivation (the weekly analogue of #597) ---
+
+    #[test]
+    fn weekly_effective_ceiling_subtracts_the_weekly_tail_margin() {
+        // The default weekly ceiling 0.98 yields an effective ceiling of 0.97 — the 1 pp weekly
+        // tail margin below the settled weekly line, so a landing here plus the worst-case weekly
+        // committed tail (`5 pp / k`, ≤ 1 pp under the `k ≥ 5` assumption) stays under 0.98.
+        assert!((weekly_effective_ceiling(0.98) - 0.97).abs() < 1e-9);
+        assert!((weekly_effective_ceiling(0.95) - 0.94).abs() < 1e-9);
+        // Clamped at 0 for a pathologically low ceiling — never negative.
+        assert_eq!(weekly_effective_ceiling(0.005), 0.0);
+        assert_eq!(weekly_effective_ceiling(0.0), 0.0);
+    }
+
+    #[test]
+    fn the_weekly_fire_point_is_strictly_early_across_the_operator_range() {
+        // The per-dimension strict-early-fire invariant (issue #607): for every weekly ceiling the
+        // operator can set (`50..=99`, config-clamped), the weekly fire point sits STRICTLY below
+        // the ceiling — so a weekly swap always lands with tail headroom, never AT the line. This
+        // is the weekly half of what `effective_ceiling` guarantees for session; the two are
+        // asserted independently because the dimensions are independent (issue #41).
+        //
+        // Scope note: this pins the STRUCTURAL property (fire < ceiling, and by exactly one margin).
+        // It deliberately does NOT re-assert a worst-case-tail bound — the tail magnitude rests on
+        // the `k >= 5` assumption documented on `WEEKLY_TAIL_MARGIN`, and restating that assumption
+        // as a loop-invariant comparison of two constants would dress one unverified premise up as
+        // independent corroboration. Only a weekly landing SLI can settle the magnitude.
+        for ceiling_pct in 50..=99u8 {
+            let ceiling = f64::from(ceiling_pct) / 100.0;
+            let fire = weekly_effective_ceiling(ceiling);
+            assert!(
+                fire < ceiling,
+                "weekly ceiling {ceiling_pct}: fire point {fire} must be strictly below the ceiling",
+            );
+            assert!(
+                (ceiling - fire - WEEKLY_TAIL_MARGIN).abs() < 1e-9,
+                "weekly ceiling {ceiling_pct}: fire point must sit exactly one margin below",
+            );
+        }
     }
 
     #[test]

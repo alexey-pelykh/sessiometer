@@ -109,9 +109,14 @@ const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// below `session_trigger` so a swapped-to target keeps runway before the next
 /// poll; supersedes #10's opt-in (an absent key now means this, not "off").
 const DEFAULT_TARGET_MAX_SESSION_USAGE: u8 = 80;
-/// Default `weekly_trigger` percent — separate from and higher than
-/// `session_trigger` (issue #41): the weekly window is the longer, harder limit,
-/// so the active account is allowed closer to full on it before a swap-away.
+/// Default `weekly_trigger` percent — the weekly CEILING (issue #607): the settled weekly line the
+/// active account must not cross, NOT a fire-at trigger. Separate from and higher than
+/// `session_trigger` (issue #41): the weekly window is the longer, harder limit, so the active
+/// account is allowed closer to full on it before a swap-away. The swap fires BACKWARD from this
+/// ceiling at `ceiling − swap::WEEKLY_TAIL_MARGIN` (1 pp) so the outgoing account lands BELOW it
+/// after its post-swap committed tail — the weekly analogue of what #597 did for `session_trigger`.
+/// 98 leaves the weekly fire point at 97, still well above the session ceiling, preserving the
+/// "weekly is the harder limit, allowed closer to full" intent this default has always encoded.
 const DEFAULT_WEEKLY_TRIGGER: u8 = 98;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
@@ -373,10 +378,27 @@ pub(crate) struct Tunables {
     /// tail/coupling evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022) and ADR-0024 (the
     /// gap-percentile lookahead + max-window coverage + downward-only ceiling jitter).
     pub(crate) session_trigger: u8,
-    /// Swap *away* from the active account at or above this WEEKLY percent
-    /// (`50..=99`) — the second, independent trigger dimension (issue #41).
-    /// Separate from `session_trigger` (no cross-field constraint), typically set
-    /// higher; the daemon swaps when EITHER dimension reaches its own trigger.
+    /// The settled WEEKLY CEILING (`50..=99` percent) — the weekly line the active account must not
+    /// cross — and the second, independent trigger dimension (issue #41). Separate from
+    /// `session_trigger` (no cross-field constraint), typically set higher; the daemon swaps when
+    /// EITHER dimension reaches its own fire point.
+    ///
+    /// Since issue #607 this is a CEILING, not a fire-*at* trigger — the weekly analogue of what
+    /// #597 did for `session_trigger`. The swap fires BACKWARD from it at `ceiling −
+    /// swap::WEEKLY_TAIL_MARGIN` (1 pp), so the outgoing account LANDS below this line after its
+    /// post-swap committed tail: the same in-flight work that keeps billing the parked account's
+    /// session window bills its weekly window too (issue #595 measured the tail on the session axis;
+    /// #596 confirmed it is real in-flight drain and saw weekly co-move in 8/13 episodes). The
+    /// margin is 1 pp — NOT the session dimension's 6 pp — because the same committed tail is a far
+    /// smaller fraction of the weekly BUDGET than of a session window (worst-case `5 pp / k` for the
+    /// quota ratio `k = weekly_quota / session_quota`, covered by 1 pp under the stated `k ≥ 5`
+    /// assumption — NOT the window-duration ratio, which would justify the margin in the wrong
+    /// direction; see `swap::WEEKLY_TAIL_MARGIN` for the full provenance). The two dimensions carry
+    /// independently calibrated margins by design.
+    ///
+    /// The name is retained for compatibility; a rename to `weekly_ceiling` is a tracked follow-up,
+    /// paired with the `session_trigger` → `session_ceiling` rename so both dimensions change
+    /// together rather than leaving a half-renamed config + menubar wire surface.
     pub(crate) weekly_trigger: u8,
     /// Bounded-blindness preemptive-swap gate threshold `T` (issue #452, ADR-0017), in
     /// seconds: the active account's retained pre-blind anchor (`last_good`, #450) must
@@ -1829,9 +1851,14 @@ impl Config {
         );
         out.push_str(&format!("session_trigger = {}\n", t.session_trigger));
         out.push_str(
-            "# Swap AWAY from the active account at or above this WEEKLY percent (50..=99).\n\
-             # Independent of session_trigger (typically higher): a swap fires when EITHER\n\
-             # dimension reaches its own trigger.\n",
+            "# The settled WEEKLY CEILING (50..=99) — the weekly line the active account must\n\
+             # NOT cross. Independent of session_trigger (typically higher): a swap fires when\n\
+             # EITHER dimension reaches its own fire point. Like session_trigger this is a\n\
+             # ceiling, not a fire-at value (issue #607): the swap fires BACKWARD from it, 1 pp\n\
+             # early, so the outgoing account LANDS below this line after its post-swap committed\n\
+             # tail (the same in-flight work that bills the session window bills the weekly one).\n\
+             # The 1 pp weekly margin is much smaller than session's 6 pp because that tail is a\n\
+             # far smaller fraction of a 7-day window. See ADR-0025 (docs/adr).\n",
         );
         out.push_str(&format!("weekly_trigger = {}\n", t.weekly_trigger));
         out.push_str(

@@ -335,7 +335,11 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
   (the phantom `active_backoff_cap_secs` doc bug — the doc/reality-drift class the kept
   loose-coupling risks, mitigated here by honest doc-comments). **#41**
   (`weekly_trigger` — the *genuinely* separate second knob; it estimates a *different*
-  quantity and is untouched). **#398/#417** (the `target_max_session_usage` reserve and
+  quantity. **Amended 2026-07-18 (#607): no longer untouched** — the weekly dimension now has
+  ceiling semantics of its own, with an independently calibrated `WEEKLY_TAIL_MARGIN`. It remains
+  genuinely *separate*: its own ceiling, its own margin, no cross-field constraint. See
+  [ADR-0025](0025-weekly-trigger-ceiling-semantics.md), which extends this decision without
+  changing the session half). **#398/#417** (the `target_max_session_usage` reserve and
   its clamp to `session_trigger`). **#608** (the shipped `v_peak` coupling validator + observed-peak
   SLI — § Alternatives 3). Follow-ups still open: the pure `session_trigger → session_ceiling` rename
   (§ Alternatives 4). Shipped: the `v_peak` coupling validator + observed-peak SLI (§ Alternatives 3,
