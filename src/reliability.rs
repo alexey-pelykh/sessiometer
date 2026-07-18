@@ -2408,4 +2408,42 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
             "P100 < 99 holds post-#609 for a burst across the re-observation gap",
         );
     }
+
+    #[test]
+    fn the_weekly_margin_covers_the_scaled_session_tail_down_to_its_breakeven() {
+        // Issue #607. `WEEKLY_TAIL_MARGIN` is SCALED from the #595 session measurement, not
+        // measured: the committed tail is one fixed quantity of in-flight work billing BOTH
+        // windows, so `weekly_tail = session_tail / k` where `k = weekly_quota / session_quota`.
+        // This test states the breakeven that scaling implies, so the assumption is executable
+        // rather than prose-only — it is NOT independent evidence for the tail's magnitude (only a
+        // weekly landing SLI can supply that; see `swap::WEEKLY_TAIL_MARGIN`).
+        const SESSION_MAX_TAIL: f64 = 0.05; // issue #595, measured max post-swap committed tail
+        const BREAKEVEN_K: f64 = 5.0; // the documented assumption: weekly budget >= 5 session windows
+
+        // At the breakeven the margin exactly covers the scaled tail; above it, strictly covers.
+        assert!((SESSION_MAX_TAIL / BREAKEVEN_K - crate::swap::WEEKLY_TAIL_MARGIN).abs() < 1e-9);
+        for k in [5.0, 8.0, 12.0, 20.0, 33.6_f64] {
+            assert!(
+                SESSION_MAX_TAIL / k <= crate::swap::WEEKLY_TAIL_MARGIN,
+                "at k={k} the scaled weekly tail must fit inside the margin",
+            );
+        }
+        // Below the breakeven the margin is NOT sufficient — recorded so the failure mode is
+        // explicit rather than discovered in production. If a weekly landing measurement ever puts
+        // the real k under 5, this constant must be re-calibrated upward.
+        const { assert!(SESSION_MAX_TAIL / 4.0 > crate::swap::WEEKLY_TAIL_MARGIN) };
+
+        // The structural half, which does NOT depend on k: the landing sits below the ceiling for
+        // every operator-settable weekly ceiling, and so below the real 100% weekly wall.
+        for ceiling_pct in 50..=99u8 {
+            let ceiling = f64::from(ceiling_pct) / 100.0;
+            let fire = crate::swap::weekly_effective_ceiling(ceiling);
+            assert!(
+                fire < ceiling,
+                "weekly ceiling {ceiling_pct}: fire below ceiling"
+            );
+            assert!(fire + crate::swap::WEEKLY_TAIL_MARGIN <= ceiling + 1e-9);
+            assert!(ceiling < 1.0);
+        }
+    }
 }

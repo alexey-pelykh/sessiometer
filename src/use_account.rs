@@ -649,7 +649,15 @@ where
     }
     .map(|idx| &config.roster[idx]);
 
-    let weekly_trigger = f64::from(config.tunables.weekly_trigger) / 100.0;
+    // Issue #607: the weekly ROTATION line — the configured ceiling less the tail margin — not the
+    // raw ceiling. `weekly_trigger` is a CEILING since #607 and the daemon releases at
+    // `ceiling − WEEKLY_TAIL_MARGIN`, so gating `use` on the raw value would ACCEPT a target in the
+    // `[ceiling − margin, ceiling)` band that the daemon then swaps away from on its next tick — an
+    // operator command that silently undoes itself. Gating on the same line the daemon rotates
+    // against keeps the standalone `use` verdict and the daemon's verdict identical (the daemon-
+    // attached path gets the same value from `Daemon::weekly_rotation_line`).
+    let weekly_trigger =
+        crate::swap::weekly_effective_ceiling(f64::from(config.tunables.weekly_trigger) / 100.0);
 
     // 3. Decide the swap MODE and perform the keychain rotation, yielding
     //    `(from_label, reason, adopted)` for the shared event / notify / print tail:
