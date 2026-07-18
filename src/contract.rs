@@ -18,6 +18,31 @@ use crate::observability::{Event, RefreshEventOutcome};
 /// this, so a fake can drive time and make the loop run instantly in tests.
 pub(crate) trait Clock {
     /// The current instant.
+    ///
+    /// # Suspend/resume assumption (issue #615)
+    ///
+    /// Callers that measure a RATE across two readings — chiefly the session-velocity interval in
+    /// [`crate::daemon`], which divides a usage delta by
+    /// `now.saturating_duration_since(prev_at)` — require this clock to keep counting while the
+    /// system is ASLEEP (boottime / `mach_continuous_time` semantics). Session usage accrues in
+    /// wall-clock time (the 5 h session window is a wall-clock window), so the honest rate across a
+    /// laptop suspend is the delta over the full wall-clock gap.
+    ///
+    /// A clock that FREEZES during sleep (uptime / `mach_absolute_time` semantics) reports a resume
+    /// interval far shorter than the span it covers, inflating the derived rate — and BOTH
+    /// velocity-aware swap arms then fire early on a climb that never happened: the projection
+    /// `observed + rate × horizon` reaches the effective ceiling sooner, and the reactive fire point
+    /// `effective_ceiling - velocity × poll_gap`
+    /// ([`crate::swap::reactive_session_threshold`]) is dragged down toward the observed reading.
+    /// macOS `Instant` semantics across sleep are platform/version-dependent and [`RealClock`] makes
+    /// no explicit boottime choice, so the requirement is stated here rather than assumed silently.
+    ///
+    /// The daemon test `a_suspend_resume_gap_neither_spurious_swaps_nor_misses_one` pins the half of
+    /// this that IS testable: driving a fake clock, it fixes the FOLD's arithmetic — the rate is the
+    /// usage delta over the FULL measured gap — so a regression that clamped or discarded a long
+    /// interval fails there. No test can observe a real machine's sleep, so this requirement is
+    /// DOCUMENTED but not yet GUARANTEED. Settling the macOS semantics empirically and, if
+    /// warranted, moving [`RealClock`] onto an explicit boottime source is tracked as issue #624.
     fn now(&self) -> Instant;
     /// Sleep for `interval` — the (jittered) wait until the next poll, computed
     /// per cycle by the daemon (issue #38). The clock no longer owns the
