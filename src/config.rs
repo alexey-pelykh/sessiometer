@@ -103,7 +103,7 @@ const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
 /// (issue #455 / #595) reachable: the ceiling is the SLO boundary and the tail margin
 /// (`swap::TAIL_MARGIN`, 6 pp) keeps the landing under it. See ADR-0023 (the ceiling redesign,
 /// superseding ADR-0022).
-const DEFAULT_SESSION_TRIGGER: u8 = 99;
+const DEFAULT_SESSION_TRIGGER: u8 = 95;
 /// Default `target_max_session_usage` percent (issue #398): the default-on swap-target
 /// reserve — only swap TO an account whose session usage is below this. Sits
 /// below `session_trigger` so a swapped-to target keeps runway before the next
@@ -362,8 +362,10 @@ pub(crate) struct Tunables {
     /// even after its post-swap committed tail (measured mean +1.08 pp, max +5 pp, issue #595 —
     /// real in-flight drain, issue #596), and a `velocity × lookahead` term absorbs the climb
     /// during the reactive re-observation gap / the projection horizon
-    /// `session_velocity_horizon_secs` (`H`). With the ceiling at 99 this makes the strict
-    /// `P100 < 99` landing SLO (issue #455 / #595) reachable. Full rationale + the tail/coupling
+    /// `session_velocity_horizon_secs` (`H`). The default ceiling **95** sits *below* the
+    /// `P100 < 99` landing SLO (issue #455 / #595) on purpose — buying headroom over the
+    /// re-observation-gap staleness the `poll_gap` term under-models (measured active-account
+    /// gaps reach p90 313 s / max 972 s vs the modeled ~120 s). Full rationale + tail/coupling
     /// evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022).
     pub(crate) session_trigger: u8,
     /// Swap *away* from the active account at or above this WEEKLY percent
@@ -1710,7 +1712,7 @@ impl Config {
              # their fire point BACKWARD from it — ceiling minus a tail margin minus\n\
              # velocity*lookahead — so the account lands BELOW the ceiling even after its\n\
              # post-swap committed tail (up to +5 pp: in-flight work keeps billing the parked\n\
-             # account). 99 makes the strict P100<99 landing SLO reachable. One knob, two\n\
+             # account). The default 95 sits below the P100<99 SLO for gap-staleness headroom. One knob, two\n\
              # estimators (the projection is a strict early-fire of the reactive decision) —\n\
              # not two knobs. See ADR-0023 (docs/adr) for the ceiling redesign.\n",
         );
@@ -2961,9 +2963,11 @@ label = "personal"
                     label = \"only\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
-        // Issue #597: the default session_trigger is the CEILING, 99 (was 95) — the value
-        // that makes the strict P100 < 99 landing SLO reachable via backward derivation.
-        assert_eq!(config.tunables.session_trigger, 99);
+        // Issue #597: the default session_trigger is the CEILING, 95 — a landing target set
+        // below the P100 < 99 SLO so backward derivation keeps the SLO reachable with headroom
+        // over re-observation-gap staleness (ADR-0023; the pre-#597 fire-AT default was also 95
+        // but meant "swap when observed reaches 95", not "land below 95").
+        assert_eq!(config.tunables.session_trigger, 95);
         // #398: the target_max_session_usage reserve is default-on at 80.
         assert_eq!(
             config.tunables.target_max_session_usage,
@@ -3038,9 +3042,10 @@ label = "personal"
     fn weekly_trigger_takes_its_default_when_absent() {
         // An absent weekly_trigger takes its compiled-in default, independent of session_trigger.
         // (Since issue #597 their magnitudes are NOT comparable: session_trigger is a CEILING both
-        // swap arms derive backward from — effective fire ~0.93 at the default 99 — while
-        // weekly_trigger is still a fire-AT trigger, so the old raw "weekly > session" comparison is
-        // apples-to-oranges and false for the current defaults, 98 < 99. The two dimensions stay
+        // swap arms derive backward from — effective fire ~0.89 at the default 95 — while
+        // weekly_trigger is still a fire-AT trigger, so the raw "weekly vs session" magnitude
+        // comparison is apples-to-oranges regardless of ordering (98 > 95 for the current
+        // defaults, but they estimate different quantities). The two dimensions stay
         // independent; this test only pins the absent-field default.)
         let t = Config::parse(&with_tunables("session_trigger = 95"))
             .unwrap()
@@ -3149,7 +3154,7 @@ label = "personal"
         // parse rejects the config with ConfigTargetMaxSessionAboveTrigger — bricking a valid config
         // after any save/export round-trip (enable/disable/remove account, capture
         // write-back, export→import). The existing round-trip test above only covers the
-        // default trigger = 99 (where 80 < 99), so it never reached this corner.
+        // default trigger = 95 (where 80 < 95), so it never reached this corner.
         let toml = with_tunables("session_trigger = 70"); // no target_max_session_usage key
         let config = Config::parse(&toml).unwrap();
         // The default is clamped to the trigger — the maximally-permissive inert value

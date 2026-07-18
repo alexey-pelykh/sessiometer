@@ -68,14 +68,25 @@ ordering.
 not cross — not a fire-*at* trigger. Both swap arms derive their fire point *backward*
 from it through a single `effective_ceiling`, so the account *lands* below the ceiling
 after its committed tail. One config value, no arm split, no new operator knob.** The
-council default is raised **95 → 99** (the ceiling *is* the SLO line now, not a
-margin-below-it guess).
+default ceiling is **95**, set deliberately *below* the `P100 < 99` SLO line. The
+`effective_ceiling` (ceiling − `TAIL_MARGIN`) keeps the *landing* below the ceiling; the
+ceiling sitting 4 pp under the SLO adds a **second, gap-independent margin** over the one
+place the first is thin — the reactive `poll_gap` term looks ahead only `2 ×
+near_limit_poll_secs` (~120 s), but the measured active-account re-observation gap runs p90
+**313 s** / max **972 s**, so on that tail usage climbs unseen past `effective_ceiling`
+before the next poll and the committed tail then lands it over the SLO. Widening `poll_gap`
+to a gap percentile (which would let the ceiling equal the SLO) is the principled
+alternative, deferred as a calibration follow-up (§ Alternatives 6); the sub-SLO default is
+the simpler, more legible interim lever the maintainer chose. The cost is only
+slightly-earlier swaps — `all_exhausted` fired **2× in 17 days**, capacity is not binding,
+the early swap is the cheap error — and an operator who trusts the `poll_gap` term may raise
+the ceiling to 99.
 
 **The effective ceiling.** `effective_ceiling = max(ceiling − TAIL_MARGIN, 0)`, where
 `ceiling = session_trigger / 100` and `TAIL_MARGIN = 0.06` (a usage fraction; §
 Calibration). A swap that lands the outgoing account *at* the effective ceiling leaves
 exactly the tail margin of headroom, so the post-swap committed tail lands below the
-true ceiling. At the default ceiling 0.99 the effective ceiling is **0.93**.
+true ceiling. At the default ceiling 0.95 the effective ceiling is **0.89**.
 (`swap::effective_ceiling`, `swap::TAIL_MARGIN` — `src/swap.rs`.)
 
 **Both arms fire backward from `effective_ceiling`.** Each leaves headroom for the gap
@@ -156,8 +167,11 @@ that does not exist yet; introducing it is deferred (§ Alternatives 3).
 canonical post-swap committed-tail measurement (window through 2026-07-17), whose
 distribution (mean +1.08 pp / p90 +2 pp / **max +5 pp**) is re-confirmed at build
 against the merged #595 record rather than copied from #597's issue body. 6 pp is
-**strictly above** the measured **max** tail of +5 pp, so the strict `P100 < 99`
-landing SLO keeps ~1 pp headroom even on the worst observed tail. It is deliberately
+**strictly above** the measured **max** tail of +5 pp, so the outgoing account lands
+below the **ceiling** even on the worst observed tail (~1 pp under it). With the default
+ceiling at 95 that landing sits ~5 pp under the `P100 < 99` SLO: the tail margin guards the
+*ceiling*, and the sub-SLO ceiling (§ Decision) guards the *SLO* against the gap-staleness
+the tail margin does not model. It is deliberately
 larger than the p90 (+2 pp) for two reasons: the SLO is defined by the **max**, not the
 median; and the **error asymmetry** favours buying margin — `all_exhausted` fired only
 **2× in 17 days**, so capacity is **not** the binding constraint, which makes an early
@@ -172,7 +186,10 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
    **rejected**. No single value survives the ~11× velocity spread (§ Context), and a
    lower value *still* cannot touch the 46% post-swap tail, which lands after a correct
    swap. This is the alternative ADR-0022 already recorded as "rejected — the finding
-   that motivates #597."
+   that motivates #597." Note this is **not** the same as the chosen default ceiling of 95
+   (§ Decision): that value keeps full *ceiling* semantics — both arms fire backward, the
+   tail margin still applies — and lands the account *below* 95; it is a landing target set
+   below the SLO, not a fire-at threshold.
 
 2. **Split `session_trigger` into two separately-calibrated knobs** (`reactive_trigger`
    + `projection_trigger`) — **rejected**, already settled 3/3 by council in ADR-0022.
@@ -205,6 +222,16 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
    arms, preserves ADR-0022's one-predicate decision and the strict-early-fire invariant
    structurally (no runtime branch, proven by an exhaustive grid + a falsifier test),
    adds **zero** operator knobs, and gives ADR-0022 a clean supersession target.
+
+6. **Widen the reactive `poll_gap` term to a measured gap percentile** (e.g. p90 313 s)
+   instead of `2 × near_limit_poll_secs` (~120 s) — **deferred to a calibration follow-up**.
+   This is the principled alternative to a sub-SLO default ceiling: a `poll_gap` that looks
+   ahead over the *real* re-observation-gap tail would fire both arms early enough that the
+   ceiling could equal the SLO (99) and still land under it. It is deferred because it needs
+   its own calibration (which percentile, how it composes with the per-cycle ceiling jitter)
+   and because the sub-SLO default ceiling (§ Decision) is the simpler, more legible interim
+   lever the maintainer chose. Filing it lets the two levers be compared on their own
+   evidence rather than bundled into this change.
 
 ## Consequences
 
@@ -271,14 +298,15 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
   quantity and is untouched). **#398/#417** (the `target_max_session_usage` reserve and
   its clamp to `session_trigger`). Follow-ups to file: the pure `session_trigger →
   session_ceiling` rename (§ Alternatives 4); the `v_peak` coupling validator plus an
-  observed-peak SLI (§ Alternatives 3).
+  observed-peak SLI (§ Alternatives 3); the gap-percentile `poll_gap` calibration that could
+  return the ceiling to the SLO line (§ Alternatives 6).
 - Code: `swap::effective_ceiling`, `swap::reactive_session_threshold`, and
   `swap::TAIL_MARGIN` (`src/swap.rs`) — the ceiling derivation and the strict-early-fire
   `max` clamp, with the exhaustive-grid + falsifier unit tests. The reactive draw +
   threshold and the `velocity_swap` projection (`src/daemon.rs`) — both now derive from
   `effective_ceiling`; the swap-reason log compares against the derived `session_threshold`
   so a velocity-early session swap is not mis-logged as weekly. `session_trigger` (the
-  struct field, its `50..=99` range check, the `DEFAULT_SESSION_TRIGGER = 99` constant,
+  struct field, its `50..=99` range check, the `DEFAULT_SESSION_TRIGGER = 95` constant,
   and the `config.toml` template comment) in `src/config.rs`, all reframed to ceiling
   semantics. The reserve validator in `Config::validate` (`src/config.rs`) and
   `Error::ConfigTargetMaxSessionAboveTrigger` (`src/error.rs`) — kept coherent, unchanged.
