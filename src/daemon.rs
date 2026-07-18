@@ -11251,6 +11251,180 @@ mod tests {
         );
     }
 
+    /// A [`warmed_velocity_daemon`] (ceiling 99 → effective ceiling 0.93) with the reactive
+    /// re-observation-gap lookahead ARMED at the production-default `near_limit_poll_secs = 60` and the
+    /// projection peer OFF (`session_velocity_horizon_secs = 0`), so a `decide_action` call exercises
+    /// the REACTIVE-velocity arm in isolation. The `tunables()` fixture ships `near_limit_poll_secs = 0`
+    /// (poll_gap 0 → the reactive velocity term inert), so this is the wiring the production path uses
+    /// but no other daemon test composes (issue #610). Peers (u-B / u-C at 0.10) are viable swap
+    /// targets, so a fire executes end-to-end to `TickAction::Swapped`.
+    async fn armed_reactive_daemon() -> FakeDaemon {
+        let mut daemon = warmed_velocity_daemon(0.80).await;
+        daemon.near_limit_poll_secs = 60; // DEFAULT_NEAR_LIMIT_POLL_SECS → reactive poll_gap armed (313 s)
+        daemon.session_velocity_horizon_secs = 0; // projection kill-switch OFF → isolate the reactive arm
+        daemon
+    }
+
+    /// A decision reading set with the active account (u-A, slot 0) at `session`, peers carried at their
+    /// warmed viable-target readings.
+    fn active_session_reading(daemon: &FakeDaemon, session: f64) -> Vec<Option<Usage>> {
+        let mut readings = daemon.state.last_readings.clone();
+        readings[0] = Some(Usage {
+            session,
+            weekly: 0.20,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        });
+        readings
+    }
+
+    #[tokio::test]
+    async fn reactive_arm_fires_early_on_the_production_default_poll_gap() {
+        // Issue #610: the production reactive-velocity path is the DEFAULT firing path
+        // (`near_limit_poll_secs = 60` → `poll_gap = max(2×60, 313) = 313 s`, reactive checked first in
+        // `decide_action`), yet no integration test composed it — every daemon test builds tunables via
+        // `tunables()`, which hard-defaults `near_limit_poll_secs = 0` (poll_gap 0, reactive velocity
+        // term inert). This drives the REAL path: a sustained EMA + an in-window reading fires the
+        // reactive swap EARLIER than the bare effective ceiling, while a control reading below the
+        // velocity-derived threshold holds. Fails if the poll_gap / velocity wiring regresses (e.g. the
+        // poll_gap collapses to 0 → threshold = bare effective ceiling → the in-window reading holds).
+        let eff = swap::effective_ceiling(0.99); // ceiling 99 → 0.93
+        let poll_gap = swap::reactive_poll_gap_secs(60);
+        assert_eq!(
+            poll_gap,
+            swap::REACTIVE_REOBSERVATION_GAP_SECS, // 313 s: at the default cadence the p90 floor dominates 2×60
+            "the production-default near-limit cadence looks ahead over the p90 re-observation gap",
+        );
+        let rate = 0.0004; // frac/s (~2.4 %/min) — a sustained velocity inside the observed spread
+        let threshold = swap::reactive_session_threshold(eff, rate, poll_gap); // 0.93 − 0.0004×313
+        let in_window = threshold + 0.02; // at/above the velocity threshold, below the effective ceiling
+        let below = threshold - 0.02; // below the velocity threshold
+        assert!(
+            in_window < eff,
+            "the in-window reading {in_window} is an EARLY fire — strictly below the effective ceiling {eff}",
+        );
+
+        // Control: a reading below the velocity-derived threshold HOLDS — the term is bounded (not an
+        // always-swap), and it is the velocity that moves the fire point, not a constant.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        let at = daemon.clock.now();
+        let readings = active_session_reading(&daemon, below);
+        let mut events = Vec::new();
+        let held = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(held, TickAction::Held),
+            "a reading below the velocity threshold holds: {held:?}",
+        );
+        assert!(events.is_empty(), "no swap event on a hold");
+
+        // The in-window reading fires the reactive arm EARLY (below the effective ceiling), attributed
+        // to Session. A fresh daemon so the swap executes from the same warmed baseline.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        let at = daemon.clock.now();
+        let readings = active_session_reading(&daemon, in_window);
+        let mut events = Vec::new();
+        let fired = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(fired, TickAction::Swapped { from: 0, .. }),
+            "the reactive velocity lookahead fires early at {in_window} (< effective ceiling {eff}): {fired:?}",
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::Session,
+                    ..
+                }
+            )),
+            "an early reactive fire is attributed to Session, not Weekly: {events:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reactive_arm_is_bounded_at_the_effective_ceiling_during_the_cold_ema_blind_window() {
+        // Issue #610 problem #1: below MIN_VELOCITY_SAMPLES the reactive velocity term reads 0 (an
+        // unwarmed EMA, or one just nulled by a 5 h window reset), so the FIRST interval of a burst is
+        // velocity-BLIND. This pins that the blind window is BOUNDED — the reactive arm still fires at
+        // the bare effective ceiling, never silently riding the burst past it — and that
+        // ≥ MIN_VELOCITY_SAMPLES samples re-engages the early velocity fire.
+        let eff = swap::effective_ceiling(0.99); // 0.93
+        let poll_gap = swap::reactive_poll_gap_secs(60);
+        let rate = 0.0004;
+        let warm_threshold = swap::reactive_session_threshold(eff, rate, poll_gap); // ~0.805
+        let in_window = warm_threshold + 0.02; // would fire early IF the velocity counted
+        assert!(
+            in_window < eff,
+            "the in-window reading is below the effective ceiling (would be an early velocity fire)",
+        );
+
+        // (1) Cold EMA (samples = 1 < MIN_VELOCITY_SAMPLES): velocity gated to 0 → the reactive
+        // threshold is the BARE effective ceiling, so the in-window reading HOLDS (the burst is ridden
+        // velocity-blind for this interval).
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 1 });
+        let at = daemon.clock.now();
+        let readings = active_session_reading(&daemon, in_window);
+        let mut events = Vec::new();
+        let cold_hold = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(cold_hold, TickAction::Held),
+            "an unsustained EMA (samples < MIN_VELOCITY_SAMPLES) ignores velocity → in-window holds: {cold_hold:?}",
+        );
+
+        // (2) The blind window is BOUNDED at the effective ceiling: a reading AT the effective ceiling
+        // fires the bare-ceiling swap even while velocity-blind — the burst is never ridden past it.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 1 });
+        let at = daemon.clock.now();
+        let readings = active_session_reading(&daemon, eff);
+        let mut events = Vec::new();
+        let cold_fire = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(cold_fire, TickAction::Swapped { from: 0, .. }),
+            "the blind window is bounded — a reading at the effective ceiling still swaps: {cold_fire:?}",
+        );
+
+        // (3) A 5 h window reset nulls the EMA (`None`); that post-reset blind window behaves exactly
+        // like the cold one — velocity absent → bare effective ceiling → the in-window reading holds.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = None;
+        let at = daemon.clock.now();
+        let readings = active_session_reading(&daemon, in_window);
+        let mut events = Vec::new();
+        let reset_hold = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(reset_hold, TickAction::Held),
+            "a post-window-reset (None) EMA is velocity-blind too → in-window holds: {reset_hold:?}",
+        );
+
+        // (4) Once the EMA is SUSTAINED (samples ≥ MIN_VELOCITY_SAMPLES) the early velocity fire
+        // re-engages: the SAME in-window reading now swaps early, below the effective ceiling.
+        let mut daemon = armed_reactive_daemon().await;
+        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        let at = daemon.clock.now();
+        let readings = active_session_reading(&daemon, in_window);
+        let mut events = Vec::new();
+        let warm_fire = daemon
+            .decide_action(at, Some(0), &readings, &mut events)
+            .await;
+        assert!(
+            matches!(warm_fire, TickAction::Swapped { from: 0, .. }),
+            "≥ MIN_VELOCITY_SAMPLES re-engages the early velocity fire at {in_window}: {warm_fire:?}",
+        );
+    }
+
     #[test]
     fn reconcile_roster_preserves_session_velocity_in_lockstep() {
         // Issue #539: the per-account EMA is a parallel vec (like `last_readings`), so a roster
