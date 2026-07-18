@@ -12452,6 +12452,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_suspend_resume_gap_neither_spurious_swaps_nor_misses_one() {
+        // Issue #615. The session-velocity interval is measured on `Clock::now` — a
+        // `std::time::Instant` in production — as `now.saturating_duration_since(prev_at)`, and
+        // `note_session_velocity` divides the usage delta by it. A laptop suspend/resume is the one
+        // ordinary event that can put an arbitrarily large WALL-CLOCK gap between two consecutive
+        // readings, so it is the interval this arithmetic is least obviously safe across.
+        //
+        // `Clock::now`'s own docs carry the suspend/resume requirement this rests on — the clock
+        // must keep counting while the system sleeps, because session usage accrues in wall-clock
+        // time — and why a sleep-FROZEN clock would fire both velocity-aware swap arms early. Not
+        // restated here: the contract belongs on the trait, this test pins the FOLD's half of it.
+        //
+        // The three legs below pin the behavior that must hold whatever the platform does:
+        // dilution (a correctly-measured long gap) must not fabricate a swap, and must not mask a
+        // genuinely-due one; a degenerate zero-length interval must reset rather than fabricate.
+        let eff = swap::effective_ceiling(0.99); // ceiling 99 → 0.93
+        let mut daemon = pre_suspend_climbing_daemon().await;
+        let pre_suspend = daemon.state.session_velocity[0].expect("a sustained pre-suspend EMA");
+
+        // --- Leg 1: the resume interval is divided by the WALL-CLOCK gap ---------------------
+        // Arm the projective peer, then resume after a 30 min suspend across which usage rose two
+        // points. The projection is `observed + rate × horizon`, so the rate this one interval
+        // yields decides directly whether the resume tick swaps — which is what makes the clock
+        // choice observable in the swap OUTCOME and not merely in the arithmetic:
+        //
+        //   honest (2 pp over the full 1800 s) → rate 8.89e-5 → 0.89 + 0.027 = 0.917 → HOLDS
+        //   sleep-frozen (2 pp over ~60 s)     → rate 2.50e-4 → 0.89 + 0.075 = 0.965 → SWAPS
+        //
+        // The resume reading sits deliberately so that only the frozen-clock projection crosses the
+        // 0.93 effective ceiling: a clock that stopped through the suspend would swap the account
+        // out on a climb that never happened. Measured honestly the gap DILUTES the retained climb
+        // (2 pp per 30 min across the suspend vs 1 pp per minute while awake), so the arm relaxes.
+        //
+        // The horizon is armed only NOW, after the climb, and the pre-suspend state is kept clear of
+        // the ceiling on purpose (0.87 + 1.67e-4 × 300 = 0.92 < 0.93) so the peer ticks that run
+        // before the active is re-polled cannot themselves fire and mask what this leg measures.
+        const SUSPEND: Duration = Duration::from_secs(30 * 60);
+        const HORIZON: u64 = 300;
+        daemon.session_velocity_horizon_secs = HORIZON;
+        assert!(
+            0.87 + pre_suspend.rate * (HORIZON as f64) < eff,
+            "the pre-suspend state must itself stay short of the ceiling, so a peer tick cannot \
+             fire before the resume poll lands",
+        );
+        poll_active_after(&mut daemon, SUSPEND, 0.89, None).await;
+        let resumed =
+            daemon.state.session_velocity[0].expect("the resume interval blends, not resets");
+        let alpha = daemon.session_velocity_ema_alpha;
+        let wall_clock_rate = (0.89 - 0.87) / SUSPEND.as_secs() as f64;
+        let expected = alpha * wall_clock_rate + (1.0 - alpha) * pre_suspend.rate;
+        assert!(
+            (resumed.rate - expected).abs() < 1e-12,
+            "the resume interval must be divided by the WALL-CLOCK gap: expected {expected}, \
+             got {} (a sleep-frozen clock would blend a much steeper rate here)",
+            resumed.rate,
+        );
+        assert!(
+            resumed.rate < pre_suspend.rate,
+            "an honestly-measured resume gap DILUTES the retained climb ({} → {})",
+            pre_suspend.rate,
+            resumed.rate,
+        );
+        // The reading straddles the two projections — the property that makes the swap assertion
+        // below discriminate the clock semantics rather than hold for unrelated reasons.
+        let frozen_rate = alpha * ((0.89 - 0.87) / 60.0) + (1.0 - alpha) * pre_suspend.rate;
+        assert!(
+            0.89 + resumed.rate * (HORIZON as f64) < eff,
+            "the honest rate must leave the projection BELOW the {eff} effective ceiling",
+        );
+        assert!(
+            0.89 + frozen_rate * (HORIZON as f64) >= eff,
+            "a sleep-frozen clock would project ACROSS the {eff} effective ceiling",
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "no spurious swap: an honestly-measured resume gap leaves the projection short of the \
+             effective ceiling",
+        );
+
+        // --- Leg 2: the diluted rate cannot MASK a genuinely-due swap -------------------------
+        // Velocity only ever SUBTRACTS from the reactive fire point, so however far a resume gap
+        // dilutes the EMA the threshold can never rise above the bare effective ceiling — a reading
+        // at or over it still swaps. Checked at the production re-observation gap (issue #609),
+        // where that term is largest, then driven end to end.
+        assert!(
+            swap::reactive_session_threshold(eff, resumed.rate, swap::reactive_poll_gap_secs(60))
+                <= eff,
+            "a diluted velocity can only lower the fire point, never raise it above {eff}",
+        );
+        poll_active_after(&mut daemon, Duration::from_secs(60), 0.94, None).await;
+        let after = daemon.state.active;
+        assert!(
+            after.is_some() && after != Some(0),
+            "no missed swap: a reading at/over the effective ceiling still swaps out (to a peer, \
+             not to nothing) despite the resume-diluted velocity — got {after:?}",
+        );
+
+        // --- Leg 3: a zero-length resume interval resets rather than fabricates ---------------
+        // The mirror hazard: if the platform's monotonic clock did NOT advance across the sleep and
+        // the resume poll lands in the same second as the pre-suspend one, the interval is 0. The
+        // rate `delta / 0` is undefined, and `note_session_velocity` must NOT invent one — it drops
+        // the EMA to `None`, which un-sustains the projective arm (samples < MIN_VELOCITY_SAMPLES)
+        // and collapses the reactive velocity term to 0, i.e. back to the bare effective ceiling.
+        let mut frozen_clock = pre_suspend_climbing_daemon().await;
+        frozen_clock.session_velocity_horizon_secs = HORIZON;
+        poll_active_after(&mut frozen_clock, Duration::ZERO, 0.89, None).await;
+        assert!(
+            frozen_clock.state.session_velocity[0].is_none(),
+            "a zero-length interval resets the EMA instead of fabricating a rate",
+        );
+        assert_eq!(
+            frozen_clock.state.active,
+            Some(0),
+            "no spurious swap off an unmeasurable interval",
+        );
+    }
+
+    /// A [`warmed_velocity_daemon`] whose ACTIVE account (u-A, slot 0) has then really climbed
+    /// 85 % → 86 % → 87 % over two ordinary 60 s polls, leaving the SUSTAINED pre-suspend velocity
+    /// EMA the issue-#615 suspend/resume test measures a resume interval against. Every reading
+    /// stays below the 0.93 effective ceiling, so the reactive arm holds throughout and the climb is
+    /// the only thing the EMA records. Shared by that test's legs so they cannot drift apart —
+    /// leg 3's zero-length interval must land on the SAME pre-suspend state leg 1 diluted.
+    async fn pre_suspend_climbing_daemon() -> FakeDaemon {
+        let mut daemon = warmed_velocity_daemon(0.85).await;
+        poll_active_at(&mut daemon, 0.86, None).await;
+        poll_active_at(&mut daemon, 0.87, None).await;
+        assert!(
+            daemon.state.session_velocity[0].is_some_and(|v| v.samples >= MIN_VELOCITY_SAMPLES),
+            "two real climbing intervals leave a SUSTAINED EMA",
+        );
+        daemon
+    }
+
     /// A warmed three-account daemon whose ACTIVE account (u-A, slot 0) has really climbed
     /// 0.86 → 0.90 → 0.94 inside session window [`WINDOW`], so the poll fold has accrued both a
     /// SUSTAINED velocity EMA and a high-water mark of 0.94 from real polls (issue #614).
@@ -12481,13 +12617,25 @@ mod tests {
     /// Advance one poll interval and tick until the staggered schedule has re-polled the ACTIVE
     /// account (slot 0) at `session` in `window`, so the reading lands through the real fold.
     async fn poll_active_at(daemon: &mut FakeDaemon, session: f64, window: Option<i64>) {
+        poll_active_after(daemon, Duration::from_secs(60), session, window).await;
+    }
+
+    /// [`poll_active_at`] with a caller-chosen clock `gap` before the poll, so a test can drive an
+    /// interval that is not the ordinary one-poll cadence — the seam the issue-#615 suspend/resume
+    /// tests use to land a sleep-sized (or zero-length) interval through the REAL poll fold.
+    async fn poll_active_after(
+        daemon: &mut FakeDaemon,
+        gap: Duration,
+        session: f64,
+        window: Option<i64>,
+    ) {
         daemon.poller = match window {
             Some(w) => FakeRosterPoller::new().ok_resets_session("u-A", session, 0.20, w),
             None => FakeRosterPoller::new().ok("u-A", session, 0.20),
         }
         .ok("u-B", 0.10, 0.10)
         .ok("u-C", 0.10, 0.10);
-        daemon.clock.advance(Duration::from_secs(60));
+        daemon.clock.advance(gap);
         for _ in 0..4 {
             daemon.tick().await;
             if daemon.state.last_readings[0].is_some_and(|u| u.session == session) {
@@ -16334,6 +16482,64 @@ mod tests {
             daemon.state.parked_landing[1].is_some(),
             "a failed poll leaves the watch armed"
         );
+    }
+
+    #[tokio::test]
+    async fn the_runtime_landing_boundary_rounds_like_the_offline_slo() {
+        // Issue #615, the RUNTIME half of the rounding boundary the offline reader pins in
+        // `reliability::landing_boundary_fraction_rounds_consistently_with_the_slo`. The live
+        // detector reaches the same `>= 99` comparison by a different route — `to_pct` here vs the
+        // reader's own fraction→percent conversion — so the boundary is asserted on BOTH sides: the
+        // two must classify an identical landing fraction identically, or the runtime `status`
+        // signal and the offline SLI would disagree about what breached.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        daemon.state.active = Some(0);
+        let base = daemon.clock.now();
+        // Arm the landing watch on the parked "spare" as a reason=session swap would (fired at 95%),
+        // feed it one live reading, and report the `landing_pct` it recorded — `None` when the
+        // reading held below the ceiling and no breach was retained.
+        let breach_pct_at = |d: &mut FakeDaemon, session: f64| {
+            d.state.last_landing_overshoot = None;
+            d.state.parked_landing[1] = Some(ParkedLanding {
+                armed_at: base,
+                decision_pct: 95,
+            });
+            d.note_landing_overshoot(1, Some(0), &Ok(reading(session, 0.50)), base);
+            d.state
+                .last_landing_overshoot
+                .as_ref()
+                .map(|r| r.landing_pct)
+        };
+
+        // The rounding IS the boundary: 0.9849 → 98.49 → 98 holds; 0.985 → 98.5 → 99 breaches. Half a
+        // percentage point below the nominal 0.99 ceiling, exactly as the offline reader classes it.
+        assert_eq!(
+            to_pct(0.9849),
+            98,
+            "just under the boundary rounds DOWN, below the ceiling"
+        );
+        assert_eq!(
+            to_pct(0.985),
+            99,
+            "the boundary rounds UP, onto the ceiling"
+        );
+        assert_eq!(breach_pct_at(&mut daemon, 0.9849), None, "0.9849 holds");
+        assert_eq!(
+            breach_pct_at(&mut daemon, 0.985),
+            Some(99),
+            "0.985 is already a runtime landing overshoot",
+        );
+
+        // The REST of the sub-ceiling band — fractions BELOW the nominal 0.99 that rounding alone
+        // pulls onto it. These are the ones truncation would silently release to a compliant 98, so
+        // they carry the discrimination; 0.99 and up round to 99 under either mode.
+        for session in [0.9875, 0.9899] {
+            assert_eq!(
+                breach_pct_at(&mut daemon, session),
+                Some(99),
+                "{session} is below the nominal ceiling but rounds onto it at runtime",
+            );
+        }
     }
 
     #[tokio::test]

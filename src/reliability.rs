@@ -2192,6 +2192,60 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
     }
 
     #[test]
+    fn landing_boundary_fraction_rounds_consistently_with_the_slo() {
+        // Issue #615. The daemon DECIDES in fraction space but this SLO is stated — and compared — in
+        // rounded whole percent (`landing_pct >= SLO_SWAP_P100_MAX`, a `u8`). Rounding is therefore
+        // part of the SLO's definition, not a display detail, and it is half-away-from-zero
+        // (`f64::round`): a landing fraction of 0.985 rounds UP to 99 and is already a breach.
+        //
+        // So the fraction-space boundary is **0.985, not 0.99** — the rounding widens the breach band
+        // by half a percentage point below the nominal ceiling. That is the boundary this test pins,
+        // so a future change of rounding mode cannot pass unnoticed: truncation would release the
+        // sub-ceiling `[0.985, 0.99)` band back to a compliant 98 and silently stop reporting those
+        // breaches. (From 0.99 up the two modes agree, so only the sub-ceiling band discriminates.)
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=95
+";
+        // One swap anchor and one in-window post-swap reading of the parked account, so the ONLY
+        // thing varying across the fractions below is the rounding under test.
+        let events = parse_events(log, None);
+        let landed_at = epoch("2026-07-11T00:05:00Z");
+        let landing_at =
+            |session: f64| aggregate(&events, &[sample(landed_at, "work", session)], None).landing;
+
+        // Just BELOW the boundary: 98.49 rounds to 98 — under the strict `< 99` ceiling, so the SLO
+        // is met and the episode is not classed a post-swap tail.
+        let under = landing_at(0.9849);
+        assert_eq!(under.p100, Some(98), "0.9849 → 98.49 → rounds DOWN to 98");
+        assert_eq!(under.p100_met(), Some(true), "98 < 99 → the SLO is met");
+        assert_eq!(under.post_swap_tail, 0, "not a breach below the boundary");
+
+        // AT the boundary: 98.50 rounds UP to 99, which the strict `< 99` ceiling already counts as a
+        // breach — and, since the swap itself fired below the ceiling (95), as a post-swap tail.
+        let at = landing_at(0.985);
+        assert_eq!(at.p100, Some(99), "0.985 → 98.5 → rounds UP to 99");
+        assert_eq!(at.p100_met(), Some(false), "99 is NOT < 99 → breached");
+        assert_eq!(
+            at.gap_crossing, 0,
+            "the swap fired at 95, below the ceiling"
+        );
+        assert_eq!(at.post_swap_tail, 1, "so the breach is the post-swap tail");
+
+        // The REST of the sub-ceiling band rounding alone pulls onto the ceiling — every fraction here
+        // is a breach that a truncating implementation would report as a compliant 98. Stopping
+        // strictly below 0.99 keeps every entry discriminating (at and above it the modes agree).
+        for session in [0.9875, 0.9899] {
+            assert_eq!(
+                landing_at(session).p100,
+                Some(99),
+                "{session} is below the nominal ceiling but rounds onto it",
+            );
+        }
+        // Above the band the value keeps climbing rather than pinning at the ceiling.
+        assert_eq!(landing_at(0.995).p100, Some(100), "0.995 → 99.5 → 100");
+    }
+
+    #[test]
     fn landing_classifies_gap_crossing_when_decision_already_over_ceiling() {
         // The daemon's OWN reading was already 100 at the swap — the overshoot is a gap-crossing,
         // visible in SLI 1 already, NOT a post-swap tail (even though the parked account stays >= 99).
