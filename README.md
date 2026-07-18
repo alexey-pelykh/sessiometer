@@ -157,6 +157,31 @@ roster would fight over which account is canonical. If you want to run in the
 foreground temporarily, `sessiometer service uninstall` first (or `sessiometer daemon
 stop` to stop it just for this login session), then `sessiometer run`.
 
+**Two machines, one roster — the single-machine-sync boundary.** That single-owner
+lock is a *per-machine* guard: it stops two `sessiometer` processes on the **same** Mac
+from fighting over the roster, but it cannot see — let alone coordinate with — a
+`sessiometer` running on a **second** machine against the same accounts. Sessiometer has
+no shared backend, so running the same roster on two machines at once is possible, and
+each daemon is **blind to the other's consumption**. Two consequences follow:
+
+- **Co-consumption.** Both machines can bill the same account's session and weekly quota
+  at the same time. The swap loop's safety margin is calibrated for a single machine's
+  post-swap tail; two machines' tails stacked on one parked account can exceed it, so an
+  account can land past its ceiling even when each machine swapped on target.
+- **Per-machine visibility.** The landing check — both the offline `sessiometer
+  reliability` readout and the live `status` overshoot signal — only sees what *this*
+  machine observed. Another machine pushing a parked account past the ceiling is
+  invisible to it.
+
+**The mitigation, and its limits.** Velocity-spike detection is the one guard that
+crosses the boundary: it reads each account's usage from the account-global
+`/oauth/usage` endpoint, which already reflects **both** machines' combined burn, so a
+co-consumption spike shows up as a faster-than-expected climb and can trigger an earlier
+swap. It **reduces** the exposure — it does not remove it: the post-swap committed tail
+and the shared per-account rate limits still apply, and two machines can still briefly
+stack usage between polls. Running one roster per machine avoids the boundary entirely;
+if you must span two, treat velocity spikes as the safety net, not a guarantee.
+
 ## Checking status
 
 `sessiometer status` queries the running daemon and prints each account as one

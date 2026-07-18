@@ -2324,6 +2324,50 @@ pub(crate) fn render_status(
         }
     }
 
+    // The daemon-level RUNTIME landing-overshoot notice (issue #613): THIS machine observed a
+    // recently-parked (`reason=session`) account reach the SLO ceiling within the landing window — the
+    // #595 landing overshoot the swap-DECISION reading is blind to, caught LIVE instead of only in a
+    // later offline `reliability` run. Surfaced as DATA (not advisory chrome): printed UNCONDITIONALLY
+    // so it survives a pipe / redirect / `status | grep` — an operator's health check must see the SLO
+    // breach — with a red emphasis added only when the color gate is open, exactly like the systemic
+    // line above. Names the parked account and the fired-vs-landed spread, and distinguishes the two
+    // breach CLASSES the offline SLI also splits: a swap that fired BELOW the SLO whose parked in-flight
+    // drain then carried it over is the post-swap committed TAIL; a swap that fired already AT/OVER the
+    // SLO (the daemon was blind/late) is a GAP-CROSSING — it did NOT climb after the swap, so the causal
+    // clause must not mislabel it a tail. Both end with the SINGLE-MACHINE caveat: best-available
+    // per-machine evidence, blind to a second machine co-consuming the same account (the
+    // single-machine-sync boundary). One handle + two percents, never a token or email (#15). Absent (no
+    // line) when no overshoot is recent.
+    if let Some(overshoot) = &response.recent_landing_overshoot {
+        let from = &overshoot.from_label;
+        let decision = overshoot.decision_pct;
+        let landed = overshoot.landing_pct;
+        let ceiling = crate::landing::LANDING_SLO_CEILING_PCT;
+        let cause = if decision < ceiling {
+            // On-target swap (below the SLO); the parked account's committed tail carried it over.
+            format!(
+                "swapped out at {decision}% but its parked session climbed to {landed}% \
+                 (>= the {ceiling} SLO) — the post-swap committed tail"
+            )
+        } else {
+            // The swap itself fired at/over the SLO — a late / gap-crossing swap-out, not a tail.
+            format!(
+                "swapped out already over the {ceiling} SLO at {decision}% and its parked session \
+                 reached {landed}% — a late swap-out, not a post-swap tail"
+            )
+        };
+        let body = format!(
+            "landing overshoot: {from} {cause}; single-machine signal \
+             (a second machine co-consuming this account is invisible to it)"
+        );
+        if color {
+            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
+        } else {
+            out.push_str(&body);
+            out.push('\n');
+        }
+    }
+
     // The daemon-level KEYCHAIN-LOCKED rollup (issue #498): the macOS login keychain is LOCKED, so the
     // daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied). The
     // daemon-LEVEL sibling of the `canonical_scrub` line below, but for an UNREADABLE item rather than a
@@ -4051,7 +4095,7 @@ mod tests {
     use super::*;
     use crate::config::Tunables;
     use crate::daemon::{
-        AccountStatusLine, BlindActive, BlindPreemptSwap, NextSwap, NoTargetCause,
+        AccountStatusLine, BlindActive, BlindPreemptSwap, LandingOvershoot, NextSwap, NoTargetCause,
     };
     use std::path::PathBuf;
 
@@ -4318,6 +4362,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4347,6 +4392,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: None,
@@ -4393,6 +4439,7 @@ spare  22222222-2222\n\
             canonical_scrub: scrub,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(60), Some(25))],
             next_swap: None,
@@ -4468,6 +4515,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: locked,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(true),
             accounts: vec![status_line("work", true, Some(60), Some(25))],
             next_swap: None,
@@ -4531,6 +4579,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![degraded],
             next_swap: None,
@@ -4568,6 +4617,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
                 refresh_enabled: None,
                 accounts: vec![ok],
                 next_swap: None,
@@ -4588,6 +4638,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, None, None)],
                 next_swap: None,
@@ -4612,6 +4663,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
@@ -4645,6 +4697,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
@@ -4805,6 +4858,7 @@ spare  22222222-2222\n\
                 to_label: "work".to_owned(),
                 last_known_session_pct: 68,
             }),
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(20), Some(15))],
             next_swap: None,
@@ -4821,12 +4875,84 @@ spare  22222222-2222\n\
         // No recent preemptive swap on the wire → no narration line.
         let quiet = StatusResponse {
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             ..narrated
         };
         let out = render_status(&quiet, NOW, None, false);
         assert!(
             !out.contains("swapped off") && !out.contains("undo with"),
             "no line when there is no recent preemptive swap: {out}",
+        );
+    }
+
+    #[test]
+    fn render_status_surfaces_a_recent_landing_overshoot() {
+        // Issue #613: a daemon-pushed `recent_landing_overshoot` renders a DATA line naming the parked
+        // account, the fired-vs-landed spread, the SLO ceiling, and the single-machine caveat — the
+        // local landing breach caught at runtime, the same breach the offline #595 landing SLI
+        // reconstructs. The causal clause distinguishes the two breach classes the offline SLI splits:
+        // a swap fired BELOW the SLO whose committed tail carried it over (the post-swap TAIL, here) vs
+        // a swap that fired already AT/OVER the SLO (a GAP-CROSSING, below). Absent from the wire → no
+        // line.
+        let breached = StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: Some(LandingOvershoot {
+                from_label: "spare".to_owned(),
+                decision_pct: 95,
+                landing_pct: 99,
+            }),
+            refresh_enabled: None,
+            accounts: vec![status_line("work", true, Some(20), Some(15))],
+            next_swap: None,
+        };
+        let out = render_status(&breached, NOW, None, false);
+        assert!(
+            out.contains(
+                "landing overshoot: spare swapped out at 95% but its parked session climbed to 99%"
+            ) && out.contains("post-swap committed tail")
+                && out.contains("single-machine signal"),
+            "the on-target tail overshoot is surfaced with parked account + spread + caveat: {out}",
+        );
+
+        // GAP-CROSSING class: the swap fired ALREADY at/over the SLO (decision == ceiling), so the
+        // parked account did not climb after the swap — the banner must NOT call it a post-swap tail.
+        let gap_crossing = StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: Some(LandingOvershoot {
+                from_label: "spare".to_owned(),
+                decision_pct: 99,
+                landing_pct: 100,
+            }),
+            refresh_enabled: None,
+            accounts: vec![status_line("work", true, Some(20), Some(15))],
+            next_swap: None,
+        };
+        let out = render_status(&gap_crossing, NOW, None, false);
+        assert!(
+            out.contains(
+                "landing overshoot: spare swapped out already over the 99 SLO at 99% and its parked \
+                 session reached 100%"
+            ) && out.contains("a late swap-out, not a post-swap tail")
+                && !out.contains("post-swap committed tail")
+                && out.contains("single-machine signal"),
+            "the gap-crossing overshoot is labelled a late swap-out, not a tail: {out}",
+        );
+
+        // No recent overshoot on the wire → no line.
+        let quiet = StatusResponse {
+            recent_landing_overshoot: None,
+            ..breached
+        };
+        let out = render_status(&quiet, NOW, None, false);
+        assert!(
+            !out.contains("landing overshoot:"),
+            "no line when there is no recent landing overshoot: {out}",
         );
     }
 
@@ -4842,6 +4968,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), spare],
             next_swap: None,
@@ -4881,6 +5008,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), healing, dead],
             next_swap: None,
@@ -4983,6 +5111,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![healthy_but_spent, dead],
             next_swap: None,
@@ -5027,6 +5156,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![AccountStatusLine {
                 health: Some(CredentialHealth::Healthy),
@@ -5058,6 +5188,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 line("healthy", Healthy),
@@ -5127,6 +5258,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 AccountStatusLine {
@@ -5188,6 +5320,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![],
             next_swap: None,
@@ -5382,6 +5515,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 work,
@@ -5425,6 +5559,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -5481,6 +5616,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 // healthy: session 12m, weekly 5d — both appear.
@@ -5570,6 +5706,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(50), Some(25)), quarantined],
             next_swap: None,
@@ -5598,6 +5735,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![{
                 let mut a = status_line_resets(
@@ -5688,6 +5826,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap,
@@ -5789,6 +5928,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line("work", true, Some(99), Some(40))],
             next_swap: Some(NextSwap::Target {
@@ -5828,6 +5968,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5864,6 +6005,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
                 refresh_enabled: Some(false),
                 accounts: vec![
                     health_line("account-a", true, Healthy),
@@ -5888,6 +6030,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(true),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5910,6 +6053,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5935,6 +6079,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Dead),
@@ -5960,6 +6105,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -5988,6 +6134,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -6013,6 +6160,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: Some(false),
             accounts: vec![
                 health_line("account-a", true, CredentialHealth::Healthy),
@@ -6040,6 +6188,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6355,6 +6504,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "hot",
@@ -6380,6 +6530,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 // green: low utilization.
@@ -6443,6 +6594,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -6483,6 +6635,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "mix",
@@ -6529,6 +6682,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "half",
@@ -6567,6 +6721,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6624,6 +6779,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("ascii", true, Some(50), Some(60)),
@@ -6713,6 +6869,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 line_for("ascii", Some(NOW + 4 * 3_600)),
@@ -6749,6 +6906,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -6855,6 +7013,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![status_line_resets(
                 "work",
@@ -7062,6 +7221,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: Some(NextSwap::Target {
@@ -7125,6 +7285,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
                 refresh_enabled: None,
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: None,

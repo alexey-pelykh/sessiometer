@@ -1469,6 +1469,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),
@@ -1490,6 +1491,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("dup", false, false, Some(10)),
@@ -1808,6 +1810,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             refresh_enabled: None,
             accounts: vec![
                 status_line("work", false, false, Some(20)),

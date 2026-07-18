@@ -20,6 +20,7 @@ mod error;
 mod hex;
 mod isolated_spawn;
 mod keychain;
+mod landing;
 mod login;
 mod migration;
 mod observability;

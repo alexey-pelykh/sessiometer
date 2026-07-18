@@ -103,6 +103,7 @@ use crate::error::{Error, Result};
 use crate::keychain::{
     CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
 };
+use crate::landing;
 use crate::observability::{
     BackoffClass, CanonicalLiveness, CaptureEventOutcome, CredentialHealth, DecisionClass,
     Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome,
@@ -137,8 +138,8 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub, NextSwap, NextSwapReason,
-    NoTargetCause, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
+    AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub, LandingOvershoot, NextSwap,
+    NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
     STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
@@ -542,6 +543,30 @@ fn recent_blind_preempt_swap_view(
         from_label: record.from.clone(),
         to_label: record.to.clone(),
         last_known_session_pct: record.last_known_session_pct,
+    })
+}
+
+/// Project the retained runtime landing-overshoot record into the `status` wire notice (issue #613),
+/// or `None` when there is none to surface or it has aged out. PURE — a function of the record and
+/// the monotonic clock — so it is unit-tested directly. `Some` only while RECENT: within the
+/// [`landing::LANDING_OVERSHOOT_NOTICE_SECS`] window since the overshoot was observed, on the SAME
+/// monotonic clock the anchor / cooldown use. Unlike [`recent_blind_preempt_swap_view`] there is NO
+/// "still current" gate — a landing overshoot is a point event about a PAST parked account, not a
+/// standing property of the current active one, so only the recency window bounds it. Keeps
+/// `render_status` a pure function of the wire (the window is decided daemon-side here), honoring the
+/// #169 UI-never-acts invariant.
+fn recent_landing_overshoot_view(
+    record: Option<&LandingOvershootRecord>,
+    at: Instant,
+) -> Option<LandingOvershoot> {
+    let record = record?;
+    if at.saturating_duration_since(record.at).as_secs() >= landing::LANDING_OVERSHOOT_NOTICE_SECS {
+        return None;
+    }
+    Some(LandingOvershoot {
+        from_label: record.from_label.clone(),
+        decision_pct: record.decision_pct,
+        landing_pct: record.landing_pct,
     })
 }
 
@@ -1480,6 +1505,48 @@ struct BlindPreemptSwapRecord {
     at: Instant,
 }
 
+/// A per-account ARMED landing watch for the runtime landing-overshoot signal (issue #613). Set on
+/// the account the daemon just swapped AWAY FROM on a `reason=session` swap (in
+/// [`Daemon::decide_action`]), held in [`DecisionState::parked_landing`] (one slot per roster
+/// account, like [`DecisionState::last_readings`]). While armed, each subsequent poll of THAT parked
+/// account is checked against the SLO ceiling ([`landing::is_overshoot`]) within the
+/// [`landing::LANDING_WINDOW`]: a crossing records a [`LandingOvershootRecord`] and disarms (fire
+/// once per parked episode); the window elapsing, or the account going active again, disarms with no
+/// overshoot. Process-local: never serialized. Non-secret — a `u8` + a monotonic [`Instant`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParkedLanding {
+    /// When the `reason=session` swap parked the account — monotonic ([`Instant`]), so the
+    /// [`landing::LANDING_WINDOW`] is measured against the SAME clock as the anchor / cooldown.
+    armed_at: Instant,
+    /// The session % the swap FIRED on (`to_pct(active_usage.session)`, the `session_pct=` on the
+    /// swap line), carried so the fired notice can show the tail's size (fired at X, landed at Y).
+    decision_pct: u8,
+}
+
+/// The most recent LOCAL landing overshoot, retained so `status` can surface it (issue #613). Set in
+/// [`Daemon::note_landing_overshoot`] when a parked account's live reading crosses the SLO ceiling
+/// within its [`ParkedLanding`] window; projected onto the wire ([`LandingOvershoot`]) by
+/// [`recent_landing_overshoot_view`] while RECENT (within [`landing::LANDING_OVERSHOOT_NOTICE_SECS`]).
+/// A single latest-wins slot (a fresh overshoot supersedes an older notice), the runtime mirror of
+/// the offline #595 landing SLI's breach. DEDICATED — kept SEPARATE from the per-account
+/// [`ParkedLanding`] arming, exactly as [`BlindPreemptSwapRecord`] is kept separate from the cooldown
+/// primitive. Process-local: never serialized. Non-secret — one operator handle + two `u8`s + a
+/// monotonic [`Instant`], never a token or email (issue #15).
+#[derive(Debug, Clone, PartialEq)]
+struct LandingOvershootRecord {
+    /// The label of the parked account that overshot — the one swapped AWAY FROM, observed climbing
+    /// past the ceiling. Never the email (issue #15).
+    from_label: String,
+    /// The session % the swap fired on (the parked [`ParkedLanding::decision_pct`]).
+    decision_pct: u8,
+    /// The session % the parked account actually LANDED at — the live peak that crossed the ceiling.
+    landing_pct: u8,
+    /// When the overshoot was observed — monotonic ([`Instant`]), so the
+    /// [`landing::LANDING_OVERSHOOT_NOTICE_SECS`] window is measured against the SAME clock as the
+    /// anchor / cooldown. Process-local: never serialized.
+    at: Instant,
+}
+
 /// The retained per-account SESSION-velocity signal (issue #399), EMA-smoothed, for the #539
 /// velocity-projection preemptive trigger (ADR-0017). The transient [`usage_velocity`] the poll
 /// fold logs is discarded, so the projective path — which runs at decision time, a step AFTER the
@@ -1681,6 +1748,12 @@ struct DecisionState {
     /// [`BlindPreemptSwapRecord`]. `None` by default (no preemptive swap yet). DEDICATED, kept off the
     /// cooldown-bearing `last_swap` above.
     last_blind_preempt_swap: Option<BlindPreemptSwapRecord>,
+    /// The most recent LOCAL landing overshoot, retained so `status` can surface it (issue #613):
+    /// `Some` from [`Daemon::note_landing_overshoot`] until aged out of the notice window. See
+    /// [`LandingOvershootRecord`]. `None` by default (no overshoot yet). A latest-wins slot; the
+    /// runtime mirror of the offline #595 landing SLI. Carries a String label, so it survives a roster
+    /// reindex untouched (unlike the per-account `parked_landing` below).
+    last_landing_overshoot: Option<LandingOvershootRecord>,
     /// Monotonic-[`Clock`] instants of recent server-`Retry-After`-driven preemptive swaps (issue
     /// #582) — the #582 circuit-breaker's evidence that the throttle is WALKING the roster rather
     /// than afflicting one account. Appended by [`Daemon::blind_swap`] on each swap it fires away
@@ -1806,6 +1879,15 @@ struct DecisionState {
     /// in lockstep by [`reconcile_roster`](Daemon::reconcile_roster). Sized to the roster in
     /// [`Daemon::new`]. See [`VelocityEma`].
     session_velocity: Vec<Option<VelocityEma>>,
+    /// The per-account ARMED landing watch for the runtime landing-overshoot signal (issue #613),
+    /// indexed in lockstep with [`last_readings`](Self::last_readings) — `Some` on the account the
+    /// daemon just parked with a `reason=session` swap, until its post-swap window ([`ParkedLanding`])
+    /// closes (an overshoot fires, the window elapses, or the account goes active again). Armed in
+    /// [`decide_action`](Daemon::decide_action), checked each poll by
+    /// [`note_landing_overshoot`](Daemon::note_landing_overshoot). Sized to the roster in
+    /// [`Daemon::new`] and rebuilt in lockstep by [`reconcile_roster`](Daemon::reconcile_roster).
+    /// `None` for every account with no open landing window. See [`ParkedLanding`].
+    parked_landing: Vec<Option<ParkedLanding>>,
     /// The per-account SESSION high-water mark within the current session window (issue #614),
     /// indexed in lockstep with [`last_readings`](Self::last_readings) — the plausibility baseline
     /// that lets both swap arms recognize a stale / cache-lagged LOW `/oauth/usage` reading (usage is
@@ -2151,6 +2233,9 @@ where
         // Per-account session-velocity EMA (issue #539), parallel to `last_readings` — `None` until
         // each account has a usable two-reading interval, so no projection off an unwarmed signal.
         let session_velocity = vec![None; roster.len()];
+        // Per-account armed landing watch (issue #613), parallel to `last_readings` — `None` until an
+        // account is parked by a `reason=session` swap, so no landing watch runs before its window opens.
+        let parked_landing = vec![None; roster.len()];
         // Per-account session high-water mark (issue #614), parallel to `last_readings` — `None`
         // until each account is polled with a parseable `session_resets_at`, so a stale-low reading
         // is only ever judged against evidence actually observed for its own window.
@@ -2245,6 +2330,7 @@ where
                 last_readings,
                 last_reading_at,
                 session_velocity,
+                parked_landing,
                 session_high_water,
                 blind_anchor,
                 polled_once,
@@ -2751,6 +2837,11 @@ where
             // `blind_window` block (whose recovery-edge semantics stay untouched) and BEFORE the slot
             // assignment below (it anchors off the PRE-poll reading + its timestamp).
             self.note_blind_episode(i, active, &result, now, &mut events);
+            // Issue #613: check this poll against any ARMED landing watch on account `i` — a parked
+            // account whose live reading crosses the SLO ceiling within its post-swap window is a LOCAL
+            // landing overshoot, surfaced through `status`. Runs on the FRESH `result` (before the slot
+            // below is overwritten), off the SAME `(i, active, now)` the blind-episode arm uses.
+            self.note_landing_overshoot(i, active, &result, now);
             // Issue #614: fold a LIVE reading into this account's per-window session high-water mark
             // — the plausibility baseline the swap arms measure a suspect low reading against. Only a
             // successful poll updates it: a `429` / `5xx` is blindness, not evidence the window
@@ -3042,6 +3133,56 @@ where
                 }
             })
             .collect()
+    }
+
+    /// Check the account just polled against any ARMED landing watch (issue #613) — the runtime
+    /// half of the local landing-overshoot signal. When account `i` was parked by a `reason=session`
+    /// swap ([`parked_landing`](DecisionState::parked_landing) is `Some`), a live reading that reaches
+    /// the SLO ceiling ([`landing::is_overshoot`]) within the [`landing::LANDING_WINDOW`] is a LOCAL
+    /// landing overshoot: the post-swap committed tail carried the parked account over the ceiling
+    /// after the swap redirected only NEW requests — the #595 breach, caught LIVE here rather than
+    /// only in a later offline `reliability` run. It retains the breach in
+    /// [`last_landing_overshoot`](DecisionState::last_landing_overshoot) (projected onto `status` by
+    /// [`recent_landing_overshoot_view`]) and DISARMS the watch, so it fires once per parked episode.
+    ///
+    /// Disarms with NO overshoot when the account has gone ACTIVE again (the window is moot — it is no
+    /// longer a parked tail) or the [`landing::LANDING_WINDOW`] has elapsed (a later climb is a fresh
+    /// session cycle, not this swap's tail). A failed poll (`Err`) leaves the watch armed — blindness
+    /// is not evidence of a safe landing, so a later live reading can still catch the overshoot inside
+    /// the window. MUST be called on the FRESH `result` BEFORE the caller overwrites `last_readings[i]`.
+    /// `now` is the tick's monotonic clock, the SAME [`Instant`] the swap arms the watch with.
+    fn note_landing_overshoot(
+        &mut self,
+        i: usize,
+        active: Option<usize>,
+        result: &Result<Usage>,
+        now: Instant,
+    ) {
+        let Some(parked) = self.state.parked_landing[i] else {
+            return;
+        };
+        // Re-activated (no longer a parked tail) or the landing window has elapsed — disarm, no breach.
+        if active == Some(i)
+            || now.saturating_duration_since(parked.armed_at) >= landing::LANDING_WINDOW
+        {
+            self.state.parked_landing[i] = None;
+            return;
+        }
+        // A live reading at/over the SLO ceiling is a landing overshoot: retain it and disarm (once
+        // per parked episode). A failed poll leaves the watch armed for a later reading in the window.
+        if let Ok(fresh) = result {
+            let landing_pct = to_pct(fresh.session);
+            if landing::is_overshoot(landing_pct) {
+                let from_label = self.roster[i].label.clone();
+                self.state.last_landing_overshoot = Some(LandingOvershootRecord {
+                    from_label,
+                    decision_pct: parked.decision_pct,
+                    landing_pct,
+                    at: now,
+                });
+                self.state.parked_landing[i] = None;
+            }
+        }
     }
 
     /// Record the UNCENSORED blind-episode edges for the account just polled (issue #583, umbrella
@@ -4170,6 +4311,20 @@ where
                     reason,
                     session_pct: to_pct(active_usage.session),
                 });
+                // Arm the runtime landing watch (issue #613) on the account just PARKED, but only for a
+                // `reason=session` swap — the offline #595 landing SLI this mirrors measures
+                // reason=session landings only (a weekly swap fires below its session trigger, so its
+                // parked account is not near the session ceiling). Its post-swap committed tail keeps
+                // billing after this swap redirects only NEW requests, so `note_landing_overshoot`
+                // watches its subsequent polls for a climb to the SLO ceiling within the landing window.
+                // `record_swap` above already cleared `parked_landing[target_idx]` (the incoming can't be
+                // a parked-landing subject); `active_idx != target_idx`, so this arm does not collide.
+                if reason == SwapReason::Session {
+                    self.state.parked_landing[active_idx] = Some(ParkedLanding {
+                        armed_at: at,
+                        decision_pct: to_pct(active_usage.session),
+                    });
+                }
                 TickAction::Swapped {
                     from: active_idx,
                     to: target_idx,
@@ -4190,6 +4345,11 @@ where
     /// the normal swap and the emergency swap (#42).
     async fn record_swap(&mut self, target_idx: usize, incoming: &str, at: Instant) {
         self.state.active = Some(target_idx);
+        // Issue #613: the account going ACTIVE cannot be a parked-landing subject — disarm any landing
+        // watch on it here (the shared swap path), so a prior park's stale window can't fire against an
+        // account that is now active again. The complementary arm of the OUTGOING account (reason=session
+        // only) is set by the reactive-swap caller right after this returns.
+        self.state.parked_landing[target_idx] = None;
         // Issue #450: the swapped-TO account has no pre-blind anchor yet — drop the
         // departing active's `last_good` so a stale foreign anchor cannot outlive the
         // swap. Load-bearing for the bounded-blindness path (#452): its OWN swap lands
@@ -4785,6 +4945,12 @@ where
         // vec never drifts out of length/index sync with the roster (a projective read would
         // otherwise index the wrong account or panic out of bounds).
         let mut session_velocity = Vec::with_capacity(new_roster.len());
+        // Issue #613: the armed landing watch is re-keyed in lockstep with `last_readings` for the
+        // same reason — kept for a persisting account (an open post-swap landing window survives a
+        // reconcile of OTHER accounts), started fresh (`None`) for a new one, so the vec never drifts
+        // out of length/index sync with the roster (a landing check would otherwise index the wrong
+        // account or panic out of bounds).
+        let mut parked_landing = Vec::with_capacity(new_roster.len());
         // Issue #614: the session high-water mark is re-keyed in lockstep with `last_readings` for
         // the same reason — kept for a persisting account (its window's plausibility baseline is
         // still valid; a reconcile of OTHER accounts is not a window roll), started fresh (`None`)
@@ -4808,6 +4974,7 @@ where
                     last_readings.push(self.state.last_readings[old_idx]);
                     last_reading_at.push(self.state.last_reading_at[old_idx]);
                     session_velocity.push(self.state.session_velocity[old_idx]);
+                    parked_landing.push(self.state.parked_landing[old_idx]);
                     session_high_water.push(self.state.session_high_water[old_idx]);
                     blind_anchor.push(self.state.blind_anchor[old_idx]);
                     polled_once.push(self.state.polled_once[old_idx]);
@@ -4817,6 +4984,7 @@ where
                     last_readings.push(None);
                     last_reading_at.push(None);
                     session_velocity.push(None);
+                    parked_landing.push(None);
                     session_high_water.push(None);
                     blind_anchor.push(None);
                     polled_once.push(false);
@@ -4838,6 +5006,7 @@ where
         self.state.last_readings = last_readings;
         self.state.last_reading_at = last_reading_at;
         self.state.session_velocity = session_velocity;
+        self.state.parked_landing = parked_landing;
         self.state.session_high_water = session_high_water;
         self.state.blind_anchor = blind_anchor;
         self.state.polled_once = polled_once;
@@ -6159,6 +6328,14 @@ where
             recent_blind_preempt_swap: recent_blind_preempt_swap_view(
                 self.state.last_blind_preempt_swap.as_ref(),
                 active.map(|i| self.roster[i].label.as_str()),
+                blind_at,
+            ),
+            // The daemon-level runtime landing-overshoot notice (issue #613): project the retained
+            // `last_landing_overshoot` record onto the wire while still within the notice window,
+            // decided here (`recent_landing_overshoot_view`) on the SAME monotonic `blind_at` the #479
+            // blind projection uses, so `render_status` stays a pure function of the wire (#169).
+            recent_landing_overshoot: recent_landing_overshoot_view(
+                self.state.last_landing_overshoot.as_ref(),
                 blind_at,
             ),
         }
@@ -12706,6 +12883,45 @@ mod tests {
         assert!(recent_blind_preempt_swap_view(None, Some("work"), base).is_none());
     }
 
+    #[test]
+    fn recent_landing_overshoot_view_projects_only_while_recent() {
+        // Issue #613: the runtime landing-overshoot notice surfaces a retained overshoot ONLY within
+        // the `LANDING_OVERSHOOT_NOTICE_SECS` window. Unlike the #479 preempt-swap view there is NO
+        // still-current gate — a landing overshoot is a point event about a PAST parked account, not a
+        // property of the current active one — so only recency bounds it. A pure function of the record
+        // and the monotonic clock.
+        let base = Instant::now();
+        let record = LandingOvershootRecord {
+            from_label: "spare".to_owned(),
+            decision_pct: 95,
+            landing_pct: 99,
+            at: base,
+        };
+
+        // Recent (mid-window) → surfaced, carrying the parked handle + the fired-vs-landed spread.
+        let shown = recent_landing_overshoot_view(
+            Some(&record),
+            base + Duration::from_secs(landing::LANDING_OVERSHOOT_NOTICE_SECS - 1),
+        )
+        .expect("a recent landing overshoot is surfaced");
+        assert_eq!(shown.from_label, "spare");
+        assert_eq!(shown.decision_pct, 95);
+        assert_eq!(shown.landing_pct, 99);
+
+        // Aged out — at/after the window boundary the notice expires.
+        assert!(
+            recent_landing_overshoot_view(
+                Some(&record),
+                base + Duration::from_secs(landing::LANDING_OVERSHOOT_NOTICE_SECS),
+            )
+            .is_none(),
+            "at the window boundary the notice has aged out",
+        );
+
+        // No record at all → nothing to surface.
+        assert!(recent_landing_overshoot_view(None, base).is_none());
+    }
+
     #[tokio::test]
     async fn snapshot_projects_blind_active_degraded_for_the_blind_active_account() {
         // Issue #479: the daemon projects the bounded-blindness state onto the wire snapshot for the
@@ -15283,6 +15499,13 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            // Issue #613: a runtime landing overshoot rides the wire as one operator handle + two
+            // small percents — populated here so the secret-free assertion below covers its bytes.
+            recent_landing_overshoot: Some(LandingOvershoot {
+                from_label: "spare".to_owned(),
+                decision_pct: 95,
+                landing_pct: 99,
+            }),
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![
@@ -15332,8 +15555,13 @@ mod tests {
         assert!(json.contains("\"state\":\"target\""));
         assert!(json.contains("\"to\":\"spare\""));
         assert!(!json.contains("last_swap"));
+        // Issue #613: the runtime landing-overshoot notice projects a handle + the two percents.
+        assert!(json.contains("\"recent_landing_overshoot\":{"));
+        assert!(json.contains("\"from_label\":\"spare\""));
+        assert!(json.contains("\"decision_pct\":95"));
+        assert!(json.contains("\"landing_pct\":99"));
         // Issue #15: the projection sources only labels + percentages, so neither an
-        // email nor a token can ever reach the wire — the new candidate included.
+        // email nor a token can ever reach the wire — the new candidate and overshoot included.
         assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
         assert!(!json.to_lowercase().contains("token"));
     }
@@ -15995,6 +16223,202 @@ mod tests {
         );
     }
 
+    /// The #613 daemon-side wiring the pure `landing` / `recent_landing_overshoot_view` unit tests
+    /// can't reach: `note_landing_overshoot` watches a PARKED account's post-swap polls, records a
+    /// LOCAL landing overshoot when the parked account crosses the SLO ceiling within the landing
+    /// window, and the retained record surfaces in `snapshot`'s `recent_landing_overshoot` projection —
+    /// the `status`-visible signal that turns the silent post-swap-tail breach into an operator-visible
+    /// one. Covers the fire path plus every disarm: below-ceiling, re-activation, window-expiry, and a
+    /// failed poll leaving the watch armed.
+    #[tokio::test]
+    async fn note_landing_overshoot_fires_on_a_parked_climb_and_projects_into_snapshot() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        daemon.state.active = Some(0); // "work" active; "spare" (idx 1) is the parked account watched
+        const NOW: i64 = 1_782_777_600;
+        let no_readings: [Option<Usage>; 3] = [None, None, None];
+        let base = daemon.clock.now(); // frozen clock, so `snapshot`'s `blind_at` equals this
+        let notice = |d: &FakeDaemon| {
+            d.snapshot(Some(0), &no_readings, NOW)
+                .recent_landing_overshoot
+        };
+
+        // Arm the landing watch on the parked "spare" as a reason=session swap would (fired at 95%).
+        let arm = |d: &mut FakeDaemon| {
+            d.state.parked_landing[1] = Some(ParkedLanding {
+                armed_at: base,
+                decision_pct: 95,
+            });
+        };
+
+        // A parked live reading AT the SLO ceiling (99) within the window → a landing overshoot: the
+        // record is retained (parked handle + fired-vs-landed spread), the watch disarms (fire once),
+        // and the snapshot surfaces it.
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(1, Some(0), &Ok(reading(0.99, 0.50)), base);
+        assert_eq!(
+            daemon.state.last_landing_overshoot,
+            Some(LandingOvershootRecord {
+                from_label: "spare".to_owned(),
+                decision_pct: 95,
+                landing_pct: 99,
+                at: base,
+            })
+        );
+        assert!(
+            daemon.state.parked_landing[1].is_none(),
+            "fires once, disarms"
+        );
+        assert_eq!(
+            notice(&daemon),
+            Some(LandingOvershoot {
+                from_label: "spare".to_owned(),
+                decision_pct: 95,
+                landing_pct: 99,
+            }),
+            "the overshoot is status-visible",
+        );
+
+        // Reset the retained record; below the ceiling is NOT an overshoot — the watch stays armed for a
+        // later reading, and nothing is recorded.
+        daemon.state.last_landing_overshoot = None;
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(1, Some(0), &Ok(reading(0.98, 0.50)), base);
+        assert!(
+            daemon.state.last_landing_overshoot.is_none(),
+            "98 < 99: no breach"
+        );
+        assert!(
+            daemon.state.parked_landing[1].is_some(),
+            "stays armed below the ceiling"
+        );
+
+        // The account going ACTIVE again disarms with no breach — it is no longer a parked tail (even at
+        // an over-ceiling reading).
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(1, Some(1), &Ok(reading(0.99, 0.50)), base);
+        assert!(
+            daemon.state.last_landing_overshoot.is_none(),
+            "re-activated: no breach"
+        );
+        assert!(
+            daemon.state.parked_landing[1].is_none(),
+            "re-activation disarms"
+        );
+
+        // Past the landing window the watch disarms with no breach — a later climb is a fresh session
+        // cycle, not this swap's committed tail.
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(
+            1,
+            Some(0),
+            &Ok(reading(0.99, 0.50)),
+            base + landing::LANDING_WINDOW,
+        );
+        assert!(
+            daemon.state.last_landing_overshoot.is_none(),
+            "window elapsed: no breach"
+        );
+        assert!(
+            daemon.state.parked_landing[1].is_none(),
+            "window-expiry disarms"
+        );
+
+        // A FAILED poll (blindness, not a safe landing) leaves the watch armed for a later live reading.
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(1, Some(0), &Err(Error::UsageUnauthorized), base);
+        assert!(
+            daemon.state.last_landing_overshoot.is_none(),
+            "a failed poll is not a breach"
+        );
+        assert!(
+            daemon.state.parked_landing[1].is_some(),
+            "a failed poll leaves the watch armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reason_session_swap_arms_the_landing_watch_but_a_weekly_swap_does_not() {
+        // Issue #613: the arm is wired into the REAL reactive-swap path (`decide_action`), which the
+        // `note_landing_overshoot` unit test above bypasses (it sets `parked_landing` by hand). Drive
+        // two genuine swaps end-to-end and pin the three load-bearing arming invariants that manual test
+        // cannot reach: (a) a reason=session swap arms the OUTGOING account with its swap-DECISION
+        // percent, (b) the INCOMING account is left disarmed, (c) a reason=weekly swap does NOT arm (the
+        // offline #595 landing SLI this mirrors measures reason=session landings only).
+
+        // (a) + (b): `work` (idx 0) over the 95 session trigger, weekly well below → a reason=session
+        // swap to the only viable target `spare` (idx 1).
+        {
+            let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+            ])
+            .await;
+            let (_dir, json) = claude_json("u-A");
+            let poller = FakeRosterPoller::new()
+                .ok("u-A", 0.97, 0.40)
+                .ok("u-B", 0.05, 0.05);
+            let tun = tunables(95, 80, 0);
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                poller,
+                store,
+                stash,
+                FakeClock::frozen(),
+                json,
+                &tun,
+            );
+
+            let outcome = warmed_tick(&mut daemon).await;
+            assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+            // The OUTGOING account (0) is armed with the swap-DECISION percent (to_pct(0.97) = 97)…
+            assert_eq!(
+                daemon.state.parked_landing[0].map(|p| p.decision_pct),
+                Some(97),
+                "a reason=session swap arms the parked (outgoing) account with its decision percent",
+            );
+            // …and the INCOMING account (1) is left disarmed (`record_swap` cleared it).
+            assert!(
+                daemon.state.parked_landing[1].is_none(),
+                "the account going active is never a parked-landing subject",
+            );
+        }
+
+        // (c): `work` session 0.50 (below the 95 session trigger) but weekly 0.98 (at the helper's 98
+        // weekly trigger) → a reason=weekly swap. The parked account must NOT be armed.
+        {
+            let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+            ])
+            .await;
+            let (_dir, json) = claude_json("u-A");
+            let poller = FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.98)
+                .ok("u-B", 0.10, 0.10);
+            let tun = tunables(95, 80, 0);
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                poller,
+                store,
+                stash,
+                FakeClock::frozen(),
+                json,
+                &tun,
+            );
+
+            let outcome = warmed_tick(&mut daemon).await;
+            assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+            assert!(
+                daemon.state.parked_landing[0].is_none(),
+                "a reason=weekly swap does not arm the landing watch",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_projects_the_canonical_scrub_rollup_gated_on_the_scrubbed_signal() {
         // Issue #516: `snapshot` projects the two edge-latched scrub signals into the wire rollup,
@@ -16058,6 +16482,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -16701,6 +17126,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![AccountReading {
@@ -16877,6 +17303,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             generated_at,
             refresh_enabled: false,
             next_swap: None,
@@ -19225,7 +19652,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":7}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":8}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -19265,6 +19692,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             generated_at: 1_782_777_600,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
@@ -19544,6 +19972,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
             generated_at: 0,
             refresh_enabled: false,
             accounts: vec![

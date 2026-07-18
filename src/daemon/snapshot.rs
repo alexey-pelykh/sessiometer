@@ -72,6 +72,11 @@ pub(crate) struct StatusSnapshot {
     /// superseding swap self-invalidates it); [`status_response`] copies it straight onto the wire.
     /// `None` by `Default`.
     pub(crate) recent_blind_preempt_swap: Option<BlindPreemptSwap>,
+    /// A just-observed RUNTIME landing overshoot to surface (issue #613), or `None` when none is
+    /// recent. Resolved daemon-side in [`Daemon::snapshot`] from the retained `last_landing_overshoot`
+    /// record, projected `Some` only within the `LANDING_OVERSHOOT_NOTICE_SECS` window;
+    /// [`status_response`] copies it straight onto the wire. `None` by `Default`.
+    pub(crate) recent_landing_overshoot: Option<LandingOvershoot>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -155,6 +160,35 @@ pub(crate) struct BlindPreemptSwap {
     /// [`BlindActive::last_known_session_pct`] shows, captured at swap-time (by projection time the
     /// anchor `last_good` has been reset to `None`). Gives R-2 content-parity across all three surfaces.
     pub(crate) last_known_session_pct: u8,
+}
+
+/// A just-observed RUNTIME landing-point overshoot (issue #613), retained so `status` can surface it —
+/// present only for a bounded window ([`crate::landing::LANDING_OVERSHOOT_NOTICE_SECS`]) after THIS
+/// daemon observed a recently-parked (`reason=session`) account climb to the SLO ceiling within the
+/// landing window ([`crate::landing::LANDING_WINDOW`]). It is the RUNTIME mirror of the offline #595
+/// landing SLI's `P100 < 99` breach: the swap redirects only NEW requests, so the parked account's
+/// in-flight committed tail keeps billing and can land it over the SLO after an on-target swap —
+/// invisible to SLI 1 (the swap-DECISION reading) and, until this, visible only in a later offline
+/// `sessiometer reliability` run. Carried on the wire so `status` renders the local breach the same
+/// way the durable landing SLI would (each medium in its own idiom, R-2 STATE-parity, as
+/// `canonical_scrub` / `recent_blind_preempt_swap` do). Best-available, still per-machine: a
+/// co-consuming second machine's tail is invisible to it (the single-machine-sync boundary — see
+/// [`crate::landing`]). The surface only REFLECTS this daemon-pushed state; it never self-acts (the
+/// #169 UI-never-acts invariant). Non-secret — one operator handle and two small percents, never a
+/// token or email (issue #15).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct LandingOvershoot {
+    /// The operator handle (label) of the parked account that overshot — the one the daemon swapped
+    /// AWAY FROM and then observed climb past the ceiling. Never the email (issue #15).
+    pub(crate) from_label: String,
+    /// The session percent (`0..=100`) the swap FIRED on — the swap-DECISION reading (`session_pct=`
+    /// on the `event=swap … reason=session` line). Below the SLO ceiling for a true post-swap tail;
+    /// paired with `landing_pct` it shows the tail's size (fired at X, landed at Y).
+    pub(crate) decision_pct: u8,
+    /// The session percent (`0..=100`) the parked account actually LANDED at — the live peak this
+    /// machine observed within the landing window, at/over the [`crate::landing::LANDING_SLO_CEILING_PCT`]
+    /// SLO ceiling (that crossing is what fired this notice).
+    pub(crate) landing_pct: u8,
 }
 
 /// The daemon-level CANONICAL-SCRUB rollup (issue #516, umbrella #463) — present only while the
@@ -277,8 +311,15 @@ pub(crate) struct SchemaVersion {
 /// `skip_serializing_if`) omitted entirely except in the bounded window after such a swap, so a
 /// no-recent-preempt-swap frame's bytes are unchanged. Takes `blind_active`'s / `canonical_scrub`'s
 /// omit-when-absent pattern; a pre-#479 client ignores the unknown key (the minor-bump
-/// tolerate-by-ignoring convention).
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 7 };
+/// tolerate-by-ignoring convention). `1.8` ADDED the daemon-level
+/// [`StatusResponse::recent_landing_overshoot`] runtime landing-overshoot notice ([`LandingOvershoot`],
+/// issue #613): a just-observed LOCAL landing overshoot (a recently-parked `reason=session` account
+/// climbing to the SLO ceiling within the landing window — the post-swap committed tail caught LIVE,
+/// not only in a later offline `reliability` run), so `status` can surface the breach in the moment —
+/// likewise optional and (via `skip_serializing_if`) omitted entirely except in the bounded window
+/// after such an overshoot, so an unaffected frame's bytes are unchanged. Takes
+/// `recent_blind_preempt_swap`'s omit-when-absent pattern; a pre-#613 client ignores the unknown key.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 8 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -354,6 +395,21 @@ pub(crate) struct StatusResponse {
     /// two handles and a `u8`, never a token or email (issue #15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recent_blind_preempt_swap: Option<BlindPreemptSwap>,
+    /// The daemon-level RUNTIME landing-overshoot notice (issue #613): `Some` for a bounded window
+    /// after THIS machine observed a recently-parked (`reason=session`) account climb to the SLO
+    /// ceiling within the landing window — the post-swap committed tail (#595) the swap-DECISION
+    /// reading is blind to, caught LIVE instead of only in a later offline `reliability` run. Carries
+    /// the parked account's handle + the decision % it swapped out at + the % it actually LANDED at,
+    /// so `sessiometer status` can surface the local breach (like the `systemic_refresh_failure`
+    /// banner). Absent when no overshoot is recent. `Option` + `#[serde(default, skip_serializing_if
+    /// = "Option::is_none")]` per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump
+    /// 1.7 → 1.8, mirroring `recent_blind_preempt_swap`): a pre-#613 daemon omits the field → `None`,
+    /// AND a no-overshoot snapshot omits it entirely, so an unaffected frame's bytes are byte-for-byte
+    /// unchanged (a pre-#613 client ignores the unknown key). Best-available, still per-machine — a
+    /// co-consuming second machine's tail is invisible to it. Non-secret — one handle and two `u8`s,
+    /// never a token or email (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_landing_overshoot: Option<LandingOvershoot>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -636,6 +692,10 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // in `Daemon::snapshot` (windowed + target-still-active): `Some` for a bounded window after a
         // #452 blind-preempt swap, `None` otherwise (and then omitted via `skip_serializing_if`).
         recent_blind_preempt_swap: snapshot.recent_blind_preempt_swap.clone(),
+        // The daemon-level runtime landing-overshoot notice (issue #613), already resolved daemon-side
+        // in `Daemon::snapshot` (windowed): `Some` for a bounded window after a local landing overshoot,
+        // `None` otherwise (and then omitted via `skip_serializing_if`).
+        recent_landing_overshoot: snapshot.recent_landing_overshoot.clone(),
     }
 }
 
