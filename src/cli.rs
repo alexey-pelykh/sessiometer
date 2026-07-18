@@ -1157,7 +1157,12 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // The systemic refresh-failure threshold (#378): after this many consecutive sweeps fail with
     // error across every eligible account, the daemon surfaces a mechanism-down signal (event +
     // `status` indicator), distinct from per-account at-risk. Config-backed (ADR-0005 hand-emit).
-    .with_systemic_failure_n(config.refresh.systemic_failure_n);
+    .with_systemic_failure_n(config.refresh.systemic_failure_n)
+    // Arm the per-daemon target-selection seed (#612): a once-drawn process-entropy value enables
+    // the velocity-aware + per-daemon-jittered selection so independent daemons over the same roster
+    // disperse instead of co-selecting (and hammering) one target. Drawn from the same coarse
+    // process entropy as the per-cycle jitter RNG; no new dependency, so `cargo deny` stays green.
+    .with_tiebreak_seed(crate::timing::SplitMix64::from_entropy().next_u64());
     let mut shutdown = RealShutdown::new()?;
 
     // Name the followable stop first (issue #397): a DETACHED `run` has no controlling terminal
