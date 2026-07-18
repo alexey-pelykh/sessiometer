@@ -26,6 +26,18 @@ one-predicate / two-estimators **decision** ADR-0022 made is **preserved** (its
 strict-early-fire invariant is an explicit #597 acceptance criterion); what this ADR
 supersedes is ADR-0022's *record of the meaning*, not its decision.
 
+**Amended 2026-07-18 (#609) — see [ADR-0024](0024-reactive-lookahead-gap-percentile-max-window-coverage.md).**
+Two follow-ups this ADR deferred are now **shipped**, amending — not superseding — the ceiling
+decision: (a) § Alternatives 6's gap-percentile `poll_gap` is **implemented** — the reactive arm
+now looks ahead over the measured **p90 313 s** re-observation gap (`swap::REACTIVE_REOBSERVATION_GAP_SECS`)
+instead of the theoretical `2 × near_limit_poll_secs` (~120 s), so the ceiling *can* return to the
+SLO line (the default stays 95 as the operator lever); and (b) the *strict-early-fire* invariant
+below is **reframed to max-window coverage** — the reactive arm is decoupled from the horizon `H`, so
+the composed swap fires at `effective_ceiling − velocity × max(poll_gap, H)`, covering the larger
+unseen window. The **ceiling-semantics decision** (settled ceiling, one predicate on two estimators,
+tail margin, reserve) is **unchanged**; only *how the reactive arm derives its fire point* changed.
+ADR-0024 also lands the downward-only ceiling jitter this ADR's § Decision left symmetric.
+
 ## Context
 
 **The SLO ADR-0022's tail makes unreachable.** The swap-out overshoot SLO is
