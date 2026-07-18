@@ -3,7 +3,8 @@ type: architecture-decision-record
 number: 22
 title: "session_trigger is one predicate on two estimators of the same quantity, not two knobs"
 date: 2026-07-17
-status: accepted
+status: superseded
+superseded_by: 23
 decision_makers: [Oleksii PELYKH (maintainer)]
 ---
 
@@ -11,7 +12,16 @@ decision_makers: [Oleksii PELYKH (maintainer)]
 
 ## Status
 
-**Accepted** — 2026-07-17. Records the **#598** decision that `session_trigger`
+**Superseded by [ADR-0023](0023-session-trigger-ceiling-semantics.md)** —
+2026-07-17, when the #597 ceiling redesign landed and reframed `session_trigger`
+from a fire-at trigger into a settled **ceiling** both arms derive their fire point
+backward from. The one-predicate / two-estimators **decision** this ADR records is
+**preserved** by that redesign (the strict-early-fire invariant is an explicit #597
+acceptance criterion); what changed is the *derivation*, so the "reach-the-trigger"
+doc-comment this ADR corrected is now itself superseded. Original status **Accepted**
+— 2026-07-17.
+
+Records the **#598** decision that `session_trigger`
 is a single swap-away predicate evaluated by **two estimators of the same
 quantity** — reactive `observed >= session_trigger` and the #539 projection
 `observed + velocity × H >= session_trigger` — that share one trigger by
@@ -31,17 +41,16 @@ reactive decision, not a differently-calibrated one" — and it *cross-reference
 `target_max_session_usage <= session_trigger` reserve invariant binds the single
 value and so is corroborating evidence that there is one trigger, not two.
 
-**This ADR will be superseded if the ceiling redesign (#597) lands.** #597
-reframes `session_trigger` from "swap when usage *reaches* this" into a settled
-**ceiling** both arms derive their fire point *backward* from
-(`ceiling − tail_margin − velocity × gap`). That reframe changes what the value
-*means*, so the doc-comment this ADR corrects is a **point-in-time** truth of the
-current "reach-the-trigger" semantics — recorded here as such so the record and
-the eventual reframe stay coherent. #597 preserves the one-predicate invariant
-(its own acceptance criterion requires the projection never fire later than
-reactive); it changes
-the derivation, not the "one predicate" decision. When #597 lands it must mark
-this ADR `Superseded by ADR-NNNN` and link both ways.
+**This ADR is superseded by [ADR-0023](0023-session-trigger-ceiling-semantics.md)
+(#597 landed).** #597 reframed `session_trigger` from "swap when usage *reaches*
+this" into a settled **ceiling** both arms derive their fire point *backward* from
+(`ceiling − tail_margin − velocity × gap`). That reframe changed what the value
+*means*, so the doc-comment this ADR corrected is a **point-in-time** truth of the
+now-superseded "reach-the-trigger" semantics — recorded here as such so the record
+and the reframe stay coherent. #597 **preserved** the one-predicate invariant (its
+own acceptance criterion requires the projection never fire later than reactive); it
+changed the *derivation*, not the "one predicate" **decision** — which is why this
+ADR is superseded (its *record of the meaning*), not reversed (its *decision*).
 
 ## Context
 
@@ -215,8 +224,8 @@ already correct, and corrects a doc-comment that under-described it.
   (the landing-point SLI that measures the post-swap tail — mean +1.08 pp, max
   +5 pp; merged, the empirical basis for fact 1). **#596** (the spike whose **GO**
   verdict confirmed the tail is real in-flight drain, not a stale `/oauth/usage`
-  cache artifact). **#597** (the ceiling redesign that will **supersede** this ADR if
-  it lands — reframes `session_trigger` as a settled ceiling both arms derive
+  cache artifact). **#597** (the ceiling redesign that **supersedes** this ADR —
+  ADR-0023; reframes `session_trigger` as a settled ceiling both arms derive
   backward from, preserving the one-predicate invariant). **#587** (the phantom
   `active_backoff_cap_secs` doc bug — the same class of doc/reality drift the coupling
   omission is). **#41** (`weekly_trigger` — the *genuinely* separate second knob,
@@ -244,4 +253,8 @@ already correct, and corrects a doc-comment that under-described it.
   the coupling leaves headroom for).
   [ADR-0005](0005-config-parsed-by-crate-emitted-by-hand.md) (config hand-emit — the
   emitted-`config.toml` `session_trigger` comment this item corrects follows it).
-  **None superseded** (this ADR is itself the candidate for supersession by #597).
+  [ADR-0023](0023-session-trigger-ceiling-semantics.md) (the #597 ceiling redesign —
+  **supersedes this ADR**: reframes `session_trigger` from a fire-at trigger into a
+  settled ceiling both arms derive backward from, preserving the one-predicate /
+  two-estimators decision recorded here). **This ADR supersedes none** — it is itself
+  superseded by ADR-0023.
