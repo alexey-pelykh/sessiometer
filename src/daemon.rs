@@ -3952,16 +3952,44 @@ where
         // (jittered) cooldown has elapsed since the last swap. This PACES swaps; it
         // cannot by itself stop a ping-pong with a persistent cause — the always-on
         // session gate in `pick_target` is what prevents two session-saturated accounts
-        // from oscillating (it excludes each as a target of the other).
+        // from oscillating (it excludes each as a target of the other). Drawn
+        // UNCONDITIONALLY — even when the #611 bypass below skips the wait — so the
+        // per-cycle RNG draw order is identical whether or not the spike bypass fires.
         let cooldown = Duration::from_secs_f64(self.cooldown_strategy.draw(
             &mut self.rng,
             COOLDOWN_SECS_LO,
             COOLDOWN_SECS_HI,
         ));
-        if let Some(last) = &self.state.last_swap {
-            if at.saturating_duration_since(last.at) < cooldown {
-                return TickAction::SkippedCooldown;
-            }
+        // Emergency-tier reactive bypass (issue #611): a LIVE (non-quarantined) active whose OBSERVED
+        // session reading has ALREADY reached the RAW ceiling (`session_trigger` — the not-cross line
+        // itself, NOT the `effective_ceiling` / `session_threshold` the normal reactive fire point is
+        // derived BACKWARD from) is past the ceiling NOW. With cross-machine coordination out of scope,
+        // a shared account can be burned from a second machine BETWEEN our observations, so this is the
+        // co-consumption spike that velocity-spike detection is the designated mitigation for — and
+        // honoring the cooldown here would suppress the reactive arm THROUGH the breach, up to the 1 h
+        // cooldown max, against #597's own asymmetry (overshoot is the expensive error). So bypass the
+        // WAIT and swap, mirroring the dead-active `emergency_swap` cooldown bypass (until now the ONLY
+        // one). STRICTLY above the normal fire point — `session_threshold ≤ effective_ceiling =
+        // session_trigger − TAIL_MARGIN < session_trigger` (TAIL_MARGIN > 0) — so an ordinary reactive
+        // swap fired BELOW the raw ceiling still defers within cooldown: the bypass never defeats
+        // cooldown's rate-limiting purpose, nor the #272 sub-floor-jitter guard, for ordinary swaps.
+        // Only the WAIT is bypassed — target selection below still HONORS the reserve + session gate
+        // (this is a live account with somewhere viable to land, NOT the dead-active
+        // liveness-beats-all path), so a spike with no viable target still holds (`NoViableTarget`),
+        // never thrashes onto a saturated peer. Interaction (issue #64 manual-hold): a manual `use`
+        // that armed the cooldown on an active ALREADY at/over the raw ceiling is likewise reverted —
+        // protection at the not-cross line overrides the hold, exactly as it already does for a
+        // manually-held DEAD active.
+        let within_cooldown = self
+            .state
+            .last_swap
+            .as_ref()
+            .is_some_and(|last| at.saturating_duration_since(last.at) < cooldown);
+        // `>=` (not `>`) so a reading landing EXACTLY on the raw ceiling still bypasses — the ceiling
+        // is the not-cross line, so being AT it already warrants escape.
+        let at_raw_ceiling = active_usage.session >= session_trigger;
+        if within_cooldown && !at_raw_ceiling {
+            return TickAction::SkippedCooldown;
         }
         // Pick the viable target whose weekly quota resets soonest (issue #37). A
         // disabled (parked) account is not viable (issue #36), and a weekly-exhausted
@@ -13468,7 +13496,11 @@ mod tests {
         .await;
         let (_dir, json) = claude_json("u-A");
         let poller = FakeRosterPoller::new()
-            .ok("u-A", 0.97, 0.40)
+            // Over the reactive fire point but BELOW the raw ceiling (0.95): an ORDINARY
+            // swap, so the cooldown is honored — the #611 spike bypass fires only AT/above the
+            // raw ceiling (test
+            // `reactive_spike_at_raw_ceiling_bypasses_cooldown_but_a_normal_swap_still_honors_it`).
+            .ok("u-A", 0.92, 0.40)
             .ok("u-B", 0.05, 0.05);
         let tun = tunables(95, 80, 100); // cooldown 100s
 
@@ -13512,8 +13544,10 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
+        // Same below-raw-ceiling reading (0.92) as the within-cooldown sibling above, so the pair
+        // differs ONLY in elapsed time: here the cooldown has passed, so the ordinary swap fires.
         let poller = FakeRosterPoller::new()
-            .ok("u-A", 0.97, 0.40)
+            .ok("u-A", 0.92, 0.40)
             .ok("u-B", 0.05, 0.05);
         let tun = tunables(95, 80, 100);
 
@@ -13538,6 +13572,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reactive_spike_at_raw_ceiling_bypasses_cooldown_but_a_normal_swap_still_honors_it() {
+        // Issue #611: the emergency-tier reactive bypass. A LIVE (non-quarantined) active whose
+        // OBSERVED session reading has reached the RAW ceiling (the not-cross line — `session_trigger`
+        // = 0.95 here, NOT the lower `effective_ceiling` / `session_threshold` the normal fire point
+        // is derived backward from) is the co-consumption spike velocity-detection is meant to catch,
+        // and it MUST escape even inside the swap cooldown. Before the fix the SAME setup returned
+        // `SkippedCooldown` and burned on THROUGH the breach for up to the 1 h cooldown max — the gap
+        // this closes. The bypass is STRICTLY above the normal fire point, so an ORDINARY
+        // over-fire-point swap BELOW the raw ceiling still defers within the cooldown: cooldown's
+        // rate-limiting purpose is untouched for ordinary swaps.
+        //
+        // ONE fixture, two readings inside the SAME freshly-armed 100 s cooldown (a swap 10 s ago),
+        // so the ONLY difference is whether the reading crosses the raw ceiling: 0.97 (≥ ceiling →
+        // bypass → swap) vs 0.92 (over the 0.89 fire point but below the ceiling → cooldown honored).
+        async fn action_for(active_session: f64) -> (TickAction, bool) {
+            let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[
+                ("Sessiometer/u-A", b"A-token", "u-A"),
+                ("Sessiometer/u-B", b"B-token", "u-B"),
+            ])
+            .await;
+            let (_dir, json) = claude_json("u-A");
+            // B is wide open — a genuinely viable target, so the ONLY thing that can hold the swap
+            // is the cooldown (which the bypass must defeat at the raw ceiling).
+            let poller = FakeRosterPoller::new()
+                .ok("u-A", active_session, 0.40)
+                .ok("u-B", 0.05, 0.05);
+            let tun = tunables(95, 80, 100); // raw ceiling 0.95, cooldown 100 s
+            let mut daemon: FakeDaemon = Daemon::new(
+                roster,
+                poller,
+                store,
+                stash,
+                FakeClock::new(Duration::ZERO),
+                json,
+                &tun,
+            );
+            daemon.state.active = Some(0);
+            // A swap 10 s ago: the 100 s cooldown is firmly armed and un-elapsed.
+            daemon.state.last_swap = Some(LastSwap {
+                at: daemon.clock.now(),
+            });
+            daemon.clock.advance(Duration::from_secs(10));
+            let action = warmed_tick(&mut daemon).await.action;
+            let canonical_a = daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token"));
+            (action, canonical_a)
+        }
+
+        // At the raw ceiling: the bypass fires — a swap despite the un-elapsed cooldown, and the
+        // canonical is rerouted off A onto the wide-open B.
+        let (spike_action, spike_canonical_a) = action_for(0.97).await;
+        assert_eq!(
+            spike_action,
+            TickAction::Swapped { from: 0, to: 1 },
+            "a live active at the raw ceiling must swap despite the active cooldown (#611 bypass)",
+        );
+        assert!(
+            !spike_canonical_a,
+            "the bypass swap rerouted the canonical off A"
+        );
+
+        // The exact-equality boundary: AC1 is "observed ≥ raw ceiling", so a reading landing EXACTLY
+        // on the raw ceiling (0.95) must also bypass — pinning the `≥` (not `>`) semantics of the
+        // strict-`<` guard.
+        let (boundary_action, boundary_canonical_a) = action_for(0.95).await;
+        assert_eq!(
+            boundary_action,
+            TickAction::Swapped { from: 0, to: 1 },
+            "a reading exactly AT the raw ceiling must also bypass the cooldown (AC1 is ≥, not >)",
+        );
+        assert!(
+            !boundary_canonical_a,
+            "the boundary bypass swap rerouted the canonical off A"
+        );
+
+        // Below the raw ceiling: an ordinary over-fire-point swap still honors the cooldown, leaving
+        // the canonical on A.
+        let (normal_action, normal_canonical_a) = action_for(0.92).await;
+        assert_eq!(
+            normal_action,
+            TickAction::SkippedCooldown,
+            "a normal (below-raw-ceiling) swap must still defer within the cooldown",
+        );
+        assert!(
+            normal_canonical_a,
+            "the honored cooldown left the canonical on A"
+        );
+    }
+
+    #[tokio::test]
+    async fn reactive_spike_bypass_still_honors_the_session_gate_so_it_holds_without_a_target() {
+        // Issue #611: the bypass skips only the cooldown WAIT — NOT the reserve or the always-on
+        // session gate (unlike the dead-active `emergency_swap`, which bypasses everything because
+        // liveness beats headroom). So a raw-ceiling spike with NO viable target still HOLDS
+        // (`NoViableTarget`); it never thrashes onto a session-saturated peer. This is what keeps the
+        // bypass "strictly above the normal fire point" from becoming a liveness-beats-all escape.
+        //
+        // The discriminator vs. the pre-fix behavior: within the cooldown the OLD code returned
+        // `SkippedCooldown` (never reaching `pick_target`); the bypass now reaches `pick_target`,
+        // where the always-on session gate excludes the saturated peer → `NoViableTarget`. Asserting
+        // `NoViableTarget` (not `SkippedCooldown`) proves BOTH that the bypass engaged AND that the
+        // gate still held.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        // A spikes to the raw ceiling; B is ALSO session-saturated (over the 95 trigger), so the
+        // always-on session gate in `pick_target` excludes it — there is nowhere viable to land.
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.20)
+            .ok("u-B", 0.96, 0.20);
+        // Floor OFF so the ONLY exclusion is the always-on session gate (not the reserve).
+        let tun = tunables_floor_off(95, 100); // cooldown 100 s
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::ZERO),
+            json,
+            &tun,
+        );
+        daemon.state.active = Some(0);
+        // A swap 10 s ago: firmly within the 100 s cooldown, so the OLD path would have skipped here.
+        daemon.state.last_swap = Some(LastSwap {
+            at: daemon.clock.now(),
+        });
+        daemon.clock.advance(Duration::from_secs(10));
+
+        let outcome = warmed_tick(&mut daemon).await;
+
+        assert_eq!(
+            outcome.action,
+            TickAction::NoViableTarget,
+            "a raw-ceiling spike bypasses the cooldown but still HOLDS on a saturated peer: {:?}",
+            outcome.action,
+        );
+        // The canonical is untouched — no thrash onto the saturated B.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
     async fn a_re_swap_within_the_floor_is_refused_even_with_wide_cooldown_jitter() {
         // Issue #272 (AC #1 + #3): the cooldown floor is NON-BYPASSABLE by jitter. With
         // the cooldown base pinned AT the floor and a spread an order of magnitude
@@ -13554,7 +13745,9 @@ mod tests {
         .await;
         let (_dir, json) = claude_json("u-A");
         let poller = FakeRosterPoller::new()
-            .ok("u-A", 0.97, 0.40)
+            // Below the raw ceiling (0.95): an ORDINARY over-fire-point swap, so the floor
+            // still binds it (the #611 spike bypass fires only AT/above the raw ceiling).
+            .ok("u-A", 0.92, 0.40)
             .ok("u-B", 0.05, 0.05);
         // Cooldown pinned at the floor, jitter spread 20x wider than it.
         let mut tun = tunables(95, 80, crate::config::COOLDOWN_SECS_FLOOR);
@@ -13675,7 +13868,12 @@ mod tests {
         // daemon would swap straight back to the wide-open A.
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.05, 0.05)
-            .ok("u-B", 0.97, 0.40);
+            // B over its fire point but BELOW the raw ceiling (0.95): the manual hold is
+            // honored. (A manual `use` onto an active AT/over the raw ceiling is instead
+            // reverted by the #611 emergency bypass — protection at the not-cross line overrides
+            // the hold; covered by
+            // `reactive_spike_at_raw_ceiling_bypasses_cooldown_but_a_normal_swap_still_honors_it`.)
+            .ok("u-B", 0.92, 0.40);
         let tun = tunables(95, 80, 100); // cooldown 100s
 
         let mut daemon: FakeDaemon = Daemon::new(
@@ -13727,7 +13925,9 @@ mod tests {
         let (_dir, json) = claude_json("u-B");
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.05, 0.05)
-            .ok("u-B", 0.97, 0.40);
+            // The SAME below-raw-ceiling reading as the manual-hold test above, so the two
+            // stay one fixture: here the difference is purely the missing adopt (no cooldown).
+            .ok("u-B", 0.92, 0.40);
         let tun = tunables(95, 80, 100);
 
         let mut daemon: FakeDaemon = Daemon::new(
@@ -14009,7 +14209,11 @@ mod tests {
             .await;
             let (_dir, json) = claude_json("u-A");
             let poller = FakeRosterPoller::new()
-                .ok("u-A", 0.97, 0.40)
+                // Below the raw ceiling (0.95): an ORDINARY over-fire-point swap, so whether it
+                // skips depends purely on the jittered cooldown draw — the property under test.
+                // (At/above the raw ceiling the #611 bypass would swap every seed, so `skipped`
+                // would be 0 and the "produces both" assertion could never hold.)
+                .ok("u-A", 0.92, 0.40)
                 .ok("u-B", 0.05, 0.05);
             let mut tun = tunables(95, 80, 100);
             tun.cooldown_strategy = Strategy {
