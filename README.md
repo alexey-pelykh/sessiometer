@@ -738,6 +738,16 @@ daemon applies at load. It reports the documented error classes and exits non-ze
 of them, so it drops into a pre-flight check: a typo'd/unknown key (e.g. `poll_secss`), an
 out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_session_usage > session_trigger`.
 
+A **valid** file may still print a non-fatal **advisory** (it does not change the exit code):
+if `target_max_session_usage` sits above the *peak-velocity runway bound* — the highest reserve
+that still leaves a swapped-to account runway when it is climbing at the assumed peak session
+velocity over the swap lookahead (`near_limit_poll_secs` / `session_velocity_horizon_secs`
+together) — `config validate` names the bound and suggests lowering the reserve or narrowing the
+lookahead. The shipped defaults sit in this band deliberately (the tail margin and the sub-SLO
+default ceiling are the guard), so it is a tuning note, not an error. Only the *unsatisfiable*
+extreme — a lookahead so wide that **no** reserve keeps runway at peak velocity — is a hard load
+error.
+
 ```console
 $ sessiometer config show --origin
 # effective configuration

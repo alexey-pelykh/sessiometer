@@ -758,6 +758,22 @@ impl MigrationConfig {
     }
 }
 
+/// The non-fatal peak-velocity runway finding (issue #608): the configured swap-target reserve
+/// admits accounts with no runway at the assumed peak velocity, though a lower reserve would keep
+/// some. Produced by [`Config::peak_runway_advisory`] and rendered by `sessiometer config validate`;
+/// see that method for why this is an advisory rather than a load error. All three fields are bare
+/// tunable values — never secrets (issue #15).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PeakRunwayAdvisory {
+    /// The configured reserve, as a whole percent.
+    pub(crate) target_max_session_usage: u8,
+    /// The highest reserve that keeps peak-velocity runway, as a whole percent (floored).
+    pub(crate) bound_pct: u8,
+    /// The composed swap lookahead the bound was derived over — `max(reactive poll gap, velocity
+    /// horizon)` in seconds — so the operator can see WHICH tunable to lower.
+    pub(crate) window_secs: u64,
+}
+
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
@@ -1298,6 +1314,50 @@ impl Config {
         }
     }
 
+    /// The non-fatal half of the issue #608 peak-velocity runway coupling: `Some` when the
+    /// configured `target_max_session_usage` sits ABOVE the bound
+    /// ([`crate::swap::peak_runway_reserve_bound`]) yet the bound is still SATISFIABLE — i.e. a
+    /// swapped-to target admitted by this reserve has no runway at the assumed peak velocity, but
+    /// some LOWER reserve would. `None` when the reserve already honors the bound.
+    ///
+    /// Deliberately an accessor, not a parse-time error. `Config::validate` rejects only the
+    /// UNSATISFIABLE stack ([`Error::ConfigPeakRunwayUnsatisfiable`]); this case is the one the
+    /// SHIPPED DEFAULT is in by design — `target_max_session_usage` 80 against a ~52 bound at the
+    /// default ceiling — because ADR-0023 recorded that looseness as accepted (the reserve is
+    /// bounded by the ceiling, and the #595 landing SLI plus `TAIL_MARGIN` are the interim guard).
+    /// Erroring would brick every stock install; warning on every *load* would fire on every stock
+    /// install and so be trained away. It is surfaced instead where an operator goes to ask exactly
+    /// this question — `sessiometer config validate` — and nowhere else.
+    ///
+    /// Returns the bound as a whole PERCENT, floored, so it reads in the same unit as the
+    /// `target_max_session_usage` it is compared against (flooring keeps the advisory's suggested
+    /// value strictly inside the bound rather than one rounding step past it).
+    pub(crate) fn peak_runway_advisory(&self) -> Option<PeakRunwayAdvisory> {
+        let t = &self.tunables;
+        let bound = crate::swap::peak_runway_reserve_bound(
+            f64::from(t.session_trigger) / 100.0,
+            t.near_limit_poll_secs,
+            t.session_velocity_horizon_secs,
+        );
+        // A non-positive bound is the parse-time error's business, not this advisory's — it cannot
+        // reach a loaded `Config`. Guarding anyway keeps the accessor total if it is ever called on
+        // a hand-built value (the tests do), and keeps the `as u8` floor below non-negative.
+        if bound <= 0.0 {
+            return None;
+        }
+        let bound_pct = (bound * 100.0).floor() as u8;
+        (t.target_max_session_usage > bound_pct).then_some(PeakRunwayAdvisory {
+            target_max_session_usage: t.target_max_session_usage,
+            bound_pct,
+            // The SAME lookahead the bound above was derived over — one source of truth, so the
+            // reported window and the bound can never describe different composed lookaheads.
+            window_secs: crate::swap::composed_swap_lookahead_secs(
+                t.near_limit_poll_secs,
+                t.session_velocity_horizon_secs,
+            ) as u64,
+        })
+    }
+
     /// Stage one: deserialize TOML into the permissive raw form, then validate.
     /// Pure (no filesystem) so the whole parse-and-validate policy is testable
     /// without touching real paths.
@@ -1434,6 +1494,43 @@ impl Config {
                 "near_limit_poll_secs must be 0 (disabled) or in 5..=3600, got {}",
                 t.near_limit_poll_secs
             )));
+        }
+        // The peak-velocity runway coupling (issue #608, discharging ADR-0023 § Alternatives 3).
+        // Checked HERE — after `session_trigger`, `session_velocity_horizon_secs` and
+        // `near_limit_poll_secs` are each range-validated above — so the bound is computed from
+        // validated values, the same "cross-field rule after its own fields" placement as
+        // `exhausted_poll_secs`.
+        //
+        // ONLY the UNSATISFIABLE stack is rejected: a bound at/below 0 means no
+        // `target_max_session_usage` in its legal `1..=session_trigger` range keeps a swapped-to
+        // account runway at peak velocity — the composed fire point has collapsed to 0, so every
+        // account would swap at any usage (ADR-0023 § Consequences' absurd-config corner). A merely
+        // EXCEEDED bound (positive, but under the configured reserve) is deliberately NOT an error:
+        // the shipped default sits there by design (target_max 80 vs a ~52 bound at the default
+        // ceiling), so rejecting it would brick every stock install — the #417 bricking failure mode.
+        // That case surfaces as the non-fatal `config validate` advisory instead.
+        let peak_runway_bound = crate::swap::peak_runway_reserve_bound(
+            f64::from(t.session_trigger as u8) / 100.0,
+            t.near_limit_poll_secs as u64,
+            t.session_velocity_horizon_secs as u64,
+        );
+        if peak_runway_bound <= 0.0 {
+            // The SAME lookahead `peak_runway_reserve_bound` computed the bound over, so the error's
+            // reported window matches the value that made it unsatisfiable (one source of truth).
+            let window_secs = crate::swap::composed_swap_lookahead_secs(
+                t.near_limit_poll_secs as u64,
+                t.session_velocity_horizon_secs as u64,
+            );
+            return Err(Error::ConfigPeakRunwayUnsatisfiable {
+                trigger: t.session_trigger,
+                near_limit_poll_secs: t.near_limit_poll_secs as u64,
+                horizon_secs: t.session_velocity_horizon_secs as u64,
+                // Both are bounded well inside i64/u64 by the range checks above; the renders are
+                // for the operator message only, never fed back into the math.
+                window_secs: window_secs as u64,
+                bound_pct: (peak_runway_bound * 100.0).floor() as i64,
+                v_peak_pct_per_min: crate::swap::V_PEAK_SESSION_PCT_PER_MIN,
+            });
         }
         // cooldown_secs has a NON-ZERO floor (issue #272): it is configurable ABOVE
         // COOLDOWN_SECS_FLOOR but not below it, so swap pacing can never be tuned down
@@ -3339,18 +3436,172 @@ label = "personal"
             .expect("0 is the valid disabled kill-switch, not a sub-floor rejection");
         assert_eq!(disabled.tunables.near_limit_poll_secs, 0);
 
-        // Both band edges load and thread through verbatim.
-        for edge in [5u64, 3600] {
+        // The lower band edge, and the largest value that keeps the reactive poll gap at its 313 s
+        // floor (`2 × 156 = 312 <= 313`), both load and thread through verbatim. Above ~156 the
+        // `2 × near_limit_poll_secs` term overtakes the floor and starts widening the reactive
+        // lookahead — see the peak-runway interaction below.
+        for edge in [5u64, 156] {
             let cfg = Config::parse(&with_tunables(&format!("near_limit_poll_secs = {edge}")))
                 .unwrap_or_else(|e| panic!("near_limit_poll_secs = {edge} is a valid edge: {e:?}"));
             assert_eq!(cfg.tunables.near_limit_poll_secs, edge);
         }
 
-        // An above-base cap LOADS (no cross-field bound): with poll_secs = 30 the base sub-interval
-        // is already < 60, so a 60 s cap can never bind — but it is inert, not a rejection.
+        // The UPPER band edge (3600) passes THIS field's own range check but now trips the issue
+        // #608 cross-field peak-runway rule: a 3600 s near-limit poll widens the reactive
+        // re-observation-gap lookahead (`2 × 3600 = 7200 s`, the raw value the daemon's fire path
+        // feeds `swap::reactive_poll_gap_secs`, daemon.rs) so far that at peak velocity NO reserve
+        // keeps runway — ADR-0023 § Consequences' absurd corner. That it surfaces as
+        // `ConfigPeakRunwayUnsatisfiable`, NOT the field-range `ConfigInvalid`, is the proof 3600 is
+        // still WITHIN the 5..=3600 band (the field check passed; the later cross-field rule caught
+        // the combination). A value truly ABOVE the band (3601) still trips the field range first.
+        match Config::parse(&with_tunables("near_limit_poll_secs = 3600")) {
+            Err(Error::ConfigPeakRunwayUnsatisfiable {
+                near_limit_poll_secs,
+                ..
+            }) => assert_eq!(
+                near_limit_poll_secs, 3600,
+                "the field value threaded into the bound"
+            ),
+            other => {
+                panic!("3600 must pass field-range and trip the peak-runway rule, got: {other:?}")
+            }
+        }
+        match Config::parse(&with_tunables("near_limit_poll_secs = 3601")) {
+            Err(Error::ConfigInvalid(msg)) => assert!(
+                msg.contains("near_limit_poll_secs") && msg.contains("5..=3600"),
+                "above-band must trip the field range first, got: {msg}"
+            ),
+            other => {
+                panic!("3601 is above the field band — expected ConfigInvalid, got: {other:?}")
+            }
+        }
+
+        // An above-base cap LOADS (no cadence cross-field bound, and satisfiable for peak-runway):
+        // with poll_secs = 30 the base sub-interval is already < 60, so a 60 s cap can never bind —
+        // but it is inert, not a rejection. 60 keeps the reactive gap at the 313 s floor, so the
+        // peak-runway bound stays satisfiable too.
         let inert = Config::parse(&with_tunables("poll_secs = 30\nnear_limit_poll_secs = 60"))
             .expect("an above-base cap is inert, not an error (no cross-field bound)");
         assert_eq!(inert.tunables.near_limit_poll_secs, 60);
+    }
+
+    // ── issue #608: the peak-velocity runway coupling (validator + advisory) ──
+
+    #[test]
+    fn the_shipped_defaults_load_despite_sitting_in_the_advisory_band() {
+        // The load-bearing severity-split fact: the shipped default (session_trigger 95, target_max
+        // 80, near_limit 60, horizon 120) is in the EXCEEDED-but-satisfiable state, so it MUST load —
+        // erroring here would brick every stock install (the #417 failure mode). But `config
+        // validate`'s advisory accessor DOES flag it, since 80 > the ~52 bound.
+        let cfg =
+            Config::parse(&with_tunables("session_trigger = 95")).expect("defaults must load");
+        let advisory = cfg
+            .peak_runway_advisory()
+            .expect("the default reserve 80 exceeds its ~52 peak-runway bound");
+        assert_eq!(advisory.target_max_session_usage, 80);
+        assert_eq!(advisory.bound_pct, 52);
+        assert_eq!(
+            advisory.window_secs, 313,
+            "default window is the 313 s p90 floor"
+        );
+    }
+
+    #[test]
+    fn rejects_the_unsatisfiable_peak_runway_stack_with_a_distinct_error() {
+        // near_limit 3600 → reactive poll_gap 7200 s; at peak velocity NO reserve in 1..=95 keeps
+        // runway, so the composed fire point has collapsed below 0. A DISTINCT variant from
+        // ConfigTargetMaxSessionAboveTrigger (the looser ceiling bound) and ConfigInvalid, carrying
+        // the offending tunables so the operator sees exactly what to lower.
+        let toml = with_tunables("near_limit_poll_secs = 3600");
+        match Config::parse(&toml) {
+            Err(Error::ConfigPeakRunwayUnsatisfiable {
+                trigger,
+                near_limit_poll_secs,
+                horizon_secs,
+                window_secs,
+                bound_pct,
+                v_peak_pct_per_min,
+            }) => {
+                assert_eq!(trigger, 95);
+                assert_eq!(near_limit_poll_secs, 3600);
+                assert_eq!(horizon_secs, 120);
+                assert_eq!(window_secs, 7200, "window = max(2×3600, 313, 120)");
+                assert!(bound_pct < 0, "the bound must be non-positive: {bound_pct}");
+                assert!((v_peak_pct_per_min - 6.95).abs() < 1e-9);
+            }
+            other => {
+                panic!("the absurd stack must be ConfigPeakRunwayUnsatisfiable, got: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn peak_runway_unsatisfiable_message_names_the_tunables_and_the_remedy() {
+        // The load error is operator-facing: it must name the three offending tunables and the
+        // remedy (lower a lookahead knob or raise the ceiling), and stay secret-free (bare numbers).
+        let err = Config::parse(&with_tunables("near_limit_poll_secs = 3600")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("near_limit_poll_secs"),
+            "names the knob: {msg}"
+        );
+        assert!(
+            msg.contains("session_velocity_horizon_secs"),
+            "names the knob: {msg}"
+        );
+        assert!(msg.contains("session_trigger"), "names the ceiling: {msg}");
+        assert!(msg.contains("peak"), "explains the mechanism: {msg}");
+        // No internal cross-references leak into the operator string (CLAUDE.md audience-fidelity).
+        assert!(
+            !msg.contains("ADR-"),
+            "no ADR pointer in a user string: {msg}"
+        );
+        assert!(
+            !msg.contains("#608"),
+            "no issue pointer in a user string: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_peak_runway_advisory_when_the_reserve_honors_the_bound() {
+        // A reserve AT or below the bound produces no advisory — the None arm. With near_limit 60
+        // (window 313, bound ~52) a target_max of 50 sits under the bound, so nothing to warn about.
+        let cfg = Config::parse(&with_tunables(
+            "session_trigger = 95\ntarget_max_session_usage = 50",
+        ))
+        .expect("a reserve under the bound loads");
+        assert_eq!(
+            cfg.peak_runway_advisory(),
+            None,
+            "a reserve honoring its bound must produce no advisory"
+        );
+    }
+
+    #[test]
+    fn peak_runway_advisory_tracks_a_narrowed_lookahead() {
+        // Lowering the lookahead RAISES the bound: with fast-poll disabled (near_limit 0) and a
+        // short horizon 30, the window is just 30 s, so the bound = 0.89 − 0.0011583×30 ≈ 0.855 → 85.
+        // A default reserve 80 then sits UNDER that higher bound — no advisory. This proves the
+        // advisory reflects the actual composed lookahead, not a fixed number.
+        let cfg = Config::parse(&with_tunables(
+            "session_trigger = 95\nnear_limit_poll_secs = 0\nsession_velocity_horizon_secs = 30",
+        ))
+        .expect("a tight-lookahead config loads");
+        assert_eq!(
+            cfg.peak_runway_advisory(),
+            None,
+            "an 80 reserve is safe once the lookahead is only 30 s (bound ~85)"
+        );
+        // But push the reserve above even that tight bound and the advisory returns, naming the 30 s window.
+        let cfg = Config::parse(&with_tunables(
+            "session_trigger = 95\nnear_limit_poll_secs = 0\nsession_velocity_horizon_secs = 30\ntarget_max_session_usage = 90",
+        ))
+        .expect("loads");
+        let advisory = cfg
+            .peak_runway_advisory()
+            .expect("90 exceeds the ~85 tight bound");
+        assert_eq!(advisory.bound_pct, 85);
+        assert_eq!(advisory.window_secs, 30);
     }
 
     #[test]

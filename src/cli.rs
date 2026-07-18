@@ -1810,13 +1810,53 @@ fn config_path() -> Result<()> {
 /// would fail on, and a clean file reports valid. Read-only: it loads and validates, nothing
 /// more. A validation failure propagates as the loader's error, so it exits non-zero (usable
 /// in a pre-flight check) — `main` prints it and maps the exit code.
+///
+/// A VALID file may still trail a non-fatal advisory (issue #608): this is the one surface that
+/// renders [`Config::peak_runway_advisory`], the swap-target reserve's peak-velocity runway
+/// coupling. It does not affect the exit code — the file IS valid — so the pre-flight use stays
+/// intact.
 fn config_validate() -> Result<()> {
     let path = paths::config_file()?;
     let config = Config::load_path(&path)?;
+    print!("{}", render_config_validate(&path, &config));
+    Ok(())
+}
+
+/// Render `config validate`'s output: the valid-file line, plus the non-fatal peak-velocity runway
+/// advisory when the reserve exceeds its bound (issue #608). Pure — no I/O — so the
+/// state→text mapping is unit-tested without touching a real config path, matching
+/// [`render_config_origin`].
+fn render_config_validate(path: &Path, config: &Config) -> String {
     let count = config.roster.len();
     let plural = if count == 1 { "" } else { "s" };
-    println!("{} is valid ({count} account{plural})", path.display());
-    Ok(())
+    let mut out = format!("{} is valid ({count} account{plural})\n", path.display());
+    if let Some(a) = config.peak_runway_advisory() {
+        out.push_str(&render_peak_runway_advisory(&a));
+    }
+    out
+}
+
+/// Render the non-fatal peak-velocity runway advisory line (issue #608). Pure — a function of the
+/// [`crate::config::PeakRunwayAdvisory`] alone — so its exact operator-facing text is unit-tested
+/// without a `Config`. Actionable-first (the remedy names the exact tunables and a concrete value); the
+/// mechanism follows so the number is not a bare oracle. No internal cross-references — an operator
+/// cannot resolve an issue or ADR number from a terminal (CLAUDE.md audience fidelity).
+fn render_peak_runway_advisory(a: &crate::config::PeakRunwayAdvisory) -> String {
+    // Locals + inline captures (this file's idiom — `{count}`, `{p50}`, `{edge}` …) so the two
+    // values each used twice (`reserve`, `bound`) read by name rather than by positional count.
+    let (reserve, bound, window) = (a.target_max_session_usage, a.bound_pct, a.window_secs);
+    let v_peak = crate::swap::V_PEAK_SESSION_PCT_PER_MIN;
+    format!(
+        "advisory: target_max_session_usage ({reserve}) exceeds the peak-velocity runway bound \
+         ({bound}).\n\
+         \x20 Lower it to {bound} or below, or narrow near_limit_poll_secs / \
+         session_velocity_horizon_secs\n\
+         \x20 (together they set the {window}s swap lookahead). At the assumed {v_peak} %/min peak, \
+         an account swapped\n\
+         \x20 to at {reserve}% is already past its own swap fire point over that lookahead, so it \
+         can swap\n\
+         \x20 straight back out. A tuning note, not an error — the shipped defaults sit here too.\n",
+    )
 }
 
 /// `config show [--origin]` (issue #401): print the effective config the daemon WOULD load
@@ -8249,6 +8289,50 @@ spare  22222222-2222\n\
         let out = render_config_origin(Path::new("/x/config.toml"), &report, true);
         assert!(out.contains("1 account,"), "singular roster: {out}");
         assert!(!out.contains("1 accounts"), "no plural for one: {out}");
+    }
+
+    #[test]
+    fn peak_runway_advisory_line_leads_with_the_remedy_and_leaks_no_internal_refs() {
+        // Issue #608: the `config validate` advisory line names the offending reserve, the bound,
+        // the concrete remedy value, the two lookahead knobs, and the assumed peak — actionable
+        // first. It must carry NO internal cross-reference an operator cannot resolve from a
+        // terminal (no ADR / issue number — CLAUDE.md audience fidelity), and stay a "tuning note".
+        let advisory = crate::config::PeakRunwayAdvisory {
+            target_max_session_usage: 80,
+            bound_pct: 52,
+            window_secs: 313,
+        };
+        let line = render_peak_runway_advisory(&advisory);
+        assert!(
+            line.starts_with("advisory: "),
+            "leads with the label: {line}"
+        );
+        assert!(line.contains("target_max_session_usage (80)"), "{line}");
+        assert!(line.contains("bound (52)"), "names the bound: {line}");
+        assert!(
+            line.contains("Lower it to 52 or below"),
+            "concrete remedy: {line}"
+        );
+        assert!(
+            line.contains("near_limit_poll_secs") && line.contains("session_velocity_horizon_secs"),
+            "names both lookahead knobs: {line}"
+        );
+        assert!(
+            line.contains("313s swap lookahead"),
+            "names the window: {line}"
+        );
+        assert!(
+            line.contains("6.95 %/min"),
+            "names the assumed peak: {line}"
+        );
+        assert!(
+            line.contains("not an error"),
+            "framed as a tuning note: {line}"
+        );
+        // No internal cross-references / secrets in an operator-facing string.
+        for banned in ["ADR-", "#608", "#597", "token", "Bearer"] {
+            assert!(!line.contains(banned), "must not leak {banned:?}: {line}");
+        }
     }
 
     #[test]
