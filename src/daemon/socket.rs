@@ -450,8 +450,9 @@ pub(crate) enum ConfigSetAck {
     /// The edits VALIDATED and were persisted (or were a no-op). `effect` says what the operator
     /// must do for them to take effect.
     Applied { effect: ConfigSetEffect },
-    /// The daemon REFUSED — ZERO writes. `detail` carries the non-secret validation message for the
-    /// `invalid` reason (the field-named range / cross-field error), absent for the others.
+    /// The daemon REFUSED — ZERO writes. `detail` carries the non-secret message for the `invalid`
+    /// reason (the field-named range / cross-field error) and for `config-unreadable` (the baseline
+    /// TOML parse error, issue #628); absent for the reasons that carry no such message.
     Rejected {
         reason: ConfigSetRejection,
         #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -642,8 +643,41 @@ pub(crate) fn control_reply(
             }
         }
         Ok(_) => (r#"{"error":"unknown command"}"#.to_owned(), None),
-        Err(_) => (r#"{"error":"malformed request"}"#.to_owned(), None),
+        // A line that is not a well-formed `ControlRequest` (issue #628): thread serde's own message
+        // into `detail` (secret-free — see `error_with_detail`) rather than discarding it, so a client
+        // can tell WHY the line was rejected instead of reading a bare "malformed request".
+        Err(err) => (
+            error_with_detail("malformed request", &err.to_string()),
+            None,
+        ),
     }
+}
+
+/// Build a redacted `{"error":<reason>,"detail":<detail>}` control-reply envelope for a DECODE-time
+/// failure (issue #628), threading serde's own message into the `detail` a client reads instead of
+/// discarding it. The `detail` is SECRET-FREE — not because serde never echoes a value (a serde_json
+/// type-mismatch DOES reflect the offending scalar, and a TOML error echoes the offending source
+/// line) but because no SECRET can reach an echoed position on this socket: credentials live in the
+/// OS keychain and are structurally unrepresentable here (issue #15) — a control line carries only
+/// non-secret command params, a `config-set` payload only non-secret tunables + labels, and
+/// `config.toml` holds no secrets — so an echoed value is at worst the client's own non-secret input
+/// reflected back over its own same-uid connection. Built with `serde_json` (not `format!`) so a
+/// multi-line TOML `detail` is escaped INTO the JSON string — the reply stays one newline-delimited
+/// frame — and a `detail` carrying quotes stays well-formed. The added `detail` is purely additive —
+/// a client probing the `error` key is unaffected — and `error` is emitted FIRST (declaration order),
+/// so the reply's leading bytes are unchanged for a prefix / substring matcher too. Falls back to the
+/// bare `{"error":<reason>}` if the (two-string, in-practice-infallible) encode ever fails.
+fn error_with_detail(reason: &'static str, detail: &str) -> String {
+    #[derive(Serialize)]
+    struct ErrorWithDetail<'a> {
+        error: &'a str,
+        detail: &'a str,
+    }
+    serde_json::to_string(&ErrorWithDetail {
+        error: reason,
+        detail,
+    })
+    .unwrap_or_else(|_| format!(r#"{{"error":"{reason}"}}"#))
 }
 
 /// Upper bound on a single control-socket request line. A control request is one
@@ -833,8 +867,18 @@ where
                             labels: set_request.labels,
                         }),
                     )),
-                    Err(_) => {
-                        write_line(&mut buffered, r#"{"error":"malformed request"}"#).await?;
+                    // A forbidden top-level key, or a stale/renamed tunable from a version-skewed
+                    // client (issue #628 — e.g. a pre-#606 menubar sending `session_trigger`, which
+                    // `SetTunables`' `deny_unknown_fields` now rejects): thread serde's key-naming
+                    // message into `detail` so the client can distinguish a version-skew edit from a
+                    // genuinely malformed line, instead of a content-free `malformed request`. Still
+                    // ZERO writes — the edit never reaches the run loop.
+                    Err(err) => {
+                        write_line(
+                            &mut buffered,
+                            &error_with_detail("malformed request", &err.to_string()),
+                        )
+                        .await?;
                         Ok(ServeOutcome::OneShot(None))
                     }
                 };
@@ -1203,7 +1247,11 @@ pub(crate) fn config_get_reply(path: &Path) -> String {
         Ok(text) => match crate::config::Config::view_from_text(&text) {
             Ok(view) => serde_json::to_string(&view)
                 .unwrap_or_else(|_| r#"{"error":"encode failed"}"#.to_owned()),
-            Err(_) => r#"{"error":"config unreadable"}"#.to_owned(),
+            // The file exists but does not parse (issue #628): thread the parse error — a secret-free
+            // TOML message echoing the offending source line, and naming the key when the failure has
+            // one (the config holds no secrets, issue #15) — into `detail` rather than discarding it,
+            // so the client learns WHERE the file is broken, not a bare envelope.
+            Err(err) => error_with_detail("config unreadable", &err.to_string()),
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             r#"{"error":"no config"}"#.to_owned()

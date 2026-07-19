@@ -7550,17 +7550,20 @@ fn classify_capture_failure(err: &Error) -> CaptureRejection {
 /// Map an [`apply_settings`](crate::config::Config::apply_settings) failure to the redacted
 /// `(reason, detail)` for a `config-set` ack (issue #268) — the config-set counterpart of
 /// [`classify_capture_failure`]. A malformed / unparseable BASELINE (the existing on-disk file
-/// cannot be understood) is `ConfigUnreadable` — config-set never overwrites a file it cannot
-/// re-render; a label edit naming an unknown roster uuid (a stale settings client) is
+/// cannot be understood) is `ConfigUnreadable`, carrying the secret-free TOML parse message as
+/// `detail` (issue #628) — config-set never overwrites a file it cannot re-render; a label edit
+/// naming an unknown roster uuid (a stale settings client) is
 /// `UnknownAccount`; a range or cross-field violation on the FINAL edited config is `Invalid`,
 /// carrying the non-secret field-named message as `detail` so the UI can point at the offending
 /// field. Secret-free by construction: the config file holds no secrets (issue #15) and the reason
 /// is a stable discriminant.
 fn classify_config_set_failure(err: &Error) -> (ConfigSetRejection, Option<String>) {
     match err {
-        // The baseline on-disk file is malformed — the overlay re-parse failed on the existing
-        // text; refuse rather than clobber a file the daemon cannot re-render.
-        Error::ConfigParse(_) => (ConfigSetRejection::ConfigUnreadable, None),
+        // The baseline on-disk file is malformed — the overlay re-parse failed on the existing text;
+        // refuse rather than clobber a file the daemon cannot re-render. Surface the parse message as
+        // `detail` (issue #628) — a secret-free TOML error (the config holds no secrets, issue #15) —
+        // so a stale / version-skewed on-disk config is diagnosable, not a bare envelope.
+        Error::ConfigParse(_) => (ConfigSetRejection::ConfigUnreadable, Some(err.to_string())),
         // A label edit named an `account_uuid` no roster account has (a stale client — the account
         // was `remove`d since its `config-get`).
         Error::AccountUuidNotFound { .. } => (ConfigSetRejection::UnknownAccount, None),
@@ -19049,6 +19052,12 @@ mod tests {
         let (reply, signal) = control_reply("not json", &StatusSnapshot::default(), true);
         assert!(reply.contains("malformed"));
         assert!(signal.is_none());
+        // issue #628: serde's decode message is threaded into `detail` rather than discarded, so a
+        // client learns WHY the line was rejected instead of reading a content-free bare envelope.
+        assert!(
+            reply.contains("\"detail\":"),
+            "a decode failure carries serde's message as detail: {reply:?}"
+        );
     }
 
     #[test]
@@ -20343,13 +20352,22 @@ mod tests {
             })
             .await;
 
-        assert_eq!(
-            ack,
+        // issue #628: the baseline TOML parse error is threaded into `detail` (secret-free — the config
+        // holds no secrets, issue #15) instead of discarded, so a stale / version-skewed on-disk config
+        // is diagnosable rather than a bare `config-unreadable`.
+        match ack {
             ConfigSetAck::Rejected {
                 reason: ConfigSetRejection::ConfigUnreadable,
-                detail: None,
+                detail: Some(msg),
+            } => {
+                assert!(!msg.is_empty(), "the parse error is surfaced as detail");
+                assert!(
+                    msg.contains("malformed config"),
+                    "detail names the parse failure: {msg}"
+                );
             }
-        );
+            other => panic!("expected ConfigUnreadable with a parse detail, got {other:?}"),
+        }
         assert_eq!(
             std::fs::read_to_string(&config_path).unwrap(),
             before,
@@ -20420,6 +20438,71 @@ mod tests {
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.contains("malformed"), "got {reply:?}");
+        // issue #628: the reply threads serde's message into `detail` — it NAMES the forbidden key so
+        // the client can diagnose the rejection...
+        assert!(
+            reply.contains("credential"),
+            "the detail names the forbidden key: {reply:?}"
+        );
+        // ...but serde's `deny_unknown_fields` names the KEY, never its VALUE — the load-bearing
+        // secret-free guarantee for this error surface a client reads (the threaded detail must not
+        // leak the `credential` value even when the client sends one).
+        assert!(
+            !reply.contains("secret"),
+            "a forbidden key's VALUE must never leak into the error detail: {reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_control_config_set_detail_distinguishes_a_version_skew_from_a_malformed_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // issue #628: after the #606 rename, a pre-rename menubar sends the now-unknown `session_trigger`
+        // tunable in its `config-set`. `SetTunables`' `deny_unknown_fields` rejects it (ZERO writes, so
+        // nothing corrupts), but the reply must let the client DISTINGUISH this version-skew edit from a
+        // genuinely malformed line: serde's message — which NAMES `session_trigger` (and lists the
+        // accepted keys, so the renamed `session_ceiling` is visible) — is threaded into `detail`,
+        // instead of the content-free `malformed request` both cases used to share.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        client
+            .write_all(b"{\"cmd\":\"config-set\",\"tunables\":{\"session_trigger\":95}}\n")
+            .await
+            .unwrap();
+        let outcome = serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap();
+        assert!(
+            outcome.one_shot().is_none(),
+            "a version-skewed config-set must not hand off to the run loop",
+        );
+        let mut skew_reply = String::new();
+        client.read_to_string(&mut skew_reply).await.unwrap();
+        // The stable machine code is unchanged, but the detail now NAMES the stale tunable.
+        assert!(skew_reply.contains("malformed"), "got {skew_reply:?}");
+        assert!(
+            skew_reply.contains("session_trigger"),
+            "the detail names the offending stale tunable: {skew_reply:?}"
+        );
+        // The VALUE (95) is a non-secret tunable, but serde still names only the KEY — the detail is a
+        // key-naming message, matching the secret-free contract of the credential case.
+
+        // A GENERIC malformed line (invalid JSON) is DISTINGUISHABLE: same code, but its decode-specific
+        // detail does NOT name `session_trigger`, so a version-skew edit and a garbage line no longer
+        // collapse to the same bare reply.
+        let (generic_reply, _signal) =
+            control_reply("not json at all", &StatusSnapshot::default(), true);
+        assert!(generic_reply.contains("malformed"), "got {generic_reply:?}");
+        assert!(
+            !generic_reply.contains("session_trigger"),
+            "a generic malformed line must not name the skew key: {generic_reply:?}"
+        );
+        // `skew_reply` carries `write_line`'s trailing newline; `control_reply` returns the bare line
+        // — trim so the inequality is about CONTENT, not the framing newline (without the trim this
+        // assertion would pass trivially on the newline alone, degrading silently).
+        assert_ne!(
+            skew_reply.trim_end(),
+            generic_reply.as_str(),
+            "a version-skew edit is distinguishable from a generic malformed line",
+        );
     }
 
     #[tokio::test]
@@ -20470,9 +20553,16 @@ mod tests {
         assert_eq!(view.accounts[0].account_uuid, "u-A");
         assert_eq!(view.accounts[0].label, "work");
 
-        // Malformed → a `config unreadable` envelope (refuse rather than guess).
+        // Malformed → a `config unreadable` envelope (refuse rather than guess). issue #628: the parse
+        // error is threaded into `detail` (secret-free — the config holds no secrets, issue #15) so the
+        // client learns WHERE the file is broken, not a content-free envelope.
         std::fs::write(&config_path, "this is not toml [[[").unwrap();
-        assert!(config_get_reply(&config_path).contains("config unreadable"));
+        let unreadable = config_get_reply(&config_path);
+        assert!(unreadable.contains("config unreadable"), "got {unreadable}");
+        assert!(
+            unreadable.contains("\"detail\":") && unreadable.contains("malformed config"),
+            "the parse error is surfaced as detail: {unreadable}"
+        );
     }
 
     #[test]
