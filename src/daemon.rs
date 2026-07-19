@@ -105,9 +105,9 @@ use crate::keychain::{
 };
 use crate::landing;
 use crate::observability::{
-    BackoffClass, CanonicalLiveness, CaptureEventOutcome, CredentialHealth, DecisionClass,
-    Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger, PollClass, RefreshEventOutcome,
-    SwapReason,
+    BackoffClass, BlindVelocity, CanonicalLiveness, CaptureEventOutcome, CredentialHealth,
+    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger, PollClass,
+    RefreshEventOutcome, SwapProjection, SwapReason,
 };
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
@@ -137,10 +137,10 @@ pub(crate) use peer_auth::{is_same_user, peer_euid};
 mod snapshot;
 
 pub(crate) use snapshot::{
-    credential_health, refresh_health_view, to_pct, versioned_status_response, AccountReading,
-    AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub, LandingOvershoot, NextSwap,
-    NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse, StatusSnapshot, VersionedStatus,
-    STATUS_SCHEMA_VERSION,
+    credential_health, refresh_health_view, to_pct, to_pct_exact, versioned_status_response,
+    AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub,
+    LandingOvershoot, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
+    StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -2863,6 +2863,17 @@ where
                         session_pct: to_pct(anchor.session),
                         session_at_recovery: to_pct(fresh.session),
                         near_limit: anchor.session >= self.session_ceiling_base,
+                        // Issue #634: the retained #539 velocity in force through the window, so the
+                        // REPORT-ONLY blind velocity-projection arm
+                        // ([`blind_velocity_projected_armed`], #584/#600) — which fires no swap and
+                        // so emits no event of its own — is reconstructable offline from this line.
+                        // Genuinely the PRE-BLIND rate: the velocity fold above is gated on a
+                        // previous live reading (`last_readings[i]`), which is exactly what this
+                        // branch requires to be `None`, so the recovery poll cannot have blended
+                        // into the EMA before this read. Same SUSTAINED gate the arm itself applies
+                        // — an unwarmed EMA could not have armed it, so no ingredient is logged for
+                        // a projection that could not have happened.
+                        velocity: self.blind_velocity_ingredients(i),
                     });
                 }
             }
@@ -4412,6 +4423,9 @@ where
                     to: self.roster[target_idx].label.clone(),
                     reason,
                     session_pct: to_pct(active_usage.session),
+                    // Reactive session/weekly swap: it fired on the OBSERVED reading, not a
+                    // projection, so `session_pct` fully describes the decision (issue #634).
+                    projection: None,
                 });
                 // Arm the runtime landing watch (issue #613) on the account just PARKED, but only for a
                 // `reason=session` swap — the offline #595 landing SLI this mirrors measures
@@ -4746,6 +4760,8 @@ where
                                 to: to.clone(),
                                 reason,
                                 session_pct: 0,
+                                // Manual / forced swap: operator-driven, not a projection (#634).
+                                projection: None,
                             };
                             (SwapAck::Accepted { from, to }, Some(event))
                         }
@@ -5475,6 +5491,11 @@ where
                     // Log it (as a percent, like every swap line) so the `swap` line agrees with the
                     // value the gate keyed off. Never a token / email (#15).
                     session_pct: last_known_session_pct,
+                    // The blind-preempt arm's projection ingredients ride its own
+                    // `blind_window` line (issue #634), not the swap line — this swap fires on the
+                    // stale anchor, and the retained velocity is carried where the report-only arm
+                    // that consumes it lives. So the swap line itself carries no projection.
+                    projection: None,
                 });
                 // Retain the swap for `status` to NARRATE (issue #479): `record_swap` above cleared any
                 // prior notice (superseding a same-active one), so set THIS swap's as the current one.
@@ -5593,6 +5614,43 @@ where
                 samples: 1,
             },
         });
+    }
+
+    /// The #539 velocity ingredients account `i`'s blind window should carry (issue #634), or `None`
+    /// when the REPORT-ONLY blind velocity-projection arm ([`blind_velocity_projected_armed`],
+    /// issues #584/#600) could not have armed on this account at all.
+    ///
+    /// That arm decides but emits nothing — it moves `status` to DEGRADED and fires no swap — so its
+    /// inputs left no trace and the report was unfalsifiable after the fact. This supplies the one
+    /// missing ingredient (the anchor and the window are already on [`Event::BlindWindow`]), letting
+    /// an offline reader recompute `anchor + rate × inflation × blind_secs` and check it against the
+    /// ceiling. The recomputation is deliberate: the arm is report-only and not in every running
+    /// binary, so logging the ingredient must NOT require the live arm to be active.
+    ///
+    /// Gated on the SAME sustained-EMA precondition the arm applies (a retained EMA with
+    /// `>= MIN_VELOCITY_SAMPLES` blended intervals), so absent tokens mean "this arm could not have
+    /// armed here" rather than "unknown" — no ingredient is published for a projection that could not
+    /// have happened.
+    ///
+    /// Stamps the CONSTANTS IN FORCE beside the ingredient rather than leaving them to be re-derived:
+    /// [`BLIND_VELOCITY_RATE_INFLATION`] is explicitly interim and ratification-pending, and the
+    /// ceiling is operator-configurable, so an offline reader applying today's values to an old
+    /// window would silently mis-report it. The ceiling is the BASE (un-jittered) draw — the line
+    /// this arm projects against ([`blind_velocity_projected_armed`]'s `session_ceiling`), NOT the
+    /// per-tick jittered effective ceiling [`velocity_swap`](Self::velocity_swap) fires on.
+    ///
+    /// A pure read of retained state; the fraction→percent conversion is the log's unit boundary
+    /// ([`to_pct_exact`]).
+    fn blind_velocity_ingredients(&self, i: usize) -> Option<BlindVelocity> {
+        let vel = self.state.session_velocity[i]?;
+        if vel.samples < MIN_VELOCITY_SAMPLES {
+            return None;
+        }
+        Some(BlindVelocity {
+            rate_pct_per_sec: to_pct_exact(vel.rate),
+            inflation: BLIND_VELOCITY_RATE_INFLATION,
+            ceiling_pct: to_pct_exact(self.session_ceiling_base),
+        })
     }
 
     /// The #539 velocity-projection preemptive swap (ADR-0017) — the OBSERVED-overshoot peer of the
@@ -5745,6 +5803,25 @@ where
                     // response came back stale-low for its own window — see `plausible_active_usage`.
                     // A percent, like every swap line; never a token / email (#15).
                     session_pct: to_pct(active_usage.session),
+                    // The PROJECTION this arm actually decided on (issue #634), so the line explains
+                    // its own fire instead of reading like a bug at a below-trigger `session_pct`:
+                    // `projected >= ceiling` is the very predicate checked above, now checkable from
+                    // the log alone. The ingredient (`rate`) is PERSISTED at full precision rather
+                    // than left to be re-derived — the durable `usage_velocity` carries only a
+                    // rounded `i16` delta, which cannot reproduce this decision — and the CONSTANTS
+                    // in force are stamped with it, so a later change to the horizon tunable or to
+                    // the ceiling semantics cannot make this record read wrong.
+                    projection: Some(SwapProjection {
+                        projected_pct: to_pct_exact(projected),
+                        // The internal EMA is a fraction per second; the log speaks percent, like
+                        // the `session_pct` / `ceiling` it sits beside.
+                        rate_pct_per_sec: to_pct_exact(vel.rate),
+                        horizon_secs: horizon,
+                        // The EFFECTIVE ceiling (the tick's draw less the #597 tail margin) — the
+                        // comparand itself, not the raw configured ceiling, so no offline reader has
+                        // to know which margin applied.
+                        ceiling_pct: to_pct_exact(effective_ceiling),
+                    }),
                 });
                 TickAction::VelocityPreemptivelySwapped {
                     from: active_idx,
@@ -11011,6 +11088,9 @@ mod tests {
                 // have been necessary (still climbing). The #482 recovery pct (raw, un-classified).
                 session_at_recovery: 97,
                 near_limit: true,
+                // No sustained velocity was seeded (a single pre-blind reading), so the arm could
+                // not have armed and no ingredient is published (issue #634).
+                velocity: None,
             }),
             "the recovery must close the blind window with its duration + recovery pct + near-limit tag: {:?}",
             recovered.events,
@@ -11047,9 +11127,119 @@ mod tests {
                 session_pct: 40,
                 session_at_recovery: 42,
                 near_limit: false,
+                velocity: None,
             }),
             "a below-band blind window is recorded but not near-limit: {:?}",
             recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_carries_the_retained_velocity_when_the_account_climbed_before_going_blind(
+    ) {
+        // Issue #634: the load-bearing finding — the #539 EMA retained at the blind-window emit is
+        // the PRE-BLIND one, so the report-only blind velocity-projection arm (#584/#600) is
+        // reconstructable offline. Drive two climbing intervals to SUSTAIN the EMA (samples ≥ 2),
+        // then blind the account and recover it: the velocity fold is gated on a live previous
+        // reading — exactly what a blind window clears — so the recovery poll cannot overwrite the
+        // retained rate before `blind_window` is emitted, and the ingredient rides the line.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.90, 0.30)).await;
+        daemon.tick().await; // reading 1 at 90 % — first reading, nothing to diff yet
+
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.93, 0.30);
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.tick().await; // reading 2 → seeds the EMA (samples = 1)
+
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.95, 0.30);
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.tick().await; // reading 3 → blends (samples = 2, SUSTAINED)
+        assert_eq!(
+            daemon.state.session_velocity[0].map(|v| v.samples),
+            Some(2),
+            "two climbing intervals sustain the EMA",
+        );
+
+        // A 429 blinds the account; the retained EMA is untouched (the fold is skipped on a failed
+        // poll).
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await;
+        daemon.clock.advance(Duration::from_secs(300));
+
+        // Recovery closes the blind window. The recovery poll's velocity fold is skipped (the prior
+        // reading was cleared by the 429), so the emitted line carries the PRE-BLIND rate.
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.97, 0.30);
+        let recovered = daemon.tick().await;
+        let ceiling_base = daemon.session_ceiling_base;
+
+        let velocity = recovered
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::BlindWindow { velocity, .. } => *velocity,
+                _ => None,
+            })
+            .expect("the blind_window carries the retained velocity ingredient (#634)");
+        assert!(
+            velocity.rate_pct_per_sec > 0.0,
+            "the retained climbing rate survives to the emit, got {}",
+            velocity.rate_pct_per_sec,
+        );
+        assert!(
+            (velocity.inflation - BLIND_VELOCITY_RATE_INFLATION).abs() < 1e-9,
+            "the inflation constant in force is stamped, got {}",
+            velocity.inflation,
+        );
+        assert!(
+            (velocity.ceiling_pct - to_pct_exact(ceiling_base)).abs() < 1e-9,
+            "the BASE ceiling in force is stamped, got {}",
+            velocity.ceiling_pct,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_velocity_ingredients_gate_on_a_sustained_ema() {
+        // Issue #634: the ingredient is published only when the report-only arm could actually have
+        // armed — a retained EMA that is SUSTAINED (>= MIN_VELOCITY_SAMPLES). No EMA and a
+        // single-interval spike both yield `None`, so absent tokens on a `blind_window` line mean
+        // "the arm could not have armed here", never "unknown". When present the fraction-domain rate
+        // is converted to percent-per-second and the constants in force are stamped.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new().ok("u-A", 0.50, 0.20)).await;
+
+        daemon.state.session_velocity[0] = None;
+        assert!(
+            daemon.blind_velocity_ingredients(0).is_none(),
+            "no retained EMA → no ingredient",
+        );
+
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.001,
+            samples: MIN_VELOCITY_SAMPLES - 1,
+        });
+        assert!(
+            daemon.blind_velocity_ingredients(0).is_none(),
+            "an unsustained single-interval EMA → no ingredient (the arm could not arm)",
+        );
+
+        daemon.state.session_velocity[0] = Some(VelocityEma {
+            rate: 0.001,
+            samples: MIN_VELOCITY_SAMPLES,
+        });
+        let ingredient = daemon
+            .blind_velocity_ingredients(0)
+            .expect("a sustained EMA publishes its ingredient");
+        assert!(
+            (ingredient.rate_pct_per_sec - 0.1).abs() < 1e-9,
+            "0.001 fraction/s renders as 0.1 %/s, got {}",
+            ingredient.rate_pct_per_sec,
+        );
+        assert!(
+            (ingredient.inflation - BLIND_VELOCITY_RATE_INFLATION).abs() < 1e-9,
+            "the inflation constant in force is stamped",
+        );
+        assert!(
+            (ingredient.ceiling_pct - to_pct_exact(daemon.session_ceiling_base)).abs() < 1e-9,
+            "the BASE (un-jittered) ceiling in force is stamped",
         );
     }
 
@@ -11293,6 +11483,7 @@ mod tests {
                 session_pct: 96,
                 session_at_recovery: 97,
                 near_limit: true,
+                velocity: None,
             }),
             "blind_window keeps its #449/#482 recovery-edge semantics verbatim: {:?}",
             recovered.events,
@@ -12580,6 +12771,55 @@ mod tests {
             )),
             "a velocity_preempt swap event carrying the fresh observed pct: {:?}",
             swapped.events,
+        );
+        // Issue #634: that same swap line carries the PROJECTION it fired on, end-to-end from the
+        // live decision — so the below-the-ceiling swap-out (92 < the 93 effective ceiling) explains
+        // itself. Assert the ingredients are internally consistent with the decision rather than
+        // pinning brittle EMA floats: the stamped constants are the ones in force (horizon 150, the
+        // #597 effective ceiling 93 = (0.99 − 0.06) × 100), the rate is a real climbing rate, and the
+        // projection reproduces `observed + rate × horizon` — the very predicate `velocity_swap`
+        // checked — and clears the stamped ceiling that fired it.
+        let projection = swapped
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::Swap {
+                    reason: SwapReason::VelocityPreempt,
+                    projection,
+                    ..
+                } => *projection,
+                _ => None,
+            })
+            .expect("the velocity_preempt swap carries its projection ingredients (#634)");
+        assert_eq!(
+            projection.horizon_secs, 150,
+            "the horizon in force is stamped"
+        );
+        assert!(
+            (projection.ceiling_pct - 93.0).abs() < 1e-9,
+            "the EFFECTIVE ceiling (99 − 6 pp tail) is the stamped comparand, got {}",
+            projection.ceiling_pct,
+        );
+        assert!(
+            projection.rate_pct_per_sec > 0.0,
+            "a climbing rate is logged, got {}",
+            projection.rate_pct_per_sec,
+        );
+        // The self-consistency identity: projected == observed (92.0) + rate × horizon, so an offline
+        // reader recomputes the decision from the line's own tokens. The observed reading is exactly
+        // 0.92 → 92.0 here.
+        let reproduced = 92.0 + projection.rate_pct_per_sec * 150.0;
+        assert!(
+            (projection.projected_pct - reproduced).abs() < 1e-6,
+            "projected={} must equal observed + rate × horizon = {}",
+            projection.projected_pct,
+            reproduced,
+        );
+        assert!(
+            projection.projected_pct >= projection.ceiling_pct,
+            "the projection that fired the swap clears its stamped ceiling: {} >= {}",
+            projection.projected_pct,
+            projection.ceiling_pct,
         );
     }
 
@@ -19544,6 +19784,7 @@ mod tests {
                 to: "spare".to_owned(),
                 reason: SwapReason::Manual,
                 session_pct: 0,
+                projection: None,
             })
         );
     }
@@ -19634,6 +19875,7 @@ mod tests {
                 to: "spare".to_owned(),
                 reason: SwapReason::Forced,
                 session_pct: 0,
+                projection: None,
             })
         );
     }
