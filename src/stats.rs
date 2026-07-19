@@ -325,6 +325,33 @@ struct AccountVelocity {
     weekly_headroom: Option<f64>,
 }
 
+/// Resolve the config for a read-only `stats` view (issue #627), separating the two
+/// silent-fallback cases that must be treated differently:
+///
+/// - an **absent** config ([`Error::ConfigNotFound`]) is the normal pre-`capture` state — `stats`
+///   works before the first capture — so it stays silent and falls back to built-in defaults;
+/// - a config that **exists but is malformed** (a parse / validate / I/O failure) is the #627 case:
+///   every *other* command (`config validate` / `show`, `list`, `run`) hard-fails and names the
+///   offending key, so `stats` — the sole silent consumer — surfaces the SAME secret-free detail
+///   ([`Error`]'s `Display`, issue #15) and *then* falls back to defaults.
+///
+/// Returns the effective config (or `None` → defaults) plus an optional warning the caller routes
+/// to its own sink: the CLI's stderr ([`run`]) or the daemon log ([`stats_socket_json`]). Pure
+/// over its argument — the [`Config::load`] I/O happens in the caller — so the absent-vs-malformed
+/// branch is unit-tested through the [`Config::load_path`] seam without touching the ambient config
+/// path or process env (issue #627 regression test).
+fn resolve_stats_config(loaded: Result<Config>) -> (Option<Config>, Option<String>) {
+    match loaded {
+        Ok(config) => (Some(config), None),
+        // Absent: pre-`capture` normal state — silent defaults, no warning (would be noise on
+        // every fresh install).
+        Err(Error::ConfigNotFound { .. }) => (None, None),
+        // Malformed: the file exists but failed to parse/validate — surface the same detail the
+        // sibling commands name, then fall back to defaults.
+        Err(err) => (None, Some(err.to_string())),
+    }
+}
+
 /// Entry point for the `stats` verb: read the store once, resolve the window, aggregate,
 /// and render. The only impure step is reading the store + wall clock; everything else is
 /// a pure function of `StoreData` + `now`.
@@ -336,10 +363,17 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
 
     let window = plan_window(args.period.as_deref(), args.since.as_deref(), now, &data)?;
     // One config load feeds BOTH the aggregator thresholds AND the roster reconciliation
-    // (issue #314). A missing/malformed config is not fatal for a read-only view — the
-    // thresholds fall back to built-in defaults, and an unknown roster simply disables the
-    // orphan partition (every handle renders as before), so `stats` still works pre-`capture`.
-    let config = Config::load().ok();
+    // (issue #314). An ABSENT config is the normal pre-`capture` state — thresholds fall back to
+    // built-in defaults and the missing roster just disables the orphan partition (every handle
+    // renders as before), so `stats` still works before the first `capture`, silently. But a
+    // config that EXISTS yet fails to parse/validate is surfaced (issue #627): every sibling
+    // command names the offending key, so `stats` must not be the one that silently renders its
+    // ceiling-dependent figures (`caps`, `t@cap`, `runway`) against DEFAULT tunables as if valid.
+    // Warn on stderr, then continue against defaults — the silence is the bug, not the exit 0.
+    let (config, config_warning) = resolve_stats_config(Config::load());
+    if let Some(warning) = &config_warning {
+        eprintln!("sessiometer: warning: rendering stats against default tunables — {warning}");
+    }
     let params = params_from(config.as_ref());
     let vparams = velocity_params_from(config.as_ref());
     let roster = config.as_ref().map(roster_handles);
@@ -410,11 +444,19 @@ fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&st
         Err(_) => return r#"{"error":"invalid period"}"#.to_owned(),
     };
     // One config load feeds both the aggregator thresholds and roster reconciliation, exactly as
-    // `run` does; a missing / malformed config falls back to defaults (the read-only view still
-    // works pre-`capture`). Re-read from disk — the same config the CLI reader sees — rather than
-    // the daemon's in-memory copy (which the spawned, `Send`-only task cannot borrow), so the socket
-    // series stays byte-parity with `stats --json`.
-    let config = Config::load().ok();
+    // `run` does. Re-read from disk — the same config the CLI reader sees — rather than the daemon's
+    // in-memory copy (which the spawned, `Send`-only task cannot borrow), so the socket series stays
+    // byte-parity with `stats --json`. An ABSENT config stays silent (defaults, the pre-`capture`
+    // state); a MALFORMED one is surfaced daemon-side (issue #627) — logged, not silently served as
+    // default-computed stats. Serving those defaults over the wire (rather than an `{"error":…}`
+    // envelope) is deliberate: the panel keeps a bounded view, and switching envelopes is a
+    // wire/behavior change beyond #627's scope. Preferring the daemon's valid in-memory config over
+    // this disk re-read (which needs threading it through the `Send`-only task) is the tracked
+    // socket follow-up.
+    let (config, config_warning) = resolve_stats_config(Config::load());
+    if let Some(warning) = &config_warning {
+        eprintln!("sessiometer: warning: serving stats against default tunables — {warning}");
+    }
     let params = params_from(config.as_ref());
     let vparams = velocity_params_from(config.as_ref());
     let roster = config.as_ref().map(roster_handles);
@@ -5217,6 +5259,48 @@ mod tests {
         assert!(
             v["summary"]["accounts"].as_object().unwrap().is_empty(),
             "no accounts in an empty store"
+        );
+    }
+
+    // --- config-load fallback for the read-only stats view (issue #627) ----------------
+
+    #[test]
+    fn stats_config_surfaces_a_malformed_file_but_stays_silent_when_absent() {
+        // #627: `stats` was the ONLY config consumer that silently rendered against DEFAULT
+        // tunables when `config.toml` failed to parse — exit 0, zero stderr — while every sibling
+        // command hard-failed and named the offending key. The fix keeps the two fallbacks apart.
+        let dir = tempfile::tempdir().unwrap();
+
+        // ABSENT config — the normal pre-`capture` state: fall back to defaults, NO warning (a
+        // warning here would be noise on every fresh install, before anything has been captured).
+        let missing = dir.path().join("config.toml");
+        let (config, warning) = resolve_stats_config(Config::load_path(&missing));
+        assert!(config.is_none(), "an absent config falls back to defaults");
+        assert!(
+            warning.is_none(),
+            "an absent config is the silent pre-capture state, not a #627 surface"
+        );
+
+        // MALFORMED config — the exact #627 upgrade case: an old `session_trigger` key (renamed to
+        // `session_ceiling` in #606) is now unknown (`deny_unknown_fields` → parse error). The
+        // report still renders against defaults (config is `None`), and the warning carries the
+        // SAME secret-free detail `config validate` surfaces — naming the offending key.
+        let malformed = dir.path().join("stale.toml");
+        std::fs::write(&malformed, b"[tunables]\nsession_trigger = 50\n").unwrap();
+        let (config, warning) = resolve_stats_config(Config::load_path(&malformed));
+        assert!(
+            config.is_none(),
+            "a malformed config falls back to defaults — the report still renders"
+        );
+        let warning = warning.expect("a malformed config must END the silence with a warning");
+        assert_eq!(
+            warning,
+            Config::load_path(&malformed).unwrap_err().to_string(),
+            "the warning is the SAME detail every sibling command surfaces (issue #627)"
+        );
+        assert!(
+            warning.contains("session_trigger"),
+            "and it names the offending key, like `config validate`: {warning}"
         );
     }
 
