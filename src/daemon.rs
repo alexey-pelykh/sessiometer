@@ -252,13 +252,14 @@ const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
 /// (#482 / #449 / #455), NOT a re-run of the #451 replay.
 const BLIND_GATE_SECS: u64 = 300;
 /// Interim `risk_band` for the #452 gate (ADR-0017), as a session-usage fraction: the retained
-/// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) must be at/over this for the gate to
-/// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_ceiling`
-/// ([`Daemon::session_ceiling_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
-/// stale anchor, before the account would have tripped the reactive band. The always-on SLI
-/// (#482) / status (#479) measurement band; #452's swap keys off the `session_blind_risk_band`
-/// CONFIG tunable (default-equal), so the action threshold and this measurement band align out of
-/// the box, but a config kill-switch disables only the action — the SLI keeps measuring.
+/// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) — plausibility-corrected to its window
+/// high-water mark (#619) — must be at/over this for the gate to turn eligible. DISTINCT from — and
+/// deliberately LOWER than — the reactive `session_ceiling` ([`Daemon::session_ceiling_base`], the
+/// #449 `near_limit` band): the gate acts PREEMPTIVELY, on a stale anchor, before the account would
+/// have tripped the reactive band. The always-on SLI (#482) / status (#479) measurement band;
+/// #452's swap keys off the `session_blind_risk_band` CONFIG tunable (default-equal), so the action
+/// threshold and this measurement band align out of the box, but a config kill-switch disables only
+/// the action — the SLI keeps measuring.
 ///
 /// INTERIM / REVERSIBLE, biased CONSERVATIVE (issue #484). ADR-0017 named the interim at 65 %; #484
 /// biases it to the low end of a conservative **[60, 65] band** — the interim evolution the ADR
@@ -446,6 +447,22 @@ fn server_retry_after_holding(health: &AccountHealth, at: Instant) -> Option<Dur
 /// whether a swap fires.
 const BLIND_PREEMPT_NOTICE_SECS: u64 = 300;
 
+/// The [`blind_active_view`] ANCHOR-arm inputs: the retained pre-blind anchor (`last_good`, #450) and
+/// the active account's frozen per-window session high-water mark (#614). Bundled into one struct so
+/// `blind_active_view` stays within the repo's 7-argument clippy bound (this repo never `#[allow]`s
+/// `too_many_arguments`) once #619 adds the mark alongside the anchor. The mark plausibility-corrects
+/// the anchor's session at the arm read (issue #619): a stale-low pre-blind reading is raised to the
+/// mark so the projection tracks the swap the #452 gate actually fires rather than reporting a
+/// false-"OK" off a reading that never happened.
+#[derive(Clone, Copy)]
+struct AnchorArmInputs {
+    /// The retained pre-blind reading (`None` = a genuinely-unknown active with no anchor, #450).
+    last_good: Option<LastGood>,
+    /// The active account's session high-water mark for the anchor's window (`None` = never polled
+    /// with a parseable `session_resets_at`, so no correction applies — the raw anchor stands).
+    high_water: Option<swap::SessionHighWater>,
+}
+
 /// Project the active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) for the
 /// `status` wire, or `None` when the account is not in bounded blindness. PURE — a function of the
 /// retained pre-blind anchor (`last_good`, #450), the blind predicate, the quarantine flag, and the
@@ -459,12 +476,14 @@ const BLIND_PREEMPT_NOTICE_SECS: u64 = 300;
 ///   `None`, a `429`/`5xx` blind window), AND
 /// - `!quarantined` — a DEAD (#42) blind active belongs to the `emergency_swap` path, not bounded
 ///   blindness; ADR-0017 keeps the two separate, so a quarantined active is excluded, AND
-/// - a retained anchor exists (`anchor` is `Some`, #450) — never a spurious projection on a
+/// - a retained anchor exists (`anchor.last_good` is `Some`, #450) — never a spurious projection on a
 ///   genuinely-unknown account with no reading to key off.
 ///
 /// `auto_protection_degraded` is `true` when ANY of THREE arms is active on this blind account:
 /// - the ANCHOR arm ([`blind_gate_armed`] — the SAME arming test
-///   [`Daemon::note_blind_gate_eligibility`] gates on, there as its negation), fronting the #452 swap;
+///   [`Daemon::note_blind_gate_eligibility`] gates on, there as its negation), fronting the #452 swap,
+///   on the #619 plausibility-corrected anchor session (`anchor.high_water`) so this projection
+///   tracks the swap the gate actually fires rather than a stale-low pre-blind reading;
 /// - the #582 SERVER-directed arm (`server_retry_after_hold` AND blind past the interim
 ///   [`BLIND_GATE_SECS`]), fronting the #582 swap-away; and
 /// - the #584 VELOCITY-projection arm ([`blind_velocity_projected_armed`]) — the first arm mirroring NO
@@ -486,7 +505,7 @@ const BLIND_PREEMPT_NOTICE_SECS: u64 = 300;
 /// the status reflects the TRUE degraded state even when the kill-switch has disabled the swap,
 /// exactly as `blind_gate_armed` does for the SLIs.
 fn blind_active_view(
-    anchor: Option<LastGood>,
+    anchor: AnchorArmInputs,
     active_is_blind: bool,
     quarantined: bool,
     server_retry_after_hold: bool,
@@ -497,12 +516,23 @@ fn blind_active_view(
     if quarantined || !active_is_blind {
         return None;
     }
-    let anchor = anchor?;
+    // Bind the mark BEFORE the anchor is shadowed to its inner `LastGood` below.
+    let high_water = anchor.high_water;
+    let anchor = anchor.last_good?;
     let blind_secs = at.saturating_duration_since(anchor.at).as_secs();
+    // Issue #619: the anchor ARM decides on the anchor's PLAUSIBLE session (raised to the frozen
+    // high-water mark when the pre-blind reading was stale-low), the SAME value `blind_swap` /
+    // `note_blind_gate_eligibility` decide on — so `status` never reports "auto-protection OK" while
+    // the corrected gate is actually armed and swapping. The DISPLAYED `last_known_session_pct`
+    // below keeps the RAW anchor — a measurement of what was last observed. The #584 velocity base
+    // ALSO stays raw, but as an out-of-scope DECISION read, not a measurement: #619 covers the #452
+    // gate only, so an anchor corrected to below the risk band still projects that arm off the
+    // stale-low value (see `swap::plausible_anchor_session`).
+    let gate_session = swap::plausible_anchor_session(high_water, anchor.session);
     Some(BlindActive {
         blind_secs,
         last_known_session_pct: to_pct(anchor.session),
-        auto_protection_degraded: blind_gate_armed(blind_secs, anchor.session)
+        auto_protection_degraded: blind_gate_armed(blind_secs, gate_session)
             || (blind_secs > BLIND_GATE_SECS && server_retry_after_hold)
             || blind_velocity_projected_armed(
                 blind_secs,
@@ -1302,11 +1332,12 @@ pub(crate) enum TickAction {
     /// PREEMPTIVELY-swapped away from a BLIND (not dead) active account `from` to `to`
     /// before it could self-exhaust unobserved (issue #452, ADR-0017): the bounded-blindness
     /// gate fired — the active was blind past `session_blind_swap_secs`, its retained
-    /// pre-blind anchor (`last_good`, #450) sat at/over `session_blind_risk_band`, and a
-    /// viable target existed. Distinct from [`Swapped`](Self::Swapped) (reactive, on a fresh
-    /// reading) and [`EmergencySwapped`](Self::EmergencySwapped) (dead active, gates
-    /// bypassed): this path HONORS cooldown and the target reserve, and keys off the STALE
-    /// anchor — never the missing reading — so a genuinely-unknown active makes no swap.
+    /// pre-blind anchor (`last_good`, #450) — plausibility-corrected to its window high-water
+    /// mark (#619) — sat at/over `session_blind_risk_band`, and a viable target existed. Distinct
+    /// from [`Swapped`](Self::Swapped) (reactive, on a fresh reading) and
+    /// [`EmergencySwapped`](Self::EmergencySwapped) (dead active, gates bypassed): this path HONORS
+    /// cooldown and the target reserve, and keys off the STALE anchor — never the missing reading —
+    /// so a genuinely-unknown active makes no swap.
     PreemptivelySwapped { from: usize, to: usize },
     /// PREEMPTIVELY-swapped away from an OBSERVED active account `from` to `to` whose PROJECTED
     /// session usage crossed the trigger before the observed reading did (issue #539, ADR-0017):
@@ -2040,8 +2071,9 @@ pub(crate) struct Daemon<P, C, S, K> {
     session_blind_swap_secs: u64,
     /// The #452 preemptive-swap `risk_band` (ADR-0017) as a session fraction (config
     /// `session_blind_risk_band / 100`): [`Self::blind_swap`] fires only when the retained
-    /// pre-blind anchor (`last_good`, #450) sat at/over this. Sibling of
-    /// `session_blind_swap_secs`; likewise distinct from the SLI/status [`BLIND_GATE_RISK_BAND`].
+    /// pre-blind anchor (`last_good`, #450) — plausibility-corrected to its window high-water
+    /// mark (#619) — sat at/over this. Sibling of `session_blind_swap_secs`; likewise distinct from
+    /// the SLI/status [`BLIND_GATE_RISK_BAND`].
     session_blind_risk_band: f64,
     /// The widened re-poll cadence CEILING, in seconds, for an out-of-rotation (weekly- or
     /// session-exhausted) NON-active peer (issue #537, config `exhausted_poll_secs`): the most
@@ -3339,8 +3371,17 @@ where
         // via the shared [`blind_gate_armed`] predicate (the same test #479's `blind_active_view`
         // projects): NOT armed — not yet past the interim T, or the anchor below the risk band → not
         // yet eligible; leave the latch untouched (it is already clear pre-first-emit).
+        //
+        // Issue #619: on the anchor's PLAUSIBLE session, exactly as `blind_swap` decides — so this
+        // ratification SLI measures the premise of the swaps the gate actually fires (a stale-low
+        // pre-blind reading no longer hides an episode the corrected swap acts on). The emitted
+        // `session_pct` below stays the RAW anchor (the measurement of what was last observed).
         let blind_elapsed = at.saturating_duration_since(anchor.at);
-        if !blind_gate_armed(blind_elapsed.as_secs(), anchor.session) {
+        let gate_session = swap::plausible_anchor_session(
+            self.state.session_high_water[active_idx],
+            anchor.session,
+        );
+        if !blind_gate_armed(blind_elapsed.as_secs(), gate_session) {
             return;
         }
         // Partial-reading guard (#80 warm-up): don't measure viable-target availability off an
@@ -5210,9 +5251,10 @@ where
     /// anchor (`last_good`, #450), NEVER the missing reading, and swaps only when ALL hold:
     ///
     /// - blind past the config `session_blind_swap_secs` (strict `>`), AND
-    /// - EITHER the anchor sat at/over the config `session_blind_risk_band` (the ratified #452
-    ///   arm) OR a nonzero server `Retry-After` is still holding the account off its usage poll
-    ///   (the #582 arm, below), AND
+    /// - EITHER the anchor — plausibility-corrected to its window high-water mark (issue #619), so a
+    ///   stale-low pre-blind reading cannot disarm the gate — sat at/over the config
+    ///   `session_blind_risk_band` (the ratified #452 arm) OR a nonzero server `Retry-After` is
+    ///   still holding the account off its usage poll (the #582 arm, below), AND
     /// - a viable target exists — a peer under `target_max_session_usage` (ADR-0013), chosen via
     ///   [`pick_target_with_reason`] with the BASE (un-jittered) triggers, exactly as
     ///   [`note_blind_gate_eligibility`](Self::note_blind_gate_eligibility)'s premise SLI (#482)
@@ -5230,7 +5272,10 @@ where
     /// Claude Code keeps burning it. Below the risk band that blindness was unreachable by EVERY
     /// swap path: the reactive `session_ceiling` and the #539 velocity projection both need a
     /// FRESH reading, and the #452 arm above needs `anchor >= session_blind_risk_band` (observed
-    /// 2026-07-17: an anchor of `0.29` burned to exhaustion behind a `Retry-After: 3600`).
+    /// 2026-07-17: an anchor of `0.29` burned to exhaustion behind a `Retry-After: 3600`). Issue
+    /// #619's correction does not close this gap: it raises only a STALE-LOW anchor to its window
+    /// high-water mark, and a GENUINELY below-band anchor like the 0.29 one (whose mark agrees)
+    /// stays below the band — so the #582 arm remains the only path that reaches it.
     ///
     /// So a nonzero server `Retry-After` on the active account is treated as a swap-away SIGNAL in
     /// its own right, wherever the anchor sat: a known ≥1 h unobservability on the credential
@@ -5291,8 +5336,20 @@ where
         // gate-premise SLI / status projection measure at (so a kill-switch disables the swap
         // without blinding #484's ratification SLIs): blind past `session_blind_swap_secs` AND
         // the anchor at/over `session_blind_risk_band`.
+        //
+        // Issue #619: the anchor arm decides on the anchor's PLAUSIBLE session, not the raw
+        // pre-blind reading. A `/oauth/usage` response that came back stale-low for its own window
+        // just before the account went blind would write a below-band anchor and cancel this
+        // otherwise-due swap, letting the account burn to exhaustion unobserved for the whole blind
+        // window — the same stale-low failure #614 fixed for the LIVE arms (`plausible_active_usage`),
+        // reached through the blind path. Raised to the frozen per-window high-water mark (a true
+        // lower bound, never a synthesized number); the stored anchor + every measurement/display
+        // surface keep the raw value (see `swap::plausible_anchor_session`).
         let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
-        let anchor_armed = anchor.session >= self.session_blind_risk_band;
+        let anchor_armed = swap::plausible_anchor_session(
+            self.state.session_high_water[active_idx],
+            anchor.session,
+        ) >= self.session_blind_risk_band;
         // Issue #582: the server-directed arm. A nonzero `Retry-After` STILL holding the active
         // account off its poll arms the gate on its OWN, wherever the anchor sat — below the band
         // that blindness is otherwise unreachable by every swap path (see the doc comment). Shares
@@ -6352,7 +6409,14 @@ where
                         // wire there via `skip_serializing_if`).
                         blind_active: if active == Some(i) {
                             blind_active_view(
-                                self.state.last_good,
+                                // Issue #619: the anchor plus the active's frozen per-window high-water
+                                // mark, so the anchor arm degrades on the PLAUSIBLE pre-blind session (a
+                                // stale-low reading no longer shows false-"OK" while the corrected gate
+                                // is armed).
+                                AnchorArmInputs {
+                                    last_good: self.state.last_good,
+                                    high_water: self.state.session_high_water[i],
+                                },
                                 self.state.last_readings[i].is_none(),
                                 health.quarantined,
                                 // Issue #582: a server `Retry-After` still holding the blind active
@@ -11785,6 +11849,127 @@ mod tests {
         );
     }
 
+    /// A warmed three-account daemon with u-A (slot 0) blind, its pre-blind anchor seeded to
+    /// `anchor_session` and this window's retained high-water mark to `mark_session`, and the clock
+    /// advanced one second past the interim gate bound — the tick on which `blind_swap` decides (issue
+    /// #619). The tick-based `.ok(...)` poller does not stamp `session_resets_at`, so the mark is
+    /// seeded through the real [`swap::SessionHighWater::fold`] seam ([`seed_high_water`]) and the
+    /// anchor set directly; a blind episode has no successful active poll to refresh either, so both
+    /// stay frozen through the deciding tick exactly as they would in production.
+    async fn blind_daemon_with_seeded_anchor(anchor_session: f64, mark_session: f64) -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A active before it goes blind"
+        );
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.last_readings[0].is_some() {
+            daemon.tick().await;
+        }
+        // Seed the episode directly: the anchor's own pre-blind reading (`anchor_session`) and the
+        // window's high-water mark (`mark_session`) — an earlier plausible reading `fold`'s max kept.
+        let anchor_at = daemon.clock.now();
+        daemon.state.last_good = Some(LastGood {
+            session: anchor_session,
+            weekly: 0.20,
+            at: anchor_at,
+        });
+        seed_high_water(&mut daemon, mark_session);
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        daemon
+    }
+
+    #[tokio::test]
+    async fn blind_swap_fires_on_a_stale_low_pre_blind_anchor() {
+        // Issue #619 AC 1: a stale / cache-lagged LOW `/oauth/usage` reading arriving JUST before the
+        // active account goes blind writes a below-band anchor (`last_good`, #450). Keyed off the RAW
+        // anchor the #452 gate sees it under the risk band and DECLINES the otherwise-due preemptive
+        // swap, letting the account burn to exhaustion unobserved for the whole blind window — the
+        // exact overshoot #614 narrows, reached one path over through the blind gate. The gate now
+        // decides on the anchor's PLAUSIBLE session (raised to the frozen 0.90 high-water mark), so
+        // the swap that was actually due fires despite the stale 0.10 the API last echoed back.
+        let mut daemon = blind_daemon_with_seeded_anchor(0.10, 0.90).await;
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the corrected anchor (0.90 ≥ band) fires the due swap despite the stale-low 0.10 \
+             reading: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the blind u-A"
+        );
+        // The #482 eligibility SLI ALSO records this episode (it shares the corrected arming test), so
+        // the ratification data tracks the swaps the gate actually fires — pinning the
+        // `note_blind_gate_eligibility` half of the correction (reverting it leaves this unfired).
+        assert!(
+            swapped
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindGateEligible { .. })),
+            "the corrected gate turns eligible, so the #482 SLI records the episode: {:?}",
+            swapped.events,
+        );
+        // #614 invariant: the DECISION used the corrected value, but the `blind_preempt` swap line
+        // logs the RAW anchor pct (10) — `session_pct` is the last-known measurement (documented as
+        // the stale pre-blind anchor), never the synthesized correction.
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    session_pct: 10,
+                    ..
+                }
+            )),
+            "the swap line carries the raw stale-low anchor pct, not the correction: {:?}",
+            swapped.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_does_not_fire_on_a_genuinely_low_pre_blind_anchor() {
+        // Issue #619 AC 2: the correction must not OVER-fire. Here the anchor is GENUINELY at 0.10 —
+        // the window's high-water mark AGREES (0.10), so the reading was not stale-low — and a
+        // below-band anchor never arms the gate, exactly as before #619. Distinct from
+        // `blind_swap_below_the_risk_band_does_not_fire` (which seeds NO mark at all): this pins that
+        // the correction is inert when the mark confirms the low reading, rather than a blanket raise.
+        let mut daemon = blind_daemon_with_seeded_anchor(0.10, 0.10).await;
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "a genuinely-low anchor (mark agrees) stays disarmed however long blind: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A unchanged — genuinely below the band"
+        );
+    }
+
     // --- #582 server-`Retry-After` swap-away + circuit-breaker (ADR-0017) ---------------------
 
     /// A warmed three-account daemon replaying the 2026-07-17 incident: u-A active with a
@@ -13465,7 +13650,11 @@ mod tests {
         // Blind, anchor in-band, but at EXACTLY T → OK: the gate arms on a strict `>` (matching
         // `note_blind_gate_eligibility`), so at T it is not yet armed. No server hold either.
         let ok = blind_active_view(
-            Some(near_band),
+            // No high-water mark → no #619 correction: these cases exercise the raw anchor.
+            AnchorArmInputs {
+                last_good: Some(near_band),
+                high_water: None,
+            },
             true,
             false,
             false,
@@ -13485,7 +13674,10 @@ mod tests {
 
         // One second past T with the anchor in-band → DEGRADED (mirrors the gate exactly).
         let degraded = blind_active_view(
-            Some(near_band),
+            AnchorArmInputs {
+                last_good: Some(near_band),
+                high_water: None,
+            },
             true,
             false,
             false,
@@ -13509,7 +13701,10 @@ mod tests {
             at: base,
         };
         let ok_below = blind_active_view(
-            Some(below_band),
+            AnchorArmInputs {
+                last_good: Some(below_band),
+                high_water: None,
+            },
             true,
             false,
             false,
@@ -13529,7 +13724,10 @@ mod tests {
         // "auto-protection OK" while the daemon sits on a below-band account blind behind a
         // directive. At exactly T the strict `>` gate is not yet armed, mirroring the anchor arm.
         let degraded_below = blind_active_view(
-            Some(below_band),
+            AnchorArmInputs {
+                last_good: Some(below_band),
+                high_water: None,
+            },
             true,
             false,
             true,
@@ -13543,7 +13741,10 @@ mod tests {
             "a below-band anchor held by a server Retry-After past T IS DEGRADED (issue #582)",
         );
         let ok_below_at_t = blind_active_view(
-            Some(below_band),
+            AnchorArmInputs {
+                last_good: Some(below_band),
+                high_water: None,
+            },
             true,
             false,
             true,
@@ -13569,13 +13770,21 @@ mod tests {
         let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
         // A live reading (not blind) → no projection, even with an in-band anchor past T. (A server
         // hold cannot exist without blindness anyway; `false` here, and it makes no difference.)
-        assert!(blind_active_view(Some(anchor), false, false, false, None, 0.95, past_t).is_none());
+        let anchor_only = AnchorArmInputs {
+            last_good: Some(anchor),
+            high_water: None,
+        };
+        assert!(blind_active_view(anchor_only, false, false, false, None, 0.95, past_t).is_none());
         // Blind but NO retained anchor (a genuinely-unknown active) → no spurious projection (#450),
         // even with a server hold — the #582 arm keys off the anchor too, exactly like `blind_swap`.
-        assert!(blind_active_view(None, true, false, true, None, 0.95, past_t).is_none());
+        let no_anchor = AnchorArmInputs {
+            last_good: None,
+            high_water: None,
+        };
+        assert!(blind_active_view(no_anchor, true, false, true, None, 0.95, past_t).is_none());
         // Blind WITH an anchor but QUARANTINED (dead, #42) → the emergency_swap path owns it, not
         // bounded blindness (ADR-0017 keeps the two separate).
-        assert!(blind_active_view(Some(anchor), true, true, false, None, 0.95, past_t).is_none());
+        assert!(blind_active_view(anchor_only, true, true, false, None, 0.95, past_t).is_none());
     }
 
     #[test]
@@ -13599,7 +13808,10 @@ mod tests {
         // Blind ~23 min past the anchor: 0.29 + 0.0005 × 1.75 × 1380 ≈ 1.50 ≫ 0.95 → DEGRADED, on the
         // velocity arm ALONE (anchor below band, no server hold — the two older arms are both silent).
         let degraded = blind_active_view(
-            Some(below_band),
+            AnchorArmInputs {
+                last_good: Some(below_band),
+                high_water: None,
+            },
             true,
             false,
             false,
@@ -13663,6 +13875,76 @@ mod tests {
             samples: MIN_VELOCITY_SAMPLES,
         });
         assert!(!blind_velocity_projected_armed(1380, 0.29, crawl, trigger));
+    }
+
+    #[test]
+    fn blind_active_view_degrades_on_a_stale_low_anchor_corrected_into_band() {
+        // Issue #619: the status projection tracks the CORRECTED gate, not the raw anchor. A pre-blind
+        // anchor whose RAW session sits below the risk band but whose frozen high-water mark stands
+        // in-band is a stale-low reading — the #452 gate arms and swaps on the corrected value, so
+        // `status` must ALSO degrade, never report false-"OK" while the daemon is actually protecting
+        // (the one-sided #479/#582/#584 honesty invariant, reached here through the #619 correction).
+        let base = Instant::now();
+        let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
+        let stale_low = LastGood {
+            session: BLIND_GATE_RISK_BAND - 0.20, // raw, below the band
+            weekly: 0.20,
+            at: base,
+        };
+        // The window's TRUE high-water (an earlier plausible reading), in-band.
+        let mark = swap::SessionHighWater::fold(
+            None,
+            &Usage {
+                session: BLIND_GATE_RISK_BAND + 0.10,
+                weekly: 0.20,
+                weekly_resets_at: None,
+                session_resets_at: Some(WINDOW),
+            },
+        );
+
+        // Control — on the RAW anchor (no mark) the arm reads below the band and reports OK: the bug.
+        let raw = blind_active_view(
+            AnchorArmInputs {
+                last_good: Some(stale_low),
+                high_water: None,
+            },
+            true,
+            false,
+            false,
+            None,
+            0.95,
+            past_t,
+        )
+        .expect("a blind active account with an anchor projects a state");
+        assert!(
+            !raw.auto_protection_degraded,
+            "control: keyed off the raw stale-low anchor the arm reports OK — the bug #619 fixes",
+        );
+
+        // Corrected against the mark → DEGRADED, mirroring the swap `blind_swap` actually fires.
+        let corrected = blind_active_view(
+            AnchorArmInputs {
+                last_good: Some(stale_low),
+                high_water: mark,
+            },
+            true,
+            false,
+            false,
+            None,
+            0.95,
+            past_t,
+        )
+        .expect("still projects a state past T");
+        assert!(
+            corrected.auto_protection_degraded,
+            "past T a stale-low anchor corrected into the band is DEGRADED, not false-OK (issue #619)",
+        );
+        // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
+        assert_eq!(
+            corrected.last_known_session_pct,
+            to_pct(stale_low.session),
+            "the displayed last-known % is the raw anchor, never the synthesized correction",
+        );
     }
 
     #[test]

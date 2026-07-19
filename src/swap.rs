@@ -645,6 +645,43 @@ pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -
     }
 }
 
+/// The plausibility-corrected session fraction of a retained PRE-BLIND ANCHOR (issue #619) — the
+/// blind-gate peer of [`plausible_session`]. Returns `anchor_session` raised to `mark`'s high-water
+/// fraction when it sits below it (the anchor's own pre-blind reading came back stale/cache-lagged),
+/// else `anchor_session` unchanged (a plausible anchor, a `None` mark → the pre-#619 value stands).
+///
+/// The #450 anchor is the last reading before the active account went blind. If THAT reading was
+/// stale-low, keying the #452 bounded-blindness gate off it under-reads the account and declines an
+/// otherwise-due preemptive swap — the exact stale-low failure #614 fixed for the LIVE swap arms,
+/// reached one path over through the blind gate. The correction is computed for the gate DECISION
+/// only and NEVER stored: `last_good` and every surface that reads it as a MEASUREMENT (the
+/// `blind_preempt` swap line's `session_pct`, `status`'s last-known %, `Event::BlindWindow`) keep
+/// the RAW value — the same read-time-only contract [`plausible_session`] draws for the
+/// reactive/projective arms, so no synthesized value lands in a raw-measurement surface.
+///
+/// One anchor consumer is a DECISION read yet deliberately left RAW: the #584 velocity projection
+/// ([`crate::daemon`]'s `blind_velocity_projected_armed`), which bases `status`'s third degradation
+/// arm on the anchor. It is out of #619's scope (the #452 gate only), NOT a measurement. Residual:
+/// an anchor whose CORRECTED value still sits below the risk band (so the #452 arm stays disarmed)
+/// projects that arm off the stale-low RAW base, so `status` can under-report degradation there.
+/// Bounded to the `status` projection; no swap path reads that predicate.
+///
+/// Unlike [`plausible_session`] this takes NO window stamp and does NO window match — sound for the
+/// ANCHOR case SPECIFICALLY: the caller consults the ACTIVE account's own `session_high_water`, which
+/// is folded ONLY on that account's successful polls, in the same poll-fold iteration that refreshes
+/// the anchor. A blind episode has NO successful active polls, so through it the mark and the anchor
+/// are BOTH frozen at the last live poll and name the SAME session window by construction. The
+/// cross-window case [`plausible_session`]'s stamp match exists to reject — a FRESH low reading in a
+/// NEW window whose mark still holds the OLD window's floor — is therefore unreachable here (`fold`'s
+/// own max keeps the mark from being dragged below the true high-water by the stale-low reading it
+/// corrects). Do NOT call this on a fresh reading; use [`plausible_session`], which window-matches.
+pub(crate) fn plausible_anchor_session(mark: Option<SessionHighWater>, anchor_session: f64) -> f64 {
+    match mark {
+        Some(m) if m.session > anchor_session => m.session,
+        _ => anchor_session,
+    }
+}
+
 /// The result of a completed [`swap`]. The token reroute (the swap proper)
 /// succeeded; these two fields report the best-effort, display-only follow-ups so
 /// the caller (#7) can log or act without re-reading the keychain itself.
@@ -1623,6 +1660,28 @@ mod tests {
             SwapDecision::Swap,
             "decided on the plausible reading, the due swap still fires",
         );
+    }
+
+    #[test]
+    fn plausible_anchor_session_raises_a_stale_low_anchor_to_the_mark() {
+        // Issue #619, the correction the #452 blind gate decides on: the pre-blind anchor's stale-low
+        // session is raised to the frozen window high-water mark — a genuine LOWER bound on the truth —
+        // so a cache-lagged reading arriving just before the account went blind cannot write a
+        // below-band anchor that then cancels the otherwise-due preemptive swap.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert_eq!(plausible_anchor_session(mark, 0.40), 0.88);
+    }
+
+    #[test]
+    fn plausible_anchor_session_is_a_no_op_on_a_plausible_or_unmarked_anchor() {
+        // A plausible anchor (at or above the mark) passes through UNCHANGED — the guard is inert
+        // outside the stale-low case — and a `None` mark (an account never polled with a parseable
+        // `session_resets_at`, so `fold` never seeded one) leaves the anchor as-is: the pre-#619
+        // value stands, never a fabricated raise off absent evidence.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert_eq!(plausible_anchor_session(mark, 0.91), 0.91);
+        assert_eq!(plausible_anchor_session(mark, 0.88), 0.88);
+        assert_eq!(plausible_anchor_session(None, 0.40), 0.40);
     }
 
     // --- the swap engine (#6) ---
