@@ -718,6 +718,22 @@ pub(crate) fn to_pct(fraction: f64) -> u8 {
     (fraction * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
+/// A usage fraction as an EXACT percent — neither rounded nor clamped, unlike [`to_pct`].
+///
+/// The conversion for values that are NOT readings: a PROJECTION (routinely over `1.0` — a steep
+/// rate carried across the horizon), a per-second RATE (far below the `u8` resolution — rounding it
+/// to a whole percent would erase the signal entirely), and a jittered CEILING draw (not a round
+/// number). Rounding or clamping any of those would destroy exactly the precision that makes the
+/// #634 projection ingredients reconstructable, so they take this conversion and carry their own
+/// decimals at render time.
+///
+/// The single place the daemon's internal fraction-per-unit domain becomes the log's percent domain
+/// for those values — the unit boundary is load-bearing (issue #634), so it lives in one function
+/// beside [`to_pct`] rather than as scattered `× 100.0`.
+pub(crate) fn to_pct_exact(fraction: f64) -> f64 {
+    fraction * 100.0
+}
+
 /// The daemon-side credential-health rollup (issue #119, extended by #137) — a PURE function
 /// of one account's health inputs, its fresh-reading liveness signal, and the wall clock, so
 /// it is unit-tested directly and computed identically for the display snapshot and the

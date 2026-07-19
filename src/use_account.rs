@@ -776,6 +776,8 @@ where
         to: target_label.clone(),
         reason,
         session_pct: 0,
+        // Manual / forced (or adopt-recovery) swap: not a projection-driven decision (issue #634).
+        projection: None,
     })?;
 
     // 5. For an adopt-target recovery, tell the operator what the recovery did: the

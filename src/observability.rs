@@ -502,6 +502,111 @@ impl ImportRollup {
     }
 }
 
+/// The PROJECTION a #539 velocity-preemptive swap fired on (issue #634) — the ingredients that make
+/// the decision self-explaining, carried on its [`Event::Swap`] as optional trailing tokens.
+///
+/// Both preemptive arms decide on a PROJECTION while the log recorded only the OBSERVED reading, so a
+/// `reason=velocity_preempt` line at `session_pct=70` read like a bug when it had in fact fired on
+/// `70 + rate × horizon >= ceiling`. Re-deriving that offline is not possible: the durable
+/// [`Event::UsageVelocity`] carries a ROUNDED `i16` percent delta, not the full-precision EMA the
+/// decision projected from. So the ingredient is PERSISTED here rather than re-folded.
+///
+/// The CONSTANTS IN FORCE are stamped alongside the ingredient, deliberately — a reader must never
+/// have to apply TODAY's constants to an OLD record. `ceiling_pct` is therefore the EFFECTIVE ceiling
+/// this decision actually compared against ([`crate::swap::effective_ceiling`] of the tick's ceiling
+/// draw — the configured ceiling less the tail margin), not the raw configured ceiling: stamping the
+/// comparand makes the whole predicate `projected_pct >= ceiling_pct` checkable from the line alone,
+/// with no knowledge of the tail margin or of which ceiling semantics were in force at write time.
+///
+/// Every field is a bare number — a percent, a rate, or a duration — never a token or email
+/// (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SwapProjection {
+    /// The projected session usage at the horizon, as a PERCENT — `observed + rate × horizon`,
+    /// the value that crossed the ceiling and fired the swap.
+    ///
+    /// Deliberately an UNCLAMPED, unrounded percent (rendered to 2 decimals), unlike the `u8`
+    /// `session_pct` beside it: a projection routinely exceeds 100 (a steep rate over a 120 s
+    /// horizon), and clamping it to the `u8` reading domain would erase exactly the "how far over
+    /// did this project?" signal the field exists to record.
+    ///
+    /// Stored DIRECTLY at full precision, so no reconstruction is needed — `projected_pct >=
+    /// ceiling_pct` reproduces the fire decision exactly. A reader who instead cross-checks it
+    /// against the DISPLAYED anchor as `projected_pct ≟ session_pct + rate_pct_per_sec × horizon_secs`
+    /// should expect ±0.5 pp of slack: `projected_pct` was computed from the unrounded fraction while
+    /// the `session_pct` beside it carries the `u8` field's rounding (the same anchor-rounding caveat
+    /// [`BlindVelocity`] notes for its own offline recomputation).
+    pub(crate) projected_pct: f64,
+    /// The #539 EMA rate the projection was taken at, in **PERCENT PER SECOND**.
+    ///
+    /// Converted from the daemon's internal fraction-per-second at the emit so it is dimensionally
+    /// consistent with the percent-valued `session_pct` / `projected_pct` / `ceiling_pct` beside it
+    /// — an offline reader recomputes the projection from the line's own tokens with no unit
+    /// conversion. FULL PRECISION (rendered to 6 decimals), not the rounded `i16` percent delta of
+    /// [`Event::UsageVelocity`], which is too lossy to reproduce a decision.
+    pub(crate) rate_pct_per_sec: f64,
+    /// The projection horizon in whole seconds — the daemon's `session_velocity_horizon_secs` at
+    /// the decision (an operator tunable, so it is stamped rather than assumed).
+    pub(crate) horizon_secs: u64,
+    /// The EFFECTIVE ceiling the projection was compared against, as a PERCENT — the tick's ceiling
+    /// draw less the post-swap committed-tail margin ([`crate::swap::effective_ceiling`]). The
+    /// comparand itself, so `projected_pct >= ceiling_pct` reproduces the fire decision exactly;
+    /// rendered to 2 decimals because the draw is per-cycle jittered, not a round number.
+    pub(crate) ceiling_pct: f64,
+}
+
+/// The retained #539 velocity signal in force during a blind window (issue #634) — the ingredient
+/// that makes the report-only blind velocity-projection arm reconstructable offline, carried on
+/// [`Event::BlindWindow`] as optional trailing tokens.
+///
+/// The blind arm ([`crate::daemon`]'s `blind_velocity_projected_armed`, issues #584/#600) reports a
+/// blind account whose stale anchor, carried forward at its retained EMA rate, plausibly reaches the
+/// ceiling before the daemon sees it again. It fires no swap and emits no event of its own, so its
+/// inputs were invisible. `rate` is the missing one — the anchor (`session_pct`) and the window
+/// (`duration_secs`) are already on the line.
+///
+/// Following the house log-the-ingredients / derive-the-views-offline idiom, the DERIVED projection
+/// is deliberately NOT stored: an offline reader recomputes
+/// `projected = session_pct + rate_pct_per_sec × inflation × duration_secs` and compares it against
+/// `ceiling_pct` — every term present on the one line. (The anchor term carries the `session_pct`
+/// field's existing `u8` rounding, so a recomputed projection inherits up to ±0.5 pp of anchor error;
+/// over any window long enough to arm the gate the rate term dominates it.)
+///
+/// Both constants are STAMPED rather than left to be re-derived, so a record stays interpretable
+/// after either drifts — an offline reader applying today's inflation factor or today's ceiling to an
+/// old window would silently mis-report it.
+///
+/// Present only when the arm had a USABLE signal: a retained EMA that is SUSTAINED
+/// (`>= MIN_VELOCITY_SAMPLES` blended intervals). Absent tokens therefore mean "no sustained velocity
+/// — this arm could not have armed here", never "unknown".
+///
+/// Every field is a bare number, never a token or email (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BlindVelocity {
+    /// The retained #539 EMA rate at the arm, in **PERCENT PER SECOND** — the rate in force through
+    /// the blind window, converted from the daemon's internal fraction-per-second at the emit so it
+    /// is dimensionally consistent with the percent-valued `session_pct` anchor beside it.
+    ///
+    /// Genuinely the PRE-BLIND rate, not a post-recovery one: the velocity fold requires a previous
+    /// live reading, which a blind window by definition cleared, so the recovery poll cannot blend
+    /// into the EMA before this event is emitted. FULL PRECISION (rendered to 6 decimals) — this is
+    /// a load-bearing contract for the offline recomputation (issue #636 recomputes `projected` from
+    /// this token), and the rounded `i16` delta of [`Event::UsageVelocity`] would not reproduce it.
+    pub(crate) rate_pct_per_sec: f64,
+    /// The worst-case rate-inflation factor in force ([`crate::daemon`]'s
+    /// `BLIND_VELOCITY_RATE_INFLATION`) — the multiplicative bias-HIGH bound the arm applies to the
+    /// EMA before projecting the stale anchor forward. Stamped because it is an interim,
+    /// ratification-pending constant: it is expected to move, and an old record must not be read
+    /// through a new value.
+    pub(crate) inflation: f64,
+    /// The session ceiling the projection is compared against, as a PERCENT — the BASE (un-jittered)
+    /// ceiling, which is what this arm projects against. Distinct from [`SwapProjection`]'s
+    /// `ceiling_pct`, which is the *effective* (tail-margin-subtracted) ceiling of the per-tick
+    /// jittered draw: the two arms genuinely compare against different lines, so each stamps its own
+    /// comparand rather than a shared one an offline reader would have to disambiguate.
+    pub(crate) ceiling_pct: f64,
+}
+
 /// One observable daemon state change, rendered as a single `key=val` log line by
 /// [`Event::to_log_line`].
 ///
@@ -524,6 +629,13 @@ pub(crate) enum Event {
         to: String,
         reason: SwapReason,
         session_pct: u8,
+        /// The projection that fired a #539 velocity-preemptive swap (issue #634) — `Some` for
+        /// `reason=velocity_preempt` (the arm cannot fire without one), `None` for every other
+        /// reason, whose decision is fully described by the observed `session_pct` already.
+        ///
+        /// Rendered as additive trailing tokens, so a non-projective swap line stays byte-for-byte
+        /// unchanged. See [`SwapProjection`].
+        projection: Option<SwapProjection>,
     },
     /// `account`'s canonical credential changed underneath the daemon — the
     /// operator ran `claude /login` and re-authenticated it — so its stash was
@@ -968,6 +1080,13 @@ pub(crate) enum Event {
         session_pct: u8,
         session_at_recovery: u8,
         near_limit: bool,
+        /// The retained #539 velocity signal in force through this blind window (issue #634), or
+        /// `None` when no SUSTAINED EMA was retained — in which case the report-only blind
+        /// velocity-projection arm could not have armed here at all.
+        ///
+        /// Rendered as additive trailing tokens, so a window with no retained velocity leaves the
+        /// line byte-for-byte unchanged. See [`BlindVelocity`].
+        velocity: Option<BlindVelocity>,
     },
     /// An account ENTERED a blind window (issue #583, umbrella #363 Path B): the poll that just
     /// cleared its [`crate::daemon`] `last_readings` slot took it from a live reading to none — a
@@ -1128,6 +1247,7 @@ impl Event {
                 to,
                 reason,
                 session_pct,
+                projection,
             } => {
                 let reason = reason.as_str();
                 // `late=true` marks a swap whose outgoing account was already at the
@@ -1141,8 +1261,24 @@ impl Event {
                 } else {
                     ""
                 };
+                // The #539 projection ingredients (issue #634), so a `reason=velocity_preempt` line
+                // explains its own decision — `projected >= ceiling` is checkable from the line
+                // alone — instead of reading like a bug at a below-trigger `session_pct`. Trailing
+                // and conditional, exactly like `late=` above: absent for every non-projective
+                // swap, so those lines are byte-for-byte unchanged, and the tolerant `key=val`
+                // field-map parsers (`usage_stats::parse_swap_events`, `reliability::parse_events`)
+                // are unaffected. `rate` carries 6 decimals — full precision, because a rounded
+                // rate cannot reproduce a decision (see `SwapProjection`); the percents carry 2.
+                // Numbers only, never a token / email (#15).
+                let projection = match projection {
+                    Some(p) => format!(
+                        " projected={:.2} rate={:.6} horizon={} ceiling={:.2}",
+                        p.projected_pct, p.rate_pct_per_sec, p.horizon_secs, p.ceiling_pct
+                    ),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=swap from={from} to={to} reason={reason} session_pct={session_pct}{late}"
+                    "ts={ts} event=swap from={from} to={to} reason={reason} session_pct={session_pct}{late}{projection}"
                 )
             }
             Event::ReStash { account } => {
@@ -1521,6 +1657,7 @@ impl Event {
                 session_pct,
                 session_at_recovery,
                 near_limit,
+                velocity,
             } => {
                 // The active account's blind-window CLOSE (issue #449) + the post-recovery
                 // swap-necessity SLI (issue #482). All bare numbers + a bool (#15): how long it was
@@ -1529,8 +1666,27 @@ impl Event {
                 // risk band. `session_at_recovery` vs `session_pct` reconciles a stale-anchor swap as
                 // necessary-vs-wasted (the threshold left to #451/#484). `acct=` is the UUID, matching
                 // the usage-family lines.
+                //
+                // Issue #634: the retained #539 velocity in force through the window trails as
+                // additive optional tokens, so the report-only blind velocity-projection arm
+                // (#584/#600) — which fires no swap and emits no event of its own — becomes
+                // reconstructable offline from THIS line:
+                // `projected = session_pct + rate × inflation × duration_secs`, armed iff it reaches
+                // `ceiling`. The derived projection is deliberately NOT stored (log the ingredients,
+                // derive the views), while the two CONSTANTS are, so a drift in either cannot make an
+                // old record read wrong. Absent when no sustained EMA was retained — a line the arm
+                // could not have armed on — leaving it byte-for-byte unchanged. `rate` carries 6
+                // decimals: it is the load-bearing contract for that recomputation, and the rounded
+                // `usage_velocity` delta cannot reproduce it. Numbers only, never a token / email.
+                let velocity = match velocity {
+                    Some(v) => format!(
+                        " rate={:.6} inflation={:.2} ceiling={:.2}",
+                        v.rate_pct_per_sec, v.inflation, v.ceiling_pct
+                    ),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}"
+                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}{velocity}"
                 )
             }
             Event::BlindEnter {
@@ -2199,6 +2355,7 @@ mod tests {
             to: "spare".to_owned(),
             reason: SwapReason::Session,
             session_pct: 97,
+            projection: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -2217,6 +2374,7 @@ mod tests {
             to: "spare".to_owned(),
             reason: SwapReason::Session,
             session_pct: 100,
+            projection: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -2235,6 +2393,7 @@ mod tests {
             to: "spare".to_owned(),
             reason: SwapReason::Session,
             session_pct: 99,
+            projection: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -2251,6 +2410,7 @@ mod tests {
             to: "spare".to_owned(),
             reason: SwapReason::Weekly,
             session_pct: 40,
+            projection: None,
         }
         .to_log_line(at_epoch(0));
         assert!(line.contains("reason=weekly"), "got: {line}");
@@ -2264,11 +2424,17 @@ mod tests {
         // `late=` marker (a projective swap fires while observed < trigger ≤ 99, so it is never late).
         // The line is redaction-clean (#15): only the operator HANDLES + a percent, never the email
         // or token — the same single-surface discipline every other swap reason rides.
+        //
+        // Issue #634: with `projection: None` (the pre-#634 shape) the line is BYTE-FOR-BYTE what it
+        // was before the field existed — the projection tokens are strictly additive, so an old log
+        // and the tolerant field-map parsers are unaffected. The WITH-projection rendering is
+        // asserted separately by `swap_line_appends_the_projection_ingredients_for_a_velocity_preempt`.
         let line = Event::Swap {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::VelocityPreempt,
             session_pct: 92,
+            projection: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -2278,6 +2444,47 @@ mod tests {
         assert!(
             !line.contains("late"),
             "a projective swap is never late: {line}"
+        );
+    }
+
+    #[test]
+    fn swap_line_appends_the_projection_ingredients_for_a_velocity_preempt() {
+        // Issue #634: the projective swap that fired at an OBSERVED session_pct=70 is
+        // SELF-EXPLAINING — the projection it decided on trails as additive tokens, so the offline
+        // reader sees `projected=96.30 >= ceiling=89.00` and understands why a below-trigger reading
+        // swapped. The ingredient (`rate`) is FULL PRECISION (6 decimals) — a rounded rate cannot
+        // reproduce the decision — and the constants IN FORCE (horizon, effective ceiling) are
+        // stamped beside it, so the record stays interpretable if either tunable later drifts.
+        // Percents render to 2 decimals, the rate to 6. Redaction-clean (#15): every new token is a
+        // bare number.
+        let line = Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::VelocityPreempt,
+            session_pct: 70,
+            projection: Some(SwapProjection {
+                projected_pct: 96.3,
+                rate_pct_per_sec: 0.218333,
+                horizon_secs: 120,
+                ceiling_pct: 89.0,
+            }),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=swap from=work to=spare reason=velocity_preempt session_pct=70 projected=96.30 rate=0.218333 horizon=120 ceiling=89.00"
+            )
+        );
+        // The reader can reproduce the fire decision from the line's own tokens: the projection is
+        // at/over the stamped effective ceiling.
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no email sigil (#15): {line}"
+        );
+        assert!(
+            !line.to_lowercase().contains("token"),
+            "no token (#15): {line}"
         );
     }
 
@@ -2298,6 +2505,9 @@ mod tests {
             to: "spare".to_owned(),
             reason: SwapReason::BlindPreempt,
             session_pct: 68,
+            // The blind-preempt swap carries no projection on its own line (issue #634): the
+            // retained velocity rides the paired `blind_window` event instead.
+            projection: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -3034,6 +3244,33 @@ mod tests {
                 to: "spare".to_owned(),
                 reason: SwapReason::Session,
                 session_pct: 97,
+                projection: None,
+            },
+            // Issue #634: the projection-carrying + velocity-carrying variants ride the same
+            // redaction sweep — the new tokens are bare numbers, so they add no email/token surface.
+            Event::Swap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+                reason: SwapReason::VelocityPreempt,
+                session_pct: 70,
+                projection: Some(SwapProjection {
+                    projected_pct: 96.5,
+                    rate_pct_per_sec: 0.221667,
+                    horizon_secs: 120,
+                    ceiling_pct: 89.0,
+                }),
+            },
+            Event::BlindWindow {
+                account: "work".to_owned(),
+                duration_secs: 480,
+                session_pct: 29,
+                session_at_recovery: 61,
+                near_limit: false,
+                velocity: Some(BlindVelocity {
+                    rate_pct_per_sec: 0.05,
+                    inflation: 1.75,
+                    ceiling_pct: 95.0,
+                }),
             },
             Event::AllExhausted {
                 hold: "work".to_owned(),
@@ -3138,6 +3375,7 @@ mod tests {
             to: "spare".to_owned(),
             reason: SwapReason::Session,
             session_pct: 97,
+            projection: None,
         })
         .unwrap();
         log.emit(&Event::Monitor401 {
@@ -3183,6 +3421,7 @@ mod tests {
                 to: "spare".to_owned(),
                 reason,
                 session_pct: 0,
+                projection: None,
             }
             .to_log_line(at_epoch(0));
             assert_eq!(
@@ -3651,6 +3890,8 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             session_pct: 96,
             session_at_recovery: 98,
             near_limit: true,
+            // No retained velocity — the line is byte-for-byte the pre-#634 shape (additive tokens).
+            velocity: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -3671,11 +3912,52 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             session_pct: 40,
             session_at_recovery: 42,
             near_limit: false,
+            velocity: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             line,
             format!("{TS0} event=blind_window acct=u-B duration_secs=90 session_pct=40 session_at_recovery=42 near_limit=false")
+        );
+    }
+
+    #[test]
+    fn blind_window_line_appends_the_retained_velocity_ingredients() {
+        // Issue #634: the retained #539 velocity in force through the window trails the line, so the
+        // REPORT-ONLY blind velocity-projection arm (#584/#600) — which fires no swap and emits no
+        // event of its own — is reconstructable OFFLINE from this one line. Here a 29 % anchor was
+        // blind for 8 min (480 s) at 0.05 %/s, inflated 1.75× against the 95 % base ceiling:
+        // `projected = 29 + 0.05 × 1.75 × 480 = 71 %` — below the ceiling, so the arm would NOT have
+        // armed; the log records the ingredients regardless so the offline reader draws that
+        // conclusion itself. `rate` is FULL PRECISION (6 decimals) — a rounded rate cannot reproduce
+        // the projection — and both CONSTANTS (inflation, ceiling) are stamped so a drift in either
+        // cannot make this old record read wrong. Redaction-clean (#15): bare numbers only.
+        let line = Event::BlindWindow {
+            account: "u-A".to_owned(),
+            duration_secs: 480,
+            session_pct: 29,
+            session_at_recovery: 61,
+            near_limit: false,
+            velocity: Some(BlindVelocity {
+                rate_pct_per_sec: 0.05,
+                inflation: 1.75,
+                ceiling_pct: 95.0,
+            }),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_window acct=u-A duration_secs=480 session_pct=29 session_at_recovery=61 near_limit=false rate=0.050000 inflation=1.75 ceiling=95.00"
+            )
+        );
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no email sigil (#15): {line}"
+        );
+        assert!(
+            !line.to_lowercase().contains("token"),
+            "no token (#15): {line}"
         );
     }
 
@@ -3895,6 +4177,13 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 session_pct: 97,
                 session_at_recovery: 99,
                 near_limit: true,
+                // Issue #634: the velocity ingredients ride this #15/#444 sweep too — bare numbers,
+                // no email/token/label surface added.
+                velocity: Some(BlindVelocity {
+                    rate_pct_per_sec: 0.045,
+                    inflation: 1.75,
+                    ceiling_pct: 95.0,
+                }),
             }
             .to_log_line(at_epoch(0)),
             Event::BlindEnter {
