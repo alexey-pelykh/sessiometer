@@ -17,9 +17,9 @@ use crate::observability::{Event, RefreshEventOutcome};
 /// Time seam: the daemon reads "now" and sleeps until the next poll through
 /// this, so a fake can drive time and make the loop run instantly in tests.
 pub(crate) trait Clock {
-    /// The current instant.
+    /// The current instant, INCLUDING any time the host spent asleep.
     ///
-    /// # Suspend/resume assumption (issue #615)
+    /// # Suspend/resume contract (issues #615, #624)
     ///
     /// Callers that measure a RATE across two readings — chiefly the session-velocity interval in
     /// [`crate::daemon`], which divides a usage delta by
@@ -34,15 +34,32 @@ pub(crate) trait Clock {
     /// `observed + rate × horizon` reaches the effective ceiling sooner, and the reactive fire point
     /// `effective_ceiling - velocity × poll_gap`
     /// ([`crate::swap::reactive_session_threshold`]) is dragged down toward the observed reading.
-    /// macOS `Instant` semantics across sleep are platform/version-dependent and [`RealClock`] makes
-    /// no explicit boottime choice, so the requirement is stated here rather than assumed silently.
     ///
-    /// The daemon test `a_suspend_resume_gap_neither_spurious_swaps_nor_misses_one` pins the half of
-    /// this that IS testable: driving a fake clock, it fixes the FOLD's arithmetic — the rate is the
-    /// usage delta over the FULL measured gap — so a regression that clamped or discarded a long
-    /// interval fails there. No test can observe a real machine's sleep, so this requirement is
-    /// DOCUMENTED but not yet GUARANTEED. Settling the macOS semantics empirically and, if
-    /// warranted, moving [`RealClock`] onto an explicit boottime source is tracked as issue #624.
+    /// ## `std`'s `Instant` does NOT satisfy this on macOS — settled by issue #624
+    ///
+    /// `Instant::now()` on Apple targets reads `CLOCK_UPTIME_RAW`, which `man 3 clock_gettime`
+    /// defines as the clock that "does not increment while the system is asleep" and whose value
+    /// "is identical to the result of `mach_absolute_time()`". That holds across the WHOLE supported
+    /// toolchain range — the crate pins no `rust-toolchain.toml`, so the range is MSRV 1.87.0
+    /// (`Cargo.toml` `rust-version`, CI `RUST_MSRV`) through the CI-pinned stable 1.96.0
+    /// (`RUST_STABLE`), and the two ends select it in different files but identically:
+    ///
+    /// - 1.87.0 — `library/std/src/sys/pal/unix/time.rs`: `const clock_id = libc::CLOCK_UPTIME_RAW`
+    /// - 1.96.0 — `library/std/src/sys/time/unix.rs`: `const CLOCK_ID = libc::CLOCK_UPTIME_RAW`
+    ///
+    /// both under `#[cfg(target_vendor = "apple")]`, each quoting that man-page text verbatim as its
+    /// rationale. A probe on macOS 26.5 confirms the value domain empirically under both toolchains:
+    /// `Instant`'s `Debug` timespec equals `clock_gettime(CLOCK_UPTIME_RAW)` to sub-microsecond, and
+    /// that in turn equals `mach_absolute_time()` exactly. (Issue #615 could not settle this from a
+    /// live probe because its host had not slept since boot, making `mach_continuous_time ==
+    /// mach_absolute_time` — the comparison was degenerate. Reading which clock `std` selects, then
+    /// applying Apple's documented semantics for THAT clock, needs no sleeping host.)
+    ///
+    /// [`RealClock`] therefore does NOT return a bare `Instant::now()` — it adds back the sleep that
+    /// clock skipped, so this contract is GUARANTEED rather than merely documented. The daemon test
+    /// `a_suspend_resume_gap_neither_spurious_swaps_nor_misses_one` pins the FOLD's half: driving a
+    /// fake clock, it fixes the arithmetic — the rate is the usage delta over the FULL measured gap
+    /// — so a regression that clamped or discarded a long interval fails there.
     fn now(&self) -> Instant;
     /// Sleep for `interval` — the (jittered) wait until the next poll, computed
     /// per cycle by the daemon (issue #38). The clock no longer owns the
@@ -50,7 +67,8 @@ pub(crate) trait Clock {
     async fn tick(&self, interval: Duration);
 }
 
-/// Real clock: monotonic `Instant::now` and a Tokio sleep of the handed interval.
+/// Real clock: a sleep-INCLUSIVE monotonic instant (see [`Clock::now`]) and a Tokio sleep of the
+/// handed interval.
 #[derive(Default)]
 pub(crate) struct RealClock;
 
@@ -60,9 +78,100 @@ impl RealClock {
     }
 }
 
+/// The mach timebase ratio: mach tick counts are in these units, NOT nanoseconds — 1/1 on x86_64,
+/// 125/3 on Apple silicon — so the ratio must be read at runtime, never assumed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+// The three libSystem entry points the sleep-inclusive clock needs (issue #624).
+//
+// Hand-declared rather than taken from `libc`. Two independent reasons, either sufficient:
+// `libc` 0.2.186 exposes only TWO of these three — `mach_absolute_time` and `mach_timebase_info`
+// — and both are `#[deprecated(since = "0.2.55", note = "Use the `mach2` crate instead")]`, which
+// CI's `-D warnings` rejects; and the one doing the actual work here, `mach_continuous_time`, the
+// crate does not expose at all. Following the deprecation note to `mach2` would add a crate to a
+// credential-adjacent supply chain for three argument-less counter reads — exactly the trade
+// `CONTRIBUTING.md`'s minimal-dependency line rejects, and the issue's own steer (a small
+// hand-rolled FFI shim over a time crate). This is the same call the raw `libc::flock` FFI makes
+// (ADR-0004). All three ship in libSystem, which the crate already links; `mach_continuous_time`
+// is macOS 10.12+.
+extern "C" {
+    /// Mach ticks since boot, EXCLUDING time spent asleep — what `Instant::now()` already reads.
+    fn mach_absolute_time() -> u64;
+    /// Mach ticks since boot, INCLUDING time spent asleep. Same epoch and timebase as
+    /// `mach_absolute_time`, so the two differ by exactly the sleep.
+    fn mach_continuous_time() -> u64;
+    /// Writes the tick-to-nanosecond ratio. Returns `KERN_SUCCESS` (0) on success.
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// Convert a mach tick count to a [`Duration`] through the timebase ratio.
+///
+/// Split out from [`slept_since_boot`] because it is the part that can be wrong silently: an
+/// inverted ratio still produces a plausible-looking `Duration`, just off by ~1700x on Apple
+/// silicon. Pure and total, so the unit tests below pin it against both real-world timebases.
+fn ticks_to_duration(ticks: u64, timebase: MachTimebaseInfo) -> Duration {
+    if timebase.denom == 0 {
+        // Unreachable via `mach_timebase_info`; guards the division rather than trusting that.
+        return Duration::ZERO;
+    }
+    let nanos = u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// How long the host has been ASLEEP since boot (issue #624).
+///
+/// `mach_continuous_time - mach_absolute_time`: both count mach ticks from the SAME boot epoch, the
+/// former through sleep and the latter not, so the difference is exactly the accumulated sleep. It
+/// is ZERO on a host that has never slept, which is what makes adding it back a strict no-op until
+/// the first suspend.
+///
+/// Darwin's `CLOCK_MONOTONIC` is the documented sleep-inclusive `clock_gettime` id and would seem
+/// the tidier source, but it is NOT epoch-aligned with `CLOCK_UPTIME_RAW` — measured on macOS 26.5,
+/// the two sit a constant ~4.87 s apart with ZERO drift between samples. Differencing THAT pair
+/// would fold a fixed constant into every reading; the mach pair is the one with a shared origin.
+fn slept_since_boot() -> Duration {
+    // Read continuous FIRST: should the host suspend between these two reads, `absolute` lands after
+    // the wake and the difference UNDER-counts the sleep rather than over-counting it. That is the
+    // safe direction — an over-counted gap would dilute a rate toward a MISSED swap, whereas
+    // under-counting merely leaves this reading as accurate as the un-adjusted clock was.
+    // SAFETY: both are argument-less libSystem reads of a kernel counter, with no preconditions.
+    let continuous = unsafe { mach_continuous_time() };
+    // SAFETY: as above.
+    let absolute = unsafe { mach_absolute_time() };
+
+    let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+    // SAFETY: `mach_timebase_info` writes the two `u32`s of the struct handed to it by pointer;
+    // `timebase` is a live local of exactly that layout (`#[repr(C)]`).
+    if unsafe { mach_timebase_info(&mut timebase) } != 0 {
+        // Unreachable in practice; degrade to "no sleep to add back", i.e. the old behaviour.
+        return Duration::ZERO;
+    }
+    ticks_to_duration(continuous.saturating_sub(absolute), timebase)
+}
+
 impl Clock for RealClock {
     fn now(&self) -> Instant {
-        Instant::now()
+        // `Instant::now()` is macOS's sleep-EXCLUSIVE uptime clock (see [`Clock::now`]); adding back
+        // the sleep it skipped yields the boottime reading this trait's contract requires.
+        //
+        // The offset is re-read EVERY call — it must be, to pick up sleep that happens during the
+        // daemon's lifetime — and `slept_since_boot` samples its two counters a few nanoseconds
+        // apart, so on a slept host the offset carries sub-microsecond jitter and two calls in the
+        // same microsecond can come back out of order. Strict per-call monotonicity is therefore
+        // deliberately NOT promised; forward progress across any real interval is. That is harmless
+        // by construction: every consumer ages a reading with `saturating_duration_since` (a
+        // backward step floors to zero, never negative) over readings taken a full poll apart
+        // (seconds, via `.as_secs()`), so a sub-µs wobble cannot invert a measured interval.
+        let uptime = Instant::now();
+        // `checked_add` cannot realistically overflow — it would take centuries of accumulated
+        // suspend — but saturating to the unadjusted instant keeps even that from panicking a
+        // long-lived daemon.
+        uptime.checked_add(slept_since_boot()).unwrap_or(uptime)
     }
 
     async fn tick(&self, interval: Duration) {
@@ -166,4 +275,105 @@ pub(crate) struct RefreshDelta {
     pub(crate) outcome: RefreshEventOutcome,
     /// Whether CC rotated the refresh token value this cycle (the AC-3 durability signal).
     pub(crate) token_rotated: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two mach timebases that occur in the wild.
+    const APPLE_SILICON: MachTimebaseInfo = MachTimebaseInfo {
+        numer: 125,
+        denom: 3,
+    };
+    const X86_64: MachTimebaseInfo = MachTimebaseInfo { numer: 1, denom: 1 };
+
+    /// The tick-to-nanosecond conversion, pinned against both real timebases. An inverted ratio is
+    /// the silent failure mode this exists to catch: it still yields a plausible `Duration`, just
+    /// ~1736x wrong on Apple silicon.
+    #[test]
+    fn ticks_convert_through_the_real_world_timebases() {
+        // Apple silicon: a 24 MHz counter, so 24e6 ticks is exactly one second.
+        assert_eq!(
+            ticks_to_duration(24_000_000, APPLE_SILICON),
+            Duration::from_secs(1)
+        );
+        // x86_64: mach ticks are already nanoseconds.
+        assert_eq!(
+            ticks_to_duration(1_000_000_000, X86_64),
+            Duration::from_secs(1)
+        );
+        // Zero ticks is zero time on any timebase — the never-slept host's case.
+        assert_eq!(ticks_to_duration(0, APPLE_SILICON), Duration::ZERO);
+    }
+
+    /// A zero denominator degrades to "no sleep to add back" instead of dividing by zero, and a tick
+    /// count large enough to overflow the nanosecond `u64` saturates instead of wrapping to a small
+    /// value — a wrap would silently reverse the correction's effect.
+    #[test]
+    fn tick_conversion_is_total() {
+        let degenerate = MachTimebaseInfo {
+            numer: 125,
+            denom: 0,
+        };
+        assert_eq!(ticks_to_duration(24_000_000, degenerate), Duration::ZERO);
+        assert_eq!(
+            ticks_to_duration(u64::MAX, APPLE_SILICON),
+            Duration::from_nanos(u64::MAX),
+        );
+    }
+
+    /// The accumulated-sleep offset is a property of the HOST, not of the moment it is read, so two
+    /// reads taken while awake must agree. This is the guard against picking a source whose two
+    /// halves drift apart while running — and the reason Darwin's `CLOCK_MONOTONIC` /
+    /// `CLOCK_UPTIME_RAW` pair is not the source here (a constant, but nonzero, epoch offset).
+    #[test]
+    fn accumulated_sleep_does_not_drift_while_awake() {
+        let first = slept_since_boot();
+        std::thread::sleep(Duration::from_millis(50));
+        let second = slept_since_boot();
+        let drift = second.abs_diff(first);
+        assert!(
+            drift < Duration::from_millis(5),
+            "the sleep offset must not advance while the host is awake: {first:?} -> {second:?}",
+        );
+    }
+
+    /// `RealClock::now` is the uptime instant plus exactly that offset — the whole of issue #624's
+    /// fix. On a host that has never slept the offset is zero and this reduces to the old
+    /// `Instant::now()`, which is why the assertion is a bound rather than an equality: it must hold
+    /// on a freshly-booted CI runner AND on a laptop that has suspended for days.
+    #[test]
+    fn real_clock_now_is_the_uptime_instant_plus_accumulated_sleep() {
+        let offset = slept_since_boot();
+        let uptime = Instant::now();
+        let now = RealClock::new().now();
+        // `now` is sampled after `uptime`, so the gap is the offset plus the (sub-ms) wall time
+        // between the two reads — never less than the offset, never much more.
+        let observed = now.saturating_duration_since(uptime);
+        assert!(
+            observed >= offset && observed - offset < Duration::from_millis(50),
+            "expected the uptime instant offset by ~{offset:?}, observed {observed:?}",
+        );
+    }
+
+    /// `RealClock::now` makes forward progress across a real interval — the property the velocity
+    /// divisor actually needs. Deliberately NOT strict per-call monotonicity: the offset is re-read
+    /// each call from two counters sampled a few ns apart, so successive readings can wobble sub-µs
+    /// on a slept host (see [`RealClock::now`]); every consumer absorbs that via
+    /// `saturating_duration_since` over readings a full poll apart. A tight-loop `next >= prev`
+    /// assertion would encode an invariant `now` does not hold — and would pass only on never-slept
+    /// hosts (every CI runner), where the offset is a hard zero, while failing on a laptop that has
+    /// actually suspended.
+    #[test]
+    fn real_clock_now_advances_across_a_real_interval() {
+        let clock = RealClock::new();
+        let start = clock.now();
+        std::thread::sleep(Duration::from_millis(20));
+        let elapsed = clock.now().saturating_duration_since(start);
+        assert!(
+            elapsed >= Duration::from_millis(15),
+            "expected ~20 ms of forward progress, saw {elapsed:?}",
+        );
+    }
 }
