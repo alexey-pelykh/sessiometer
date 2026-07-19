@@ -73,10 +73,14 @@ pub(crate) enum SwapReason {
     /// BYPASSED (#63). Safety behavior is never bypassed — only policy.
     Forced,
     /// The #452 bounded-blindness preemptive gate fired (ADR-0017): the active account
-    /// was blind past `session_blind_swap_secs` with a retained pre-blind anchor at/over
-    /// `session_blind_risk_band` and a viable target existed, so it swapped away before it
-    /// could self-exhaust unobserved. `session_pct` carries the STALE pre-blind anchor —
-    /// the only session signal available while blind — not a fresh reading.
+    /// was blind past `session_blind_swap_secs` with a retained pre-blind anchor — since
+    /// issue #619 plausibility-corrected to its window high-water mark, so a stale-low
+    /// pre-blind reading cannot disarm the gate — at/over `session_blind_risk_band`, and a
+    /// viable target existed, so it swapped away before it could self-exhaust unobserved.
+    /// `session_pct` carries the STALE pre-blind anchor VERBATIM — the only session signal
+    /// available while blind — not a fresh reading, and NOT the #619-corrected value the
+    /// gate decided on (the correction is applied at the decision read, never stored or
+    /// logged, so this field stays a raw measurement).
     BlindPreempt,
     /// The #539 velocity-projection preemptive gate fired (ADR-0017): the active account's
     /// OBSERVED reading was below the trigger, but its projected session usage
