@@ -36,8 +36,8 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
     case nearLimitPollSecs = "near_limit_poll_secs"
     case cooldownSecs = "cooldown_secs"
     case targetMaxSessionUsage = "target_max_session_usage"
-    case sessionTrigger = "session_trigger"
-    case weeklyTrigger = "weekly_trigger"
+    case sessionCeiling = "session_ceiling"
+    case weeklyCeiling = "weekly_ceiling"
     case sessionBlindSwapSecs = "session_blind_swap_secs"
     case sessionBlindRiskBand = "session_blind_risk_band"
     case sessionVelocityHorizonSecs = "session_velocity_horizon_secs"
@@ -53,8 +53,8 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         switch self {
         case .pollSecs, .exhaustedPollSecs, .nearLimitPollSecs, .cooldownSecs:
             return .pollingCooldown
-        case .targetMaxSessionUsage, .sessionTrigger, .weeklyTrigger:
-            return .swapTriggers
+        case .targetMaxSessionUsage, .sessionCeiling, .weeklyCeiling:
+            return .swapCeilings
         case .sessionBlindSwapSecs, .sessionBlindRiskBand:
             return .blindWindow
         case .sessionVelocityHorizonSecs, .sessionVelocityMinProjectAbove, .sessionVelocityEmaAlphaPct:
@@ -73,8 +73,8 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         case .nearLimitPollSecs: return tunables.nearLimitPollSecs
         case .cooldownSecs: return tunables.cooldownSecs
         case .targetMaxSessionUsage: return UInt64(tunables.targetMaxSessionUsage)
-        case .sessionTrigger: return UInt64(tunables.sessionTrigger)
-        case .weeklyTrigger: return UInt64(tunables.weeklyTrigger)
+        case .sessionCeiling: return UInt64(tunables.sessionCeiling)
+        case .weeklyCeiling: return UInt64(tunables.weeklyCeiling)
         case .sessionBlindSwapSecs: return tunables.sessionBlindSwapSecs
         case .sessionBlindRiskBand: return UInt64(tunables.sessionBlindRiskBand)
         case .sessionVelocityHorizonSecs: return tunables.sessionVelocityHorizonSecs
@@ -96,8 +96,8 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         case .nearLimitPollSecs: tunables.nearLimitPollSecs = value
         case .cooldownSecs: tunables.cooldownSecs = value
         case .targetMaxSessionUsage: tunables.targetMaxSessionUsage = value
-        case .sessionTrigger: tunables.sessionTrigger = value
-        case .weeklyTrigger: tunables.weeklyTrigger = value
+        case .sessionCeiling: tunables.sessionCeiling = value
+        case .weeklyCeiling: tunables.weeklyCeiling = value
         case .sessionBlindSwapSecs: tunables.sessionBlindSwapSecs = value
         case .sessionBlindRiskBand: tunables.sessionBlindRiskBand = value
         case .sessionVelocityHorizonSecs: tunables.sessionVelocityHorizonSecs = value
@@ -111,7 +111,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
     /// The form's tunable sections, in display order.
     enum Section: String, CaseIterable, Identifiable {
         case pollingCooldown
-        case swapTriggers
+        case swapCeilings
         case blindWindow
         case velocity
         case connectionHealth
@@ -127,7 +127,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         var title: String {
             switch self {
             case .pollingCooldown: return "Polling & Cooldown"
-            case .swapTriggers: return "Swap Triggers"
+            case .swapCeilings: return "Reserve & Ceilings"
             case .blindWindow: return "Blind-Window Safety"
             case .velocity: return "Velocity Projection"
             case .connectionHealth: return "Connection Health"

@@ -1067,7 +1067,7 @@ pub(crate) enum Event {
     /// The #582 server-`Retry-After` swap-away path was ARMED on the active account but HELD
     /// because firing would have spent the LAST viable target (issue #582). The swap-away is
     /// speculative — it acts on a server directive, not on an observed near-limit reading — so it
-    /// must yield the final target to a CONFIRMED-exhaustion swap (the reactive `session_trigger`
+    /// must yield the final target to a CONFIRMED-exhaustion swap (the reactive `session_ceiling`
     /// path, which fires on evidence) rather than consume it on a guess.
     ///
     /// The AC's "reported, not hidden" surface: without this line the daemon would sit silently
@@ -1932,8 +1932,8 @@ pub(crate) enum Diagnostic {
         accounts: usize,
         poll_secs: u64,
         target_max_session_usage: u8,
-        session_trigger: u8,
-        weekly_trigger: u8,
+        session_ceiling: u8,
+        weekly_ceiling: u8,
         monitor_401_n: u8,
         monitor_recovery_m: u8,
     },
@@ -2019,8 +2019,8 @@ impl Diagnostic {
                 accounts,
                 poll_secs,
                 target_max_session_usage,
-                session_trigger,
-                weekly_trigger,
+                session_ceiling,
+                weekly_ceiling,
                 monitor_401_n,
                 monitor_recovery_m,
             } => {
@@ -2028,8 +2028,8 @@ impl Diagnostic {
                 // like the other counts/percentages (no `off` sentinel to carry).
                 format!(
                     "ts={ts} diag=start accounts={accounts} poll_secs={poll_secs} \
-                     target_max_session_usage={target_max_session_usage} session_trigger={session_trigger} \
-                     weekly_trigger={weekly_trigger} monitor_401_n={monitor_401_n} \
+                     target_max_session_usage={target_max_session_usage} session_ceiling={session_ceiling} \
+                     weekly_ceiling={weekly_ceiling} monitor_401_n={monitor_401_n} \
                      monitor_recovery_m={monitor_recovery_m}"
                 )
             }
@@ -3944,8 +3944,8 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             accounts: 3,
             poll_secs: 30,
             target_max_session_usage: 70,
-            session_trigger: 90,
-            weekly_trigger: 98,
+            session_ceiling: 90,
+            weekly_ceiling: 98,
             monitor_401_n: 5,
             monitor_recovery_m: 4,
         }
@@ -3954,7 +3954,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             line,
             format!(
                 "{TS0} diag=start accounts=3 poll_secs=30 target_max_session_usage=70 \
-                 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4"
+                 session_ceiling=90 weekly_ceiling=98 monitor_401_n=5 monitor_recovery_m=4"
             )
         );
     }
@@ -4095,8 +4095,8 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 accounts: 2,
                 poll_secs: 30,
                 target_max_session_usage: 70,
-                session_trigger: 90,
-                weekly_trigger: 98,
+                session_ceiling: 90,
+                weekly_ceiling: 98,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
             },

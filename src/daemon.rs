@@ -180,15 +180,15 @@ pub(crate) use run_loop::run_loop;
 pub(crate) use run_loop::{swap_report, unrecoverable_report};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
-/// config's `session_trigger` range so a jittered draw can never escape it.
+/// config's `session_ceiling` range so a jittered draw can never escape it.
 const TRIGGER_PCT_LO: f64 = 50.0;
 const TRIGGER_PCT_HI: f64 = 99.0;
 /// Per-cycle clamp bounds for the WEEKLY swap-away trigger draw, in PERCENT
-/// (issue #41) — mirrors config's `weekly_trigger` range. Its own constants
+/// (issue #41) — mirrors config's `weekly_ceiling` range. Its own constants
 /// (numerically equal to the session bounds today) so the two triggers stay
 /// independently bounded.
-const WEEKLY_TRIGGER_PCT_LO: f64 = 50.0;
-const WEEKLY_TRIGGER_PCT_HI: f64 = 99.0;
+const WEEKLY_CEILING_PCT_LO: f64 = 50.0;
+const WEEKLY_CEILING_PCT_HI: f64 = 99.0;
 /// Per-cycle clamp bounds for the cooldown draw, in seconds. The LOW bound is the
 /// non-zero swap-cooldown floor ([`crate::config::COOLDOWN_SECS_FLOOR`], issue #272),
 /// which the config `cooldown_secs` range mirrors (`floor..=3600`). Clamping every
@@ -253,8 +253,8 @@ const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
 const BLIND_GATE_SECS: u64 = 300;
 /// Interim `risk_band` for the #452 gate (ADR-0017), as a session-usage fraction: the retained
 /// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) must be at/over this for the gate to
-/// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_trigger`
-/// ([`Daemon::session_trigger_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
+/// turn eligible. DISTINCT from — and deliberately LOWER than — the reactive `session_ceiling`
+/// ([`Daemon::session_ceiling_base`], the #449 `near_limit` band): the gate acts PREEMPTIVELY, on a
 /// stale anchor, before the account would have tripped the reactive band. The always-on SLI
 /// (#482) / status (#479) measurement band; #452's swap keys off the `session_blind_risk_band`
 /// CONFIG tunable (default-equal), so the action threshold and this measurement band align out of
@@ -375,10 +375,10 @@ fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
 ///   share — below it the blindness is presumed calm / self-resolving), AND
 /// - a retained [`VelocityEma`] exists and is SUSTAINED (`>= MIN_VELOCITY_SAMPLES` blended intervals — a
 ///   single-interval spike has already decayed, the #539 invariant), AND
-/// - `anchor + rate × BLIND_VELOCITY_RATE_INFLATION × blind_secs >= session_trigger` — the anchor,
+/// - `anchor + rate × BLIND_VELOCITY_RATE_INFLATION × blind_secs >= session_ceiling` — the anchor,
 ///   projected forward over the blind window at the bias-HIGH bound, plausibly reaches the trigger.
 ///
-/// `session_trigger` is the BASE (un-jittered) draw — the projection/preview trigger the SLI's
+/// `session_ceiling` is the BASE (un-jittered) draw — the projection/preview trigger the SLI's
 /// `pick_target` and `next_swap` already use — NOT the per-cycle jittered draw [`Daemon::velocity_swap`]
 /// projects on: that jitter is a per-tick anti-herd artefact, meaningless over a multi-minute blind
 /// horizon.
@@ -386,7 +386,7 @@ fn blind_velocity_projected_armed(
     blind_secs: u64,
     anchor_session: f64,
     velocity: Option<VelocityEma>,
-    session_trigger: f64,
+    session_ceiling: f64,
 ) -> bool {
     if blind_secs <= BLIND_GATE_SECS {
         return false;
@@ -406,7 +406,7 @@ fn blind_velocity_projected_armed(
         "velocity EMA rate must be finite and non-negative",
     );
     let projected = anchor_session + vel.rate * BLIND_VELOCITY_RATE_INFLATION * blind_secs as f64;
-    projected >= session_trigger
+    projected >= session_ceiling
 }
 
 /// The RAW server-advised `Retry-After` (pre-cap, issue #295) STILL holding `health`'s account off
@@ -491,7 +491,7 @@ fn blind_active_view(
     quarantined: bool,
     server_retry_after_hold: bool,
     velocity: Option<VelocityEma>,
-    session_trigger: f64,
+    session_ceiling: f64,
     at: Instant,
 ) -> Option<BlindActive> {
     if quarantined || !active_is_blind {
@@ -508,7 +508,7 @@ fn blind_active_view(
                 blind_secs,
                 anchor.session,
                 velocity,
-                session_trigger,
+                session_ceiling,
             ),
     })
 }
@@ -1996,34 +1996,34 @@ pub(crate) struct Daemon<P, C, S, K> {
     claude_json: PathBuf,
     /// Per-cycle swap-away trigger strategy (issue #38): drawn + clamped to
     /// `50..=99` percent each cycle, then `/100` for the swap decision. Replaces
-    /// the former fixed `session_trigger` fraction.
+    /// the former fixed `session_ceiling` fraction.
     trigger_strategy: Strategy,
     /// Per-cycle WEEKLY swap-away trigger strategy (issue #41): drawn + clamped to
     /// `50..=99` percent each cycle, then `/100` for the swap decision — the
     /// weekly-dimension counterpart of `trigger_strategy`, independent of it.
-    weekly_trigger_strategy: Strategy,
-    /// Base WEEKLY CEILING as a fraction (`weekly_trigger / 100`), un-jittered — the configured
+    weekly_ceiling_strategy: Strategy,
+    /// Base WEEKLY CEILING as a fraction (`weekly_ceiling / 100`), un-jittered — the configured
     /// not-cross line itself (issue #607 reframed this from a fire-AT trigger), and the SAME value
     /// the `use` pre-swap gate treats as "weekly exhausted" (issue #11/#37). Distinct from
-    /// `weekly_trigger_strategy` (the per-cycle JITTERED draw): the snapshot's `weekly_exhausted`
+    /// `weekly_ceiling_strategy` (the per-cycle JITTERED draw): the snapshot's `weekly_exhausted`
     /// verdict (issue #72) must be deterministic and match the user-facing viability rule, so it
     /// keys off this base, not a per-cycle draw.
     ///
     /// This is the RAW ceiling. Rotation decisions must NOT use it directly — they use
     /// [`Self::weekly_rotation_line`], which applies the tail margin. See that method for why.
-    weekly_trigger_base: f64,
-    /// Base SESSION swap-away threshold as a fraction (`session_trigger / 100`),
-    /// un-jittered — the session-dimension counterpart of [`Self::weekly_trigger_base`].
+    weekly_ceiling_base: f64,
+    /// Base SESSION swap-away threshold as a fraction (`session_ceiling / 100`),
+    /// un-jittered — the session-dimension counterpart of [`Self::weekly_ceiling_base`].
     /// The always-on session anti-thrash gate in [`pick_target`] keys off this on the
     /// deterministic display paths ([`Self::next_swap`], [`Self::refresh_exclusions`]),
     /// so the "next swap" candidate never flickers with per-cycle session-trigger
     /// jitter; the live swap path (`decide_action`) uses the per-cycle drawn trigger.
-    session_trigger_base: f64,
+    session_ceiling_base: f64,
     /// Default-on swap-target session reserve (issue #398) as a fraction
     /// (`target_max_session_usage / 100`), always valued. The PROACTIVE swap path passes it as
     /// `Some(..)` to [`pick_target`] — only swap TO an account whose session usage is
     /// below it — layering a STRICTER reserve on the always-on session gate
-    /// (`session < session_trigger`, which prevents oscillation on its own). The
+    /// (`session < session_ceiling`, which prevents oscillation on its own). The
     /// EMERGENCY path ([`Self::emergency_swap`]) passes `None` instead: when the active
     /// credential is DEAD, liveness beats the reserve. Supersedes #10's opt-in `None`
     /// default — the config `target_max_session_usage` is now always set.
@@ -2072,7 +2072,7 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// The #539 velocity-projection guard (ADR-0017) as a session FRACTION (config
     /// `session_velocity_min_project_above / 100`): [`Self::velocity_swap`] projects only when the
     /// observed reading is at/over this. The #538 spike's free guard (the projection cannot reach
-    /// below it), biased below `session_trigger` like [`Self::session_blind_risk_band`].
+    /// below it), biased below `session_ceiling` like [`Self::session_blind_risk_band`].
     session_velocity_min_project_above: f64,
     /// The #539 velocity-projection EMA weight α (ADR-0017) as a FRACTION (config
     /// `session_velocity_ema_alpha_pct / 100`): [`Self::note_session_velocity`] blends
@@ -2090,7 +2090,7 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// the cooldown exactly as the standalone `use` path does (which derives the same
     /// window from `config.tunables.cooldown_secs`). Distinct from `cooldown_strategy`
     /// (the per-cycle JITTERED draw the auto-swap path uses), mirroring how
-    /// `weekly_trigger_base` is the stable base distinct from `weekly_trigger_strategy`.
+    /// `weekly_ceiling_base` is the stable base distinct from `weekly_ceiling_strategy`.
     cooldown_base: Duration,
     /// Per-cycle poll-interval strategy (issue #38): drawn + clamped to
     /// `5..=3600` s each loop iteration by
@@ -2255,14 +2255,14 @@ where
             clock,
             claude_json,
             trigger_strategy: tunables.trigger_strategy,
-            weekly_trigger_strategy: tunables.weekly_trigger_strategy,
+            weekly_ceiling_strategy: tunables.weekly_ceiling_strategy,
             // The un-jittered RAW weekly ceiling (the operator's not-cross line). The
             // deterministic `status` `weekly_exhausted` verdict + `use` gate key off the
             // ROTATION line derived from it — `weekly_rotation_line()` = this −
             // `swap::WEEKLY_TAIL_MARGIN` (issue #607/#72) — NOT this raw value directly, and
             // NOT the per-cycle jittered swap-decision draw.
-            weekly_trigger_base: f64::from(tunables.weekly_trigger) / 100.0,
-            session_trigger_base: f64::from(tunables.session_trigger) / 100.0,
+            weekly_ceiling_base: f64::from(tunables.weekly_ceiling) / 100.0,
+            session_ceiling_base: f64::from(tunables.session_ceiling) / 100.0,
             target_max_session_usage: f64::from(tunables.target_max_session_usage) / 100.0,
             session_blind_swap_secs: tunables.session_blind_swap_secs,
             session_blind_risk_band: f64::from(tunables.session_blind_risk_band) / 100.0,
@@ -2830,7 +2830,7 @@ where
                         duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
                         session_pct: to_pct(anchor.session),
                         session_at_recovery: to_pct(fresh.session),
-                        near_limit: anchor.session >= self.session_trigger_base,
+                        near_limit: anchor.session >= self.session_ceiling_base,
                     });
                 }
             }
@@ -3244,7 +3244,7 @@ where
                 // both lines of one episode agree BY CONSTRUCTION rather than by two derivations
                 // that happen to coincide. Keys off the BASE (un-jittered) trigger, matching
                 // `blind_window`'s tag so the two families filter alike.
-                let near_limit = prev.session >= self.session_trigger_base;
+                let near_limit = prev.session >= self.session_ceiling_base;
                 self.state.blind_anchor[i] = Some(BlindAnchor {
                     session: prev.session,
                     weekly: prev.weekly,
@@ -3364,7 +3364,7 @@ where
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
-            self.session_trigger_base,
+            self.session_ceiling_base,
             self.weekly_rotation_line(),
         )
         .is_some();
@@ -4056,7 +4056,7 @@ where
     }
 
     /// The deterministic (un-jittered) WEEKLY line the daemon makes ROTATION decisions against
-    /// (issue #607): [`Self::weekly_trigger_base`] less `swap::WEEKLY_TAIL_MARGIN`.
+    /// (issue #607): [`Self::weekly_ceiling_base`] less `swap::WEEKLY_TAIL_MARGIN`.
     ///
     /// Every path that decides whether an account may be swapped TO, stays in rotation, or is
     /// previewed as the next swap MUST key off this, not the raw ceiling. The reason is
@@ -4071,14 +4071,14 @@ where
     /// The jittered live path derives its own line from the per-cycle draw
     /// (`swap::weekly_effective_ceiling(weekly_ceiling)` in [`Self::decide_action`]); this is its
     /// deterministic counterpart for the display / non-drawing paths, exactly as
-    /// [`Self::weekly_trigger_base`] is the deterministic counterpart of the jittered draw.
+    /// [`Self::weekly_ceiling_base`] is the deterministic counterpart of the jittered draw.
     ///
     /// DELIBERATELY NOT used by the two emergency paths ([`Self::emergency_swap`],
     /// [`Self::recover_scrubbed_canonical`]): those already drop the session reserve for liveness,
     /// and a dead or scrubbed credential is worse than a target that must swap again shortly, so
     /// they keep the raw ceiling and admit the widest viable set.
     fn weekly_rotation_line(&self) -> f64 {
-        swap::weekly_effective_ceiling(self.weekly_trigger_base)
+        swap::weekly_effective_ceiling(self.weekly_ceiling_base)
     }
 
     /// Decide what to do about the active account this cycle, performing the swap
@@ -4153,14 +4153,14 @@ where
         // stay independent — swap when EITHER reaches its own fire point; below BOTH → hold. Both are
         // drawn every cycle (a fixed strategy consumes no RNG, and `draw_downward` consumes the same
         // per-mode RNG count as `draw`), keeping the per-cycle draw order deterministic.
-        let session_trigger =
+        let session_ceiling =
             self.trigger_strategy
                 .draw_downward(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
                 / 100.0;
-        let weekly_ceiling = self.weekly_trigger_strategy.draw_downward(
+        let weekly_ceiling = self.weekly_ceiling_strategy.draw_downward(
             &mut self.rng,
-            WEEKLY_TRIGGER_PCT_LO,
-            WEEKLY_TRIGGER_PCT_HI,
+            WEEKLY_CEILING_PCT_LO,
+            WEEKLY_CEILING_PCT_HI,
         ) / 100.0;
         // #597/#609 ceiling derivation: the reactive arm fires BACKWARD from the effective ceiling
         // (ceiling − tail margin) so the outgoing account lands below the ceiling even after its
@@ -4172,7 +4172,7 @@ where
         // ceiling — never early. The two arms cover DIFFERENT unseen windows (this one the
         // re-observation gap, the projection peer the velocity horizon `H`); the composed swap fires
         // at `eff − v·max(poll_gap, H)`, the max-window coverage in `swap::reactive_session_threshold`.
-        let effective_ceiling = swap::effective_ceiling(session_trigger);
+        let effective_ceiling = swap::effective_ceiling(session_ceiling);
         let velocity = self.state.session_velocity[active_idx]
             .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
             .map_or(0.0, |v| v.rate);
@@ -4226,7 +4226,7 @@ where
                 .velocity_swap(
                     at,
                     active_idx,
-                    session_trigger,
+                    session_ceiling,
                     weekly_threshold,
                     readings,
                     events,
@@ -4257,7 +4257,7 @@ where
             COOLDOWN_SECS_HI,
         ));
         // Emergency-tier reactive bypass (issue #611): a LIVE (non-quarantined) active whose OBSERVED
-        // session reading has ALREADY reached the RAW ceiling (`session_trigger` — the not-cross line
+        // session reading has ALREADY reached the RAW ceiling (`session_ceiling` — the not-cross line
         // itself, NOT the `effective_ceiling` / `session_threshold` the normal reactive fire point is
         // derived BACKWARD from) is past the ceiling NOW. With cross-machine coordination out of scope,
         // a shared account can be burned from a second machine BETWEEN our observations, so this is the
@@ -4266,7 +4266,7 @@ where
         // cooldown max, against #597's own asymmetry (overshoot is the expensive error). So bypass the
         // WAIT and swap, mirroring the dead-active `emergency_swap` cooldown bypass (until now the ONLY
         // one). STRICTLY above the normal fire point — `session_threshold ≤ effective_ceiling =
-        // session_trigger − TAIL_MARGIN < session_trigger` (TAIL_MARGIN > 0) — so an ordinary reactive
+        // session_ceiling − TAIL_MARGIN < session_ceiling` (TAIL_MARGIN > 0) — so an ordinary reactive
         // swap fired BELOW the raw ceiling still defers within cooldown: the bypass never defeats
         // cooldown's rate-limiting purpose, nor the #272 sub-floor-jitter guard, for ordinary swaps.
         // Only the WAIT is bypassed — target selection below still HONORS the reserve + session gate
@@ -4283,7 +4283,7 @@ where
             .is_some_and(|last| at.saturating_duration_since(last.at) < cooldown);
         // `>=` (not `>`) so a reading landing EXACTLY on the raw ceiling still bypasses — the ceiling
         // is the not-cross line, so being AT it already warrants escape.
-        let at_raw_ceiling = active_usage.session >= session_trigger;
+        let at_raw_ceiling = active_usage.session >= session_ceiling;
         if within_cooldown && !at_raw_ceiling {
             return TickAction::SkippedCooldown;
         }
@@ -4298,7 +4298,7 @@ where
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
-            session_trigger,
+            session_ceiling,
             // The #607 effective weekly ceiling, NOT the raw one: the acquire predicate must stay at
             // least as strict as the negation of the release predicate on the weekly dimension, or a
             // target in `[weekly_threshold, weekly_ceiling)` re-trips `decide` next cycle and thrashes.
@@ -4321,12 +4321,12 @@ where
             // edge-triggered: emit only on ENTERING the state, so the payload is computed
             // once per episode, not every poll while it holds.
             if !self.state.signaled_all_exhausted {
-                let session_ceiling = session_trigger.min(self.target_max_session_usage);
+                let session_block_line = session_ceiling.min(self.target_max_session_usage);
                 let (cause, hold_idx, resets_at) = all_exhausted_relief(
                     active_idx,
                     readings,
                     &self.enabled_mask(),
-                    session_ceiling,
+                    session_block_line,
                     // The same #607 effective weekly ceiling the viability filter just used, so the
                     // relief hint EXPLAINS the verdict it accompanies rather than reasoning against a
                     // different weekly line.
@@ -4626,7 +4626,7 @@ where
         // 2. Re-validate viability from the daemon's LIVE state (health + last readings + the
         //    un-jittered weekly rotation line + the in-memory last-swap), never a client hint. The
         //    `weekly_exhausted` computation is EXACTLY the snapshot's per-account verdict
-        //    (`weekly >= weekly_rotation_line()`, i.e. `weekly_trigger_base − WEEKLY_TAIL_MARGIN`,
+        //    (`weekly >= weekly_rotation_line()`, i.e. `weekly_ceiling_base − WEEKLY_TAIL_MARGIN`,
         //    issue #607) — same data source AND formula, so the ack agrees with what `status`
         //    shows. This is the daemon's LAST-KNOWN reading (≤ one poll interval old), NOT the
         //    fresh poll the daemon-DOWN `use` runs: a target that crossed the threshold since the
@@ -4847,7 +4847,7 @@ where
     /// Load→overlay→validate→save is the SAME path `capture` uses: read the current file TEXT,
     /// [`apply_settings`](crate::config::Config::apply_settings) overlays the edits onto the raw
     /// layer and re-validates the WHOLE edited config atomically (so a cross-field rule — e.g.
-    /// `target_max_session_usage <= session_trigger` — sees the FINAL state, never a transient
+    /// `target_max_session_usage <= session_ceiling` — sees the FINAL state, never a transient
     /// intermediate), then [`save_to`](crate::config::Config::save_to) writes it 0600-atomically
     /// (temp + rename). Every refusal is a TRUE no-op — ZERO writes — leaving the old file intact:
     /// no wired `config_path` → `Unavailable`; absent file → `NoConfig`; unreadable / malformed
@@ -5123,10 +5123,10 @@ where
         // beats a target that merely has to swap again shortly. Same reasoning as the reserve this
         // path already drops (`None`). The anti-thrash invariant is knowingly traded for liveness,
         // and only here plus `recover_scrubbed_canonical`.
-        let weekly_trigger = self.weekly_trigger_strategy.draw(
+        let weekly_ceiling = self.weekly_ceiling_strategy.draw(
             &mut self.rng,
-            WEEKLY_TRIGGER_PCT_LO,
-            WEEKLY_TRIGGER_PCT_HI,
+            WEEKLY_CEILING_PCT_LO,
+            WEEKLY_CEILING_PCT_HI,
         ) / 100.0;
         let Some(target_idx) = pick_target_ranked(
             active_idx,
@@ -5144,7 +5144,7 @@ where
             // Also bypass the always-on session gate here (same liveness rationale):
             // escape even to an account over the session trigger.
             f64::INFINITY,
-            weekly_trigger,
+            weekly_ceiling,
             // Enhanced selection (issue #612): even in escape, disperse two dead-active daemons off
             // one target and prefer a calmer peer.
             self.selection_tiebreak(),
@@ -5160,7 +5160,7 @@ where
             if !self.state.signaled_active_dead_no_target {
                 // Reuse `all_exhausted_relief` — it already excludes the active index by masking
                 // (the dead active's reading is `None` on this branch, its precondition), so it
-                // works unchanged when the active IS the dead one. `session_ceiling = INFINITY`
+                // works unchanged when the active IS the dead one. `session_block_line = INFINITY`
                 // because the emergency path bypasses the session gate: relief here is NEVER a
                 // session reset (a weekly-viable-but-session-blocked spare would have been picked),
                 // so the classification correctly falls to the weekly-wide branch.
@@ -5169,7 +5169,7 @@ where
                     readings,
                     &self.enabled_mask(),
                     f64::INFINITY,
-                    weekly_trigger,
+                    weekly_ceiling,
                 );
                 events.push(Event::ActiveDeadNoTarget {
                     // The DEAD active's label — the account the daemon is stuck on, and the
@@ -5228,7 +5228,7 @@ where
     /// (issue #453 makes the server directive an absolute floor) and the failed poll clears the
     /// reading — so the consumed credential goes blind for the directive's whole duration while
     /// Claude Code keeps burning it. Below the risk band that blindness was unreachable by EVERY
-    /// swap path: the reactive `session_trigger` and the #539 velocity projection both need a
+    /// swap path: the reactive `session_ceiling` and the #539 velocity projection both need a
     /// FRESH reading, and the #452 arm above needs `anchor >= session_blind_risk_band` (observed
     /// 2026-07-17: an anchor of `0.29` burned to exhaustion behind a `Retry-After: 3600`).
     ///
@@ -5370,7 +5370,7 @@ where
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
-            self.session_trigger_base,
+            self.session_ceiling_base,
             // Issue #607: this path fires a REAL swap, so it must honour the same weekly rotation
             // line the reactive arm releases on — a raw-ceiling gate here would land the preemptive
             // swap on a band account that bounces straight back.
@@ -5560,7 +5560,7 @@ where
     /// - the roster is warmed up, the cooldown has elapsed (else `SkippedCooldown`), and a viable
     ///   target exists (a peer under the reserve).
     ///
-    /// `session_trigger` is the session CEILING draw the reactive path used this tick; this arm
+    /// `session_ceiling` is the session CEILING draw the reactive path used this tick; this arm
     /// derives the SAME effective ceiling (ceiling − tail margin) the reactive threshold does, and
     /// `pick_target` sees the same reserve — so the two are coupled (one ceiling, one reserve), not
     /// differently-calibrated triggers. This arm covers the velocity horizon (it fires at
@@ -5578,7 +5578,7 @@ where
         &mut self,
         at: Instant,
         active_idx: usize,
-        session_trigger: f64,
+        session_ceiling: f64,
         weekly_threshold: f64,
         readings: &[Option<Usage>],
         events: &mut Vec<Event>,
@@ -5625,7 +5625,7 @@ where
         // after the post-swap tail. This arm covers the velocity horizon `H`; the reactive arm covers
         // the re-observation gap (#609); the composed swap fires at `eff − v·max(poll_gap, H)` (see
         // `swap::reactive_session_threshold`), so whichever window is larger sets the fire point.
-        let effective_ceiling = swap::effective_ceiling(session_trigger);
+        let effective_ceiling = swap::effective_ceiling(session_ceiling);
         let projected = active_usage.session + vel.rate * horizon as f64;
         if projected < effective_ceiling {
             return TickAction::Held;
@@ -5659,7 +5659,7 @@ where
             readings,
             &self.enabled_mask(),
             Some(self.target_max_session_usage),
-            session_trigger,
+            session_ceiling,
             weekly_threshold,
             // Enhanced target selection (issue #612), same as the reactive path this front-runs, so
             // the projective peer selects exactly as the swap it precedes: velocity-preferred + herd-
@@ -5772,10 +5772,10 @@ where
         // and SYMMETRIC `draw`, both widening the admissible target set. A scrubbed canonical locks
         // out the whole fleet, so adopting a live token that must rotate again shortly strictly
         // beats leaving every session unauthenticated.
-        let weekly_trigger = self.weekly_trigger_strategy.draw(
+        let weekly_ceiling = self.weekly_ceiling_strategy.draw(
             &mut self.rng,
-            WEEKLY_TRIGGER_PCT_LO,
-            WEEKLY_TRIGGER_PCT_HI,
+            WEEKLY_CEILING_PCT_LO,
+            WEEKLY_CEILING_PCT_HI,
         ) / 100.0;
         let target_idx = pick_target_ranked(
             active.unwrap_or(usize::MAX),
@@ -5783,7 +5783,7 @@ where
             &self.enabled_mask(),
             None,
             f64::INFINITY,
-            weekly_trigger,
+            weekly_ceiling,
             // Enhanced selection (issue #612): disperse the fleet-locked scrub-recovery target and
             // prefer a calmer peer.
             self.selection_tiebreak(),
@@ -5828,7 +5828,7 @@ where
     /// SAME enhanced selection as the live swap paths (issue #612: velocity-preferred,
     /// then per-daemon jittered, off this daemon's seed) so the surfaced candidate matches
     /// what the daemon would actually promote. Uses the BASE (un-jittered) session and
-    /// weekly triggers ([`Self::session_trigger_base`], [`Self::weekly_trigger_base`]) —
+    /// weekly triggers ([`Self::session_ceiling_base`], [`Self::weekly_ceiling_base`]) —
     /// the same thresholds the snapshot's per-account exhaustion flags key off — so the
     /// candidate and the displayed exhaustion state can never disagree, and the candidate
     /// does not flicker with the per-cycle swap-decision jitter. The #612 seed is likewise
@@ -5849,7 +5849,7 @@ where
             readings,
             &enabled,
             Some(self.target_max_session_usage),
-            self.session_trigger_base,
+            self.session_ceiling_base,
             // Issue #607: the rotation line, so this PREVIEW names the account the daemon would
             // actually pick. Against the raw ceiling the preview could surface a band account the
             // live path would refuse — a status/menubar display that contradicts the daemon.
@@ -5899,19 +5899,19 @@ where
             // Carry the fleet-capacity RELIEF hint (issue #405) so the status footer can say WHY the
             // fleet is blocked and WHEN capacity returns, instead of a content-free "no viable
             // target". Uses the SAME `all_exhausted_relief` classification the durable events do,
-            // with the PROACTIVE session ceiling (`min(session_trigger_base, target_max_session_usage)`) so
+            // with the PROACTIVE session ceiling (`min(session_ceiling_base, target_max_session_usage)`) so
             // it agrees with the base-trigger `pick_target_with_reason` verdict just above (the
             // snapshot keys off the BASE, un-jittered triggers — #88 — so the footer never flickers
             // with the per-cycle swap-decision jitter). Covers BOTH the active-alive-and-over-trigger
             // and the active-DEAD-and-stranded cases: a dead active leaves every live spare
             // weekly-exhausted, so relief classifies `Weekly` here while the dead active's 🔴 health
             // rides its own account row (the composite an operator needs — issue #405).
-            let session_ceiling = self.session_trigger_base.min(self.target_max_session_usage);
+            let session_block_line = self.session_ceiling_base.min(self.target_max_session_usage);
             let (cause, _hold, resets_at) = all_exhausted_relief(
                 active_idx,
                 readings,
                 &enabled,
-                session_ceiling,
+                session_block_line,
                 // Issue #607: the same rotation line the viability filter above used, so the relief
                 // hint explains the verdict it accompanies rather than a different weekly line.
                 self.weekly_rotation_line(),
@@ -5972,7 +5972,7 @@ where
                 &readings,
                 &enabled,
                 Some(self.target_max_session_usage),
-                self.session_trigger_base,
+                self.session_ceiling_base,
                 // Issue #607: the rotation line, matching the swap paths this exclusion shadows.
                 self.weekly_rotation_line(),
                 self.selection_tiebreak(),
@@ -6366,7 +6366,7 @@ where
                                 // reach the trigger inside the blind window (a burn the anchor arm, frozen
                                 // below the band, cannot see). Report-only — no swap keys off this.
                                 self.state.session_velocity[i],
-                                self.session_trigger_base,
+                                self.session_ceiling_base,
                                 blind_at,
                             )
                         } else {
@@ -6760,8 +6760,8 @@ where
     /// ([`last_readings`](DecisionState::last_readings)`[i]`):
     ///
     /// - **NON-active peer, reading out of rotation** (`weekly >= weekly_rotation_line()` —
-    ///   i.e. `weekly_trigger_base − WEEKLY_TAIL_MARGIN`, issue #607 — `|| session >=
-    ///   session_trigger_base`): arm `exhausted_poll_until = now + <window>` (the
+    ///   i.e. `weekly_ceiling_base − WEEKLY_TAIL_MARGIN`, issue #607 — `|| session >=
+    ///   session_ceiling_base`): arm `exhausted_poll_until = now + <window>` (the
     ///   reset-aware [`exhausted_poll_window`]) so the peer's poll is skipped until the window
     ///   elapses. Edge-triggered ENTER — a durable [`Event::ExhaustedSlowPoll`] fires ONLY on
     ///   the normal→slow transition; a re-arm while the peer stays exhausted is not a new entry
@@ -6798,7 +6798,7 @@ where
         // slow-polls, with no band that is excluded from selection yet still polled at full rate).
         let out_of_rotation = active != Some(i)
             && (reading.weekly >= self.weekly_rotation_line()
-                || reading.session >= self.session_trigger_base);
+                || reading.session >= self.session_ceiling_base);
         let account_uuid = self.roster[i].account_uuid.clone();
         if out_of_rotation {
             let window = exhausted_poll_window(
@@ -6806,7 +6806,7 @@ where
                 // Issue #607: the same rotation line the `out_of_rotation` verdict above used, so
                 // the widened re-poll window is computed against the line that armed it.
                 self.weekly_rotation_line(),
-                self.session_trigger_base,
+                self.session_ceiling_base,
                 now_secs,
                 self.exhausted_poll_secs,
                 // The floor is `poll_secs` — the un-jittered base of the poll strategy (the same
@@ -7001,8 +7001,8 @@ fn usage_velocity(prev: &Usage, next: &Usage) -> (i16, i16) {
 /// cannot underflow.
 fn exhausted_poll_window(
     reading: &Usage,
-    weekly_trigger: f64,
-    session_trigger: f64,
+    weekly_ceiling: f64,
+    session_ceiling: f64,
     now_secs: i64,
     exhausted_poll_secs: u64,
     poll_secs: u64,
@@ -7016,10 +7016,10 @@ fn exhausted_poll_window(
             soonest = Some(soonest.map_or(at, |cur: i64| cur.min(at)));
         }
     };
-    if reading.weekly >= weekly_trigger {
+    if reading.weekly >= weekly_ceiling {
         consider(reading.weekly_resets_at);
     }
-    if reading.session >= session_trigger {
+    if reading.session >= session_ceiling {
         consider(reading.session_resets_at);
     }
     let ceiling = exhausted_poll_secs as i64;
@@ -7039,7 +7039,7 @@ fn exhausted_poll_window(
 /// Pick the viable swap target whose weekly window resets SOONEST (issue #37):
 /// among accounts other than `active` that are enabled (issue #36), whose reading
 /// is available, that are NOT session-saturated (session usage below
-/// `session_trigger`) and NOT weekly-exhausted (weekly usage below `weekly_trigger`,
+/// `session_ceiling`) and NOT weekly-exhausted (weekly usage below `weekly_ceiling`,
 /// issue #11) — and, when the opt-in `floor` is `Some`, whose session usage is
 /// below it too (#10) — the one with the earliest weekly `resets_at`. An account with a
 /// known reset is preferred over one without (an unknown reset sorts last); an
@@ -7067,16 +7067,16 @@ fn exhausted_poll_window(
 /// can never be a useful destination — excluding it is what turns "all enabled
 /// accounts weekly-exhausted" into a no-viable-target verdict instead of a swap.
 /// The session-saturation exclusion is its exact mirror on the OTHER trigger
-/// dimension: [`swap::decide`] swaps away on `session >= session_trigger` OR
-/// `weekly >= weekly_trigger`, so a target at/above EITHER trigger re-trips next
+/// dimension: [`swap::decide`] swaps away on `session >= session_ceiling` OR
+/// `weekly >= weekly_ceiling`, so a target at/above EITHER trigger re-trips next
 /// cycle. Guarding only weekly left a session-saturated but weekly-viable account
 /// eligible, and the soonest-reset rule — anti-correlated with session headroom,
 /// since the account nearest its weekly reset is the most-cycled one — would pick
 /// exactly such a target, producing an indefinite session ping-pong between the two
-/// soonest-reset accounts. The `session < session_trigger` filter closes that: the
+/// soonest-reset accounts. The `session < session_ceiling` filter closes that: the
 /// acquire predicate is now at least as strict as the negation of the release
 /// predicate on BOTH dimensions. It is unconditional, distinct from `floor` — a
-/// STRICTER reserve layered on top (effective ceiling `min(session_trigger, floor)`)
+/// STRICTER reserve layered on top (effective ceiling `min(session_ceiling, floor)`)
 /// which the PROACTIVE caller passes (default 80, #398) and the EMERGENCY caller
 /// drops (`None`) so a dead active always escapes. The disabled exclusion (#36): a parked account
 /// is never a destination even with ample headroom, and — being excluded here
@@ -7087,8 +7087,8 @@ fn pick_target(
     readings: &[Option<Usage>],
     enabled: &[bool],
     floor: Option<f64>,
-    session_trigger: f64,
-    weekly_trigger: f64,
+    session_ceiling: f64,
+    weekly_ceiling: f64,
 ) -> Option<usize> {
     // The index-only projection for the callers that need no rationale (the swap decision, the
     // refresh exclusions). [`pick_target_with_reason`] is the single source of selection truth;
@@ -7098,8 +7098,8 @@ fn pick_target(
         readings,
         enabled,
         floor,
-        session_trigger,
-        weekly_trigger,
+        session_ceiling,
+        weekly_ceiling,
     )
     .map(|(i, _)| i)
 }
@@ -7127,8 +7127,8 @@ fn pick_target_ranked(
     readings: &[Option<Usage>],
     enabled: &[bool],
     floor: Option<f64>,
-    session_trigger: f64,
-    weekly_trigger: f64,
+    session_ceiling: f64,
+    weekly_ceiling: f64,
     sel: SelectionTiebreak,
 ) -> Option<usize> {
     pick_target_with_reason_ranked(
@@ -7136,8 +7136,8 @@ fn pick_target_ranked(
         readings,
         enabled,
         floor,
-        session_trigger,
-        weekly_trigger,
+        session_ceiling,
+        weekly_ceiling,
         sel,
     )
     .map(|(i, _)| i)
@@ -7184,16 +7184,16 @@ fn pick_target_with_reason(
     readings: &[Option<Usage>],
     enabled: &[bool],
     floor: Option<f64>,
-    session_trigger: f64,
-    weekly_trigger: f64,
+    session_ceiling: f64,
+    weekly_ceiling: f64,
 ) -> Option<(usize, NextSwapReason)> {
     pick_target_with_reason_ranked(
         active,
         readings,
         enabled,
         floor,
-        session_trigger,
-        weekly_trigger,
+        session_ceiling,
+        weekly_ceiling,
         SelectionTiebreak {
             velocity: &[],
             seed: None,
@@ -7243,8 +7243,8 @@ fn pick_target_with_reason_ranked(
     readings: &[Option<Usage>],
     enabled: &[bool],
     floor: Option<f64>,
-    session_trigger: f64,
-    weekly_trigger: f64,
+    session_ceiling: f64,
+    weekly_ceiling: f64,
     sel: SelectionTiebreak,
 ) -> Option<(usize, NextSwapReason)> {
     // The viable set — the same exclusions `pick_target` applies (issue #11/#36/#37, the
@@ -7256,12 +7256,12 @@ fn pick_target_with_reason_ranked(
         .filter(|&(i, _)| i != active)
         .filter(|&(i, _)| enabled[i])
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
-        .filter(|&(_, usage)| usage.weekly < weekly_trigger)
+        .filter(|&(_, usage)| usage.weekly < weekly_ceiling)
         // Always-on session anti-thrash gate: exclude a target at/above the session
         // trigger — it would immediately re-trip [`swap::decide`]'s session dimension
         // and thrash (the exact mirror of the weekly filter above). Distinct from the
         // `floor` below, which tightens this ceiling further when the caller passes it.
-        .filter(|&(_, usage)| usage.session < session_trigger)
+        .filter(|&(_, usage)| usage.session < session_ceiling)
         .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
         .collect();
     let candidate_count = viable.len();
@@ -7335,8 +7335,8 @@ fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
 /// Classify why [`pick_target`] found no viable target, for the `all_exhausted`
 /// relief hint (issue #398): `(cause, hold_idx, resets_at)`.
 ///
-/// A candidate that is weekly-VIABLE (`weekly < weekly_trigger`) but session-blocked
-/// (`session >= session_ceiling`, the ceiling being `min(session_trigger, floor)`) is
+/// A candidate that is weekly-VIABLE (`weekly < weekly_block_line`) but session-blocked
+/// (`session >= session_block_line`, the block line being `min(session_ceiling, floor)`) is
 /// held out ONLY by session — it returns at its SESSION reset, sooner than any weekly
 /// reset. If any such candidate exists the block is session-wide: report
 /// [`SwapReason::Session`] and key the hint off the soonest such session reset (naming
@@ -7348,8 +7348,8 @@ fn all_exhausted_relief(
     active: usize,
     readings: &[Option<Usage>],
     enabled: &[bool],
-    session_ceiling: f64,
-    weekly_trigger: f64,
+    session_block_line: f64,
+    weekly_block_line: f64,
 ) -> (SwapReason, usize, Option<i64>) {
     // Soonest SESSION reset among weekly-viable-but-session-blocked candidates, plus a
     // naming fallback (the first such account) for when none reports a parseable reset.
@@ -7360,7 +7360,7 @@ fn all_exhausted_relief(
             continue;
         }
         let Some(usage) = reading else { continue };
-        if usage.weekly < weekly_trigger && usage.session >= session_ceiling {
+        if usage.weekly < weekly_block_line && usage.session >= session_block_line {
             session_blocked.get_or_insert(i);
             if let Some(at) = usage.session_resets_at {
                 if session_relief.is_none_or(|(_, best)| at < best) {
@@ -7502,7 +7502,7 @@ fn classify_config_set_failure(err: &Error) -> (ConfigSetRejection, Option<Strin
         Error::AccountUuidNotFound { .. } => (ConfigSetRejection::UnknownAccount, None),
         // A range / cross-field rule failed on the FINAL edited config (an out-of-range tunable, an
         // empty label, `exhausted_poll_secs < poll_secs`, `target_max_session_usage >
-        // session_trigger`); surface the non-secret field-named message as `detail`.
+        // session_ceiling`); surface the non-secret field-named message as `detail`.
         Error::ConfigTargetMaxSessionAboveTrigger { .. } => {
             (ConfigSetRejection::Invalid, Some(err.to_string()))
         }
@@ -8173,7 +8173,7 @@ mod tests {
         // (all well below it) never trip the new weekly path (issue #41): these
         // tests pin the SESSION trigger. A fixed strategy draws no RNG, so the
         // per-cycle draw sequence — and every seeded-jitter test — is unchanged.
-        const WEEKLY_TRIGGER: u8 = 98;
+        const WEEKLY_CEILING: u8 = 98;
         Tunables {
             poll_secs: 60,
             // The out-of-rotation slow-poll cadence (issue #537), default 3600. Baseline daemon
@@ -8188,8 +8188,8 @@ mod tests {
             // Most daemon tests set an explicit floor; `tunables_floor_off` sets it
             // inert (== trigger) for the tests that pin the always-on gate instead.
             target_max_session_usage: floor,
-            session_trigger: trigger,
-            weekly_trigger: WEEKLY_TRIGGER,
+            session_ceiling: trigger,
+            weekly_ceiling: WEEKLY_CEILING,
             // Issue #452 bounded-blindness preemptive swap: INERT by default (T parked at
             // the kill-switch ceiling) so baseline daemon tests are unperturbed by the new
             // gate; the blind-swap tests override `session_blind_swap_secs` to arm it.
@@ -8207,14 +8207,14 @@ mod tests {
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
             trigger_strategy: Strategy::fixed(f64::from(trigger)),
-            weekly_trigger_strategy: Strategy::fixed(f64::from(WEEKLY_TRIGGER)),
+            weekly_ceiling_strategy: Strategy::fixed(f64::from(WEEKLY_CEILING)),
             cooldown_strategy: Strategy::fixed(cooldown as f64),
         }
     }
 
-    /// Tunables with the target-max-session-usage reserve INERT — set to `session_trigger`, so
+    /// Tunables with the target-max-session-usage reserve INERT — set to `session_ceiling`, so
     /// `pick_target`'s floor filter never tightens beyond the always-on session gate
-    /// (config allows `target_max_session_usage == session_trigger`). Post-#398 the floor is
+    /// (config allows `target_max_session_usage == session_ceiling`). Post-#398 the floor is
     /// always-valued, so "no extra tightening" is expressed this way rather than the
     /// removed opt-out; behaviorally identical to the old `None` for target selection.
     /// The tests that use it pin the always-on gate / weekly behavior, not the reserve.
@@ -8340,7 +8340,7 @@ mod tests {
     // floor / selection behavior; the #11 tests use readings at/above it.
     const WK: f64 = 0.98;
 
-    // A session trigger matching the default (`DEFAULT_SESSION_TRIGGER`), for the
+    // A session trigger matching the default (`DEFAULT_SESSION_CEILING`), for the
     // always-on session anti-thrash gate. The selection/floor tests below keep every
     // viable winner's session below it, so the gate is a no-op for them; the dedicated
     // `pick_target_excludes_session_saturated_accounts` test exercises it.
@@ -8668,7 +8668,7 @@ mod tests {
         // The opt-in target_max_session_usage (#10) is a STRICTER reserve layered on the always-on
         // session gate: with the floor OFF a target need only clear the gate
         // (session < trigger); an enabled floor also excludes accounts that pass the
-        // gate but sit at/above the floor. Effective ceiling = min(session_trigger, floor).
+        // gate but sit at/above the floor. Effective ceiling = min(session_ceiling, floor).
         let readings = vec![
             Some(Usage {
                 session: 0.97,
@@ -9151,8 +9151,8 @@ mod tests {
         // index would ship green. Here TWO spares qualify with DISTINCT session resets and
         // the later-indexed one resets sooner, so a correct comparison must override the
         // first-seen fallback.
-        let session_ceiling = 0.80_f64;
-        let weekly_trigger = 0.95_f64;
+        let session_block_line = 0.80_f64;
+        let weekly_ceiling = 0.95_f64;
         let readings = vec![
             // idx 0: the exhausted active account — skipped (active == 0).
             Some(Usage {
@@ -9178,7 +9178,7 @@ mod tests {
         ];
         let enabled = vec![true, true, true];
         let (cause, hold_idx, resets_at) =
-            all_exhausted_relief(0, &readings, &enabled, session_ceiling, weekly_trigger);
+            all_exhausted_relief(0, &readings, &enabled, session_block_line, weekly_ceiling);
         assert_eq!(cause, SwapReason::Session);
         // idx 2 (soonest, 150) wins over idx 1 (first-seen fallback, 300).
         assert_eq!(hold_idx, 2);
@@ -9678,7 +9678,7 @@ mod tests {
         // an account while the UI, the `use` gate, the swap preview and the poll scheduler all still
         // call it viable. This pins the four DISPLAY/SCHEDULING verdicts against a peer parked
         // squarely in that band (0.975): each must read the ROTATION line, so reverting any one of
-        // them to `weekly_trigger_base` fails here. (The release side — `decide` — is pinned by the
+        // them to `weekly_ceiling_base` fails here. (The release side — `decide` — is pinned by the
         // two `tick_*` tests above; `pick_target`'s own filter by
         // `pick_target_excludes_the_weekly_tail_margin_band_so_the_arms_cannot_thrash`.)
         let daemon = three_account_daemon(FakeRosterPoller::new()).await;
@@ -9837,11 +9837,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_holds_when_weekly_is_below_its_own_trigger_even_above_the_session_trigger() {
+    async fn tick_holds_when_weekly_is_below_its_own_trigger_even_above_the_session_ceiling() {
         // Issue #41: weekly is gated by its OWN (higher) trigger, not the session
         // one. Weekly 0.96 sits ABOVE the 0.95 session trigger yet BELOW the 0.98
         // weekly trigger, and session itself (0.50) is below its trigger — so the
-        // cycle HOLDS. (Under a single-threshold rule keyed on session_trigger this
+        // cycle HOLDS. (Under a single-threshold rule keyed on session_ceiling this
         // same reading would have swapped; the separate weekly trigger is exactly
         // what changes that.)
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
@@ -12289,7 +12289,7 @@ mod tests {
         // 95 default that is 0.89 — too tight a band above the 0.85 projection floor. Raise the ceiling
         // to 99 (effective ceiling 0.93) so the in-band climbing readings hold reactively.
         daemon.trigger_strategy = Strategy::fixed(99.0);
-        daemon.session_trigger_base = 0.99;
+        daemon.session_ceiling_base = 0.99;
         for _ in 0..4 {
             daemon.tick().await;
         }
@@ -12417,7 +12417,7 @@ mod tests {
         // #597: raise the ceiling to 99 (effective 0.93) so the climbing readings hold reactively
         // and only the projection can cross — matching `warmed_velocity_daemon`.
         daemon.trigger_strategy = Strategy::fixed(99.0);
-        daemon.session_trigger_base = 0.99;
+        daemon.session_ceiling_base = 0.99;
         for _ in 0..4 {
             daemon.tick().await;
         }
@@ -13289,7 +13289,7 @@ mod tests {
         // Ceiling 99 (effective 0.93) so the climbing readings stay reactively held, exactly as
         // `warmed_velocity_daemon` does; the projection peer is off so no swap interrupts the climb.
         daemon.trigger_strategy = Strategy::fixed(99.0);
-        daemon.session_trigger_base = 0.99;
+        daemon.session_ceiling_base = 0.99;
         daemon.session_velocity_horizon_secs = 0;
         for _ in 0..4 {
             daemon.tick().await;
@@ -14194,7 +14194,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_exhausted_peer_is_slow_polled_keyed_off_the_session_reset() {
-        // AC: a session-exhausted (session >= session_trigger) non-active peer is slow-polled the
+        // AC: a session-exhausted (session >= session_ceiling) non-active peer is slow-polled the
         // same way, keyed off its SESSION reset. Here the session resets ~10 min out, so the
         // window is pulled EARLIER than the hourly ceiling.
         let now = wall_clock_now_secs();
@@ -15264,7 +15264,7 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
-        // All three weekly-exhausted (weekly 0.99 ≥ weekly_trigger 0.98). B resets
+        // All three weekly-exhausted (weekly 0.99 ≥ weekly_ceiling 0.98). B resets
         // soonest, so it is the least-bad hold target even though A is active.
         const A_RESET: i64 = 1_782_777_600; // 2026-06-30T00:00:00Z
         const B_RESET: i64 = 1_782_496_800; // 2026-06-26T18:00:00Z (soonest)
@@ -15273,7 +15273,7 @@ mod tests {
             .ok_resets("u-A", 0.50, 0.99, A_RESET)
             .ok_resets("u-B", 0.50, 0.99, B_RESET)
             .ok_resets("u-C", 0.50, 0.99, C_RESET);
-        // Floor inert (== trigger via tunables_floor_off); weekly_trigger 98, so the
+        // Floor inert (== trigger via tunables_floor_off); weekly_ceiling 98, so the
         // swap-away fires on the weekly dimension and every target is excluded.
         let tun = tunables_floor_off(95, 0);
 
@@ -15573,7 +15573,7 @@ mod tests {
     #[tokio::test]
     async fn reactive_spike_at_raw_ceiling_bypasses_cooldown_but_a_normal_swap_still_honors_it() {
         // Issue #611: the emergency-tier reactive bypass. A LIVE (non-quarantined) active whose
-        // OBSERVED session reading has reached the RAW ceiling (the not-cross line — `session_trigger`
+        // OBSERVED session reading has reached the RAW ceiling (the not-cross line — `session_ceiling`
         // = 0.95 here, NOT the lower `effective_ceiling` / `session_threshold` the normal fire point
         // is derived backward from) is the co-consumption spike velocity-detection is meant to catch,
         // and it MUST escape even inside the swap cooldown. Before the fix the SAME setup returned
@@ -16135,7 +16135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_jittered_weekly_trigger_is_deterministic_and_varies_the_swap_decision() {
+    async fn a_jittered_weekly_ceiling_is_deterministic_and_varies_the_swap_decision() {
         // The WEEKLY-axis mirror of the jittered-trigger test (issue #41): session
         // is held LOW (never trips its trigger), weekly sits at a fixed 60%, and a
         // wide uniform weekly-ceiling jitter spans downward from the 95 base to the
@@ -16166,7 +16166,7 @@ mod tests {
                 .ok("u-A", 0.10, 0.60)
                 .ok("u-B", 0.05, 0.05);
             let mut tun = tunables(95, 80, 0);
-            tun.weekly_trigger_strategy = Strategy {
+            tun.weekly_ceiling_strategy = Strategy {
                 base: 95.0,
                 jitter: Jitter::Uniform { spread: 100.0 },
             };
@@ -19271,7 +19271,7 @@ mod tests {
         ])
         .await;
         let (_dir, json) = claude_json("u-A");
-        // spare's weekly (0.99) is at/above the 0.98 base (`tunables` WEEKLY_TRIGGER=98) → exhausted;
+        // spare's weekly (0.99) is at/above the 0.98 base (`tunables` WEEKLY_CEILING=98) → exhausted;
         // work stays active and viable so warm-up holds.
         let poller = FakeRosterPoller::new()
             .ok("u-A", 0.10, 0.10)
@@ -19982,7 +19982,7 @@ mod tests {
         let ack = daemon
             .perform_config_set(&ConfigSetCommand {
                 tunables: SetTunables {
-                    session_trigger: Some(200), // a usage percent > 100 is out of range
+                    session_ceiling: Some(200), // a usage percent > 100 is out of range
                     ..SetTunables::default()
                 },
                 labels: BTreeMap::new(),
@@ -21018,7 +21018,7 @@ mod tests {
     async fn next_swap_classifies_the_candidate_from_the_readings() {
         // The daemon-side candidate (#88) IS `pick_target` mapped to a label, plus the
         // two no-candidate verdicts the wire must distinguish. Reuses the 3-account
-        // harness (work=0, spare=1, backup=2; target_max_session_usage 0.80, weekly_trigger_base
+        // harness (work=0, spare=1, backup=2; target_max_session_usage 0.80, weekly_ceiling_base
         // 0.98). This pins the projection/classification wrapper — `pick_target`'s own
         // selection logic is covered by its dedicated suite above.
         let daemon = three_account_daemon(FakeRosterPoller::new()).await;
@@ -25597,7 +25597,7 @@ mod tests {
             },
             Error::RosterEmpty,
             Error::ConfigParse("expected `=` at line 3".to_owned()),
-            Error::ConfigInvalid("session_trigger must be in 50..=99, got 120".to_owned()),
+            Error::ConfigInvalid("session_ceiling must be in 50..=99, got 120".to_owned()),
             Error::ConfigTargetMaxSessionAboveTrigger {
                 target_max_session_usage: 95,
                 trigger: 90,
@@ -25800,8 +25800,8 @@ mod tests {
                 accounts: 3,
                 poll_secs: 30,
                 target_max_session_usage: 70,
-                session_trigger: 90,
-                weekly_trigger: 98,
+                session_ceiling: 90,
+                weekly_ceiling: 98,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
             }

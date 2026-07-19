@@ -480,7 +480,7 @@ pub(crate) enum ConfigSetEffect {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ConfigSetRejection {
     /// A tunable was out of range, or a cross-field rule failed (e.g. `exhausted_poll_secs < poll_secs`,
-    /// `target_max_session_usage > session_trigger`). The ack's `detail` names the offending field.
+    /// `target_max_session_usage > session_ceiling`). The ack's `detail` names the offending field.
     Invalid,
     /// A label edit named an `account_uuid` matching no roster account (a stale client — the account
     /// was `remove`d since its `config-get`).

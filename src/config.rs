@@ -94,7 +94,7 @@ pub(crate) const COOLDOWN_SECS_FLOOR: u64 = 5;
 // silent runtime gap — and because `daemon::COOLDOWN_SECS_LO` derives from this
 // constant, the guard covers the per-cycle jitter clamp too.
 const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
-/// Default `session_trigger` percent — the CEILING (issue #597): the settled session line
+/// Default `session_ceiling` percent — the CEILING (issue #597): the settled session line
 /// the active account must not cross, NOT a fire-at trigger. Both swap arms (the reactive
 /// `observed` estimator and the issue #539 projection) derive their fire point BACKWARD from
 /// it — `ceiling − tail_margin − velocity × lookahead` — so a swap lands the outgoing account
@@ -103,21 +103,21 @@ const _: () = assert!(COOLDOWN_SECS_FLOOR >= 1);
 /// (issue #455 / #595) reachable: the ceiling is the SLO boundary and the tail margin
 /// (`swap::TAIL_MARGIN`, 6 pp) keeps the landing under it. See ADR-0023 (the ceiling redesign,
 /// superseding ADR-0022).
-const DEFAULT_SESSION_TRIGGER: u8 = 95;
+const DEFAULT_SESSION_CEILING: u8 = 95;
 /// Default `target_max_session_usage` percent (issue #398): the default-on swap-target
 /// reserve — only swap TO an account whose session usage is below this. Sits
-/// below `session_trigger` so a swapped-to target keeps runway before the next
+/// below `session_ceiling` so a swapped-to target keeps runway before the next
 /// poll; supersedes #10's opt-in (an absent key now means this, not "off").
 const DEFAULT_TARGET_MAX_SESSION_USAGE: u8 = 80;
-/// Default `weekly_trigger` percent — the weekly CEILING (issue #607): the settled weekly line the
+/// Default `weekly_ceiling` percent — the weekly CEILING (issue #607): the settled weekly line the
 /// active account must not cross, NOT a fire-at trigger. Separate from and higher than
-/// `session_trigger` (issue #41): the weekly window is the longer, harder limit, so the active
+/// `session_ceiling` (issue #41): the weekly window is the longer, harder limit, so the active
 /// account is allowed closer to full on it before a swap-away. The swap fires BACKWARD from this
 /// ceiling at `ceiling − swap::WEEKLY_TAIL_MARGIN` (1 pp) so the outgoing account lands BELOW it
-/// after its post-swap committed tail — the weekly analogue of what #597 did for `session_trigger`.
+/// after its post-swap committed tail — the weekly analogue of what #597 did for `session_ceiling`.
 /// 98 leaves the weekly fire point at 97, still well above the session ceiling, preserving the
 /// "weekly is the harder limit, allowed closer to full" intent this default has always encoded.
-const DEFAULT_WEEKLY_TRIGGER: u8 = 98;
+const DEFAULT_WEEKLY_CEILING: u8 = 98;
 /// Default consecutive-401 count before an account is treated as rejected.
 const DEFAULT_MONITOR_401_N: u8 = 3;
 /// Default consecutive recovery-probe successes before a quarantined (dead)
@@ -132,7 +132,7 @@ const DEFAULT_MONITOR_RECOVERY_M: u8 = 2;
 const DEFAULT_SESSION_BLIND_SWAP_SECS: u64 = 300;
 /// Default `session_blind_risk_band` percent (issue #452, ADR-0017): the retained
 /// pre-blind anchor (`last_good`, #450) must be at/over this for the preemptive gate to
-/// arm. Deliberately LOWER than `session_trigger` — the gate acts preemptively on a
+/// arm. Deliberately LOWER than `session_ceiling` — the gate acts preemptively on a
 /// stale anchor, before the account would trip the reactive trigger. 60 is the low end
 /// of the conservative 60-to-65 band #484 ratified: the #451 replay is flat from 68 %
 /// down to 50 %, so the data bounds only the ceiling and the fire-early-is-cheaper
@@ -142,7 +142,7 @@ const DEFAULT_SESSION_BLIND_RISK_BAND: u8 = 60;
 /// Default `session_velocity_horizon_secs` (issue #539, ADR-0017): the projection horizon `H`
 /// (seconds) for the velocity-projection preemptive trigger — the active account swaps away when
 /// its PROJECTED session usage (`last + velocity × H`) crosses the effective ceiling
-/// (`session_trigger` minus the tail margin, issue #597), before the observed
+/// (`session_ceiling` minus the tail margin, issue #597), before the observed
 /// reading does. 120 s ≈ one active poll interval (the post-#366 interleave cadence, NOT the
 /// `poll_secs=300` peer cadence), the horizon the #538 spike validated on 22,022 real samples
 /// (P50=94 / P100=98 covered-swap, 0 over-fire at H ≤ 150 s). Setting it to `0` disables the path
@@ -152,7 +152,7 @@ const DEFAULT_SESSION_VELOCITY_HORIZON_SECS: u64 = 120;
 /// Default `session_velocity_min_project_above` percent (issue #539, ADR-0017): the projective
 /// trigger only projects when the observed session reading is at/over this. The #538 spike's FREE
 /// guard — projection can't reach below it anyway (max reach ≤ 14 pp at H ≤ 150 s) — so it costs no
-/// benefit while excluding spurious low-usage projections. Conventionally BELOW `session_trigger`
+/// benefit while excluding spurious low-usage projections. Conventionally BELOW `session_ceiling`
 /// (the projection fires in the band beneath the reactive trigger).
 const DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE: u8 = 85;
 /// Default `session_velocity_ema_alpha_pct` (issue #539, ADR-0017): the EMA smoothing weight α
@@ -343,12 +343,12 @@ pub(crate) struct Tunables {
     pub(crate) cooldown_secs: u64,
     /// Default-on swap-target reserve (issue #398): the most-full an account may be
     /// to receive the active session — only swap *to* an account whose session usage
-    /// is below this percent (`1..=session_trigger`; an explicit `0` admits no target
+    /// is below this percent (`1..=session_ceiling`; an explicit `0` admits no target
     /// and is rejected), so a freshly-swapped target keeps runway before the next
     /// poll. Always valued — an absent key means [`DEFAULT_TARGET_MAX_SESSION_USAGE`], not
-    /// "off" (this supersedes #10's opt-in `Option`). Raise it toward `session_trigger`
+    /// "off" (this supersedes #10's opt-in `Option`). Raise it toward `session_ceiling`
     /// to admit busier targets (equal is inert); the always-on session gate
-    /// (`session < session_trigger`, [`crate::daemon`]) still prevents oscillation
+    /// (`session < session_ceiling`, [`crate::daemon`]) still prevents oscillation
     /// independently.
     pub(crate) target_max_session_usage: u8,
     /// The session CEILING (issues #597, #609): the settled session percent (`50..=99`) the active
@@ -361,8 +361,7 @@ pub(crate) struct Tunables {
     /// (`poll_gap`), the projection the velocity horizon (`H`) — and the daemon composes them (fire at
     /// the earlier), so the swap fires at `observed >= ceiling − tail_margin − velocity × max(poll_gap,
     /// H)`, covering the larger window (issue #609, superseding #597's strict-early-fire framing). This
-    /// stays ONE knob, never two: both derive from this single ceiling and share the reserve. The name
-    /// is retained for compatibility; a rename to `session_ceiling` is a tracked follow-up.
+    /// stays ONE knob, never two: both derive from this single ceiling and share the reserve.
     ///
     /// This IS (near) the landing point now — the point of the redesign: the `tail_margin`
     /// (`swap::TAIL_MARGIN`, 6 pp) is subtracted so the outgoing account lands BELOW the ceiling even
@@ -377,14 +376,14 @@ pub(crate) struct Tunables {
     /// operator who trusts it may raise the ceiling to 99. Full rationale +
     /// tail/coupling evidence: ADR-0023 (the ceiling redesign, superseding ADR-0022) and ADR-0024 (the
     /// gap-percentile lookahead + max-window coverage + downward-only ceiling jitter).
-    pub(crate) session_trigger: u8,
+    pub(crate) session_ceiling: u8,
     /// The settled WEEKLY CEILING (`50..=99` percent) — the weekly line the active account must not
-    /// cross — and the second, independent trigger dimension (issue #41). Separate from
-    /// `session_trigger` (no cross-field constraint), typically set higher; the daemon swaps when
+    /// cross — and the second, independent ceiling dimension (issue #41). Separate from
+    /// `session_ceiling` (no cross-field constraint), typically set higher; the daemon swaps when
     /// EITHER dimension reaches its own fire point.
     ///
     /// Since issue #607 this is a CEILING, not a fire-*at* trigger — the weekly analogue of what
-    /// #597 did for `session_trigger`. The swap fires BACKWARD from it at `ceiling −
+    /// #597 did for `session_ceiling`. The swap fires BACKWARD from it at `ceiling −
     /// swap::WEEKLY_TAIL_MARGIN` (1 pp), so the outgoing account LANDS below this line after its
     /// post-swap committed tail: the same in-flight work that keeps billing the parked account's
     /// session window bills its weekly window too (issue #595 measured the tail on the session axis;
@@ -395,11 +394,7 @@ pub(crate) struct Tunables {
     /// assumption — NOT the window-duration ratio, which would justify the margin in the wrong
     /// direction; see `swap::WEEKLY_TAIL_MARGIN` for the full provenance). The two dimensions carry
     /// independently calibrated margins by design.
-    ///
-    /// The name is retained for compatibility; a rename to `weekly_ceiling` is a tracked follow-up,
-    /// paired with the `session_trigger` → `session_ceiling` rename so both dimensions change
-    /// together rather than leaving a half-renamed config + menubar wire surface.
-    pub(crate) weekly_trigger: u8,
+    pub(crate) weekly_ceiling: u8,
     /// Bounded-blindness preemptive-swap gate threshold `T` (issue #452, ADR-0017), in
     /// seconds: the active account's retained pre-blind anchor (`last_good`, #450) must
     /// be stale beyond this before the gate arms. Promoted from the interim
@@ -409,19 +404,19 @@ pub(crate) struct Tunables {
     /// Bounded-blindness preemptive-swap `risk_band` (issue #452, ADR-0017), as a
     /// session-usage percent: the pre-blind anchor must be at/over this for the gate to
     /// arm. Promoted from the interim `BLIND_GATE_RISK_BAND` daemon constant; DISTINCT
-    /// from and biased below `session_trigger` (the gate acts preemptively on a stale
+    /// from and biased below `session_ceiling` (the gate acts preemptively on a stale
     /// anchor). Conservative 60 by default (#484).
     pub(crate) session_blind_risk_band: u8,
     /// Velocity-projection preemptive-trigger horizon `H` (issue #539, ADR-0017), in seconds:
     /// the active account swaps away when its PROJECTED session usage (`last + velocity × H`,
-    /// keyed off the #399 usage-velocity signal) crosses the effective ceiling (`session_trigger`
+    /// keyed off the #399 usage-velocity signal) crosses the effective ceiling (`session_ceiling`
     /// minus the tail margin, issue #597), before the observed reading does — closing the OBSERVED
     /// reactive overshoot (#363) #452's blind-window path does not.
     /// `0` disables the path (projection reduces to `last`, never crosses) — the kill-switch.
     pub(crate) session_velocity_horizon_secs: u64,
     /// Velocity-projection guard (issue #539, ADR-0017), as a session-usage percent: the projective
     /// trigger only projects when the observed reading is at/over this. The #538 spike's FREE guard
-    /// (projection can't reach lower anyway); conventionally BELOW `session_trigger`, like
+    /// (projection can't reach lower anyway); conventionally BELOW `session_ceiling`, like
     /// `session_blind_risk_band`.
     pub(crate) session_velocity_min_project_above: u8,
     /// Velocity-projection EMA smoothing weight α (issue #539, ADR-0017), as a percent: the per-poll
@@ -447,14 +442,14 @@ pub(crate) struct Tunables {
     /// cycle instead of sleeping a fixed interval.
     pub(crate) poll_strategy: Strategy,
     /// Swap-away trigger timing strategy (issue #38), in the PERCENT domain:
-    /// base = `session_trigger`, no jitter unless configured. Drawn + clamped to
+    /// base = `session_ceiling`, no jitter unless configured. Drawn + clamped to
     /// `50..=99` each cycle, then divided by 100 for the swap decision.
     pub(crate) trigger_strategy: Strategy,
     /// Weekly swap-away trigger timing strategy (issue #41), in the PERCENT
-    /// domain: base = `weekly_trigger`, no jitter unless configured. Drawn +
+    /// domain: base = `weekly_ceiling`, no jitter unless configured. Drawn +
     /// clamped to `50..=99` each cycle, then divided by 100 for the swap decision
     /// — the weekly-dimension counterpart of `trigger_strategy`.
-    pub(crate) weekly_trigger_strategy: Strategy,
+    pub(crate) weekly_ceiling_strategy: Strategy,
     /// Post-swap cooldown timing strategy (issue #38), in seconds: base =
     /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to
     /// `COOLDOWN_SECS_FLOOR..=3600` each cycle — the low bound is the non-zero swap
@@ -470,8 +465,8 @@ impl Default for Tunables {
             near_limit_poll_secs: DEFAULT_NEAR_LIMIT_POLL_SECS,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
             target_max_session_usage: DEFAULT_TARGET_MAX_SESSION_USAGE,
-            session_trigger: DEFAULT_SESSION_TRIGGER,
-            weekly_trigger: DEFAULT_WEEKLY_TRIGGER,
+            session_ceiling: DEFAULT_SESSION_CEILING,
+            weekly_ceiling: DEFAULT_WEEKLY_CEILING,
             session_blind_swap_secs: DEFAULT_SESSION_BLIND_SWAP_SECS,
             session_blind_risk_band: DEFAULT_SESSION_BLIND_RISK_BAND,
             session_velocity_horizon_secs: DEFAULT_SESSION_VELOCITY_HORIZON_SECS,
@@ -483,15 +478,15 @@ impl Default for Tunables {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
             },
-            trigger_strategy: Strategy::fixed(f64::from(DEFAULT_SESSION_TRIGGER)),
-            weekly_trigger_strategy: Strategy::fixed(f64::from(DEFAULT_WEEKLY_TRIGGER)),
+            trigger_strategy: Strategy::fixed(f64::from(DEFAULT_SESSION_CEILING)),
+            weekly_ceiling_strategy: Strategy::fixed(f64::from(DEFAULT_WEEKLY_CEILING)),
             cooldown_strategy: Strategy::fixed(DEFAULT_COOLDOWN_SECS as f64),
         }
     }
 }
 
 /// The default poll-interval jitter: normal, so polls decorrelate out of the box
-/// (issue #38). Trigger, weekly trigger, and cooldown default to [`Jitter::None`].
+/// (issue #38). Trigger, weekly ceiling, and cooldown default to [`Jitter::None`].
 fn default_poll_jitter() -> Jitter {
     Jitter::Normal {
         stddev: DEFAULT_POLL_JITTER_STDDEV,
@@ -1007,14 +1002,14 @@ impl Config {
                     present("tunables", "target_max_session_usage"),
                 ),
                 entry(
-                    "session_trigger",
-                    t.session_trigger.to_string(),
-                    present("tunables", "session_trigger"),
+                    "session_ceiling",
+                    t.session_ceiling.to_string(),
+                    present("tunables", "session_ceiling"),
                 ),
                 entry(
-                    "weekly_trigger",
-                    t.weekly_trigger.to_string(),
-                    present("tunables", "weekly_trigger"),
+                    "weekly_ceiling",
+                    t.weekly_ceiling.to_string(),
+                    present("tunables", "weekly_ceiling"),
                 ),
                 entry(
                     "session_blind_swap_secs",
@@ -1069,9 +1064,9 @@ impl Config {
                     present("jitter", "trigger"),
                 ),
                 entry(
-                    "weekly_trigger",
-                    render_jitter(&t.weekly_trigger_strategy.jitter),
-                    present("jitter", "weekly_trigger"),
+                    "weekly_ceiling",
+                    render_jitter(&t.weekly_ceiling_strategy.jitter),
+                    present("jitter", "weekly_ceiling"),
                 ),
                 entry(
                     "cooldown",
@@ -1229,7 +1224,7 @@ impl Config {
     /// Apply a `config-set` control command's edits (issue #268) to the config `text`
     /// read from disk, re-validating the WHOLE result through the same
     /// [`validate`](Config::validate) that [`load`](Config::load) runs — so every range
-    /// and cross-field rule (`target_max_session_usage <= session_trigger`,
+    /// and cross-field rule (`target_max_session_usage <= session_ceiling`,
     /// `exhausted_poll_secs >= poll_secs`, the `near_limit_poll_secs` 0-or-band shape, …)
     /// is enforced atomically over the FINAL state. An invalid batch is rejected with
     /// nothing written; a batch is valid iff its resulting config is (an individually
@@ -1306,16 +1301,16 @@ impl Config {
         Duration::from_secs(self.tunables.poll_secs)
     }
 
-    /// The session CEILING as a fraction in `[0.0, 1.0]` (issue #597) — `session_trigger`
+    /// The session CEILING as a fraction in `[0.0, 1.0]` (issue #597) — `session_ceiling`
     /// / 100. The settled line the active account must not cross; the daemon's swap arms
-    /// derive their fire point backward from it (see the `session_trigger` field).
+    /// derive their fire point backward from it (see the `session_ceiling` field).
     ///
     /// The daemon derives its own ceiling / floor / cooldown uniformly from
     /// [`Tunables`] (issue #7), so this Config-level accessor is currently a
     /// tested seam for the `status` view (#9) rather than the run loop.
     #[allow(dead_code)]
     pub(crate) fn swap_threshold(&self) -> f64 {
-        f64::from(self.tunables.session_trigger) / 100.0
+        f64::from(self.tunables.session_ceiling) / 100.0
     }
 
     /// Ensure the roster holds at least one account — the daemon's precondition.
@@ -1357,7 +1352,7 @@ impl Config {
     pub(crate) fn peak_runway_advisory(&self) -> Option<PeakRunwayAdvisory> {
         let t = &self.tunables;
         let bound = crate::swap::peak_runway_reserve_bound(
-            f64::from(t.session_trigger) / 100.0,
+            f64::from(t.session_ceiling) / 100.0,
             t.near_limit_poll_secs,
             t.session_velocity_horizon_secs,
         );
@@ -1391,22 +1386,22 @@ impl Config {
 
     /// Stage two: bounds-check every tunable and the roster, producing the typed
     /// `Config`. Each rejection names the offending field; the cross-field rule
-    /// (`target_max_session_usage <= session_trigger`) gets its own distinct error.
+    /// (`target_max_session_usage <= session_ceiling`) gets its own distinct error.
     fn validate(raw: RawConfig) -> Result<Self> {
         let t = raw.tunables;
 
-        range("session_trigger", t.session_trigger, 50, 99)?;
+        range("session_ceiling", t.session_ceiling, 50, 99)?;
         // The weekly trigger is independent of the session trigger (issue #41):
         // its own 50..=99 bound, with NO cross-field rule — weekly may sit below
         // session (an unusual but valid operator choice), so both are configurable
         // independently (AC #3).
-        range("weekly_trigger", t.weekly_trigger, 50, 99)?;
+        range("weekly_ceiling", t.weekly_ceiling, 50, 99)?;
         // Issue #452 (ADR-0017) bounded-blindness preemptive-swap gate. `session_blind_swap_secs`
         // is `T` in seconds: floored at 60 (at least one poll cycle blind) and capped at 86400 — a
         // 24 h ceiling far beyond any real blind window, so setting it there disables the path (the
         // config kill-switch). `session_blind_risk_band` is a session percent, 50..=99 like the
-        // triggers but conventionally set BELOW `session_trigger` (the gate fires preemptively on a
-        // stale anchor). No NEW cross-field: ADR-0017's `target_max_session_usage <= session_trigger`
+        // triggers but conventionally set BELOW `session_ceiling` (the gate fires preemptively on a
+        // stale anchor). No NEW cross-field: ADR-0017's `target_max_session_usage <= session_ceiling`
         // is the existing reserve invariant enforced below — the blind path's target still needs
         // runway below its own reactive trigger, which that invariant already guarantees.
         range(
@@ -1422,7 +1417,7 @@ impl Config {
         // the config kill-switch), and 600 is a sanity ceiling (the #538 spike validated H ≈ 120 and
         // showed over-fire creeping in above ~150, so a large H is a foot-gun the false-projection SLI
         // surfaces; the ceiling just bounds the absurd). `session_velocity_min_project_above` is a
-        // session percent (`50..=99`) conventionally set BELOW `session_trigger` — the projective peer
+        // session percent (`50..=99`) conventionally set BELOW `session_ceiling` — the projective peer
         // fires in the band beneath the reactive trigger — exactly like `session_blind_risk_band`, so no
         // NEW cross-field. `session_velocity_ema_alpha_pct` is the EMA weight α (`1..=100`); the `0`
         // floor is excluded because α=0 would freeze the EMA (never integrate a new sample), a
@@ -1446,17 +1441,17 @@ impl Config {
             100,
         )?;
         // target_max_session_usage is default-on (#398): absent → DEFAULT_TARGET_MAX_SESSION_USAGE, clamped
-        // down to session_trigger so the default honors the SAME
-        // `target_max_session_usage <= session_trigger` invariant the present-value arm enforces
-        // (#417 — without the clamp a `session_trigger < 80` config loads with an
+        // down to session_ceiling so the default honors the SAME
+        // `target_max_session_usage <= session_ceiling` invariant the present-value arm enforces
+        // (#417 — without the clamp a `session_ceiling < 80` config loads with an
         // unchecked reserve of 80 and then bricks after a render→parse round-trip, since
         // #398 renders the default as a live line; an equal reserve is inert per
         // ADR-0013). When present, its lower bound is 1 (an explicit 0 admits no
         // target, silently disabling proactive swapping) and its upper bound is
-        // session_trigger (a higher reserve could never admit a target), the latter a
+        // session_ceiling (a higher reserve could never admit a target), the latter a
         // distinct cross-field error.
         let target_max_session_usage = match t.target_max_session_usage {
-            None => DEFAULT_TARGET_MAX_SESSION_USAGE.min(t.session_trigger as u8),
+            None => DEFAULT_TARGET_MAX_SESSION_USAGE.min(t.session_ceiling as u8),
             Some(value) => {
                 if value == 0 {
                     // The swap predicate is `usage.session < target_max_session_usage`, so 0
@@ -1468,20 +1463,20 @@ impl Config {
                     return Err(Error::ConfigInvalid(format!(
                         "target_max_session_usage = 0 admits no swap target and silently disables \
                          proactive swapping; it must be in 1..={}. Raise it toward \
-                         session_trigger to admit more targets.",
-                        t.session_trigger
+                         session_ceiling to admit more targets.",
+                        t.session_ceiling
                     )));
                 }
                 if value < 0 {
                     return Err(Error::ConfigInvalid(format!(
                         "target_max_session_usage must be in 1..={}, got {value}",
-                        t.session_trigger
+                        t.session_ceiling
                     )));
                 }
-                if value > t.session_trigger {
+                if value > t.session_ceiling {
                     return Err(Error::ConfigTargetMaxSessionAboveTrigger {
                         target_max_session_usage: value,
-                        trigger: t.session_trigger,
+                        trigger: t.session_ceiling,
                     });
                 }
                 value as u8
@@ -1518,13 +1513,13 @@ impl Config {
             )));
         }
         // The peak-velocity runway coupling (issue #608, discharging ADR-0023 § Alternatives 3).
-        // Checked HERE — after `session_trigger`, `session_velocity_horizon_secs` and
+        // Checked HERE — after `session_ceiling`, `session_velocity_horizon_secs` and
         // `near_limit_poll_secs` are each range-validated above — so the bound is computed from
         // validated values, the same "cross-field rule after its own fields" placement as
         // `exhausted_poll_secs`.
         //
         // ONLY the UNSATISFIABLE stack is rejected: a bound at/below 0 means no
-        // `target_max_session_usage` in its legal `1..=session_trigger` range keeps a swapped-to
+        // `target_max_session_usage` in its legal `1..=session_ceiling` range keeps a swapped-to
         // account runway at peak velocity — the composed fire point has collapsed to 0, so every
         // account would swap at any usage (ADR-0023 § Consequences' absurd-config corner). A merely
         // EXCEEDED bound (positive, but under the configured reserve) is deliberately NOT an error:
@@ -1532,7 +1527,7 @@ impl Config {
         // ceiling), so rejecting it would brick every stock install — the #417 bricking failure mode.
         // That case surfaces as the non-fatal `config validate` advisory instead.
         let peak_runway_bound = crate::swap::peak_runway_reserve_bound(
-            f64::from(t.session_trigger as u8) / 100.0,
+            f64::from(t.session_ceiling as u8) / 100.0,
             t.near_limit_poll_secs as u64,
             t.session_velocity_horizon_secs as u64,
         );
@@ -1544,7 +1539,7 @@ impl Config {
                 t.session_velocity_horizon_secs as u64,
             );
             return Err(Error::ConfigPeakRunwayUnsatisfiable {
-                trigger: t.session_trigger,
+                trigger: t.session_ceiling,
                 near_limit_poll_secs: t.near_limit_poll_secs as u64,
                 horizon_secs: t.session_velocity_horizon_secs as u64,
                 // Both are bounded well inside i64/u64 by the range checks above; the renders are
@@ -1572,8 +1567,8 @@ impl Config {
         // cooldown are fixed unless the operator configures a strategy.
         let poll_jitter = parse_jitter("poll", raw.jitter.poll, default_poll_jitter())?;
         let trigger_jitter = parse_jitter("trigger", raw.jitter.trigger, Jitter::None)?;
-        let weekly_trigger_jitter =
-            parse_jitter("weekly_trigger", raw.jitter.weekly_trigger, Jitter::None)?;
+        let weekly_ceiling_jitter =
+            parse_jitter("weekly_ceiling", raw.jitter.weekly_ceiling, Jitter::None)?;
         let cooldown_jitter = parse_jitter("cooldown", raw.jitter.cooldown, Jitter::None)?;
 
         // Ranges are checked above, so these narrowing casts cannot truncate. The
@@ -1585,8 +1580,8 @@ impl Config {
             near_limit_poll_secs: t.near_limit_poll_secs as u64,
             cooldown_secs: t.cooldown_secs as u64,
             target_max_session_usage,
-            session_trigger: t.session_trigger as u8,
-            weekly_trigger: t.weekly_trigger as u8,
+            session_ceiling: t.session_ceiling as u8,
+            weekly_ceiling: t.weekly_ceiling as u8,
             session_blind_swap_secs: t.session_blind_swap_secs as u64,
             session_blind_risk_band: t.session_blind_risk_band as u8,
             session_velocity_horizon_secs: t.session_velocity_horizon_secs as u64,
@@ -1599,12 +1594,12 @@ impl Config {
                 jitter: poll_jitter,
             },
             trigger_strategy: Strategy {
-                base: t.session_trigger as f64,
+                base: t.session_ceiling as f64,
                 jitter: trigger_jitter,
             },
-            weekly_trigger_strategy: Strategy {
-                base: t.weekly_trigger as f64,
-                jitter: weekly_trigger_jitter,
+            weekly_ceiling_strategy: Strategy {
+                base: t.weekly_ceiling as f64,
+                jitter: weekly_ceiling_jitter,
             },
             cooldown_strategy: Strategy {
                 base: t.cooldown_secs as f64,
@@ -1830,7 +1825,7 @@ impl Config {
         out.push_str(&format!("cooldown_secs = {}\n", t.cooldown_secs));
         out.push_str(
             "# The most-full an account may be to receive the active session: only swap\n\
-             # TO an account whose session usage is below this percent (1..=session_trigger).\n\
+             # TO an account whose session usage is below this percent (1..=session_ceiling).\n\
              # This is NOT the level that triggers a swap. Default-on (#398); 0 is rejected\n\
              # — it admits no target and would disable proactive swapping.\n",
         );
@@ -1849,18 +1844,18 @@ impl Config {
              # lever — 99 is reachable (raise it to spend the margin as runway). One knob, two\n\
              # estimators (not two knobs). See ADR-0023 + ADR-0024 (docs/adr).\n",
         );
-        out.push_str(&format!("session_trigger = {}\n", t.session_trigger));
+        out.push_str(&format!("session_ceiling = {}\n", t.session_ceiling));
         out.push_str(
             "# The settled WEEKLY CEILING (50..=99) — the weekly line the active account must\n\
-             # NOT cross. Independent of session_trigger (typically higher): a swap fires when\n\
-             # EITHER dimension reaches its own fire point. Like session_trigger this is a\n\
+             # NOT cross. Independent of session_ceiling (typically higher): a swap fires when\n\
+             # EITHER dimension reaches its own fire point. Like session_ceiling this is a\n\
              # ceiling, not a fire-at value (issue #607): the swap fires BACKWARD from it, 1 pp\n\
              # early, so the outgoing account LANDS below this line after its post-swap committed\n\
              # tail (the same in-flight work that bills the session window bills the weekly one).\n\
              # The 1 pp weekly margin is much smaller than session's 6 pp because that tail is a\n\
              # far smaller fraction of a 7-day window. See ADR-0025 (docs/adr).\n",
         );
-        out.push_str(&format!("weekly_trigger = {}\n", t.weekly_trigger));
+        out.push_str(&format!("weekly_ceiling = {}\n", t.weekly_ceiling));
         out.push_str(
             "# Bounded-blindness preemptive swap (issue #452, ADR-0017): when the active\n\
              # account's usage poll stays blind (429/5xx) longer than this many seconds AND\n\
@@ -1873,7 +1868,7 @@ impl Config {
         ));
         out.push_str(
             "# The last-known session percent (50..=99) at/over which a blind active account\n\
-             # is eligible for the preemptive swap above. Set BELOW session_trigger — it acts\n\
+             # is eligible for the preemptive swap above. Set BELOW session_ceiling — it acts\n\
              # on the stale pre-blind reading, before the reactive trigger would fire.\n",
         );
         out.push_str(&format!(
@@ -1883,7 +1878,7 @@ impl Config {
         out.push_str(
             "# Velocity-projection preemptive swap (issue #539, ADR-0017): swap the active\n\
              # account away when its PROJECTED session usage (last + velocity * H) crosses the\n\
-             # effective ceiling (session_trigger minus the tail margin, issue #597) before the\n\
+             # effective ceiling (session_ceiling minus the tail margin, issue #597) before the\n\
              # observed reading does — H is this horizon in seconds (~ the active poll cadence;\n\
              # 120 validated by #538). Set to 0 to disable.\n",
         );
@@ -1894,7 +1889,7 @@ impl Config {
         out.push_str(
             "# Only project when the observed session percent (50..=99) is at/over this — the\n\
              # projection can't reach lower anyway, so it is a free guard. Set BELOW\n\
-             # session_trigger (the projective peer fires in the band beneath it).\n",
+             # session_ceiling (the projective peer fires in the band beneath it).\n",
         );
         out.push_str(&format!(
             "session_velocity_min_project_above = {}\n",
@@ -1928,7 +1923,7 @@ impl Config {
             "# Randomization drawn each cycle and clamped to the tunable's range.\n\
              # kind = \"none\" | \"uniform\" (with `spread`) | \"normal\" (with `stddev`).\n\
              # poll defaults to normal jitter (stddev ~20% of poll_secs) so accounts\n\
-             # decorrelate; trigger, weekly_trigger and cooldown default to none.\n",
+             # decorrelate; trigger, weekly_ceiling and cooldown default to none.\n",
         );
         out.push_str(&format!(
             "poll = {}\n",
@@ -1939,8 +1934,8 @@ impl Config {
             render_jitter(&t.trigger_strategy.jitter)
         ));
         out.push_str(&format!(
-            "weekly_trigger = {}\n",
-            render_jitter(&t.weekly_trigger_strategy.jitter)
+            "weekly_ceiling = {}\n",
+            render_jitter(&t.weekly_ceiling_strategy.jitter)
         ));
         out.push_str(&format!(
             "cooldown = {}\n",
@@ -2294,9 +2289,9 @@ pub(crate) struct SetTunables {
     #[serde(default)]
     pub(crate) target_max_session_usage: Option<i64>,
     #[serde(default)]
-    pub(crate) session_trigger: Option<i64>,
+    pub(crate) session_ceiling: Option<i64>,
     #[serde(default)]
-    pub(crate) weekly_trigger: Option<i64>,
+    pub(crate) weekly_ceiling: Option<i64>,
     #[serde(default)]
     pub(crate) session_blind_swap_secs: Option<i64>,
     #[serde(default)]
@@ -2342,8 +2337,8 @@ pub(crate) struct TunablesView {
     pub(crate) near_limit_poll_secs: u64,
     pub(crate) cooldown_secs: u64,
     pub(crate) target_max_session_usage: u8,
-    pub(crate) session_trigger: u8,
-    pub(crate) weekly_trigger: u8,
+    pub(crate) session_ceiling: u8,
+    pub(crate) weekly_ceiling: u8,
     pub(crate) session_blind_swap_secs: u64,
     pub(crate) session_blind_risk_band: u8,
     pub(crate) session_velocity_horizon_secs: u64,
@@ -2361,8 +2356,8 @@ impl From<&Tunables> for TunablesView {
             near_limit_poll_secs: t.near_limit_poll_secs,
             cooldown_secs: t.cooldown_secs,
             target_max_session_usage: t.target_max_session_usage,
-            session_trigger: t.session_trigger,
-            weekly_trigger: t.weekly_trigger,
+            session_ceiling: t.session_ceiling,
+            weekly_ceiling: t.weekly_ceiling,
             session_blind_swap_secs: t.session_blind_swap_secs,
             session_blind_risk_band: t.session_blind_risk_band,
             session_velocity_horizon_secs: t.session_velocity_horizon_secs,
@@ -2404,11 +2399,11 @@ fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
     if let Some(v) = edits.target_max_session_usage {
         raw.target_max_session_usage = Some(v);
     }
-    if let Some(v) = edits.session_trigger {
-        raw.session_trigger = v;
+    if let Some(v) = edits.session_ceiling {
+        raw.session_ceiling = v;
     }
-    if let Some(v) = edits.weekly_trigger {
-        raw.weekly_trigger = v;
+    if let Some(v) = edits.weekly_ceiling {
+        raw.weekly_ceiling = v;
     }
     if let Some(v) = edits.session_blind_swap_secs {
         raw.session_blind_swap_secs = v;
@@ -2521,10 +2516,10 @@ struct RawTunables {
     /// operator mid-migration gets no silent winner.
     #[serde(default, alias = "target_max_usage", alias = "session_floor")]
     target_max_session_usage: Option<i64>,
-    #[serde(default = "default_session_trigger")]
-    session_trigger: i64,
-    #[serde(default = "default_weekly_trigger")]
-    weekly_trigger: i64,
+    #[serde(default = "default_session_ceiling")]
+    session_ceiling: i64,
+    #[serde(default = "default_weekly_ceiling")]
+    weekly_ceiling: i64,
     #[serde(default = "default_session_blind_swap_secs")]
     session_blind_swap_secs: i64,
     #[serde(default = "default_session_blind_risk_band")]
@@ -2549,8 +2544,8 @@ impl Default for RawTunables {
             near_limit_poll_secs: default_near_limit_poll_secs(),
             cooldown_secs: default_cooldown_secs(),
             target_max_session_usage: None,
-            session_trigger: default_session_trigger(),
-            weekly_trigger: default_weekly_trigger(),
+            session_ceiling: default_session_ceiling(),
+            weekly_ceiling: default_weekly_ceiling(),
             session_blind_swap_secs: default_session_blind_swap_secs(),
             session_blind_risk_band: default_session_blind_risk_band(),
             session_velocity_horizon_secs: default_session_velocity_horizon_secs(),
@@ -2574,11 +2569,11 @@ fn default_near_limit_poll_secs() -> i64 {
 fn default_cooldown_secs() -> i64 {
     DEFAULT_COOLDOWN_SECS as i64
 }
-fn default_session_trigger() -> i64 {
-    i64::from(DEFAULT_SESSION_TRIGGER)
+fn default_session_ceiling() -> i64 {
+    i64::from(DEFAULT_SESSION_CEILING)
 }
-fn default_weekly_trigger() -> i64 {
-    i64::from(DEFAULT_WEEKLY_TRIGGER)
+fn default_weekly_ceiling() -> i64 {
+    i64::from(DEFAULT_WEEKLY_CEILING)
 }
 fn default_session_blind_swap_secs() -> i64 {
     DEFAULT_SESSION_BLIND_SWAP_SECS as i64
@@ -2780,7 +2775,7 @@ struct RawJitter {
     #[serde(default)]
     trigger: Option<RawJitterSpec>,
     #[serde(default)]
-    weekly_trigger: Option<RawJitterSpec>,
+    weekly_ceiling: Option<RawJitterSpec>,
     #[serde(default)]
     cooldown: Option<RawJitterSpec>,
 }
@@ -2809,8 +2804,8 @@ mod tests {
 poll_secs = 30
 cooldown_secs = 45
 target_max_session_usage = 70
-session_trigger = 90
-weekly_trigger = 97
+session_ceiling = 90
+weekly_ceiling = 97
 monitor_401_n = 5
 monitor_recovery_m = 4
 
@@ -2934,8 +2929,8 @@ label = "personal"
     }
 
     #[test]
-    fn apply_settings_rejects_target_max_above_session_trigger() {
-        // VALID session_trigger=90; target_max_session_usage=95 > 90 → the distinct cross-field error.
+    fn apply_settings_rejects_target_max_above_session_ceiling() {
+        // VALID session_ceiling=90; target_max_session_usage=95 > 90 → the distinct cross-field error.
         let err = Config::apply_settings(
             VALID,
             &SetTunables {
@@ -3022,14 +3017,14 @@ label = "personal"
         // A bare scalar tunable parses; unset keys stay None.
         let ok: SetTunables = serde_json::from_str(r#"{"poll_secs":300}"#).unwrap();
         assert_eq!(ok.poll_secs, Some(300));
-        assert_eq!(ok.session_trigger, None);
+        assert_eq!(ok.session_ceiling, None);
     }
 
     #[test]
     fn config_view_projects_tunables_and_roster() {
         let view = Config::parse(VALID).unwrap().view();
         assert_eq!(view.tunables.poll_secs, 30);
-        assert_eq!(view.tunables.session_trigger, 90);
+        assert_eq!(view.tunables.session_ceiling, 90);
         assert_eq!(view.accounts.len(), 2);
         assert_eq!(
             view.accounts[0].account_uuid,
@@ -3063,8 +3058,8 @@ label = "personal"
                 near_limit_poll_secs: 60,
                 cooldown_secs: 45,
                 target_max_session_usage: 70,
-                session_trigger: 90,
-                weekly_trigger: 97,
+                session_ceiling: 90,
+                weekly_ceiling: 97,
                 // VALID sets no blind-swap keys → the compiled-in defaults (issue #452).
                 session_blind_swap_secs: 300,
                 session_blind_risk_band: 60,
@@ -3075,14 +3070,14 @@ label = "personal"
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
                 // No [jitter] table in VALID → default strategies: poll jitters
-                // normally (base from poll_secs), trigger/weekly_trigger/cooldown
+                // normally (base from poll_secs), trigger/weekly_ceiling/cooldown
                 // are fixed at their respective bases.
                 poll_strategy: Strategy {
                     base: 30.0,
                     jitter: default_poll_jitter(),
                 },
                 trigger_strategy: Strategy::fixed(90.0),
-                weekly_trigger_strategy: Strategy::fixed(97.0),
+                weekly_ceiling_strategy: Strategy::fixed(97.0),
                 cooldown_strategy: Strategy::fixed(45.0),
             }
         );
@@ -3101,11 +3096,11 @@ label = "personal"
                     label = \"only\"\n";
         let config = Config::parse(toml).unwrap();
         assert_eq!(config.tunables, Tunables::default());
-        // Issue #597: the default session_trigger is the CEILING, 95 — a landing target set
+        // Issue #597: the default session_ceiling is the CEILING, 95 — a landing target set
         // below the P100 < 99 SLO so backward derivation keeps the SLO reachable with headroom
         // over re-observation-gap staleness (ADR-0023; the pre-#597 fire-AT default was also 95
         // but meant "swap when observed reaches 95", not "land below 95").
-        assert_eq!(config.tunables.session_trigger, 95);
+        assert_eq!(config.tunables.session_ceiling, 95);
         // #398: the target_max_session_usage reserve is default-on at 80.
         assert_eq!(
             config.tunables.target_max_session_usage,
@@ -3133,71 +3128,111 @@ label = "personal"
     }
 
     #[test]
+    fn the_pre_rename_trigger_keys_are_rejected_not_silently_defaulted() {
+        // Issue #606 renamed `session_trigger` → `session_ceiling` and `weekly_trigger` →
+        // `weekly_ceiling` with NO migration (maintainer decision, ADR-0023 § Alternatives 4):
+        // the break is DELIBERATE, so it is pinned here rather than left to chance.
+        //
+        // Two things this asserts, both load-bearing. First, the failure is LOUD and
+        // SELF-REMEDYING: `RawTunables` is `deny_unknown_fields`, so an old config.toml is a
+        // parse error that names the offending key AND — via serde's "expected one of" field
+        // list — the replacement to write. It is NOT "ignored and falls back to the default",
+        // the framing issue #606's own text used. An operator who deletes the stale key gets
+        // the default; one who renames it keeps their value. Second, this is the falsifier for
+        // the no-back-compat decision: a later well-meaning `#[serde(alias = "session_trigger")]`
+        // would silently restore back-compat, and nothing else in the suite would go red.
+        // (Contrast `deprecated_aliases_parse_and_render_as_target_max_session_usage`, which
+        // pins the OPPOSITE decision for the target-reserve key — the asymmetry is intentional.)
+        for (stale, replacement) in [
+            ("session_trigger = 90", "session_ceiling"),
+            ("weekly_trigger = 95", "weekly_ceiling"),
+        ] {
+            let stale_key = stale.split(' ').next().expect("fragment is `key = value`");
+            match Config::parse(&with_tunables(stale)) {
+                Err(Error::ConfigParse(msg)) => {
+                    assert!(
+                        msg.contains(stale_key),
+                        "the rejection must NAME the stale key, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains(replacement),
+                        "…and point at `{replacement}` so the operator can rename it, got: {msg}"
+                    );
+                }
+                other => panic!(
+                    "pre-rename key `{stale}` must be rejected, never silently defaulted; got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn rejects_out_of_range_trigger() {
         for trigger in ["49", "100", "120"] {
-            let toml = with_tunables(&format!("session_trigger = {trigger}"));
+            let toml = with_tunables(&format!("session_ceiling = {trigger}"));
             assert!(
                 matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
-                "session_trigger = {trigger} should be rejected"
+                "session_ceiling = {trigger} should be rejected"
             );
         }
     }
 
     #[test]
-    fn rejects_out_of_range_weekly_trigger() {
+    fn rejects_out_of_range_weekly_ceiling() {
         // #41: the weekly trigger carries the same 50..=99 bound as the session one.
         for trigger in ["49", "100", "120"] {
-            let toml = with_tunables(&format!("weekly_trigger = {trigger}"));
+            let toml = with_tunables(&format!("weekly_ceiling = {trigger}"));
             assert!(
                 matches!(Config::parse(&toml), Err(Error::ConfigInvalid(_))),
-                "weekly_trigger = {trigger} should be rejected"
+                "weekly_ceiling = {trigger} should be rejected"
             );
         }
     }
 
     #[test]
-    fn session_and_weekly_triggers_are_independently_configurable() {
+    fn session_and_weekly_ceilings_are_independently_configurable() {
         // AC #3: the two triggers are set independently — there is NO cross-field
         // rule, so weekly may even sit BELOW session (unlike target_max_session_usage, which
-        // is capped at session_trigger).
-        let t = Config::parse(&with_tunables("session_trigger = 90\nweekly_trigger = 99"))
+        // is capped at session_ceiling).
+        let t = Config::parse(&with_tunables("session_ceiling = 90\nweekly_ceiling = 99"))
             .unwrap()
             .tunables;
-        assert_eq!(t.session_trigger, 90);
-        assert_eq!(t.weekly_trigger, 99);
+        assert_eq!(t.session_ceiling, 90);
+        assert_eq!(t.weekly_ceiling, 99);
         assert_eq!(t.trigger_strategy.base, 90.0);
-        assert_eq!(t.weekly_trigger_strategy.base, 99.0);
+        assert_eq!(t.weekly_ceiling_strategy.base, 99.0);
 
         // weekly BELOW session is accepted (no target_max_session_usage-style cross-field constraint).
-        let inverted = Config::parse(&with_tunables("session_trigger = 95\nweekly_trigger = 60"))
+        let inverted = Config::parse(&with_tunables("session_ceiling = 95\nweekly_ceiling = 60"))
             .unwrap()
             .tunables;
-        assert_eq!(inverted.session_trigger, 95);
-        assert_eq!(inverted.weekly_trigger, 60);
+        assert_eq!(inverted.session_ceiling, 95);
+        assert_eq!(inverted.weekly_ceiling, 60);
     }
 
     #[test]
-    fn weekly_trigger_takes_its_default_when_absent() {
-        // An absent weekly_trigger takes its compiled-in default, independent of session_trigger.
-        // (Since issue #597 their magnitudes are NOT comparable: session_trigger is a CEILING both
-        // swap arms derive backward from — effective fire ~0.89 at the default 95 — while
-        // weekly_trigger is still a fire-AT trigger, so the raw "weekly vs session" magnitude
-        // comparison is apples-to-oranges regardless of ordering (98 > 95 for the current
-        // defaults, but they estimate different quantities). The two dimensions stay
-        // independent; this test only pins the absent-field default.)
-        let t = Config::parse(&with_tunables("session_trigger = 95"))
+    fn weekly_ceiling_takes_its_default_when_absent() {
+        // An absent weekly_ceiling takes its compiled-in default, independent of session_ceiling.
+        // (Their magnitudes are NOT comparable: since #597 session_ceiling is a CEILING both swap
+        // arms derive backward from — effective fire ~0.89 at the default 95 — and since #607
+        // weekly_ceiling is a CEILING too, but fired backward by only 1 pp (vs session's 6 pp) over
+        // the weekly window, so the raw "weekly vs session" magnitude comparison is apples-to-oranges
+        // regardless of ordering (98 > 95 for the current defaults, but they estimate different
+        // quantities). The two dimensions stay independent; this test only pins the absent-field
+        // default.)
+        let t = Config::parse(&with_tunables("session_ceiling = 95"))
             .unwrap()
             .tunables;
-        assert_eq!(t.weekly_trigger, DEFAULT_WEEKLY_TRIGGER);
+        assert_eq!(t.weekly_ceiling, DEFAULT_WEEKLY_CEILING);
         assert_eq!(
-            t.weekly_trigger_strategy.base,
-            f64::from(DEFAULT_WEEKLY_TRIGGER)
+            t.weekly_ceiling_strategy.base,
+            f64::from(DEFAULT_WEEKLY_CEILING)
         );
     }
 
     #[test]
     fn rejects_target_max_above_trigger_with_a_distinct_error() {
-        let toml = with_tunables("target_max_session_usage = 95\nsession_trigger = 90");
+        let toml = with_tunables("target_max_session_usage = 95\nsession_ceiling = 90");
         assert!(matches!(
             Config::parse(&toml),
             Err(Error::ConfigTargetMaxSessionAboveTrigger {
@@ -3220,11 +3255,11 @@ label = "personal"
         // Since #398 made target_max_session_usage a live, hand-editable line, 0 is the natural
         // (wrong) guess for "no restriction" — its exact opposite. validate must reject it
         // with a message that names the consequence AND points at the remedy (raise it
-        // toward session_trigger to admit more targets).
-        let toml = with_tunables("target_max_session_usage = 0\nsession_trigger = 90");
+        // toward session_ceiling to admit more targets).
+        let toml = with_tunables("target_max_session_usage = 0\nsession_ceiling = 90");
         match Config::parse(&toml) {
             Err(Error::ConfigInvalid(msg)) => assert!(
-                msg.contains("disables proactive swapping") && msg.contains("session_trigger"),
+                msg.contains("disables proactive swapping") && msg.contains("session_ceiling"),
                 "rejection must name the consequence and the remedy, got: {msg}"
             ),
             Ok(_) => panic!("target_max_session_usage = 0 must be rejected, not accepted"),
@@ -3234,14 +3269,14 @@ label = "personal"
         // The reject is precisely 0, not "any low value": 1 is the valid lower edge and
         // still parses (inert-but-valid — admits only accounts at 0% session).
         let one = Config::parse(&with_tunables(
-            "target_max_session_usage = 1\nsession_trigger = 90",
+            "target_max_session_usage = 1\nsession_ceiling = 90",
         ))
         .expect("target_max_session_usage = 1 is the valid lower bound and must parse");
         assert_eq!(one.tunables.target_max_session_usage, 1);
 
         // …and the absent-key default path (#417 clamp) is untouched by the reject: an
         // absent target_max_session_usage still yields the default-on reserve, never 0.
-        let absent = Config::parse(&with_tunables("session_trigger = 90")).unwrap();
+        let absent = Config::parse(&with_tunables("session_ceiling = 90")).unwrap();
         assert_eq!(
             absent.tunables.target_max_session_usage,
             DEFAULT_TARGET_MAX_SESSION_USAGE
@@ -3252,14 +3287,14 @@ label = "personal"
     fn target_max_session_usage_defaults_to_80_when_absent() {
         // #398: an absent target_max_session_usage takes the default-on reserve (80), even when
         // other tunables are set…
-        let absent = Config::parse(&with_tunables("session_trigger = 95")).unwrap();
+        let absent = Config::parse(&with_tunables("session_ceiling = 95")).unwrap();
         assert_eq!(
             absent.tunables.target_max_session_usage,
             DEFAULT_TARGET_MAX_SESSION_USAGE
         );
         // …and a present value overrides it at that percent.
         let set = Config::parse(&with_tunables(
-            "target_max_session_usage = 90\nsession_trigger = 95",
+            "target_max_session_usage = 90\nsession_ceiling = 95",
         ))
         .unwrap();
         assert_eq!(set.tunables.target_max_session_usage, 90);
@@ -3283,9 +3318,9 @@ label = "personal"
 
     #[test]
     fn absent_target_max_default_clamps_to_trigger_below_80_and_survives_round_trip() {
-        // #417 (regression from #398): with session_trigger < 80 and NO target_max_session_usage
-        // key, the absent-key default (80) MUST clamp down to session_trigger — honoring
-        // the same target_max_session_usage <= session_trigger invariant the present-value arm
+        // #417 (regression from #398): with session_ceiling < 80 and NO target_max_session_usage
+        // key, the absent-key default (80) MUST clamp down to session_ceiling — honoring
+        // the same target_max_session_usage <= session_ceiling invariant the present-value arm
         // already enforces (ADR-0013 Decision 1). Without the clamp the first load
         // silently yields a reserve of 80 (> trigger — the cross-field check is skipped on
         // the absent-key arm), render() then emits it as a LIVE line (#398), and the SECOND
@@ -3293,20 +3328,20 @@ label = "personal"
         // after any save/export round-trip (enable/disable/remove account, capture
         // write-back, export→import). The existing round-trip test above only covers the
         // default trigger = 95 (where 80 < 95), so it never reached this corner.
-        let toml = with_tunables("session_trigger = 70"); // no target_max_session_usage key
+        let toml = with_tunables("session_ceiling = 70"); // no target_max_session_usage key
         let config = Config::parse(&toml).unwrap();
         // The default is clamped to the trigger — the maximally-permissive inert value
         // (ADR-0013: an equal reserve admits exactly what the always-on gate admits),
         // never left at 80.
         assert_eq!(config.tunables.target_max_session_usage, 70);
-        assert!(config.tunables.target_max_session_usage <= config.tunables.session_trigger);
+        assert!(config.tunables.target_max_session_usage <= config.tunables.session_ceiling);
 
         // …and it survives a render → parse round-trip: the exact path that bricked.
         let text = config.render();
         assert!(text.contains("target_max_session_usage = 70"), "got {text}");
         let reparsed = Config::parse(&text).unwrap();
         assert_eq!(reparsed.tunables.target_max_session_usage, 70);
-        assert_eq!(reparsed.tunables.session_trigger, 70);
+        assert_eq!(reparsed.tunables.session_ceiling, 70);
     }
 
     #[test]
@@ -3325,7 +3360,7 @@ label = "personal"
             "target_max_usage",
             "target_max_session_usage",
         ] {
-            let cfg = Config::parse(&with_tunables(&format!("{key} = 70\nsession_trigger = 90")))
+            let cfg = Config::parse(&with_tunables(&format!("{key} = 70\nsession_ceiling = 90")))
                 .unwrap_or_else(|e| panic!("a config written with `{key}` must still parse: {e}"));
             assert_eq!(
                 cfg.tunables.target_max_session_usage, 70,
@@ -3336,7 +3371,7 @@ label = "personal"
         // A deprecated-key file is REWRITTEN to the new key on render (the one-way key rewrite,
         // mirroring the #70 stash drop): the emitted file carries `target_max_session_usage`,
         // never either old key.
-        let old = Config::parse(&with_tunables("session_floor = 70\nsession_trigger = 90"))
+        let old = Config::parse(&with_tunables("session_floor = 70\nsession_ceiling = 90"))
             .expect("a config written with the deprecated `session_floor` key must still parse");
         let rendered = old.render();
         assert!(
@@ -3369,7 +3404,7 @@ label = "personal"
             "session_floor = 70\ntarget_max_usage = 75\ntarget_max_session_usage = 80",
         ];
         for combo in collisions {
-            let toml = with_tunables(&format!("{combo}\nsession_trigger = 90"));
+            let toml = with_tunables(&format!("{combo}\nsession_ceiling = 90"));
             assert!(
                 matches!(Config::parse(&toml), Err(Error::ConfigParse(_))),
                 "multiple reserve-key spellings present must be a ConfigParse error for `{combo}`, got: {:?}",
@@ -3524,12 +3559,12 @@ label = "personal"
 
     #[test]
     fn the_shipped_defaults_load_despite_sitting_in_the_advisory_band() {
-        // The load-bearing severity-split fact: the shipped default (session_trigger 95, target_max
+        // The load-bearing severity-split fact: the shipped default (session_ceiling 95, target_max
         // 80, near_limit 60, horizon 120) is in the EXCEEDED-but-satisfiable state, so it MUST load —
         // erroring here would brick every stock install (the #417 failure mode). But `config
         // validate`'s advisory accessor DOES flag it, since 80 > the ~52 bound.
         let cfg =
-            Config::parse(&with_tunables("session_trigger = 95")).expect("defaults must load");
+            Config::parse(&with_tunables("session_ceiling = 95")).expect("defaults must load");
         let advisory = cfg
             .peak_runway_advisory()
             .expect("the default reserve 80 exceeds its ~52 peak-runway bound");
@@ -3584,7 +3619,7 @@ label = "personal"
             msg.contains("session_velocity_horizon_secs"),
             "names the knob: {msg}"
         );
-        assert!(msg.contains("session_trigger"), "names the ceiling: {msg}");
+        assert!(msg.contains("session_ceiling"), "names the ceiling: {msg}");
         assert!(msg.contains("peak"), "explains the mechanism: {msg}");
         // No internal cross-references leak into the operator string (CLAUDE.md audience-fidelity).
         assert!(
@@ -3602,7 +3637,7 @@ label = "personal"
         // A reserve AT or below the bound produces no advisory — the None arm. With near_limit 60
         // (window 313, bound ~52) a target_max of 50 sits under the bound, so nothing to warn about.
         let cfg = Config::parse(&with_tunables(
-            "session_trigger = 95\ntarget_max_session_usage = 50",
+            "session_ceiling = 95\ntarget_max_session_usage = 50",
         ))
         .expect("a reserve under the bound loads");
         assert_eq!(
@@ -3619,7 +3654,7 @@ label = "personal"
         // A default reserve 80 then sits UNDER that higher bound — no advisory. This proves the
         // advisory reflects the actual composed lookahead, not a fixed number.
         let cfg = Config::parse(&with_tunables(
-            "session_trigger = 95\nnear_limit_poll_secs = 0\nsession_velocity_horizon_secs = 30",
+            "session_ceiling = 95\nnear_limit_poll_secs = 0\nsession_velocity_horizon_secs = 30",
         ))
         .expect("a tight-lookahead config loads");
         assert_eq!(
@@ -3629,7 +3664,7 @@ label = "personal"
         );
         // But push the reserve above even that tight bound and the advisory returns, naming the 30 s window.
         let cfg = Config::parse(&with_tunables(
-            "session_trigger = 95\nnear_limit_poll_secs = 0\nsession_velocity_horizon_secs = 30\ntarget_max_session_usage = 90",
+            "session_ceiling = 95\nnear_limit_poll_secs = 0\nsession_velocity_horizon_secs = 30\ntarget_max_session_usage = 90",
         ))
         .expect("loads");
         let advisory = cfg
@@ -4176,7 +4211,7 @@ label = "personal"
 
     #[test]
     fn poll_jitter_defaults_to_normal_trigger_and_cooldown_stay_fixed() {
-        // AC: poll interval uses normal jitter by default; trigger, weekly_trigger
+        // AC: poll interval uses normal jitter by default; trigger, weekly_ceiling
         // and cooldown are fixed unless the operator configures a strategy. Bases
         // mirror the validated scalar tunables.
         let t = Config::parse(VALID).unwrap().tunables;
@@ -4187,11 +4222,11 @@ label = "personal"
             }
         );
         assert_eq!(t.trigger_strategy.jitter, Jitter::None);
-        assert_eq!(t.weekly_trigger_strategy.jitter, Jitter::None);
+        assert_eq!(t.weekly_ceiling_strategy.jitter, Jitter::None);
         assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
         assert_eq!(t.poll_strategy.base, 30.0);
         assert_eq!(t.trigger_strategy.base, 90.0);
-        assert_eq!(t.weekly_trigger_strategy.base, 97.0);
+        assert_eq!(t.weekly_ceiling_strategy.base, 97.0);
         assert_eq!(t.cooldown_strategy.base, 45.0);
     }
 
@@ -4213,14 +4248,14 @@ label = "personal"
         let toml = with_jitter(
             "poll = { kind = \"normal\", stddev = 25.0 }\n\
              trigger = { kind = \"uniform\", spread = 2.5 }\n\
-             weekly_trigger = { kind = \"normal\", stddev = 1.0 }\n\
+             weekly_ceiling = { kind = \"normal\", stddev = 1.0 }\n\
              cooldown = { kind = \"none\" }",
         );
         let t = Config::parse(&toml).unwrap().tunables;
         assert_eq!(t.poll_strategy.jitter, Jitter::Normal { stddev: 25.0 });
         assert_eq!(t.trigger_strategy.jitter, Jitter::Uniform { spread: 2.5 });
         assert_eq!(
-            t.weekly_trigger_strategy.jitter,
+            t.weekly_ceiling_strategy.jitter,
             Jitter::Normal { stddev: 1.0 }
         );
         assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
@@ -4259,8 +4294,8 @@ label = "personal"
             Err(Error::ConfigParse(_))
         ));
         // …and so is an unrecognized tunable name. The jitter tunables are
-        // poll/trigger/weekly_trigger/cooldown (issue #41 added weekly_trigger); a
-        // bare `weekly` (≠ the actual `weekly_trigger` key) is still unknown.
+        // poll/trigger/weekly_ceiling/cooldown (issue #41 added weekly_ceiling); a
+        // bare `weekly` (≠ the actual `weekly_ceiling` key) is still unknown.
         assert!(matches!(
             Config::parse(&with_jitter("weekly = { kind = \"none\" }")),
             Err(Error::ConfigParse(_))
@@ -4272,7 +4307,7 @@ label = "personal"
         let toml = with_jitter(
             "poll = { kind = \"uniform\", spread = 12.5 }\n\
              trigger = { kind = \"normal\", stddev = 1.5 }\n\
-             weekly_trigger = { kind = \"uniform\", spread = 0.5 }\n\
+             weekly_ceiling = { kind = \"uniform\", spread = 0.5 }\n\
              cooldown = { kind = \"none\" }",
         );
         let original = Config::parse(&toml).unwrap();
@@ -4284,7 +4319,7 @@ label = "personal"
     fn rendered_config_documents_the_jitter_table() {
         let text = Config::parse(VALID).unwrap().render();
         assert!(text.contains("[jitter]"));
-        for key in ["poll", "trigger", "weekly_trigger", "cooldown"] {
+        for key in ["poll", "trigger", "weekly_ceiling", "cooldown"] {
             assert!(
                 text.contains(key),
                 "rendered config must mention jitter.{key}"
@@ -4319,8 +4354,8 @@ label = "personal"
             "near_limit_poll_secs",
             "cooldown_secs",
             "target_max_session_usage",
-            "session_trigger",
-            "weekly_trigger",
+            "session_ceiling",
+            "weekly_ceiling",
             "session_velocity_horizon_secs",
             "session_velocity_min_project_above",
             "session_velocity_ema_alpha_pct",
@@ -4427,10 +4462,10 @@ label = "personal"
         // 0 admits no target) and floor == trigger, poll 5/3600, cooldown 5/3600 (5 =
         // the non-zero floor, #272), monitor 1/20.
         for fragment in [
-            "session_trigger = 50\ntarget_max_session_usage = 1",
-            "session_trigger = 99\ntarget_max_session_usage = 99", // target_max_session_usage == trigger is allowed
-            "weekly_trigger = 50",
-            "weekly_trigger = 99",
+            "session_ceiling = 50\ntarget_max_session_usage = 1",
+            "session_ceiling = 99\ntarget_max_session_usage = 99", // target_max_session_usage == trigger is allowed
+            "weekly_ceiling = 50",
+            "weekly_ceiling = 99",
             "poll_secs = 5",
             "poll_secs = 3600",
             "cooldown_secs = 5",
@@ -4470,13 +4505,13 @@ label = "personal"
 
     // --- config show --origin (issue #401) ---------------------------------
 
-    /// The provenance test #401 exists for: a file that sets ONLY `session_trigger`
+    /// The provenance test #401 exists for: a file that sets ONLY `session_ceiling`
     /// must show that one key `FromFile` and EVERY other tunable — plus every absent
     /// optional section — `Default`, so a silently-defaulted (absent) block is visible.
     #[test]
     fn origin_report_tags_absent_keys_default_and_present_keys_from_file() {
-        let text = "[tunables]\nsession_trigger = 90\n";
-        let config = Config::from_toml_str(text).expect("a lone session_trigger is valid");
+        let text = "[tunables]\nsession_ceiling = 90\n";
+        let config = Config::from_toml_str(text).expect("a lone session_ceiling is valid");
         let table: toml::Table = toml::from_str(text).expect("valid TOML");
         let report = config.origin_report(&table);
 
@@ -4490,8 +4525,8 @@ label = "personal"
                 .find(|e| e.key == k)
                 .unwrap_or_else(|| panic!("no `{k}` entry"))
         };
-        assert_eq!(by_key("session_trigger").origin, Origin::FromFile);
-        assert_eq!(by_key("session_trigger").value, "90");
+        assert_eq!(by_key("session_ceiling").origin, Origin::FromFile);
+        assert_eq!(by_key("session_ceiling").value, "90");
         // Every OTHER tunable in the present section is still a compiled-in default.
         assert_eq!(by_key("poll_secs").origin, Origin::Default);
         assert_eq!(by_key("target_max_session_usage").origin, Origin::Default);

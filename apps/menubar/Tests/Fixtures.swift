@@ -316,14 +316,14 @@ enum Fixtures {
     /// A `config-get` reply: the bare `ConfigView` — the 14 effective tunables (each a distinct value)
     /// plus a two-account roster (one enabled, one parked). Mirrors `Config::view` (`src/config.rs`).
     static let configViewBasic = #"""
-    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_trigger":90,"weekly_trigger":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"22222222-2222-2222-2222-222222222222","label":"personal","enabled":false}]}
+    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_ceiling":90,"weekly_ceiling":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"22222222-2222-2222-2222-222222222222","label":"personal","enabled":false}]}
     """#
 
     /// A drifted-daemon `config-get`: a well-formed `ConfigView` whose roster carries a DUPLICATE
     /// `account_uuid`. It decodes cleanly (the wire types cannot forbid it), so the model must reject it at
     /// adoption — degrade loudly as `.undecodable`, NEVER trap building the uuid→label map.
     static let configViewDuplicateAccount = #"""
-    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_trigger":90,"weekly_trigger":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"duplicate","enabled":false}]}
+    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_ceiling":90,"weekly_ceiling":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"duplicate","enabled":false}]}
     """#
 
     /// `config-get` when `config.toml` does not exist — the redacted `{"error":"no config"}` envelope.

@@ -48,7 +48,7 @@ Config lives at `~/Library/Application Support/sessiometer/config.toml` (or
 
 ```toml
 poll_secs       = 5     # poll briskly so the run is quick (min 5)
-session_trigger = 50    # the minimum: a half-used session already trips a swap-away
+session_ceiling = 50    # the minimum: a half-used session already trips a swap-away
 cooldown_secs   = 60    # a window long enough to watch the no-oscillation hold
 # leave target_max_session_usage commented out (the #10 default: cooldown alone bounds oscillation)
 ```
@@ -69,7 +69,7 @@ Restore your normal values when finished (Step 9).
 1. **Confirm the roster.** `sessiometer list` shows both accounts with their labels (referred to below
    as **A** and **B**), neither marked `disabled`.
 
-2. **Apply the synthetic threshold.** Edit `config.toml` as above (`session_trigger = 50`,
+2. **Apply the synthetic threshold.** Edit `config.toml` as above (`session_ceiling = 50`,
    `poll_secs = 5`, `cooldown_secs = 60`).
 
 3. **Start the daemon (foreground).** `sessiometer run` — or `sessiometer run -v` to also watch the
@@ -86,7 +86,7 @@ Restore your normal values when finished (Step 9).
    - Claude Code itself continues working as the swapped-to account (the canonical credential and
      `~/.claude.json` both moved — propagation).
    - If the active account's session is below 50%, use it briefly (any Claude Code request) until it
-     crosses, or lower `session_trigger` further toward your actual usage.
+     crosses, or lower `session_ceiling` further toward your actual usage.
 
 5. **Observe no oscillation.** Keep watching for the length of `cooldown_secs` (60 s). Even though the
    now-active account may also be over the trigger, **no second swap occurs inside the window** — the
@@ -112,7 +112,7 @@ Restore your normal values when finished (Step 9).
    issue #73); the color only **augments** the same non-secret text and adds nothing but ANSI escapes —
    pipe it (`sessiometer status | cat -v`) to confirm the escapes vanish and not a single secret appears.
 
-9. **Teardown.** `Ctrl-C` the daemon. Restore `config.toml` to your normal `session_trigger` /
+9. **Teardown.** `Ctrl-C` the daemon. Restore `config.toml` to your normal `session_ceiling` /
    `poll_secs` / `cooldown_secs`. The rotation and both stashes are unchanged.
 
 ## Pass criteria

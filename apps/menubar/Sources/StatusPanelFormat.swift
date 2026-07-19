@@ -824,7 +824,7 @@ enum StatusPanelFormat {
     }
 
     /// The urgency band for a utilization percent — the panel's mirror of `src/cli.rs` `util_severity`:
-    /// `>= 90` Red (at/near the ~95% session swap-away trigger, #41), `>= 75` Yellow (worth watching),
+    /// `>= 90` Red (at/near the ~95% session swap-away ceiling, #41), `>= 75` Yellow (worth watching),
     /// else Green. One shared "how full is too full" definition (issue #84), so the panel's per-metric
     /// threshold color keys off the SAME bands as the CLI's per-cell overlay for the same reading.
     static func utilSeverity(_ pct: UInt8) -> UsageSeverity {
@@ -842,7 +842,7 @@ enum StatusPanelFormat {
 
     /// The WEEKLY metric's severity — `utilSeverity` of its percent, EXCEPT a weekly-EXHAUSTED account
     /// (the daemon's blocked-for-the-week verdict, #11/#37) reads Red whatever the rounded percent — a
-    /// week-blocked account is never painted "healthy", even under a lowered `weekly_trigger`. `nil`
+    /// week-blocked account is never painted "healthy", even under a lowered `weekly_ceiling`. `nil`
     /// when the weekly poll failed. Mirrors the CLI's `weekly_cell_severity`.
     static func weeklySeverity(weeklyPct: UInt8?, weeklyExhausted: Bool) -> UsageSeverity? {
         weeklyPct.map { weeklyExhausted ? .red : utilSeverity($0) }
@@ -1062,7 +1062,7 @@ enum StatusPanelFormat {
     /// rendered from the wire `NextSwap.target` discriminant. This REPLACES the former client-side
     /// derivation, which asserted "lowest weekly · most headroom" — a rationale on the SUPERSEDED
     /// selection axis (`pick_target` chooses by soonest weekly reset, #37, not headroom), and one
-    /// the client could not honestly re-derive anyway (the daemon-only session trigger / floor never
+    /// the client could not honestly re-derive anyway (the daemon-only session ceiling / floor never
     /// ride the wire). `nil` when the candidate is not a `target`, OR when a pre-#393 daemon carried
     /// a target with no reason — the card then shows just the label (strictly more honest than the
     /// old superseded-rule story). Each medium renders the shared discriminant its own way

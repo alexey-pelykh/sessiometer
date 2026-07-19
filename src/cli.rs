@@ -926,7 +926,7 @@ USAGE:
     sessiometer config <path|validate|show> [--origin]
 
     path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
-    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_session_usage > session_trigger
+    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_session_usage > session_ceiling
     show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
     --origin    (with show) tag each value's provenance, so a silently-defaulted absent section is visible
     -h, --help  print this help
@@ -1186,8 +1186,8 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         accounts: config.roster.len(),
         poll_secs: config.tunables.poll_secs,
         target_max_session_usage: config.tunables.target_max_session_usage,
-        session_trigger: config.tunables.session_trigger,
-        weekly_trigger: config.tunables.weekly_trigger,
+        session_ceiling: config.tunables.session_ceiling,
+        weekly_ceiling: config.tunables.weekly_ceiling,
         monitor_401_n: config.tunables.monitor_401_n,
         monitor_recovery_m: config.tunables.monitor_recovery_m,
     });
@@ -1805,7 +1805,7 @@ fn config_path() -> Result<()> {
 /// `config validate` (issue #401): parse + validate `config.toml` WITHOUT running, routing
 /// through the SAME [`Config::load_path`] seam the daemon loads through — so a typo'd/unknown
 /// key (`deny_unknown_fields` → [`Error::ConfigParse`]), an out-of-range value
-/// ([`Error::ConfigInvalid`]), or `target_max_session_usage > session_trigger`
+/// ([`Error::ConfigInvalid`]), or `target_max_session_usage > session_ceiling`
 /// ([`Error::ConfigTargetMaxSessionAboveTrigger`]) surfaces here with the identical message the daemon
 /// would fail on, and a clean file reports valid. Read-only: it loads and validates, nothing
 /// more. A validation failure propagates as the loader's error, so it exits non-zero (usable
@@ -2747,10 +2747,10 @@ fn util_severity(pct: u8) -> Severity {
 /// `n/a` text carries the truth.
 ///
 /// Utilization sets the base from the BINDING window. A weekly-EXHAUSTED account
-/// (the daemon's blocked-for-the-week verdict, `weekly >= weekly_trigger`, issue
+/// (the daemon's blocked-for-the-week verdict, `weekly >= weekly_ceiling`, issue
 /// #11/#37) is bound by its weekly window whatever the raw percentages say — the
 /// SAME window its WEEKLY reset cell shows — and is at least Red: a week-blocked account
-/// is never painted "healthy", even when the operator has lowered `weekly_trigger`
+/// is never painted "healthy", even when the operator has lowered `weekly_ceiling`
 /// (configurable down to 50) below the Red utilization cutoff. Otherwise the
 /// more-depleted of session / weekly is the constraint, and its percent governs:
 /// `>= RED_UTIL_PCT` Red, `>= YELLOW_UTIL_PCT` Yellow, else Green. Reset proximity
@@ -2799,9 +2799,9 @@ fn severity(account: &AccountStatusLine, now: i64) -> Option<Severity> {
 
 /// The `WEEKLY` cell's own health (issue #84): the fixed [`util_severity`] bands on
 /// `weekly_pct`, except a weekly-EXHAUSTED account (the daemon's `weekly >=
-/// weekly_trigger` verdict, issue #11/#37) reads Red whatever its rounded percent —
+/// weekly_ceiling` verdict, issue #11/#37) reads Red whatever its rounded percent —
 /// a week-blocked account is never painted "healthy", even when the operator has
-/// lowered `weekly_trigger` below the Red cutoff (the same guarantee [`severity`]
+/// lowered `weekly_ceiling` below the Red cutoff (the same guarantee [`severity`]
 /// gives the aggregate). `None` when the weekly poll failed: the cell then shows
 /// `n/a`, which stays uncolored (absence of color is not a false "healthy"), so the
 /// exhaustion override is mapped over a PRESENT reading only.
@@ -4135,7 +4135,7 @@ mod tests {
             tunables: Tunables {
                 poll_secs: 60,
                 cooldown_secs: 60,
-                session_trigger: 95,
+                session_ceiling: 95,
                 monitor_401_n: 3,
                 // `list` reads no timing strategies; default jitter is a fine
                 // placeholder (issue #38).
@@ -6307,7 +6307,7 @@ spare  22222222-2222\n\
     #[test]
     fn severity_treats_a_weekly_exhausted_account_as_blocked_not_healthy() {
         // The daemon's blocked-for-the-week verdict (`weekly_exhausted`) must win
-        // over raw utilization: with a lowered `weekly_trigger` an account can be
+        // over raw utilization: with a lowered `weekly_ceiling` an account can be
         // exhausted at a weekly percent well BELOW the Red cutoff, yet it is
         // blocked for days — it must read Red, never the "healthy" Green its 65%
         // utilization would otherwise give. Mirrors what its WEEKLY reset cell shows
@@ -6316,7 +6316,7 @@ spare  22222222-2222\n\
             "blocked",
             Some(30),               // session is fine…
             Some(65),               // …weekly below RED_UTIL_PCT, but…
-            true,                   // …exhausted (e.g. weekly_trigger lowered to 60)
+            true,                   // …exhausted (e.g. weekly_ceiling lowered to 60)
             Some(NOW + 600),        // a soon SESSION reset must NOT rescue it
             Some(NOW + 3 * 86_400), // the binding WEEKLY reset is 3 days out
         );
@@ -6378,9 +6378,9 @@ spare  22222222-2222\n\
         assert_eq!(weekly_cell_severity(&acct), Some(Severity::Yellow));
         acct.weekly_pct = Some(95);
         assert_eq!(weekly_cell_severity(&acct), Some(Severity::Red));
-        // Exhausted (the daemon's weekly_trigger verdict) → Red even at a percent
+        // Exhausted (the daemon's weekly_ceiling verdict) → Red even at a percent
         // well below the Red cutoff: a week-blocked cell never reads "healthy",
-        // honoring a lowered weekly_trigger (issue #11/#37).
+        // honoring a lowered weekly_ceiling (issue #11/#37).
         let blocked = status_line_resets("b", Some(20), Some(65), true, None, Some(NOW + 86_400));
         assert_eq!(weekly_cell_severity(&blocked), Some(Severity::Red));
         // No weekly reading → None: the cell shows `n/a`, which stays uncolored.
@@ -8390,7 +8390,7 @@ spare  22222222-2222\n\
                         origin: Origin::Default,
                     },
                     OriginEntry {
-                        key: "session_trigger",
+                        key: "session_ceiling",
                         value: "90".to_string(),
                         origin: Origin::FromFile,
                     },
@@ -8434,7 +8434,7 @@ spare  22222222-2222\n\
             "no absent-flag without --origin: {plain}"
         );
         assert!(
-            plain.contains("session_trigger = 90"),
+            plain.contains("session_ceiling = 90"),
             "still prints the value: {plain}",
         );
     }

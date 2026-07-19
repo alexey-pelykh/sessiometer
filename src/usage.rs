@@ -80,7 +80,7 @@ const POLL_TIMEOUT_SECS: u32 = 30;
 /// A point-in-time usage reading for one account, across both quota windows.
 ///
 /// The swap decision compares each dimension against its OWN threshold (issue
-/// #41: session vs `session_trigger`, weekly vs the separate `weekly_trigger`),
+/// #41: session vs `session_ceiling`, weekly vs the separate `weekly_ceiling`),
 /// so the reading carries both fractions and projects neither to a single
 /// worst-case scalar.
 #[derive(Debug, Clone, Copy, PartialEq)]

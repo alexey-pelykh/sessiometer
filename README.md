@@ -390,7 +390,7 @@ per-tick decision and any back-off, plus the daemon's start (with the effective
 config), its stop, and the moment it **leaves** the all-exhausted state:
 
 ```text
-ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 target_max_session_usage=80 session_trigger=90 weekly_trigger=98 monitor_401_n=5 monitor_recovery_m=4
+ts=2026-06-30T00:00:00Z diag=start accounts=2 poll_secs=30 target_max_session_usage=80 session_ceiling=90 weekly_ceiling=98 monitor_401_n=5 monitor_recovery_m=4
 ts=2026-06-30T00:00:00Z diag=poll account=work outcome=rate_limited
 ts=2026-06-30T00:00:00Z diag=tick decision=skip_active_unavailable backoff_secs=120
 ts=2026-06-30T00:00:30Z diag=poll account=work outcome=live
@@ -693,9 +693,9 @@ The primary hand-editable block — the poll cadence and the swap thresholds.
 | `poll_secs` | Seconds between re-polling a given account — the per-account cadence and the base of the rate-limit back-off. | `5..=3600` | `300` |
 | `exhausted_poll_secs` | Widened re-poll cadence for an **out-of-rotation** peer — one that is weekly- or session-exhausted. Its usage can only change when its server-side window resets (a time the daemon already knows) or on a rare out-of-band reset, so re-polling it every `poll_secs` wastes a request; this is the **ceiling** of its slow-poll window, pulled **earlier** when a known reset lands sooner. The **active** account is never slow-polled. | `poll_secs..=86400` | `3600` |
 | `cooldown_secs` | Seconds to wait after a swap before another is allowed — the swap-pacing floor. Tunable **above** a non-zero minimum but never down to zero, so rapid-fire account flapping can't be configured on. | `5..=3600` | `60` |
-| `session_trigger` | The session-usage **ceiling** (%) the active account must not cross — *not* a fire-at level. Both swap estimators (reactive `observed`, projected `observed + velocity × H` — one predicate, **not two knobs**) derive their fire point **backward** from it, covering the larger unseen window (`observed ≥ ceiling − tail_margin − velocity × max(poll_gap, H)`), so the account *lands below* the ceiling even after its post-swap committed tail (up to +5 pp — in-flight work keeps billing the parked account). The reactive arm looks ahead over the **measured p90 re-observation gap (313 s floor)**, so the default `95` is a conservative lever — **99 is reachable** (raise it to spend the margin as runway). See [ADR-0023](docs/adr/0023-session-trigger-ceiling-semantics.md) and [ADR-0024](docs/adr/0024-reactive-lookahead-gap-percentile-max-window-coverage.md). | `50..=99` | `95` |
-| `weekly_trigger` | Swap **away** at or above this **weekly**-usage percent — independent of `session_trigger` (typically higher); a swap fires when *either* dimension trips. | `50..=99` | `98` |
-| `target_max_session_usage` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent — the most-full a target may be to receive the active session, so it keeps runway. *Raising* it toward `session_trigger` admits busier targets (equal is inert); `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_trigger`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_trigger` | `80` |
+| `session_ceiling` | The session-usage **ceiling** (%) the active account must not cross — *not* a fire-at level. Both swap estimators (reactive `observed`, projected `observed + velocity × H` — one predicate, **not two knobs**) derive their fire point **backward** from it, covering the larger unseen window (`observed ≥ ceiling − tail_margin − velocity × max(poll_gap, H)`), so the account *lands below* the ceiling even after its post-swap committed tail (the `tail_margin` is 6 pp, chosen just above the measured max tail of +5 pp — in-flight work keeps billing the parked account). The reactive arm looks ahead over the **measured p90 re-observation gap (313 s floor)**, so the default `95` is a conservative lever — **99 is reachable** (raise it to spend the margin as runway). See [ADR-0023](docs/adr/0023-session-trigger-ceiling-semantics.md) and [ADR-0024](docs/adr/0024-reactive-lookahead-gap-percentile-max-window-coverage.md). | `50..=99` | `95` |
+| `weekly_ceiling` | The weekly-usage **ceiling** (%) the active account must not cross — *not* a fire-at level. The swap fires **backward** from it at `ceiling − 1 pp`, so the parked account *lands below* the ceiling after its post-swap committed tail; the margin is 1 pp rather than the session dimension's 6 pp because the same committed tail is a far smaller fraction of the weekly budget. Independent of `session_ceiling` (no cross-field constraint, typically higher); a swap fires when *either* dimension reaches its own fire point. See [ADR-0025](docs/adr/0025-weekly-trigger-ceiling-semantics.md). | `50..=99` | `98` |
+| `target_max_session_usage` | Swap-target **reserve**: only swap **to** an account whose session usage is below this percent — the most-full a target may be to receive the active session, so it keeps runway. *Raising* it toward `session_ceiling` admits busier targets (equal is inert); `0` admits nothing (proactive swaps off). Not a swap-away level; that is `session_ceiling`. A **dead** active ignores it entirely and escapes to any live account. When nothing sits below it the daemon holds and logs `all_exhausted cause=session`. | `0..=session_ceiling` | `80` |
 | `monitor_401_n` | Consecutive non-scope `401`s before an account is treated as dead and quarantined. | `1..=20` | `3` |
 | `monitor_recovery_m` | Consecutive recovery-probe successes before a quarantined account whose own token recovers (without a re-login) is returned to the rotation. | `1..=20` | `2` |
 
@@ -707,14 +707,15 @@ the single source of truth this table is drawn from, so it stays in step with th
 
 Per-cycle randomization added to a tunable, drawn fresh each cycle and clamped back to
 the tunable's range, so polls and swaps decorrelate across accounts and cycles. One
-optional entry per tunable — `poll`, `trigger`, `weekly_trigger`, `cooldown` — each an
-inline table whose `kind` is `"none"`, `"uniform"` (with a `spread`), or `"normal"`
-(with a `stddev`); magnitudes are TOML floats. Only `poll` jitters by default:
+optional entry per tunable — `poll`, `trigger` (the `session_ceiling` entry), `weekly_ceiling`,
+`cooldown` — each an inline table whose `kind` is `"none"`, `"uniform"` (with a `spread`), or
+`"normal"` (with a `stddev`); magnitudes are TOML floats. The session entry is still spelled
+`trigger`, the one jitter key whose name doesn't track its tunable. Only `poll` jitters by default:
 
 ```toml
 [jitter]
 poll = { kind = "normal", stddev = 60.0 }   # default: normal, ~20% of poll_secs
-trigger = { kind = "none" }                 # trigger / weekly_trigger / cooldown default to none
+trigger = { kind = "none" }                 # trigger / weekly_ceiling / cooldown default to none
 ```
 
 ### `[login]`
@@ -761,7 +762,7 @@ $ sessiometer config validate
 `config validate` parses and validates the file **without running** — the same checks the
 daemon applies at load. It reports the documented error classes and exits non-zero on any
 of them, so it drops into a pre-flight check: a typo'd/unknown key (e.g. `poll_secss`), an
-out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_session_usage > session_trigger`.
+out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_session_usage > session_ceiling`.
 
 A **valid** file may still print a non-fatal **advisory** (it does not change the exit code):
 if `target_max_session_usage` sits above the *peak-velocity runway bound* — the highest reserve
@@ -780,7 +781,7 @@ $ sessiometer config show --origin
 
 [tunables]  (absent — all defaults)
   poll_secs          = 300  default
-  session_trigger    = 95   default
+  session_ceiling    = 95   default
   …
 [refresh]
   enabled            = true  from-file

@@ -33,8 +33,8 @@ struct TunablesView: Decodable, Equatable {
     let nearLimitPollSecs: UInt64
     let cooldownSecs: UInt64
     let targetMaxSessionUsage: UInt8
-    let sessionTrigger: UInt8
-    let weeklyTrigger: UInt8
+    let sessionCeiling: UInt8
+    let weeklyCeiling: UInt8
     let sessionBlindSwapSecs: UInt64
     let sessionBlindRiskBand: UInt8
     let sessionVelocityHorizonSecs: UInt64
@@ -49,8 +49,8 @@ struct TunablesView: Decodable, Equatable {
         case nearLimitPollSecs = "near_limit_poll_secs"
         case cooldownSecs = "cooldown_secs"
         case targetMaxSessionUsage = "target_max_session_usage"
-        case sessionTrigger = "session_trigger"
-        case weeklyTrigger = "weekly_trigger"
+        case sessionCeiling = "session_ceiling"
+        case weeklyCeiling = "weekly_ceiling"
         case sessionBlindSwapSecs = "session_blind_swap_secs"
         case sessionBlindRiskBand = "session_blind_risk_band"
         case sessionVelocityHorizonSecs = "session_velocity_horizon_secs"
@@ -149,8 +149,8 @@ struct SetTunables: Encodable, Equatable {
     var nearLimitPollSecs: Int64?
     var cooldownSecs: Int64?
     var targetMaxSessionUsage: Int64?
-    var sessionTrigger: Int64?
-    var weeklyTrigger: Int64?
+    var sessionCeiling: Int64?
+    var weeklyCeiling: Int64?
     var sessionBlindSwapSecs: Int64?
     var sessionBlindRiskBand: Int64?
     var sessionVelocityHorizonSecs: Int64?
@@ -165,8 +165,8 @@ struct SetTunables: Encodable, Equatable {
         case nearLimitPollSecs = "near_limit_poll_secs"
         case cooldownSecs = "cooldown_secs"
         case targetMaxSessionUsage = "target_max_session_usage"
-        case sessionTrigger = "session_trigger"
-        case weeklyTrigger = "weekly_trigger"
+        case sessionCeiling = "session_ceiling"
+        case weeklyCeiling = "weekly_ceiling"
         case sessionBlindSwapSecs = "session_blind_swap_secs"
         case sessionBlindRiskBand = "session_blind_risk_band"
         case sessionVelocityHorizonSecs = "session_velocity_horizon_secs"
@@ -180,7 +180,7 @@ struct SetTunables: Encodable, Equatable {
     /// uses to decide the expected effect and to keep an all-empty submit honest.
     var isEmpty: Bool {
         pollSecs == nil && exhaustedPollSecs == nil && nearLimitPollSecs == nil && cooldownSecs == nil
-            && targetMaxSessionUsage == nil && sessionTrigger == nil && weeklyTrigger == nil
+            && targetMaxSessionUsage == nil && sessionCeiling == nil && weeklyCeiling == nil
             && sessionBlindSwapSecs == nil && sessionBlindRiskBand == nil
             && sessionVelocityHorizonSecs == nil && sessionVelocityMinProjectAbove == nil
             && sessionVelocityEmaAlphaPct == nil && monitor401N == nil && monitorRecoveryM == nil

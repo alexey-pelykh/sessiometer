@@ -304,7 +304,7 @@ impl SwapTarget {
     /// transient poll failure on the live fallback propagates as `Err` (still
     /// before any write) for the caller to surface.
     ///
-    /// `active_stash` is the active (outgoing) account's stash, `weekly_trigger` is
+    /// `active_stash` is the active (outgoing) account's stash, `weekly_ceiling` is
     /// the fraction at/above which the weekly window counts as exhausted, and
     /// `in_cooldown` is the caller-computed cooldown verdict (kept a parameter so
     /// the gate stays pure and hermetically testable, independent of wall-clock).
@@ -315,7 +315,7 @@ impl SwapTarget {
         poller: &P,
         account: &Account,
         active_stash: &str,
-        weekly_trigger: f64,
+        weekly_ceiling: f64,
         in_cooldown: bool,
     ) -> Result<GateOutcome> {
         if account.stash() == active_stash {
@@ -324,7 +324,7 @@ impl SwapTarget {
         if in_cooldown {
             return Ok(GateOutcome::Refused(Refusal::Cooldown));
         }
-        match gate_viability(cache, poller, account, weekly_trigger).await? {
+        match gate_viability(cache, poller, account, weekly_ceiling).await? {
             Viability::Viable => Ok(GateOutcome::Proceed(SwapTarget {
                 incoming_stash: account.stash(),
             })),
@@ -359,13 +359,13 @@ impl SwapTarget {
 async fn poll_viability<P: RosterPoller>(
     poller: &P,
     account: &Account,
-    weekly_trigger: f64,
+    weekly_ceiling: f64,
 ) -> Result<Viability> {
     match poller.poll(account, false).await {
         // Only the weekly dimension of the reading drives the viability verdict; the
         // sample-only fields on the `PolledReading` are irrelevant here (this is the
         // one-shot `use`-command probe, not the daemon's sampling poll loop).
-        Ok(reading) if reading.usage.weekly >= weekly_trigger => Ok(Viability::WeeklyExhausted),
+        Ok(reading) if reading.usage.weekly >= weekly_ceiling => Ok(Viability::WeeklyExhausted),
         Ok(_) => Ok(Viability::Viable),
         // A dead stored token: the daemon-independent "quarantined / needs re-login"
         // signal (#42). 401 (rejected) and 403 (missing usage scope) both mean the
@@ -393,7 +393,7 @@ async fn gate_viability<R, P>(
     cache: &R,
     poller: &P,
     account: &Account,
-    weekly_trigger: f64,
+    weekly_ceiling: f64,
 ) -> Result<Viability>
 where
     R: CachedViabilitySource,
@@ -405,7 +405,7 @@ where
     // Cache MISS → a single live poll (today's behaviour). A `429` here is the
     // opaque abort issue #75 fixes: with no daemon to consult, surface a distinct,
     // actionable error rather than the raw rate-limit.
-    match poll_viability(poller, account, weekly_trigger).await {
+    match poll_viability(poller, account, weekly_ceiling).await {
         Err(Error::UsageRateLimited { .. }) => Err(Error::UseViabilityUnverifiable {
             label: account.label.clone(),
         }),
@@ -524,7 +524,7 @@ async fn warn_if_forcing_onto_non_viable<R, P>(
     cache: &R,
     poller: &P,
     target: &Account,
-    weekly_trigger: f64,
+    weekly_ceiling: f64,
 ) -> Result<()>
 where
     R: CachedViabilitySource,
@@ -532,7 +532,7 @@ where
 {
     let viability = match cache.cached_viability(target).await {
         Some(cached) => Some(cached),
-        None => match poll_viability(poller, target, weekly_trigger).await {
+        None => match poll_viability(poller, target, weekly_ceiling).await {
             Ok(viability) => Some(viability),
             // SAFETY is never bypassed: a locked keychain aborts even with `--force`
             // (ZERO writes — the swap never runs).
@@ -650,14 +650,14 @@ where
     .map(|idx| &config.roster[idx]);
 
     // Issue #607: the weekly ROTATION line — the configured ceiling less the tail margin — not the
-    // raw ceiling. `weekly_trigger` is a CEILING since #607 and the daemon releases at
+    // raw ceiling. `weekly_ceiling` is a CEILING since #607 and the daemon releases at
     // `ceiling − WEEKLY_TAIL_MARGIN`, so gating `use` on the raw value would ACCEPT a target in the
     // `[ceiling − margin, ceiling)` band that the daemon then swaps away from on its next tick — an
     // operator command that silently undoes itself. Gating on the same line the daemon rotates
     // against keeps the standalone `use` verdict and the daemon's verdict identical (the daemon-
     // attached path gets the same value from `Daemon::weekly_rotation_line`).
-    let weekly_trigger =
-        crate::swap::weekly_effective_ceiling(f64::from(config.tunables.weekly_trigger) / 100.0);
+    let weekly_ceiling =
+        crate::swap::weekly_effective_ceiling(f64::from(config.tunables.weekly_ceiling) / 100.0);
 
     // 3. Decide the swap MODE and perform the keychain rotation, yielding
     //    `(from_label, reason, adopted)` for the shared event / notify / print tail:
@@ -674,7 +674,7 @@ where
         // Warn-and-proceed if forcing onto a non-viable target, exactly as a normal
         // forced swap does; a locked keychain on the viability poll still aborts (ZERO
         // writes) — the always-enforced safety.
-        warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_trigger).await?;
+        warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_ceiling).await?;
         // Adopt: skip the outgoing re-stash, install the target (steps 3–5), lock-wrapped
         // (#64) so a concurrent daemon swap cannot interleave. SAFETY still holds inside
         // the engine: the canonical is probed for a LOCK before any write (ZERO writes on
@@ -707,7 +707,7 @@ where
         let (swap_target, reason) = if force {
             // `--force` bypasses the POLICY gates (cooldown, weekly-exhausted,
             // already-active), but still WARNS when forcing onto a non-viable target.
-            warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_trigger)
+            warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_ceiling)
                 .await?;
             (SwapTarget::forced(target), SwapReason::Forced)
         } else {
@@ -716,7 +716,7 @@ where
                 seams.poller,
                 target,
                 &active_stash,
-                weekly_trigger,
+                weekly_ceiling,
                 in_cooldown,
             )
             .await?
@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     /// A two-account config: `work` (uuid `u-A`) and `spare` (uuid `u-B`), default
-    /// tunables (weekly_trigger 98 ⇒ 0.98, cooldown 60).
+    /// tunables (weekly_ceiling 98 ⇒ 0.98, cooldown 60).
     fn config_ab() -> Config {
         Config {
             roster: vec![acct("work", "u-A"), acct("spare", "u-B")],
