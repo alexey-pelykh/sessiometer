@@ -2046,7 +2046,7 @@ pub(crate) fn render_status(
     // three sections downstream read them: the cornered alarm, the per-account blind line, and the
     // next-swap footer's suppression. Both are `Copy`, so each stays usable after being passed on.
     let active_blind = active_blind_projection(response);
-    let cornered = cornered_state(active_blind, &response.next_swap);
+    let cornered = cornered_state(active_blind, response.next_swap.as_ref());
 
     if let Some(cornered) = cornered {
         out.push_str(&render_cornered(cornered, now, color));
@@ -2058,13 +2058,13 @@ pub(crate) fn render_status(
     // already folded in this exact `no_viable_target` relief, so re-printing `next swap: none — …`
     // would be redundant (cornered fires only on that arm).
     if cornered.is_none() {
-        out.push_str(&render_next_swap(&response.next_swap, now));
+        out.push_str(&render_next_swap(response.next_swap.as_ref(), now));
     }
     out.push_str(&render_systemic_refresh_failure(response, color));
     out.push_str(&render_landing_overshoot(response, color));
     out.push_str(&render_keychain_locked(response));
     out.push_str(&render_canonical_scrub(response));
-    out.push_str(&render_refresh_advisory(response, color));
+    out.push_str(&render_refresh_disabled_advisory(response, color));
     out
 }
 
@@ -2208,7 +2208,7 @@ type CorneredState<'a> = (&'a str, BlindActive, Option<NoTargetCause>, Option<i6
 /// wire, so it needs no new field.
 fn cornered_state<'a>(
     active_blind: Option<(&'a str, BlindActive)>,
-    next_swap: &Option<NextSwap>,
+    next_swap: Option<&NextSwap>,
 ) -> Option<CorneredState<'a>> {
     match (active_blind, next_swap) {
         (Some((label, blind)), Some(NextSwap::NoViableTarget { cause, resets_at }))
@@ -2217,6 +2217,22 @@ fn cornered_state<'a>(
             Some((label, blind, *cause, *resets_at))
         }
         _ => None,
+    }
+}
+
+/// A daemon-fault footer line: `body` as DATA — printed UNCONDITIONALLY so it survives a pipe /
+/// redirect / `status | grep`, an operator's health check must be able to see it — plus its
+/// newline, red-emphasized only when `emphasize` is set. The overlay is the SAME
+/// `\x1b[{code}m…\x1b[0m` SGR [`render_cells`] wraps a table cell in, so every fault line in this
+/// surface tints identically; folding the four sites into one call is what KEEPS them identical
+/// (the invariant was previously hand-maintained in four prose cross-references). The plain text
+/// carries the whole message on its own, so a `--no-color` / piped reader loses nothing — the
+/// colour only ever AUGMENTS.
+fn red_line(body: &str, emphasize: bool) -> String {
+    if emphasize {
+        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
+    } else {
+        format!("{body}\n")
     }
 }
 
@@ -2246,11 +2262,7 @@ fn render_cornered(cornered: CorneredState<'_>, now: i64, color: bool) -> String
         "CORNERED: active {label} blind for {dur} at last-known session {last_known}% and \
          auto-protection cannot act — {blocked}; add or free an account"
     );
-    if color {
-        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
-    } else {
-        format!("{body}\n")
-    }
+    red_line(&body, color)
 }
 
 /// The normal per-account blind-active line (issue #479 surface 1, shipped in #496), rendered when
@@ -2271,11 +2283,7 @@ fn render_blind_active(label: &str, blind: BlindActive, color: bool) -> String {
         "active {label}: blind for {dur} — last-known session {last_known}% — \
          auto-protection {verdict}"
     );
-    if color && blind.auto_protection_degraded {
-        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
-    } else {
-        format!("{body}\n")
-    }
+    red_line(&body, color && blind.auto_protection_degraded)
 }
 
 /// The #452 preemptive-swap NARRATION (issue #479, surface 2): when the daemon swapped a BLIND
@@ -2307,7 +2315,7 @@ fn render_blind_preempt_swap(response: &StatusResponse) -> String {
 /// sent no candidate — either a current daemon with no active account to anchor a swap from, or
 /// (via `#[serde(default)]`) a pre-#88 daemon that omits the field — and renders a bare `none`
 /// either way.
-fn render_next_swap(next_swap: &Option<NextSwap>, now: i64) -> String {
+fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
     match next_swap {
         // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
         // so the CLI operator sees WHY this account — the identical "why this target?" the panel
@@ -2373,12 +2381,7 @@ fn render_systemic_refresh_failure(response: &StatusResponse, color: bool) -> St
          account; the mechanism is failing, not one account (check the daemon log 'reason=' \
          and the [refresh] claude binary)"
     );
-    if color {
-        // Same SGR overlay `render_cells` uses (`\x1b[{code}m…\x1b[0m`), red for the fault.
-        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
-    } else {
-        format!("{body}\n")
-    }
+    red_line(&body, color)
 }
 
 /// The daemon-level RUNTIME landing-overshoot notice (issue #613): THIS machine observed a
@@ -2420,11 +2423,7 @@ fn render_landing_overshoot(response: &StatusResponse, color: bool) -> String {
         "landing overshoot: {from} {cause}; single-machine signal \
          (a second machine co-consuming this account is invisible to it)"
     );
-    if color {
-        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
-    } else {
-        format!("{body}\n")
-    }
+    red_line(&body, color)
 }
 
 /// The daemon-level KEYCHAIN-LOCKED rollup (issue #498): the macOS login keychain is LOCKED, so the
@@ -2494,7 +2493,7 @@ fn render_canonical_scrub(response: &StatusResponse) -> String {
 /// there), a pipe, a redirect, or under NO_COLOR / CLICOLOR=0 / TERM=dumb / `--no-color`.
 /// `Some(false)` is the ONLY arming value; `Some(true)` (enabled) and `None` (a pre-#138 daemon that
 /// omits the field) both suppress.
-fn render_refresh_advisory(response: &StatusResponse, color: bool) -> String {
+fn render_refresh_disabled_advisory(response: &StatusResponse, color: bool) -> String {
     if color && response.refresh_enabled == Some(false) && has_stale_nonactive(response) {
         REFRESH_DISABLED_ADVISORY.to_owned()
     } else {
