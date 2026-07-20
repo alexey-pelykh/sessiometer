@@ -97,12 +97,14 @@ enum Idle {
     /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
     /// — reload + reconcile the in-memory roster, then re-tick.
     RosterReloadRequested,
-    /// An authenticated `restored` control command (#275) asked to un-quarantine the
-    /// account with this `uuid` WITHOUT activating it — apply the existing
-    /// [`Daemon::apply_refresh_restore`] primitive (best-effort log its edge-triggered
-    /// `CredentialRestored`), then re-tick so `status` reflects the un-quarantine within
-    /// the poll cadence rather than up to a full interval later. Carries the `uuid` moved
-    /// out of the [`ControlSignal::Restored`] payload.
+    /// An authenticated `restored` control command (#275) asked to reconcile a revived
+    /// account with this `uuid` WITHOUT activating it — apply
+    /// [`Daemon::reconcile_restored`] (best-effort log its edge-triggered events), then
+    /// re-tick so `status` reflects the recovery within the poll cadence rather than up to
+    /// a full interval later. For a bare `Degraded` quarantine that is the plain #275
+    /// un-quarantine; for a `Dead` account (issue #643) it additionally drives an immediate
+    /// isolated refresh so a fixed credential clears to 🟢 within a cycle instead of latching
+    /// stale 🔴. Carries the `uuid` moved out of the [`ControlSignal::Restored`] payload.
     Restored(String),
     /// An authenticated `swap` control command (#167) asked the daemon to swap the active
     /// account onto a target. Carries the still-OPEN connection + the parsed request (moved
@@ -622,21 +624,34 @@ where
 
         match idle {
             Idle::Shutdown => return Ok(()),
-            // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick
-            // holds on the operator's choice, and re-resolve active from the
-            // canonical — BEFORE looping back to re-tick.
-            Idle::ManualSwapped => daemon.adopt_manual_swap().await,
+            // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick holds on
+            // the operator's choice, and re-resolve active from the canonical — then, if the
+            // newly-active account carries the terminal 🔴 `Dead` verdict (a forced `use` onto
+            // a dead spare, issue #643), force an immediate active-safe keep-warm re-probe so
+            // it clears to 🟢 (or an honest 🔴) within the cycle instead of latching stale
+            // `Dead` — BEFORE looping back to re-tick. The re-probe's events (incl. any
+            // LOGGED-not-notified `CredentialUnrecoverable`) are best-effort logged.
+            Idle::ManualSwapped => {
+                daemon.adopt_manual_swap().await;
+                for event in daemon.reprobe_active_if_dead().await {
+                    emit_best_effort(log, &event);
+                }
+            }
             // Reload + reconcile the in-memory roster to the freshly-written
             // `config.toml` (#139) — the onboarded / relogged-in / removed account is
             // adopted into the live rotation — BEFORE looping back to re-tick.
             Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
-            // Apply the on-demand un-quarantine the `restored` control command asked for
-            // (#275): the SAME primitive the #106 sweep drives (`apply_refresh_restore`),
-            // best-effort logging its edge-triggered `CredentialRestored` — no canonical
-            // write, no active-account change — BEFORE looping back to re-tick. An unknown
-            // or already-non-quarantined uuid returns `None`: an idempotent, silent no-op.
+            // Reconcile the revived account the `restored` control command named (#275 +
+            // issue #643): a bare `Degraded` quarantine takes the plain on-demand
+            // un-quarantine (`apply_refresh_restore`); a `Dead` PARKED account additionally
+            // drives an immediate isolated refresh (`reprobe_dead_parked_credential`), folding
+            // a genuinely successful result to 🟢 or leaving an honest 🔴 — no active-account
+            // change either way — BEFORE looping back to re-tick. Any `CredentialUnrecoverable`
+            // edge is LOGGED here but deliberately NOT surfaced as a macOS notify (the operator
+            // just ran `claude /login`; don't toast "run claude /login" at them). An unknown or
+            // non-`Dead`, non-quarantined uuid yields no events: an idempotent, silent no-op.
             Idle::Restored(uuid) => {
-                if let Some(event) = daemon.apply_refresh_restore(&uuid) {
+                for event in daemon.reconcile_restored(&uuid).await {
                     emit_best_effort(log, &event);
                 }
             }
@@ -654,6 +669,15 @@ where
                 }
                 let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_swap_ack(stream, &ack))
                     .await;
+                // Issue #643: a socket swap-on-click (the menubar app) onto an account carrying
+                // the terminal 🔴 `Dead` verdict re-probes it on the spot — active-safe keep-warm
+                // mint → 🟢 (or an honest 🔴) — instead of latching stale `Dead`. AFTER the ack so
+                // the waiting client is never blocked on the `claude -p` mint; the re-probe's
+                // events (incl. any LOGGED-not-notified `CredentialUnrecoverable`) are best-effort
+                // logged.
+                for event in daemon.reprobe_active_if_dead().await {
+                    emit_best_effort(log, &event);
+                }
             }
             // Perform the authenticated `capture` control command (#359) where `&mut daemon` is
             // available: read the active credential + identity and stash them through the

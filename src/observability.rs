@@ -234,10 +234,12 @@ impl RefreshEventReason {
 
 /// What prompted an in-place ACTIVE-account keep-warm cycle (issue #282) — the `trigger=`
 /// token of an [`Event::KeepWarm`] line. Unlike the poll-path [`Event::PollRefresh`]'s fixed
-/// `poll_401` literal, keep-warm fires from two distinct conditions, so the discriminant is a
-/// carried enum field: a `proactive` mint scheduled before the active token nears expiry, or a
+/// `poll_401` literal, keep-warm fires from three distinct conditions, so the discriminant is a
+/// carried enum field: a `proactive` mint scheduled before the active token nears expiry, a
 /// `reactive` backstop mint on an active usage-401 (revive the canonical before the 401 counts
-/// toward the #42 death streak). A non-secret classification only — never a token or email.
+/// toward the #42 death streak), or a `recovery` mint forced when an account that is `Dead` on
+/// `use`-activation is re-probed on the spot (issue #643). A non-secret classification only —
+/// never a token or email.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeepWarmTrigger {
     /// A scheduled mint fired because the active token entered its (staggered) near-expiry
@@ -246,6 +248,11 @@ pub(crate) enum KeepWarmTrigger {
     /// A backstop mint fired on an active usage-401, reviving the canonical in place before
     /// the 401 advances the #42 death streak toward a false quarantine.
     Reactive,
+    /// A forced mint fired when a `use`-activated account carries the terminal 🔴 `Dead` verdict
+    /// (issue #643): the active-safe re-probe that folds a genuinely successful refresh back to
+    /// 🟢 — or leaves an honest 🔴 — instead of latching the stale `Dead` for a full access-token
+    /// lifetime until the next natural sweep.
+    Recovery,
 }
 
 impl KeepWarmTrigger {
@@ -254,6 +261,7 @@ impl KeepWarmTrigger {
         match self {
             KeepWarmTrigger::Proactive => "proactive",
             KeepWarmTrigger::Reactive => "reactive",
+            KeepWarmTrigger::Recovery => "recovery",
         }
     }
 }

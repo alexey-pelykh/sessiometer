@@ -1085,6 +1085,25 @@ pub(crate) trait KeepWarm {
 /// [`crate::refresh::keep_warm_cycle`] returns.
 type KeepWarmMint = (RefreshReport, Option<Credential>);
 
+/// The result of one [`keep_warm_and_promote`](Daemon::keep_warm_and_promote) attempt: whether a
+/// fresh token was PROMOTED to the canonical item, plus the cycle's non-secret classification
+/// (issue #643). The reactive caller reads only [`promoted`](Self::promoted); the proactive caller
+/// discards the result entirely; the `use`-activate recovery re-probe additionally folds
+/// [`outcome`](Self::outcome) / [`token_rotated`](Self::token_rotated) into the credential-health
+/// verdict via [`fold_recovery_outcome`](Daemon::fold_recovery_outcome). A dead / absent refresh
+/// token (the `!has_live_refresh_token` short-circuit) maps to `outcome = Dead` — its absence IS the
+/// dead signal — so the recovery path keeps an honest 🔴 without a doomed spawn.
+struct KeepWarmPromote {
+    /// Whether a fresh token was actually written to the canonical item this cycle.
+    promoted: bool,
+    /// The cycle's non-secret [`RefreshEventOutcome`] — `Dead` for the empty-refresh-token
+    /// short-circuit, else the classified mint result (`Error` on a could-not-run).
+    outcome: RefreshEventOutcome,
+    /// Whether CC rotated the refresh token value this cycle (the AC-3 durability signal;
+    /// `false` for the short-circuit / could-not-run).
+    token_rotated: bool,
+}
+
 /// The production [`KeepWarm`]: mints via [`crate::refresh::keep_warm_account`], which reuses
 /// the #102 isolated back-dating spawn on a COPY of the canonical blob and hands the fresh
 /// token back. Holds the `[refresh].claude_bin` OVERRIDE (issue #375), NOT a resolved path:
@@ -3904,6 +3923,7 @@ where
         if self
             .keep_warm_and_promote(i, canonical, KeepWarmTrigger::Reactive, events)
             .await
+            .promoted
         {
             // The canonical now holds a fresh token → re-poll the ACTIVE account through it.
             self.poller
@@ -3997,14 +4017,17 @@ where
     }
 
     /// Mint a fresh token for the active account `i` from its `canonical` blob and, on a real
-    /// refresh, PROMOTE it to the canonical item (issue #282) — the shared core of the proactive
-    /// and reactive paths. Returns whether a fresh token was actually promoted to canonical.
+    /// refresh, PROMOTE it to the canonical item (issue #282) — the shared core of the proactive and
+    /// reactive paths. Returns a [`KeepWarmPromote`]: whether a fresh token was promoted, plus the
+    /// cycle's classified outcome (issue #643, folded by the `use`-activate recovery re-probe; the
+    /// reactive caller reads only `.promoted`, the proactive one discards the result).
     ///
     /// Steps: (1) short-circuit a dead/absent refresh token — CC has nothing to exchange, so skip
-    /// the doomed spawn and report no-promote (the caller lets the #42 streak advance: invariant
-    /// 4); (2) stamp `last_keep_warm_attempt` (the proactive throttle + reactive-suppresses-proactive
-    /// signal) BEFORE the mint, so even a could-not-run attempt counts; (3) drive the keep-warm
-    /// engine to mint; (4) push ONE durable [`Event::KeepWarm`] recording the action (mirrors
+    /// the doomed spawn and report no-promote with a `Dead` outcome (the caller lets the #42 streak
+    /// advance: invariant 4; the absence IS the dead signal, issue #643); (2) stamp
+    /// `last_keep_warm_attempt` (the proactive throttle + reactive-suppresses-proactive signal)
+    /// BEFORE the mint, so even a could-not-run attempt counts; (3) drive the keep-warm engine to
+    /// mint; (4) push ONE durable [`Event::KeepWarm`] recording the action (mirrors
     /// [`refresh_retry`](Self::refresh_retry)'s `PollRefresh` event); (5) promote ONLY a real mint
     /// ([`RefreshOutcome::Refreshed`] → `Some(credential)`) via
     /// [`promote_canonical`](Self::promote_canonical); every other outcome
@@ -4015,12 +4038,18 @@ where
         canonical: &Credential,
         trigger: KeepWarmTrigger,
         events: &mut Vec<Event>,
-    ) -> bool {
+    ) -> KeepWarmPromote {
         // A dead (empty) or absent refresh token cannot be revived by ANY mint — skip the doomed
         // `claude -p` spawn and report no-promote so the caller lets the #42 streak advance to
-        // quarantine → emergency swap (invariant 4). Only a NON-empty RT is worth minting.
+        // quarantine → emergency swap (invariant 4). Only a NON-empty RT is worth minting. Its
+        // ABSENCE is itself the dead signal (issue #643): report `Dead` so a recovery re-probe folds
+        // an honest 🔴, exactly as a completed cycle that returned `Dead` would.
         if !has_live_refresh_token(canonical) {
-            return false;
+            return KeepWarmPromote {
+                promoted: false,
+                outcome: RefreshEventOutcome::Dead,
+                token_rotated: false,
+            };
         }
         // Stamp the attempt up front so BOTH the proactive throttle and the
         // reactive-suppresses-a-same-window-proactive signal count even a mint that cannot run.
@@ -4028,7 +4057,18 @@ where
         let minted = match self.keep_warm.as_ref() {
             Some(engine) => engine.keep_warm(&self.roster[i], canonical).await,
             // Unreachable given the callers' `keep_warm.is_some()` gate; treat as no-promote.
-            None => return false,
+            None => {
+                return KeepWarmPromote {
+                    promoted: false,
+                    outcome: RefreshEventOutcome::Error,
+                    token_rotated: false,
+                }
+            }
+        };
+        // The cycle's non-secret classification, computed once and reused by the event + the return.
+        let (outcome, token_rotated) = match &minted {
+            Ok((report, _)) => (refresh_event_outcome(report), report.refresh_token_rotated),
+            Err(_) => (RefreshEventOutcome::Error, false),
         };
         // Durably record the keep-warm ACTION (issue #282), for EVERY firing — the forensic trail
         // mirroring `refresh_retry`'s `PollRefresh`. A completed cycle maps through the shared
@@ -4036,19 +4076,18 @@ where
         events.push(Event::KeepWarm {
             account: self.roster[i].label.clone(),
             trigger,
-            outcome: match &minted {
-                Ok((report, _)) => refresh_event_outcome(report),
-                Err(_) => RefreshEventOutcome::Error,
-            },
-            refresh_token_rotated: match &minted {
-                Ok((report, _)) => report.refresh_token_rotated,
-                Err(_) => false,
-            },
+            outcome,
+            refresh_token_rotated: token_rotated,
         });
         // Promote ONLY a real mint; NoChange / Dead / Error / could-not-run leave canonical as-is.
-        match minted {
+        let promoted = match minted {
             Ok((_, Some(cred))) => self.promote_canonical(i, &cred).await.unwrap_or(false),
             _ => false,
+        };
+        KeepWarmPromote {
+            promoted,
+            outcome,
+            token_rotated,
         }
     }
 
@@ -6160,6 +6199,198 @@ where
         })
     }
 
+    /// Handle a `restored` control notify (issue #276) — the on-demand recovery of a revived
+    /// account — with the issue #643 credential re-probe. When the revived account's health
+    /// verdict is the terminal 🔴 `Dead` (its [`last_refresh_outcome`](AccountHealth::last_refresh_outcome)
+    /// latched `Dead`), drive an IMMEDIATE isolated refresh (the always-wired #162/#426
+    /// `poll_refresh` engine) and fold a genuinely SUCCESSFUL refresh into the verdict, so a fixed
+    /// credential returns to 🟢 within a cycle instead of latching 🔴 for a full ~8h access-token
+    /// lifetime until the next natural near-expiry sweep. Recovery from `Dead` stays gated on a real
+    /// successful refresh, NEVER a usage-poll 200 (the false-recovery guard issue #427 established: a
+    /// usage 200 exercises the ACCESS token and says nothing about the REFRESH token, which is
+    /// exactly what `Dead` asserts) — a still-dead re-stash whose fresh credential ALSO fails to
+    /// refresh keeps the honest 🔴.
+    ///
+    /// When the account is NOT `Dead` (a bare `Degraded` quarantine, whose access-token 401-streak a
+    /// re-login clears WITHOUT needing a refresh), the isolated engine is unwired (a hermetic
+    /// daemon), or the account is unexpectedly the ACTIVE one (the isolated engine must never touch
+    /// it, issue #253 — the active path re-probes via keep-warm instead), it falls back to the plain
+    /// #275 on-demand un-quarantine ([`apply_refresh_restore`](Self::apply_refresh_restore)). Returns
+    /// the events to log; the edge-triggered `CredentialHealth` transition rides the run loop's
+    /// immediate re-tick.
+    async fn reconcile_restored(&mut self, uuid: &str) -> Vec<Event> {
+        let Some(idx) = self.roster.iter().position(|a| a.account_uuid == uuid) else {
+            // Unknown uuid: an idempotent no-op (the daemon no longer holds it), mirroring
+            // `apply_refresh_restore`.
+            return Vec::new();
+        };
+        // `credential_health` reserves the terminal 🔴 `Dead` for `last_refresh_outcome == Dead`
+        // (issue #427) — the ONLY verdict a fresh refresh is needed to clear; a bare `Degraded`
+        // quarantine clears on the un-quarantine alone. The active-account exclusion mirrors
+        // `should_refresh_retry` (issue #253): the isolated engine rotates the server-side refresh
+        // token but writes only the STASH, so it is safe for PARKED accounts only.
+        let is_dead =
+            self.state.health[idx].last_refresh_outcome == Some(RefreshEventOutcome::Dead);
+        if is_dead && self.poll_refresh.is_some() && self.state.active != Some(idx) {
+            self.reprobe_dead_parked_credential(idx).await
+        } else {
+            // #275: the bare on-demand un-quarantine — a `Degraded` revive, or an unwired engine.
+            self.apply_refresh_restore(uuid).into_iter().collect()
+        }
+    }
+
+    /// Re-probe a revived PARKED account's credential with ONE isolated refresh and fold a
+    /// genuinely SUCCESSFUL result into its health (issue #643). Only called from
+    /// [`reconcile_restored`](Self::reconcile_restored) when the account is `Dead`, `poll_refresh`
+    /// is wired, AND it is not the active one — so the engine `as_ref()` is always `Some`. The
+    /// isolated #102 engine rotates the server-side refresh token but CAS-writes only the account's
+    /// STASH, never the live canonical — parked-account-safe (issue #253), the SAME engine the
+    /// reactive #162 poll path drives. Emits one durable [`Event::PollRefresh`] for the ACTION
+    /// (mirroring [`refresh_retry`](Self::refresh_retry)), then folds a live outcome via
+    /// [`fold_recovery_outcome`](Self::fold_recovery_outcome); a `Dead` re-stash (still dead) or a
+    /// transient engine error leaves the honest 🔴 standing.
+    async fn reprobe_dead_parked_credential(&mut self, idx: usize) -> Vec<Event> {
+        let refreshed = match self.poll_refresh.as_ref() {
+            Some(engine) => engine.refresh(&self.roster[idx]).await,
+            // Unreachable given the caller's `poll_refresh.is_some()` gate; treat as could-not-run.
+            None => return Vec::new(),
+        };
+        let (outcome, rotated) = match &refreshed {
+            Ok(report) => (refresh_event_outcome(report), report.refresh_token_rotated),
+            Err(_) => (RefreshEventOutcome::Error, false),
+        };
+        // Durably record the isolated-refresh ACTION (issue #255 vocabulary), for EVERY firing —
+        // the forensic trail the transient `diag=` line alone did not leave, exactly as the #162
+        // poll-path refresh does.
+        let mut events = vec![Event::PollRefresh {
+            account: self.roster[idx].label.clone(),
+            outcome,
+            refresh_token_rotated: rotated,
+        }];
+        // Read the freshly re-stashed access-token expiry (the sweep reads it the same way) so the
+        // rollup's staleness clock tracks the revived credential. `fold_recovery_outcome` applies it
+        // whenever the stash yielded one (`Some`); on a non-live outcome the verdict is `Dead`/`AtRisk`
+        // regardless of the expiry, so the update is inert there.
+        let expires_at_ms =
+            crate::refresh::stored_expires_at(&self.stash, &self.roster[idx].stash()).await;
+        events.extend(self.fold_recovery_outcome(idx, outcome, rotated, expires_at_ms));
+        events
+    }
+
+    /// Fold a MANUAL-RECOVERY refresh `outcome` for account `idx` into its health (issue #643) — the
+    /// shared core of the parked ([`reconcile_restored`](Self::reconcile_restored)) and active
+    /// (`use`-activate) recovery re-probes. Folds the refresh-health half via
+    /// [`note_refresh_outcome`](Self::note_refresh_outcome) (the SAME primitive the #119 sweep uses,
+    /// so `last_refresh_outcome` / the #261 latch never drift), then decides quarantine membership by
+    /// the outcome's DEFINITIVENESS — recovery from the terminal 🔴 `Dead` stays gated on a genuinely
+    /// successful refresh (the issue #427 false-recovery guard: a usage-poll 200 exercises only the
+    /// ACCESS token and never reaches this refresh path):
+    ///
+    /// - a LIVE outcome (`Refreshed` / `RefreshedNotReStashed` / `NoChange` — the refresh token
+    ///   actually answered) → un-quarantine → 🟢 (the fix: a fixed credential clears within a cycle);
+    /// - a definitive `Dead` (CC rejected the refresh token itself) → KEEP the quarantine, so a
+    ///   confirmed-dead credential stays out of rotation and honestly 🔴 (the AC-3 regression guard);
+    /// - a transient `Error` (a spawn / read-back / lock hiccup — INCONCLUSIVE, not a dead verdict)
+    ///   → un-quarantine (preserving the #275 guarantee that a re-login clears the quarantine) → 🟡
+    ///   `AtRisk`, which self-heals on the next sweep rather than stranding a genuinely-fixed account.
+    ///
+    /// `expires_at_ms` refreshes the staleness clock ONLY when `Some` (the parked path passes the
+    /// fresh stash expiry; the active path passes `None`, since
+    /// [`promote_canonical`](Self::promote_canonical) already reconciled `access_expires_at` to the
+    /// promoted canonical — issue #477 — and clobbering it to `None` would false-fire `Stale`). The
+    /// `CredentialHealth` rollup transition rides the caller's next tick.
+    fn fold_recovery_outcome(
+        &mut self,
+        idx: usize,
+        outcome: RefreshEventOutcome,
+        rotated: bool,
+        expires_at_ms: Option<i64>,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        // The refresh-health fold (`last_refresh_outcome` + rotated + the at-risk streak + the #261
+        // latch), shared with the sweep. Any `CredentialUnrecoverable` edge it returns is LOGGED
+        // (via the caller's `emit_best_effort`) but never NOTIFIED — a login-triggered re-probe must
+        // not spawn a "run claude /login" macOS toast the instant the operator just DID.
+        if let Some(event) = self.note_refresh_outcome(idx, outcome, rotated) {
+            events.push(event);
+        }
+        // Staleness clock: parked passes the fresh stash expiry; active passes `None` (promote owns
+        // it). ms → s at the boundary, matching `apply_refresh_observation`.
+        if let Some(ms) = expires_at_ms {
+            self.state.health[idx].access_expires_at = Some(ms / 1000);
+        }
+        // Quarantine membership by definitiveness (see the doc ladder): a confirmed-`Dead` credential
+        // STAYS quarantined (out of rotation, honest 🔴); every other outcome un-quarantines — a live
+        // one to 🟢, an inconclusive `Error` to 🟡 (the #275 un-quarantine guarantee).
+        if outcome != RefreshEventOutcome::Dead {
+            let uuid = self.roster[idx].account_uuid.clone();
+            if let Some(event) = self.apply_refresh_restore(&uuid) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Re-probe the ACTIVE account's credential with ONE forced keep-warm mint when a `use`-activation
+    /// (a manual `use` swap or a menubar swap-on-click) lands on an account carrying the terminal 🔴
+    /// `Dead` verdict (issue #643) — the active-account counterpart of
+    /// [`reprobe_dead_parked_credential`](Self::reprobe_dead_parked_credential). Driven from the run
+    /// loop right after a swap adopts the new active ([`adopt_manual_swap`](Self::adopt_manual_swap) /
+    /// [`perform_socket_swap`](Self::perform_socket_swap) have already set `state.active`), so the
+    /// newly-active account is re-evaluated WITHIN the cycle rather than latching a stale `Dead` for a
+    /// full ~8h access-token lifetime — the sweep that would otherwise clear it EXCLUDES the active
+    /// account (issue #253), so nothing else re-probes it.
+    ///
+    /// Gated to the exact fix precondition: the active account's verdict is `Dead`
+    /// (`last_refresh_outcome == Some(Dead)`) AND the active-safe keep-warm engine is wired — the ONE
+    /// refresh path that may touch the LIVE canonical (issue #253; the isolated poll-refresh engine
+    /// must never write it, which is why the parked path uses `poll_refresh` and this one uses
+    /// `keep_warm`). A non-`Dead` active account (nothing to recover) or an unwired engine returns
+    /// empty. The mint reads the POST-swap canonical (`self.store.read()` — the now-active account's
+    /// blob the swap just wrote); an unreadable / locked keychain fails safe to empty (the next tick
+    /// re-resolves active anyway — locked ≠ dead).
+    ///
+    /// Recovery stays gated on a genuinely SUCCESSFUL refresh (the issue #427 false-recovery guard):
+    /// [`keep_warm_and_promote`](Self::keep_warm_and_promote) mints + promotes, surfacing the cycle's
+    /// classified [`RefreshEventOutcome`], which [`fold_recovery_outcome`](Self::fold_recovery_outcome)
+    /// folds — a live outcome clears the `Dead` latch to 🟢; a `Dead` re-mint (CC rejected the refresh
+    /// token, or it is absent) keeps the honest 🔴. `expires_at_ms` is `None`: a real mint's
+    /// [`promote_canonical`](Self::promote_canonical) already reconciled `access_expires_at` (issue
+    /// #477), so the active path must not clobber it to `None` and false-fire `Stale`.
+    async fn reprobe_active_if_dead(&mut self) -> Vec<Event> {
+        let Some(idx) = self.state.active else {
+            return Vec::new();
+        };
+        // Only the terminal 🔴 `Dead` verdict needs a forced refresh; a healthy / degraded active
+        // account is left to the normal tick. `keep_warm` is the ONLY active-safe refresh (issue
+        // #253): unwired → nothing to do.
+        let is_dead =
+            self.state.health[idx].last_refresh_outcome == Some(RefreshEventOutcome::Dead);
+        if !is_dead || self.keep_warm.is_none() {
+            return Vec::new();
+        }
+        // Mint from the POST-swap canonical — the now-active account's credential the swap just
+        // wrote. A locked / unreadable keychain fails safe (the next tick re-resolves active anyway).
+        let Ok(canonical) = self.store.read().await else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        // `.promoted` is deliberately unused here (the `..`): a promote either landed a fresh token
+        // for the fold's live outcome to clear, or it didn't and the fold keeps the honest 🔴 — the
+        // recovery verdict keys on `outcome`, not on whether the canonical was rewritten.
+        let KeepWarmPromote {
+            outcome,
+            token_rotated,
+            ..
+        } = self
+            .keep_warm_and_promote(idx, &canonical, KeepWarmTrigger::Recovery, &mut events)
+            .await;
+        // `None` expiry: a real mint's `promote_canonical` already reconciled `access_expires_at`
+        // (issue #477); the active path must not clobber it to `None` and false-fire `Stale`.
+        events.extend(self.fold_recovery_outcome(idx, outcome, token_rotated, None));
+        events
+    }
+
     /// Fold one [`RefreshObservation`] the refresh sweep reported (issue #119) into the
     /// owning account's carried health state — the credential clocks the `status` rollup
     /// projects. The engine's `expiresAt` is MS (CC's native unit); it is converted to the
@@ -6184,13 +6415,40 @@ where
             .roster
             .iter()
             .position(|a| a.account_uuid == observation.account_uuid)?;
-        let health = &mut self.state.health[idx];
-        // ms → s at the boundary; the rollup/wire are uniform epoch seconds.
-        health.access_expires_at = observation.expires_at_ms.map(|ms| ms / 1000);
+        // ms → s at the boundary; the rollup/wire are uniform epoch seconds. The expiry clock
+        // updates on EVERY observation (refreshed or read-only).
+        self.state.health[idx].access_expires_at = observation.expires_at_ms.map(|ms| ms / 1000);
+        // The refresh-health fields update only when the sweep actually refreshed the account.
         let delta = observation.refresh?;
-        health.last_refresh_outcome = Some(delta.outcome);
-        health.refresh_token_rotated = Some(delta.token_rotated);
-        match delta.outcome {
+        self.note_refresh_outcome(idx, delta.outcome, delta.token_rotated)
+    }
+
+    /// Fold ONE refresh cycle's non-secret `outcome` (+ whether the refresh token rotated) into
+    /// account `idx`'s carried refresh-health — the shared core of the #119 sweep observation
+    /// ([`apply_refresh_observation`](Self::apply_refresh_observation)) and the issue #643 manual-
+    /// recovery re-probe ([`fold_recovery_outcome`](Self::fold_recovery_outcome)), so
+    /// `last_refresh_outcome`, the at-risk streak, and the #261 latch stay single-homed and cannot
+    /// drift across the two callers. Deliberately does NOT touch `access_expires_at` — that clock is
+    /// owned by each caller (the sweep reads it from the stash; the active recovery leaves
+    /// [`promote_canonical`](Self::promote_canonical)'s #477 reconciliation intact).
+    ///
+    /// A `Dead` / `Error` outcome advances the consecutive-failure streak; any alive outcome resets
+    /// it — so the streak the rollup's `AtRisk` keys off counts only CONSECUTIVE failures. Returns
+    /// [`Event::CredentialUnrecoverable`] on the ONE fold that first confirms a QUARANTINED account's
+    /// refresh token is dead (issue #261): CC rejected the refresh token, so no automated path
+    /// revives it and only an operator `claude /login` can. Gated by the sticky per-account
+    /// [`AccountHealth::unrecoverable_signaled`] latch so the caller emits the operator signal
+    /// exactly once per quarantine episode, never per re-probe. Every other fold returns `None`.
+    fn note_refresh_outcome(
+        &mut self,
+        idx: usize,
+        outcome: RefreshEventOutcome,
+        token_rotated: bool,
+    ) -> Option<Event> {
+        let health = &mut self.state.health[idx];
+        health.last_refresh_outcome = Some(outcome);
+        health.refresh_token_rotated = Some(token_rotated);
+        match outcome {
             RefreshEventOutcome::Dead | RefreshEventOutcome::Error => {
                 health.consecutive_refresh_failures =
                     health.consecutive_refresh_failures.saturating_add(1);
@@ -6201,12 +6459,12 @@ where
                 health.consecutive_refresh_failures = 0;
             }
         }
-        // Issue #261: a QUARANTINED account whose isolated sweep-refresh returns `Dead` is
-        // confirmed unrecoverable. Fire the operator signal once per quarantine episode — the
-        // latch (reset on re-quarantine in `note_poll_outcome`) suppresses the re-probe repeats
-        // and the `Dead`↔`Error` flap. Keyed on the latch, deliberately NOT on the prior
-        // `last_refresh_outcome`, which is orthogonal to the quarantine lifecycle.
-        let signal = delta.outcome == RefreshEventOutcome::Dead
+        // Issue #261: a QUARANTINED account whose isolated refresh returns `Dead` is confirmed
+        // unrecoverable. Fire the operator signal once per quarantine episode — the latch (reset on
+        // re-quarantine in `note_poll_outcome`) suppresses the re-probe repeats and the `Dead`↔`Error`
+        // flap. Keyed on the latch, deliberately NOT on the prior `last_refresh_outcome`, which is
+        // orthogonal to the quarantine lifecycle.
+        let signal = outcome == RefreshEventOutcome::Dead
             && health.quarantined
             && !health.unrecoverable_signaled;
         if signal {
@@ -27604,6 +27862,801 @@ mod tests {
         assert!(
             e3.iter().any(|e| matches!(e, Event::UsageRollup { .. })),
             "rolls again past the cadence"
+        );
+    }
+
+    // --- issue #643: revived-account stale-Dead-latch re-probe --------------
+    //
+    // A non-active account whose REFRESH token died latches 🔴 `Dead` (`last_refresh_outcome ==
+    // Some(Dead)`), which clears ONLY on a genuinely successful refresh. Manual recovery
+    // (`sessiometer login` on a parked account whose ACCESS token is still valid, or `sessiometer
+    // use` activating a dead spare) never drove such a refresh — usage polls kept returning 200, so
+    // the account read stale 🔴 for a full ~8h access-token lifetime. The fix re-probes on the spot:
+    // the parked path (`reconcile_restored`) drives the isolated `poll_refresh` engine; the active
+    // path (`reprobe_active_if_dead`) drives the active-safe `keep_warm` engine. Recovery stays
+    // gated on a SUCCESSFUL refresh (never a usage 200 — the #427 false-recovery guard).
+
+    #[tokio::test]
+    async fn reconcile_restored_reprobes_a_dead_parked_account_and_clears_to_healthy_on_a_live_refresh(
+    ) {
+        // AC-1 (positive): a PARKED account latched 🔴 `Dead` whose operator just ran `claude /login`
+        // (the `restored` notify) is re-probed with ONE isolated refresh. The revived credential
+        // answers (`Refreshed`), so the `Dead` latch clears, the quarantine lifts, and the account
+        // reads 🟢 WITHIN the cycle — not stale 🔴 until the next natural near-expiry sweep.
+        const NOW: i64 = 1_782_777_600;
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        // `work` (idx 0) stays active; `spare` (u-B, idx 1) is the parked account latched
+        // Dead+quarantined, with its ACCESS token still valid (the #643 precondition — usage polls
+        // keep returning 200, so nothing else triggers a refresh). Already signaled unrecoverable by
+        // the sweep that first confirmed the death.
+        daemon.state.active = Some(0);
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[1].unrecoverable_signaled = true;
+        daemon.state.health[1].access_expires_at = Some(NOW + 3600);
+
+        let events = daemon.reconcile_restored("u-B").await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "exactly one isolated refresh re-probed the revived credential"
+        );
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "a genuinely successful refresh lifts the quarantine"
+        );
+        let h = &daemon.state.health[1];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::Healthy,
+            "the revived credential reads 🟢, not the stale 🔴 Dead latch",
+        );
+        assert_eq!(
+            events,
+            vec![
+                Event::PollRefresh {
+                    account: "spare".to_owned(),
+                    outcome: RefreshEventOutcome::Refreshed,
+                    refresh_token_rotated: true,
+                },
+                Event::CredentialRestored {
+                    account: "spare".to_owned(),
+                },
+            ],
+            "the re-probe logs its isolated-refresh ACTION, then the un-quarantine edge",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restored_clears_a_dead_not_quarantined_parked_account_via_the_fold() {
+        // AC-1 (Case B): a refresh-detected death the 401 path never quarantined (`last_refresh_outcome
+        // == Dead` but NOT quarantined). `apply_refresh_restore` is a no-op here (nothing to
+        // un-quarantine), so it is the FOLD of the fresh live outcome — not the un-quarantine — that
+        // clears the verdict. Proves the fix does not rely on the quarantine flag being set.
+        const NOW: i64 = 1_782_777_600;
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = false; // Case B: dead verdict, never quarantined
+        daemon.state.health[1].access_expires_at = Some(NOW + 3600);
+
+        let events = daemon.reconcile_restored("u-B").await;
+
+        assert_eq!(calls.get(), 1, "the revived credential is re-probed once");
+        let h = &daemon.state.health[1];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::Healthy,
+            "the fold of a live outcome clears the Dead verdict even without a quarantine to lift",
+        );
+        assert_eq!(
+            events,
+            vec![Event::PollRefresh {
+                account: "spare".to_owned(),
+                outcome: RefreshEventOutcome::Refreshed,
+                refresh_token_rotated: true,
+            }],
+            "no CredentialRestored — there was no quarantine to lift (Case B)",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restored_keeps_an_honest_dead_when_the_revived_parked_credential_still_fails(
+    ) {
+        // AC-3 (the false-recovery regression guard): a login-revive whose FRESH credential ALSO
+        // fails to refresh (the isolated re-probe returns `Dead`) must NOT be falsely cleared.
+        // Recovery from the terminal 🔴 stays gated on a genuinely successful refresh (issue #427) —
+        // a usage-poll 200 exercises only the ACCESS token and never reaches this refresh path — so
+        // the account stays quarantined and reads an honest 🔴. The operator signal does NOT re-fire
+        // (the #261 latch was already set).
+        const NOW: i64 = 1_782_777_600;
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Dead,
+            None,
+            false,
+            3,
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[1].unrecoverable_signaled = true;
+
+        let events = daemon.reconcile_restored("u-B").await;
+
+        assert_eq!(calls.get(), 1, "the revived credential is re-probed once");
+        assert!(
+            daemon.state.health[1].quarantined,
+            "a still-dead re-probe keeps the quarantine — never falsely cleared",
+        );
+        let h = &daemon.state.health[1];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::Dead,
+            "the confirmed-dead credential stays an honest 🔴, not a false 🟢",
+        );
+        assert_eq!(
+            events,
+            vec![Event::PollRefresh {
+                account: "spare".to_owned(),
+                outcome: RefreshEventOutcome::Dead,
+                refresh_token_rotated: false,
+            }],
+            "the action is logged; the #261 operator signal does NOT re-fire (already latched)",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restored_un_quarantines_a_transient_error_re_probe_to_at_risk_not_dead() {
+        // A TRANSIENT re-probe error (a spawn / lock / read-back hiccup — INCONCLUSIVE, not a proven
+        // death) must NOT strand a genuinely-fixed account. The three-way fold un-quarantines on any
+        // non-`Dead` outcome, so an `Error` clears the terminal 🔴 to 🟡 `AtRisk` (which self-heals on
+        // the next sweep) rather than leaving it stuck at 🔴 `Dead`/🟠 `Degraded`. This preserves the
+        // #275 un-quarantine guarantee: a re-login always at least lifts the quarantine.
+        const NOW: i64 = 1_782_777_600;
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed, // ignored: `hard_error` returns Err before reading it
+            None,
+            true, // hard_error → the isolated refresh cannot even run
+            3,
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[1].unrecoverable_signaled = true;
+
+        let events = daemon.reconcile_restored("u-B").await;
+
+        assert_eq!(calls.get(), 1, "the revived credential is re-probed once");
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "a transient error still lifts the quarantine (never strands a fixed account at 🔴)",
+        );
+        let h = &daemon.state.health[1];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::AtRisk,
+            "an inconclusive error reads 🟡 AtRisk (self-heals next sweep), not a false 🔴/🟠",
+        );
+        assert_eq!(
+            events,
+            vec![
+                Event::PollRefresh {
+                    account: "spare".to_owned(),
+                    outcome: RefreshEventOutcome::Error,
+                    refresh_token_rotated: false,
+                },
+                Event::CredentialRestored {
+                    account: "spare".to_owned(),
+                },
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restored_bare_un_quarantines_a_degraded_account_without_a_refresh() {
+        // A quarantined-but-NOT-`Dead` account (a bare `Degraded` 401-streak quarantine, whose
+        // access-token streak a re-login clears WITHOUT needing a refresh) must take the plain #275
+        // on-demand un-quarantine — NOT drive an isolated refresh. Proves the fix does not
+        // over-refresh: only the terminal 🔴 `Dead` verdict warrants the re-probe.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[1].last_refresh_outcome = None; // NOT Dead
+        daemon.state.health[1].quarantined = true;
+
+        let events = daemon.reconcile_restored("u-B").await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "a non-Dead account is never isolated-refreshed — the plain #275 un-quarantine only",
+        );
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "the bare on-demand un-quarantine still lifts the quarantine (#275 preserved)",
+        );
+        assert_eq!(
+            events,
+            vec![Event::CredentialRestored {
+                account: "spare".to_owned(),
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restored_never_isolated_refreshes_the_active_account() {
+        // #253 safety guard: the isolated `poll_refresh` engine rotates the server-side refresh token
+        // but writes only the STASH — safe for PARKED accounts only. If a `restored` notify ever names
+        // the ACTIVE account, `reconcile_restored` must FALL BACK to the plain un-quarantine and NEVER
+        // drive the isolated engine against the live canonical (the active path re-probes via keep-warm
+        // instead).
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        // u-B (idx 1) is BOTH the active account AND latched Dead — the excluded case.
+        daemon.state.active = Some(1);
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = true;
+
+        let events = daemon.reconcile_restored("u-B").await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "the isolated engine is NEVER driven against the active account (#253)",
+        );
+        // The other half of the guard: it still FALLS BACK to the plain #275 un-quarantine (a return
+        // that did nothing would also leave `calls == 0`, so assert the fallback actually fired).
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "the active-account case falls back to the bare un-quarantine, not a silent no-op",
+        );
+        assert_eq!(
+            events,
+            vec![Event::CredentialRestored {
+                account: "spare".to_owned(),
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn reprobe_active_if_dead_clears_a_use_activated_dead_account_on_a_live_mint() {
+        // AC-2 (positive): `sessiometer use <dead-account>` activates an account latched 🔴 `Dead`. The
+        // active-safe keep-warm mint answers (`Refreshed`), promotes the fresh token to the canonical,
+        // and the fold clears the latch — so the account reads 🟢 within the cycle. `access_expires_at`
+        // is left to `promote_canonical`'s #477 reconciliation (the fold passes `None`), NOT clobbered.
+        const NOW: i64 = 1_782_777_600;
+        let fresh_expiry_ms = 1_800_000_000_000 + 7 * 3_600_000;
+        let fresh = warm_canonical(fresh_expiry_ms, "rt-live2");
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(fresh.clone()),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[0].quarantined = true;
+        daemon.state.health[0].unrecoverable_signaled = true;
+
+        let events = daemon.reprobe_active_if_dead().await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "exactly one active-safe mint re-probed the credential"
+        );
+        assert!(
+            !daemon.state.health[0].quarantined,
+            "a live mint lifts the quarantine"
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            fresh.expose(),
+            "the fresh token is promoted to the canonical item a live session reads",
+        );
+        assert_eq!(
+            daemon.state.health[0].access_expires_at,
+            Some(fresh_expiry_ms / 1000),
+            "the fold passes None so promote_canonical's #477 expiry is preserved, not clobbered",
+        );
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::Healthy,
+            "the use-activated account reads 🟢, not the stale 🔴 Dead latch",
+        );
+        assert_eq!(
+            events,
+            vec![
+                Event::KeepWarm {
+                    account: "work".to_owned(),
+                    trigger: KeepWarmTrigger::Recovery,
+                    // A keep-warm PROMOTES rather than re-stashes → refreshed_not_restashed.
+                    outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                    refresh_token_rotated: true,
+                },
+                Event::CredentialRestored {
+                    account: "work".to_owned(),
+                },
+            ],
+            "the re-probe logs a `recovery`-trigger keep_warm ACTION, then the un-quarantine edge",
+        );
+    }
+
+    #[tokio::test]
+    async fn reprobe_active_if_dead_keeps_an_honest_dead_when_the_active_mint_reports_dead() {
+        // AC-2 / AC-3 (regression guard, active path): the RT was non-empty (so the mint DOES run) but
+        // CC rejected it and the cycle reports `Dead` — a genuine death. No promote, the latch stays,
+        // the account stays quarantined and reads an honest 🔴. Recovery is never falsely granted.
+        const NOW: i64 = 1_782_777_600;
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Dead,
+            None,
+            None,
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[0].quarantined = true;
+        daemon.state.health[0].unrecoverable_signaled = true;
+
+        let events = daemon.reprobe_active_if_dead().await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the mint ran once (the RT was non-empty) and reported Dead"
+        );
+        assert!(
+            daemon.state.health[0].quarantined,
+            "a Dead mint keeps the quarantine — never falsely cleared",
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            warm_canonical(FAR_FUTURE_MS, "rt-live").expose(),
+            "a Dead outcome promotes nothing — the canonical is untouched",
+        );
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::Dead,
+            "the confirmed-dead active credential stays an honest 🔴",
+        );
+        assert_eq!(
+            events,
+            vec![Event::KeepWarm {
+                account: "work".to_owned(),
+                trigger: KeepWarmTrigger::Recovery,
+                outcome: RefreshEventOutcome::Dead,
+                refresh_token_rotated: false,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn reprobe_active_if_dead_keeps_an_honest_dead_for_an_empty_refresh_token() {
+        // AC-2 / AC-3 / invariant 4 (empty-RT): a dead (empty) refresh token cannot be revived by any
+        // mint, so the active re-probe SHORT-CIRCUITS — no `claude -p` spawn, no event — and the honest
+        // 🔴 stays. The absence of the refresh token IS the dead signal.
+        const NOW: i64 = 1_782_777_600;
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, ""), // EMPTY refresh token → dead
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[0].quarantined = true;
+        // A `Dead`-latched account was already signaled unrecoverable by the sweep that set it Dead,
+        // so the fold does not re-fire the #261 operator signal (isolating the "no MINT action" claim).
+        daemon.state.health[0].unrecoverable_signaled = true;
+
+        let events = daemon.reprobe_active_if_dead().await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "a dead (empty) refresh token skips the doomed mint spawn"
+        );
+        assert!(
+            daemon.state.health[0].quarantined,
+            "the honest 🔴 quarantine stays"
+        );
+        let h = &daemon.state.health[0];
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::Dead,
+            "an absent refresh token stays an honest 🔴",
+        );
+        assert!(
+            events.is_empty(),
+            "a skipped re-probe emits no action event: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reprobe_active_if_dead_is_a_noop_for_a_non_dead_active_account() {
+        // Guard: the re-probe fires ONLY on the terminal 🔴 `Dead` verdict. A healthy active account
+        // (a normal `use` swap onto a live spare) is left entirely to the normal tick — no mint.
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        daemon.state.active = Some(0);
+        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Refreshed);
+
+        let events = daemon.reprobe_active_if_dead().await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "a non-Dead active account is never re-probed"
+        );
+        assert!(events.is_empty(), "no mint → no event: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn reprobe_active_if_dead_is_inert_without_a_wired_keep_warm_engine() {
+        // Guard: `keep_warm` is the ONLY active-safe refresh (#253). With no keep-warm engine wired
+        // (a `[refresh]`-off daemon — where `Dead` is in any case unreachable, the sweep that sets it
+        // being on the same switch) the active re-probe is an inert no-op, never touching the isolated
+        // `poll_refresh` engine against the live canonical.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        assert!(
+            daemon.keep_warm.is_none(),
+            "the seam daemon wires no keep-warm engine"
+        );
+        daemon.state.active = Some(0);
+        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+
+        let events = daemon.reprobe_active_if_dead().await;
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "the active path never drives the isolated poll_refresh engine (#253)",
+        );
+        assert!(
+            events.is_empty(),
+            "an unwired keep-warm re-probe is a silent no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_restored_reprobes_a_dead_parked_account_through_the_idle_select() {
+        // AC-1 (wiring): the run loop's idle select must route a `Restored(uuid)` control signal into
+        // `reconcile_restored`, which — for a `Dead` parked account with `poll_refresh` wired — drives
+        // the isolated re-probe end-to-end. A regression unwiring the arm (or reverting it to the bare
+        // `apply_refresh_restore`) would leave `spare` latched 🔴 and fail this test.
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            false,
+            3,
+        )
+        .await;
+        // `spare` (u-B, idx 1) is the parked account latched Dead+quarantined; `work` is active. The
+        // warm-up tick polls only the active `work`, so this state survives into the idle where the
+        // control signal delivers the re-probe. The `NoopRefreshTicker` keeps the periodic sweep from
+        // firing, so the ONLY refresh is the one `reconcile_restored` drives.
+        daemon.state.active = Some(0);
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[1].unrecoverable_signaled = true;
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        // Tick 1 → idle delivers `Restored(u-B)` → tick 2 → shutdown. after(3): 1 start-up check
+        // (pends) + 2 idle shutdown-checks.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = OnceRestored::new("u-B");
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the Restored signal reached reconcile_restored's isolated re-probe through the select",
+        );
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "the revived parked account is un-quarantined within the cycle",
+        );
+        assert_ne!(
+            daemon.state.health[1].last_refresh_outcome,
+            Some(RefreshEventOutcome::Dead),
+            "the stale Dead latch is cleared — no multi-hour 🔴",
+        );
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            logged.contains("event=credential_restored account=spare"),
+            "the un-quarantine edge rode the log: {logged:?}",
+        );
+        // The active account is UNCHANGED — restoring the parked spare never activates it.
+        assert_eq!(daemon.state.active, Some(0), "work stays active");
+    }
+
+    #[tokio::test]
+    async fn run_loop_manual_swap_reprobes_a_dead_active_account_through_the_idle_select() {
+        // AC-2 (wiring): the run loop's idle select must route a `ManualSwapped` control signal into
+        // `adopt_manual_swap` THEN `reprobe_active_if_dead` — so `sessiometer use <dead-account>`
+        // forces the active-safe mint end-to-end. A regression dropping the post-adopt re-probe would
+        // leave the newly-active account latched 🔴 and fail this test.
+        let fresh = warm_canonical(FAR_FUTURE_MS, "rt-live2");
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed,
+            None,
+            Some(fresh.clone()),
+            // FAR-future canonical → the proactive near-expiry path stays inert, isolating the
+            // recovery re-probe as the ONLY mint.
+            warm_canonical(FAR_FUTURE_MS, "rt-live"),
+        )
+        .await;
+        // The active `work` (idx 0) is latched Dead — the dead spare a forced `use` just activated.
+        daemon.state.active = Some(0);
+        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[0].quarantined = true;
+        daemon.state.health[0].unrecoverable_signaled = true;
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        // Tick 1 → idle delivers `ManualSwapped` (adopt + re-probe) → tick 2 → shutdown. after(3): 1
+        // start-up check (pends) + 2 idle shutdown-checks.
+        let mut shutdown = FakeShutdown::after(3);
+        let control = OnceManualSwap::new();
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the ManualSwapped signal reached reprobe_active_if_dead's mint through the select",
+        );
+        assert_ne!(
+            daemon.state.health[0].last_refresh_outcome,
+            Some(RefreshEventOutcome::Dead),
+            "the use-activated account's stale Dead latch is cleared within the cycle",
+        );
+        assert!(
+            !daemon.state.health[0].quarantined,
+            "the revived active account is un-quarantined",
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            fresh.expose(),
+            "the fresh token was promoted to the canonical item",
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_swap_requested_reprobes_a_dead_active_account_through_the_idle_select() {
+        // AC-2 (wiring, menubar swap-on-click): the run loop's `Idle::SwapRequested` arm must — AFTER
+        // writing the client ack — drive `reprobe_active_if_dead`, so a socket `swap` onto an account
+        // latched 🔴 `Dead` forces the active-safe mint end-to-end (the menubar counterpart of the
+        // `sessiometer use` → `ManualSwapped` path). A regression dropping ONLY this arm's post-ack
+        // re-probe would pass every other test; this is its dedicated guard.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        // `spare`'s stash holds a LIVE-RT credential, so the forced swap installs a canonical the
+        // active-safe mint can actually exchange — a dead-RT canonical would short-circuit, masking
+        // whether the re-probe ran at all.
+        let spare_cred = warm_canonical(FAR_FUTURE_MS, "rt-live");
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", spare_cred.expose(), "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let fresh = warm_canonical(FAR_FUTURE_MS, "rt-live2");
+        let calls = Rc::new(Cell::new(0u32));
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        )
+        .with_keep_warm_engine(
+            Box::new(SeamKeepWarm {
+                outcomes: Rc::new(RefCell::new(HashMap::new())),
+                outcome: RefreshOutcome::Refreshed,
+                revive_to: None,
+                fresh: Some(fresh.clone()),
+                calls: calls.clone(),
+            }),
+            Duration::from_secs(3600),
+        );
+        // `spare` (u-B, idx 1) is the dead spare a forced swap-on-click activates. Proactive keep-warm
+        // stays OFF (the default), so the ONLY mint is the recovery re-probe.
+        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.health[1].quarantined = true;
+        daemon.state.health[1].unrecoverable_signaled = true;
+
+        // A real socket pair so the arm's `write_swap_ack` has a client end; the re-probe runs AFTER it.
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
+        let control = OnceSwap {
+            command: SwapCommand {
+                target: "spare".to_owned(),
+                force: true, // bypass the quarantine POLICY gate so the swap onto the dead spare lands
+            },
+            stream: RefCell::new(Some(server)),
+            fired: Cell::new(false),
+        };
+
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        let mut shutdown = FakeShutdown::after(4);
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        // The client received the swap ack — proving the arm reached its post-ack re-probe, not
+        // aborted before it. (EOF arrives when the loop drops the server end after writing.)
+        use tokio::io::AsyncReadExt;
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            !reply.trim().is_empty(),
+            "the client received a swap ack: {reply:?}"
+        );
+
+        // The forced swap activated the dead spare, THEN the re-probe minted + cleared the latch.
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "the forced swap activated spare"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "the SwapRequested arm drove the active-safe re-probe after the ack",
+        );
+        assert_ne!(
+            daemon.state.health[1].last_refresh_outcome,
+            Some(RefreshEventOutcome::Dead),
+            "the swap-on-click's stale Dead latch is cleared within the cycle",
+        );
+        assert!(
+            !daemon.state.health[1].quarantined,
+            "the revived active account is un-quarantined",
         );
     }
 }
