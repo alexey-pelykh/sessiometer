@@ -472,11 +472,11 @@ pub(crate) struct Tunables {
     /// Swap-away trigger timing strategy (issue #38), in the PERCENT domain:
     /// base = `session_ceiling`, no jitter unless configured. Drawn + clamped to
     /// `50..=99` each cycle, then divided by 100 for the swap decision.
-    pub(crate) trigger_strategy: Strategy,
+    pub(crate) session_ceiling_strategy: Strategy,
     /// Weekly swap-away trigger timing strategy (issue #41), in the PERCENT
     /// domain: base = `weekly_ceiling`, no jitter unless configured. Drawn +
     /// clamped to `50..=99` each cycle, then divided by 100 for the swap decision
-    /// — the weekly-dimension counterpart of `trigger_strategy`.
+    /// — the weekly-dimension counterpart of `session_ceiling_strategy`.
     pub(crate) weekly_ceiling_strategy: Strategy,
     /// Post-swap cooldown timing strategy (issue #38), in seconds: base =
     /// `cooldown_secs`, no jitter unless configured. Drawn + clamped to
@@ -506,7 +506,7 @@ impl Default for Tunables {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
             },
-            trigger_strategy: Strategy::fixed(f64::from(DEFAULT_SESSION_CEILING)),
+            session_ceiling_strategy: Strategy::fixed(f64::from(DEFAULT_SESSION_CEILING)),
             weekly_ceiling_strategy: Strategy::fixed(f64::from(DEFAULT_WEEKLY_CEILING)),
             cooldown_strategy: Strategy::fixed(DEFAULT_COOLDOWN_SECS as f64),
         }
@@ -514,7 +514,7 @@ impl Default for Tunables {
 }
 
 /// The default poll-interval jitter: normal, so polls decorrelate out of the box
-/// (issue #38). Trigger, weekly ceiling, and cooldown default to [`Jitter::None`].
+/// (issue #38). Session ceiling, weekly ceiling, and cooldown default to [`Jitter::None`].
 fn default_poll_jitter() -> Jitter {
     Jitter::Normal {
         stddev: DEFAULT_POLL_JITTER_STDDEV,
@@ -1433,7 +1433,7 @@ struct RawJitter {
     #[serde(default)]
     poll: Option<RawJitterSpec>,
     #[serde(default)]
-    trigger: Option<RawJitterSpec>,
+    session_ceiling: Option<RawJitterSpec>,
     #[serde(default)]
     weekly_ceiling: Option<RawJitterSpec>,
     #[serde(default)]
@@ -1730,13 +1730,13 @@ label = "personal"
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
                 // No [jitter] table in VALID → default strategies: poll jitters
-                // normally (base from poll_secs), trigger/weekly_ceiling/cooldown
+                // normally (base from poll_secs), session_ceiling/weekly_ceiling/cooldown
                 // are fixed at their respective bases.
                 poll_strategy: Strategy {
                     base: 30.0,
                     jitter: default_poll_jitter(),
                 },
-                trigger_strategy: Strategy::fixed(90.0),
+                session_ceiling_strategy: Strategy::fixed(90.0),
                 weekly_ceiling_strategy: Strategy::fixed(97.0),
                 cooldown_strategy: Strategy::fixed(45.0),
             }
@@ -1859,7 +1859,7 @@ label = "personal"
             .tunables;
         assert_eq!(t.session_ceiling, 90);
         assert_eq!(t.weekly_ceiling, 99);
-        assert_eq!(t.trigger_strategy.base, 90.0);
+        assert_eq!(t.session_ceiling_strategy.base, 90.0);
         assert_eq!(t.weekly_ceiling_strategy.base, 99.0);
 
         // weekly BELOW session is accepted (no target_max_session_usage-style cross-field constraint).
@@ -2870,8 +2870,8 @@ label = "personal"
     }
 
     #[test]
-    fn poll_jitter_defaults_to_normal_trigger_and_cooldown_stay_fixed() {
-        // AC: poll interval uses normal jitter by default; trigger, weekly_ceiling
+    fn poll_jitter_defaults_to_normal_session_ceiling_and_cooldown_stay_fixed() {
+        // AC: poll interval uses normal jitter by default; session_ceiling, weekly_ceiling
         // and cooldown are fixed unless the operator configures a strategy. Bases
         // mirror the validated scalar tunables.
         let t = Config::parse(VALID).unwrap().tunables;
@@ -2881,11 +2881,11 @@ label = "personal"
                 stddev: DEFAULT_POLL_JITTER_STDDEV
             }
         );
-        assert_eq!(t.trigger_strategy.jitter, Jitter::None);
+        assert_eq!(t.session_ceiling_strategy.jitter, Jitter::None);
         assert_eq!(t.weekly_ceiling_strategy.jitter, Jitter::None);
         assert_eq!(t.cooldown_strategy.jitter, Jitter::None);
         assert_eq!(t.poll_strategy.base, 30.0);
-        assert_eq!(t.trigger_strategy.base, 90.0);
+        assert_eq!(t.session_ceiling_strategy.base, 90.0);
         assert_eq!(t.weekly_ceiling_strategy.base, 97.0);
         assert_eq!(t.cooldown_strategy.base, 45.0);
     }
@@ -2907,13 +2907,16 @@ label = "personal"
     fn parses_a_full_jitter_table() {
         let toml = with_jitter(
             "poll = { kind = \"normal\", stddev = 25.0 }\n\
-             trigger = { kind = \"uniform\", spread = 2.5 }\n\
+             session_ceiling = { kind = \"uniform\", spread = 2.5 }\n\
              weekly_ceiling = { kind = \"normal\", stddev = 1.0 }\n\
              cooldown = { kind = \"none\" }",
         );
         let t = Config::parse(&toml).unwrap().tunables;
         assert_eq!(t.poll_strategy.jitter, Jitter::Normal { stddev: 25.0 });
-        assert_eq!(t.trigger_strategy.jitter, Jitter::Uniform { spread: 2.5 });
+        assert_eq!(
+            t.session_ceiling_strategy.jitter,
+            Jitter::Uniform { spread: 2.5 }
+        );
         assert_eq!(
             t.weekly_ceiling_strategy.jitter,
             Jitter::Normal { stddev: 1.0 }
@@ -2954,7 +2957,7 @@ label = "personal"
             Err(Error::ConfigParse(_))
         ));
         // …and so is an unrecognized tunable name. The jitter tunables are
-        // poll/trigger/weekly_ceiling/cooldown (issue #41 added weekly_ceiling); a
+        // poll/session_ceiling/weekly_ceiling/cooldown (issue #41 added weekly_ceiling); a
         // bare `weekly` (≠ the actual `weekly_ceiling` key) is still unknown.
         assert!(matches!(
             Config::parse(&with_jitter("weekly = { kind = \"none\" }")),
@@ -2963,10 +2966,41 @@ label = "personal"
     }
 
     #[test]
+    fn the_pre_rename_jitter_trigger_key_is_rejected_not_silently_defaulted() {
+        // Issue #629 renamed the `[jitter].trigger` key → `session_ceiling`, finishing the
+        // #606 dimension rename under the SAME no-migration posture. This is a fourth
+        // breaking config key and the break is DELIBERATE, so it is pinned here rather than
+        // left to chance.
+        //
+        // `RawJitter` is `deny_unknown_fields`, so a pre-#629 config.toml is a parse error
+        // that NAMES the stale key AND — via serde's "expected one of" field list — the
+        // replacement to write. That is also the falsifier for the no-back-compat decision:
+        // a later well-meaning `#[serde(alias = "trigger")]` would silently restore
+        // back-compat and nothing else in the suite would go red. Sibling of
+        // `the_pre_rename_trigger_keys_are_rejected_not_silently_defaulted`, which pins the
+        // same decision for the `[tunables]` half of the rename.
+        match Config::parse(&with_jitter("trigger = { kind = \"none\" }")) {
+            Err(Error::ConfigParse(msg)) => {
+                assert!(
+                    msg.contains("trigger"),
+                    "the rejection must NAME the stale key, got: {msg}"
+                );
+                assert!(
+                    msg.contains("session_ceiling"),
+                    "…and point at `session_ceiling` so the operator can rename it, got: {msg}"
+                );
+            }
+            other => panic!(
+                "pre-rename `[jitter].trigger` must be rejected, never silently defaulted; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn round_trips_a_configured_jitter_table() {
         let toml = with_jitter(
             "poll = { kind = \"uniform\", spread = 12.5 }\n\
-             trigger = { kind = \"normal\", stddev = 1.5 }\n\
+             session_ceiling = { kind = \"normal\", stddev = 1.5 }\n\
              weekly_ceiling = { kind = \"uniform\", spread = 0.5 }\n\
              cooldown = { kind = \"none\" }",
         );
@@ -2979,7 +3013,7 @@ label = "personal"
     fn rendered_config_documents_the_jitter_table() {
         let text = Config::parse(VALID).unwrap().render();
         assert!(text.contains("[jitter]"));
-        for key in ["poll", "trigger", "weekly_ceiling", "cooldown"] {
+        for key in ["poll", "session_ceiling", "weekly_ceiling", "cooldown"] {
             assert!(
                 text.contains(key),
                 "rendered config must mention jitter.{key}"
