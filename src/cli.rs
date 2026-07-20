@@ -22,9 +22,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
-    run_loop, AccountStatusLine, CanonicalScrub, Daemon, ExternalLoginWatcher, InstanceLock,
-    NextSwap, NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller,
-    RealShutdown, SchemaVersion, StatusResponse, UnixControl, VersionedStatus,
+    run_loop, AccountStatusLine, BlindActive, CanonicalScrub, Daemon, ExternalLoginWatcher,
+    InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine,
+    RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl, VersionedStatus,
     STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
@@ -2037,16 +2037,46 @@ pub(crate) fn render_status(
         .map(|account| StatusRow::new(account, now))
         .collect();
 
-    // Display order (issue #94): `account`, then the SESSION pair (% + its reset),
-    // then the WEEKLY pair, then the health-text tags. Each column carries a lead
-    // gap (the spaces BEFORE it): `0` for the first column, `1` to tie a reset
-    // tightly to the `%` it pairs with, `2` between independent columns — so each
-    // `%` reads immediately followed by its own reset, the pairing the header row
-    // (issue #99) also labels. A drop priority of `None` always keeps the column; the
-    // WEEKLY pair shares priority 1 so both leave atomically (never a `%` without its
-    // reset); the health-text column is priority 2 (drops next). The health-text
-    // column is included only when some account carries a tag — an all-healthy roster
-    // shows none.
+    let mut columns = status_columns(&rows);
+    fit_columns(&mut columns, &rows, cols);
+    let mut out = render_table(&columns, &rows, color);
+
+    out.push('\n');
+    // Both the blind-active projection and the cornered verdict are resolved ONCE, HERE, because
+    // three sections downstream read them: the cornered alarm, the per-account blind line, and the
+    // next-swap footer's suppression. Both are `Copy`, so each stays usable after being passed on.
+    let active_blind = active_blind_projection(response);
+    let cornered = cornered_state(active_blind, response.next_swap.as_ref());
+
+    if let Some(cornered) = cornered {
+        out.push_str(&render_cornered(cornered, now, color));
+    } else if let Some((label, blind)) = active_blind {
+        out.push_str(&render_blind_active(label, blind, color));
+    }
+    out.push_str(&render_blind_preempt_swap(response));
+    // The next-swap footer is SUPPRESSED when cornered (issue #479): the cornered alarm above
+    // already folded in this exact `no_viable_target` relief, so re-printing `next swap: none — …`
+    // would be redundant (cornered fires only on that arm).
+    if cornered.is_none() {
+        out.push_str(&render_next_swap(response.next_swap.as_ref(), now));
+    }
+    out.push_str(&render_systemic_refresh_failure(response, color));
+    out.push_str(&render_landing_overshoot(response, color));
+    out.push_str(&render_keychain_locked(response));
+    out.push_str(&render_canonical_scrub(response));
+    out.push_str(&render_refresh_disabled_advisory(response, color));
+    out
+}
+
+/// The `status` table's column set, in display order (issue #94): `account`, then the SESSION
+/// pair (% + its reset), then the WEEKLY pair, then the health-text tags. Each column carries a
+/// lead gap (the spaces BEFORE it): `0` for the first column, `1` to tie a reset tightly to the
+/// `%` it pairs with, `2` between independent columns — so each `%` reads immediately followed by
+/// its own reset, the pairing the header row (issue #99) also labels. A drop priority of `None`
+/// always keeps the column; the WEEKLY pair shares priority 1 so both leave atomically (never a
+/// `%` without its reset); the health-text column is priority 2 (drops next). The health-text
+/// column is included only when some account carries a tag — an all-healthy roster shows none.
+fn status_columns(rows: &[StatusRow]) -> Vec<Column> {
     let mut columns: Vec<Column> = vec![
         Column::keep("ACCOUNT", |row| &row.account, |row| row.account_severity, 0),
         Column::keep(
@@ -2091,13 +2121,16 @@ pub(crate) fn render_status(
             STATUS_COL_GAP,
         ));
     }
+    columns
+}
 
-    // Drop the lowest-priority droppable columns until the table fits `cols`. ALL
-    // columns sharing the lowest present priority drop together, so the WEEKLY pair
-    // (both priority 1) leaves atomically — never a weekly `%` stranded without its
-    // reset. A non-TTY width (`None`) never enters the loop — the full table is kept.
+/// Drop the lowest-priority droppable columns until the table fits `cols`. ALL columns sharing
+/// the lowest present priority drop together, so the WEEKLY pair (both priority 1) leaves
+/// atomically — never a weekly `%` stranded without its reset. A non-TTY width (`None`) never
+/// enters the loop — the full table is kept.
+fn fit_columns(columns: &mut Vec<Column>, rows: &[StatusRow], cols: Option<usize>) {
     while let Some(width) = cols {
-        if table_width(&columns, &rows) <= width {
+        if table_width(columns, rows) <= width {
             break;
         }
         match columns.iter().filter_map(|col| col.drop_priority).min() {
@@ -2107,23 +2140,26 @@ pub(crate) fn render_status(
             None => break,
         }
     }
+}
 
-    let widths = column_widths(&columns, &rows);
+/// The aligned account table: a header row (issue #99) followed by one line per account.
+///
+/// The header is a plain, uncolored label per column, padded to the SAME measured widths as the
+/// data so labels and values line up. Printed in the text view regardless of the colour gate or
+/// TTY (it is never in `--json`, the separate full-data contract). Skipped only for an empty
+/// roster — a lone header labelling no data would mislead. Whichever columns survived the
+/// narrow-terminal drop carry their labels with them, so a dropped WEEKLY pair takes its
+/// `WEEKLY%`/`RESET` labels too while `ACCOUNT` + the always-kept SESSION pair keep theirs.
+fn render_table(columns: &[Column], rows: &[StatusRow], color: bool) -> String {
+    let widths = column_widths(columns, rows);
     let lead_gaps: Vec<usize> = columns.iter().map(|col| col.lead_gap).collect();
     let mut out = String::new();
-    // Header row (issue #99): a plain, uncolored label per column, padded to the SAME
-    // measured widths as the data so labels and values line up. Printed in the text
-    // view regardless of the colour gate or TTY (it is never in `--json`, the separate
-    // full-data contract). Skipped only for an empty roster — a lone header labelling
-    // no data would mislead. Whichever columns survive the narrow-terminal drop above
-    // carry their labels with them, so a dropped WEEKLY pair takes its `WEEKLY%`/`RESET`
-    // labels too while `ACCOUNT` + the always-kept SESSION pair keep theirs.
     if !rows.is_empty() {
         let headers: Vec<&str> = columns.iter().map(|col| col.header).collect();
         let uncolored: Vec<Option<&str>> = vec![None; columns.len()];
         out.push_str(&render_cells(&headers, &widths, &uncolored, &lead_gaps));
     }
-    for row in &rows {
+    for row in rows {
         let cells: Vec<&str> = columns.iter().map(|col| (col.get)(row)).collect();
         // Each cell is tinted by its OWN health when the gate is open (issue #84), so
         // one row can show several independent colors; a cell with no reading, and the
@@ -2138,300 +2174,331 @@ pub(crate) fn render_status(
             .collect();
         out.push_str(&render_cells(&cells, &widths, &colors, &lead_gaps));
     }
+    out
+}
 
-    out.push('\n');
-    // The blind ACTIVE account's retained-anchor projection (issue #479, umbrella #363 Path B), or
-    // `None` when the active account is not in bounded blindness. Resolved ONCE so the per-account
-    // blind line AND the cornered-state detection below read the SAME value. `blind_active` is set
-    // only on the active account and only while blind (a pre-#479 daemon omits it → `None`).
-    let active_blind = response
+/// The blind ACTIVE account's retained-anchor projection (issue #479, umbrella #363 Path B), or
+/// `None` when the active account is not in bounded blindness. `blind_active` is set only on the
+/// active account and only while blind (a pre-#479 daemon omits it → `None`).
+fn active_blind_projection(response: &StatusResponse) -> Option<(&str, BlindActive)> {
+    response
         .accounts
         .iter()
         .find(|account| account.active)
-        .and_then(|account| account.blind_active.map(|blind| (&account.label, blind)));
+        .and_then(|account| {
+            account
+                .blind_active
+                .map(|blind| (account.label.as_str(), blind))
+        })
+}
 
-    // CORNERED (issue #479, surface 3): the active account is blind, ADR-0017 auto-protection is
-    // DEGRADED (the preemptive gate is armed but acting on a STALE anchor), AND there is no viable
-    // target to swap to — the one bounded-blindness state the daemon CANNOT resolve itself, so the
-    // operator must act. Keying off `auto_protection_degraded` (blind PAST the interim gate window,
-    // anchor at/over the risk band) rather than the raw last-known % is deliberate: before the gate
-    // window the daemon is still self-resolving by waiting out a transient blind blip, so a loudest
-    // alarm THEN would cry wolf — DEGRADED is exactly "auto-protection WOULD swap now but can't".
-    // Composes two daemon verdicts (`blind_active` + `next_swap == no_viable_target`) already on the
-    // wire, so it needs no new field. `active_blind` is `Copy`, so this leaves it usable below.
-    let cornered = match (active_blind, &response.next_swap) {
+/// The resolved CORNERED state: the blind active account's label and projection, plus the
+/// `no_viable_target` cause and reset instant FOLDED IN from `next_swap` so the cornered alarm can
+/// carry the relief the suppressed next-swap footer would otherwise have printed.
+type CorneredState<'a> = (&'a str, BlindActive, Option<NoTargetCause>, Option<i64>);
+
+/// CORNERED (issue #479, surface 3): the active account is blind, ADR-0017 auto-protection is
+/// DEGRADED (the preemptive gate is armed but acting on a STALE anchor), AND there is no viable
+/// target to swap to — the one bounded-blindness state the daemon CANNOT resolve itself, so the
+/// operator must act. Keying off `auto_protection_degraded` (blind PAST the interim gate window,
+/// anchor at/over the risk band) rather than the raw last-known % is deliberate: before the gate
+/// window the daemon is still self-resolving by waiting out a transient blind blip, so a loudest
+/// alarm THEN would cry wolf — DEGRADED is exactly "auto-protection WOULD swap now but can't".
+/// Composes two daemon verdicts (`blind_active` + `next_swap == no_viable_target`) already on the
+/// wire, so it needs no new field.
+fn cornered_state<'a>(
+    active_blind: Option<(&'a str, BlindActive)>,
+    next_swap: Option<&NextSwap>,
+) -> Option<CorneredState<'a>> {
+    match (active_blind, next_swap) {
         (Some((label, blind)), Some(NextSwap::NoViableTarget { cause, resets_at }))
             if blind.auto_protection_degraded =>
         {
-            Some((label, blind, cause, resets_at))
+            Some((label, blind, *cause, *resets_at))
         }
         _ => None,
+    }
+}
+
+/// A daemon-fault footer line: `body` as DATA — printed UNCONDITIONALLY so it survives a pipe /
+/// redirect / `status | grep`, an operator's health check must be able to see it — plus its
+/// newline, red-emphasized only when `emphasize` is set. The overlay is the SAME
+/// `\x1b[{code}m…\x1b[0m` SGR [`render_cells`] wraps a table cell in, so every fault line in this
+/// surface tints identically; folding the four sites into one call is what KEEPS them identical
+/// (the invariant was previously hand-maintained in four prose cross-references). The plain text
+/// carries the whole message on its own, so a `--no-color` / piped reader loses nothing — the
+/// colour only ever AUGMENTS.
+fn red_line(body: &str, emphasize: bool) -> String {
+    if emphasize {
+        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
+    } else {
+        format!("{body}\n")
+    }
+}
+
+/// The loudest, distinct state: blind + DEGRADED + nowhere to swap. Names the source, how long
+/// blind, the stale last-known %, WHY the fleet is blocked (the relief cause/reset FOLDED IN from
+/// `next_swap`, so the remedy is not lost when this alarm replaces that footer), and the ONE remedy
+/// only the operator can apply — add or free an account. Printed as DATA (unconditional, survives a
+/// pipe / redirect), red-emphasized when the color gate is open (the SAME SGR the DEGRADED /
+/// systemic lines use); the plain text conveys it under `--no-color`. The surface only REFLECTS
+/// this daemon-pushed state; it never self-swaps (issue #169).
+fn render_cornered(cornered: CorneredState<'_>, now: i64, color: bool) -> String {
+    let (label, blind, cause, resets_at) = cornered;
+    let dur = humanize_until(blind.blind_secs as i64);
+    let last_known = blind.last_known_session_pct;
+    let relief = match resets_at {
+        Some(at) => format!(", resets in {}", humanize_until(at - now)),
+        None => String::new(),
     };
-
-    if let Some((label, blind, cause, resets_at)) = cornered {
-        // The loudest, distinct state: blind + DEGRADED + nowhere to swap. Name the source, how long
-        // blind, the stale last-known %, WHY the fleet is blocked (the relief cause/reset FOLDED IN
-        // from `next_swap`, so the remedy is not lost when this alarm replaces that footer), and the
-        // ONE remedy only the operator can apply — add or free an account. Printed as DATA
-        // (unconditional, survives a pipe / redirect), red-emphasized when the color gate is open
-        // (the SAME SGR the DEGRADED / systemic lines use); the plain text conveys it under
-        // --no-color. The surface only REFLECTS this daemon-pushed state; it never self-swaps (#169).
-        let dur = humanize_until(blind.blind_secs as i64);
-        let last_known = blind.last_known_session_pct;
-        let relief = match resets_at {
-            Some(at) => format!(", resets in {}", humanize_until(at - now)),
-            None => String::new(),
-        };
-        let blocked = match cause {
-            Some(NoTargetCause::Weekly) => format!("every account is weekly-exhausted{relief}"),
-            Some(NoTargetCause::Session) => {
-                format!("every account is over its session limit{relief}")
-            }
-            None => "no viable target".to_owned(),
-        };
-        let body = format!(
-            "CORNERED: active {label} blind for {dur} at last-known session {last_known}% and \
-             auto-protection cannot act — {blocked}; add or free an account"
-        );
-        if color {
-            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
-        } else {
-            out.push_str(&body);
-            out.push('\n');
+    let blocked = match cause {
+        Some(NoTargetCause::Weekly) => format!("every account is weekly-exhausted{relief}"),
+        Some(NoTargetCause::Session) => {
+            format!("every account is over its session limit{relief}")
         }
-    } else if let Some((label, blind)) = active_blind {
-        // Not cornered — the normal per-account blind-active line (issue #479 surface 1, shipped in
-        // #496): narrate the REAL state — how long blind, last-known session %, and whether ADR-0017
-        // auto-protection is OK or DEGRADED — instead of the content-free `n/a … 🟡`. Printed as DATA
-        // (unconditional), like the systemic-refresh line below; only the DEGRADED emphasis is
-        // color-gated. DEGRADED is a fault: the gate is armed but acting on a STALE anchor.
-        let dur = humanize_until(blind.blind_secs as i64);
-        let last_known = blind.last_known_session_pct;
-        let verdict = if blind.auto_protection_degraded {
-            "DEGRADED (acting on a stale anchor)"
-        } else {
-            "OK"
-        };
-        let body = format!(
-            "active {label}: blind for {dur} — last-known session {last_known}% — \
-             auto-protection {verdict}"
-        );
-        if color && blind.auto_protection_degraded {
-            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
-        } else {
-            out.push_str(&body);
-            out.push('\n');
+        None => "no viable target".to_owned(),
+    };
+    let body = format!(
+        "CORNERED: active {label} blind for {dur} at last-known session {last_known}% and \
+         auto-protection cannot act — {blocked}; add or free an account"
+    );
+    red_line(&body, color)
+}
+
+/// The normal per-account blind-active line (issue #479 surface 1, shipped in #496), rendered when
+/// the active account is blind but NOT cornered: narrate the REAL state — how long blind,
+/// last-known session %, and whether ADR-0017 auto-protection is OK or DEGRADED — instead of the
+/// content-free `n/a … 🟡`. Printed as DATA (unconditional), like the systemic-refresh line; only
+/// the DEGRADED emphasis is color-gated. DEGRADED is a fault: the gate is armed but acting on a
+/// STALE anchor.
+fn render_blind_active(label: &str, blind: BlindActive, color: bool) -> String {
+    let dur = humanize_until(blind.blind_secs as i64);
+    let last_known = blind.last_known_session_pct;
+    let verdict = if blind.auto_protection_degraded {
+        "DEGRADED (acting on a stale anchor)"
+    } else {
+        "OK"
+    };
+    let body = format!(
+        "active {label}: blind for {dur} — last-known session {last_known}% — \
+         auto-protection {verdict}"
+    );
+    red_line(&body, color && blind.auto_protection_degraded)
+}
+
+/// The #452 preemptive-swap NARRATION (issue #479, surface 2): when the daemon swapped a BLIND
+/// active account away on its stale pre-blind anchor, `status` narrates it — the source, the
+/// last-known % the gate FIRED on, the target, and the `use <from>` undo — so an operator can
+/// reverse it if the swapped-away account has since recovered. The SAME information the durable
+/// `event=swap … reason=blind_preempt` log line holds, reflected HERE because `render_status`
+/// reads only this wire, never the event log — each medium in its own idiom (R-2 STATE-parity, as
+/// the `canonical_scrub` footer is). Daemon-side windowed + target-still-active
+/// (`recent_blind_preempt_swap`, projected only within a bounded window while its target is still
+/// active), so this stays a pure render — the surface REFLECTS, never self-swaps (issue #169).
+/// Empty (no line) when there is no recent-and-still-current preemptive swap.
+fn render_blind_preempt_swap(response: &StatusResponse) -> String {
+    let Some(swap) = &response.recent_blind_preempt_swap else {
+        return String::new();
+    };
+    let from = &swap.from_label;
+    let to = &swap.to_label;
+    let pct = swap.last_known_session_pct;
+    format!(
+        "swapped off {from} (blind @ last-known {pct}%) → {to}; \
+         undo with 'use {from}' if it recovered\n"
+    )
+}
+
+/// The forward-looking next-swap candidate (issue #88), computed daemon-side
+/// ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like the table footer
+/// it replaces (per-cell health coloring is issue #84, orthogonal). A `None` field means the daemon
+/// sent no candidate — either a current daemon with no active account to anchor a swap from, or
+/// (via `#[serde(default)]`) a pre-#88 daemon that omits the field — and renders a bare `none`
+/// either way.
+fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
+    match next_swap {
+        // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
+        // so the CLI operator sees WHY this account — the identical "why this target?" the panel
+        // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
+        // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
+        Some(NextSwap::Target { to, reason }) => {
+            let why = match reason {
+                Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+                Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
+                Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
+                None => "",
+            };
+            format!("next swap: {to}{why}\n")
         }
-    }
-
-    // The #452 preemptive-swap NARRATION (issue #479, surface 2): when the daemon swapped a BLIND
-    // active account away on its stale pre-blind anchor, `status` narrates it — the source, the
-    // last-known % the gate FIRED on, the target, and the `use <from>` undo — so an operator can
-    // reverse it if the swapped-away account has since recovered. The SAME information the durable
-    // `event=swap … reason=blind_preempt` log line holds, reflected HERE because `render_status`
-    // reads only this wire, never the event log — each medium in its own idiom (R-2 STATE-parity, as
-    // the `canonical_scrub` footer is). Daemon-side windowed + target-still-active
-    // (`recent_blind_preempt_swap`, projected only within a bounded window while its target is still
-    // active), so this stays a pure render — the surface REFLECTS, never self-swaps (#169). Omitted
-    // from the wire (no line) when there is no recent-and-still-current preemptive swap.
-    if let Some(swap) = &response.recent_blind_preempt_swap {
-        let from = &swap.from_label;
-        let to = &swap.to_label;
-        let pct = swap.last_known_session_pct;
-        out.push_str(&format!(
-            "swapped off {from} (blind @ last-known {pct}%) → {to}; \
-             undo with 'use {from}' if it recovered\n"
-        ));
-    }
-
-    // The forward-looking next-swap candidate (issue #88), computed daemon-side
-    // ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like
-    // the table footer it replaces (per-cell health coloring is #84, orthogonal). A
-    // `None` field means the daemon sent no candidate — either a current daemon with no
-    // active account to anchor a swap from, or (via `#[serde(default)]`) a pre-#88 daemon
-    // that omits the field — and renders a bare `none` either way. SUPPRESSED when cornered
-    // (issue #479): the cornered alarm above already folded in this exact `no_viable_target` relief,
-    // so re-printing `next swap: none — …` would be redundant (cornered fires only on that arm).
-    if cornered.is_none() {
-        match &response.next_swap {
-            // The daemon's own selection rationale (issue #393) trails the target as a parenthetical,
-            // so the CLI operator sees WHY this account — the identical "why this target?" the panel
-            // answers, each medium rendering the shared discriminant its own way (R-2 state-parity). A
-            // pre-#393 daemon carries no reason (`None`) → the bare label, the honest fallback.
-            Some(NextSwap::Target { to, reason }) => {
-                let why = match reason {
-                    Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
-                    Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
-                    Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
-                    None => "",
-                };
-                out.push_str(&format!("next swap: {to}{why}\n"));
-            }
-            // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
-            // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
-            // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
-            // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
-            // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
-            // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
-            Some(NextSwap::NoViableTarget { cause, resets_at }) => {
-                let relief = match resets_at {
-                    Some(at) => format!("; resets in {}", humanize_until(at - now)),
-                    None => String::new(),
-                };
-                match cause {
-                    // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
-                    // the meaningful escape is more accounts.
-                    Some(NoTargetCause::Weekly) => out.push_str(&format!(
+        // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
+        // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
+        // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
+        // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
+        // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
+        // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
+        Some(NextSwap::NoViableTarget { cause, resets_at }) => {
+            let relief = match resets_at {
+                Some(at) => format!("; resets in {}", humanize_until(at - now)),
+                None => String::new(),
+            };
+            match cause {
+                // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
+                // the meaningful escape is more accounts.
+                Some(NoTargetCause::Weekly) => format!(
                     "next swap: none — every account is weekly-exhausted{relief} — add an account\n"
-                )),
-                    // A session-wide block lifts at the sooner session reset (minutes/hours), so the
-                    // reset time itself is the remedy.
-                    Some(NoTargetCause::Session) => out.push_str(&format!(
-                        "next swap: none — every account is over its session limit{relief}\n"
-                    )),
-                    None => out.push_str("next swap: none (no viable target)\n"),
+                ),
+                // A session-wide block lifts at the sooner session reset (minutes/hours), so the
+                // reset time itself is the remedy.
+                Some(NoTargetCause::Session) => {
+                    format!("next swap: none — every account is over its session limit{relief}\n")
                 }
+                None => "next swap: none (no viable target)\n".to_owned(),
             }
-            Some(NextSwap::AwaitingData) => out.push_str("next swap: none (awaiting usage data)\n"),
-            None => out.push_str("next swap: none\n"),
         }
+        Some(NextSwap::AwaitingData) => "next swap: none (awaiting usage data)\n".to_owned(),
+        None => "next swap: none\n".to_owned(),
     }
+}
 
-    // The systemic refresh-failure indicator (issue #378): the daemon reports the refresh
-    // MECHANISM is down — `consecutive` sweeps in a row failed with error across EVERY eligible
-    // account (a stale `claude` path #375, a wedged spawn), not one account's creds. Surfaced as
-    // DATA (not advisory chrome like the #138 line below): printed UNCONDITIONALLY so it survives a
-    // pipe / redirect / `status | grep` — an operator's health check must be able to see it —
-    // with a red emphasis added only when the color gate is open. Distinct from the per-account
-    // `AUTH` column: it is the whole mechanism failing, visible before any account dies. Carries
-    // only the COUNT (#15). Mutually exclusive with the #138 advisory (that needs `[refresh]` OFF;
-    // this needs sweeps running, i.e. ON), so their ordering here never matters.
-    if let Some(consecutive) = response.systemic_refresh_failure {
-        // `consecutive` is a valid `1..=100` count, so keep the noun agreement right at the `n=1`
-        // floor (a threshold of 1 fires on the first all-error sweep → "1 consecutive sweep").
-        let sweeps = if consecutive == 1 { "sweep" } else { "sweeps" };
-        let body = format!(
-            "refresh mechanism: DOWN — {consecutive} consecutive {sweeps} failed for every eligible \
-             account; the mechanism is failing, not one account (check the daemon log 'reason=' \
-             and the [refresh] claude binary)"
-        );
-        if color {
-            // Same SGR overlay `render_cells` uses (`\x1b[{code}m…\x1b[0m`), red for the fault.
-            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
-        } else {
-            out.push_str(&body);
-            out.push('\n');
-        }
-    }
+/// The systemic refresh-failure indicator (issue #378): the daemon reports the refresh MECHANISM is
+/// down — `consecutive` sweeps in a row failed with error across EVERY eligible account (a stale
+/// `claude` path #375, a wedged spawn), not one account's creds. Surfaced as DATA (not advisory
+/// chrome like the #138 line): printed UNCONDITIONALLY so it survives a pipe / redirect /
+/// `status | grep` — an operator's health check must be able to see it — with a red emphasis added
+/// only when the color gate is open. Distinct from the per-account `AUTH` column: it is the whole
+/// mechanism failing, visible before any account dies. Carries only the COUNT (issue #15). Mutually
+/// exclusive with the #138 advisory (that needs `[refresh]` OFF; this needs sweeps running, i.e.
+/// ON), so their ordering never matters.
+fn render_systemic_refresh_failure(response: &StatusResponse, color: bool) -> String {
+    let Some(consecutive) = response.systemic_refresh_failure else {
+        return String::new();
+    };
+    // `consecutive` is a valid `1..=100` count, so keep the noun agreement right at the `n=1`
+    // floor (a threshold of 1 fires on the first all-error sweep → "1 consecutive sweep").
+    let sweeps = if consecutive == 1 { "sweep" } else { "sweeps" };
+    let body = format!(
+        "refresh mechanism: DOWN — {consecutive} consecutive {sweeps} failed for every eligible \
+         account; the mechanism is failing, not one account (check the daemon log 'reason=' \
+         and the [refresh] claude binary)"
+    );
+    red_line(&body, color)
+}
 
-    // The daemon-level RUNTIME landing-overshoot notice (issue #613): THIS machine observed a
-    // recently-parked (`reason=session`) account reach the SLO ceiling within the landing window — the
-    // #595 landing overshoot the swap-DECISION reading is blind to, caught LIVE instead of only in a
-    // later offline `reliability` run. Surfaced as DATA (not advisory chrome): printed UNCONDITIONALLY
-    // so it survives a pipe / redirect / `status | grep` — an operator's health check must see the SLO
-    // breach — with a red emphasis added only when the color gate is open, exactly like the systemic
-    // line above. Names the parked account and the fired-vs-landed spread, and distinguishes the two
-    // breach CLASSES the offline SLI also splits: a swap that fired BELOW the SLO whose parked in-flight
-    // drain then carried it over is the post-swap committed TAIL; a swap that fired already AT/OVER the
-    // SLO (the daemon was blind/late) is a GAP-CROSSING — it did NOT climb after the swap, so the causal
-    // clause must not mislabel it a tail. Both end with the SINGLE-MACHINE caveat: best-available
-    // per-machine evidence, blind to a second machine co-consuming the same account (the
-    // single-machine-sync boundary). One handle + two percents, never a token or email (#15). Absent (no
-    // line) when no overshoot is recent.
-    if let Some(overshoot) = &response.recent_landing_overshoot {
-        let from = &overshoot.from_label;
-        let decision = overshoot.decision_pct;
-        let landed = overshoot.landing_pct;
-        let ceiling = crate::landing::LANDING_SLO_CEILING_PCT;
-        let cause = if decision < ceiling {
-            // On-target swap (below the SLO); the parked account's committed tail carried it over.
-            format!(
-                "swapped out at {decision}% but its parked session climbed to {landed}% \
-                 (>= the {ceiling} SLO) — the post-swap committed tail"
-            )
-        } else {
-            // The swap itself fired at/over the SLO — a late / gap-crossing swap-out, not a tail.
-            format!(
-                "swapped out already over the {ceiling} SLO at {decision}% and its parked session \
-                 reached {landed}% — a late swap-out, not a post-swap tail"
-            )
-        };
-        let body = format!(
-            "landing overshoot: {from} {cause}; single-machine signal \
-             (a second machine co-consuming this account is invisible to it)"
-        );
-        if color {
-            out.push_str(&format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr()));
-        } else {
-            out.push_str(&body);
-            out.push('\n');
-        }
-    }
+/// The daemon-level RUNTIME landing-overshoot notice (issue #613): THIS machine observed a
+/// recently-parked (`reason=session`) account reach the SLO ceiling within the landing window — the
+/// #595 landing overshoot the swap-DECISION reading is blind to, caught LIVE instead of only in a
+/// later offline `reliability` run. Surfaced as DATA (not advisory chrome): printed UNCONDITIONALLY
+/// so it survives a pipe / redirect / `status | grep` — an operator's health check must see the SLO
+/// breach — with a red emphasis added only when the color gate is open, exactly like the systemic
+/// line. Names the parked account and the fired-vs-landed spread, and distinguishes the two breach
+/// CLASSES the offline SLI also splits: a swap that fired BELOW the SLO whose parked in-flight drain
+/// then carried it over is the post-swap committed TAIL; a swap that fired already AT/OVER the SLO
+/// (the daemon was blind/late) is a GAP-CROSSING — it did NOT climb after the swap, so the causal
+/// clause must not mislabel it a tail. Both end with the SINGLE-MACHINE caveat: best-available
+/// per-machine evidence, blind to a second machine co-consuming the same account (the
+/// single-machine-sync boundary). One handle + two percents, never a token or email (issue #15).
+/// Empty (no line) when no overshoot is recent.
+fn render_landing_overshoot(response: &StatusResponse, color: bool) -> String {
+    let Some(overshoot) = &response.recent_landing_overshoot else {
+        return String::new();
+    };
+    let from = &overshoot.from_label;
+    let decision = overshoot.decision_pct;
+    let landed = overshoot.landing_pct;
+    let ceiling = crate::landing::LANDING_SLO_CEILING_PCT;
+    let cause = if decision < ceiling {
+        // On-target swap (below the SLO); the parked account's committed tail carried it over.
+        format!(
+            "swapped out at {decision}% but its parked session climbed to {landed}% \
+             (>= the {ceiling} SLO) — the post-swap committed tail"
+        )
+    } else {
+        // The swap itself fired at/over the SLO — a late / gap-crossing swap-out, not a tail.
+        format!(
+            "swapped out already over the {ceiling} SLO at {decision}% and its parked session \
+             reached {landed}% — a late swap-out, not a post-swap tail"
+        )
+    };
+    let body = format!(
+        "landing overshoot: {from} {cause}; single-machine signal \
+         (a second machine co-consuming this account is invisible to it)"
+    );
+    red_line(&body, color)
+}
 
-    // The daemon-level KEYCHAIN-LOCKED rollup (issue #498): the macOS login keychain is LOCKED, so the
-    // daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied). The
-    // daemon-LEVEL sibling of the `canonical_scrub` line below, but for an UNREADABLE item rather than a
-    // readable-but-emptied one — so the remedy DIFFERS: UNLOCK THE KEYCHAIN, never `claude /login` (a
-    // re-login cannot help while the keychain that stores the credential is locked). Surfaced as DATA
-    // (unconditional, like the scrub + systemic lines — so it survives a pipe / redirect / `status |
-    // grep`, an operator's health check must see it), naming the state AND the unlock remedy.
-    // Content-parity with the menubar (`StatusPanelFormat.keychainLockedBanner`): same state + same
-    // unlock remedy, each medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for
-    // `ActiveDeadNoTarget`). Printed PLAIN — the action-first footer register of the `shared login:
-    // scrubbed …` sibling (ADR-0016), NOT the systemic line's red SGR. Rendered ABOVE `canonical_scrub`
-    // (worst-first: an unreadable item is at least as severe as a readable-but-scrubbed one), though the
-    // two are daemon-mutually-exclusive in practice (a locked keychain can't be read to know
-    // scrubbed-ness). A bare BINARY state discriminant — never a token or email (#15). `false` (a
-    // healthy / pre-#498 daemon that omits the field) prints nothing.
+/// The daemon-level KEYCHAIN-LOCKED rollup (issue #498): the macOS login keychain is LOCKED, so the
+/// daemon cannot READ the shared `Claude Code-credentials` item at ALL (access denied). The
+/// daemon-LEVEL sibling of the `canonical_scrub` line, but for an UNREADABLE item rather than a
+/// readable-but-emptied one — so the remedy DIFFERS: UNLOCK THE KEYCHAIN, never `claude /login` (a
+/// re-login cannot help while the keychain that stores the credential is locked). Surfaced as DATA
+/// (unconditional, like the scrub + systemic lines — so it survives a pipe / redirect /
+/// `status | grep`, an operator's health check must see it), naming the state AND the unlock remedy.
+/// Content-parity with the menubar (`StatusPanelFormat.keychainLockedBanner`): same state + same
+/// unlock remedy, each medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for
+/// `ActiveDeadNoTarget`). Printed PLAIN — the action-first footer register of the `shared login:
+/// scrubbed …` sibling (ADR-0016), NOT the systemic line's red SGR. Rendered ABOVE `canonical_scrub`
+/// (worst-first: an unreadable item is at least as severe as a readable-but-scrubbed one), though
+/// the two are daemon-mutually-exclusive in practice (a locked keychain can't be read to know
+/// scrubbed-ness). A bare BINARY state discriminant — never a token or email (issue #15). `false` (a
+/// healthy / pre-#498 daemon that omits the field) prints nothing.
+fn render_keychain_locked(response: &StatusResponse) -> String {
     if response.keychain_locked {
-        out.push_str(
-            "shared login: unreadable — the login keychain is locked; unlock it to restore access\n",
-        );
+        "shared login: unreadable — the login keychain is locked; unlock it to restore access\n"
+            .to_owned()
+    } else {
+        String::new()
     }
+}
 
-    // The daemon-level CANONICAL-SCRUB rollup (issue #469, umbrella #463): the shared
-    // `Claude Code-credentials` canonical item has been SCRUBBED (its token cleared), so every
-    // `claude` session is logged out — the fleet-wide lockout NO per-account `AUTH` column reflects
-    // (each account row can read perfectly healthy while the shared item sits emptied). Surfaced as
-    // DATA (unconditional, like the systemic line above — so it survives a pipe / redirect /
-    // `status | grep`, an operator's health check must be able to see it), naming the state and, for
-    // the un-recoverable residual, the `claude /login` remedy. Content-parity with the menubar
-    // (`StatusPanelFormat.canonicalScrubBanner`): same state + same `claude /login` remedy, each
-    // medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for `ActiveDeadNoTarget`).
-    // Printed PLAIN — no color overlay, in the action-first footer register of the `next swap: none
-    // — …` footer above (ADR-0016), NOT the systemic line's red SGR. A fleet-wide STATE discriminant
-    // only — never per-account, never a token or email (#15). `None` (a healthy / pre-#516 daemon
-    // that omits the field) prints nothing.
+/// The daemon-level CANONICAL-SCRUB rollup (issue #469, umbrella #463): the shared
+/// `Claude Code-credentials` canonical item has been SCRUBBED (its token cleared), so every
+/// `claude` session is logged out — the fleet-wide lockout NO per-account `AUTH` column reflects
+/// (each account row can read perfectly healthy while the shared item sits emptied). Surfaced as
+/// DATA (unconditional, like the systemic line — so it survives a pipe / redirect /
+/// `status | grep`, an operator's health check must be able to see it), naming the state and, for
+/// the un-recoverable residual, the `claude /login` remedy. Content-parity with the menubar
+/// (`StatusPanelFormat.canonicalScrubBanner`): same state + same `claude /login` remedy, each
+/// medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for `ActiveDeadNoTarget`).
+/// Printed PLAIN — no color overlay, in the action-first footer register of the `next swap: none
+/// — …` footer (ADR-0016), NOT the systemic line's red SGR. A fleet-wide STATE discriminant only —
+/// never per-account, never a token or email (issue #15). `None` (a healthy / pre-#516 daemon that
+/// omits the field) prints nothing.
+fn render_canonical_scrub(response: &StatusResponse) -> String {
     match response.canonical_scrub {
         // Exhausted — recovery backed off (the bounded adopt churn hit its cap, or no viable adopt
         // target exists), so the canonical stays empty until a re-login. Name the state AND the
         // actionable remedy; `claude /login` is the byte-shared remedy the menubar names too.
-        Some(CanonicalScrub::Exhausted) => out.push_str(
+        Some(CanonicalScrub::Exhausted) => {
             "shared login: scrubbed — every session is logged out and auto-recovery is exhausted; \
-             run claude /login to restore it\n",
-        ),
+             run claude /login to restore it\n"
+                .to_owned()
+        }
         // Recovering — the daemon is autonomously adopting a live account back into the canonical, so
         // the fleet may self-heal with NO operator action. The calm, no-remedy cue (lower severity).
-        Some(CanonicalScrub::Recovering) => out.push_str(
+        Some(CanonicalScrub::Recovering) => {
             "shared login: scrubbed — recovering automatically (adopting a live account); \
-             no action needed\n",
-        ),
-        None => {}
+             no action needed\n"
+                .to_owned()
+        }
+        None => String::new(),
     }
+}
 
-    // The isolated-refresh discoverability advisory (issue #138): when the periodic refresh
-    // tick is OFF (`[refresh].enabled = false`) AND ≥1 NON-ACTIVE account is unverified / stale
-    // / at-risk / dead, that account's stored credential is going unmaintained — the operator
-    // would otherwise only find out at `next swap: none (no viable target)`, after the fallback
-    // set is already dead. One line names the remedy. ADVISORY CHROME, not data (AC-3): gated on
-    // the SAME color gate as the #73 ANSI overlay, so it rides an interactive stdout TTY only —
-    // never into `--json` (this fn is not reached there), a pipe, a redirect, or under
-    // NO_COLOR / CLICOLOR=0 / TERM=dumb / --no-color. `Some(false)` is the ONLY arming value;
-    // `Some(true)` (enabled) and `None` (a pre-#138 daemon that omits the field) both suppress.
+/// The isolated-refresh discoverability advisory (issue #138): when the periodic refresh tick is OFF
+/// (`[refresh].enabled = false`) AND ≥1 NON-ACTIVE account is unverified / stale / at-risk / dead,
+/// that account's stored credential is going unmaintained — the operator would otherwise only find
+/// out at `next swap: none (no viable target)`, after the fallback set is already dead. One line
+/// names the remedy. ADVISORY CHROME, not data (AC-3): gated on the SAME color gate as the #73 ANSI
+/// overlay, so it rides an interactive stdout TTY only — never into `--json` (this fn is not reached
+/// there), a pipe, a redirect, or under NO_COLOR / CLICOLOR=0 / TERM=dumb / `--no-color`.
+/// `Some(false)` is the ONLY arming value; `Some(true)` (enabled) and `None` (a pre-#138 daemon that
+/// omits the field) both suppress.
+fn render_refresh_disabled_advisory(response: &StatusResponse, color: bool) -> String {
     if color && response.refresh_enabled == Some(false) && has_stale_nonactive(response) {
-        out.push_str(REFRESH_DISABLED_ADVISORY);
+        REFRESH_DISABLED_ADVISORY.to_owned()
+    } else {
+        String::new()
     }
-    out
 }
 
 /// The age (in seconds) past which a snapshot's data is UNAMBIGUOUSLY stale — the maximum possible
