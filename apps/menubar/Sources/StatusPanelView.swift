@@ -1519,6 +1519,11 @@ private struct StatsContent: View {
         // kit applies identically on both tabs, since they render the same accounts.
         let monograms = StatusPanelFormat.accountMonograms(handles)
         VStack(alignment: .leading, spacing: 0) {
+            // The daemon told us its config is unreadable (issue #642) — say so ABOVE the numbers, so the
+            // caveat is read before the figures it qualifies, never as a footnote after they've landed.
+            if let detail = wire.configUnreadable {
+                StatsCaveat(text: StatusPanelFormat.statsConfigUnreadableNote(detail))
+            }
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(handles, id: \.self) { handle in
                     if let account = wire.summary.accounts[handle] {
@@ -1536,6 +1541,44 @@ private struct StatsContent: View {
             StatsAggregate(roster: wire.summary.roster, window: wire.window)
             SignalLegend()
         }
+    }
+}
+
+/// The Stats-tab caveat strip (issue #642): a dot-plus-sentence line telling the operator that the figures
+/// below rest on DEFAULT tunables because the daemon could not read `config.toml`. Deliberately the same
+/// dot + tint + secondary-text vocabulary as `BannerView` (the panel's established degraded idiom) rather
+/// than a new affordance — and deliberately `.orange`/`.warning` weight, not `.error`: the series IS real
+/// data, only its ceiling-dependent framing is off. Panel-surface only; it never escalates the menu-bar
+/// glyph (a new glyph fault class is design-gated, and a stale tunable is not a fleet fault).
+///
+/// Part of this text is DAEMON-AUTHORED, so the panel does not own its length. The daemon keeps it short by
+/// construction — it sends one of a small set of STATIC reasons, never the parser's own message (which
+/// re-prints the operator's config file) — and `lineLimit` below is the panel-side suspenders to that belt:
+/// the popover is fixed in WIDTH (380pt) but INTRINSIC in height, with no `ScrollView`, so an unbounded
+/// reason from a drifted daemon would not clip, it would grow the whole panel arbitrarily tall.
+private struct StatsCaveat: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Circle()
+                .fill(Color.orange)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(5)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        // `rosterInset` is the stats block's own inset; the `+ 8` is the row card's internal padding
+        // (mock `.stat { padding:10px 8px }`), so this dot lines up with a row's status dot, not its card edge.
+        .padding(.horizontal, PanelMetrics.rosterInset + 8)
+        .padding(.top, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
     }
 }
 

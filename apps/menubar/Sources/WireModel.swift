@@ -588,7 +588,11 @@ private struct HeartbeatFrame: Decodable {
 // Unlike the `watch` frames this carries NO `type` tag — it is a request→response body decoded directly
 // (an `{"error":…}` envelope on an invalid period is detected first, see `decodeStatsReply`). `#159`/`#160`
 // extend the contract ADDITIVELY without bumping `schema`, so absent keys are tolerated: `orphans`
-// (`skip_serializing_if` when empty) and `period` / `since` (`Option::is_none`) each decode to a default.
+// (`skip_serializing_if` when empty), `period` / `since` (`Option::is_none`), and `config_unreadable`
+// (#642, `Option::is_none`) each decode to a default. NOTE this wire is versioned by its OWN `schema`
+// (`src/stats.rs` `JSON_SCHEMA_VERSION`), NOT by `STATUS_SCHEMA_VERSION` — that governs the separate
+// `status` / `watch` `VersionedStatus` payload mirrored above, which carries a `schema_version` object
+// this document does not have.
 //
 // Source of truth (mirror, do not re-derive): `src/stats.rs` — `StatsWire`, `WindowWire`, `BucketWire`,
 // `PeriodWire`, `AccountWire`, `DimWire`, `RosterWire`, `SwapsWire`, `Band`, `CoverageClass`.
@@ -606,9 +610,20 @@ struct StatsWire: Decodable, Equatable {
     /// Non-roster ("orphan") handles (issue #314), keyed like `summary.accounts` but OMITTED when none
     /// (Rust `skip_serializing_if`), so an absent key decodes to empty — never plotted (summary-window only).
     let orphans: [String: StatsAccountStats]
+    /// The daemon's honesty signal (issue #642): the secret-free reason `config.toml` could not be read,
+    /// or `nil` when the config is fine (the key is then ABSENT, not null — Rust `skip_serializing_if`).
+    ///
+    /// Non-`nil` means every ceiling-dependent figure in this document — `capHits`, `timeAtCapSecs`, the
+    /// `band`, the sparkline scale — was computed against the daemon's DEFAULT tunables, not the
+    /// operator's (between `session_ceiling` 95 and 50 the same store yields cap-hits 112 vs 356). The
+    /// panel MUST annotate the readout rather than render it as fact: a surface must not read more
+    /// confident than reality (the #479 / #582 / #632 honesty family). Additive — a pre-#642 daemon
+    /// simply omits the key and this decodes to `nil`, so no `schema` bump is involved.
+    let configUnreadable: String?
 
     private enum CodingKeys: String, CodingKey {
         case schema, window, accounts, series, summary, orphans
+        case configUnreadable = "config_unreadable"
     }
 
     init(from decoder: Decoder) throws {
@@ -619,6 +634,7 @@ struct StatsWire: Decodable, Equatable {
         series = try c.decode([StatsBucket].self, forKey: .series)
         summary = try c.decode(StatsPeriodBody.self, forKey: .summary)
         orphans = try c.decodeIfPresent([String: StatsAccountStats].self, forKey: .orphans) ?? [:]
+        configUnreadable = try c.decodeIfPresent(String.self, forKey: .configUnreadable)
     }
 }
 

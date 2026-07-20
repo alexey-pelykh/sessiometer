@@ -325,6 +325,32 @@ struct AccountVelocity {
     weekly_headroom: Option<f64>,
 }
 
+/// Why a `stats` view fell back to DEFAULT tunables — the two-sink split issues #627 and #642
+/// together demand. Built ONLY for the malformed case; an ABSENT config produces no fault at all.
+struct ConfigFault {
+    /// The full, secret-free detail for the OPERATOR-SCOPED sink — the CLI's stderr ([`run_output`])
+    /// or the daemon log ([`stats_socket_json_with`]). This is [`Error`]'s own `Display`: the parser's
+    /// span echo, caret art and all, exactly as `config validate` prints it (issue #627). Unchanged.
+    log_detail: String,
+    /// The reason placed on the WIRE (issue #642) — and deliberately a `&'static str`.
+    ///
+    /// That type IS the redaction guarantee: a static string cannot contain a byte of the operator's
+    /// `config.toml`, so no scrubber has to anticipate every shape a parser error can take. That
+    /// matters because the shapes are genuinely unbounded — the TOML span echo re-prints the whole
+    /// offending line, serde's `invalid type: string "…"` quotes the VALUE, and validation errors
+    /// interpolate values with no delimiter at all (`duplicate account_uuid: …`). `label` and
+    /// `account_uuid` are exactly where an operator's e-mail address lives (`src/config.rs`), and
+    /// #642 moves this string from the log onto three WIDER surfaces: `stats --json` on stdout
+    /// (piped into files and dashboards), the control socket, and a screenshot-able panel. Sanitising
+    /// an adversarial string for those is a losing game; not deriving it from the config wins outright.
+    ///
+    /// Actionability is preserved by NAMING THE COMMAND rather than echoing the content — the
+    /// operator runs `sessiometer config validate` on their own terminal and gets the full detail
+    /// from the tool built to print it. Being static also makes the string trivially short, which is
+    /// what the fixed-width panel needs.
+    wire_reason: &'static str,
+}
+
 /// Resolve the config for a read-only `stats` view (issue #627), separating the two
 /// silent-fallback cases that must be treated differently:
 ///
@@ -335,12 +361,12 @@ struct AccountVelocity {
 ///   offending key, so `stats` — the sole silent consumer — surfaces the SAME secret-free detail
 ///   ([`Error`]'s `Display`, issue #15) and *then* falls back to defaults.
 ///
-/// Returns the effective config (or `None` → defaults) plus an optional warning the caller routes
-/// to its own sink: the CLI's stderr ([`run`]) or the daemon log ([`stats_socket_json`]). Pure
-/// over its argument — the [`Config::load`] I/O happens in the caller — so the absent-vs-malformed
-/// branch is unit-tested through the [`Config::load_path`] seam without touching the ambient config
-/// path or process env (issue #627 regression test).
-fn resolve_stats_config(loaded: Result<Config>) -> (Option<Config>, Option<String>) {
+/// Returns the effective config (or `None` → defaults) plus, on the malformed branch, the
+/// [`ConfigFault`] whose two fields the caller routes to its two different sinks. Pure over its
+/// argument — the [`Config::load`] I/O happens in the caller — so the absent-vs-malformed branch is
+/// unit-tested through the [`Config::load_path`] seam without touching the ambient config path or
+/// process env (issue #627 regression test).
+fn resolve_stats_config(loaded: Result<Config>) -> (Option<Config>, Option<ConfigFault>) {
     match loaded {
         Ok(config) => (Some(config), None),
         // Absent: pre-`capture` normal state — silent defaults, no warning (would be noise on
@@ -348,7 +374,34 @@ fn resolve_stats_config(loaded: Result<Config>) -> (Option<Config>, Option<Strin
         Err(Error::ConfigNotFound { .. }) => (None, None),
         // Malformed: the file exists but failed to parse/validate — surface the same detail the
         // sibling commands name, then fall back to defaults.
-        Err(err) => (None, Some(err.to_string())),
+        Err(err) => (
+            None,
+            Some(ConfigFault {
+                wire_reason: wire_config_reason(&err),
+                log_detail: err.to_string(),
+            }),
+        ),
+    }
+}
+
+/// Classify a config-load failure into the static wire reason (issue #642).
+///
+/// Matches on the [`Error`] VARIANT, never on its rendered message, so the classification cannot
+/// drift when a dependency reformats its error text — and, by returning `&'static str`, cannot carry
+/// config content by construction (see [`ConfigFault::wire_reason`]). The arms are deliberately
+/// coarse: the wire says WHICH KIND of failure and where to get the detail; the operator-scoped log
+/// says exactly what and where.
+fn wire_config_reason(err: &Error) -> &'static str {
+    match err {
+        Error::ConfigParse(_) => {
+            "config.toml is not valid TOML — run `sessiometer config validate` for the detail"
+        }
+        Error::Io(_) => {
+            "config.toml could not be read — run `sessiometer config validate` for the detail"
+        }
+        // `ConfigInvalid`, the cross-field `ConfigTargetMaxSessionAboveTrigger`, and any future
+        // validation variant: the file parsed, a value did not hold.
+        _ => "config.toml failed validation — run `sessiometer config validate` for the detail",
     }
 }
 
@@ -360,8 +413,23 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     let data = StoreData::read(&store)?;
     let now = wall_clock_now();
     let offset = local_offset_secs(now);
+    print!("{}", run_output(args, &data, now, offset, Config::load)?);
+    Ok(())
+}
 
-    let window = plan_window(args.period.as_deref(), args.since.as_deref(), now, &data)?;
+/// Everything [`run`] does AFTER the store read, over an INJECTED config load — the CLI peer of
+/// [`stats_socket_json_with`], and for the same reason: `run` reads the AMBIENT config, so without
+/// this seam the `config_unreadable` argument could be severed at its call site with the whole suite
+/// still green. Returns the rendered stdout text; the stderr warning is emitted here (it is part of
+/// the behaviour under test, issue #627).
+fn run_output(
+    args: StatsArgs,
+    data: &StoreData,
+    now: i64,
+    offset: i64,
+    load_config: impl FnOnce() -> Result<Config>,
+) -> Result<String> {
+    let window = plan_window(args.period.as_deref(), args.since.as_deref(), now, data)?;
     // One config load feeds BOTH the aggregator thresholds AND the roster reconciliation
     // (issue #314). An ABSENT config is the normal pre-`capture` state — thresholds fall back to
     // built-in defaults and the missing roster just disables the orphan partition (every handle
@@ -370,16 +438,22 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
     // command names the offending key, so `stats` must not be the one that silently renders its
     // ceiling-dependent figures (`caps`, `t@cap`, `runway`) against DEFAULT tunables as if valid.
     // Warn on stderr, then continue against defaults — the silence is the bug, not the exit 0.
-    let (config, config_warning) = resolve_stats_config(Config::load());
-    if let Some(warning) = &config_warning {
-        eprintln!("sessiometer: warning: rendering stats against default tunables — {warning}");
+    let (config, config_fault) = resolve_stats_config(load_config());
+    // Two sinks, two fidelities (issues #627 + #642): stderr is operator-scoped and keeps the FULL
+    // parser detail; the `--json` document below gets only the static wire reason, because stdout is
+    // one of the surfaces #642 widens (it is piped into files and dashboards).
+    if let Some(fault) = &config_fault {
+        eprintln!(
+            "sessiometer: warning: rendering stats against default tunables — {}",
+            fault.log_detail
+        );
     }
     let params = params_from(config.as_ref());
     let vparams = velocity_params_from(config.as_ref());
     let roster = config.as_ref().map(roster_handles);
     let report = with_velocity(
         build_report(
-            &data,
+            data,
             window,
             args.accounts,
             roster.as_ref(),
@@ -391,19 +465,25 @@ pub(crate) async fn run(args: StatsArgs) -> Result<()> {
         &vparams,
     );
 
-    let out = if args.json {
-        render_json(&report)?
+    if args.json {
+        // The `--json` document states the same malformed-config provenance the stderr warning
+        // above does (issue #642) — a consumer piping stdout never sees that warning, so without
+        // this key it is exactly as blind as the panel was.
+        render_json(&report, config_fault.map(|f| f.wire_reason))
     } else {
-        render_human(&report, TermEnv::detect(args.no_color, args.ascii))
-    };
-    print!("{out}");
-    Ok(())
+        Ok(render_human(
+            &report,
+            TermEnv::detect(args.no_color, args.ascii),
+        ))
+    }
 }
 
 /// The daemon `stats` socket verb (issue #356): read the store, compute the bounded per-account
 /// daily series, and return the reply line the spawned socket task writes verbatim — the compact
 /// `StatsWire` JSON for `period`, or a non-secret `{"error":"…"}` envelope on an invalid period or
-/// an unreadable store.
+/// an unreadable store. When `config.toml` exists but is malformed, the document is still served
+/// and additionally carries `config_unreadable` (issue #642) — the client's signal that every
+/// ceiling-dependent figure rests on DEFAULT tunables.
 ///
 /// Reads the SAME on-disk store `sessiometer stats` reads and runs it through the SAME
 /// [`build_report`] + [`stats_wire`] pipeline, so a socket read equals `sessiometer stats --period
@@ -436,7 +516,32 @@ pub(crate) fn socket_stats_reply(period: Option<&str>) -> String {
 /// pipeline [`render_json`] uses, serialized COMPACT (no trailing newline — the socket framing
 /// appends it). Returns a redacted `{"error":…}` envelope on an invalid period or a non-finite usage
 /// value; the caller maps an unreadable store to the same shape.
+///
+/// A malformed `config.toml` is NOT one of those envelope cases: the document is still served (the
+/// panel keeps its series) but carries `config_unreadable` so the client can say the numbers rest on
+/// defaults (issue #642).
+///
+/// Reads the ambient `config.toml`; [`stats_socket_json_with`] is the same body over an INJECTED
+/// config load, so the malformed-config path is testable without touching the real config path.
 fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&str>) -> String {
+    stats_socket_json_with(data, now, offset, period, Config::load)
+}
+
+/// [`stats_socket_json`] over an injected config loader — the seam that lets a test drive the
+/// WHOLE socket path (window → config resolve → report → wire) against a controlled malformed
+/// `config.toml`, rather than only the `stats_wire` builder in isolation. Without it, severing the
+/// `config_unreadable` argument at the call site below leaves every test green: the plumbing #642
+/// exists to create would be uncovered by construction.
+///
+/// Takes a CLOSURE, not a `Result<Config>`, so the load still happens lazily AFTER the period
+/// check — an invalid period must short-circuit before any config I/O, exactly as before.
+fn stats_socket_json_with(
+    data: &StoreData,
+    now: i64,
+    offset: i64,
+    period: Option<&str>,
+    load_config: impl FnOnce() -> Result<Config>,
+) -> String {
     // `since` is always `None` over the socket — only the CLI `--since` grammar drives that path — so
     // the sole `plan_window` failure here is an unknown `--period` value (`StatsPeriodInvalid`).
     let window = match plan_window(period, None, now, data) {
@@ -447,15 +552,23 @@ fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&st
     // `run` does. Re-read from disk — the same config the CLI reader sees — rather than the daemon's
     // in-memory copy (which the spawned, `Send`-only task cannot borrow), so the socket series stays
     // byte-parity with `stats --json`. An ABSENT config stays silent (defaults, the pre-`capture`
-    // state); a MALFORMED one is surfaced daemon-side (issue #627) — logged, not silently served as
-    // default-computed stats. Serving those defaults over the wire (rather than an `{"error":…}`
-    // envelope) is deliberate: the panel keeps a bounded view, and switching envelopes is a
-    // wire/behavior change beyond #627's scope. Preferring the daemon's valid in-memory config over
-    // this disk re-read (which needs threading it through the `Send`-only task) is the tracked
-    // socket follow-up.
-    let (config, config_warning) = resolve_stats_config(Config::load());
-    if let Some(warning) = &config_warning {
-        eprintln!("sessiometer: warning: serving stats against default tunables — {warning}");
+    // state); a MALFORMED one is BOTH logged daemon-side (issue #627) AND surfaced on the wire as
+    // `config_unreadable` (issue #642), so the client can annotate the numbers instead of trusting
+    // them. The reply stays a FULL document rather than an `{"error":…}` envelope: dropping the
+    // whole payload would cost the panel its best-effort series, whereas the flag lets it render
+    // "computed against defaults" over real data. Preferring the daemon's valid in-memory config
+    // over this disk re-read (which needs threading it through the `Send`-only task) remains the
+    // orthogonal, still-open follow-up — it would change WHICH tunables apply; #642 changes only
+    // whether the client is TOLD which applied.
+    let (config, config_fault) = resolve_stats_config(load_config());
+    // The LOG keeps the full parser detail (span echo and all) — it is operator-scoped and #627
+    // already accepted it. The WIRE gets only the static reason, because the socket is one of the
+    // wider surfaces #642 opens.
+    if let Some(fault) = &config_fault {
+        eprintln!(
+            "sessiometer: warning: serving stats against default tunables — {}",
+            fault.log_detail
+        );
     }
     let params = params_from(config.as_ref());
     let vparams = velocity_params_from(config.as_ref());
@@ -469,7 +582,7 @@ fn stats_socket_json(data: &StoreData, now: i64, offset: i64, period: Option<&st
         &params,
         &vparams,
     );
-    serde_json::to_string(&stats_wire(&report))
+    serde_json::to_string(&stats_wire(&report, config_fault.map(|f| f.wire_reason)))
         .unwrap_or_else(|_| r#"{"error":"stats unavailable"}"#.to_owned())
 }
 
@@ -1506,6 +1619,28 @@ struct StatsWire<'a> {
     /// summary-window only — the `series` buckets never carry orphans.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     orphans: BTreeMap<String, AccountWire>,
+    /// The honesty signal for issue #642: PRESENT exactly when `config.toml` EXISTS but failed to
+    /// parse/validate, carrying [`ConfigFault::wire_reason`] — a STATIC string naming the failure
+    /// class and the command that prints the detail, never the raw [`Error`] `Display` the log
+    /// gets (see that field for why the wire copy is not derived from the config at all). OMITTED
+    /// on the healthy path AND on an ABSENT config (the normal pre-`capture` state, which
+    /// legitimately uses defaults).
+    ///
+    /// Its presence means: **every ceiling-dependent figure in this document was computed against
+    /// DEFAULT tunables, not the operator's.** That is not cosmetic — between `session_ceiling` 95
+    /// and 50 the same store yields `cap_hits` 112 vs 356 and `time_at_cap_secs` 8h52m vs 17h37m.
+    /// Before #642 the daemon merely LOGGED this and served the numbers bare, so a socket client
+    /// (the menubar Stats tab) read a confident payload it had no way to distrust — the same
+    /// honesty failure as issues #479 / #582 / #632: a surface must not read more confident than
+    /// reality. The reply stays a FULL document rather than degrading to an `{"error":…}` envelope
+    /// so the panel keeps its best-effort series and annotates it, rather than losing the tab.
+    ///
+    /// Additive to `schema:1` — `skip_serializing_if` keeps the healthy payload byte-identical, so
+    /// a pre-#642 client that ignores the key decodes every prior field unchanged. Per this wire's
+    /// own rule ("bumped only on a breaking change", see [`JSON_SCHEMA_VERSION`]) and the
+    /// `#159`/`#160`/`#314`/`#543`/`#544` precedent, it does NOT bump `schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_unreadable: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1693,7 +1828,13 @@ impl CoverageClass {
 /// so BOTH the CLI `--json` render (pretty, below) AND the daemon `stats` socket verb (issue #356,
 /// [`socket_stats_reply`], compact) serialize the IDENTICAL `StatsWire` — the R-2 parity guarantee
 /// is structural (one builder), not a re-derivation kept in lockstep by hand.
-fn stats_wire(report: &Report) -> StatsWire<'_> {
+///
+/// `config_unreadable` is the caller's config-load provenance (issue #642): `Some(detail)` when the
+/// report's tunables fell back to DEFAULTS because an EXISTING `config.toml` failed to parse, else
+/// `None`. Passed explicitly rather than carried on [`Report`] so the aggregate stays a pure value
+/// (this is an I/O outcome, not an aggregation result) and every caller must state its provenance —
+/// there is no default that silently claims a healthy config.
+fn stats_wire<'a>(report: &'a Report, config_unreadable: Option<&'a str>) -> StatsWire<'a> {
     let (period, since) = match &report.window.kind {
         WindowKind::Period(p) => (Some(p.wire_tag()), None),
         WindowKind::Since(s) => (None, Some(s.as_str())),
@@ -1729,14 +1870,23 @@ fn stats_wire(report: &Report) -> StatsWire<'_> {
         },
         // Orphans carry no velocity either (a non-roster readout is out of scope, issue #543).
         orphans: accounts_wire(&report.orphans, None),
+        // The caller's config-load provenance (issue #642), verbatim: the wire says "these numbers
+        // rest on defaults" exactly when the caller resolved a malformed config.
+        config_unreadable,
     }
 }
 
 /// Render the stable `--json` document — the human / file view: PRETTY-printed with a trailing
 /// newline. (The daemon `stats` socket verb serializes the same [`stats_wire`] COMPACT, no trailing
 /// newline — issue #356; the newline is the socket framing, added on write.)
-fn render_json(report: &Report) -> Result<String> {
-    let mut json = serde_json::to_string_pretty(&stats_wire(report))
+///
+/// `config_unreadable` carries the same issue #642 provenance [`stats_wire`] documents. The CLI
+/// passes it too — not just the socket — because R-2 parity is structural (one builder, so a
+/// socket-only field would break byte-equality with `stats --json`) AND because a `--json` consumer
+/// PIPES stdout and never sees the stderr warning [`run`] prints: without the key it is exactly as
+/// blind as the panel was.
+fn render_json(report: &Report, config_unreadable: Option<&str>) -> Result<String> {
+    let mut json = serde_json::to_string_pretty(&stats_wire(report, config_unreadable))
         .map_err(|_| Error::StatsSerialize("a usage value was not a finite number"))?;
     json.push('\n');
     Ok(json)
@@ -3331,7 +3481,7 @@ mod tests {
     fn charts_never_leak_into_the_json_wire() {
         // The charts are presentation-only: the schema:1 wire carries no glyph, no ANSI, no
         // chart field — the #158 contract is unchanged by #159.
-        let json = render_json(&two_account_charts()).unwrap();
+        let json = render_json(&two_account_charts(), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schema"], 1);
         assert!(!json.contains('\x1b'));
@@ -3712,7 +3862,7 @@ mod tests {
 
     #[test]
     fn json_is_schema_1_with_series_summary_and_window() {
-        let json = render_json(&report_fixture()).unwrap();
+        let json = render_json(&report_fixture(), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schema"], 1);
         assert_eq!(v["window"]["period"], "day");
@@ -3728,7 +3878,7 @@ mod tests {
 
     #[test]
     fn json_carries_neutral_descriptor_enums_and_no_recommendation() {
-        let json = render_json(&report_fixture()).unwrap();
+        let json = render_json(&report_fixture(), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let work = &v["summary"]["accounts"]["work"];
         // `work` peaks at 0.99 (≥ 0.8, < 1.0) → the neutral `high` band, NOT a signal.
@@ -3750,7 +3900,7 @@ mod tests {
 
     #[test]
     fn json_handles_are_redacted_and_no_secret_leaks() {
-        let json = render_json(&report_fixture()).unwrap();
+        let json = render_json(&report_fixture(), None).unwrap();
         // Handle fixture (`work`/`play`): no authored labels, so an empty allow-set is
         // the strict bar — any `@`-shape would be UNAUTHORED and fail. Provenance
         // vocabulary rather than a blanket no-`@` (issue #15, relaxed by #444/#447 —
@@ -3780,7 +3930,7 @@ mod tests {
         );
         let window = plan_window(Some("day"), None, now, &store).unwrap();
         let report = build_report(&store, window, vec![], None, &params(), 0);
-        let json = render_json(&report).unwrap();
+        let json = render_json(&report, None).unwrap();
 
         // The authored email label IS the account key on the wire (runtime honesty)…
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3805,7 +3955,7 @@ mod tests {
 
     #[test]
     fn json_account_object_has_exactly_the_intended_keys() {
-        let json = render_json(&report_fixture()).unwrap();
+        let json = render_json(&report_fixture(), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let mut keys: Vec<&str> = v["summary"]["accounts"]["work"]
             .as_object()
@@ -3863,7 +4013,8 @@ mod tests {
         assert!(out.contains("no per-account usage in this window"));
         assert!(out.contains("0 swaps"));
         // JSON of an empty window is still a valid schema:1 document.
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         assert_eq!(v["schema"], 1);
         assert!(v["summary"]["accounts"].as_object().unwrap().is_empty());
     }
@@ -4221,7 +4372,7 @@ mod tests {
 
         // The band is HUMAN-only — none of its vocabulary reaches the schema:1 wire (which
         // keeps the finer per-account `band`/`coverage_class` enums, byte-stable vs #159).
-        let json = render_json(&report_fixture()).unwrap();
+        let json = render_json(&report_fixture(), None).unwrap();
         for token in [
             "signal",
             "underused",
@@ -4261,7 +4412,7 @@ mod tests {
         }
 
         // The `--json` KEYS are neutral too (the wire carries descriptor enums, no verb).
-        let json = render_json(&report_fixture()).unwrap();
+        let json = render_json(&report_fixture(), None).unwrap();
         let mut keys = Vec::new();
         json_keys(&serde_json::from_str(&json).unwrap(), &mut keys);
         assert_eq!(scan_banned(&keys.join(" ")), None, "json keys are neutral");
@@ -4365,7 +4516,8 @@ mod tests {
 
         // Wire: the velocity object carries %/min + whole-second runway; the flat weekly is a
         // KNOWN 0.0 rate with an EXPLICIT null runway (honest degradation, never a sentinel).
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         let vel = &v["summary"]["accounts"]["work"]["velocity"];
         assert!((vel["session_pct_per_min"].as_f64().unwrap() - 0.2).abs() < 1e-9);
         assert_eq!(vel["session_runway_secs"].as_i64().unwrap(), 8400);
@@ -4400,7 +4552,8 @@ mod tests {
         );
         assert_eq!(scan_banned(&text), None, "the days render is neutral");
 
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         let secs = v["summary"]["accounts"]["work"]["velocity"]["weekly_runway_secs"]
             .as_i64()
             .unwrap();
@@ -4433,7 +4586,8 @@ mod tests {
             "the all-unknown runway column elides: {text}"
         );
 
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         let vel = &v["summary"]["accounts"]["work"]["velocity"];
         assert_eq!(vel["session_pct_per_min"].as_f64().unwrap(), 0.0);
         assert!(
@@ -4459,7 +4613,8 @@ mod tests {
             "no velocity column without a rate (elided): {text}"
         );
 
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         let work = &v["summary"]["accounts"]["work"];
         assert_eq!(
             work["seen"].as_i64().unwrap(),
@@ -4493,7 +4648,8 @@ mod tests {
             "a stale reading shows no velocity column (elided): {text}"
         );
 
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         let work = &v["summary"]["accounts"]["work"];
         assert_eq!(
             work["seen"].as_i64().unwrap(),
@@ -4545,7 +4701,7 @@ mod tests {
         }
 
         // The `--json` keys the readout adds are neutral (the wire carries figures, no verb).
-        let json = render_json(&report).unwrap();
+        let json = render_json(&report, None).unwrap();
         let mut wire_keys = Vec::new();
         json_keys(&serde_json::from_str(&json).unwrap(), &mut wire_keys);
         assert!(
@@ -4628,7 +4784,8 @@ mod tests {
         );
 
         // Wire: a `fleet` object on the SUMMARY, carrying the whole-second runway + the cardinality.
-        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
         let fleet_obj = &v["summary"]["fleet"];
         assert!(
             (fleet_obj["runway_secs"].as_i64().unwrap() - 164_400).abs() <= 2,
@@ -4718,7 +4875,8 @@ mod tests {
             !render_text(&flat).contains("fleet  "),
             "no fleet line without a figure"
         );
-        let v: serde_json::Value = serde_json::from_str(&render_json(&flat).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&flat, None).unwrap()).unwrap();
         assert!(
             v["summary"]["fleet"]["runway_secs"].is_null(),
             "an unknown fleet runway is an explicit null, not a sentinel: {}",
@@ -4726,7 +4884,7 @@ mod tests {
         );
         assert_eq!(v["summary"]["fleet"]["counted"].as_i64().unwrap(), 2);
         assert_eq!(
-            scan_banned(&render_json(&flat).unwrap()),
+            scan_banned(&render_json(&flat, None).unwrap()),
             None,
             "the null-runway fleet object is neutral too"
         );
@@ -4745,7 +4903,8 @@ mod tests {
             "nothing countable → no fleet"
         );
         assert!(!render_text(&thin).contains("fleet  "));
-        let v2: serde_json::Value = serde_json::from_str(&render_json(&thin).unwrap()).unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_str(&render_json(&thin, None).unwrap()).unwrap();
         assert!(
             v2["summary"].get("fleet").is_none(),
             "the wire omits an empty fleet: {}",
@@ -4846,7 +5005,7 @@ mod tests {
     #[test]
     fn json_wire_is_byte_stable_vs_158_159() {
         assert_eq!(
-            render_json(&wire_golden_report()).unwrap(),
+            render_json(&wire_golden_report(), None).unwrap(),
             WIRE_GOLDEN,
             "#160 must not perturb the schema:1 wire by a single byte"
         );
@@ -4994,7 +5153,7 @@ mod tests {
     #[test]
     fn json_places_orphans_apart_from_live_accounts() {
         let live = roster(&["work", "spare"]);
-        let json = render_json(&orphan_report(Some(&live))).unwrap();
+        let json = render_json(&orphan_report(Some(&live)), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // Live accounts under `summary.accounts`; an orphan is absent there.
         assert!(v["summary"]["accounts"]["work"].is_object());
@@ -5027,7 +5186,7 @@ mod tests {
         // Roster covers every present handle → no orphans → the key is omitted entirely
         // (additive to schema:1; a consumer sees `orphans` only when there are some).
         let live = roster(&["work", "spare", "backup", "third"]);
-        let json = render_json(&orphan_report(Some(&live))).unwrap();
+        let json = render_json(&orphan_report(Some(&live)), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(
             v.get("orphans").is_none(),
@@ -5051,7 +5210,7 @@ mod tests {
         for h in ["work", "spare", "backup", "third"] {
             assert!(out.contains(h), "{h} still rendered in the main table");
         }
-        let json = render_json(&orphan_report(None)).unwrap();
+        let json = render_json(&orphan_report(None), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v.get("orphans").is_none(), "no roster ⇒ no orphans key");
         assert!(
@@ -5192,13 +5351,25 @@ mod tests {
         // decode to the identical JSON value (the bytes differ only in whitespace). Parity is
         // guaranteed by the shared builder, not kept in lockstep by hand.
         let report = report_fixture();
-        let socket = serde_json::to_string(&stats_wire(&report)).unwrap();
-        let cli = render_json(&report).unwrap();
+        let socket = serde_json::to_string(&stats_wire(&report, None)).unwrap();
+        let cli = render_json(&report, None).unwrap();
         let socket_v: serde_json::Value = serde_json::from_str(&socket).unwrap();
         let cli_v: serde_json::Value = serde_json::from_str(cli.trim_end()).unwrap();
         assert_eq!(
             socket_v, cli_v,
             "the stats socket wire must equal `stats --json` for the same window (R-2 parity)"
+        );
+
+        // R-2 holds on the DEGRADED path too (issue #642): the honesty flag is a `stats_wire`
+        // parameter, not a socket-only key, so a socket-only field can never silently break
+        // byte-equality with `stats --json` for the same config-load outcome.
+        let detail = "malformed config: unknown field `session_trigger`";
+        let socket_bad = serde_json::to_string(&stats_wire(&report, Some(detail))).unwrap();
+        let cli_bad = render_json(&report, Some(detail)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&socket_bad).unwrap(),
+            serde_json::from_str::<serde_json::Value>(cli_bad.trim_end()).unwrap(),
+            "R-2 parity must survive the #642 degraded path, not just the healthy one"
         );
     }
 
@@ -5274,10 +5445,10 @@ mod tests {
         // ABSENT config — the normal pre-`capture` state: fall back to defaults, NO warning (a
         // warning here would be noise on every fresh install, before anything has been captured).
         let missing = dir.path().join("config.toml");
-        let (config, warning) = resolve_stats_config(Config::load_path(&missing));
+        let (config, fault) = resolve_stats_config(Config::load_path(&missing));
         assert!(config.is_none(), "an absent config falls back to defaults");
         assert!(
-            warning.is_none(),
+            fault.is_none(),
             "an absent config is the silent pre-capture state, not a #627 surface"
         );
 
@@ -5287,20 +5458,300 @@ mod tests {
         // SAME secret-free detail `config validate` surfaces — naming the offending key.
         let malformed = dir.path().join("stale.toml");
         std::fs::write(&malformed, b"[tunables]\nsession_trigger = 50\n").unwrap();
-        let (config, warning) = resolve_stats_config(Config::load_path(&malformed));
+        let (config, fault) = resolve_stats_config(Config::load_path(&malformed));
         assert!(
             config.is_none(),
             "a malformed config falls back to defaults — the report still renders"
         );
-        let warning = warning.expect("a malformed config must END the silence with a warning");
+        let fault = fault.expect("a malformed config must END the silence with a warning");
         assert_eq!(
-            warning,
+            fault.log_detail,
             Config::load_path(&malformed).unwrap_err().to_string(),
-            "the warning is the SAME detail every sibling command surfaces (issue #627)"
+            "the LOG detail is the SAME one every sibling command surfaces (issue #627)"
         );
         assert!(
-            warning.contains("session_trigger"),
-            "and it names the offending key, like `config validate`: {warning}"
+            fault.log_detail.contains("session_trigger"),
+            "and it names the offending key, like `config validate`: {}",
+            fault.log_detail
+        );
+    }
+
+    // --- the malformed config is SIGNALLED on the wire, not just logged (issue #642) ----
+
+    #[test]
+    fn a_healthy_config_omits_the_degraded_key_entirely() {
+        // #642's additive contract: on the healthy path (and on the ABSENT-config path, which
+        // legitimately uses defaults) the key is not merely `null` — it is ABSENT, so the payload
+        // stays byte-identical to pre-#642 and a client that never heard of `config_unreadable`
+        // decodes every prior field unchanged. This is what makes the change safe WITHOUT a
+        // `schema` bump, per this wire's own "bumped only on a breaking change" rule.
+        let report = report_fixture();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&stats_wire(&report, None)).unwrap())
+                .unwrap();
+        assert!(
+            v.as_object().unwrap().get("config_unreadable").is_none(),
+            "a healthy config must leave NO trace on the wire (absent, not null): {v}"
+        );
+        assert_eq!(v["schema"], 1, "an additive field does not bump `schema`");
+    }
+
+    #[test]
+    fn a_malformed_config_is_signalled_on_the_wire_not_only_in_the_daemon_log() {
+        // THE #642 REGRESSION. Before this fix a socket client (the menubar Stats tab) receiving a
+        // malformed-config reply saw a full, confident document computed against DEFAULT tunables
+        // with zero indication anything was wrong — the daemon logged it, the client could not tell.
+        // The wire now says so, so the panel can annotate the numbers instead of trusting them
+        // (honesty family: issues #479 / #582 / #632).
+        let dir = tempfile::tempdir().unwrap();
+        // A config that EXISTS and fails to PARSE — deliberately not a missing file, which is the
+        // ABSENT case `resolve_stats_config` routes to silent defaults with no fault at all.
+        let bad = malformed_config(
+            dir.path(),
+            "stale.toml",
+            "[tunables]\nsession_trigger = 50\n",
+        );
+        let (_, fault) = resolve_stats_config(Config::load_path(&bad));
+        let fault = fault.expect("a malformed config must produce a fault");
+
+        let report = report_fixture();
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&stats_wire(&report, Some(fault.wire_reason))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["config_unreadable"],
+            serde_json::Value::from(fault.wire_reason),
+            "the wire states the classified reason"
+        );
+        // Still a FULL document, never degraded to an `{"error":…}` envelope: the panel keeps its
+        // best-effort series and annotates it, rather than losing the tab entirely.
+        assert!(v.get("error").is_none(), "not an error envelope: {v}");
+        assert!(v["summary"]["accounts"].is_object(), "series still served");
+        assert_eq!(
+            v["schema"], 1,
+            "and still `schema:1` — the field is additive"
+        );
+    }
+
+    /// A config file that EXISTS but fails to parse — the #627/#642 case, written into a temp dir.
+    fn malformed_config(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_socket_reply_itself_carries_the_signal_end_to_end() {
+        // THE PLUMBING TEST. Drives the WHOLE socket path — window → config resolve → report →
+        // wire — against a controlled malformed config, not just the `stats_wire` builder in
+        // isolation. Without it, severing the `config_unreadable` argument inside
+        // `stats_socket_json_with` leaves every other test green: the very wire #642 exists to
+        // create would be uncovered by construction.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = malformed_config(
+            dir.path(),
+            "stale.toml",
+            "[tunables]\nsession_trigger = 50\n",
+        );
+        let now = epoch("2026-07-08T00:00:00Z");
+        let store = data(vec![sample(now - 2 * DAY_SECS, "work", 0.6, 0.3)], "");
+
+        let reply =
+            stats_socket_json_with(&store, now, 0, Some("week"), || Config::load_path(&bad));
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        let signalled = v["config_unreadable"]
+            .as_str()
+            .expect("the socket reply itself must carry the #642 signal");
+        assert_eq!(
+            signalled,
+            wire_config_reason(&Config::load_path(&bad).unwrap_err()),
+            "the socket carries the classified wire reason for this failure"
+        );
+        assert!(
+            signalled.contains("config validate"),
+            "which points at the command that prints the detail: {signalled}"
+        );
+        // The FULL detail is not lost — it goes to the operator-scoped log instead (issue #627).
+        assert!(
+            resolve_stats_config(Config::load_path(&bad))
+                .1
+                .unwrap()
+                .log_detail
+                .contains("session_trigger"),
+            "the offending key still reaches the daemon log, just not the wire"
+        );
+        // Still a FULL document — the panel keeps its series and annotates it.
+        assert_eq!(v["schema"], 1);
+        assert_eq!(v["series"].as_array().unwrap().len(), 7);
+
+        // And the ABSENT-config counterpart over the SAME path leaves no trace.
+        let missing = dir.path().join("nope.toml");
+        let clean =
+            stats_socket_json_with(&store, now, 0, Some("week"), || Config::load_path(&missing));
+        let cv: serde_json::Value = serde_json::from_str(&clean).unwrap();
+        assert!(
+            cv.as_object().unwrap().get("config_unreadable").is_none(),
+            "an ABSENT config is the silent pre-capture state, not a #642 surface: {cv}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_period_short_circuits_before_any_config_load() {
+        // The lazy-loader contract: the period check must reject BEFORE config I/O, exactly as it
+        // did when the load was inline. A closure that panics proves the load never ran.
+        let store = data(vec![], "");
+        assert_eq!(
+            stats_socket_json_with(&store, 1_000_000, 0, Some("7d"), || {
+                panic!("config must not be loaded for an invalid period")
+            }),
+            r#"{"error":"invalid period"}"#
+        );
+    }
+
+    #[test]
+    fn no_config_derived_byte_can_reach_the_wire_across_every_failure_class() {
+        // THE #642 REDACTION INVARIANT, swept across the failure classes rather than asserted on
+        // one input. Each case plants the SAME e-mail in a different place a config error is known
+        // to echo it: the TOML span echo re-prints the whole offending line; serde's `invalid type`
+        // quotes the VALUE; validation errors interpolate values with no delimiter at all; and an
+        // unknown KEY is echoed verbatim. That variety is exactly why the wire reason is a
+        // `&'static str` rather than a scrubbed copy of the message — there is no sanitiser that
+        // could be trusted to anticipate all of these, and more arrive with every dependency bump.
+        let dir = tempfile::tempdir().unwrap();
+        let planted = "alice@example.com";
+        let cases = [
+            // (name, config body) — every one MUST fail to load.
+            ("span echo", format!("[[account]]\nlabel = \"{planted}\n")),
+            (
+                "quoted value / wrong type",
+                format!("[tunables]\npoll_secs = \"{planted}\"\n"),
+            ),
+            (
+                "unquoted validation interpolation",
+                format!(
+                    "[[account]]\nlabel = \"a\"\naccount_uuid = \"{planted}\"\n\
+                     [[account]]\nlabel = \"b\"\naccount_uuid = \"{planted}\"\n"
+                ),
+            ),
+            ("unknown key", format!("[tunables]\n\"{planted}\" = 1\n")),
+            ("unknown table", format!("[\"{planted}\"]\nx = 1\n")),
+        ];
+
+        for (name, body) in &cases {
+            let file = format!(
+                "{}.toml",
+                name.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+            );
+            let path = malformed_config(dir.path(), &file, body);
+            let err = Config::load_path(&path)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: precondition — this config must fail to load"));
+            let (_, fault) = resolve_stats_config(Err(err));
+            let fault = fault.unwrap_or_else(|| panic!("{name}: a malformed config must fault"));
+
+            // The wire reason is what the panel and `stats --json` actually receive.
+            assert_eq!(
+                crate::redaction::meter::unauthored_emails(fault.wire_reason, &[]),
+                Vec::<String>::new(),
+                "{name}: an e-mail reached the wire: {}",
+                fault.wire_reason
+            );
+            assert!(
+                !fault.wire_reason.contains(planted),
+                "{name}: config content reached the wire: {}",
+                fault.wire_reason
+            );
+            // ...and it says enough to act on, rather than buying honesty with uselessness.
+            assert!(
+                fault.wire_reason.contains("config.toml")
+                    && fault.wire_reason.contains("config validate"),
+                "{name}: the wire reason must name the file and the command: {}",
+                fault.wire_reason
+            );
+            assert!(
+                !fault.wire_reason.contains('\n'),
+                "{name}: one line — the panel has no scroll view"
+            );
+        }
+
+        // Control: at least one case really DOES leak through the raw Display, so this test would
+        // have caught the pre-fix behaviour rather than passing vacuously on a parser that never
+        // echoed anything.
+        let leaky = malformed_config(
+            dir.path(),
+            "control.toml",
+            &format!("[[account]]\nlabel = \"{planted}\n"),
+        );
+        assert!(
+            Config::load_path(&leaky)
+                .unwrap_err()
+                .to_string()
+                .contains(planted),
+            "control: the RAW error must echo the address, else the sweep proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_wire_reason_is_classified_by_error_variant_not_by_message_text() {
+        // Matching the VARIANT (not the rendered string) is what keeps the classification stable
+        // when a dependency reformats its error text — and keeps the arms exhaustive by the type
+        // system rather than by a chain of `contains` guesses.
+        assert!(wire_config_reason(&Error::ConfigParse("x".into())).contains("not valid TOML"));
+        assert!(wire_config_reason(&Error::ConfigInvalid("x".into())).contains("failed validation"));
+        assert!(wire_config_reason(&Error::Io(std::io::Error::other("x")))
+            .contains("could not be read"));
+        // The cross-field variant is a validation failure, not a parse failure.
+        assert!(
+            wire_config_reason(&Error::ConfigTargetMaxSessionAboveTrigger {
+                target_max_session_usage: 99,
+                trigger: 50,
+            })
+            .contains("failed validation")
+        );
+    }
+
+    #[test]
+    fn the_cli_run_path_wires_the_signal_all_the_way_to_stdout() {
+        // The CLI's OWN call site, not just the seam it calls. `run` reads the ambient config, so
+        // `run_output` is the injected-load peer of `stats_socket_json_with` — without driving it,
+        // severing `config_fault` inside `run` leaves the whole suite green and `stats --json` could
+        // silently stop carrying the honesty signal.
+        let dir = tempfile::tempdir().unwrap();
+        let bad = malformed_config(
+            dir.path(),
+            "cli-run.toml",
+            "[tunables]\nsession_trigger = 50\n",
+        );
+        let now = epoch("2026-07-08T00:00:00Z");
+        let store = data(vec![sample(now - 2 * DAY_SECS, "work", 0.6, 0.3)], "");
+        let json_args = || StatsArgs {
+            accounts: Vec::new(),
+            period: Some("week".to_owned()),
+            since: None,
+            json: true,
+            no_color: true,
+            ascii: true,
+        };
+
+        let out = run_output(json_args(), &store, now, 0, || Config::load_path(&bad)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["config_unreadable"],
+            serde_json::Value::from(wire_config_reason(&Config::load_path(&bad).unwrap_err())),
+            "`stats --json` must carry the reason the socket does — stdout is piped, stderr is not"
+        );
+
+        // The healthy/absent counterpart over the SAME path leaves no trace.
+        let missing = dir.path().join("nope.toml");
+        let clean =
+            run_output(json_args(), &store, now, 0, || Config::load_path(&missing)).unwrap();
+        let cv: serde_json::Value = serde_json::from_str(&clean).unwrap();
+        assert!(
+            cv.as_object().unwrap().get("config_unreadable").is_none(),
+            "an absent config is the silent pre-capture state: {cv}"
         );
     }
 
@@ -5320,7 +5771,7 @@ mod tests {
     /// Freezing the identical report both PRETTY (CLI) and COMPACT (socket) makes R-2 parity
     /// self-evident: one `stats_wire`, two serializations.
     fn wire_golden_stats_socket_frame() -> String {
-        serde_json::to_string(&stats_wire(&wire_golden_report()))
+        serde_json::to_string(&stats_wire(&wire_golden_report(), None))
             .expect("the stats golden report serializes")
     }
 

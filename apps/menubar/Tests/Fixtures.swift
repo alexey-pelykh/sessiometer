@@ -185,6 +185,24 @@ enum Fixtures {
     {"schema":1,"window":{"start":1782864000,"end":1782907200,"label":"last 24h (Jul 1–Jul 1)","period":"day"},"accounts":[],"series":[{"start":0,"end":21600,"roster":{"swap_count":1,"swaps":{"session":1,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"work":{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.9,"p95":0.85},"weekly":{"mean":0.3,"peak":0.4,"p95":0.38},"cap_hits":1,"time_at_cap_secs":300,"contribution_share":1.0,"band":"high"}}}],"summary":{"roster":{"swap_count":1,"swaps":{"session":1,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"work":{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.9,"p95":0.85},"weekly":{"mean":0.3,"peak":0.4,"p95":0.38},"cap_hits":1,"time_at_cap_secs":300,"contribution_share":1.0,"band":"high"}}}}
     """#
 
+    /// A `stats` reply from a daemon whose `config.toml` EXISTS but failed to parse (issue #642):
+    /// `statsBasic` plus the additive `config_unreadable` key.
+    ///
+    /// The reason is the REAL string the daemon emits for a parse failure, copied verbatim from
+    /// `wire_config_reason` (`src/stats.rs`) — one of a small, fixed set of STATIC strings. The daemon
+    /// deliberately does NOT put the parser's own message here: that message re-prints the operator's
+    /// config (the TOML span echo quotes the offending line; serde quotes bad values; validation errors
+    /// interpolate them bare), and `label` / `account_uuid` are where an e-mail address lives. So the
+    /// wire names the failure CLASS and the command that prints the detail, and the full detail stays
+    /// in the daemon log. A static reason is also why the panel can render this unclipped.
+    ///
+    /// Hand-built (not byte-emitted) BY DESIGN: the Rust golden is emitted from a HEALTHY report, where
+    /// `skip_serializing_if` omits the key entirely — which is exactly the property `statsBasic` above
+    /// still pins. This fixture covers the other branch, so the decoder is tested on both.
+    static let statsConfigUnreadable = #"""
+    {"schema":1,"window":{"start":1782864000,"end":1782907200,"label":"last 24h (Jul 1–Jul 1)","period":"day"},"accounts":[],"series":[{"start":0,"end":21600,"roster":{"swap_count":1,"swaps":{"session":1,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"work":{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.9,"p95":0.85},"weekly":{"mean":0.3,"peak":0.4,"p95":0.38},"cap_hits":1,"time_at_cap_secs":300,"contribution_share":1.0,"band":"high"}}}],"summary":{"roster":{"swap_count":1,"swaps":{"session":1,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"work":{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.9,"p95":0.85},"weekly":{"mean":0.3,"peak":0.4,"p95":0.38},"cap_hits":1,"time_at_cap_secs":300,"contribution_share":1.0,"band":"high"}}},"config_unreadable":"config.toml is not valid TOML — run `sessiometer config validate` for the detail"}
+    """#
+
     // ---- Backward/forward-compat frames (hand-built to the same contract) -------------------
 
     /// A pre-#119 daemon: `auth` present as null. The client must read it as "no verdict" (nil),

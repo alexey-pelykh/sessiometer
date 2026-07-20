@@ -91,6 +91,61 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(work.timeAtCapSecs, 300)
         XCTAssertEqual(work.contributionShare, 1.0, accuracy: 1e-9)
         XCTAssertEqual(work.band, .high)
+
+        // Back-compat (#642): the golden is emitted from a HEALTHY report, so `config_unreadable` is
+        // ABSENT (not null) and decodes to nil — the `decodeIfPresent` additive-default path. These
+        // are the same bytes a PRE-#642 daemon sends, so the ~40 assertions above are also the proof
+        // that an older daemon's reply still decodes field-for-field: that is what makes the field
+        // safe WITHOUT a `schema` bump. The panel renders no caveat and reads the numbers as the
+        // operator's own.
+        XCTAssertNil(wire.configUnreadable,
+                     "a healthy (or pre-#642) daemon omits `config_unreadable` entirely — no caveat to render")
+    }
+
+    // MARK: - #642: the malformed-config wire signal
+
+    // THE #642 REGRESSION, decoder half. Before the fix the daemon served this exact document WITHOUT the
+    // key, so the panel had no way to know every ceiling-dependent figure below rested on DEFAULT tunables.
+    // The key now arrives and the panel can annotate rather than silently trust (honesty family #479/#582/#632).
+    func testDecodesTheConfigUnreadableSignal() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsConfigUnreadable) else {
+            return XCTFail("a degraded config must still yield a FULL document, not an error envelope")
+        }
+        let detail = try XCTUnwrap(wire.configUnreadable, "the #642 signal must decode")
+        XCTAssertTrue(detail.contains("config validate"),
+                      "the reason points at the command that prints the detail: \(detail)")
+        // The daemon never derives this string from the config (the parser's own message re-prints
+        // the operator's file, where e-mail labels live), so it is one of a small set of STATIC
+        // reasons. Assert that contract at the point of consumption too — the panel renders it
+        // verbatim into a fixed-width popover with no scroll view.
+        XCTAssertFalse(detail.contains("\n"), "one line — no caret art in a fixed-size popover")
+        XCTAssertFalse(detail.contains("|"), "no span-echo gutter of the operator's own config")
+        XCTAssertFalse(detail.contains("@"), "no address-shaped token from an echoed config line")
+        // The series is still fully served — the panel keeps its best-effort data and qualifies it, rather
+        // than losing the tab. That is why the daemon does NOT degrade to an `{"error":…}` envelope here.
+        XCTAssertEqual(wire.schema, 1, "an additive field, so still schema:1 — no bump")
+        XCTAssertEqual(wire.series.count, 1, "the series survives the degraded path")
+        XCTAssertEqual(try XCTUnwrap(wire.summary.accounts["work"]).capHits, 1)
+    }
+
+    // The panel copy: it must state the CONSEQUENCE (numbers rest on defaults), not merely that something
+    // failed, and route the operator to the command that prints the real detail. Composed from the fixture's
+    // reason rather than a hand-written stub, so the assertion is against the string the daemon actually
+    // sends (`wire_config_reason`, `src/stats.rs`) and not one invented here to make the test pass.
+    func testConfigUnreadableNoteStatesTheConsequenceAndCarriesTheDetail() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsConfigUnreadable) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        let detail = try XCTUnwrap(wire.configUnreadable)
+        let note = StatusPanelFormat.statsConfigUnreadableNote(detail)
+        XCTAssertTrue(note.contains("default tunables"),
+                      "the caveat must say the numbers rest on defaults, not just that a read failed: \(note)")
+        XCTAssertTrue(note.contains("config.toml"), "and name what could not be read: \(note)")
+        XCTAssertTrue(note.hasPrefix("Computed against default tunables"),
+                      "leading with the CONSEQUENCE, not with the fault: \(note)")
+        XCTAssertTrue(note.contains("config validate"),
+                      "and route the operator to the command that prints the detail: \(note)")
+        XCTAssertFalse(note.contains("\n"), "and stay a single paragraph for the caveat strip: \(note)")
     }
 
     // The redacted `{"error":…}` envelope (an invalid period — off the panel's path, but honestly surfaced)

@@ -1221,6 +1221,20 @@ enum StatusPanelFormat {
         }
     }
 
+    /// The honest caveat shown above the Stats readout when the daemon reports `config_unreadable`
+    /// (issue #642): the numbers below were computed against DEFAULT tunables because `config.toml`
+    /// exists but could not be parsed, so every ceiling-dependent figure (cap-hits, the band, the
+    /// sparkline scale) may be well off the operator's own thresholds.
+    ///
+    /// Leads with the CONSEQUENCE — "computed against default tunables" — because that is what the
+    /// operator must know to read the numbers correctly; "the config failed to load" alone would
+    /// state a fault without saying what it costs. `reason` is the daemon's own classification (see
+    /// `StatsWire.configUnreadable`), naming the failure class and the command that prints the full
+    /// detail, so the caveat routes the operator onward instead of dead-ending in an apology.
+    static func statsConfigUnreadableNote(_ reason: String) -> String {
+        "Computed against default tunables — \(reason)."
+    }
+
     /// The neutral three-way utilisation signal the mock's `.signal` pill shows, collapsed from the wire's
     /// finer `band` EXACTLY as the CLI does (`src/stats.rs` `SignalBand::of`): idle/low → underused,
     /// moderate → balanced, high/at-cap → saturated. A DESCRIPTOR (equal-weight departures from the balanced
