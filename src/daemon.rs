@@ -250,7 +250,13 @@ const ACTIVE_POLL_BACKOFF_CAP: Duration = Duration::from_secs(120);
 /// INTERIM / REVERSIBLE — stays so until the production ratification bar (issue #484, documented on
 /// [`BLIND_GATE_RISK_BAND`] and shared by both constants) is met; promotion reads PRODUCTION SLIs
 /// (#482 / #449 / #455), NOT a re-run of the #451 replay.
-const BLIND_GATE_SECS: u64 = 300;
+///
+/// `pub(crate)` so the OFFLINE blind-arm projection-error SLI ([`crate::reliability`], issue #636)
+/// scopes its scored population to the SAME first gate this arm applies — one `T`, referenced from
+/// both, so the runtime arm and the offline readout that grades it cannot drift apart (the shared-
+/// constant discipline [`crate::reliability`]'s `SLO_SWAP_P100_MAX` already uses with
+/// [`crate::landing`]).
+pub(crate) const BLIND_GATE_SECS: u64 = 300;
 /// Interim `risk_band` for the #452 gate (ADR-0017), as a session-usage fraction: the retained
 /// pre-blind anchor ([`crate::daemon`]'s `last_good`, #450) — plausibility-corrected to its window
 /// high-water mark (#619) — must be at/over this for the gate to turn eligible. DISTINCT from — and

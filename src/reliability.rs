@@ -38,6 +38,16 @@
 //!    Reconstructed offline by joining the event log's swaps with the daemon's per-account usage
 //!    samples — the two-source recipe spike #596 used; it neither adds an event nor changes the
 //!    swap mechanism it measures (the #449 → #452 precedent: expose the SLI before the fix).
+//! 6. **blind-arm projection error** (issue #636) — `projected − session_at_recovery` for the
+//!    REPORT-ONLY blind velocity-projection arm ([`crate::daemon`]'s
+//!    `blind_velocity_projected_armed`, issues #584/#600). That arm fires no swap and emits no
+//!    event of its own, so its forecast was unfalsifiable until #634 stamped its ingredients onto
+//!    `blind_window`; `projected` is RECOMPUTED here from those tokens and reconciled against the
+//!    durable actual already on the same line. BLIND-ARM ONLY: the velocity arm's actual is a
+//!    counterfactual (the swap parks the account, so its crossing never happens), which is why
+//!    `false_projection.rate` stays `None` rather than gaining a symmetric forecast-error rate.
+//!    The error percentiles are published PAIRED with their cardinality + censoring counts (the
+//!    survivorship guard, issue #484) and never bare.
 //!
 //! Like `stats` (issue #158) this is an OFFLINE reader: it reads the daemon's durable files
 //! directly — the event log for SLIs 1-4, plus (for SLI 5) the `usage-samples.jsonl` store
@@ -141,8 +151,11 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// ignores unknown fields still parses every prior field unchanged. Bumped `5 → 6`
 /// (issue #635) by RENAMING the velocity-projection block's key to `projective_swap_out_pct` — the one
 /// non-additive bump: the block measures the OBSERVED session_pct at projection-triggered swaps, not
-/// projection error, so the prior name (implying tracked projection accuracy) was corrected.
-const JSON_SCHEMA_VERSION: u32 = 6;
+/// projection error, so the prior name (implying tracked projection accuracy) was corrected. Bumped
+/// `6 → 7` when the #636 blind-arm projection-error SLI added the `blind_projection_error` object —
+/// ADDITIVE again (a new always-present field; every schema:6 key is byte-identical), so the rename
+/// at 6 stays the lone non-additive bump.
+const JSON_SCHEMA_VERSION: u32 = 7;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -308,6 +321,29 @@ struct Reactivation {
     acct: String,
 }
 
+/// One reconciled blind-arm projection (issue #636): what the REPORT-ONLY blind velocity-projection
+/// arm would have forecast for this `blind_window`, beside what the account actually arrived at.
+///
+/// Recomputed OFFLINE from the line's own tokens — the house log-the-ingredients / derive-the-views
+/// idiom the #634 `BlindVelocity` doc names as this readout's contract — rather than read from a
+/// stored projection: `projected = session_pct + rate × inflation × duration_secs`, with `rate` the
+/// full-precision (6-dp) pre-blind EMA in %/s and `inflation` the factor STAMPED on the line, never
+/// today's [`crate::daemon`] constant (an old window read through a new factor would silently
+/// mis-report). The anchor term carries the `session_pct` field's `u8` rounding, so a recomputed
+/// projection inherits up to ±0.5 pp of anchor error; over any window long enough to arm the report
+/// the rate term dominates it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BlindProjection {
+    /// The recomputed projection, as a PERCENT. Deliberately UNCLAMPED (a steep retained rate over a
+    /// multi-minute blind window routinely projects past 100), so the "how far over did this
+    /// project?" signal the error distribution exists to measure survives.
+    projected_pct: f64,
+    /// The durable actual: `session_at_recovery`, the FRESH reading at the recovery poll that closed
+    /// the window. `0` is the session-window-RESET sentinel — the 5 h window rolled mid-blindness, so
+    /// the account never "arrived" anywhere — and is excluded from the error distribution downstream.
+    arrived_pct: u8,
+}
+
 /// The raw SLI ingredients pulled out of the event log, before aggregation.
 #[derive(Debug, Default, PartialEq)]
 struct Inputs {
@@ -358,6 +394,61 @@ struct Inputs {
     /// parse. Keeps the constant honest: when the real peak outruns it, the `v_peak` coupling bound
     /// is silently too loose, exactly as `TAIL_MARGIN` is kept honest by the #595 landing SLI.
     session_velocities: Vec<f64>,
+    /// Every `blind_window` that carried #634's velocity ingredients, recomputed into a
+    /// (projection, actual) pair — the blind-arm projection-error input (issue #636).
+    ///
+    /// Deliberately NOT restricted to `near_limit=true`, unlike the two SLIs above: the climbing
+    /// population this SLI exists to score is predominantly `near_limit=FALSE` (a stale anchor
+    /// sitting well UNDER the risk band, climbing unseen, is exactly the 2026-07-17 episode issue
+    /// #584 filed the arm for), so the near-limit filter would keep only the degenerate
+    /// already-at-the-ceiling windows and measure nothing.
+    blind_projections: Vec<BlindProjection>,
+    /// Every `blind_window` line in view, classified (issue #636) — the DENOMINATOR context that
+    /// keeps the projection-error percentiles from reading as the whole blind story.
+    blind_window_census: BlindWindowCensus,
+}
+
+/// The complete classification of the `blind_window` lines in view (issue #636).
+///
+/// Every line lands in EXACTLY ONE bucket — `total == projectable + below_arm_gate +
+/// without_velocity + malformed` — so no line can vanish between parse and render. That total
+/// invariant is the point: this readout's whole thesis is that a percentile without its denominator
+/// is a survivorship lie, and a silently-dropped line is exactly a missing denominator.
+///
+/// The three non-projectable buckets are ordered to MIRROR
+/// [`crate::daemon`]'s `blind_velocity_projected_armed` gate order — duration first, then the
+/// sustained-EMA check — so "outside the arm's domain" here means the same thing it means there.
+#[derive(Debug, Default, PartialEq)]
+struct BlindWindowCensus {
+    /// Every `blind_window` line in view, whatever its disposition.
+    total: usize,
+    /// Lines shorter than the arm's first gate ([`crate::daemon::BLIND_GATE_SECS`]).
+    ///
+    /// The arm returns `false` on these BEFORE computing any projection, so it never forecast here
+    /// and there is nothing to grade — yet the daemon still stamps the #634 ingredients on them
+    /// (`blind_velocity_ingredients` gates only on the SUSTAINED-EMA condition, not on duration).
+    /// Scoring them would swamp the signal: on the production log four fifths of `blind_window`
+    /// lines are under the gate, and their `rate × inflation × duration_secs` term is small enough
+    /// that their error mostly measures ANCHOR STALENESS, not the inflation factor this SLI exists
+    /// to tune. Excluded and counted, never mixed in.
+    ///
+    /// **Disclosed bound.** `T` is applied at TODAY's value: unlike `inflation` / `ceiling` (which
+    /// issue #634 STAMPS per line precisely so an old record is never re-read through a new
+    /// constant), the gate is not on the line, so a `T` that moves would silently re-partition old
+    /// windows. Stamping it is the #634-style follow-up; until then this is a documented,
+    /// disclosed limitation rather than a hidden one — and the shared `pub(crate)` constant at
+    /// least keeps the offline reader and the runtime arm on ONE value.
+    below_arm_gate: usize,
+    /// Lines at/over the gate but carrying NO `rate=` ingredient. Absent tokens mean "no SUSTAINED
+    /// retained EMA — this arm could not have armed here", never "unknown", so there is no
+    /// projection to score. The arm's SECOND gate.
+    without_velocity: usize,
+    /// Lines this reader could not classify: a missing or unparseable `session_pct` /
+    /// `session_at_recovery` / `duration_secs`, an unparseable or non-finite `rate=` / `inflation=`,
+    /// or a projection that overflowed to non-finite. A CORRUPT record, distinct from a well-formed
+    /// window the arm simply could not arm on — folding the two together would report corruption as
+    /// coverage. The tolerant-drop precedent every sibling arm here uses, made VISIBLE.
+    malformed: usize,
 }
 
 /// Record a re-activation edge (issue #595): the account named by `{acct_field}=` on this log line
@@ -383,6 +474,85 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
             acct: acct.to_owned(),
         });
     }
+}
+
+/// Fold one `blind_window` line into the blind-arm projection-error input (issue #636).
+///
+/// Recomputes the REPORT-ONLY arm's forecast from the line's OWN tokens — `session_pct + rate ×
+/// inflation × duration_secs`, the [`crate::daemon`] `blind_velocity_projected_armed` formula — and
+/// pairs it with the durable `session_at_recovery` beside it. Every term is stamped on the line
+/// (issue #634), so no daemon constant is imported and an old window is never read through a
+/// today-value.
+///
+/// Classifies EVERY line into exactly one [`BlindWindowCensus`] bucket, applying the arm's OWN
+/// gates in the arm's OWN order — duration first, sustained EMA second — so "outside the arm's
+/// domain" means here exactly what it means there. Collapsing any two of these buckets would
+/// fabricate the survivorship story the SLI exists to guard:
+///
+/// 1. **Core fields unreadable** (`session_pct` / `session_at_recovery` / `duration_secs` missing or
+///    unparseable) ⇒ `malformed`. A corrupt record is not evidence of anything.
+/// 2. **`duration_secs <= BLIND_GATE_SECS`** ⇒ `below_arm_gate`. The arm returns `false` here BEFORE
+///    computing a projection, so there is no forecast to grade — even though the daemon does stamp
+///    the ingredients on such a line.
+/// 3. **No `rate=` token** ⇒ `without_velocity`. Absent tokens mean "no SUSTAINED retained EMA", the
+///    arm's second gate — never "unknown".
+/// 4. **`rate=` / `inflation=` unreadable, or the projection overflows to non-finite** ⇒
+///    `malformed`. Publishing a non-finite percentile would make the human text (`+inf`) and the
+///    `--json` wire (`null`, which this schema defines as "empty population") disagree about the
+///    same episode.
+/// 5. **Complete** ⇒ a [`BlindProjection`]. The `session_at_recovery = 0` window-reset sentinel is
+///    carried through and excluded later, at aggregation, so the exclusion is COUNTED rather than
+///    silently swallowed at parse.
+///
+/// Deliberately called BEFORE the `near_limit=true` gate — see [`Inputs::blind_projections`].
+fn record_blind_projection(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>) {
+    let census = &mut inputs.blind_window_census;
+    census.total = census.total.saturating_add(1);
+    let (Some(anchor), Some(arrived), Some(blind_secs)) = (
+        fields.get("session_pct").and_then(|v| v.parse::<u8>().ok()),
+        fields
+            .get("session_at_recovery")
+            .and_then(|v| v.parse::<u8>().ok()),
+        fields
+            .get("duration_secs")
+            .and_then(|v| v.parse::<u64>().ok()),
+    ) else {
+        census.malformed = census.malformed.saturating_add(1);
+        return;
+    };
+    if blind_secs <= crate::daemon::BLIND_GATE_SECS {
+        census.below_arm_gate = census.below_arm_gate.saturating_add(1);
+        return;
+    }
+    if !fields.contains_key("rate") {
+        census.without_velocity = census.without_velocity.saturating_add(1);
+        return;
+    }
+    let (Some(rate), Some(inflation)) = (
+        fields
+            .get("rate")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite()),
+        fields
+            .get("inflation")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite()),
+    ) else {
+        census.malformed = census.malformed.saturating_add(1);
+        return;
+    };
+    // Finite INPUTS do not imply a finite product: `rate × inflation × blind_secs` can overflow to
+    // `inf` (or, with a zero duration, `inf × 0 = NaN`) on a corrupted line. Checked on the RESULT,
+    // so no non-finite value can reach the percentile and split the two renderers apart.
+    let projected_pct = f64::from(anchor) + rate * inflation * blind_secs as f64;
+    if !projected_pct.is_finite() {
+        census.malformed = census.malformed.saturating_add(1);
+        return;
+    }
+    inputs.blind_projections.push(BlindProjection {
+        projected_pct,
+        arrived_pct: arrived,
+    });
 }
 
 /// Parse the SLI ingredients out of the structured event-log `text`.
@@ -480,6 +650,12 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 }
             }
             Some("blind_window") => {
+                // The blind-arm projection error (issue #636) is folded FIRST, deliberately ahead of
+                // the near-limit gate below: the climbing population it scores is predominantly
+                // `near_limit=false` (an anchor under the risk band, burning unseen — the #584
+                // episode), so gating it would keep only the degenerate already-at-the-ceiling
+                // windows. The two SLIs below keep their near-limit scope unchanged.
+                record_blind_projection(&mut inputs, &fields);
                 // Only near-limit windows feed either the time-blind sum or the proxy.
                 if fields.get("near_limit").copied() != Some("true") {
                     continue;
@@ -790,6 +966,84 @@ struct FalseProjection {
     rate: Option<f64>,
 }
 
+/// The blind-arm projection-error SLI (issue #636): `projected − session_at_recovery` percentiles
+/// for the REPORT-ONLY blind velocity-projection arm ([`crate::daemon`]'s
+/// `blind_velocity_projected_armed`, issues #584/#600), in percentage points.
+///
+/// POSITIVE = the arm over-projected (it would have cried DEGRADED further ahead of the real burn
+/// than the account actually got); NEGATIVE = it under-projected (the account burned past where the
+/// inflated forecast put it — the failure mode the arm exists to prevent). The distribution's centre
+/// and spread are the tuning input for [`crate::daemon`]'s interim, ratification-pending
+/// `BLIND_VELOCITY_RATE_INFLATION = 1.75`, which is the primary value here — the observed burns are
+/// small (single-digit pp), so this is a calibration instrument, not a catastrophe detector.
+///
+/// **Survivorship guard (mandatory, issue #484).** The percentiles are NEVER published bare: every
+/// renderer emits them paired with the counts below, and with the censoring disclosure. `blind_window`
+/// fires only on the `None -> live` RECOVERY edge of the ACTIVE account, so the population here is
+/// RECOVERED-ONLY by construction — measuring the EASY episodes. The two censored tails
+/// ([`Self::n_swapped_away`] / [`Self::n_never_recovered`]) are structurally invisible to this event
+/// and are reported as `None`, never as a fabricated `0`; the uncensored `blind_enter` / `blind_exit`
+/// denominator that populates them is issue #591's, and this SLI consumes rather than duplicates it.
+///
+/// **Domain guard.** The scored population is the arm's OWN domain: windows past
+/// [`crate::daemon::BLIND_GATE_SECS`], the gate the arm checks FIRST. The daemon stamps #634's
+/// ingredients on shorter windows too, but the arm returns `false` on them before projecting
+/// anything — and on the production log four fifths of `blind_window` lines are under the gate, so
+/// scoring them would drag P50 (this readout's own stated tuning output) toward zero and read as
+/// "1.75 is well calibrated" on episodes the arm never evaluated. They are excluded and COUNTED.
+///
+/// Percentiles are `None` on an empty reconcilable population — cardinality-zero is not a passing
+/// `0` (the [`SwapOvershoot`] discipline), so a `1.75` tuning verdict is never asserted on no data.
+#[derive(Debug, PartialEq)]
+struct BlindProjectionError {
+    /// Every `blind_window` line in view — the denominator the buckets below partition exactly:
+    /// `n_blind_windows == n_projectable + n_below_arm_gate + n_without_velocity + n_malformed`.
+    n_blind_windows: usize,
+    /// Windows inside the arm's domain that carried #634's velocity ingredients — the projectable
+    /// population. Partitioned exactly by `n_reconcilable + n_sentinel_excluded`.
+    n_projectable: usize,
+    /// Projectable windows with a real actual (`session_at_recovery > 0`) — the percentile subject.
+    n_reconcilable: usize,
+    /// Projectable windows dropped for the `session_at_recovery = 0` session-window-RESET sentinel:
+    /// the 5 h window rolled mid-blindness, so the account never "arrived" anywhere and the
+    /// difference would measure the reset, not the forecast. Same reset-drop discipline the #608
+    /// `usage_velocity` arm applies to a negative rate — reported as a count, not swallowed.
+    n_sentinel_excluded: usize,
+    /// Windows shorter than the arm's first gate — it never projected here, so there is nothing to
+    /// grade. See [`BlindWindowCensus::below_arm_gate`] for the disclosed today's-`T` bound.
+    n_below_arm_gate: usize,
+    /// In-domain windows with NO retained velocity — the arm's second gate could not pass, so there
+    /// was no projection to score. Coverage context, not a zero error.
+    n_without_velocity: usize,
+    /// Windows this reader could not classify (corrupt fields, or a projection that overflowed).
+    /// Reported rather than silently dropped: an undisclosed drop is a missing denominator, which is
+    /// precisely the survivorship failure the rest of this block guards against.
+    n_malformed: usize,
+    /// Episodes the daemon SWAPPED AWAY from before they recovered. Always `None`: `blind_window` is
+    /// active-scoped, so an episode the daemon swaps off is structurally unrecordable by it. Filled
+    /// in when issue #591's censoring-aware denominator lands — `None` is the honest "unobservable",
+    /// distinct from an observed `0` (the same still-pending shape as [`FalseProjection::rate`]).
+    n_swapped_away: Option<usize>,
+    /// Episodes that NEVER recovered. Always `None` for the mirrored reason: `blind_window` fires on
+    /// the RECOVERY edge, so an account that goes dark and stays dark emits nothing at all — the
+    /// episode is invisible precisely when it is worst. Issue #591 owns it.
+    n_never_recovered: Option<usize>,
+    /// Error percentiles in percentage points, rounded to 2 dp (see [`round_pp`]). Signed.
+    p50: Option<f64>,
+    p95: Option<f64>,
+    p100: Option<f64>,
+}
+
+/// Round a percentage-point error to 2 dp for display and the wire.
+///
+/// Applied at AGGREGATION, not per-renderer, so the human text and the `--json` document cannot
+/// report different numbers for the same episode. The trailing `+ 0.0` normalizes IEEE `-0.0` (an
+/// error that rounds to zero from below) to `0.0`, so a spot-on projection renders `+0.00` rather
+/// than the confusing `-0.00`.
+fn round_pp(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0 + 0.0
+}
+
 /// 429-rate neutrality counts.
 #[derive(Debug, PartialEq)]
 struct RateLimit {
@@ -819,6 +1073,9 @@ struct Report {
     false_preempt: FalsePreempt,
     /// The #539 false-projection SLI (velocity-projection swaps observed; real rate pending).
     false_projection: FalseProjection,
+    /// The #636 blind-arm projection error — `projected − session_at_recovery` percentiles, paired
+    /// with the cardinality + censoring counts that keep them from reading as the whole blind story.
+    blind_projection_error: BlindProjectionError,
     rate_limit: RateLimit,
 }
 
@@ -877,6 +1134,40 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         p100: velocity_pct(1.0),
     };
 
+    // The #636 blind-arm projection error. The sentinel split happens HERE rather than at parse, so
+    // the excluded count is reported instead of silently vanishing: `session_at_recovery = 0` is the
+    // session-window RESET, which would otherwise enter the distribution as a huge phantom
+    // over-projection and swamp the single-digit-pp signal this SLI is tuning `1.75` against. The
+    // `arrived_pct = 0` sentinel is the strict complement of the reconcilable set, so its count is
+    // exact by construction — nothing escapes the split.
+    let errors: Vec<f64> = inputs
+        .blind_projections
+        .iter()
+        .filter(|p| p.arrived_pct > 0)
+        .map(|p| p.projected_pct - f64::from(p.arrived_pct))
+        .collect();
+    let error_n = errors.len();
+    let n_sentinel_excluded = inputs.blind_projections.len() - error_n;
+    let error_pct = |p: f64| -> Option<f64> {
+        (error_n > 0).then(|| round_pp(crate::percentile::percentile(&errors, p)))
+    };
+    let blind_projection_error = BlindProjectionError {
+        n_blind_windows: inputs.blind_window_census.total,
+        n_projectable: inputs.blind_projections.len(),
+        n_reconcilable: error_n,
+        n_sentinel_excluded,
+        n_below_arm_gate: inputs.blind_window_census.below_arm_gate,
+        n_without_velocity: inputs.blind_window_census.without_velocity,
+        n_malformed: inputs.blind_window_census.malformed,
+        // Both censored tails are unobservable from `blind_window` — `None`, never a fabricated 0.
+        // Issue #591's uncensored `blind_enter`/`blind_exit` denominator populates them.
+        n_swapped_away: None,
+        n_never_recovered: None,
+        p50: error_pct(0.50),
+        p95: error_pct(0.95),
+        p100: error_pct(1.0),
+    };
+
     Report {
         window,
         swap_overshoot,
@@ -893,6 +1184,7 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
             velocity_preempt_swaps_observed: inputs.velocity_preempt_swaps,
             rate: None,
         },
+        blind_projection_error,
         rate_limit: RateLimit {
             rate_limited: inputs.rate_limited,
             transient: inputs.transient,
@@ -1083,6 +1375,42 @@ fn render_human(r: &Report) -> String {
         r.false_projection.velocity_preempt_swaps_observed
     ));
 
+    // SLI 6 — blind-arm projection error (issue #636): the REPORT-ONLY blind velocity-projection
+    // arm's forecast, recomputed from #634's stamped ingredients, against the durable actual on the
+    // same line. The percentiles are ALWAYS preceded by their cardinality line and ALWAYS followed
+    // by the censoring disclosure — the #484 survivorship guard: this population is recovered-only,
+    // so a bare percentile would read as the whole blind story when it is the easy half of it.
+    let e = &r.blind_projection_error;
+    out.push_str(
+        "blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)\n",
+    );
+    out.push_str(&format!(
+        "  reconcilable n={} of {} projectable ({} excluded: session_at_recovery=0 window-reset sentinel), from {} blind windows\n",
+        e.n_reconcilable, e.n_projectable, e.n_sentinel_excluded, e.n_blind_windows
+    ));
+    out.push_str(&format!(
+        "  outside the arm's domain: {} below the T={}s gate; {} with no retained velocity; {} malformed\n",
+        e.n_below_arm_gate,
+        crate::daemon::BLIND_GATE_SECS,
+        e.n_without_velocity,
+        e.n_malformed
+    ));
+    out.push_str(
+        "  censoring: RECOVERED-ONLY — swapped-away and never-recovered episodes are unobservable from blind_window (issue #591 owns the uncensored denominator)\n",
+    );
+    match (e.p50, e.p95, e.p100) {
+        (Some(p50), Some(p95), Some(p100)) => {
+            // Signed and explicitly so: positive = over-projected (cried DEGRADED early), negative =
+            // under-projected (burned past the inflated forecast — the failure the arm exists to
+            // prevent). Dropping the sign would erase the whole direction of the tuning signal.
+            out.push_str(&format!("  P50  = {p50:+.2} pp\n"));
+            out.push_str(&format!("  P95  = {p95:+.2} pp\n"));
+            out.push_str(&format!("  P100 = {p100:+.2} pp\n"));
+        }
+        _ => out.push_str("  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)\n"),
+    }
+    out.push('\n');
+
     // SLI 4 — 429-rate neutrality (roster-wide counts; active attribution is a follow-up).
     out.push_str(&format!(
         "usage-poll 429 neutrality (roster-wide): rate_limited={} transient={} cleared={}\n",
@@ -1113,6 +1441,8 @@ struct ReliabilityWire {
     false_preempt: FalsePreemptWire,
     /// The #539 false-projection SLI (schema:3, additive).
     false_projection: FalseProjectionWire,
+    /// The #636 blind-arm projection error (schema:7, additive).
+    blind_projection_error: BlindProjectionErrorWire,
     rate_limit_neutrality: RateLimitWire,
 }
 
@@ -1254,6 +1584,48 @@ struct FalseProjectionWire {
     rate: Option<f64>,
 }
 
+/// Blind-arm projection-error block (issue #636): `projected − session_at_recovery` percentiles in
+/// percentage points, SIGNED (positive = over-projected, negative = under-projected — the burn ran
+/// past the inflated forecast).
+///
+/// The percentiles are never published alone: the four counts above them carry the cardinality and
+/// the sentinel exclusion, and the two `null` census fields carry the CENSORING — this population is
+/// recovered-only, because `blind_window` fires on the recovery edge of the active account. A
+/// consumer that reads `p100` without reading `n_swapped_away` / `n_never_recovered` is reading the
+/// easy half of the distribution; those two are `null` (unobservable), NEVER `0`, until issue #591's
+/// uncensored `blind_enter`/`blind_exit` denominator lands. `p50`/`p95`/`p100` are `null` on an empty
+/// reconcilable population (an empty subject is not a passing `0 pp` error).
+#[derive(serde::Serialize)]
+struct BlindProjectionErrorWire {
+    /// Every `blind_window` line in view. Partitioned EXACTLY by `n_projectable +
+    /// n_below_arm_gate + n_without_velocity + n_malformed`, so no line goes undisclosed.
+    n_blind_windows: usize,
+    /// In-domain windows carrying #634's velocity ingredients (`n_reconcilable +
+    /// n_sentinel_excluded`).
+    n_projectable: usize,
+    /// The percentile subject: projectable windows with a real actual (`session_at_recovery > 0`).
+    n_reconcilable: usize,
+    /// Excluded for the `session_at_recovery = 0` session-window-RESET sentinel.
+    n_sentinel_excluded: usize,
+    /// Windows shorter than the arm's first gate (`T` seconds, `arm_gate_secs` below) — the arm
+    /// never projected here, so there is no forecast to grade.
+    n_below_arm_gate: usize,
+    /// In-domain windows with no retained velocity — the arm's second gate (coverage, not error).
+    n_without_velocity: usize,
+    /// Windows dropped as corrupt (unreadable fields, or a projection that overflowed).
+    n_malformed: usize,
+    /// The arm's first gate in seconds, at TODAY's value — stamped here because it is NOT on the
+    /// log line, so a consumer can tell which `T` this partition was computed with.
+    arm_gate_secs: u64,
+    /// Swapped-away episodes. Always `null`: unobservable from the active-scoped `blind_window`.
+    n_swapped_away: Option<usize>,
+    /// Never-recovered episodes. Always `null`: unobservable from the recovery-edge `blind_window`.
+    n_never_recovered: Option<usize>,
+    p50: Option<f64>,
+    p95: Option<f64>,
+    p100: Option<f64>,
+}
+
 /// 429-rate neutrality counts.
 #[derive(serde::Serialize)]
 struct RateLimitWire {
@@ -1335,6 +1707,21 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
         false_projection: FalseProjectionWire {
             velocity_preempt_swaps_observed: r.false_projection.velocity_preempt_swaps_observed,
             rate: r.false_projection.rate,
+        },
+        blind_projection_error: BlindProjectionErrorWire {
+            n_blind_windows: r.blind_projection_error.n_blind_windows,
+            n_projectable: r.blind_projection_error.n_projectable,
+            n_reconcilable: r.blind_projection_error.n_reconcilable,
+            n_sentinel_excluded: r.blind_projection_error.n_sentinel_excluded,
+            n_below_arm_gate: r.blind_projection_error.n_below_arm_gate,
+            n_without_velocity: r.blind_projection_error.n_without_velocity,
+            n_malformed: r.blind_projection_error.n_malformed,
+            arm_gate_secs: crate::daemon::BLIND_GATE_SECS,
+            n_swapped_away: r.blind_projection_error.n_swapped_away,
+            n_never_recovered: r.blind_projection_error.n_never_recovered,
+            p50: r.blind_projection_error.p50,
+            p95: r.blind_projection_error.p95,
+            p100: r.blind_projection_error.p100,
         },
         rate_limit_neutrality: RateLimitWire {
             rate_limited: r.rate_limit.rate_limited,
@@ -1585,6 +1972,12 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "false-projection (velocity-projection swap fired ahead of the observed overshoot)\n",
                 "  velocity-projection swaps observed: 0\n",
                 "\n",
+                "blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)\n",
+                "  reconcilable n=0 of 0 projectable (0 excluded: session_at_recovery=0 window-reset sentinel), from 3 blind windows\n",
+                "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed\n",
+                "  censoring: RECOVERED-ONLY — swapped-away and never-recovered episodes are unobservable from blind_window (issue #591 owns the uncensored denominator)\n",
+                "  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)\n",
+                "\n",
                 "usage-poll 429 neutrality (roster-wide): rate_limited=2 transient=1 cleared=1\n",
             )
         );
@@ -1600,19 +1993,22 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     }
 
     #[test]
-    fn json_render_is_stable_schema_6() {
+    fn json_render_is_stable_schema_7() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
-        // schema:1–5 — the additive contract (#494/#539/#595/#608) plus the one #635 rename. The #608
-        // `observed_peak` object is always-present (n=1 here — the FIXTURE_LOG's single usage_velocity
-        // line at 0.20 %/min, well under the 6.95 v_peak, so v_peak_honest=true). A `--since` document
-        // is asserted separately in `json_documents_the_active_window`.
+        // schema:1–5 — the additive contract (#494/#539/#595/#608/#636) plus the one #635 rename. The
+        // #608 `observed_peak` object is always-present (n=1 here — the FIXTURE_LOG's single
+        // usage_velocity line at 0.20 %/min, well under the 6.95 v_peak, so v_peak_honest=true), as is
+        // the #636 `blind_projection_error` object (schema:7 — the FIXTURE_LOG's three blind_window
+        // lines predate #634's ingredients, so all three land in `n_without_velocity` and no
+        // percentile is asserted). A `--since` document is asserted separately in
+        // `json_documents_the_active_window`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 6,\n",
+                "  \"schema\": 7,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -1679,6 +2075,21 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "    \"velocity_preempt_swaps_observed\": 0,\n",
                 "    \"rate\": null\n",
                 "  },\n",
+                "  \"blind_projection_error\": {\n",
+                "    \"n_blind_windows\": 3,\n",
+                "    \"n_projectable\": 0,\n",
+                "    \"n_reconcilable\": 0,\n",
+                "    \"n_sentinel_excluded\": 0,\n",
+                "    \"n_below_arm_gate\": 2,\n",
+                "    \"n_without_velocity\": 1,\n",
+                "    \"n_malformed\": 0,\n",
+                "    \"arm_gate_secs\": 300,\n",
+                "    \"n_swapped_away\": null,\n",
+                "    \"n_never_recovered\": null,\n",
+                "    \"p50\": null,\n",
+                "    \"p95\": null,\n",
+                "    \"p100\": null\n",
+                "  },\n",
                 "  \"rate_limit_neutrality\": {\n",
                 "    \"rate_limited\": 2,\n",
                 "    \"transient\": 1,\n",
@@ -1701,6 +2112,347 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
             "no-data P50 must be null: {out}"
         );
         assert!(out.contains("\"met\": {\n      \"p50\": null,\n      \"p100\": null\n    }"));
+    }
+
+    // --- issue #636: the blind-arm projection error ---------------------------
+
+    /// A `blind_window` fixture spanning every census bucket: the three lines the SLI must SCORE,
+    /// and the four it must not — the `session_at_recovery=0` window-reset sentinel, two windows
+    /// under the arm's own duration gate, and a pre-#634 line with no ingredients at all.
+    ///
+    /// The arithmetic is `projected = session_pct + rate × inflation × duration_secs`
+    /// ([`crate::daemon`]'s `blind_velocity_projected_armed`), recomputed from each line's OWN
+    /// stamped tokens:
+    ///
+    /// - u-A: `30 + 0.01 × 1.75 × 600  = 40.50` vs 40 ⇒ **+0.50** (mild over-projection)
+    /// - u-B: `55 + 0.01 × 1.75 × 900  = 70.75` vs 75 ⇒ **−4.25** (UNDER-projected — the account
+    ///   burned past the inflated forecast, the failure direction the arm exists to prevent)
+    /// - u-C: `40 + 0.008 × 1.75 × 1800 = 65.20` vs 52 ⇒ **+13.20**
+    /// - u-D: `62 + 0.015 × 1.75 × 1200 = 93.50` vs **0** ⇒ SENTINEL-EXCLUDED. Left in deliberately
+    ///   as a guard with teeth: admitted, its `+93.50` phantom would become P95/P100 and swamp the
+    ///   single-digit-pp signal the readout tunes `1.75` against, so a regression fails loudly.
+    /// - u-E: past the gate but NO ingredients ⇒ `without_velocity` coverage, never a `0 pp` error.
+    /// - u-F (`200 s`) / u-G (exactly `300 s`) ⇒ BELOW the arm's `T` gate. Both carry full
+    ///   ingredients — because the daemon stamps them regardless of duration — and both would score
+    ///   a tiny `+0.05` error that drags P50 toward "1.75 is perfectly calibrated" on windows the
+    ///   arm never evaluated. u-G pins the boundary as EXCLUSIVE (`blind_secs <= T` ⇒ no arm), the
+    ///   same comparator the arm itself uses.
+    ///
+    /// Every scored line is `near_limit=false` — the climbing population is exactly the one the
+    /// near-limit gate would discard, so this fixture also pins that the fold runs BEFORE that gate.
+    const BLIND_PROJECTION_LOG: &str = "\
+ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=900 session_pct=55 session_at_recovery=75 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=1800 session_pct=40 session_at_recovery=52 near_limit=false rate=0.008000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:40:00Z event=blind_window acct=u-D duration_secs=1200 session_pct=62 session_at_recovery=0 near_limit=false rate=0.015000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:50:00Z event=blind_window acct=u-E duration_secs=600 session_pct=80 session_at_recovery=82 near_limit=false
+ts=2026-07-11T01:00:00Z event=blind_window acct=u-F duration_secs=200 session_pct=30 session_at_recovery=31 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pct=30 session_at_recovery=31 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+";
+
+    #[test]
+    fn blind_projection_error_recomputes_the_forecast_from_the_logged_ingredients() {
+        let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, None), &[], None);
+        let e = &r.blind_projection_error;
+        // Sorted errors [−4.25, +0.50, +13.20], n=3 — nearest rank: P50=ceil(.5·3)=2 → +0.50,
+        // P95=ceil(.95·3)=3 → +13.20, P100 → +13.20.
+        assert_eq!(e.p50, Some(0.5));
+        assert_eq!(e.p95, Some(13.2));
+        assert_eq!(e.p100, Some(13.2));
+    }
+
+    #[test]
+    fn blind_projection_error_publishes_cardinality_and_censoring_beside_the_percentiles() {
+        let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, None), &[], None);
+        let e = &r.blind_projection_error;
+        // The mandatory survivorship pairing (issue #484). Every count is published, and BOTH
+        // partitions close exactly — no `blind_window` line can go undisclosed between parse and
+        // render, because an undisclosed drop IS a missing denominator.
+        assert_eq!(e.n_blind_windows, 7);
+        assert_eq!(e.n_projectable, 4);
+        assert_eq!(e.n_reconcilable, 3);
+        assert_eq!(e.n_sentinel_excluded, 1);
+        assert_eq!(e.n_below_arm_gate, 2);
+        assert_eq!(e.n_without_velocity, 1);
+        assert_eq!(e.n_malformed, 0);
+        assert_eq!(e.n_projectable, e.n_reconcilable + e.n_sentinel_excluded);
+        assert_eq!(
+            e.n_blind_windows,
+            e.n_projectable + e.n_below_arm_gate + e.n_without_velocity + e.n_malformed,
+            "every blind_window line must land in exactly one disclosed bucket"
+        );
+        // The two censored tails are UNOBSERVABLE from `blind_window` (recovery-edge + active-scoped),
+        // so they read `None` — never a fabricated `0`, which would assert this recovered-only
+        // population is the whole blind story. Issue #591's uncensored denominator fills them in.
+        assert_eq!(e.n_swapped_away, None);
+        assert_eq!(e.n_never_recovered, None);
+    }
+
+    #[test]
+    fn blind_projection_error_scores_only_the_arms_own_domain() {
+        // The arm checks `blind_secs > BLIND_GATE_SECS` FIRST and returns before projecting anything,
+        // but the daemon stamps the #634 ingredients regardless of duration — so a reader that scores
+        // every ingredient-bearing line grades the arm on windows it never evaluated. On the live log
+        // that is ~80 % of them, and their errors are dominated by anchor staleness rather than the
+        // inflation factor, so admitting them drags P50 toward zero and reads as "1.75 is well
+        // calibrated". u-F/u-G would each contribute `30 + 0.01×1.75×200 = 30.35` vs 31 ⇒ −0.65 and
+        // `30 + 0.01×1.75×300 = 30.525` vs 31 ⇒ −0.475; admitted, the five-sample P50 becomes −0.475
+        // instead of the in-domain +0.50 — the tuning verdict inverts on a population the arm never
+        // touched. These assertions fail the moment the domain gate is dropped.
+        let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, None), &[], None);
+        let e = &r.blind_projection_error;
+        assert_eq!(e.n_below_arm_gate, 2, "u-F (200s) and u-G (exactly 300s)");
+        assert_eq!(
+            e.n_reconcilable, 3,
+            "the below-gate pair must not be scored"
+        );
+        assert_eq!(e.p50, Some(0.5), "P50 must be the in-domain median");
+    }
+
+    #[test]
+    fn blind_projection_error_gate_boundary_is_exclusive_like_the_arms_own() {
+        // `blind_velocity_projected_armed` bails on `blind_secs <= BLIND_GATE_SECS`, so a window of
+        // EXACTLY `T` is outside the domain and one of `T + 1` is inside. Pinned against the shared
+        // constant rather than a literal, so a future `T` move cannot silently desynchronize the
+        // offline grader from the runtime arm it grades.
+        let line = |secs: u64| {
+            format!(
+                "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs={secs} session_pct=30 session_at_recovery=31 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00\n"
+            )
+        };
+        let at_gate = parse_events(&line(crate::daemon::BLIND_GATE_SECS), None);
+        assert_eq!(at_gate.blind_window_census.below_arm_gate, 1);
+        assert!(at_gate.blind_projections.is_empty());
+
+        let past_gate = parse_events(&line(crate::daemon::BLIND_GATE_SECS + 1), None);
+        assert_eq!(past_gate.blind_window_census.below_arm_gate, 0);
+        assert_eq!(past_gate.blind_projections.len(), 1);
+    }
+
+    #[test]
+    fn blind_projection_error_excludes_the_session_reset_sentinel() {
+        let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, None), &[], None);
+        let e = &r.blind_projection_error;
+        // u-D's `session_at_recovery=0` is the session-window RESET, not an arrival at 0: admitting it
+        // would score a `93.50 − 0 = +93.50` phantom, which as the max would become BOTH P95 and P100
+        // and bury the real single-digit-pp spread. These two assertions are the ones that fail if the
+        // exclusion is ever dropped.
+        assert_eq!(e.n_sentinel_excluded, 1);
+        assert_eq!(e.p100, Some(13.2), "the sentinel must not become the max");
+    }
+
+    #[test]
+    fn blind_projection_error_is_scored_outside_the_near_limit_gate() {
+        // Every scored line above is `near_limit=false`, so the two near-limit SLIs see nothing at all
+        // while the projection error sees four windows. This pins that the fold runs BEFORE the
+        // near-limit gate: were it inside, the climbing population (#584's whole point) would vanish.
+        let inputs = parse_events(BLIND_PROJECTION_LOG, None);
+        assert_eq!(inputs.time_blind_near_limit_secs, 0);
+        assert!(inputs.near_limit_reconciliations.is_empty());
+        assert_eq!(inputs.blind_projections.len(), 4);
+        assert_eq!(inputs.blind_window_census.total, 7);
+    }
+
+    #[test]
+    fn blind_projection_error_is_none_on_an_empty_population() {
+        // Cardinality-zero discipline: no reconcilable window ⇒ `None`, never a passing `0 pp` (which
+        // would read as a perfectly-calibrated `1.75`). Checked on BOTH empty shapes — a log with no
+        // blind windows at all, and one whose only projectable window is the excluded sentinel.
+        let empty = aggregate(&parse_events("", None), &[], None);
+        assert_eq!(empty.blind_projection_error.n_blind_windows, 0);
+        assert_eq!(empty.blind_projection_error.n_projectable, 0);
+        assert_eq!(empty.blind_projection_error.n_reconcilable, 0);
+        assert_eq!(empty.blind_projection_error.p50, None);
+        assert_eq!(empty.blind_projection_error.p95, None);
+        assert_eq!(empty.blind_projection_error.p100, None);
+
+        let sentinel_only = aggregate(
+            &parse_events(
+                "ts=2026-07-11T00:40:00Z event=blind_window acct=u-D duration_secs=1200 session_pct=62 session_at_recovery=0 near_limit=false rate=0.015000 inflation=1.75 ceiling=95.00\n",
+                None,
+            ),
+            &[],
+            None,
+        );
+        assert_eq!(sentinel_only.blind_projection_error.n_projectable, 1);
+        assert_eq!(sentinel_only.blind_projection_error.n_sentinel_excluded, 1);
+        assert_eq!(sentinel_only.blind_projection_error.n_reconcilable, 0);
+        assert_eq!(sentinel_only.blind_projection_error.p100, None);
+    }
+
+    #[test]
+    fn blind_projection_error_classifies_corruption_apart_from_coverage() {
+        // A CORRUPT record is not evidence that "the arm could not have armed" — folding the two
+        // together would report corruption as coverage, and dropping it from both counters would
+        // leave a silent hole in the denominator (the survivorship failure this block exists to
+        // prevent: 40 truncated lines would render as a clean full-coverage readout over 60 % of the
+        // data). Five corruption shapes, each landing in `malformed` and none in `without_velocity`.
+        let inputs = parse_events(
+            "\
+ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=oops inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=NaN inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=600 session_pct=30 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:40:00Z event=blind_window acct=u-D near_limit=false
+ts=2026-07-11T00:50:00Z event=blind_window acct=u-E duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=1e300 inflation=1e300 ceiling=95.00
+",
+            None,
+        );
+        assert!(inputs.blind_projections.is_empty());
+        assert_eq!(inputs.blind_window_census.total, 5);
+        assert_eq!(inputs.blind_window_census.malformed, 5);
+        assert_eq!(inputs.blind_window_census.without_velocity, 0);
+        assert_eq!(inputs.blind_window_census.below_arm_gate, 0);
+    }
+
+    #[test]
+    fn blind_projection_error_never_publishes_a_non_finite_percentile() {
+        // `rate=1e300 inflation=1e300` each pass an individual `is_finite()` check, but their PRODUCT
+        // overflows: the projection becomes `inf` (and with a zero duration, `inf × 0 = NaN`). Left
+        // unguarded, the human text would print `P100 = +inf pp` while `--json` printed `"p100":
+        // null` — and this schema defines `null` as "empty population", so a machine consumer would
+        // read cardinality-1-with-no-data instead of a corrupt record. The two renderers must never
+        // disagree about the same episode; the guard is on the RESULT, not the inputs.
+        for line in [
+            "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=1e300 inflation=1e300 ceiling=95.00\n",
+            "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=1e300 inflation=-1e300 ceiling=95.00\n",
+        ] {
+            let r = aggregate(&parse_events(line, None), &[], None);
+            let e = &r.blind_projection_error;
+            assert_eq!(e.n_malformed, 1, "overflow is corruption: {line}");
+            assert_eq!(e.n_reconcilable, 0);
+            assert_eq!(e.p100, None);
+            let human = render_human(&r);
+            assert!(!human.contains("inf"), "no inf in human text: {human}");
+            assert!(!human.contains("NaN"), "no NaN in human text: {human}");
+            // The wire's `null` must mean what the schema says it means — empty population — so a
+            // `null` percentile can never sit beside a non-zero reconcilable count.
+            let json = render_json(&r).expect("wire serializes");
+            assert!(json.contains("\"n_reconcilable\": 0,"), "{json}");
+        }
+    }
+
+    #[test]
+    fn blind_projection_error_render_pairs_percentiles_with_their_censoring() {
+        let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, None), &[], None);
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "  reconcilable n=3 of 4 projectable (1 excluded: session_at_recovery=0 window-reset sentinel), from 7 blind windows\n"
+            ),
+            "percentiles must never be published bare: {human}"
+        );
+        assert!(
+            human.contains(
+                "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed\n"
+            ),
+            "the out-of-domain split must be published beside the percentiles: {human}"
+        );
+        assert!(
+            human.contains("  censoring: RECOVERED-ONLY"),
+            "the survivorship disclosure is mandatory: {human}"
+        );
+        // Signed rendering: the direction of the error IS the tuning signal, so a negative P50 must
+        // stay visibly negative and a positive one visibly positive.
+        assert!(human.contains("  P50  = +0.50 pp\n"), "{human}");
+        assert!(human.contains("  P100 = +13.20 pp\n"), "{human}");
+
+        let json = render_json(&r).expect("wire serializes");
+        assert!(json.contains("\"n_blind_windows\": 7,"), "{json}");
+        assert!(json.contains("\"n_reconcilable\": 3,"), "{json}");
+        assert!(json.contains("\"n_sentinel_excluded\": 1,"), "{json}");
+        assert!(json.contains("\"n_below_arm_gate\": 2,"), "{json}");
+        assert!(json.contains("\"n_without_velocity\": 1,"), "{json}");
+        assert!(json.contains("\"n_malformed\": 0,"), "{json}");
+        assert!(json.contains("\"arm_gate_secs\": 300,"), "{json}");
+        assert!(json.contains("\"n_swapped_away\": null,"), "{json}");
+        assert!(json.contains("\"n_never_recovered\": null,"), "{json}");
+        assert!(json.contains("\"p50\": 0.5,"), "{json}");
+        assert!(json.contains("\"p100\": 13.2"), "{json}");
+    }
+
+    #[test]
+    fn blind_projection_error_renders_an_under_projection_with_its_sign() {
+        // A distribution whose worst case is an UNDER-projection: the account burned 6 pp past the
+        // inflated forecast. `60 + 0.005 × 1.75 × 600 = 65.25` vs 71 ⇒ −5.75. Rendering this as
+        // `5.75` would invert the tuning verdict — 1.75 reads too HIGH when it is too LOW.
+        let r = aggregate(
+            &parse_events(
+                "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=60 session_at_recovery=71 near_limit=false rate=0.005000 inflation=1.75 ceiling=95.00\n",
+                None,
+            ),
+            &[],
+            None,
+        );
+        assert_eq!(r.blind_projection_error.p100, Some(-5.75));
+        assert!(
+            render_human(&r).contains("  P100 = -5.75 pp\n"),
+            "an under-projection must keep its sign"
+        );
+    }
+
+    #[test]
+    fn blind_projection_error_normalizes_negative_zero_to_a_positive_display() {
+        // A spot-on projection that rounds to zero FROM BELOW: `40 + 0.000950 × 1.75 × 600 = 40.9975`
+        // vs 41 ⇒ −0.0025, which `f64::round` sends to IEEE −0.0. Without `round_pp`'s `+ 0.0`
+        // normalization that renders as the confusing `-0.00 pp`. `Some(0.0) == Some(-0.0)` is true in
+        // IEEE, so a percentile equality check CANNOT catch a regression here (removing `+ 0.0` leaves
+        // every other test green — mutation-verified) — this locks it on the sign bit and the rendered
+        // bytes instead.
+        assert!(
+            !round_pp(-0.0025).is_sign_negative(),
+            "round_pp must normalize a rounds-to-zero-from-below error to +0.0, not -0.0"
+        );
+        let r = aggregate(
+            &parse_events(
+                "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=40 session_at_recovery=41 near_limit=false rate=0.000950 inflation=1.75 ceiling=95.00\n",
+                None,
+            ),
+            &[],
+            None,
+        );
+        assert!(
+            !r.blind_projection_error.p100.unwrap().is_sign_negative(),
+            "a near-zero error must not carry a negative sign into the report"
+        );
+        let human = render_human(&r);
+        assert!(human.contains("  P100 = +0.00 pp\n"), "{human}");
+        assert!(
+            !human.contains("-0.00"),
+            "no negative zero in the display: {human}"
+        );
+    }
+
+    #[test]
+    fn blind_projection_error_reads_the_stamped_inflation_not_a_todays_constant() {
+        // #634 stamps `inflation=` per line precisely so an OLD window is never re-read through a NEW
+        // factor. Two identical windows differing only in the stamped factor must therefore score
+        // differently: `30 + 0.01 × 1.00 × 600 = 36` vs 40 ⇒ −4.00, against u-A's 1.75 ⇒ +0.50.
+        let r = aggregate(
+            &parse_events(
+                "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=0.010000 inflation=1.00 ceiling=95.00\n",
+                None,
+            ),
+            &[],
+            None,
+        );
+        assert_eq!(r.blind_projection_error.p100, Some(-4.0));
+    }
+
+    #[test]
+    fn blind_projection_error_is_bounded_by_the_active_window() {
+        // `--since` bounds this SLI like every other: the cutoff drops u-A/u-B, leaving u-C (+13.20),
+        // the sentinel, and the no-velocity line. A single remaining sample is its own P50/P95/P100.
+        let cutoff = epoch("2026-07-11T00:25:00Z");
+        let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, Some(cutoff)), &[], None);
+        let e = &r.blind_projection_error;
+        assert_eq!(e.n_blind_windows, 5, "u-A and u-B fall before the cutoff");
+        assert_eq!(e.n_projectable, 2);
+        assert_eq!(e.n_reconcilable, 1);
+        assert_eq!(e.n_sentinel_excluded, 1);
+        assert_eq!(e.n_below_arm_gate, 2);
+        assert_eq!(e.n_without_velocity, 1);
+        assert_eq!(e.p50, Some(13.2));
+        assert_eq!(e.p100, Some(13.2));
     }
 
     // --- issue #494: the `--since` window --------------------------------------
@@ -1902,7 +2654,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 6,"), "schema bumped to 6: {out}");
+        assert!(out.contains("\"schema\": 7,"), "schema bumped to 7: {out}");
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",
