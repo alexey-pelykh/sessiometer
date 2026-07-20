@@ -181,8 +181,8 @@ pub(crate) use run_loop::{swap_report, unrecoverable_report};
 
 /// Per-cycle clamp bounds for the swap-away trigger draw, in PERCENT — mirrors
 /// config's `session_ceiling` range so a jittered draw can never escape it.
-const TRIGGER_PCT_LO: f64 = 50.0;
-const TRIGGER_PCT_HI: f64 = 99.0;
+const SESSION_CEILING_PCT_LO: f64 = 50.0;
+const SESSION_CEILING_PCT_HI: f64 = 99.0;
 /// Per-cycle clamp bounds for the WEEKLY swap-away trigger draw, in PERCENT
 /// (issue #41) — mirrors config's `weekly_ceiling` range. Its own constants
 /// (numerically equal to the session bounds today) so the two triggers stay
@@ -2051,12 +2051,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     clock: K,
     claude_json: PathBuf,
     /// Per-cycle swap-away trigger strategy (issue #38): drawn + clamped to
-    /// `50..=99` percent each cycle, then `/100` for the swap decision. Replaces
-    /// the former fixed `session_ceiling` fraction.
-    trigger_strategy: Strategy,
+    /// `50..=99` percent each cycle, then `/100` for the swap decision. Distinct from
+    /// [`Self::session_ceiling_base`] (the un-jittered base it draws around), which the
+    /// deterministic display paths key off instead.
+    session_ceiling_strategy: Strategy,
     /// Per-cycle WEEKLY swap-away trigger strategy (issue #41): drawn + clamped to
     /// `50..=99` percent each cycle, then `/100` for the swap decision — the
-    /// weekly-dimension counterpart of `trigger_strategy`, independent of it.
+    /// weekly-dimension counterpart of `session_ceiling_strategy`, independent of it.
     weekly_ceiling_strategy: Strategy,
     /// Base WEEKLY CEILING as a fraction (`weekly_ceiling / 100`), un-jittered — the configured
     /// not-cross line itself (issue #607 reframed this from a fire-AT trigger), and the SAME value
@@ -2311,7 +2312,7 @@ where
             stash,
             clock,
             claude_json,
-            trigger_strategy: tunables.trigger_strategy,
+            session_ceiling_strategy: tunables.session_ceiling_strategy,
             weekly_ceiling_strategy: tunables.weekly_ceiling_strategy,
             // The un-jittered RAW weekly ceiling (the operator's not-cross line). The
             // deterministic `status` `weekly_exhausted` verdict + `use` gate key off the
@@ -4250,10 +4251,11 @@ where
         // stay independent — swap when EITHER reaches its own fire point; below BOTH → hold. Both are
         // drawn every cycle (a fixed strategy consumes no RNG, and `draw_downward` consumes the same
         // per-mode RNG count as `draw`), keeping the per-cycle draw order deterministic.
-        let session_ceiling =
-            self.trigger_strategy
-                .draw_downward(&mut self.rng, TRIGGER_PCT_LO, TRIGGER_PCT_HI)
-                / 100.0;
+        let session_ceiling = self.session_ceiling_strategy.draw_downward(
+            &mut self.rng,
+            SESSION_CEILING_PCT_LO,
+            SESSION_CEILING_PCT_HI,
+        ) / 100.0;
         let weekly_ceiling = self.weekly_ceiling_strategy.draw_downward(
             &mut self.rng,
             WEEKLY_CEILING_PCT_LO,
@@ -8614,7 +8616,7 @@ mod tests {
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
-            trigger_strategy: Strategy::fixed(f64::from(trigger)),
+            session_ceiling_strategy: Strategy::fixed(f64::from(trigger)),
             weekly_ceiling_strategy: Strategy::fixed(f64::from(WEEKLY_CEILING)),
             cooldown_strategy: Strategy::fixed(cooldown as f64),
         }
@@ -12931,7 +12933,7 @@ mod tests {
         // #597: the reactive arm now fires at the effective ceiling (ceiling − tail margin), so at the
         // 95 default that is 0.89 — too tight a band above the 0.85 projection floor. Raise the ceiling
         // to 99 (effective ceiling 0.93) so the in-band climbing readings hold reactively.
-        daemon.trigger_strategy = Strategy::fixed(99.0);
+        daemon.session_ceiling_strategy = Strategy::fixed(99.0);
         daemon.session_ceiling_base = 0.99;
         for _ in 0..4 {
             daemon.tick().await;
@@ -13108,7 +13110,7 @@ mod tests {
         .await;
         // #597: raise the ceiling to 99 (effective 0.93) so the climbing readings hold reactively
         // and only the projection can cross — matching `warmed_velocity_daemon`.
-        daemon.trigger_strategy = Strategy::fixed(99.0);
+        daemon.session_ceiling_strategy = Strategy::fixed(99.0);
         daemon.session_ceiling_base = 0.99;
         for _ in 0..4 {
             daemon.tick().await;
@@ -13980,7 +13982,7 @@ mod tests {
         .await;
         // Ceiling 99 (effective 0.93) so the climbing readings stay reactively held, exactly as
         // `warmed_velocity_daemon` does; the projection peer is off so no swap interrupts the climb.
-        daemon.trigger_strategy = Strategy::fixed(99.0);
+        daemon.session_ceiling_strategy = Strategy::fixed(99.0);
         daemon.session_ceiling_base = 0.99;
         daemon.session_velocity_horizon_secs = 0;
         for _ in 0..4 {
@@ -16870,7 +16872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_jittered_trigger_is_deterministic_and_varies_the_swap_decision() {
+    async fn a_jittered_session_ceiling_is_deterministic_and_varies_the_swap_decision() {
         // Active A sits at a fixed 60% session; a wide uniform trigger jitter
         // spans the whole 50..=99 range, so some cycles draw a trigger ≤ 60
         // (→ swap) and others > 60 (→ hold). Deterministic per seed, but VARYING
@@ -16888,7 +16890,7 @@ mod tests {
                 .ok("u-A", 0.60, 0.10)
                 .ok("u-B", 0.05, 0.05);
             let mut tun = tunables(95, 80, 0);
-            tun.trigger_strategy = Strategy {
+            tun.session_ceiling_strategy = Strategy {
                 base: 95.0,
                 jitter: Jitter::Uniform { spread: 100.0 },
             };

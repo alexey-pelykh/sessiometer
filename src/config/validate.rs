@@ -193,10 +193,12 @@ impl Config {
         range("monitor_recovery_m", t.monitor_recovery_m, 1, 20)?;
 
         // Jitter specs (issue #38): each optional and validated to a clear load
-        // error (parse-or-error). Poll jitters normally by default; trigger and
-        // cooldown are fixed unless the operator configures a strategy.
+        // error (parse-or-error). Poll jitters normally by default; session_ceiling,
+        // weekly_ceiling and cooldown are fixed unless the operator configures a
+        // strategy.
         let poll_jitter = parse_jitter("poll", raw.jitter.poll, default_poll_jitter())?;
-        let trigger_jitter = parse_jitter("trigger", raw.jitter.trigger, Jitter::None)?;
+        let session_ceiling_jitter =
+            parse_jitter("session_ceiling", raw.jitter.session_ceiling, Jitter::None)?;
         let weekly_ceiling_jitter =
             parse_jitter("weekly_ceiling", raw.jitter.weekly_ceiling, Jitter::None)?;
         let cooldown_jitter = parse_jitter("cooldown", raw.jitter.cooldown, Jitter::None)?;
@@ -223,9 +225,9 @@ impl Config {
                 base: t.poll_secs as f64,
                 jitter: poll_jitter,
             },
-            trigger_strategy: Strategy {
+            session_ceiling_strategy: Strategy {
                 base: t.session_ceiling as f64,
-                jitter: trigger_jitter,
+                jitter: session_ceiling_jitter,
             },
             weekly_ceiling_strategy: Strategy {
                 base: t.weekly_ceiling as f64,

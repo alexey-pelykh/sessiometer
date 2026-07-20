@@ -128,9 +128,9 @@ impl Config {
                     present("jitter", "poll"),
                 ),
                 entry(
-                    "trigger",
-                    render_jitter(&t.trigger_strategy.jitter),
-                    present("jitter", "trigger"),
+                    "session_ceiling",
+                    render_jitter(&t.session_ceiling_strategy.jitter),
+                    present("jitter", "session_ceiling"),
                 ),
                 entry(
                     "weekly_ceiling",
@@ -456,15 +456,15 @@ impl Config {
             "# Randomization drawn each cycle and clamped to the tunable's range.\n\
              # kind = \"none\" | \"uniform\" (with `spread`) | \"normal\" (with `stddev`).\n\
              # poll defaults to normal jitter (stddev ~20% of poll_secs) so accounts\n\
-             # decorrelate; trigger, weekly_ceiling and cooldown default to none.\n",
+             # decorrelate; session_ceiling, weekly_ceiling and cooldown default to none.\n",
         );
         out.push_str(&format!(
             "poll = {}\n",
             render_jitter(&t.poll_strategy.jitter)
         ));
         out.push_str(&format!(
-            "trigger = {}\n",
-            render_jitter(&t.trigger_strategy.jitter)
+            "session_ceiling = {}\n",
+            render_jitter(&t.session_ceiling_strategy.jitter)
         ));
         out.push_str(&format!(
             "weekly_ceiling = {}\n",

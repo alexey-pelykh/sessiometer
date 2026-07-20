@@ -707,15 +707,15 @@ the single source of truth this table is drawn from, so it stays in step with th
 
 Per-cycle randomization added to a tunable, drawn fresh each cycle and clamped back to
 the tunable's range, so polls and swaps decorrelate across accounts and cycles. One
-optional entry per tunable — `poll`, `trigger` (the `session_ceiling` entry), `weekly_ceiling`,
-`cooldown` — each an inline table whose `kind` is `"none"`, `"uniform"` (with a `spread`), or
-`"normal"` (with a `stddev`); magnitudes are TOML floats. The session entry is still spelled
-`trigger`, the one jitter key whose name doesn't track its tunable. Only `poll` jitters by default:
+optional entry per tunable — `poll`, `session_ceiling`, `weekly_ceiling`, `cooldown` —
+each an inline table whose `kind` is `"none"`, `"uniform"` (with a `spread`), or
+`"normal"` (with a `stddev`); magnitudes are TOML floats. Each key is named for the
+tunable it jitters. Only `poll` jitters by default:
 
 ```toml
 [jitter]
 poll = { kind = "normal", stddev = 60.0 }   # default: normal, ~20% of poll_secs
-trigger = { kind = "none" }                 # trigger / weekly_ceiling / cooldown default to none
+session_ceiling = { kind = "none" }         # session_ceiling / weekly_ceiling / cooldown default to none
 ```
 
 ### `[login]`
