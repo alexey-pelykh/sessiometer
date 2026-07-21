@@ -79,7 +79,14 @@ def design(name):
 
 
 def cap(name):
-    return "data:image/png;base64," + base64.b64encode((caps_dir / name).read_bytes()).decode()
+    """The built panel PNG for `name`, base64-embedded — or a loud failure naming the missing file."""
+    png = caps_dir / name
+    if not png.is_file():
+        raise SystemExit(
+            f'STATES capture="{name}": {png} — no such capture. Render the built panel states '
+            f'first:\n  "$BIN" --render-panel {caps_dir}'
+        )
+    return "data:image/png;base64," + base64.b64encode(png.read_bytes()).decode()
 
 
 STATES = [
