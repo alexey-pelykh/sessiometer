@@ -94,13 +94,14 @@ pub(crate) fn pick_target(
 /// `#[allow]`s `too_many_arguments`).
 ///
 /// The fields are `pub(super)`, not `pub(crate)`: only `daemon` itself builds one
-/// ([`Daemon::selection_tiebreak`]), and [`VelocityEma`] is private to `daemon`, so widening them
+/// ([`Daemon::selection_tiebreak`]), and [`AccountRuntime`] is private to `daemon`, so widening them
 /// crate-wide would leak a more-private type through a more-public field (`private_interfaces`).
 #[derive(Clone, Copy)]
 pub(crate) struct SelectionTiebreak<'a> {
-    /// Per-account retained session-velocity EMA (issue #539), indexed in lockstep with `readings`;
-    /// `&[]` — or any absent slot — reads as "no observed climb" (see [`velocity_rate`]).
-    pub(super) velocity: &'a [Option<VelocityEma>],
+    /// Per-account carried runtime state (issue #668), indexed in lockstep with `readings` — the
+    /// tie-break reads its retained session-velocity EMA (issue #539). `&[]` — or any absent slot —
+    /// reads as "no observed climb" (see [`velocity_rate`]).
+    pub(super) accounts: &'a [AccountRuntime],
     /// The per-daemon selection seed (see [`Daemon::tiebreak_seed`]). `Some` activates BOTH enhanced
     /// axes (velocity preference, then per-daemon jitter); `None` degrades selection to exactly the
     /// pre-#612 soonest-reset + roster-index order (velocity ignored, un-jittered).
@@ -139,11 +140,10 @@ pub(crate) fn pick_target_ranked(
 /// rather than deprioritising a target on one unstable interval. A missing/untrusted signal thus
 /// treats an un-warmed or just-reset account as the safest (lowest-velocity) landing rather than
 /// penalising it for lack of data. See [`VelocityEma`].
-fn velocity_rate(velocity: &[Option<VelocityEma>], idx: usize) -> f64 {
-    velocity
+fn velocity_rate(accounts: &[AccountRuntime], idx: usize) -> f64 {
+    accounts
         .get(idx)
-        .copied()
-        .flatten()
+        .and_then(|account| account.session_velocity)
         .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
         .map_or(0.0, |v| v.rate)
 }
@@ -183,7 +183,7 @@ pub(crate) fn pick_target_with_reason(
         session_ceiling,
         weekly_ceiling,
         SelectionTiebreak {
-            velocity: &[],
+            accounts: &[],
             seed: None,
         },
     )
@@ -272,8 +272,8 @@ pub(crate) fn pick_target_with_reason_ranked(
             // co-selection herd on a remaining tie (a fixed per-daemon seed keeps it stable across
             // ticks). `None` is the legacy path: both inert, straight to the roster index below.
             .then_with(|| match sel.seed {
-                Some(seed) => velocity_rate(sel.velocity, a_idx)
-                    .total_cmp(&velocity_rate(sel.velocity, b_idx))
+                Some(seed) => velocity_rate(sel.accounts, a_idx)
+                    .total_cmp(&velocity_rate(sel.accounts, b_idx))
                     .then_with(|| {
                         selection_tiebreak_key(seed, a_idx)
                             .cmp(&selection_tiebreak_key(seed, b_idx))
@@ -869,6 +869,19 @@ mod tests {
         Some(VelocityEma { rate, samples })
     }
 
+    /// The per-account runtime slots (issue #668) carrying just these velocity EMAs — every other
+    /// [`AccountRuntime`] field defaulted, since the tie-break reads only the EMA. Lets each #612
+    /// case keep stating its discriminator as the bare EMA list.
+    fn runtimes(velocity: &[Option<VelocityEma>]) -> Vec<AccountRuntime> {
+        velocity
+            .iter()
+            .map(|&session_velocity| AccountRuntime {
+                session_velocity,
+                ..AccountRuntime::default()
+            })
+            .collect()
+    }
+
     /// [`pick_target_ranked`] with the frame every #612 case shares held fixed — account 0 active,
     /// the 0.80 reserve floor (ADR-0013), the base triggers — so each call shows only its
     /// discriminator: the readings, the velocity EMAs, and the per-daemon seed (`None` = the legacy,
@@ -885,7 +898,10 @@ mod tests {
             Some(0.80),
             SESS,
             WK,
-            SelectionTiebreak { velocity, seed },
+            SelectionTiebreak {
+                accounts: &runtimes(velocity),
+                seed,
+            },
         )
     }
 
@@ -927,7 +943,7 @@ mod tests {
                 SESS,
                 WK,
                 SelectionTiebreak {
-                    velocity: &velocity,
+                    accounts: &runtimes(&velocity),
                     seed: Some(9),
                 },
             ),

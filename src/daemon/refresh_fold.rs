@@ -52,13 +52,13 @@ where
     ) {
         match classify_poll(result) {
             PollOutcome::Unauthorized => {
-                let consecutive = self.state.health[i].consec_401.saturating_add(1);
-                self.state.health[i].consec_401 = consecutive;
+                let consecutive = self.state.accounts[i].health.consec_401.saturating_add(1);
+                self.state.accounts[i].health.consec_401 = consecutive;
                 // A 401 breaks any in-progress recovery probe.
-                self.state.health[i].recovery_successes = 0;
+                self.state.accounts[i].health.recovery_successes = 0;
                 // Already dead → stay silent: the durable status carries the dead
                 // state; CredentialDead already fired on the transition (no spam).
-                if self.state.health[i].quarantined {
+                if self.state.accounts[i].health.quarantined {
                     return;
                 }
                 events.push(Event::Monitor401 {
@@ -67,25 +67,28 @@ where
                 });
                 // The Nth consecutive non-scope 401 declares the credential DEAD.
                 if consecutive >= u32::from(self.monitor_401_n) {
-                    self.state.health[i].quarantined = true;
+                    self.state.accounts[i].health.quarantined = true;
                     // Open a fresh unrecoverable-death episode (issue #261): this account
                     // may later be confirmed unrecoverable by a dead sweep-refresh, and the
                     // #261 latch must be armed for THIS quarantine, having been left set by
                     // any prior episode. Reset here, the single quarantine-SET site.
-                    self.state.health[i].unrecoverable_signaled = false;
+                    self.state.accounts[i].health.unrecoverable_signaled = false;
                     events.push(Event::CredentialDead {
                         account: self.roster[i].label.clone(),
                     });
                 }
             }
             PollOutcome::Live => {
-                self.state.health[i].consec_401 = 0;
-                if self.state.health[i].quarantined {
-                    let m = self.state.health[i].recovery_successes.saturating_add(1);
-                    self.state.health[i].recovery_successes = m;
+                self.state.accounts[i].health.consec_401 = 0;
+                if self.state.accounts[i].health.quarantined {
+                    let m = self.state.accounts[i]
+                        .health
+                        .recovery_successes
+                        .saturating_add(1);
+                    self.state.accounts[i].health.recovery_successes = m;
                     if m >= u32::from(self.monitor_recovery_m) {
-                        self.state.health[i].quarantined = false;
-                        self.state.health[i].recovery_successes = 0;
+                        self.state.accounts[i].health.quarantined = false;
+                        self.state.accounts[i].health.recovery_successes = 0;
                         events.push(Event::CredentialRestored {
                             account: self.roster[i].label.clone(),
                         });
@@ -93,15 +96,15 @@ where
                 }
             }
             PollOutcome::ScopeMissing => {
-                self.state.health[i].consec_401 = 0;
-                self.state.health[i].recovery_successes = 0;
+                self.state.accounts[i].health.consec_401 = 0;
+                self.state.accounts[i].health.recovery_successes = 0;
                 events.push(Event::UsageScopeFail {
                     account: self.roster[i].label.clone(),
                 });
             }
             PollOutcome::Transient => {
-                self.state.health[i].consec_401 = 0;
-                self.state.health[i].recovery_successes = 0;
+                self.state.accounts[i].health.consec_401 = 0;
+                self.state.accounts[i].health.recovery_successes = 0;
             }
         }
     }
@@ -135,8 +138,8 @@ where
     pub(super) fn should_refresh_retry(&self, i: usize, result: &Result<Usage>) -> bool {
         self.poll_refresh.is_some()
             && matches!(classify_poll(result), PollOutcome::Unauthorized)
-            && !self.state.health[i].quarantined
-            && self.state.health[i].consec_401 == 0
+            && !self.state.accounts[i].health.quarantined
+            && self.state.accounts[i].health.consec_401 == 0
             && self.state.active != Some(i)
     }
 
@@ -268,7 +271,7 @@ where
         self.roster
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.state.health[*i].quarantined)
+            .filter(|(i, _)| self.state.accounts[*i].health.quarantined)
             .map(|(_, account)| account.account_uuid.clone())
             .collect()
     }
@@ -281,11 +284,11 @@ where
     /// and #107 re-login recovery paths do; the tick only signals which accounts recovered.
     pub(super) fn apply_refresh_restore(&mut self, uuid: &str) -> Option<Event> {
         let idx = self.roster.iter().position(|a| a.account_uuid == uuid)?;
-        if !self.state.health[idx].quarantined {
+        if !self.state.accounts[idx].health.quarantined {
             return None;
         }
-        self.state.health[idx].quarantined = false;
-        self.state.health[idx].recovery_successes = 0;
+        self.state.accounts[idx].health.quarantined = false;
+        self.state.accounts[idx].health.recovery_successes = 0;
         Some(Event::CredentialRestored {
             account: self.roster[idx].label.clone(),
         })
@@ -322,7 +325,7 @@ where
         // `should_refresh_retry` (issue #253): the isolated engine rotates the server-side refresh
         // token but writes only the STASH, so it is safe for PARKED accounts only.
         let is_dead =
-            self.state.health[idx].last_refresh_outcome == Some(RefreshEventOutcome::Dead);
+            self.state.accounts[idx].health.last_refresh_outcome == Some(RefreshEventOutcome::Dead);
         if is_dead && self.poll_refresh.is_some() && self.state.active != Some(idx) {
             self.reprobe_dead_parked_credential(idx).await
         } else {
@@ -409,7 +412,7 @@ where
         // Staleness clock: parked passes the fresh stash expiry; active passes `None` (promote owns
         // it). ms → s at the boundary, matching `apply_refresh_observation`.
         if let Some(ms) = expires_at_ms {
-            self.state.health[idx].access_expires_at = Some(ms / 1000);
+            self.state.accounts[idx].health.access_expires_at = Some(ms / 1000);
         }
         // Quarantine membership by definitiveness (see the doc ladder): a confirmed-`Dead` credential
         // STAYS quarantined (out of rotation, honest 🔴); every other outcome un-quarantines — a live
@@ -457,7 +460,7 @@ where
         // account is left to the normal tick. `keep_warm` is the ONLY active-safe refresh (issue
         // #253): unwired → nothing to do.
         let is_dead =
-            self.state.health[idx].last_refresh_outcome == Some(RefreshEventOutcome::Dead);
+            self.state.accounts[idx].health.last_refresh_outcome == Some(RefreshEventOutcome::Dead);
         if !is_dead || self.keep_warm.is_none() {
             return Vec::new();
         }
@@ -512,7 +515,8 @@ where
             .position(|a| a.account_uuid == observation.account_uuid)?;
         // ms → s at the boundary; the rollup/wire are uniform epoch seconds. The expiry clock
         // updates on EVERY observation (refreshed or read-only).
-        self.state.health[idx].access_expires_at = observation.expires_at_ms.map(|ms| ms / 1000);
+        self.state.accounts[idx].health.access_expires_at =
+            observation.expires_at_ms.map(|ms| ms / 1000);
         // The refresh-health fields update only when the sweep actually refreshed the account.
         let delta = observation.refresh?;
         self.note_refresh_outcome(idx, delta.outcome, delta.token_rotated)
@@ -540,7 +544,7 @@ where
         outcome: RefreshEventOutcome,
         token_rotated: bool,
     ) -> Option<Event> {
-        let health = &mut self.state.health[idx];
+        let health = &mut self.state.accounts[idx].health;
         health.last_refresh_outcome = Some(outcome);
         health.refresh_token_rotated = Some(token_rotated);
         match outcome {
@@ -669,11 +673,14 @@ mod tests {
             refresh: None,
         });
         assert_eq!(
-            daemon.state.health[0].access_expires_at,
+            daemon.state.accounts[0].health.access_expires_at,
             Some(1_782_777_600)
         );
-        assert_eq!(daemon.state.health[0].last_refresh_outcome, None);
-        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 0);
+        assert_eq!(daemon.state.accounts[0].health.last_refresh_outcome, None);
+        assert_eq!(
+            daemon.state.accounts[0].health.consecutive_refresh_failures,
+            0
+        );
 
         // Failing refreshes advance the consecutive-failure streak and record the outcome.
         daemon.apply_refresh_observation(&observe(
@@ -681,15 +688,21 @@ mod tests {
             false,
             1_782_777_600_000,
         ));
-        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 1);
+        assert_eq!(
+            daemon.state.accounts[0].health.consecutive_refresh_failures,
+            1
+        );
         daemon.apply_refresh_observation(&observe(
             RefreshEventOutcome::Dead,
             false,
             1_782_777_600_000,
         ));
-        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 2);
         assert_eq!(
-            daemon.state.health[0].last_refresh_outcome,
+            daemon.state.accounts[0].health.consecutive_refresh_failures,
+            2
+        );
+        assert_eq!(
+            daemon.state.accounts[0].health.last_refresh_outcome,
             Some(RefreshEventOutcome::Dead)
         );
 
@@ -700,10 +713,16 @@ mod tests {
             true,
             1_782_784_800_000,
         ));
-        assert_eq!(daemon.state.health[0].consecutive_refresh_failures, 0);
-        assert_eq!(daemon.state.health[0].refresh_token_rotated, Some(true));
         assert_eq!(
-            daemon.state.health[0].access_expires_at,
+            daemon.state.accounts[0].health.consecutive_refresh_failures,
+            0
+        );
+        assert_eq!(
+            daemon.state.accounts[0].health.refresh_token_rotated,
+            Some(true)
+        );
+        assert_eq!(
+            daemon.state.accounts[0].health.access_expires_at,
             Some(1_782_784_800)
         );
 
@@ -714,7 +733,7 @@ mod tests {
             expires_at_ms: Some(0),
             refresh: None,
         });
-        assert_eq!(daemon.state.health[1].access_expires_at, None);
+        assert_eq!(daemon.state.accounts[1].health.access_expires_at, None);
     }
 
     #[tokio::test]
@@ -736,8 +755,8 @@ mod tests {
 
         // Quarantine the PARKED, non-active `spare` (index 1) — the #106 parked-and-stuck case —
         // and seed a recovery streak the restore must clear.
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[1].recovery_successes = 2;
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[1].health.recovery_successes = 2;
 
         // First restore: un-quarantines and emits exactly the edge event, named by handle only.
         assert_eq!(
@@ -746,9 +765,12 @@ mod tests {
                 account: "spare".to_owned(),
             })
         );
-        assert!(!daemon.state.health[1].quarantined, "spare un-quarantined");
+        assert!(
+            !daemon.state.accounts[1].health.quarantined,
+            "spare un-quarantined"
+        );
         assert_eq!(
-            daemon.state.health[1].recovery_successes, 0,
+            daemon.state.accounts[1].health.recovery_successes, 0,
             "the recovery streak is reset on restore"
         );
 
@@ -786,18 +808,18 @@ mod tests {
             daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Dead)),
             None
         );
-        assert!(!daemon.state.health[0].unrecoverable_signaled);
+        assert!(!daemon.state.accounts[0].health.unrecoverable_signaled);
 
         // Quarantine account 0 (the #42 verdict); the next dead sweep-refresh CONFIRMS it
         // unrecoverable → exactly one event, named by handle only.
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
         assert_eq!(
             daemon.apply_refresh_observation(&obs("u-A", RefreshEventOutcome::Dead)),
             Some(Event::CredentialUnrecoverable {
                 account: "work".to_owned(),
             })
         );
-        assert!(daemon.state.health[0].unrecoverable_signaled);
+        assert!(daemon.state.accounts[0].health.unrecoverable_signaled);
 
         // Every subsequent re-probe of the still-dead token is SILENT — INCLUDING a
         // `Dead`→`Error`→`Dead` flap, which a naive last-outcome guard would double-fire on (a
@@ -845,14 +867,14 @@ mod tests {
         // `last_refresh_outcome` is now `Some(Dead)` — the state that would poison a naive guard.
         assert_eq!(daemon.apply_refresh_observation(&dead("u-A")), None);
         assert_eq!(
-            daemon.state.health[0].last_refresh_outcome,
+            daemon.state.accounts[0].health.last_refresh_outcome,
             Some(RefreshEventOutcome::Dead)
         );
 
         // The access token then 401-streaks account 0 into quarantine; the SET clears the latch.
         quarantine(&mut daemon, 0, &mut events);
-        assert!(daemon.state.health[0].quarantined);
-        assert!(!daemon.state.health[0].unrecoverable_signaled);
+        assert!(daemon.state.accounts[0].health.quarantined);
+        assert!(!daemon.state.accounts[0].health.unrecoverable_signaled);
         // Despite `last_refresh_outcome` ALREADY being `Dead`, the next dead sweep FIRES — the
         // latch, not the outcome history, gates the edge.
         assert_eq!(
@@ -863,10 +885,10 @@ mod tests {
         );
 
         // (a) Recover (an operator re-login un-quarantines) then re-die: the fresh episode re-fires.
-        daemon.state.health[0].quarantined = false;
-        daemon.state.health[0].consec_401 = 0;
+        daemon.state.accounts[0].health.quarantined = false;
+        daemon.state.accounts[0].health.consec_401 = 0;
         quarantine(&mut daemon, 0, &mut events);
-        assert!(!daemon.state.health[0].unrecoverable_signaled);
+        assert!(!daemon.state.accounts[0].health.unrecoverable_signaled);
         assert_eq!(
             daemon.apply_refresh_observation(&dead("u-A")),
             Some(Event::CredentialUnrecoverable {
@@ -944,14 +966,14 @@ mod tests {
         // Two 401s climb the streak; below the threshold (3) the account stays alive.
         daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
         daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
-        assert!(!daemon.state.health[1].quarantined);
-        assert_eq!(daemon.state.health[1].consec_401, 2);
+        assert!(!daemon.state.accounts[1].health.quarantined);
+        assert_eq!(daemon.state.accounts[1].health.consec_401, 2);
 
         // The 3rd consecutive 401 declares the credential DEAD: the climbing
         // `monitor_401` AND exactly one `credential_dead`, on the false→true edge.
         events.clear();
         daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
-        assert!(daemon.state.health[1].quarantined);
+        assert!(daemon.state.accounts[1].health.quarantined);
         assert_eq!(
             events,
             vec![
@@ -969,7 +991,7 @@ mod tests {
         // durable status, not a repeated log line (no spam).
         events.clear();
         daemon.note_poll_outcome(1, &Err(Error::UsageUnauthorized), &mut events);
-        assert!(daemon.state.health[1].quarantined);
+        assert!(daemon.state.accounts[1].health.quarantined);
         assert!(
             events.is_empty(),
             "an already-dead 401 re-emits nothing: {events:?}"
@@ -1096,11 +1118,11 @@ mod tests {
             daemon.tick().await;
         }
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "a 401 that clears after one refresh must NOT quarantine the account",
         );
         assert_eq!(
-            daemon.state.health[1].consec_401, 0,
+            daemon.state.accounts[1].health.consec_401, 0,
             "the successful re-poll resets the streak",
         );
         assert_eq!(
@@ -1128,7 +1150,7 @@ mod tests {
             daemon.tick().await;
         }
         assert!(
-            daemon.state.health[1].quarantined,
+            daemon.state.accounts[1].health.quarantined,
             "a 401 that survives the fresh token must still quarantine after N",
         );
         assert_eq!(
@@ -1148,7 +1170,7 @@ mod tests {
             daemon.tick().await;
         }
         assert!(
-            daemon.state.health[1].quarantined,
+            daemon.state.accounts[1].health.quarantined,
             "a refresh that reports the token Dead must quarantine the account",
         );
         assert_eq!(
@@ -1176,7 +1198,7 @@ mod tests {
             daemon.tick().await;
         }
         assert!(
-            daemon.state.health[1].quarantined,
+            daemon.state.accounts[1].health.quarantined,
             "a refresh failure is treated as could-not-revive → the account still quarantines",
         );
         assert_eq!(
@@ -1202,14 +1224,14 @@ mod tests {
         daemon.tick().await; // tick 1: work (healthy)
         daemon.tick().await; // tick 2: spare 401 → refresh (calls = 1), streak = 1
         assert_eq!(calls.get(), 1);
-        assert_eq!(daemon.state.health[1].consec_401, 1);
+        assert_eq!(daemon.state.accounts[1].health.consec_401, 1);
         // Heal the spare: its next poll is Live → the streak resets, closing the episode.
         outcomes
             .borrow_mut()
             .insert("u-B".to_owned(), Scripted::Ok(reading(0.10, 0.10)));
         daemon.tick().await; // tick 3: work
         daemon.tick().await; // tick 4: spare Live → streak resets to 0
-        assert_eq!(daemon.state.health[1].consec_401, 0);
+        assert_eq!(daemon.state.accounts[1].health.consec_401, 0);
         assert_eq!(calls.get(), 1, "a live poll needs no refresh");
         // Break the spare again → the next spare 401 is a NEW episode → one more refresh.
         outcomes
@@ -1239,7 +1261,7 @@ mod tests {
         for _ in 0..6 {
             daemon.tick().await;
         }
-        assert!(!daemon.state.health[1].quarantined);
+        assert!(!daemon.state.accounts[1].health.quarantined);
         assert_eq!(
             calls.get(),
             0,
@@ -1285,7 +1307,7 @@ mod tests {
              the canonical credential the #102 refresh would rotate server-side",
         );
         assert_eq!(
-            daemon.state.health[0].consec_401, 2,
+            daemon.state.accounts[0].health.consec_401, 2,
             "#253: a still-active account's 401 advances the #42 streak toward operator re-login, \
              never a stash-only refresh + re-poll that resets the streak and masks it healthy",
         );
@@ -1466,10 +1488,10 @@ mod tests {
         // keep returning 200, so nothing else triggers a refresh). Already signaled unrecoverable by
         // the sweep that first confirmed the death.
         daemon.state.active = Some(0);
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[1].unrecoverable_signaled = true;
-        daemon.state.health[1].access_expires_at = Some(NOW + 3600);
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[1].health.unrecoverable_signaled = true;
+        daemon.state.accounts[1].health.access_expires_at = Some(NOW + 3600);
 
         let events = daemon.reconcile_restored("u-B").await;
 
@@ -1479,10 +1501,10 @@ mod tests {
             "exactly one isolated refresh re-probed the revived credential"
         );
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "a genuinely successful refresh lifts the quarantine"
         );
-        let h = &daemon.state.health[1];
+        let h = &daemon.state.accounts[1].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1527,14 +1549,14 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = false; // Case B: dead verdict, never quarantined
-        daemon.state.health[1].access_expires_at = Some(NOW + 3600);
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = false; // Case B: dead verdict, never quarantined
+        daemon.state.accounts[1].health.access_expires_at = Some(NOW + 3600);
 
         let events = daemon.reconcile_restored("u-B").await;
 
         assert_eq!(calls.get(), 1, "the revived credential is re-probed once");
-        let h = &daemon.state.health[1];
+        let h = &daemon.state.accounts[1].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1577,18 +1599,18 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[1].unrecoverable_signaled = true;
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[1].health.unrecoverable_signaled = true;
 
         let events = daemon.reconcile_restored("u-B").await;
 
         assert_eq!(calls.get(), 1, "the revived credential is re-probed once");
         assert!(
-            daemon.state.health[1].quarantined,
+            daemon.state.accounts[1].health.quarantined,
             "a still-dead re-probe keeps the quarantine — never falsely cleared",
         );
-        let h = &daemon.state.health[1];
+        let h = &daemon.state.accounts[1].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1629,18 +1651,18 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[1].unrecoverable_signaled = true;
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[1].health.unrecoverable_signaled = true;
 
         let events = daemon.reconcile_restored("u-B").await;
 
         assert_eq!(calls.get(), 1, "the revived credential is re-probed once");
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "a transient error still lifts the quarantine (never strands a fixed account at 🔴)",
         );
-        let h = &daemon.state.health[1];
+        let h = &daemon.state.accounts[1].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1683,8 +1705,8 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[1].last_refresh_outcome = None; // NOT Dead
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.last_refresh_outcome = None; // NOT Dead
+        daemon.state.accounts[1].health.quarantined = true;
 
         let events = daemon.reconcile_restored("u-B").await;
 
@@ -1694,7 +1716,7 @@ mod tests {
             "a non-Dead account is never isolated-refreshed — the plain #275 un-quarantine only",
         );
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "the bare on-demand un-quarantine still lifts the quarantine (#275 preserved)",
         );
         assert_eq!(
@@ -1722,8 +1744,8 @@ mod tests {
         .await;
         // u-B (idx 1) is BOTH the active account AND latched Dead — the excluded case.
         daemon.state.active = Some(1);
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = true;
 
         let events = daemon.reconcile_restored("u-B").await;
 
@@ -1735,7 +1757,7 @@ mod tests {
         // The other half of the guard: it still FALLS BACK to the plain #275 un-quarantine (a return
         // that did nothing would also leave `calls == 0`, so assert the fallback actually fired).
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "the active-account case falls back to the bare un-quarantine, not a silent no-op",
         );
         assert_eq!(
@@ -1764,9 +1786,9 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[0].quarantined = true;
-        daemon.state.health[0].unrecoverable_signaled = true;
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon.state.accounts[0].health.unrecoverable_signaled = true;
 
         let events = daemon.reprobe_active_if_dead().await;
 
@@ -1776,7 +1798,7 @@ mod tests {
             "exactly one active-safe mint re-probed the credential"
         );
         assert!(
-            !daemon.state.health[0].quarantined,
+            !daemon.state.accounts[0].health.quarantined,
             "a live mint lifts the quarantine"
         );
         assert_eq!(
@@ -1785,11 +1807,11 @@ mod tests {
             "the fresh token is promoted to the canonical item a live session reads",
         );
         assert_eq!(
-            daemon.state.health[0].access_expires_at,
+            daemon.state.accounts[0].health.access_expires_at,
             Some(fresh_expiry_ms / 1000),
             "the fold passes None so promote_canonical's #477 expiry is preserved, not clobbered",
         );
-        let h = &daemon.state.health[0];
+        let h = &daemon.state.accounts[0].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1835,9 +1857,9 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[0].quarantined = true;
-        daemon.state.health[0].unrecoverable_signaled = true;
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon.state.accounts[0].health.unrecoverable_signaled = true;
 
         let events = daemon.reprobe_active_if_dead().await;
 
@@ -1847,7 +1869,7 @@ mod tests {
             "the mint ran once (the RT was non-empty) and reported Dead"
         );
         assert!(
-            daemon.state.health[0].quarantined,
+            daemon.state.accounts[0].health.quarantined,
             "a Dead mint keeps the quarantine — never falsely cleared",
         );
         assert_eq!(
@@ -1855,7 +1877,7 @@ mod tests {
             warm_canonical(FAR_FUTURE_MS, "rt-live").expose(),
             "a Dead outcome promotes nothing — the canonical is untouched",
         );
-        let h = &daemon.state.health[0];
+        let h = &daemon.state.accounts[0].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1894,11 +1916,11 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[0].health.quarantined = true;
         // A `Dead`-latched account was already signaled unrecoverable by the sweep that set it Dead,
         // so the fold does not re-fire the #261 operator signal (isolating the "no MINT action" claim).
-        daemon.state.health[0].unrecoverable_signaled = true;
+        daemon.state.accounts[0].health.unrecoverable_signaled = true;
 
         let events = daemon.reprobe_active_if_dead().await;
 
@@ -1908,10 +1930,10 @@ mod tests {
             "a dead (empty) refresh token skips the doomed mint spawn"
         );
         assert!(
-            daemon.state.health[0].quarantined,
+            daemon.state.accounts[0].health.quarantined,
             "the honest 🔴 quarantine stays"
         );
-        let h = &daemon.state.health[0];
+        let h = &daemon.state.accounts[0].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -1943,7 +1965,7 @@ mod tests {
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Refreshed);
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Refreshed);
 
         let events = daemon.reprobe_active_if_dead().await;
 
@@ -1974,7 +1996,7 @@ mod tests {
             "the seam daemon wires no keep-warm engine"
         );
         daemon.state.active = Some(0);
-        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
 
         let events = daemon.reprobe_active_if_dead().await;
 
@@ -2008,9 +2030,9 @@ mod tests {
         // control signal delivers the re-probe. The `NoopRefreshTicker` keeps the periodic sweep from
         // firing, so the ONLY refresh is the one `reconcile_restored` drives.
         daemon.state.active = Some(0);
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[1].unrecoverable_signaled = true;
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[1].health.unrecoverable_signaled = true;
 
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
@@ -2039,11 +2061,11 @@ mod tests {
             "the Restored signal reached reconcile_restored's isolated re-probe through the select",
         );
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "the revived parked account is un-quarantined within the cycle",
         );
         assert_ne!(
-            daemon.state.health[1].last_refresh_outcome,
+            daemon.state.accounts[1].health.last_refresh_outcome,
             Some(RefreshEventOutcome::Dead),
             "the stale Dead latch is cleared — no multi-hour 🔴",
         );
@@ -2075,9 +2097,9 @@ mod tests {
         .await;
         // The active `work` (idx 0) is latched Dead — the dead spare a forced `use` just activated.
         daemon.state.active = Some(0);
-        daemon.state.health[0].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[0].quarantined = true;
-        daemon.state.health[0].unrecoverable_signaled = true;
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon.state.accounts[0].health.unrecoverable_signaled = true;
 
         let logdir = tempfile::tempdir().unwrap();
         let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
@@ -2105,12 +2127,12 @@ mod tests {
             "the ManualSwapped signal reached reprobe_active_if_dead's mint through the select",
         );
         assert_ne!(
-            daemon.state.health[0].last_refresh_outcome,
+            daemon.state.accounts[0].health.last_refresh_outcome,
             Some(RefreshEventOutcome::Dead),
             "the use-activated account's stale Dead latch is cleared within the cycle",
         );
         assert!(
-            !daemon.state.health[0].quarantined,
+            !daemon.state.accounts[0].health.quarantined,
             "the revived active account is un-quarantined",
         );
         assert_eq!(
@@ -2166,9 +2188,9 @@ mod tests {
         );
         // `spare` (u-B, idx 1) is the dead spare a forced swap-on-click activates. Proactive keep-warm
         // stays OFF (the default), so the ONLY mint is the recovery re-probe.
-        daemon.state.health[1].last_refresh_outcome = Some(RefreshEventOutcome::Dead);
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[1].unrecoverable_signaled = true;
+        daemon.state.accounts[1].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[1].health.unrecoverable_signaled = true;
 
         // A real socket pair so the arm's `write_swap_ack` has a client end; the re-probe runs AFTER it.
         let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
@@ -2219,12 +2241,12 @@ mod tests {
             "the SwapRequested arm drove the active-safe re-probe after the ack",
         );
         assert_ne!(
-            daemon.state.health[1].last_refresh_outcome,
+            daemon.state.accounts[1].health.last_refresh_outcome,
             Some(RefreshEventOutcome::Dead),
             "the swap-on-click's stale Dead latch is cleared within the cycle",
         );
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "the revived active account is un-quarantined",
         );
     }
