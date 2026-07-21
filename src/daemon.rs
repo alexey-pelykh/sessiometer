@@ -3786,7 +3786,11 @@ where
     /// inputs left no trace and the report was unfalsifiable after the fact. This supplies the one
     /// missing ingredient (the anchor and the window are already on [`Event::BlindWindow`]), letting
     /// an offline reader recompute `anchor + rate × inflation × blind_secs` and check it against the
-    /// ceiling. The recomputation is deliberate: the arm is report-only and not in every running
+    /// ceiling. Since issue #632 the live arm projects off the #619 plausibility-CORRECTED anchor,
+    /// while `session_pct` on the event is the RAW anchor (a measurement, kept raw) — so this recompute
+    /// reproduces the arm exactly absent a stale-low correction and is a conservative LOWER bound under
+    /// one; the frozen high-water mark that would close the gap is not yet carried here (issue #670).
+    /// The recomputation is deliberate: the arm is report-only and not in every running
     /// binary, so logging the ingredient must NOT require the live arm to be active.
     ///
     /// Gated on the SAME sustained-EMA precondition the arm applies (a retained EMA with
