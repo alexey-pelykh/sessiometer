@@ -44,8 +44,8 @@ where
     pub(super) fn should_keep_warm_retry(&self, i: usize, result: &Result<Usage>) -> bool {
         self.keep_warm.is_some()
             && matches!(classify_poll(result), PollOutcome::Unauthorized)
-            && !self.state.health[i].quarantined
-            && self.state.health[i].consec_401 == 0
+            && !self.state.accounts[i].health.quarantined
+            && self.state.accounts[i].health.consec_401 == 0
             && self.state.active == Some(i)
     }
 
@@ -143,7 +143,7 @@ where
         };
         // A quarantined active account is a dead credential the #42 streak / emergency swap owns —
         // never re-warmed every tick (invariant 4; mirrors `should_keep_warm_retry`'s guard).
-        if self.state.health[i].quarantined {
+        if self.state.accounts[i].health.quarantined {
             return;
         }
         // Near-expiry gate: fire only inside the token's staggered horizon. An unreadable expiry
@@ -163,7 +163,7 @@ where
         // stamps `last_keep_warm_attempt`, so it suppresses a redundant proactive mint the same
         // window).
         let now = self.clock.now();
-        if let Some(last) = self.state.health[i].last_keep_warm_attempt {
+        if let Some(last) = self.state.accounts[i].health.last_keep_warm_attempt {
             if now.saturating_duration_since(last) < self.keep_warm_cadence {
                 return;
             }
@@ -212,7 +212,7 @@ where
         }
         // Stamp the attempt up front so BOTH the proactive throttle and the
         // reactive-suppresses-a-same-window-proactive signal count even a mint that cannot run.
-        self.state.health[i].last_keep_warm_attempt = Some(self.clock.now());
+        self.state.accounts[i].health.last_keep_warm_attempt = Some(self.clock.now());
         let minted = match self.keep_warm.as_ref() {
             Some(engine) => engine.keep_warm(&self.roster[i], canonical).await,
             // Unreachable given the callers' `keep_warm.is_some()` gate; treat as no-promote.
@@ -299,7 +299,7 @@ where
         // dead/rejected canonical is never bumped and still reads `Stale` — whether short-circuited
         // BEFORE the mint (an empty refresh token, `has_live_refresh_token`) or AFTER it (a server
         // `Dead` / `NoChange` mint with no fresh token to promote, the `match minted` arm).
-        self.state.health[i].access_expires_at =
+        self.state.accounts[i].health.access_expires_at =
             crate::refresh::expires_at(cred.expose()).map(millis_to_secs);
         Ok(true)
     }
@@ -353,12 +353,12 @@ mod tests {
 
         // Past the first 401 of the episode (`consec_401 > 0`) → suppressed (no mint storm; the
         // rest of the episode advances the streak directly toward the #42 emergency swap).
-        daemon.state.health[0].consec_401 = 1;
+        daemon.state.accounts[0].health.consec_401 = 1;
         assert!(!daemon.should_keep_warm_retry(0, &unauthorized));
-        daemon.state.health[0].consec_401 = 0;
+        daemon.state.accounts[0].health.consec_401 = 0;
 
         // A quarantined active account is the streak's job — never re-warmed every re-probe poll.
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
         assert!(!daemon.should_keep_warm_retry(0, &unauthorized));
     }
 
@@ -523,11 +523,11 @@ mod tests {
         let events = daemon.tick().await.events;
 
         assert!(
-            !daemon.state.health[0].quarantined,
+            !daemon.state.accounts[0].health.quarantined,
             "a revivable active 401 is kept warm in place, never quarantined",
         );
         assert_eq!(
-            daemon.state.health[0].consec_401, 0,
+            daemon.state.accounts[0].health.consec_401, 0,
             "the cleared re-poll resets the streak",
         );
         assert_eq!(calls.get(), 1, "exactly one mint (no storm)");
@@ -580,7 +580,10 @@ mod tests {
             "the proactive mint promotes the fresh token to the canonical item",
         );
         assert!(
-            daemon.state.health[0].last_keep_warm_attempt.is_some(),
+            daemon.state.accounts[0]
+                .health
+                .last_keep_warm_attempt
+                .is_some(),
             "the attempt is stamped for the proactive throttle",
         );
         assert_eq!(
@@ -619,7 +622,7 @@ mod tests {
         .await;
         // The un-restashed stash the parked sweep last folded is already EXPIRED — the
         // false-staleness source the keep-warm leaves behind.
-        daemon.state.health[0].access_expires_at = Some(now_secs - 100);
+        daemon.state.accounts[0].health.access_expires_at = Some(now_secs - 100);
 
         let mut events = Vec::new();
         daemon
@@ -640,7 +643,7 @@ mod tests {
         // …and the rollup's staleness input is reconciled to it (the #477 fix). Before the fix this
         // stayed pinned to the expired stash → a false `stale`.
         assert_eq!(
-            daemon.state.health[0].access_expires_at,
+            daemon.state.accounts[0].health.access_expires_at,
             Some(fresh_expiry_ms / 1000),
             "the rollup expiry reflects the promoted canonical, not the stale stash",
         );
@@ -648,7 +651,7 @@ mod tests {
         // isolates the expiry-driven verdict: it proves the FIX (not a masking fresh poll) cleared
         // the false stale — the Stale branch precedes the Healthy branch, so a stale expiry would
         // still read `stale` here regardless of a fresh reading.
-        let h = &daemon.state.health[0];
+        let h = &daemon.state.accounts[0].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -683,7 +686,7 @@ mod tests {
         )
         .await;
         // A genuinely expired canonical expiry.
-        daemon.state.health[0].access_expires_at = Some(now_secs - 100);
+        daemon.state.accounts[0].health.access_expires_at = Some(now_secs - 100);
 
         let mut events = Vec::new();
         daemon
@@ -693,11 +696,11 @@ mod tests {
         assert_eq!(calls.get(), 0, "a dead refresh token is never minted");
         // The stale expiry is UNTOUCHED — the reconcile only fires on a real promote.
         assert_eq!(
-            daemon.state.health[0].access_expires_at,
+            daemon.state.accounts[0].health.access_expires_at,
             Some(now_secs - 100),
             "no promote → the rollup expiry is not bumped",
         );
-        let h = &daemon.state.health[0];
+        let h = &daemon.state.accounts[0].health;
         assert_eq!(
             credential_health(
                 h.quarantined,
@@ -736,7 +739,7 @@ mod tests {
         assert_eq!(calls.get(), 0, "a far-from-expiry token is not warmed");
 
         // …but even a near-expiry token is skipped once the account is quarantined.
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
         daemon
             .keep_active_warm(Some(0), Some(&canonical), now_ms, &mut events)
             .await;
@@ -787,7 +790,10 @@ mod tests {
             "no proactive mint → no keep_warm event: {events:?}",
         );
         assert!(
-            daemon.state.health[0].last_keep_warm_attempt.is_none(),
+            daemon.state.accounts[0]
+                .health
+                .last_keep_warm_attempt
+                .is_none(),
             "no mint attempted → the proactive throttle stamp is untouched",
         );
         assert_eq!(
@@ -970,10 +976,10 @@ mod tests {
             "a near-expiry active 401 mints exactly once — the reactive stamp throttles proactive",
         );
         assert_eq!(
-            daemon.state.health[0].consec_401, 0,
+            daemon.state.accounts[0].health.consec_401, 0,
             "the revive reset the streak"
         );
-        assert!(!daemon.state.health[0].quarantined);
+        assert!(!daemon.state.accounts[0].health.quarantined);
     }
 
     #[tokio::test]
@@ -1080,7 +1086,7 @@ mod tests {
             &tun,
         );
         // `spare` is already dead from a prior episode.
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.quarantined = true;
 
         // The staggered schedule (#80) is [work, backup] — the quarantined spare is
         // excluded outright — so the warm-up cycle polls only those two; the swap
@@ -1093,7 +1099,7 @@ mod tests {
         // `spare` was skipped, not polled: its 401 script never ran, so its streak
         // stayed 0 and it emitted no `monitor_401`.
         assert_eq!(
-            daemon.state.health[1].consec_401, 0,
+            daemon.state.accounts[1].health.consec_401, 0,
             "the dead spare was not polled"
         );
         assert!(
@@ -1117,7 +1123,7 @@ mod tests {
             lifecycle_daemon_with(FakeRosterPoller::new(), tunables(95, 80, 9_999)).await;
         let at = daemon.clock.now();
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
         daemon.state.last_swap = Some(LastSwap {
             at, // zero elapsed against a 9_999s cooldown → a normal swap would defer
         });
@@ -1161,7 +1167,7 @@ mod tests {
         let mut daemon = lifecycle_daemon_with(FakeRosterPoller::new(), tunables(95, 80, 0)).await;
         let at = daemon.clock.now();
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
 
         // Dead active has no reading; the spare polled live but is OVER the floor
         // (0.85 ≥ 0.80) — the PROACTIVE path would exclude it, the emergency path must
@@ -1204,7 +1210,7 @@ mod tests {
         let mut daemon = lifecycle_daemon().await;
         let at = daemon.clock.now();
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
 
         // The active account polled live (recovering); the spare is also available.
         let readings = vec![
@@ -1233,7 +1239,7 @@ mod tests {
         );
         // `decide_action` never recovers — only `note_poll_outcome` does — so the
         // account is still quarantined here.
-        assert!(daemon.state.health[0].quarantined);
+        assert!(daemon.state.accounts[0].health.quarantined);
         assert_eq!(daemon.state.active, Some(0), "no swap away mid-recovery");
     }
 
@@ -1252,8 +1258,8 @@ mod tests {
         // `work` (active) is mid-recovery: quarantined, but its OWN token started
         // answering again — 1 of `monitor_recovery_m` = 2 live polls accrued.
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true;
-        daemon.state.health[0].recovery_successes = 1;
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon.state.accounts[0].health.recovery_successes = 1;
 
         // The operator runs `use spare`: the canonical now holds spare's token and the
         // control socket signals the daemon to adopt the manual choice.
@@ -1262,11 +1268,11 @@ mod tests {
 
         assert_eq!(daemon.state.active, Some(1), "the manual choice is adopted");
         assert!(
-            daemon.state.health[0].quarantined,
+            daemon.state.accounts[0].health.quarantined,
             "still dead — a swap-away never recovers an account"
         );
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 0,
+            daemon.state.accounts[0].health.recovery_successes, 0,
             "the frozen probe is dropped — no phantom partial progress (#108)"
         );
         // The departed account is now indistinguishable from any other dead spare: still
@@ -1282,8 +1288,8 @@ mod tests {
         // leaving the swap-TO account untouched.
         let mut daemon = lifecycle_daemon().await;
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true;
-        daemon.state.health[0].recovery_successes = 1;
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon.state.accounts[0].health.recovery_successes = 1;
 
         let mut events = Vec::new();
         // Prime the watch on `work`'s current canonical (A-token): first observation,
@@ -1292,7 +1298,7 @@ mod tests {
             .reconcile_canonical_change(&cred(b"A-token"), &mut events)
             .await;
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 1,
+            daemon.state.accounts[0].health.recovery_successes, 1,
             "priming the watch changes no health"
         );
 
@@ -1303,11 +1309,11 @@ mod tests {
             .await;
 
         assert!(
-            daemon.state.health[0].quarantined,
+            daemon.state.accounts[0].health.quarantined,
             "work is still dead — a detected swap-away never recovers it"
         );
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 0,
+            daemon.state.accounts[0].health.recovery_successes, 0,
             "the frozen probe is dropped on the reconcile seam too (#108)"
         );
         assert_eq!(
@@ -1315,8 +1321,8 @@ mod tests {
             "active is dropped for re-resolution against the new canonical"
         );
         // The swap-TO account (`spare`) is healthy and untouched by the probe reset.
-        assert!(!daemon.state.health[1].quarantined);
-        assert_eq!(daemon.state.health[1].recovery_successes, 0);
+        assert!(!daemon.state.accounts[1].health.quarantined);
+        assert_eq!(daemon.state.accounts[1].health.recovery_successes, 0);
     }
 
     #[tokio::test]
@@ -1391,7 +1397,7 @@ mod tests {
         let mut daemon = lifecycle_daemon().await;
         let at = daemon.clock.now();
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
 
         // No other account has a reading → no viable target.
         let readings = vec![None, None];
@@ -1475,21 +1481,21 @@ mod tests {
         // re-login takes the immediate #107 path in reconcile_canonical_change instead —
         // see `a_relogin_un_quarantines_a_dead_account_immediately_on_restash`.)
         let mut daemon = lifecycle_daemon().await;
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
         let mut events = Vec::new();
 
         // The first live poll while quarantined is a recovery PROBE — still dead,
         // and silent (below `monitor_recovery_m` = 2).
         daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
-        assert!(daemon.state.health[0].quarantined);
-        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+        assert!(daemon.state.accounts[0].health.quarantined);
+        assert_eq!(daemon.state.accounts[0].health.recovery_successes, 1);
         assert!(events.is_empty());
 
         // The 2nd consecutive live reaches the threshold → RESTORED (one event).
         daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
-        assert!(!daemon.state.health[0].quarantined);
+        assert!(!daemon.state.accounts[0].health.quarantined);
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 0,
+            daemon.state.accounts[0].health.recovery_successes, 0,
             "the probe resets on restore"
         );
         assert_eq!(
@@ -1510,28 +1516,28 @@ mod tests {
         // The recovery streak is consecutive: a 401 partway through breaks it, so a
         // single later live is NOT enough — a full M=2 fresh live polls are required.
         let mut daemon = lifecycle_daemon().await;
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
         let mut events = Vec::new();
 
         daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events); // probe at 1
-        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+        assert_eq!(daemon.state.accounts[0].health.recovery_successes, 1);
         // A 401 mid-recovery breaks the streak (and is silent — already dead).
         daemon.note_poll_outcome(0, &Err(Error::UsageUnauthorized), &mut events);
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 0,
+            daemon.state.accounts[0].health.recovery_successes, 0,
             "the 401 reset the probe"
         );
-        assert!(daemon.state.health[0].quarantined);
+        assert!(daemon.state.accounts[0].health.quarantined);
         assert!(events.is_empty());
 
         // One live after the reset is not enough; the second crosses the threshold.
         daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
         assert!(
-            daemon.state.health[0].quarantined,
+            daemon.state.accounts[0].health.quarantined,
             "one live after a reset is not enough"
         );
         daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
-        assert!(!daemon.state.health[0].quarantined);
+        assert!(!daemon.state.accounts[0].health.quarantined);
         assert_eq!(
             events,
             vec![Event::CredentialRestored {
@@ -1547,7 +1553,7 @@ mod tests {
         // token and no email (#15).
         let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10); // active holds
         let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
-        daemon.state.health[1].quarantined = true; // `spare` is dead
+        daemon.state.accounts[1].health.quarantined = true; // `spare` is dead
 
         let outcome = daemon.tick().await;
 
@@ -1580,14 +1586,14 @@ mod tests {
         // `note_poll_outcome` → `snapshot` derivation, not a hand-set flag.
         let mut daemon = lifecycle_daemon().await;
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true; // `work` is dead…
+        daemon.state.accounts[0].health.quarantined = true; // `work` is dead…
 
         // …but its OWN token answers one live probe: still quarantined (below
         // monitor_recovery_m = 2), now mid-recovery.
         let mut events = Vec::new();
         daemon.note_poll_outcome(0, &live(0.10, 0.10), &mut events);
-        assert!(daemon.state.health[0].quarantined);
-        assert_eq!(daemon.state.health[0].recovery_successes, 1);
+        assert!(daemon.state.accounts[0].health.quarantined);
+        assert_eq!(daemon.state.accounts[0].health.recovery_successes, 1);
 
         // The snapshot derives `recovering` from that health; the healthy spare does not.
         let readings = vec![
@@ -1628,7 +1634,7 @@ mod tests {
             .ok("u-A", 0.10, 0.10) // active, holds
             .ok("u-B", 0.10, 0.10); // WOULD be live — but the dead spare is never polled
         let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
-        daemon.state.health[1].quarantined = true; // `spare` died in a prior episode
+        daemon.state.accounts[1].health.quarantined = true; // `spare` died in a prior episode
 
         for _ in 0..3 {
             let outcome = daemon.tick().await;
@@ -1643,11 +1649,11 @@ mod tests {
         }
 
         assert!(
-            daemon.state.health[1].quarantined,
+            daemon.state.accounts[1].health.quarantined,
             "still dead — never polled"
         );
-        assert_eq!(daemon.state.health[1].recovery_successes, 0);
-        assert_eq!(daemon.state.health[1].consec_401, 0);
+        assert_eq!(daemon.state.accounts[1].health.recovery_successes, 0);
+        assert_eq!(daemon.state.accounts[1].health.consec_401, 0);
     }
 
     #[tokio::test]
@@ -1684,7 +1690,7 @@ mod tests {
         );
         // The post-emergency-swap state: `work` is dead and parked off the active slot.
         daemon.state.active = Some(1);
-        daemon.state.health[0].quarantined = true;
+        daemon.state.accounts[0].health.quarantined = true;
 
         // Tick 1 primes the canonical watch on `spare`; the dead `work` is skipped and
         // stays dead — no re-login has happened yet.
@@ -1693,7 +1699,7 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::ReStash { .. } | Event::CredentialRestored { .. })));
-        assert!(daemon.state.health[0].quarantined);
+        assert!(daemon.state.accounts[0].health.quarantined);
 
         // The operator `claude /login`s back into `work`: the canonical becomes its
         // fresh token and the display switches to it.
@@ -1714,11 +1720,11 @@ mod tests {
             second.events
         );
         assert!(
-            !daemon.state.health[0].quarantined,
+            !daemon.state.accounts[0].health.quarantined,
             "the re-login un-quarantines work on the spot — no M-poll delay (#107)"
         );
         assert_eq!(
-            daemon.state.health[0].recovery_successes, 0,
+            daemon.state.accounts[0].health.recovery_successes, 0,
             "an immediate restore leaves no recovery probe pending"
         );
         assert_eq!(
@@ -1740,7 +1746,7 @@ mod tests {
         // Tick 3: `work` is healthy and active; no canonical change and no quarantine →
         // no further restore (the edge does not re-fire on an already-alive account).
         let third = daemon.tick().await;
-        assert!(!daemon.state.health[0].quarantined);
+        assert!(!daemon.state.accounts[0].health.quarantined);
         assert!(
             !third
                 .events
@@ -1785,6 +1791,9 @@ mod tests {
             restores, 1,
             "one credential_restored per recovery edge: {events:?}"
         );
-        assert!(daemon.state.health[0].quarantined, "ends dead in episode 2");
+        assert!(
+            daemon.state.accounts[0].health.quarantined,
+            "ends dead in episode 2"
+        );
     }
 }

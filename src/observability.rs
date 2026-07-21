@@ -1059,7 +1059,7 @@ pub(crate) enum Event {
     },
     /// The ACTIVE account's session-usage BLIND WINDOW just closed (issue #449, umbrella #363 Path
     /// B): the account had gone blind — a `429` / `5xx` / failed poll cleared its
-    /// [`crate::daemon`] `last_readings` slot so [`crate::swap::decide`] had no reading to act on —
+    /// [`crate::daemon`] `last_reading` slot so [`crate::swap::decide`] had no reading to act on —
     /// and this poll read it live again. `duration_secs` is how long it was blind, measured from the
     /// retained pre-blind anchor ([`crate::daemon`]'s `last_good`, issue #450) to this recovery — the
     /// same `blind_elapsed` the bounded-blindness preemptive swap (#452, ADR-0017) keys off, now made
@@ -1099,7 +1099,7 @@ pub(crate) enum Event {
         velocity: Option<BlindVelocity>,
     },
     /// An account ENTERED a blind window (issue #583, umbrella #363 Path B): the poll that just
-    /// cleared its [`crate::daemon`] `last_readings` slot took it from a live reading to none — a
+    /// cleared its [`crate::daemon`] `last_reading` slot took it from a live reading to none — a
     /// `429` / `5xx` / network failure. The OPENING half of the uncensored blind-episode pair
     /// ([`Event::BlindExit`] closes it), and the answer to `blind_window`'s FIRST censoring tail:
     /// `blind_window` fires only on the `None -> live` RECOVERY edge, so an account that goes dark

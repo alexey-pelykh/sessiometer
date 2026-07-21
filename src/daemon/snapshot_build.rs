@@ -67,7 +67,7 @@ where
         // `None` a failed poll / out-of-rotation account → the #137 `Unknown` input.
         let readings = self.decision_readings(self.state.active);
         for (i, reading) in readings.iter().enumerate() {
-            let health = &self.state.health[i];
+            let health = &self.state.accounts[i].health;
             let verdict = credential_health(
                 health.quarantined,
                 health.last_refresh_outcome,
@@ -78,7 +78,7 @@ where
             );
             // Emit only on a CHANGE from a SEEDED baseline; the first observation (None)
             // seeds silently.
-            if let Some(prev) = self.state.health[i].last_health {
+            if let Some(prev) = self.state.accounts[i].health.last_health {
                 if prev != verdict {
                     events.push(Event::CredentialHealth {
                         account: self.roster[i].label.clone(),
@@ -86,7 +86,7 @@ where
                     });
                 }
             }
-            self.state.health[i].last_health = Some(verdict);
+            self.state.accounts[i].health.last_health = Some(verdict);
         }
         events
     }
@@ -109,7 +109,7 @@ where
                 .iter()
                 .enumerate()
                 .map(|(i, account)| {
-                    let health = &self.state.health[i];
+                    let health = &self.state.accounts[i].health;
                     AccountReading {
                         label: account.label.clone(),
                         active: active == Some(i),
@@ -154,7 +154,7 @@ where
                         // The bounded-blindness projection (issue #479): ONLY the active account can
                         // be in bounded blindness — it is the only one that self-exhausts while
                         // active and the only one the `last_good` anchor belongs to. Keyed off
-                        // `last_readings[active].is_none()` (the true blind predicate the anchor +
+                        // `accounts[active].last_reading.is_none()` (the true blind predicate the anchor +
                         // `note_blind_gate_eligibility` logic use, NOT the masked `readings` arg) and
                         // the retained anchor; `None` for every other account (and omitted from the
                         // wire there via `skip_serializing_if`).
@@ -166,9 +166,9 @@ where
                                 // is armed).
                                 AnchorArmInputs {
                                     last_good: self.state.last_good,
-                                    high_water: self.state.session_high_water[i],
+                                    high_water: self.state.accounts[i].session_high_water,
                                 },
-                                self.state.last_readings[i].is_none(),
+                                self.state.accounts[i].last_reading.is_none(),
                                 health.quarantined,
                                 // Issue #582: a server `Retry-After` still holding the blind active
                                 // off its poll degrades auto-protection too — read from the SAME
@@ -180,7 +180,7 @@ where
                                 // `status` also degrades a below-band anchor whose measured climb could
                                 // reach the trigger inside the blind window (a burn the anchor arm, frozen
                                 // below the band, cannot see). Report-only — no swap keys off this.
-                                self.state.session_velocity[i],
+                                self.state.accounts[i].session_velocity,
                                 self.session_ceiling_base,
                                 blind_at,
                             )
@@ -586,22 +586,28 @@ mod tests {
 
         // Tick 1 polls the ACTIVE account (u-A) → its expiry is read from the CANONICAL item…
         daemon.tick().await;
-        assert_eq!(daemon.state.health[0].poll_expires_at, Some(CANON_S));
+        assert_eq!(
+            daemon.state.accounts[0].health.poll_expires_at,
+            Some(CANON_S)
+        );
         // …while the refresh-sourced field the rollup actually reads stays untouched: with
         // `[refresh]` off it is still `None`, so no lapsed poll clock can reach the Stale branch.
-        assert_eq!(daemon.state.health[0].access_expires_at, None);
+        assert_eq!(daemon.state.accounts[0].health.access_expires_at, None);
 
         // Tick 2 polls a NON-active account (u-B) → its expiry is read from that account's STASH.
         daemon.tick().await;
-        assert_eq!(daemon.state.health[1].poll_expires_at, Some(STASH_S));
-        assert_eq!(daemon.state.health[1].access_expires_at, None);
+        assert_eq!(
+            daemon.state.accounts[1].health.poll_expires_at,
+            Some(STASH_S)
+        );
+        assert_eq!(daemon.state.accounts[1].health.access_expires_at, None);
 
         // Project the wire the control socket returns, with `now` set a day AFTER the polled
         // expiry — the exact lapsed-idle case. The clock IS populated (AC: non-null with
         // `[refresh]` off) yet the ACTIVE account stays Healthy, NOT a false-🟠 Stale: the
         // poll clock never reaches the Stale branch, and its own successful poll is the
         // positive-liveness signal keeping it Healthy rather than Unknown (#137).
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
         let snapshot = daemon.snapshot(daemon.state.active, &readings, CANON_S + 86_400);
         assert_eq!(snapshot.accounts[0].access_expires_at, Some(CANON_S));
         assert_eq!(snapshot.accounts[0].health, CredentialHealth::Healthy);
@@ -632,7 +638,7 @@ mod tests {
         // liveness signal, so honestly unverified rather than a false 🟢.
         assert!(daemon.note_health_transitions(NOW).is_empty());
         assert_eq!(
-            daemon.state.health[0].last_health,
+            daemon.state.accounts[0].health.last_health,
             Some(CredentialHealth::Unknown)
         );
 
@@ -640,7 +646,7 @@ mod tests {
         // state — and only for the account that changed. A bare quarantine (an access-token
         // 401-streak) transitions to Degraded, NOT Dead (issue #427): the event log carries the
         // honest non-terminal verdict too, so a `grep` never cries a false death.
-        daemon.state.health[0].quarantined = true; // → Degraded
+        daemon.state.accounts[0].health.quarantined = true; // → Degraded
         assert_eq!(
             daemon.note_health_transitions(NOW),
             vec![Event::CredentialHealth {
@@ -654,7 +660,7 @@ mod tests {
 
         // Un-quarantine WITHOUT any new evidence ⇒ back to Unknown, NOT a false Healthy
         // (#137): clearing the quarantine flag does not prove the credential is alive.
-        daemon.state.health[0].quarantined = false; // → Unknown (still no liveness signal)
+        daemon.state.accounts[0].health.quarantined = false; // → Unknown (still no liveness signal)
         assert_eq!(
             daemon.note_health_transitions(NOW),
             vec![Event::CredentialHealth {
@@ -665,7 +671,7 @@ mod tests {
 
         // Evidence ARRIVES — a successful poll for `work` (enabled, non-quarantined, so it
         // surfaces through `decision_readings`) ⇒ Unknown transitions to a real Healthy state.
-        daemon.state.last_readings[0] = Some(Usage {
+        daemon.state.accounts[0].last_reading = Some(Usage {
             session: 0.10,
             weekly: 0.10,
             weekly_resets_at: None,
@@ -2048,7 +2054,7 @@ mod tests {
         // readings that make `spare` (reset 200) the soonest-reset viable target ahead of
         // `reserve` (reset 500). `backup` is dead — its masked-away reading is irrelevant.
         daemon.state.active = Some(0);
-        daemon.state.last_readings = vec![
+        daemon.state.seed_readings([
             Some(Usage {
                 session: 0.97,
                 weekly: 0.10,
@@ -2073,8 +2079,8 @@ mod tests {
                 weekly_resets_at: Some(500), // …but a later reset, so never the target
                 session_resets_at: None,
             }),
-        ];
-        daemon.state.health[2].quarantined = true; // `backup` is dead
+        ]);
+        daemon.state.accounts[2].health.quarantined = true; // `backup` is dead
 
         let excluded = daemon.refresh_exclusions();
         let quarantined = daemon.refresh_quarantined();
@@ -2138,7 +2144,7 @@ mod tests {
                 &tun,
             );
             daemon.state.active = Some(0);
-            daemon.state.last_readings = vec![
+            daemon.state.seed_readings([
                 Some(Usage {
                     session: 0.97,
                     weekly: 0.10,
@@ -2157,8 +2163,16 @@ mod tests {
                     weekly_resets_at: Some(200), // …tied, so the tie-break decides
                     session_resets_at: None,
                 }),
-            ];
-            daemon.state.session_velocity = vec![None, ema(0.010, 3), ema(0.001, 3)];
+            ]);
+            for (account, velocity) in
+                daemon
+                    .state
+                    .accounts
+                    .iter_mut()
+                    .zip([None, ema(0.010, 3), ema(0.001, 3)])
+            {
+                account.session_velocity = velocity;
+            }
             (dir, daemon)
         }
 
@@ -2445,8 +2459,8 @@ mod tests {
 
         // Both other accounts dead (their readings masked to `None`, as the snapshot
         // would pass them) → no viable target, NOT awaiting-data.
-        daemon.state.health[1].quarantined = true;
-        daemon.state.health[2].quarantined = true;
+        daemon.state.accounts[1].health.quarantined = true;
+        daemon.state.accounts[2].health.quarantined = true;
         // Every other reading masked to `None` → relief falls to the WEEKLY-wide default with no
         // parseable reset (the per-account 🔴 health names the re-login remedy on each row; #405).
         assert_eq!(
@@ -2459,7 +2473,7 @@ mod tests {
 
         // Revive one: a live, not-yet-polled other account restores the genuine
         // cold-start `awaiting usage data` verdict (the substate is unchanged for it).
-        daemon.state.health[1].quarantined = false;
+        daemon.state.accounts[1].health.quarantined = false;
         assert_eq!(
             daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
             Some(NextSwap::AwaitingData),
