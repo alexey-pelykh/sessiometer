@@ -659,12 +659,13 @@ pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -
 /// the RAW value — the same read-time-only contract [`plausible_session`] draws for the
 /// reactive/projective arms, so no synthesized value lands in a raw-measurement surface.
 ///
-/// One anchor consumer is a DECISION read yet deliberately left RAW: the #584 velocity projection
-/// ([`crate::daemon`]'s `blind_velocity_projected_armed`), which bases `status`'s third degradation
-/// arm on the anchor. It is out of #619's scope (the #452 gate only), NOT a measurement. Residual:
-/// an anchor whose CORRECTED value still sits below the risk band (so the #452 arm stays disarmed)
-/// projects that arm off the stale-low RAW base, so `status` can under-report degradation there.
-/// Bounded to the `status` projection; no swap path reads that predicate.
+/// BOTH `status` DECISION arms decide on this corrected value: the #452 gate arm (issue #619) and,
+/// since issue #632, the #584 velocity projection ([`crate::daemon`]'s `blind_velocity_projected_armed`)
+/// — so an anchor whose CORRECTED session still sits below the risk band (the #452 arm stays disarmed)
+/// no longer projects the velocity arm off the stale-low RAW base and under-reports degradation. Every
+/// MEASUREMENT surface (above) still keeps the raw value; so does the OFFLINE reconstruction of the
+/// velocity arm, which reproduces the corrected decision only up to a stale-low correction until the
+/// mark is carried onto `Event::BlindWindow` (issue #670).
 ///
 /// Unlike [`plausible_session`] this takes NO window stamp and does NO window match — sound for the
 /// ANCHOR case SPECIFICALLY: the caller consults the ACTIVE account's own `session_high_water`, which

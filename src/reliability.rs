@@ -482,7 +482,10 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
 /// inflation × duration_secs`, the [`crate::daemon`] `blind_velocity_projected_armed` formula — and
 /// pairs it with the durable `session_at_recovery` beside it. Every term is stamped on the line
 /// (issue #634), so no daemon constant is imported and an old window is never read through a
-/// today-value.
+/// today-value. `session_pct` is the RAW anchor: since issue #632 the live arm projects off the #619
+/// plausibility-CORRECTED base, so this recompute reproduces the live forecast exactly absent a
+/// stale-low correction and is a conservative LOWER bound under one — carrying the frozen high-water
+/// mark onto the line would close that gap (issue #670).
 ///
 /// Classifies EVERY line into exactly one [`BlindWindowCensus`] bucket, applying the arm's OWN
 /// gates in the arm's OWN order — duration first, sustained EMA second — so "outside the arm's

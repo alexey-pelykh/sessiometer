@@ -384,23 +384,19 @@ pub(super) fn blind_active_view(
     // Issue #619: the anchor ARM decides on the anchor's PLAUSIBLE session (raised to the frozen
     // high-water mark when the pre-blind reading was stale-low), the SAME value `blind_swap` /
     // `note_blind_gate_eligibility` decide on — so `status` never reports "auto-protection OK" while
-    // the corrected gate is actually armed and swapping. The DISPLAYED `last_known_session_pct`
-    // below keeps the RAW anchor — a measurement of what was last observed. The #584 velocity base
-    // ALSO stays raw, but as an out-of-scope DECISION read, not a measurement: #619 covers the #452
-    // gate only, so an anchor corrected to below the risk band still projects that arm off the
-    // stale-low value (see `swap::plausible_anchor_session`).
+    // the corrected gate is actually armed and swapping. Issue #632 extends that correction to the
+    // #584 velocity base below: both DECISION arms now project off `gate_session`, so an anchor
+    // corrected to still-below the risk band (the #452 arm stays disarmed) no longer projects the
+    // velocity arm off the stale-low value and under-reports degradation. The DISPLAYED
+    // `last_known_session_pct` below keeps the RAW anchor — a measurement of what was last observed,
+    // never the synthesized correction (the #614 / #619 read-time-only contract).
     let gate_session = swap::plausible_anchor_session(high_water, anchor.session);
     Some(BlindActive {
         blind_secs,
         last_known_session_pct: to_pct(anchor.session),
         auto_protection_degraded: blind_gate_armed(blind_secs, gate_session)
             || (blind_secs > BLIND_GATE_SECS && server_retry_after_hold)
-            || blind_velocity_projected_armed(
-                blind_secs,
-                anchor.session,
-                velocity,
-                session_ceiling,
-            ),
+            || blind_velocity_projected_armed(blind_secs, gate_session, velocity, session_ceiling),
     })
 }
 
@@ -760,6 +756,115 @@ mod tests {
         assert!(
             corrected.auto_protection_degraded,
             "past T a stale-low anchor corrected into the band is DEGRADED, not false-OK (issue #619)",
+        );
+        // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
+        assert_eq!(
+            corrected.last_known_session_pct,
+            to_pct(stale_low.session),
+            "the displayed last-known % is the raw anchor, never the synthesized correction",
+        );
+    }
+
+    #[test]
+    fn blind_active_view_velocity_arm_projects_off_the_corrected_below_band_anchor() {
+        // Issue #632 (the #619 residual): the #584 VELOCITY-projection arm must project off the SAME
+        // #619 plausibility-corrected base the anchor arm decides on, not the raw stale-low anchor.
+        // The isolating case is an anchor whose CORRECTED value STILL sits BELOW the risk band — so
+        // the #452 anchor arm correctly stays disarmed — yet whose retained velocity, projected off
+        // the corrected base, reaches the trigger inside the blind window while projecting off the raw
+        // base misses it. `status` must DEGRADE (the one-sided #479/#582/#584 honesty invariant),
+        // never read false-"OK" off the stale-low base.
+        let base = Instant::now();
+        let trigger = 0.95;
+        // Raw anchor 0.40 below the band; corrected to 0.50 — STILL below the 0.60 band, so the anchor
+        // arm (`blind_gate_armed`: session >= BLIND_GATE_RISK_BAND) never fires and the velocity arm
+        // is what this test isolates.
+        let stale_low = LastGood {
+            session: BLIND_GATE_RISK_BAND - 0.40, // 0.20 raw, well below the band
+            weekly: 0.20,
+            at: base,
+        };
+        // The window's TRUE high-water (an earlier plausible reading) — a real lower bound, itself
+        // still below the band (0.50 < 0.60), so it corrects the base WITHOUT arming the anchor arm.
+        let mark = swap::SessionHighWater::fold(
+            None,
+            &Usage {
+                session: BLIND_GATE_RISK_BAND - 0.10, // 0.50, the corrected base — below the band
+                weekly: 0.20,
+                weekly_resets_at: None,
+                session_resets_at: Some(WINDOW),
+            },
+        );
+        // A SUSTAINED climb (samples >= MIN_VELOCITY_SAMPLES), rate 0.0003 session-fraction/s. Blind
+        // 1200 s (> the 300 s gate) the inflated bound adds 0.0003 × 1.75 × 1200 = 0.63:
+        //   raw base       0.20 + 0.63 = 0.83 < 0.95 → the arm MISSES (the bug: reports OK), while
+        //   corrected base 0.50 + 0.63 = 1.13 ≥ 0.95 → the arm HITS  (the fix: DEGRADED).
+        let climbing = Some(VelocityEma {
+            rate: 0.0003,
+            samples: MIN_VELOCITY_SAMPLES,
+        });
+        let past_t = base + Duration::from_secs(1200);
+        assert!(
+            (BLIND_GATE_RISK_BAND - 0.40) + 0.0003 * BLIND_VELOCITY_RATE_INFLATION * 1200.0
+                < trigger,
+            "fixture sanity: off the RAW stale-low base the projection stays below the trigger",
+        );
+        assert!(
+            (BLIND_GATE_RISK_BAND - 0.10) + 0.0003 * BLIND_VELOCITY_RATE_INFLATION * 1200.0
+                >= trigger,
+            "fixture sanity: off the CORRECTED base the projection reaches the trigger",
+        );
+
+        // Control — NO mark → the velocity arm reads the raw stale-low base and MISSES: reports OK,
+        // the under-report #632 fixes. The anchor arm is below the band either way, so the velocity
+        // arm is the only arm in play in both halves.
+        let raw = blind_active_view(
+            AnchorArmInputs {
+                last_good: Some(stale_low),
+                high_water: None,
+            },
+            true,
+            false,
+            false,
+            climbing,
+            trigger,
+            past_t,
+        )
+        .expect("a blind active account with an anchor projects a state");
+        assert!(
+            !raw.auto_protection_degraded,
+            "control: off the raw stale-low base the velocity projection misses the trigger — OK",
+        );
+
+        // Corrected against the mark → the velocity projection reaches the trigger → DEGRADED. This
+        // assertion FAILS before #632 (the arm was passed the raw `anchor.session`) and holds after.
+        let corrected = blind_active_view(
+            AnchorArmInputs {
+                last_good: Some(stale_low),
+                high_water: mark,
+            },
+            true,
+            false,
+            false,
+            climbing,
+            trigger,
+            past_t,
+        )
+        .expect("still projects a state past T");
+        assert!(
+            corrected.auto_protection_degraded,
+            "a below-band anchor corrected to a base whose velocity projection reaches the trigger is \
+             DEGRADED, not false-OK — the #584 velocity arm on the #619 corrected base (issue #632)",
+        );
+        // Fixture guard: the anchor arm itself is DISARMED (corrected 0.50 < 0.60 band), so the
+        // velocity arm ALONE flips the verdict — this pins the velocity-arm correction, not the
+        // anchor arm's (which #619 already covered).
+        assert!(
+            !blind_gate_armed(
+                past_t.saturating_duration_since(base).as_secs(),
+                swap::plausible_anchor_session(mark, stale_low.session),
+            ),
+            "fixture guard: the corrected anchor stays below the band, so the anchor arm is disarmed",
         );
         // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
         assert_eq!(
