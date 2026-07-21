@@ -247,8 +247,11 @@ struct SettingsView: View {
                 .foregroundStyle(.red)
                 .help(detail ?? "")
         case .failed(let failure):
+            // `.help` mirrors the `rejected` path: a daemon-error `detail` (the #628 stale-key message,
+            // issue #645) can be long, so keep it fully readable on hover even when the inline label truncates.
             Label(applyFailureText(failure), systemImage: "bolt.horizontal.circle")
                 .foregroundStyle(.red)
+                .help(applyFailureText(failure))
         }
     }
 
