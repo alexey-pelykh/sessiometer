@@ -93,8 +93,11 @@ chip) + unit tests instead.
 `build-comparison.py` assembles a single self-contained page that puts the mock's **live** `.pop`
 blocks next to the built-panel captures, state by state — the fastest way to eyeball parity across the
 eight connection-states the panel implements, plus the active-account **blind** modifier (OK / DEGRADED,
-#479/#485). The mock's `keychain-locked` stays unpaired: it is a daemon-**fault** banner, and
-`RenderPanelTool` renders none of that family, so there is no capture to set beside it (#592):
+#479/#485) and the four **daemon-fault** ranks (#592). Neither of those last two is a connection-state:
+`blind` is a per-row modifier and a fault banner is resolved *over* a connected snapshot, which is why
+both pair against a healthy green roster. The four fault ranks pair in the worst-first order the panel
+resolves them (keychain-locked › scrub-exhausted › systemic › recovering), so a severity **inversion** —
+a visual claim the format-layer unit tests cannot reach — shows up by reading them in sequence:
 
 ```sh
 # from apps/menubar, after a Debug build

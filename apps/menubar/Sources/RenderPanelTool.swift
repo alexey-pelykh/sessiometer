@@ -27,6 +27,12 @@ enum RenderPanelTool {
         let rows: [AccountRow]
         let nextSwap: NextSwap?
         let generatedAt: Int64?
+        // The three daemon-level payload faults `StatusPanelFormat.daemonFaultBanner` ranks worst-first
+        // (#592). `var` with a default, not `let` — Swift's memberwise init defaults `var` properties but
+        // EXCLUDES defaulted `let`s, so `let` here would make these unreachable from the fixture list.
+        var keychainLocked: Bool = false
+        var canonicalScrub: CanonicalScrub?
+        var systemicRefreshFailure: UInt32?
     }
 
     /// Render every panel-supported state (light + dark) into `outputDir` as `panel-<state>-<theme>.png`.
@@ -108,11 +114,17 @@ enum RenderPanelTool {
             Fixture(name: "blind-degraded", state: .connected, rows: blindDegradedRows,
                     nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 12),
-        ]
+        // …plus the four daemon-level FAULT ranks (#592) — appended rather than inlined because they vary a
+        // different axis: same `.connected` state and same healthy roster, differing only in which payload
+        // fault is set. See `faultFixtures`.
+        ] + faultFixtures(rows: rows, now: now, day: day)
 
         for fixture in fixtures {
             let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
-                                                 nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt)
+                                                 nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
+                                                 canonicalScrub: fixture.canonicalScrub,
+                                                 keychainLocked: fixture.keychainLocked,
+                                                 systemicRefreshFailure: fixture.systemicRefreshFailure)
             for scheme in [ColorScheme.light, .dark] {
                 let theme = scheme == .light ? "light" : "dark"
                 let name = "panel-\(fixture.name)-\(theme).png"
@@ -149,6 +161,50 @@ enum RenderPanelTool {
                 write(cg, to: outputDir + "/" + name)
             }
         }
+    }
+
+    /// The four DAEMON-LEVEL FAULT fixtures (#592) — one per rank of `StatusPanelFormat.daemonFaultBanner`'s
+    /// worst-first resolver, so the shipped banner family finally has a VISUAL oracle to set beside the
+    /// mock's fault frames (`menubar-preview.html`). Until these, `RenderPanelTool` rendered none of the
+    /// family, so `design/build-comparison.py` had nothing to pair against and the severity ranking — a
+    /// *visual* claim — was defended by format-layer unit tests alone.
+    ///
+    /// All four ride a `.connected` snapshot over the SAME healthy green roster, deliberately: a daemon-level
+    /// fault is exactly the one NO per-row `auth` cell reflects, so "full green roster under a loud banner" is
+    /// the state these banners exist to contradict — not an inconsistency in the fixture. Header and footer
+    /// stay fresh for the same reason: the fault is the DAEMON's, not the snapshot's (never a whole-snapshot
+    /// `stale`, #137).
+    ///
+    /// Rendering all four — including the calm rank 4 — is the point rather than redundancy: rank 3 (systemic,
+    /// `.warning`) has to be SEEN to beat rank 4 (`recovering`, `.info`), and an inversion between those two is
+    /// precisely the regression `daemonFaultBanner` documents at length. One frame each is what makes the
+    /// (fault, VARIANT) ordering reviewable instead of asserted.
+    private static func faultFixtures(rows: [AccountRow], now: Int64, day: Int64) -> [Fixture] {
+        // The healthy next-swap the roster would carry regardless — ranks 3-4 leave swapping alive, and even
+        // where the daemon is blocked the panel still states its recommendation.
+        let nextSwap = NextSwap.target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day))
+        func fault(_ name: String, _ apply: (inout Fixture) -> Void) -> Fixture {
+            var fixture = Fixture(name: name, state: .connected, rows: rows,
+                                  nextSwap: nextSwap, generatedAt: now - 12)
+            apply(&fixture)
+            return fixture
+        }
+        return [
+            // Rank 1 — the login keychain is LOCKED, so the shared item is unreadable. `.error`; remedy is
+            // UNLOCK, never `claude /login` (#498).
+            fault("fault-keychain-locked") { $0.keychainLocked = true },
+            // Rank 2 — the shared canonical is scrubbed AND recovery is exhausted: an act-now lockout whose
+            // remedy is `claude /login` (#469). `.error`.
+            fault("fault-scrub-exhausted") { $0.canonicalScrub = .exhausted },
+            // Rank 3 — the refresh MECHANISM is down. `.warning`, not `.error`: every account still works, so
+            // it is a pre-death "next break" task, ranked deliberately ABOVE the calm scrub below (#523). The
+            // count is plural-agreeing, so 3 exercises the "sweeps" arm rather than the n=1 floor.
+            fault("fault-systemic-refresh") { $0.systemicRefreshFailure = 3 },
+            // Rank 4 — scrubbed but self-healing. `.info`, and the LOWEST claim on the one banner slot
+            // precisely because its whole message is "no action needed" — a self-healing state can never
+            // outrank one that cannot self-heal.
+            fault("fault-scrub-recovering") { $0.canonicalScrub = .recovering },
+        ]
     }
 
     private static func write(_ cg: CGImage, to path: String) {
