@@ -22,7 +22,7 @@
 //!    own rate-limit window: the usage endpoint is source-scoped and serves ~one
 //!    request per short window, so the former poll-of-all BURST had all-but-one
 //!    `429`-fail at the CDN edge. The polled account's reading updates its slot in the
-//!    carried `last_readings`; a failed poll clears it. A `429` / `5xx` backs off
+//!    carried per-account readings; a failed poll clears it. A `429` / `5xx` backs off
 //!    only THAT account's next poll (issue #293, revising #76): the `429` is
 //!    per-account (each token resolves to its own Anthropic org, so the throttle
 //!    buckets are independent), so the throttled account is skipped until its
@@ -1142,6 +1142,83 @@ pub(crate) struct AccountHealth {
     exhausted_poll_until: Option<Instant>,
 }
 
+/// One roster account's carried per-signal runtime state (issue #668, #637 step 5).
+///
+/// Bundles what were EIGHT parallel `Vec`s on [`DecisionState`], each indexed by roster position and
+/// held in hand-maintained lockstep at every sizing/re-key site. That index-alignment was an
+/// invariant no type enforced: a ninth per-account signal meant remembering [`Daemon::new`], both
+/// arms of [`reconcile_roster`](Daemon::reconcile_roster), and the commit block — and forgetting one
+/// still COMPILED, silently drifting a vec out of length/index sync with the roster (a projective
+/// read would then index the wrong account or panic out of bounds). Bundled, the roster's runtime
+/// state is ONE vec: a new signal is a new FIELD here, and every lockstep site updates it for free.
+///
+/// [`DecisionState::accounts`] holds one of these per roster account, in roster order. State NOT
+/// indexed by roster position — the cooldown (#10), the canonical watch (#13), the tick counter, the
+/// active account's [`last_good`](DecisionState::last_good) anchor (#450) — deliberately stays on
+/// [`DecisionState`]: it is daemon-scoped, not account-scoped.
+///
+/// `Clone` (not `Copy`) because [`AccountHealth`] is: [`reconcile_roster`](Daemon::reconcile_roster)
+/// clones a persisting account's slot into the rebuilt vec. `Default` is the freshly-onboarded
+/// account's state — unpolled, no reading, healthy — so a new roster entry is `AccountRuntime::default()`.
+#[derive(Default, Clone)]
+struct AccountRuntime {
+    /// Health carried across ticks (issue #42): the consecutive-401 streak (feeding the `monitor_401`
+    /// log event and the dead-credential threshold), the quarantine flag, and the recovery-probe
+    /// count. See [`AccountHealth`].
+    health: AccountHealth,
+    /// Last-known usage reading (issue #80). The daemon polls ONE account per tick (staggered, the
+    /// active interleaved before each peer — #366), so a decision is taken on the most recent reading
+    /// of EACH account rather than a single-instant poll-of-all — one account's number may be ~a cycle
+    /// older than another's. `None` until the account is first polled (or after a poll fails). The
+    /// decision/snapshot view masks an out-of-rotation (disabled / quarantined) non-active account back
+    /// to `None` ([`decision_readings`](Daemon::decision_readings)), so stale carried data can never
+    /// leak into [`pick_target`].
+    last_reading: Option<Usage>,
+    /// When [`last_reading`](Self::last_reading) was observed (issue #449) — the monotonic ([`Instant`])
+    /// time of the reading now in that slot, `None` whenever the reading is `None` (never polled, or
+    /// cleared by a failed poll). The per-account usage-velocity signal divides its delta by
+    /// `now - last_reading_at` to normalize to %/min; keeping the timestamp BESIDE the reading (rather
+    /// than folding it into the `Copy` decision [`Usage`]) leaves the swap-decision type lean and every
+    /// reader of the reading unchanged. Process-local: never serialized (an [`Instant`] is meaningless
+    /// across the socket).
+    last_reading_at: Option<Instant>,
+    /// The retained SESSION-velocity EMA (issue #539, ADR-0017) — the smoothed rate the #539
+    /// velocity-projection preemptive trigger ([`Daemon::velocity_swap`]) projects from. `None` until
+    /// the account has a usable two-reading interval, and RESET to `None` on a session-usage DROP (a
+    /// 5 h reset / recovery). Updated in the poll fold by
+    /// [`note_session_velocity`](Daemon::note_session_velocity) from the SAME `(prev, next, elapsed)`
+    /// the durable [`Event::UsageVelocity`] uses. See [`VelocityEma`].
+    session_velocity: Option<VelocityEma>,
+    /// The ARMED landing watch for the runtime landing-overshoot signal (issue #613) — `Some` on the
+    /// account the daemon just parked with a `reason=session` swap, until its post-swap window
+    /// ([`ParkedLanding`]) closes (an overshoot fires, the window elapses, or the account goes active
+    /// again). Armed in [`decide_action`](Daemon::decide_action), checked each poll by
+    /// [`note_landing_overshoot`](Daemon::note_landing_overshoot). `None` when no landing window is
+    /// open. See [`ParkedLanding`].
+    parked_landing: Option<ParkedLanding>,
+    /// The SESSION high-water mark within the current session window (issue #614) — the plausibility
+    /// baseline that lets both swap arms recognize a stale / cache-lagged LOW `/oauth/usage` reading
+    /// (usage is monotonic within a window, so a drop with an unchanged `session_resets_at` cannot be
+    /// real). Folded from every SUCCESSFUL poll by [`swap::SessionHighWater::fold`] (a failed poll is
+    /// blindness, not evidence the window rolled, so it leaves the mark untouched) and released
+    /// automatically when the window rolls, so it can never pin an account across windows. `None`
+    /// until the account is polled with a parseable `session_resets_at`. See [`swap::SessionHighWater`].
+    session_high_water: Option<swap::SessionHighWater>,
+    /// The pre-blind anchor (issue #583) — `Some` exactly while this account is inside a blind episode
+    /// whose entry the daemon actually witnessed. Set on the live→blind ENTRY edge (which emits
+    /// [`Event::BlindEnter`]), read and cleared on the blind→live EXIT edge (which emits
+    /// [`Event::BlindExit`]), and touched by nothing else — no swap path, no active resolution — so
+    /// neither censoring tail of `blind_window` can reach it. `None` for an account that is reading
+    /// live, and for one whose blindness the daemon never saw begin (a first-ever poll that fails, or
+    /// one already blind at startup): with no anchor there is no baseline to difference against, so no
+    /// episode is claimed. See [`BlindAnchor`]; contrast the ACTIVE-scoped
+    /// [`last_good`](DecisionState::last_good).
+    blind_anchor: Option<BlindAnchor>,
+    /// Whether this account has been polled at least once this run (issue #80). Drives the warm-up
+    /// latch [`warmed_up`](DecisionState::warmed_up).
+    polled_once: bool,
+}
+
 /// Per-loop decision state carried across polls.
 #[derive(Default)]
 struct DecisionState {
@@ -1191,11 +1268,16 @@ struct DecisionState {
     /// [`signaled_retry_after_reserve`](Self::signaled_retry_after_reserve) above. Mirrors the
     /// `signaled_all_exhausted` idiom.
     signaled_retry_after_walk: bool,
-    /// Per-account health carried across ticks (issue #42), indexed by roster
-    /// position: the consecutive-401 streak (feeding the `monitor_401` log event and
-    /// the dead-credential threshold), the quarantine flag, and the recovery-probe
-    /// count. Sized to the roster in [`Daemon::new`]. See [`AccountHealth`].
-    health: Vec<AccountHealth>,
+    /// Per-account carried runtime state (issue #668), one slot per roster account, in roster order —
+    /// health (#42), the last-known reading (#80) and its timestamp (#449), the session-velocity EMA
+    /// (#539), the armed landing watch (#613), the session high-water mark (#614), the pre-blind
+    /// anchor (#583), and the warm-up flag (#80). Sized to the roster in [`Daemon::new`] and re-keyed
+    /// BY UUID (never by position) in [`reconcile_roster`](Daemon::reconcile_roster).
+    ///
+    /// ONE vec, not eight parallel ones: index `i` denotes roster account `i` for EVERY signal at
+    /// once, so the roster/state length-and-index invariant is structural rather than hand-maintained
+    /// across a growing set of sizing and re-key sites. See [`AccountRuntime`].
+    accounts: Vec<AccountRuntime>,
     /// Edge-trigger guard for the all-exhausted signal (issue #11): set when an
     /// `all_exhausted` event is emitted, and cleared by [`Daemon::tick`] on any
     /// cycle that is NOT the no-viable-target state. So the signal fires exactly
@@ -1266,70 +1348,10 @@ struct DecisionState {
     /// churn window resets — so the back-off fires exactly ONCE per episode, not once per held tick
     /// while the canonical stays scrubbed. Mirrors `signaled_all_exhausted`.
     signaled_scrub_adopt_exhausted: bool,
-    /// Last-known usage reading per roster account (issue #80), indexed by roster
-    /// position. The daemon polls ONE account per tick (staggered, the active
-    /// interleaved before each peer — #366), so a decision is taken on the most recent
-    /// reading of EACH account rather than a single-instant poll-of-all — one account's
-    /// number may be ~a cycle older than another's. `None` until an account is first
-    /// polled (or after a poll fails).
-    /// Sized to the roster in [`Daemon::new`]. The decision/snapshot view masks an
-    /// out-of-rotation (disabled / quarantined) non-active account back to `None`
-    /// ([`decision_readings`](Daemon::decision_readings)), so stale carried data can
-    /// never leak into [`pick_target`].
-    last_readings: Vec<Option<Usage>>,
-    /// When each [`last_readings`](Self::last_readings) slot was observed (issue #449), indexed in
-    /// lockstep with it — the monotonic ([`Instant`]) time of the reading now in that slot, `None`
-    /// whenever the slot is `None` (never polled, or cleared by a failed poll). The per-account
-    /// usage-velocity signal divides its delta by `now - last_reading_at[i]` to normalize to %/min;
-    /// keeping the timestamp PARALLEL to `last_readings` (rather than folding it into the `Copy`
-    /// decision [`Usage`]) leaves the swap-decision type lean and every reader of `last_readings`
-    /// unchanged. Process-local: never serialized (an [`Instant`] is meaningless across the socket).
-    last_reading_at: Vec<Option<Instant>>,
-    /// The retained per-account SESSION-velocity EMA (issue #539, ADR-0017), indexed in lockstep
-    /// with [`last_readings`](Self::last_readings) — the smoothed rate the #539 velocity-projection
-    /// preemptive trigger ([`Daemon::velocity_swap`]) projects from. `None` until an account has a
-    /// usable two-reading interval, and RESET to `None` on a session-usage DROP (a 5 h reset /
-    /// recovery). Updated in the poll fold by [`note_session_velocity`](Daemon::note_session_velocity)
-    /// from the SAME `(prev, next, elapsed)` the durable [`Event::UsageVelocity`] uses, and rebuilt
-    /// in lockstep by [`reconcile_roster`](Daemon::reconcile_roster). Sized to the roster in
-    /// [`Daemon::new`]. See [`VelocityEma`].
-    session_velocity: Vec<Option<VelocityEma>>,
-    /// The per-account ARMED landing watch for the runtime landing-overshoot signal (issue #613),
-    /// indexed in lockstep with [`last_readings`](Self::last_readings) — `Some` on the account the
-    /// daemon just parked with a `reason=session` swap, until its post-swap window ([`ParkedLanding`])
-    /// closes (an overshoot fires, the window elapses, or the account goes active again). Armed in
-    /// [`decide_action`](Daemon::decide_action), checked each poll by
-    /// [`note_landing_overshoot`](Daemon::note_landing_overshoot). Sized to the roster in
-    /// [`Daemon::new`] and rebuilt in lockstep by [`reconcile_roster`](Daemon::reconcile_roster).
-    /// `None` for every account with no open landing window. See [`ParkedLanding`].
-    parked_landing: Vec<Option<ParkedLanding>>,
-    /// The per-account SESSION high-water mark within the current session window (issue #614),
-    /// indexed in lockstep with [`last_readings`](Self::last_readings) — the plausibility baseline
-    /// that lets both swap arms recognize a stale / cache-lagged LOW `/oauth/usage` reading (usage is
-    /// monotonic within a window, so a drop with an unchanged `session_resets_at` cannot be real).
-    /// Folded from every SUCCESSFUL poll by [`swap::SessionHighWater::fold`] (a failed poll is blindness,
-    /// not evidence the window rolled, so it leaves the mark untouched) and released automatically
-    /// when the window rolls, so it can never pin an account across windows. `None` until an account
-    /// is polled with a parseable `session_resets_at`. Rebuilt in lockstep by
-    /// [`reconcile_roster`](Daemon::reconcile_roster) and sized to the roster in [`Daemon::new`], like
-    /// every other per-account vec. See [`swap::SessionHighWater`].
-    session_high_water: Vec<Option<swap::SessionHighWater>>,
-    /// The PER-ACCOUNT pre-blind anchor (issue #583), indexed in lockstep with
-    /// [`last_readings`](Self::last_readings) — `Some` exactly while that account is inside a blind
-    /// episode whose entry the daemon actually witnessed. Set on the live→blind ENTRY edge (which
-    /// emits [`Event::BlindEnter`]), read and cleared on the blind→live EXIT edge (which emits
-    /// [`Event::BlindExit`]), and touched by nothing else — no swap path, no active resolution — so
-    /// neither censoring tail of `blind_window` can reach it. `None` for an account that is reading
-    /// live, and for one whose blindness the daemon never saw begin (a first-ever poll that fails, or
-    /// one already blind at startup): with no anchor there is no baseline to difference against, so
-    /// no episode is claimed. Rebuilt in lockstep by
-    /// [`reconcile_roster`](Daemon::reconcile_roster) and sized to the roster in [`Daemon::new`], like
-    /// every other per-account vec. See [`BlindAnchor`]; contrast [`last_good`](Self::last_good).
-    blind_anchor: Vec<Option<BlindAnchor>>,
     /// The ACTIVE account's retained pre-blind anchor (issue #450): its last
     /// SUCCESSFUL reading (`session` / `weekly` fractions) plus the monotonic time it
     /// was observed, kept ACROSS a `429` / `5xx` blindness window that clears
-    /// [`last_readings`](Self::last_readings)`[active]` to `None`. `None` until the
+    /// `accounts[active].last_reading` to `None`. `None` until the
     /// active account is polled successfully once, and reset to `None` on every
     /// swap-away / active-loss so it always belongs to the CURRENT active account.
     /// Consumed by the bounded-blindness preemptive swap (issue #452, ADR-0017); the
@@ -1373,10 +1395,6 @@ struct DecisionState {
     /// (the active interleaved between peers, issue #366) instead of bursting all at
     /// once (issue #80).
     poll_pos: usize,
-    /// Whether each roster account has been polled at least once this run (issue #80),
-    /// indexed by roster position. Drives the warm-up latch below; sized to the roster
-    /// in [`Daemon::new`].
-    polled_once: Vec<bool>,
     /// Warm-up latch (issue #80): `false` until every account in the FIRST cycle's
     /// schedule has been polled once, then latched `true` for the run. While `false`
     /// the swap-away decision HOLDS — no swap and no `all_exhausted` signal — because
@@ -1399,6 +1417,36 @@ struct DecisionState {
     /// mechanism-down signal distinct from the per-account `at_risk` rollup. `Default` (healthy,
     /// no streak) is the fresh-daemon state. See [`SystemicRefreshHealth`].
     systemic_refresh: SystemicRefreshHealth,
+}
+
+#[cfg(test)]
+impl DecisionState {
+    /// Test seam: the per-account carried readings, flattened into the positional vec the decision
+    /// and preview entry points take — the read the pre-#668 parallel `last_readings` vec offered
+    /// directly.
+    fn readings(&self) -> Vec<Option<Usage>> {
+        self.accounts.iter().map(|a| a.last_reading).collect()
+    }
+
+    /// Test seam: seed each account's carried reading positionally, leaving every OTHER
+    /// [`AccountRuntime`] field untouched — the write the pre-#668 parallel `last_readings` vec
+    /// offered directly, minus its ability to clobber the other signals.
+    ///
+    /// Panics on a length mismatch: [`accounts`](Self::accounts) is sized to the roster, so a
+    /// differently-sized seed is a test bug. Pre-#668 the same assignment silently desynced ONE vec
+    /// from the other seven — exactly the invariant this bundle removes — so the loud failure is the
+    /// point.
+    fn seed_readings(&mut self, readings: impl IntoIterator<Item = Option<Usage>>) {
+        let readings: Vec<_> = readings.into_iter().collect();
+        assert_eq!(
+            readings.len(),
+            self.accounts.len(),
+            "a reading seed must cover exactly the roster",
+        );
+        for (account, reading) in self.accounts.iter_mut().zip(readings) {
+            account.last_reading = reading;
+        }
+    }
 }
 
 /// The poll loop, generic over its four injectable seams.
@@ -1480,7 +1528,7 @@ pub(crate) struct Daemon<P, C, S, K> {
     near_limit_poll_secs: u64,
     /// The #539 velocity-projection horizon `H` (ADR-0017), in seconds (config
     /// `session_velocity_horizon_secs`): [`Self::velocity_swap`] projects
-    /// `observed + session_velocity[active].rate × H` and fires when it crosses the trigger. `0`
+    /// `observed + accounts[active].session_velocity.rate × H` and fires when it crosses the trigger. `0`
     /// disables the path (the projection reduces to `observed`, which the reactive path already
     /// held below the trigger, so it never crosses) — the kill-switch. Kept as `u64` seconds (not a
     /// pre-divided `f64`) so the projection reads `rate` (fraction/sec) × `H` in the SAME units the
@@ -1642,28 +1690,14 @@ where
         claude_json: PathBuf,
         tunables: &Tunables,
     ) -> Self {
-        // Per-account health carried across ticks (issue #42), one slot per account.
-        let health = vec![AccountHealth::default(); roster.len()];
-        // Carried last-known reading + warm-up tracking per account (issue #80), one
-        // slot per account, sized to the roster like `health`.
-        let last_readings = vec![None; roster.len()];
-        // Reading timestamps parallel to `last_readings` (issue #449), for the %/min velocity
-        // interval — sized to the roster like `last_readings`, `None` until each account is polled.
-        let last_reading_at = vec![None; roster.len()];
-        // Per-account session-velocity EMA (issue #539), parallel to `last_readings` — `None` until
-        // each account has a usable two-reading interval, so no projection off an unwarmed signal.
-        let session_velocity = vec![None; roster.len()];
-        // Per-account armed landing watch (issue #613), parallel to `last_readings` — `None` until an
-        // account is parked by a `reason=session` swap, so no landing watch runs before its window opens.
-        let parked_landing = vec![None; roster.len()];
-        // Per-account session high-water mark (issue #614), parallel to `last_readings` — `None`
-        // until each account is polled with a parseable `session_resets_at`, so a stale-low reading
-        // is only ever judged against evidence actually observed for its own window.
-        let session_high_water = vec![None; roster.len()];
-        // Per-account pre-blind anchor (issue #583), parallel to `last_readings` — `None` until an
-        // account is seen going live→blind, so a never-witnessed episode claims no baseline.
-        let blind_anchor = vec![None; roster.len()];
-        let polled_once = vec![false; roster.len()];
+        // Per-account carried runtime state (issue #668), ONE slot per account — health (#42), the
+        // last-known reading (#80) and its timestamp (#449), the session-velocity EMA (#539), the
+        // armed landing watch (#613), the session high-water mark (#614), the pre-blind anchor
+        // (#583), and the warm-up flag (#80). `AccountRuntime::default()` is the unpolled, no-reading,
+        // healthy start: no projection, landing watch, plausibility baseline, or blind episode can
+        // read off a signal the daemon has not observed yet. One sizing site for every signal, so a
+        // ninth cannot be added and forgotten here.
+        let accounts = vec![AccountRuntime::default(); roster.len()];
         Self {
             roster,
             poller,
@@ -1748,14 +1782,7 @@ where
             // the value for a `note_systemic_refresh` call an integration test drives at defaults.
             systemic_failure_n: DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
             state: DecisionState {
-                health,
-                last_readings,
-                last_reading_at,
-                session_velocity,
-                parked_landing,
-                session_high_water,
-                blind_anchor,
-                polled_once,
+                accounts,
                 ..DecisionState::default()
             },
         }
@@ -1916,14 +1943,15 @@ where
         self
     }
 
-    /// The issue-#612 tie-break inputs, as every live selection site passes them: the retained
-    /// per-account velocity EMAs plus this daemon's seed. One accessor rather than the literal
-    /// repeated at each call site, so a site cannot thread the velocities while forgetting the seed
-    /// (which compiles, and silently drops that path back to the pre-#612 order). Inert until
-    /// production arms the seed — see [`tiebreak_seed`](Self::tiebreak_seed).
+    /// The issue-#612 tie-break inputs, as every live selection site passes them: the carried
+    /// per-account runtime state (whose retained velocity EMAs the tie-break reads) plus this
+    /// daemon's seed. One accessor rather than the literal repeated at each call site, so a site
+    /// cannot thread the runtime state while forgetting the seed (which compiles, and silently drops
+    /// that path back to the pre-#612 order). Inert until production arms the seed — see
+    /// [`tiebreak_seed`](Self::tiebreak_seed).
     fn selection_tiebreak(&self) -> SelectionTiebreak<'_> {
         SelectionTiebreak {
-            velocity: &self.state.session_velocity,
+            accounts: &self.state.accounts,
             seed: self.tiebreak_seed,
         }
     }
@@ -2019,7 +2047,7 @@ where
         // non-quarantined peer (#366), one account per sub-interval, so each poll lands
         // in its own rate-limit window instead of a single back-to-back burst (most of
         // which the source-scoped usage endpoint `429`s at the CDN edge). The polled
-        // account's reading replaces its slot in the carried `last_readings`; every
+        // account's reading replaces its slot in the carried readings; every
         // OTHER slot keeps its most-recent value, so the decision below is taken on
         // last-known-per-account readings (one account's number may be ~a cycle older
         // than another's). The poll OUTCOME still feeds the event log (issue #9: a 401
@@ -2040,7 +2068,7 @@ where
         // ONLY its own next poll — the active account and every other account keep their
         // normal cadence. `filter` drops the scheduled index while that account is still
         // inside its back-off window, so the whole poll body below is SKIPPED (no usage
-        // request, no `Diagnostic::Poll`, `last_readings` carried untouched); the schedule
+        // request, no `Diagnostic::Poll`, readings carried untouched); the schedule
         // cursor already advanced in `next_poll_index`, so the slot is consumed and the
         // account is re-attempted once the window elapses. Transient (`5xx` / network) is
         // scoped the same way — see `note_account_backoff`.
@@ -2049,7 +2077,7 @@ where
         // peer read weekly- or session-exhausted is skipped until its `exhausted_poll_until`
         // window elapses — its usage cannot change until its server-side window resets, so
         // re-polling it every `poll_secs` wastes a request. Same skip mechanics as the back-off
-        // (slot consumed, `last_readings` carried, no usage request); the ACTIVE account is
+        // (slot consumed, readings carried, no usage request); the ACTIVE account is
         // exempt inside `exhausted_slow_polling` so its swap-away trigger stays observable.
         if let Some(i) = poll_idx
             .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
@@ -2126,9 +2154,9 @@ where
             // account must have measurably MOVED (a non-zero rounded delta in either dimension),
             // mirroring `usage_rollup`'s no-op silence so a flat idle account stays quiet.
             if let (Some(prev), Ok(next), Some(prev_at)) = (
-                self.state.last_readings[i].as_ref(),
+                self.state.accounts[i].last_reading.as_ref(),
                 result.as_ref(),
-                self.state.last_reading_at[i],
+                self.state.accounts[i].last_reading_at,
             ) {
                 let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
                 let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
@@ -2160,15 +2188,15 @@ where
                 // the last real intervals still describe the account's climb. The mark itself is
                 // folded further below, AFTER this, so the comparison is against evidence gathered
                 // strictly BEFORE this reading (`next` cannot mask its own implausibility).
-                let stale_low_interval =
-                    swap::is_stale_low(self.state.session_high_water[i], &prev_usage)
-                        || swap::is_stale_low(self.state.session_high_water[i], &next_usage);
+                let high_water = self.state.accounts[i].session_high_water;
+                let stale_low_interval = swap::is_stale_low(high_water, &prev_usage)
+                    || swap::is_stale_low(high_water, &next_usage);
                 if !stale_low_interval {
                     self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
                 }
             }
             // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
-            // the active had gone blind (a `429` / `5xx` cleared `last_readings[active]` so
+            // the active had gone blind (a `429` / `5xx` cleared `accounts[active].last_reading` so
             // `swap::decide` had no reading to act on) and this poll reads it live again. Measured
             // from the retained pre-blind anchor (`last_good`, #450) — read HERE, before the refresh
             // below, so it is still the OLD anchor — so `duration_secs` is the `blind_elapsed` #452
@@ -2177,11 +2205,12 @@ where
             // is this poll's FRESH session pct (issue #482): paired with the stale anchor
             // (`session_pct`) + its age (`duration_secs`) it reconciles a hypothetical stale-anchor
             // preemptive swap as necessary (still climbing) vs wasted (already reset). The
-            // `last_readings[i].is_none()` was-blind check plus `last_good.is_some()` excludes a
+            // `accounts[i].last_reading.is_none()` was-blind check plus `last_good.is_some()` excludes a
             // first-ever poll (a `None` slot that was never blind); `active == Some(i)` scopes it to
             // the active account the anchor belongs to. Edge-triggered: the None→live transition fires
             // exactly once per blind episode.
-            if active == Some(i) && result.is_ok() && self.state.last_readings[i].is_none() {
+            if active == Some(i) && result.is_ok() && self.state.accounts[i].last_reading.is_none()
+            {
                 if let (Some(anchor), Ok(fresh)) = (self.state.last_good, result.as_ref()) {
                     events.push(Event::BlindWindow {
                         account: self.roster[i].account_uuid.clone(),
@@ -2194,7 +2223,7 @@ where
                         // ([`blind_velocity_projected_armed`], #584/#600) — which fires no swap and
                         // so emits no event of its own — is reconstructable offline from this line.
                         // Genuinely the PRE-BLIND rate: the velocity fold above is gated on a
-                        // previous live reading (`last_readings[i]`), which is exactly what this
+                        // previous live reading (`accounts[i].last_reading`), which is exactly what this
                         // branch requires to be `None`, so the recovery poll cannot have blended
                         // into the EMA before this read. Same SUSTAINED gate the arm itself applies
                         // — an unwarmed EMA could not have armed it, so no ingredient is logged for
@@ -2222,14 +2251,15 @@ where
             // rolled, so a failed poll must leave the mark standing. `fold` releases the mark on its
             // own when `session_resets_at` moves to a new window, so it never pins across windows.
             if let Ok(fresh) = result.as_ref() {
-                self.state.session_high_water[i] =
-                    swap::SessionHighWater::fold(self.state.session_high_water[i], fresh);
+                self.state.accounts[i].session_high_water =
+                    swap::SessionHighWater::fold(self.state.accounts[i].session_high_water, fresh);
             }
-            self.state.last_readings[i] = result.ok();
-            // Track WHEN this reading was observed, in lockstep with `last_readings` (issue #449):
-            // `now` on a live reading, cleared on a failed poll — so the velocity interval above
-            // spans only two real consecutive readings (never a gap).
-            self.state.last_reading_at[i] = self.state.last_readings[i].as_ref().map(|_| now);
+            self.state.accounts[i].last_reading = result.ok();
+            // Track WHEN this reading was observed, beside it on the same `AccountRuntime` (issue
+            // #449): `now` on a live reading, cleared on a failed poll — so the velocity interval
+            // above spans only two real consecutive readings (never a gap).
+            self.state.accounts[i].last_reading_at =
+                self.state.accounts[i].last_reading.as_ref().map(|_| now);
             // Fold this poll into the account's out-of-rotation slow-poll window (issue #537):
             // arm/refresh it on a NON-active peer read exhausted (skip its poll until its
             // server-side window resets), or clear it when the account reads viable again / is
@@ -2239,7 +2269,7 @@ where
             // account's own poll cadence, like the per-account back-off (`note_account_backoff`).
             self.note_exhausted_poll(i, active, now, wall_clock_now_secs(), &mut events);
             // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
-            // anchor, SEPARATE from `last_readings` (which the assignment above clears to
+            // anchor, SEPARATE from `last_reading` (which the assignment above clears to
             // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
             // Refreshed on every successful active poll and carried untouched across a
             // throttle / failure, so the bounded-blindness preemptive swap (#452) can reason
@@ -2247,7 +2277,7 @@ where
             // `None` on swap-away (`record_swap` / `adopt_manual_swap` / the reconcile paths),
             // so the anchor always belongs to the current active account.
             if active == Some(i) {
-                if let Some(reading) = self.state.last_readings[i] {
+                if let Some(reading) = self.state.accounts[i].last_reading {
                     self.state.last_good = Some(LastGood {
                         session: reading.session,
                         weekly: reading.weekly,
@@ -2263,7 +2293,7 @@ where
             let poll_expiry = self
                 .read_poll_expires_at(&self.roster[i], active == Some(i))
                 .await;
-            self.state.health[i].poll_expires_at = poll_expiry;
+            self.state.accounts[i].health.poll_expires_at = poll_expiry;
             self.note_polled(i);
         }
 
@@ -2452,7 +2482,7 @@ where
             if active == Some(i) {
                 continue; // the active account is interleaved below, never listed as a peer
             }
-            if self.roster[i].enabled && !self.state.health[i].quarantined {
+            if self.roster[i].enabled && !self.state.accounts[i].health.quarantined {
                 if let Some(a) = active {
                     schedule.push(a); // re-observe the active account before each peer (#366)
                 }
@@ -2476,13 +2506,13 @@ where
     /// partial. Until then the swap-away decision HOLDS (see
     /// [`decide_action`](Self::decide_action)).
     fn note_polled(&mut self, i: usize) {
-        self.state.polled_once[i] = true;
+        self.state.accounts[i].polled_once = true;
         if !self.state.warmed_up
             && self
                 .state
                 .poll_schedule
                 .iter()
-                .all(|&j| self.state.polled_once[j])
+                .all(|&j| self.state.accounts[j].polled_once)
         {
             self.state.warmed_up = true;
         }
@@ -2499,9 +2529,9 @@ where
         (0..self.roster.len())
             .map(|i| {
                 if active == Some(i)
-                    || (self.roster[i].enabled && !self.state.health[i].quarantined)
+                    || (self.roster[i].enabled && !self.state.accounts[i].health.quarantined)
                 {
-                    self.state.last_readings[i]
+                    self.state.accounts[i].last_reading
                 } else {
                     None
                 }
@@ -2511,7 +2541,7 @@ where
 
     /// Check the account just polled against any ARMED landing watch (issue #613) — the runtime
     /// half of the local landing-overshoot signal. When account `i` was parked by a `reason=session`
-    /// swap ([`parked_landing`](DecisionState::parked_landing) is `Some`), a live reading that reaches
+    /// swap ([`parked_landing`](AccountRuntime::parked_landing) is `Some`), a live reading that reaches
     /// the SLO ceiling ([`landing::is_overshoot`]) within the [`landing::LANDING_WINDOW`] is a LOCAL
     /// landing overshoot: the post-swap committed tail carried the parked account over the ceiling
     /// after the swap redirected only NEW requests — the #595 breach, caught LIVE here rather than
@@ -2523,7 +2553,7 @@ where
     /// longer a parked tail) or the [`landing::LANDING_WINDOW`] has elapsed (a later climb is a fresh
     /// session cycle, not this swap's tail). A failed poll (`Err`) leaves the watch armed — blindness
     /// is not evidence of a safe landing, so a later live reading can still catch the overshoot inside
-    /// the window. MUST be called on the FRESH `result` BEFORE the caller overwrites `last_readings[i]`.
+    /// the window. MUST be called on the FRESH `result` BEFORE the caller overwrites `accounts[i].last_reading`.
     /// `now` is the tick's monotonic clock, the SAME [`Instant`] the swap arms the watch with.
     fn note_landing_overshoot(
         &mut self,
@@ -2532,14 +2562,14 @@ where
         result: &Result<Usage>,
         now: Instant,
     ) {
-        let Some(parked) = self.state.parked_landing[i] else {
+        let Some(parked) = self.state.accounts[i].parked_landing else {
             return;
         };
         // Re-activated (no longer a parked tail) or the landing window has elapsed — disarm, no breach.
         if active == Some(i)
             || now.saturating_duration_since(parked.armed_at) >= landing::LANDING_WINDOW
         {
-            self.state.parked_landing[i] = None;
+            self.state.accounts[i].parked_landing = None;
             return;
         }
         // A live reading at/over the SLO ceiling is a landing overshoot: retain it and disarm (once
@@ -2554,14 +2584,14 @@ where
                     landing_pct,
                     at: now,
                 });
-                self.state.parked_landing[i] = None;
+                self.state.accounts[i].parked_landing = None;
             }
         }
     }
 
     /// Record the UNCENSORED blind-episode edges for the account just polled (issue #583, umbrella
     /// #363 Path B): [`Event::BlindEnter`] on its live→blind transition and [`Event::BlindExit`] on
-    /// its blind→live one, measured from a PER-ACCOUNT anchor ([`blind_anchor`](DecisionState::blind_anchor)).
+    /// its blind→live one, measured from a PER-ACCOUNT anchor ([`blind_anchor`](AccountRuntime::blind_anchor)).
     ///
     /// This exists because [`Event::BlindWindow`] (#449) is censored at BOTH tails of the very
     /// distribution #484's promotion bar reads to ratify [`BLIND_GATE_SECS`] / [`BLIND_GATE_RISK_BAND`]:
@@ -2580,14 +2610,14 @@ where
     /// the retrospective duration histogram for SLO reporting, which is a fine purpose; it was merely
     /// assigned the wrong one (detection).
     ///
-    /// The entry edge requires a PRIOR LIVE reading (`last_readings[i]` still `Some` here, before the
+    /// The entry edge requires a PRIOR LIVE reading (`accounts[i].last_reading` still `Some` here, before the
     /// caller's assignment clears it): an account whose first-ever poll fails, or one already blind at
     /// startup, has no baseline to difference against, so no anchor is taken and no episode is claimed
     /// — the same never-fabricate-an-anchor reasoning as `blind_window`'s `last_good.is_some()` guard.
     /// Both edges are level-safe: a held blind tick and an ordinary live poll each match no edge and
     /// emit nothing, so the log carries exactly two lines per witnessed episode.
     ///
-    /// MUST be called BEFORE the caller writes `last_readings[i]` / `last_reading_at[i]` for this poll
+    /// MUST be called BEFORE the caller writes `accounts[i].last_reading` / `accounts[i].last_reading_at` for this poll
     /// — the entry anchor is read out of the PRE-poll slots. `now` is the tick's monotonic clock, the
     /// SAME [`Instant`] the #450 anchor and the swap cooldown use.
     fn note_blind_episode(
@@ -2598,13 +2628,14 @@ where
         now: Instant,
         events: &mut Vec<Event>,
     ) {
-        match (self.state.blind_anchor[i], result) {
+        match (self.state.accounts[i].blind_anchor, result) {
             // ENTRY edge — the account had a live reading and this poll failed. Anchor its last
             // reading (BOTH windows) and open the episode.
             (None, Err(_)) => {
-                let (Some(prev), Some(prev_at)) =
-                    (self.state.last_readings[i], self.state.last_reading_at[i])
-                else {
+                let (Some(prev), Some(prev_at)) = (
+                    self.state.accounts[i].last_reading,
+                    self.state.accounts[i].last_reading_at,
+                ) else {
                     return; // No prior live reading → no baseline → claim no episode.
                 };
                 let was_active = active == Some(i);
@@ -2614,7 +2645,7 @@ where
                 // that happen to coincide. Keys off the BASE (un-jittered) trigger, matching
                 // `blind_window`'s tag so the two families filter alike.
                 let near_limit = prev.session >= self.session_ceiling_base;
-                self.state.blind_anchor[i] = Some(BlindAnchor {
+                self.state.accounts[i].blind_anchor = Some(BlindAnchor {
                     session: prev.session,
                     weekly: prev.weekly,
                     at: prev_at,
@@ -2644,7 +2675,7 @@ where
                     swapped_away: anchor.was_active && active != Some(i),
                     near_limit: anchor.near_limit,
                 });
-                self.state.blind_anchor[i] = None;
+                self.state.accounts[i].blind_anchor = None;
             }
             // Held blind (episode already open) or an ordinary live poll — no edge, stay silent.
             (Some(_), Err(_)) | (None, Ok(_)) => {}
@@ -2659,7 +2690,7 @@ where
     ///
     /// Eligibility is the gate's first two ADR-0017 conditions on the retained pre-blind anchor
     /// ([`last_good`](DecisionState::last_good), #450): the active account has been blind (its live
-    /// reading cleared, `last_readings[active].is_none()`) past the interim [`BLIND_GATE_SECS`], and
+    /// reading cleared, `accounts[active].last_reading.is_none()`) past the interim [`BLIND_GATE_SECS`], and
     /// the anchor sat at/over the interim [`BLIND_GATE_RISK_BAND`]. The gate's THIRD condition — a
     /// viable target — is the value the SLI records, selected exactly as #452's gate would via the
     /// shared [`pick_target`] with the BASE (un-jittered) triggers (a standing measurement, not a
@@ -2687,7 +2718,7 @@ where
         };
         // A live reading means the active account is NOT blind (recovered, or never blind) → the
         // episode is over: clear the latch so the NEXT episode signals afresh.
-        if self.state.last_readings[active_idx].is_some() {
+        if self.state.accounts[active_idx].last_reading.is_some() {
             self.state.blind_gate_signaled = false;
             return;
         }
@@ -2695,7 +2726,7 @@ where
         // preemptive gate — ADR-0017 keeps the two separate (bounded blindness is a healthy 429'd
         // active, not a dead one). Exclude it so the premise SLI measures only the #452 path and does
         // not inflate the gate-eligible count with cases the emergency path would handle instead.
-        if self.state.health[active_idx].quarantined {
+        if self.state.accounts[active_idx].health.quarantined {
             return;
         }
         // No anchor → no episode (swap-away / active-loss dropped `last_good`): the latch's other
@@ -2715,7 +2746,7 @@ where
         // `session_pct` below stays the RAW anchor (the measurement of what was last observed).
         let blind_elapsed = at.saturating_duration_since(anchor.at);
         let gate_session = swap::plausible_anchor_session(
-            self.state.session_high_water[active_idx],
+            self.state.accounts[active_idx].session_high_water,
             anchor.session,
         );
         if !blind_gate_armed(blind_elapsed.as_secs(), gate_session) {
@@ -2768,7 +2799,7 @@ where
         (0..self.roster.len())
             .filter(|&i| {
                 self.state.active == Some(i)
-                    || (self.roster[i].enabled && !self.state.health[i].quarantined)
+                    || (self.roster[i].enabled && !self.state.accounts[i].health.quarantined)
             })
             .count()
     }
@@ -2873,7 +2904,7 @@ where
         };
         // The active account's credential is DEAD (quarantined, #42) — distinct from
         // a transient skip below. Two sub-cases, by whether it polled this cycle:
-        if self.state.health[active_idx].quarantined {
+        if self.state.accounts[active_idx].health.quarantined {
             match readings[active_idx] {
                 // Still failing (no reading) → the live session is blocked. Escape it
                 // with an emergency swap, bypassing the swap-away trigger AND cooldown.
@@ -2905,7 +2936,7 @@ where
         // the expensive one. A plausible reading passes through UNCHANGED, so this is a no-op on every
         // normal tick. Deliberately scoped to this local: `readings` — and so `pick_target`, the
         // all-exhausted relief hint, and the status snapshot — keep the VERBATIM reading, and
-        // `last_readings` is never written back over. The projection peer applies the same correction
+        // `last_reading` is never written back over. The projection peer applies the same correction
         // to the same account through the same helper, so both arms decide on one value (ADR-0022's
         // one predicate, two estimators).
         let active_usage = self.plausible_active_usage(active_idx, active_usage);
@@ -2950,7 +2981,8 @@ where
         // re-observation gap, the projection peer the velocity horizon `H`); the composed swap fires
         // at `eff − v·max(poll_gap, H)`, the max-window coverage in `swap::reactive_session_threshold`.
         let effective_ceiling = swap::effective_ceiling(session_ceiling);
-        let velocity = self.state.session_velocity[active_idx]
+        let velocity = self.state.accounts[active_idx]
+            .session_velocity
             .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
             .map_or(0.0, |v| v.rate);
         // The reactive re-observation gap: how long the active account climbs UNSEEN between the
@@ -3158,10 +3190,10 @@ where
                 // parked account is not near the session ceiling). Its post-swap committed tail keeps
                 // billing after this swap redirects only NEW requests, so `note_landing_overshoot`
                 // watches its subsequent polls for a climb to the SLO ceiling within the landing window.
-                // `record_swap` above already cleared `parked_landing[target_idx]` (the incoming can't be
+                // `record_swap` above already cleared `accounts[target_idx].parked_landing` (the incoming can't be
                 // a parked-landing subject); `active_idx != target_idx`, so this arm does not collide.
                 if reason == SwapReason::Session {
-                    self.state.parked_landing[active_idx] = Some(ParkedLanding {
+                    self.state.accounts[active_idx].parked_landing = Some(ParkedLanding {
                         armed_at: at,
                         decision_pct: to_pct(active_usage.session),
                     });
@@ -3190,7 +3222,7 @@ where
         // watch on it here (the shared swap path), so a prior park's stale window can't fire against an
         // account that is now active again. The complementary arm of the OUTGOING account (reason=session
         // only) is set by the reactive-swap caller right after this returns.
-        self.state.parked_landing[target_idx] = None;
+        self.state.accounts[target_idx].parked_landing = None;
         // Issue #450: the swapped-TO account has no pre-blind anchor yet — drop the
         // departing active's `last_good` so a stale foreign anchor cannot outlive the
         // swap. Load-bearing for the bounded-blindness path (#452): its OWN swap lands
@@ -3304,7 +3336,7 @@ where
         if next == Some(prev) {
             return;
         }
-        let health = &mut self.state.health[prev];
+        let health = &mut self.state.accounts[prev].health;
         if health.quarantined && health.recovery_successes > 0 {
             health.recovery_successes = 0;
         }
@@ -3525,14 +3557,14 @@ where
         // surface keep the raw value (see `swap::plausible_anchor_session`).
         let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
         let anchor_armed = swap::plausible_anchor_session(
-            self.state.session_high_water[active_idx],
+            self.state.accounts[active_idx].session_high_water,
             anchor.session,
         ) >= self.session_blind_risk_band;
         // Issue #582: the server-directed arm. A nonzero `Retry-After` STILL holding the active
         // account off its poll arms the gate on its OWN, wherever the anchor sat — below the band
         // that blindness is otherwise unreachable by every swap path (see the doc comment). Shares
         // condition 1 (`session_blind_swap_secs`), so the kill-switch disables both arms.
-        let retry_after = server_retry_after_holding(&self.state.health[active_idx], at);
+        let retry_after = server_retry_after_holding(&self.state.accounts[active_idx].health, at);
         if !(blind_elapsed > self.session_blind_swap_secs
             && (anchor_armed || retry_after.is_some()))
         {
@@ -3717,7 +3749,7 @@ where
     /// # What the correction does and does not reach
     ///
     /// It is applied to the swap DECISION and to the record OF that decision — nothing else. The
-    /// carried [`last_readings`](DecisionState::last_readings) slot is never written back over, so
+    /// carried [`last_reading`](AccountRuntime::last_reading) slot is never written back over, so
     /// `pick_target`, the all-exhausted relief hint, the `status` snapshot, and the usage-sample store
     /// all keep exactly what the API reported.
     ///
@@ -3730,7 +3762,7 @@ where
     /// real usage, so it is the honest estimate of the swap-out point. It is, however, a PRIOR
     /// observation rather than this tick's fresh one, which is the caveat to read those SLIs with.
     fn plausible_active_usage(&self, i: usize, usage: Usage) -> Usage {
-        swap::plausible_session(self.state.session_high_water[i], &usage)
+        swap::plausible_session(self.state.accounts[i].session_high_water, &usage)
     }
 
     /// Fold one poll interval into account `i`'s retained session-velocity EMA (issue #539,
@@ -3761,21 +3793,22 @@ where
         elapsed_secs: u64,
     ) {
         if elapsed_secs == 0 || next_session < prev_session {
-            self.state.session_velocity[i] = None;
+            self.state.accounts[i].session_velocity = None;
             return;
         }
         let instant = (next_session - prev_session) / elapsed_secs as f64;
         let alpha = self.session_velocity_ema_alpha;
-        self.state.session_velocity[i] = Some(match self.state.session_velocity[i] {
-            Some(prev) => VelocityEma {
-                rate: alpha * instant + (1.0 - alpha) * prev.rate,
-                samples: prev.samples.saturating_add(1),
-            },
-            None => VelocityEma {
-                rate: instant,
-                samples: 1,
-            },
-        });
+        self.state.accounts[i].session_velocity =
+            Some(match self.state.accounts[i].session_velocity {
+                Some(prev) => VelocityEma {
+                    rate: alpha * instant + (1.0 - alpha) * prev.rate,
+                    samples: prev.samples.saturating_add(1),
+                },
+                None => VelocityEma {
+                    rate: instant,
+                    samples: 1,
+                },
+            });
     }
 
     /// The #539 velocity ingredients account `i`'s blind window should carry (issue #634), or `None`
@@ -3808,7 +3841,7 @@ where
     /// A pure read of retained state; the fraction→percent conversion is the log's unit boundary
     /// ([`to_pct_exact`]).
     fn blind_velocity_ingredients(&self, i: usize) -> Option<BlindVelocity> {
-        let vel = self.state.session_velocity[i]?;
+        let vel = self.state.accounts[i].session_velocity?;
         if vel.samples < MIN_VELOCITY_SAMPLES {
             return None;
         }
@@ -3886,7 +3919,7 @@ where
         // intervals). Absent (a first/failed poll, or reset by a window drop — the poll-gap case #540
         // owns) or single-sample → never project (the "no-fire on a missing/unwarmed velocity"
         // invariant): hold on the fresh reading rather than swap on a guess.
-        let Some(vel) = self.state.session_velocity[active_idx] else {
+        let Some(vel) = self.state.accounts[active_idx].session_velocity else {
             return TickAction::Held;
         };
         if vel.samples < MIN_VELOCITY_SAMPLES {
@@ -4066,7 +4099,7 @@ where
         let mut any_other_enabled = false;
         let mut all_unpolled = true;
         for (i, reading) in readings.iter().enumerate() {
-            if i != active_idx && enabled[i] && !self.state.health[i].quarantined {
+            if i != active_idx && enabled[i] && !self.state.accounts[i].health.quarantined {
                 any_other_enabled = true;
                 all_unpolled &= reading.is_none();
             }
@@ -4177,7 +4210,7 @@ where
     /// band" arm, so the fast-poll engages BEFORE a fast burst is even observed in-band). A pure
     /// read of `self.state`; `active_idx` is a resolved roster index, so the slot always exists.
     fn active_near_limit(&self, active_idx: usize) -> bool {
-        let Some(active_usage) = self.state.last_readings[active_idx] else {
+        let Some(active_usage) = self.state.accounts[active_idx].last_reading else {
             return false;
         };
         // Issue #614: through the SAME plausibility correction the two swap arms apply, because this
@@ -4199,7 +4232,7 @@ where
         if horizon == 0 {
             return false;
         }
-        let Some(vel) = self.state.session_velocity[active_idx] else {
+        let Some(vel) = self.state.accounts[active_idx].session_velocity else {
             return false;
         };
         if vel.samples < MIN_VELOCITY_SAMPLES {
@@ -4252,7 +4285,8 @@ where
     /// the window elapses, or after any non-throttling poll clears it
     /// ([`note_account_backoff`](Self::note_account_backoff)).
     fn account_backing_off(&self, i: usize) -> bool {
-        self.state.health[i]
+        self.state.accounts[i]
+            .health
             .poll_backoff_until
             .is_some_and(|until| self.clock.now() < until)
     }
@@ -4272,7 +4306,8 @@ where
     /// [`account_backing_off`](Self::account_backing_off)'s rate-limit skip (ADR-0019).
     fn exhausted_slow_polling(&self, i: usize, active: Option<usize>) -> bool {
         active != Some(i)
-            && self.state.health[i]
+            && self.state.accounts[i]
+                .health
                 .exhausted_poll_until
                 .is_some_and(|until| self.clock.now() < until)
     }
@@ -4317,10 +4352,10 @@ where
     ) -> Option<TickBackoff> {
         // The account UUID is the durable identity for the #399 events (never the free-form,
         // PII-capable `label`, #15). Cloned up front so the borrow does not tangle with the
-        // `&mut self.state.health[i]` below.
+        // `&mut self.state.accounts[i].health` below.
         let account_uuid = self.roster[i].account_uuid.clone();
         let Some(signal) = backoff_signal(result) else {
-            let health = &mut self.state.health[i];
+            let health = &mut self.state.accounts[i].health;
             // Edge-triggered EXIT (issue #399): a non-throttling poll (success / 401 / 403) that
             // CLEARED an actually-armed window emits a durable `usage_backoff_cleared`, bracketing
             // the episode's span. A plain clean poll with no armed window stays silent (mirroring
@@ -4339,8 +4374,11 @@ where
             }
             return None;
         };
-        let streak = self.state.health[i].poll_backoff_streak.saturating_add(1);
-        self.state.health[i].poll_backoff_streak = streak;
+        let streak = self.state.accounts[i]
+            .health
+            .poll_backoff_streak
+            .saturating_add(1);
+        self.state.accounts[i].health.poll_backoff_streak = streak;
         let shift = streak.min(POLL_BACKOFF_MAX_SHIFT);
         // The exponential self-backoff ceiling is role-dependent (issue #453): the ACTIVE
         // account clamps tighter (`ACTIVE_POLL_BACKOFF_CAP`) so a throttle on the consumed
@@ -4379,7 +4417,7 @@ where
         let until = now
             .checked_add(wait)
             .unwrap_or_else(|| now + POLL_BACKOFF_CAP);
-        self.state.health[i].poll_backoff_until = Some(until);
+        self.state.accounts[i].health.poll_backoff_until = Some(until);
         // Issue #582: retain the RAW (pre-cap #295) server directive alongside the window it just
         // armed, so the bounded-blindness swap-away path can read it on a LATER tick — the active
         // account is skipped while backing off, so the deciding tick never re-observes this `429`.
@@ -4395,7 +4433,7 @@ where
         // blindness the anchor gate deliberately leaves alone, and let the walk alarm claim a
         // "server throttle" that does not exist. The raw zero still rides the `UsageBackoff` event
         // + tick diagnostic below (#295) — this normalization is for the DECISION, not the report.
-        self.state.health[i].poll_backoff_retry_after =
+        self.state.accounts[i].health.poll_backoff_retry_after =
             signal.retry_after.filter(|ra| !ra.is_zero());
         let armed = until.saturating_duration_since(now);
         // Durable ENTER (issue #399): make the previously stderr-only 429 / back-off signal durable
@@ -4425,7 +4463,7 @@ where
     /// Fold account `i`'s poll into its out-of-rotation slow-poll window (issue #537), the
     /// quota-exhaustion sibling of [`note_account_backoff`](Self::note_account_backoff)'s
     /// rate-limit back-off. Reads the account's freshly-stored reading
-    /// ([`last_readings`](DecisionState::last_readings)`[i]`):
+    /// (`accounts[i].last_reading`):
     ///
     /// - **NON-active peer, reading out of rotation** (`weekly >= weekly_rotation_line()` —
     ///   i.e. `weekly_ceiling_base − WEEKLY_TAIL_MARGIN`, issue #607 — `|| session >=
@@ -4439,7 +4477,7 @@ where
     ///   Edge-triggered EXIT — a durable [`Event::ExhaustedSlowPollCleared`] fires ONLY when a
     ///   window was actually armed, bracketing the episode; a plain viable poll stays silent.
     ///
-    /// A FAILED poll (`last_readings[i]` is `None`) carries NO exhaustion signal, so the window
+    /// A FAILED poll (`accounts[i].last_reading` is `None`) carries NO exhaustion signal, so the window
     /// is left untouched — the peer keeps whatever window it had (exactly as a throttle carries
     /// the prior reading). `now` is the tick's monotonic [`Clock`] instant (the armed window's
     /// deadline); `now_secs` is the tick's wall-clock epoch (the `resets_at` delta) — both read
@@ -4454,7 +4492,7 @@ where
         events: &mut Vec<Event>,
     ) {
         // A failed poll carries no exhaustion signal — leave any window as-is.
-        let Some(reading) = self.state.last_readings[i] else {
+        let Some(reading) = self.state.accounts[i].last_reading else {
             return;
         };
         // The ACTIVE account is EXEMPT (peers only): polled at full cadence, so by definition
@@ -4482,7 +4520,7 @@ where
                 // re-poll faster than the normal cadence.
                 self.poll_strategy.base as u64,
             );
-            let health = &mut self.state.health[i];
+            let health = &mut self.state.accounts[i].health;
             let was_slow_polling = health.exhausted_poll_until.is_some();
             // `window <= exhausted_poll_secs <= 86400 s`, so this bounded add cannot overflow the
             // monotonic instant (unlike `note_account_backoff`'s un-clamped active `Retry-After`).
@@ -4494,7 +4532,7 @@ where
                 });
             }
         } else {
-            let health = &mut self.state.health[i];
+            let health = &mut self.state.accounts[i].health;
             let was_slow_polling = health.exhausted_poll_until.is_some();
             health.exhausted_poll_until = None;
             if was_slow_polling {
@@ -5617,7 +5655,7 @@ mod tests {
         )
     }
 
-    /// A carried usage reading for seeding `last_readings` in the reconcile tests.
+    /// A carried usage reading for seeding an account's `last_reading` in the reconcile tests.
     pub(super) fn reading(session: f64, weekly: f64) -> Usage {
         Usage {
             session,
@@ -6601,7 +6639,7 @@ mod tests {
         //    target it names the ACTIVE account only — never a band peer as the "imminent target".
         let mut daemon = daemon;
         daemon.state.active = Some(0);
-        daemon.state.last_readings = readings.to_vec();
+        daemon.state.seed_readings(readings);
         assert_eq!(
             daemon.refresh_exclusions(),
             vec!["u-A".to_owned()],
@@ -6796,7 +6834,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_good_retains_the_pre_blind_reading_across_an_active_429() {
-        // Issue #450 AC1: a `429` on the active account's poll clears `last_readings[active]`
+        // Issue #450 AC1: a `429` on the active account's poll clears `accounts[active].last_reading`
         // to `None` (the reactive `decide()` path is unchanged — it never swaps on missing
         // data), but the SEPARATE `last_good` anchor keeps the pre-blind reading + its
         // timestamp, so #452 can still reason about how near the band the active account was
@@ -6813,7 +6851,9 @@ mod tests {
         // and the anchor.
         daemon.tick().await;
         assert_eq!(
-            daemon.state.last_readings[0].map(|r| (r.session, r.weekly)),
+            daemon.state.accounts[0]
+                .last_reading
+                .map(|r| (r.session, r.weekly)),
             Some((0.68, 0.40)),
         );
         let anchor = daemon
@@ -6832,7 +6872,7 @@ mod tests {
         daemon.tick().await; // tick 3 — active `work` 429s
 
         // Reactive path byte-for-byte unchanged: the slot is cleared to `None`.
-        assert_eq!(daemon.state.last_readings[0], None);
+        assert_eq!(daemon.state.accounts[0].last_reading, None);
         // …but the pre-blind anchor is retained intact.
         assert_eq!(
             daemon.state.last_good.map(|g| (g.session, g.weekly)),
@@ -7578,7 +7618,7 @@ mod tests {
     #[tokio::test]
     async fn usage_velocity_does_not_span_a_throttle_gap() {
         // A velocity always spans two CONSECUTIVE real readings. A throttle clears the prior reading
-        // (its `Err` result sets `last_readings` to `None`), so the recovering clean poll has
+        // (its `Err` result sets `last_reading` to `None`), so the recovering clean poll has
         // nothing to diff — no spurious velocity across an unknown-duration gap.
         let (_dir, mut daemon) =
             rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.90, 0.30)).await;
@@ -7605,7 +7645,7 @@ mod tests {
     #[tokio::test]
     async fn blind_window_close_is_emitted_on_active_recovery_with_duration_and_near_limit() {
         // Issue #449 (umbrella #363 Path B): the active account was near the limit (96%) when a 429
-        // blinded it — its `last_readings` slot cleared, so `swap::decide` had no reading. Five
+        // blinded it — its `last_reading` slot cleared, so `swap::decide` had no reading. Five
         // minutes later it reads live again; the daemon emits ONE durable `blind_window` close with
         // the blind DURATION (300 s), the pre-blind anchor's session pct (96), and `near_limit=true`
         // (the anchor sat at/over the 95% trigger). The two SLIs the #451 spike reads.
@@ -7707,7 +7747,7 @@ mod tests {
         daemon.clock.advance(Duration::from_secs(60));
         daemon.tick().await; // reading 3 → blends (samples = 2, SUSTAINED)
         assert_eq!(
-            daemon.state.session_velocity[0].map(|v| v.samples),
+            daemon.state.accounts[0].session_velocity.map(|v| v.samples),
             Some(2),
             "two climbing intervals sustain the EMA",
         );
@@ -7758,13 +7798,13 @@ mod tests {
         // is converted to percent-per-second and the constants in force are stamped.
         let mut daemon = three_account_daemon(FakeRosterPoller::new().ok("u-A", 0.50, 0.20)).await;
 
-        daemon.state.session_velocity[0] = None;
+        daemon.state.accounts[0].session_velocity = None;
         assert!(
             daemon.blind_velocity_ingredients(0).is_none(),
             "no retained EMA → no ingredient",
         );
 
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.001,
             samples: MIN_VELOCITY_SAMPLES - 1,
         });
@@ -7773,7 +7813,7 @@ mod tests {
             "an unsustained single-interval EMA → no ingredient (the arm could not arm)",
         );
 
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.001,
             samples: MIN_VELOCITY_SAMPLES,
         });
@@ -7892,7 +7932,7 @@ mod tests {
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
         let mut entry = Vec::new();
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             entry.extend(daemon.tick().await.events);
         }
         assert!(
@@ -7931,7 +7971,7 @@ mod tests {
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
         let mut exit = Vec::new();
-        while daemon.state.last_readings[0].is_none() {
+        while daemon.state.accounts[0].last_reading.is_none() {
             exit.extend(daemon.tick().await.events);
         }
         assert!(
@@ -7980,7 +8020,7 @@ mod tests {
 
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.00, 0.170);
         let mut recovered = Vec::new();
-        while daemon.state.last_readings[0].is_none() {
+        while daemon.state.accounts[0].last_reading.is_none() {
             recovered.extend(daemon.tick().await.events);
         }
         let exit = recovered
@@ -8085,12 +8125,12 @@ mod tests {
             "a first-ever failed poll has no anchor, so it opens no episode: {:?}",
             first.events,
         );
-        assert!(daemon.state.blind_anchor[0].is_none());
+        assert!(daemon.state.accounts[0].blind_anchor.is_none());
 
         daemon.clock.advance(Duration::from_secs(600));
         daemon.poller = FakeRosterPoller::new().ok("u-A", 0.40, 0.10);
         let mut live = Vec::new();
-        while daemon.state.last_readings[0].is_none() {
+        while daemon.state.accounts[0].last_reading.is_none() {
             live.extend(daemon.tick().await.events);
         }
         assert!(
@@ -8117,7 +8157,7 @@ mod tests {
             "a clean re-poll crosses no blind edge: {:?}",
             second.events,
         );
-        assert!(daemon.state.blind_anchor[0].is_none());
+        assert!(daemon.state.accounts[0].blind_anchor.is_none());
     }
 
     #[tokio::test]
@@ -8148,7 +8188,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             let out = daemon.tick().await;
             assert!(
                 !out.events
@@ -8200,7 +8240,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.85, 0.10)
             .ok("u-C", 0.90, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -8244,7 +8284,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.975)
             .ok("u-C", 0.10, 0.975);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -8298,7 +8338,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             let out = daemon.tick().await;
             assert!(
                 !matches!(out.action, TickAction::PreemptivelySwapped { .. }),
@@ -8440,7 +8480,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.85, 0.10)
             .ok("u-C", 0.90, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -8484,7 +8524,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.975)
             .ok("u-C", 0.10, 0.975);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -8528,7 +8568,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         // Advance FAR past the interim T (but nowhere near the 24 h kill-switch ceiling).
@@ -8576,7 +8616,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -8624,7 +8664,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         // Seed the episode directly: the anchor's own pre-blind reading (`anchor_session`) and the
@@ -8759,7 +8799,7 @@ mod tests {
             .rate_limited("u-A", Some(retry_after))
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", peer_c_session, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         // Cross the gate bound. The directive's window (3600 s) still has hours to run, so the
@@ -8933,18 +8973,19 @@ mod tests {
             "the episode must cross the gate for this to test anything: blind_secs={blind_secs}",
         );
         assert!(
-            daemon.state.last_readings[0].is_none(),
+            daemon.state.accounts[0].last_reading.is_none(),
             "u-A is genuinely blind throughout",
         );
         // The mechanism, pinned at the field: a zero is normalized away, so no directive is ever
         // "holding" u-A — even though its self-backoff window IS open (the lapse check is NOT what
         // declined the swap here).
         assert_eq!(
-            daemon.state.health[0].poll_backoff_retry_after, None,
+            daemon.state.accounts[0].health.poll_backoff_retry_after, None,
             "a zero Retry-After is normalized to None — it is not a server directive",
         );
         assert!(
-            daemon.state.health[0]
+            daemon.state.accounts[0]
+                .health
                 .poll_backoff_until
                 .is_some_and(|until| until > daemon.clock.now()),
             "the self-backoff window is OPEN — so only the zero-filter can be declining the swap",
@@ -8973,7 +9014,7 @@ mod tests {
         // and re-arm the swap-away on a recovered account.
         let mut daemon = blind_retry_after_daemon(0.29, 0.10, Duration::from_secs(3600)).await;
         assert_eq!(
-            daemon.state.health[0].poll_backoff_retry_after,
+            daemon.state.accounts[0].health.poll_backoff_retry_after,
             Some(Duration::from_secs(3600)),
             "the directive is retained while its window holds u-A off",
         );
@@ -8985,11 +9026,11 @@ mod tests {
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
         daemon.clock.advance(Duration::from_secs(3600));
-        while daemon.state.last_readings[0].is_none() {
+        while daemon.state.accounts[0].last_reading.is_none() {
             daemon.tick().await;
         }
         assert_eq!(
-            daemon.state.health[0].poll_backoff_retry_after, None,
+            daemon.state.accounts[0].health.poll_backoff_retry_after, None,
             "a clean poll clears the retained directive with its window",
         );
     }
@@ -9200,7 +9241,7 @@ mod tests {
     /// path HOLDS and the projective peer is the only thing that can fire) and u-B / u-C viable targets
     /// at 10 % (under the 80 % reserve). The velocity gate is left INERT
     /// (`session_velocity_horizon_secs == 0`, the `tunables()` default) and the EMA slot is `None` —
-    /// each direct-call test arms the horizon and seeds `state.session_velocity[0]` to the exact signal
+    /// each direct-call test arms the horizon and seeds `state.accounts[0].session_velocity` to the exact signal
     /// it exercises, then calls [`Daemon::velocity_swap`] with a cloned reading set (so `self` is free
     /// for the `&mut` swap path). Peer readings default to viable targets.
     ///
@@ -9233,7 +9274,7 @@ mod tests {
         // Frozen clock through the warm-up → every re-poll of the active saw a zero interval, so the
         // EMA reset to `None`: the seed each test installs is the ONLY velocity signal in play.
         assert!(
-            daemon.state.session_velocity[0].is_none(),
+            daemon.state.accounts[0].session_velocity.is_none(),
             "the warm-up leaves the EMA unseeded (zero-interval resets)",
         );
         daemon
@@ -9270,7 +9311,7 @@ mod tests {
             seeded.action,
         );
         assert_eq!(
-            daemon.state.session_velocity[0].map(|v| v.samples),
+            daemon.state.accounts[0].session_velocity.map(|v| v.samples),
             Some(1),
             "the first climbing interval seeds the EMA at one sample",
         );
@@ -9445,12 +9486,12 @@ mod tests {
         // short-circuits BEFORE the projection, excluding spurious low-usage projections cheaply.
         let mut daemon = warmed_velocity_daemon(0.80).await;
         daemon.session_velocity_horizon_secs = 150;
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.01,
             samples: 5,
         });
         let at = daemon.clock.now();
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
         let mut events = Vec::new();
         let action = daemon
             .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
@@ -9471,10 +9512,10 @@ mod tests {
         let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.session_velocity_horizon_secs = 150;
         let at = daemon.clock.now();
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
 
         // A single-interval spike steep enough to cross IF it counted — but samples = 1 holds.
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.01,
             samples: 1,
         });
@@ -9489,7 +9530,7 @@ mod tests {
         assert!(events.is_empty());
 
         // No retained signal at all → hold (never project on a missing velocity).
-        daemon.state.session_velocity[0] = None;
+        daemon.state.accounts[0].session_velocity = None;
         let mut events = Vec::new();
         let missing = daemon
             .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
@@ -9510,12 +9551,12 @@ mod tests {
         // effective ceiling for the 0.99 ceiling passed below.)
         let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.session_velocity_horizon_secs = 150;
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.0001,
             samples: 3,
         });
         let at = daemon.clock.now();
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
         let mut events = Vec::new();
         let action = daemon
             .velocity_swap(at, 0, 0.99, 0.98, &readings, &mut events)
@@ -9536,12 +9577,12 @@ mod tests {
         // effective ceiling) can never cross. The disabled projective path is a plain `Held`.
         let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.session_velocity_horizon_secs = 0;
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.01,
             samples: 5,
         });
         let at = daemon.clock.now();
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
         let mut events = Vec::new();
         let action = daemon
             .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
@@ -9572,12 +9613,12 @@ mod tests {
             daemon.tick().await;
         }
         assert!(daemon.state.warmed_up);
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.001,
             samples: 3,
         });
         let at = daemon.clock.now();
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
         let mut events = Vec::new();
         let action = daemon
             .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
@@ -9603,12 +9644,12 @@ mod tests {
         daemon.state.last_swap = Some(LastSwap {
             at: daemon.clock.now(),
         });
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.001,
             samples: 3,
         });
         let at = daemon.clock.now();
-        let readings = daemon.state.last_readings.clone();
+        let readings = daemon.state.readings();
         let mut events = Vec::new();
         let action = daemon
             .velocity_swap(at, 0, 0.95, 0.98, &readings, &mut events)
@@ -9638,7 +9679,9 @@ mod tests {
 
         // First sample: seed at the raw instant rate (0.06 / 60 s = 0.001 /s), samples = 1.
         daemon.note_session_velocity(0, 0.80, 0.86, 60);
-        let seeded = daemon.state.session_velocity[0].expect("seeded on the first interval");
+        let seeded = daemon.state.accounts[0]
+            .session_velocity
+            .expect("seeded on the first interval");
         assert!(
             (seeded.rate - 0.001).abs() < 1e-9,
             "seeded at the raw instant rate, not zero: {}",
@@ -9648,7 +9691,9 @@ mod tests {
 
         // Second sample: blend at α (0.12 / 60 s = 0.002 /s), rate = 0.5·0.002 + 0.5·0.001, samples = 2.
         daemon.note_session_velocity(0, 0.86, 0.98, 60);
-        let blended = daemon.state.session_velocity[0].expect("still present after the blend");
+        let blended = daemon.state.accounts[0]
+            .session_velocity
+            .expect("still present after the blend");
         assert!(
             (blended.rate - (0.5 * 0.002 + 0.5 * 0.001)).abs() < 1e-9,
             "EMA blend at α = 0.5: {}",
@@ -9659,16 +9704,19 @@ mod tests {
         // A session-usage DROP (next < prev — a 5 h window reset) resets the slot.
         daemon.note_session_velocity(0, 0.98, 0.10, 60);
         assert!(
-            daemon.state.session_velocity[0].is_none(),
+            daemon.state.accounts[0].session_velocity.is_none(),
             "a usage drop resets the EMA (the climbing trend is stale)",
         );
 
         // Re-seed, then a ZERO interval (degenerate — nothing to integrate) resets it too.
         daemon.note_session_velocity(0, 0.10, 0.20, 60);
-        assert!(daemon.state.session_velocity[0].is_some(), "re-seeded");
+        assert!(
+            daemon.state.accounts[0].session_velocity.is_some(),
+            "re-seeded"
+        );
         daemon.note_session_velocity(0, 0.20, 0.30, 0);
         assert!(
-            daemon.state.session_velocity[0].is_none(),
+            daemon.state.accounts[0].session_velocity.is_none(),
             "a zero interval resets the EMA",
         );
     }
@@ -9690,7 +9738,7 @@ mod tests {
     /// A decision reading set with the active account (u-A, slot 0) at `session`, peers carried at their
     /// warmed viable-target readings.
     fn active_session_reading(daemon: &FakeDaemon, session: f64) -> Vec<Option<Usage>> {
-        let mut readings = daemon.state.last_readings.clone();
+        let mut readings = daemon.state.readings();
         readings[0] = Some(Usage {
             session,
             weekly: 0.20,
@@ -9729,7 +9777,7 @@ mod tests {
         // Control: a reading below the velocity-derived threshold HOLDS — the term is bounded (not an
         // always-swap), and it is the velocity that moves the fire point, not a constant.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         let at = daemon.clock.now();
         let readings = active_session_reading(&daemon, below);
         let mut events = Vec::new();
@@ -9745,7 +9793,7 @@ mod tests {
         // The in-window reading fires the reactive arm EARLY (below the effective ceiling), attributed
         // to Session. A fresh daemon so the swap executes from the same warmed baseline.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         let at = daemon.clock.now();
         let readings = active_session_reading(&daemon, in_window);
         let mut events = Vec::new();
@@ -9789,7 +9837,7 @@ mod tests {
         // threshold is the BARE effective ceiling, so the in-window reading HOLDS (the burst is ridden
         // velocity-blind for this interval).
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 1 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 1 });
         let at = daemon.clock.now();
         let readings = active_session_reading(&daemon, in_window);
         let mut events = Vec::new();
@@ -9804,7 +9852,7 @@ mod tests {
         // (2) The blind window is BOUNDED at the effective ceiling: a reading AT the effective ceiling
         // fires the bare-ceiling swap even while velocity-blind — the burst is never ridden past it.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 1 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 1 });
         let at = daemon.clock.now();
         let readings = active_session_reading(&daemon, eff);
         let mut events = Vec::new();
@@ -9819,7 +9867,7 @@ mod tests {
         // (3) A 5 h window reset nulls the EMA (`None`); that post-reset blind window behaves exactly
         // like the cold one — velocity absent → bare effective ceiling → the in-window reading holds.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = None;
+        daemon.state.accounts[0].session_velocity = None;
         let at = daemon.clock.now();
         let readings = active_session_reading(&daemon, in_window);
         let mut events = Vec::new();
@@ -9834,7 +9882,7 @@ mod tests {
         // (4) Once the EMA is SUSTAINED (samples ≥ MIN_VELOCITY_SAMPLES) the early velocity fire
         // re-engages: the SAME in-window reading now swaps early, below the effective ceiling.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         let at = daemon.clock.now();
         let readings = active_session_reading(&daemon, in_window);
         let mut events = Vec::new();
@@ -9861,7 +9909,7 @@ mod tests {
         session: f64,
         window: Option<i64>,
     ) -> Vec<Option<Usage>> {
-        let mut readings = daemon.state.last_readings.clone();
+        let mut readings = daemon.state.readings();
         readings[0] = Some(Usage {
             session,
             weekly: 0.20,
@@ -9874,7 +9922,7 @@ mod tests {
     /// Install a session high-water mark of `session` in window [`WINDOW`] on the active account
     /// (slot 0), through the real [`swap::SessionHighWater::fold`] seam rather than by hand.
     fn seed_high_water(daemon: &mut FakeDaemon, session: f64) {
-        daemon.state.session_high_water[0] = swap::SessionHighWater::fold(
+        daemon.state.accounts[0].session_high_water = swap::SessionHighWater::fold(
             None,
             &Usage {
                 session,
@@ -9907,7 +9955,7 @@ mod tests {
         // Control — WITHOUT a high-water mark the stale reading is taken at face value and holds. This
         // is the pre-#614 behaviour, and it pins that the guard (not the fixture) is what changes it.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         let at = daemon.clock.now();
         let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
         let mut events = Vec::new();
@@ -9923,7 +9971,7 @@ mod tests {
         // fires the swap that was actually due — attributed to Session (the velocity-derived
         // threshold), not mis-logged as Weekly.
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         seed_high_water(&mut daemon, real);
         let at = daemon.clock.now();
         let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
@@ -9974,7 +10022,7 @@ mod tests {
         // holds, and the account rides past the ceiling unswapped.
         let mut daemon = warmed_velocity_daemon(0.86).await;
         daemon.session_velocity_horizon_secs = 150;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         let at = daemon.clock.now();
         let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
         let mut events = Vec::new();
@@ -9990,7 +10038,7 @@ mod tests {
         // the preemptive swap fires.
         let mut daemon = warmed_velocity_daemon(0.86).await;
         daemon.session_velocity_horizon_secs = 150;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         seed_high_water(&mut daemon, real);
         let at = daemon.clock.now();
         let readings = stamped_active_reading(&daemon, stale, Some(WINDOW));
@@ -10031,7 +10079,7 @@ mod tests {
         // eliminate). Closing this tail would need a different signal than the reading itself carries.
         let rate = 0.0004;
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         seed_high_water(&mut daemon, 0.88); // a mark exists — but the reading claims no window
         let at = daemon.clock.now();
         let readings = stamped_active_reading(&daemon, 0.40, None);
@@ -10054,7 +10102,7 @@ mod tests {
         // for no reason (and pin it there for the rest of the new window).
         let rate = 0.0004;
         let mut daemon = armed_reactive_daemon().await;
-        daemon.state.session_velocity[0] = Some(VelocityEma { rate, samples: 2 });
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples: 2 });
         seed_high_water(&mut daemon, 0.88); // the PREVIOUS window's mark
         let at = daemon.clock.now();
         let readings = stamped_active_reading(&daemon, 0.40, Some(WINDOW_ROLLED));
@@ -10080,14 +10128,16 @@ mod tests {
         // arms velocity-blind (the projection holds outright; the reactive term collapses to 0). The
         // fold now skips such an interval entirely, so the retained EMA survives untouched.
         let mut daemon = window_stamped_climbing_daemon().await;
-        let warm = daemon.state.session_velocity[0].expect("a sustained EMA from the real climb");
+        let warm = daemon.state.accounts[0]
+            .session_velocity
+            .expect("a sustained EMA from the real climb");
         assert!(
             warm.samples >= MIN_VELOCITY_SAMPLES,
             "the fixture leaves a SUSTAINED EMA ({} samples)",
             warm.samples,
         );
         assert_eq!(
-            daemon.state.session_high_water[0],
+            daemon.state.accounts[0].session_high_water,
             swap::SessionHighWater::fold(
                 None,
                 &Usage {
@@ -10104,7 +10154,7 @@ mod tests {
         // interval is not folded — the EMA is byte-for-byte what the real climb left.
         poll_active_at(&mut daemon, 0.40, Some(WINDOW)).await;
         assert_eq!(
-            daemon.state.session_velocity[0],
+            daemon.state.accounts[0].session_velocity,
             Some(warm),
             "the implausible interval left the retained EMA untouched",
         );
@@ -10114,7 +10164,7 @@ mod tests {
         let mut daemon = window_stamped_climbing_daemon().await;
         poll_active_at(&mut daemon, 0.40, Some(WINDOW_ROLLED)).await;
         assert!(
-            daemon.state.session_velocity[0].is_none(),
+            daemon.state.accounts[0].session_velocity.is_none(),
             "a legitimate window reset still resets the EMA (the climbing trend really is stale)",
         );
     }
@@ -10137,7 +10187,9 @@ mod tests {
         // genuinely-due one; a degenerate zero-length interval must reset rather than fabricate.
         let eff = swap::effective_ceiling(0.99); // ceiling 99 → 0.93
         let mut daemon = pre_suspend_climbing_daemon().await;
-        let pre_suspend = daemon.state.session_velocity[0].expect("a sustained pre-suspend EMA");
+        let pre_suspend = daemon.state.accounts[0]
+            .session_velocity
+            .expect("a sustained pre-suspend EMA");
 
         // --- Leg 1: the resume interval is divided by the WALL-CLOCK gap ---------------------
         // Arm the projective peer, then resume after a 30 min suspend across which usage rose two
@@ -10165,8 +10217,9 @@ mod tests {
              fire before the resume poll lands",
         );
         poll_active_after(&mut daemon, SUSPEND, 0.89, None).await;
-        let resumed =
-            daemon.state.session_velocity[0].expect("the resume interval blends, not resets");
+        let resumed = daemon.state.accounts[0]
+            .session_velocity
+            .expect("the resume interval blends, not resets");
         let alpha = daemon.session_velocity_ema_alpha;
         let wall_clock_rate = (0.89 - 0.87) / SUSPEND.as_secs() as f64;
         let expected = alpha * wall_clock_rate + (1.0 - alpha) * pre_suspend.rate;
@@ -10228,7 +10281,7 @@ mod tests {
         frozen_clock.session_velocity_horizon_secs = HORIZON;
         poll_active_after(&mut frozen_clock, Duration::ZERO, 0.89, None).await;
         assert!(
-            frozen_clock.state.session_velocity[0].is_none(),
+            frozen_clock.state.accounts[0].session_velocity.is_none(),
             "a zero-length interval resets the EMA instead of fabricating a rate",
         );
         assert_eq!(
@@ -10249,7 +10302,9 @@ mod tests {
         poll_active_at(&mut daemon, 0.86, None).await;
         poll_active_at(&mut daemon, 0.87, None).await;
         assert!(
-            daemon.state.session_velocity[0].is_some_and(|v| v.samples >= MIN_VELOCITY_SAMPLES),
+            daemon.state.accounts[0]
+                .session_velocity
+                .is_some_and(|v| v.samples >= MIN_VELOCITY_SAMPLES),
             "two real climbing intervals leave a SUSTAINED EMA",
         );
         daemon
@@ -10305,7 +10360,10 @@ mod tests {
         daemon.clock.advance(gap);
         for _ in 0..4 {
             daemon.tick().await;
-            if daemon.state.last_readings[0].is_some_and(|u| u.session == session) {
+            if daemon.state.accounts[0]
+                .last_reading
+                .is_some_and(|u| u.session == session)
+            {
                 return;
             }
         }
@@ -10314,11 +10372,13 @@ mod tests {
 
     #[test]
     fn reconcile_roster_preserves_session_high_water_in_lockstep() {
-        // Issue #614: the high-water mark is a parallel per-account vec (like `last_readings` and the
-        // #539 EMA), so a roster reconcile MUST re-key it by uuid — preserved for a persisting account
-        // (merely re-indexed), `None` for a newly-onboarded one — or the plausibility guard would judge
-        // one account's reading against ANOTHER account's mark, or panic out of bounds. Here u-A is
-        // REMOVED (index shift) and u-C is ONBOARDED.
+        // Issue #614: the high-water mark is a per-account `AccountRuntime` field (bundled with the
+        // reading and the #539 EMA, #668), so a roster reconcile MUST re-key it by uuid — preserved
+        // for a persisting account (merely re-indexed), `None` for a newly-onboarded one — or the
+        // plausibility guard would judge one account's reading against ANOTHER account's mark, or
+        // panic out of bounds. Here u-A is REMOVED (index shift) and u-C is ONBOARDED. (The exhaustive
+        // cross-signal sweep is `reconcile_roster_rekeys_every_per_account_signal_by_uuid_not_by_index`;
+        // this focused case narrates the high-water stake specifically.)
         let stamped = |session: f64| Usage {
             session,
             weekly: 0.20,
@@ -10326,40 +10386,43 @@ mod tests {
             session_resets_at: Some(WINDOW),
         };
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
-        daemon.state.session_high_water[0] = swap::SessionHighWater::fold(None, &stamped(0.95));
-        daemon.state.session_high_water[1] = swap::SessionHighWater::fold(None, &stamped(0.42));
+        daemon.state.accounts[0].session_high_water =
+            swap::SessionHighWater::fold(None, &stamped(0.95));
+        daemon.state.accounts[1].session_high_water =
+            swap::SessionHighWater::fold(None, &stamped(0.42));
 
         daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
 
         // The vec stays length- and index-aligned with the new roster.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
-        assert_eq!(daemon.state.session_high_water.len(), 2);
+        assert_eq!(daemon.state.accounts.len(), 2);
         // u-B's mark is preserved, re-indexed from slot 1 to slot 0 — its window's plausibility
         // baseline is still valid (a reconcile of another account is not a window roll).
         assert_eq!(
-            daemon.state.session_high_water[0],
+            daemon.state.accounts[0].session_high_water,
             swap::SessionHighWater::fold(None, &stamped(0.42)),
             "u-B's mark survives the reconcile, re-indexed",
         );
         // u-C onboards with a fresh (`None`) mark — no stale floor leaks in from the removed u-A.
         assert!(
-            daemon.state.session_high_water[1].is_none(),
+            daemon.state.accounts[1].session_high_water.is_none(),
             "the onboarded account starts with no high-water mark",
         );
     }
 
     #[test]
     fn reconcile_roster_preserves_session_velocity_in_lockstep() {
-        // Issue #539: the per-account EMA is a parallel vec (like `last_readings`), so a roster
-        // reconcile MUST re-key it by uuid — preserved for a persisting account (merely re-indexed),
-        // `None` for a newly-onboarded one — or a projective read would index the wrong account or
-        // panic out of bounds. Here u-A is REMOVED (index shift) and u-C is ONBOARDED.
+        // Issue #539: the per-account EMA is an `AccountRuntime` field (bundled with the reading,
+        // #668), so a roster reconcile MUST re-key it by uuid — preserved for a persisting account
+        // (merely re-indexed), `None` for a newly-onboarded one — or a projective read would index
+        // the wrong account or panic out of bounds. Here u-A is REMOVED (index shift) and u-C is
+        // ONBOARDED.
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.003,
             samples: 4,
         });
-        daemon.state.session_velocity[1] = Some(VelocityEma {
+        daemon.state.accounts[1].session_velocity = Some(VelocityEma {
             rate: 0.007,
             samples: 2,
         });
@@ -10368,36 +10431,39 @@ mod tests {
 
         // The vec stays length- and index-aligned with the new roster.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
-        assert_eq!(daemon.state.session_velocity.len(), 2);
+        assert_eq!(daemon.state.accounts.len(), 2);
         // u-B's EMA is preserved, re-indexed from slot 1 to slot 0.
-        let preserved = daemon.state.session_velocity[0].expect("u-B's EMA survives the reconcile");
+        let preserved = daemon.state.accounts[0]
+            .session_velocity
+            .expect("u-B's EMA survives the reconcile");
         assert_eq!(preserved.samples, 2);
         assert!((preserved.rate - 0.007).abs() < 1e-9);
         // u-C onboards with a fresh (`None`) EMA — no stale velocity leaks in from the removed u-A.
         assert!(
-            daemon.state.session_velocity[1].is_none(),
+            daemon.state.accounts[1].session_velocity.is_none(),
             "the onboarded account starts with no velocity",
         );
     }
 
     #[test]
     fn reconcile_roster_preserves_an_in_flight_blind_anchor_in_lockstep() {
-        // Issue #583: the per-account pre-blind anchor is a parallel vec, so a reconcile MUST re-key
-        // it by uuid for the same reason the #539 EMA above must — an episode edge would otherwise
-        // anchor off the wrong account or panic out of bounds. It also carries a liveness stake the
+        // Issue #583: the per-account pre-blind anchor is an `AccountRuntime` field (#668), so a
+        // reconcile MUST re-key it by uuid for the same reason the #539 EMA above must — an episode
+        // edge would otherwise anchor off the wrong account or panic out of bounds. It also carries a
+        // liveness stake the
         // EMA does not: an in-flight blind episode must SURVIVE a reconcile triggered by an unrelated
         // account, or a `remove` elsewhere silently truncates it and the episode is censored again by
         // a third route. Here u-A is REMOVED (index shift) and u-C is ONBOARDED while u-B is blind.
         let base = Instant::now();
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
-        daemon.state.blind_anchor[0] = Some(BlindAnchor {
+        daemon.state.accounts[0].blind_anchor = Some(BlindAnchor {
             session: 0.96,
             weekly: 0.40,
             at: base,
             was_active: true,
             near_limit: true,
         });
-        daemon.state.blind_anchor[1] = Some(BlindAnchor {
+        daemon.state.accounts[1].blind_anchor = Some(BlindAnchor {
             session: 0.30,
             weekly: 0.10,
             at: base,
@@ -10409,11 +10475,11 @@ mod tests {
 
         // The vec stays length- and index-aligned with the new roster.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
-        assert_eq!(daemon.state.blind_anchor.len(), 2);
+        assert_eq!(daemon.state.accounts.len(), 2);
         // u-B's in-flight episode survives whole, re-indexed from slot 1 to slot 0 — its eventual
         // recovery still closes against the anchor it went blind on.
         assert_eq!(
-            daemon.state.blind_anchor[0],
+            daemon.state.accounts[0].blind_anchor,
             Some(BlindAnchor {
                 session: 0.30,
                 weekly: 0.10,
@@ -10425,7 +10491,7 @@ mod tests {
         );
         // u-C onboards with no anchor — the removed u-A's 96% anchor must not leak into its slot.
         assert!(
-            daemon.state.blind_anchor[1].is_none(),
+            daemon.state.accounts[1].blind_anchor.is_none(),
             "the onboarded account starts inside no episode",
         );
     }
@@ -10542,7 +10608,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -10614,7 +10680,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         // Well past the interim T — still no signal: the anchor is below the risk band.
@@ -10652,7 +10718,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -10676,7 +10742,7 @@ mod tests {
             .ok("u-A", 0.70, 0.20)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_none() {
+        while daemon.state.accounts[0].last_reading.is_none() {
             daemon.tick().await;
         }
 
@@ -10685,7 +10751,7 @@ mod tests {
             .rate_limited("u-A", None)
             .ok("u-B", 0.10, 0.10)
             .ok("u-C", 0.10, 0.10);
-        while daemon.state.last_readings[0].is_some() {
+        while daemon.state.accounts[0].last_reading.is_some() {
             daemon.tick().await;
         }
         daemon
@@ -11093,7 +11159,10 @@ mod tests {
         // The peer's first poll (still NON-active) reads it exhausted → arms its slow-poll window.
         next_peer_tick(&mut daemon).await;
         assert!(
-            daemon.state.health[1].exhausted_poll_until.is_some(),
+            daemon.state.accounts[1]
+                .health
+                .exhausted_poll_until
+                .is_some(),
             "the peer's slow-poll window is armed before promotion",
         );
         // Promote u-B to active — what `use u-B` effects (repoint active) — WITHOUT advancing the
@@ -11109,7 +11178,10 @@ mod tests {
         // That active poll cleared the stale window (active is treated viable) — no dangling
         // deadline once it is back in rotation as the consumed account.
         assert!(
-            daemon.state.health[1].exhausted_poll_until.is_none(),
+            daemon.state.accounts[1]
+                .health
+                .exhausted_poll_until
+                .is_none(),
             "the active poll cleared the stale slow-poll window",
         );
     }
@@ -11147,7 +11219,9 @@ mod tests {
         );
         // The peer's reading — with its weekly reset — is RETAINED across the skips, so the
         // relief math (all_exhausted_relief) still has the reset to key off.
-        let retained = daemon.state.last_readings[1].expect("peer reading retained across skips");
+        let retained = daemon.state.accounts[1]
+            .last_reading
+            .expect("peer reading retained across skips");
         assert_eq!(retained.weekly_resets_at, Some(now + 999_999));
     }
 
@@ -11259,9 +11333,9 @@ mod tests {
         .await;
         let sessions = |d: &FakeDaemon| -> Vec<Option<f64>> {
             d.state
-                .last_readings
+                .accounts
                 .iter()
-                .map(|u| u.as_ref().map(|r| r.session))
+                .map(|a| a.last_reading.as_ref().map(|r| r.session))
                 .collect()
         };
 
@@ -11342,12 +11416,12 @@ mod tests {
 
         // Quarantine peer 2: it drops out entirely — the active is NOT interleaved before
         // an excluded peer (so no `2`, and no extra leading `0` for it).
-        daemon.state.health[2].quarantined = true;
+        daemon.state.accounts[2].health.quarantined = true;
         assert_eq!(daemon.build_poll_schedule(Some(0)), vec![0, 1]);
 
         // Quarantine the last remaining peer too: an active with NO peers still polls
         // itself (its swap-away trigger / dead-active re-probe), never an empty schedule.
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.quarantined = true;
         assert_eq!(daemon.build_poll_schedule(Some(0)), vec![0]);
     }
 
@@ -11409,8 +11483,8 @@ mod tests {
         );
 
         // Below the band with NO velocity signal (the poll-gap case #540 owns): NOT engaged.
-        daemon.state.last_readings[0] = Some(usage(0.80));
-        daemon.state.session_velocity[0] = None;
+        daemon.state.accounts[0].last_reading = Some(usage(0.80));
+        daemon.state.accounts[0].session_velocity = None;
         assert!(
             !daemon.near_limit_fast_poll_engaged(),
             "below the band with no velocity → not engaged",
@@ -11418,7 +11492,7 @@ mod tests {
 
         // Below the band, but a SUSTAINED projection reaches the floor (0.80 + 0.01 × 150 = 2.3 ≥
         // 0.85): the "approaching the band" arm engages BEFORE the fast burst is observed in-band.
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.01,
             samples: 3,
         });
@@ -11429,7 +11503,7 @@ mod tests {
 
         // A SHORT projection (0.80 + 0.0001 × 150 = 0.815 < 0.85) stays below the floor → NOT
         // engaged; the reactive path catches it if it keeps climbing.
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.0001,
             samples: 3,
         });
@@ -11440,7 +11514,7 @@ mod tests {
 
         // A single-interval spike (samples < MIN_VELOCITY_SAMPLES) is not SUSTAINED → NOT engaged,
         // exactly as #539's projection guards — never fire on a one-off spike.
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.01,
             samples: 1,
         });
@@ -11451,7 +11525,7 @@ mod tests {
 
         // The #539 horizon kill-switch (0) collapses the projection to the observed (below-band)
         // reading → NOT engaged, even with a steep, well-sustained velocity.
-        daemon.state.session_velocity[0] = Some(VelocityEma {
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
             rate: 0.01,
             samples: 5,
         });
@@ -11464,14 +11538,14 @@ mod tests {
 
         // A BLIND active (its slot cleared by a 429/5xx) carries no OBSERVED near-limit signal —
         // that is the #452 bounded-blindness path, not #540's — so a None reading holds it OFF.
-        daemon.state.last_readings[0] = None;
+        daemon.state.accounts[0].last_reading = None;
         assert!(
             !daemon.near_limit_fast_poll_engaged(),
             "a blind active (None reading) → not engaged (#452's domain, not #540's)",
         );
 
         // Re-arm an in-band reading, then verify the three GATE guards each independently hold off.
-        daemon.state.last_readings[0] = Some(usage(0.90));
+        daemon.state.accounts[0].last_reading = Some(usage(0.90));
         assert!(daemon.near_limit_fast_poll_engaged(), "re-armed in-band");
 
         // Kill-switch: near_limit_poll_secs == 0 disables the whole path.
@@ -11510,14 +11584,14 @@ mod tests {
         let mut daemon = warmed_velocity_daemon(0.90).await;
         daemon.near_limit_poll_secs = 60; // enable the path
         daemon.session_velocity_horizon_secs = 0; // projection OFF → isolate the OBSERVED-band arm
-        daemon.state.session_velocity[0] = None; // no velocity → only the reading can carry the band
+        daemon.state.accounts[0].session_velocity = None; // no velocity → only the reading can carry the band
         let stale = Usage {
             session: 0.40,
             weekly: 0.20,
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
-        daemon.state.last_readings[0] = Some(stale);
+        daemon.state.accounts[0].last_reading = Some(stale);
 
         // Control: with no high-water mark the stale 0.40 is below the band → NOT engaged (pre-#614).
         assert!(
@@ -11534,7 +11608,7 @@ mod tests {
 
         // And the correction is scoped to the window: once it rolls, the same 0.40 really IS below the
         // band, so the fast-poll correctly disengages (the mark does not pin the fast-poll on).
-        daemon.state.last_readings[0] = Some(Usage {
+        daemon.state.accounts[0].last_reading = Some(Usage {
             session_resets_at: Some(WINDOW_ROLLED),
             ..stale
         });
@@ -12755,7 +12829,7 @@ mod tests {
 
         // Arm the landing watch on the parked "spare" as a reason=session swap would (fired at 95%).
         let arm = |d: &mut FakeDaemon| {
-            d.state.parked_landing[1] = Some(ParkedLanding {
+            d.state.accounts[1].parked_landing = Some(ParkedLanding {
                 armed_at: base,
                 decision_pct: 95,
             });
@@ -12776,7 +12850,7 @@ mod tests {
             })
         );
         assert!(
-            daemon.state.parked_landing[1].is_none(),
+            daemon.state.accounts[1].parked_landing.is_none(),
             "fires once, disarms"
         );
         assert_eq!(
@@ -12799,7 +12873,7 @@ mod tests {
             "98 < 99: no breach"
         );
         assert!(
-            daemon.state.parked_landing[1].is_some(),
+            daemon.state.accounts[1].parked_landing.is_some(),
             "stays armed below the ceiling"
         );
 
@@ -12812,7 +12886,7 @@ mod tests {
             "re-activated: no breach"
         );
         assert!(
-            daemon.state.parked_landing[1].is_none(),
+            daemon.state.accounts[1].parked_landing.is_none(),
             "re-activation disarms"
         );
 
@@ -12830,7 +12904,7 @@ mod tests {
             "window elapsed: no breach"
         );
         assert!(
-            daemon.state.parked_landing[1].is_none(),
+            daemon.state.accounts[1].parked_landing.is_none(),
             "window-expiry disarms"
         );
 
@@ -12842,7 +12916,7 @@ mod tests {
             "a failed poll is not a breach"
         );
         assert!(
-            daemon.state.parked_landing[1].is_some(),
+            daemon.state.accounts[1].parked_landing.is_some(),
             "a failed poll leaves the watch armed"
         );
     }
@@ -12863,7 +12937,7 @@ mod tests {
         // reading held below the ceiling and no breach was retained.
         let breach_pct_at = |d: &mut FakeDaemon, session: f64| {
             d.state.last_landing_overshoot = None;
-            d.state.parked_landing[1] = Some(ParkedLanding {
+            d.state.accounts[1].parked_landing = Some(ParkedLanding {
                 armed_at: base,
                 decision_pct: 95,
             });
@@ -12943,13 +13017,13 @@ mod tests {
             assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
             // The OUTGOING account (0) is armed with the swap-DECISION percent (to_pct(0.97) = 97)…
             assert_eq!(
-                daemon.state.parked_landing[0].map(|p| p.decision_pct),
+                daemon.state.accounts[0].parked_landing.map(|p| p.decision_pct),
                 Some(97),
                 "a reason=session swap arms the parked (outgoing) account with its decision percent",
             );
             // …and the INCOMING account (1) is left disarmed (`record_swap` cleared it).
             assert!(
-                daemon.state.parked_landing[1].is_none(),
+                daemon.state.accounts[1].parked_landing.is_none(),
                 "the account going active is never a parked-landing subject",
             );
         }
@@ -12982,7 +13056,7 @@ mod tests {
             let outcome = warmed_tick(&mut daemon).await;
             assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
             assert!(
-                daemon.state.parked_landing[0].is_none(),
+                daemon.state.accounts[0].parked_landing.is_none(),
                 "a reason=weekly swap does not arm the landing watch",
             );
         }
@@ -13909,7 +13983,7 @@ mod tests {
             };
             let (mut daemon, _dir) = meter_daemon(&secrets, &[A, B], poller, &tun).await;
             daemon.state.active = Some(0);
-            daemon.state.health[0].quarantined = true; // dead, now being re-probed
+            daemon.state.accounts[0].health.quarantined = true; // dead, now being re-probed
             let outcome = daemon.tick().await;
             assert_eq!(outcome.action, TickAction::Held);
             harvest_channels(&outcome, &mut corpus);

@@ -168,7 +168,7 @@ pub(super) struct LastSwap {
 }
 
 /// The ACTIVE account's last SUCCESSFUL usage reading, retained as a pre-blind
-/// anchor (issue #450) SEPARATELY from [`DecisionState::last_readings`] — which a
+/// anchor (issue #450) SEPARATELY from [`AccountRuntime::last_reading`] — which a
 /// failed / throttled poll clears to `None`, leaving the reactive swap path
 /// (`swap::decide`) byte-for-byte unchanged but losing any answer to "how near the
 /// band was the active account when it went blind?". Refreshed on every successful
@@ -202,7 +202,7 @@ pub(super) struct LastGood {
 /// account handle). Those resets are exactly the second censoring tail #583 fixes, so this anchor is
 /// held one-per-roster-slot and is touched by NOTHING but its own episode edges — no swap path, no
 /// active resolution. Keeping the two separate leaves #450/#452's anchor semantics byte-for-byte
-/// unchanged, exactly as `last_good` itself is kept separate from `last_readings`.
+/// unchanged, exactly as `last_good` itself is kept separate from the account's `last_reading`.
 ///
 /// Carries BOTH usage windows: the session window resets on its own 5 h cadence, so a session-only
 /// anchor cannot distinguish a mid-blindness reset from a quiet account — the failure that hid a real
@@ -234,7 +234,7 @@ pub(super) struct BlindAnchor {
 /// Cleared in [`Daemon::record_swap`] (so a later same-active swap supersedes it before
 /// [`blind_swap`](Daemon::blind_swap) re-sets its own); a differently-targeted swap self-invalidates
 /// it at projection time instead. DEDICATED — kept SEPARATE from the cooldown-bearing [`LastSwap`]
-/// (read on every swap path) exactly as [`LastGood`] is kept separate from `last_readings`, so the
+/// (read on every swap path) exactly as [`LastGood`] is kept separate from the account's `last_reading`, so the
 /// narration state never burdens the cooldown primitive. Non-secret — two operator handles + a `u8`
 /// + a process-local [`Instant`] (never serialized), never a token or email (issue #15).
 #[derive(Debug, Clone, PartialEq)]
@@ -253,8 +253,8 @@ pub(super) struct BlindPreemptSwapRecord {
 
 /// A per-account ARMED landing watch for the runtime landing-overshoot signal (issue #613). Set on
 /// the account the daemon just swapped AWAY FROM on a `reason=session` swap (in
-/// [`Daemon::decide_action`]), held in [`DecisionState::parked_landing`] (one slot per roster
-/// account, like [`DecisionState::last_readings`]). While armed, each subsequent poll of THAT parked
+/// [`Daemon::decide_action`]), held in [`AccountRuntime::parked_landing`] (one slot per roster
+/// account, like [`AccountRuntime::last_reading`]). While armed, each subsequent poll of THAT parked
 /// account is checked against the SLO ceiling ([`landing::is_overshoot`]) within the
 /// [`landing::LANDING_WINDOW`]: a crossing records a [`LandingOvershootRecord`] and disarms (fire
 /// once per parked episode); the window elapsing, or the account going active again, disarms with no
@@ -273,7 +273,7 @@ pub(super) struct ParkedLanding {
 /// velocity-projection preemptive trigger (ADR-0017). The transient [`usage_velocity`] the poll
 /// fold logs is discarded, so the projective path — which runs at decision time, a step AFTER the
 /// fold that would recompute it — has nothing to project from; this carries a smoothed rate ACROSS
-/// polls instead. Held in [`DecisionState::session_velocity`], one slot per roster account (only the
+/// polls instead. Held in [`AccountRuntime::session_velocity`], one slot per roster account (only the
 /// ACTIVE slot is projected, but every account accrues its own so the signal is warm the moment it
 /// becomes active), reset to `None` on a session-usage DROP (a 5 h window reset / recovery — the
 /// prior climbing trend is then stale) so a post-reset projection never keys off a pre-reset rate.
@@ -333,7 +333,7 @@ pub(super) enum SwapVerdict {
 ///
 /// Returns `Some` only when ALL hold — the same episode shape [`Daemon::note_blind_gate_eligibility`]
 /// gates on, MINUS its viable-target check (surfacing the state does not need a target):
-/// - `active_is_blind` — the active account's live reading is cleared (`last_readings[active]` is
+/// - `active_is_blind` — the active account's live reading is cleared (`accounts[active].last_reading` is
 ///   `None`, a `429`/`5xx` blind window), AND
 /// - `!quarantined` — a DEAD (#42) blind active belongs to the `emergency_swap` path, not bounded
 ///   blindness; ADR-0017 keeps the two separate, so a quarantined active is excluded, AND

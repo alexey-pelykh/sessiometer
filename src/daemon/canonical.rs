@@ -127,9 +127,9 @@ where
                         // `note_poll_outcome` remains for the spontaneous-revival path (a
                         // dead ACTIVE account whose own token answers again WITHOUT a
                         // re-login).
-                        if self.state.health[idx].quarantined {
-                            self.state.health[idx].quarantined = false;
-                            self.state.health[idx].recovery_successes = 0;
+                        if self.state.accounts[idx].health.quarantined {
+                            self.state.accounts[idx].health.quarantined = false;
+                            self.state.accounts[idx].health.recovery_successes = 0;
                             events.push(Event::CredentialRestored {
                                 account: self.roster[idx].label.clone(),
                             });

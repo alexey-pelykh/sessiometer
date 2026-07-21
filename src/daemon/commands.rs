@@ -127,11 +127,12 @@ where
         //    it deliberately keeps this re-validation off the network so it never blocks the
         //    single-thread run loop (ADR-0001). `force` overrides it either way.
         let now = self.clock.now();
-        let quarantined = self.state.health[target_idx].quarantined;
+        let quarantined = self.state.accounts[target_idx].health.quarantined;
         // Issue #607: the ROTATION line, not the raw ceiling — otherwise this re-validation accepts
         // a target in the `[ceiling − margin, ceiling)` band that `decide` swaps away from on the
         // next tick, i.e. an operator `use` that silently undoes itself moments later.
-        let weekly_exhausted = self.state.last_readings[target_idx]
+        let weekly_exhausted = self.state.accounts[target_idx]
+            .last_reading
             .is_some_and(|usage| usage.weekly >= self.weekly_rotation_line());
         let in_cooldown = self
             .state
@@ -496,60 +497,28 @@ where
         // Re-key each account's carried decision state by uuid: preserve it for an
         // account that persists, default it for a newly-onboarded one. (Rosters are a
         // handful of accounts, so the per-account `position` scan is inconsequential.)
-        let mut health = Vec::with_capacity(new_roster.len());
-        let mut last_readings = Vec::with_capacity(new_roster.len());
-        let mut last_reading_at = Vec::with_capacity(new_roster.len());
-        // Issue #539: the session-velocity EMA is re-keyed in lockstep with `last_readings` — kept
-        // for a persisting account (merely re-indexed), started fresh (`None`) for a new one, so the
-        // vec never drifts out of length/index sync with the roster (a projective read would
-        // otherwise index the wrong account or panic out of bounds).
-        let mut session_velocity = Vec::with_capacity(new_roster.len());
-        // Issue #613: the armed landing watch is re-keyed in lockstep with `last_readings` for the
-        // same reason — kept for a persisting account (an open post-swap landing window survives a
-        // reconcile of OTHER accounts), started fresh (`None`) for a new one, so the vec never drifts
-        // out of length/index sync with the roster (a landing check would otherwise index the wrong
-        // account or panic out of bounds).
-        let mut parked_landing = Vec::with_capacity(new_roster.len());
-        // Issue #614: the session high-water mark is re-keyed in lockstep with `last_readings` for
-        // the same reason — kept for a persisting account (its window's plausibility baseline is
-        // still valid; a reconcile of OTHER accounts is not a window roll), started fresh (`None`)
-        // for a new one, so the vec never drifts out of length/index sync with the roster.
-        let mut session_high_water = Vec::with_capacity(new_roster.len());
-        // Issue #583: the per-account pre-blind anchor is re-keyed in lockstep with `last_readings`
-        // for the same reason — kept for a persisting account (an in-flight blind episode survives a
-        // reconcile of OTHER accounts, so a `remove` elsewhere cannot silently truncate it), started
-        // fresh (`None`) for a new one, so the vec never drifts out of length/index sync with the
-        // roster (an episode edge would otherwise anchor off the wrong account or panic out of bounds).
-        let mut blind_anchor = Vec::with_capacity(new_roster.len());
-        let mut polled_once = Vec::with_capacity(new_roster.len());
-        for account in &new_roster {
-            match self
-                .roster
-                .iter()
-                .position(|old| old.account_uuid == account.account_uuid)
-            {
-                Some(old_idx) => {
-                    health.push(self.state.health[old_idx].clone());
-                    last_readings.push(self.state.last_readings[old_idx]);
-                    last_reading_at.push(self.state.last_reading_at[old_idx]);
-                    session_velocity.push(self.state.session_velocity[old_idx]);
-                    parked_landing.push(self.state.parked_landing[old_idx]);
-                    session_high_water.push(self.state.session_high_water[old_idx]);
-                    blind_anchor.push(self.state.blind_anchor[old_idx]);
-                    polled_once.push(self.state.polled_once[old_idx]);
+        // ONE re-key, covering EVERY per-account signal at once (issue #668): health (#42), the
+        // last-known reading (#80) + its timestamp (#449), the session-velocity EMA (#539), the armed
+        // landing watch (#613), the session high-water mark (#614), and the pre-blind anchor (#583).
+        // A persisting account's whole slot is kept (merely re-indexed) — so an open landing window,
+        // a warm velocity EMA, its window's plausibility baseline, and an in-flight blind episode all
+        // survive a `capture`/`login`/`remove` of ANOTHER account — and a newly-onboarded one starts
+        // at `AccountRuntime::default()`. Because it is ONE vec, no signal can drift out of
+        // length/index sync with the roster (which would index the wrong account or panic out of
+        // bounds), and a ninth signal is re-keyed here for free.
+        let accounts = new_roster
+            .iter()
+            .map(|account| {
+                match self
+                    .roster
+                    .iter()
+                    .position(|old| old.account_uuid == account.account_uuid)
+                {
+                    Some(old_idx) => self.state.accounts[old_idx].clone(),
+                    None => AccountRuntime::default(),
                 }
-                None => {
-                    health.push(AccountHealth::default());
-                    last_readings.push(None);
-                    last_reading_at.push(None);
-                    session_velocity.push(None);
-                    parked_landing.push(None);
-                    session_high_water.push(None);
-                    blind_anchor.push(None);
-                    polled_once.push(false);
-                }
-            }
-        }
+            })
+            .collect();
 
         // Re-resolve active by uuid: kept (its new index) if it persists, else `None`.
         let active = active_uuid.and_then(|uuid| {
@@ -558,21 +527,14 @@ where
                 .position(|account| account.account_uuid == uuid)
         });
 
-        // Commit the reconciled roster + parallel state together, so no tick ever
+        // Commit the reconciled roster + its per-account runtime state together, so no tick ever
         // observes a roster/state length mismatch.
         self.roster = new_roster;
-        self.state.health = health;
-        self.state.last_readings = last_readings;
-        self.state.last_reading_at = last_reading_at;
-        self.state.session_velocity = session_velocity;
-        self.state.parked_landing = parked_landing;
-        self.state.session_high_water = session_high_water;
-        self.state.blind_anchor = blind_anchor;
-        self.state.polled_once = polled_once;
+        self.state.accounts = accounts;
         self.state.active = active;
         // Issue #450: `last_good` belongs to the active account by identity; reconcile
         // keeps it whole if that account persists (it is merely re-indexed, like
-        // `last_readings` above), but drops it if the active account left the roster —
+        // the per-account readings above), but drops it if the active account left the roster —
         // a removed account's anchor must not leak into the next active's blindness
         // reasoning (#452).
         if active.is_none() {
@@ -2144,9 +2106,11 @@ mod tests {
         // not reset a healthy one).
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true; // A carries a distinctive health mark
-        daemon.state.last_readings[1] = Some(reading(0.30, 0.40)); // B carries a reading
-        daemon.state.polled_once = vec![true, true];
+        daemon.state.accounts[0].health.quarantined = true; // A carries a distinctive health mark
+        daemon.state.accounts[1].last_reading = Some(reading(0.30, 0.40)); // B carries a reading
+        for account in &mut daemon.state.accounts {
+            account.polled_once = true;
+        }
 
         daemon.reconcile_roster(vec![
             account("u-A", "work"),
@@ -2156,21 +2120,24 @@ mod tests {
 
         // The new account is now in the live roster…
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
-        // …with every parallel state array grown to match (no length skew).
-        assert_eq!(daemon.state.health.len(), 3);
-        assert_eq!(daemon.state.last_readings.len(), 3);
-        assert_eq!(daemon.state.polled_once.len(), 3);
+        // …with the runtime state grown to match (no length skew). Pre-#668 this was three
+        // separate length assertions, one per parallel vec; the bundle makes that agreement
+        // structural, so one assertion now covers every signal.
+        assert_eq!(daemon.state.accounts.len(), 3);
         // Persisting accounts keep their carried state.
-        assert!(daemon.state.health[0].quarantined, "A's health preserved");
+        assert!(
+            daemon.state.accounts[0].health.quarantined,
+            "A's health preserved"
+        );
         assert_eq!(
-            daemon.state.last_readings[1],
+            daemon.state.accounts[1].last_reading,
             Some(reading(0.30, 0.40)),
             "B's reading preserved"
         );
         // The onboarded account joins with DEFAULT state (unpolled, no reading, healthy).
-        assert!(!daemon.state.health[2].quarantined);
-        assert_eq!(daemon.state.last_readings[2], None);
-        assert!(!daemon.state.polled_once[2]);
+        assert!(!daemon.state.accounts[2].health.quarantined);
+        assert_eq!(daemon.state.accounts[2].last_reading, None);
+        assert!(!daemon.state.accounts[2].polled_once);
         // Active (A) is unchanged — an append never shifts existing indices.
         assert_eq!(daemon.state.active, Some(0));
     }
@@ -2182,8 +2149,8 @@ mod tests {
         // the account's carried decision state. (Un-quarantine on relogin is the
         // daemon's separate canonical-change path #107, not reconcile's job.)
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
-        daemon.state.last_readings[1] = Some(reading(0.11, 0.22));
-        daemon.state.health[1].recovery_successes = 2;
+        daemon.state.accounts[1].last_reading = Some(reading(0.11, 0.22));
+        daemon.state.accounts[1].health.recovery_successes = 2;
 
         daemon.reconcile_roster(vec![
             account("u-A", "work"),
@@ -2193,12 +2160,12 @@ mod tests {
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B"], "no duplicate");
         assert_eq!(daemon.roster[1].label, "spare-renamed", "label updated");
         assert_eq!(
-            daemon.state.last_readings[1],
+            daemon.state.accounts[1].last_reading,
             Some(reading(0.11, 0.22)),
             "carried reading preserved across the relogin"
         );
         assert_eq!(
-            daemon.state.health[1].recovery_successes, 2,
+            daemon.state.accounts[1].health.recovery_successes, 2,
             "health preserved"
         );
     }
@@ -2210,7 +2177,7 @@ mod tests {
         // account's carried decision state — so the flip takes effect in the live
         // rotation without a restart, not merely at the next daemon start.
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
-        daemon.state.last_readings[1] = Some(reading(0.10, 0.20));
+        daemon.state.accounts[1].last_reading = Some(reading(0.10, 0.20));
 
         // `disable spare` on disk → the reloaded roster carries B parked.
         daemon.reconcile_roster(vec![
@@ -2223,7 +2190,7 @@ mod tests {
             "B is now parked in the live roster"
         );
         assert_eq!(
-            daemon.state.last_readings[1],
+            daemon.state.accounts[1].last_reading,
             Some(reading(0.10, 0.20)),
             "B's carried reading is preserved across the flip"
         );
@@ -2239,17 +2206,20 @@ mod tests {
             account("u-C", "third"),
         ]);
         daemon.state.active = Some(0);
-        daemon.state.last_readings[0] = Some(reading(0.10, 0.10)); // A reading
-        daemon.state.health[2].recovery_successes = 3; // C health mark
+        daemon.state.accounts[0].last_reading = Some(reading(0.10, 0.10)); // A reading
+        daemon.state.accounts[2].health.recovery_successes = 3; // C health mark
 
         daemon.reconcile_roster(vec![account("u-A", "work"), account("u-C", "third")]);
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-C"], "B dropped");
-        assert_eq!(daemon.state.health.len(), 2);
+        assert_eq!(daemon.state.accounts.len(), 2);
         // A (still index 0) keeps its reading; C (now index 1) keeps its health mark.
-        assert_eq!(daemon.state.last_readings[0], Some(reading(0.10, 0.10)));
         assert_eq!(
-            daemon.state.health[1].recovery_successes, 3,
+            daemon.state.accounts[0].last_reading,
+            Some(reading(0.10, 0.10))
+        );
+        assert_eq!(
+            daemon.state.accounts[1].health.recovery_successes, 3,
             "C re-keyed by uuid"
         );
         assert_eq!(daemon.state.active, Some(0), "active A preserved");
@@ -2289,20 +2259,212 @@ mod tests {
     #[test]
     fn reconcile_roster_to_an_empty_roster_clears_active_and_state() {
         // Reachable edge: removing the LAST account (a `remove` of the final entry)
-        // reconciles to an empty roster — every parallel array empties and active drops
+        // reconciles to an empty roster — the per-account runtime state empties and active drops
         // to `None`. A degenerate-but-valid runtime state (the daemon then polls
         // nothing); it must not panic on the length-zero reshape.
         let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
         daemon.state.active = Some(0);
-        daemon.state.last_readings[0] = Some(reading(0.10, 0.10));
+        daemon.state.accounts[0].last_reading = Some(reading(0.10, 0.10));
 
         daemon.reconcile_roster(vec![]);
 
         assert!(daemon.roster.is_empty());
-        assert!(daemon.state.health.is_empty());
-        assert!(daemon.state.last_readings.is_empty());
-        assert!(daemon.state.polled_once.is_empty());
+        assert!(daemon.state.accounts.is_empty());
         assert_eq!(daemon.state.active, None);
+    }
+
+    /// Every per-account signal on [`AccountRuntime`], projected into one comparable tuple.
+    ///
+    /// The EXHAUSTIVE destructure is the point (issue #668): a NINTH per-account signal added to
+    /// `AccountRuntime` without a matching arm here fails to compile, so the roster-reload property
+    /// below can never silently stop covering a signal — which is exactly how the pre-#668 parallel
+    /// vecs drifted (a new vec was added, and the sites that had to re-key it were remembered by
+    /// hand).
+    #[expect(
+        clippy::type_complexity,
+        reason = "the exhaustive per-signal projection IS the compile-time completeness guard"
+    )]
+    fn fingerprint(
+        account: &AccountRuntime,
+    ) -> (
+        (bool, u32, Option<i64>),
+        Option<Usage>,
+        Option<Instant>,
+        Option<VelocityEma>,
+        Option<ParkedLanding>,
+        Option<swap::SessionHighWater>,
+        Option<BlindAnchor>,
+        bool,
+    ) {
+        let AccountRuntime {
+            health,
+            last_reading,
+            last_reading_at,
+            session_velocity,
+            parked_landing,
+            session_high_water,
+            blind_anchor,
+            polled_once,
+        } = account;
+        (
+            (
+                health.quarantined,
+                health.recovery_successes,
+                health.access_expires_at,
+            ),
+            *last_reading,
+            *last_reading_at,
+            *session_velocity,
+            *parked_landing,
+            *session_high_water,
+            *blind_anchor,
+            *polled_once,
+        )
+    }
+
+    /// Every ordering of every subset of `items` — the exhaustive reshape space a roster reload can
+    /// produce by adding, removing, and reordering accounts in `config.toml`.
+    fn subset_permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        fn perms<T: Clone>(pool: &[T], acc: &mut Vec<T>, out: &mut Vec<Vec<T>>) {
+            out.push(acc.clone());
+            for (i, item) in pool.iter().enumerate() {
+                let mut rest = pool.to_vec();
+                rest.remove(i);
+                acc.push(item.clone());
+                perms(&rest, acc, out);
+                acc.pop();
+            }
+        }
+        let mut out = Vec::new();
+        perms(items, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// PROPERTY (issue #668): a roster reload re-keys EVERY per-account runtime signal by
+    /// `account_uuid`, never by positional index — across every ordering of every subset of the
+    /// roster, plus an onboard.
+    ///
+    /// The pre-#668 shape made this eight independent hand-maintained re-keys, so the property held
+    /// only as long as every one of them was remembered; bundling makes it one. Seeding each account
+    /// with a DISTINCT value in ALL EIGHT signals is what makes the test discriminating: a re-key
+    /// that fell back to positional order (or dropped a signal to its default) mismatches here rather
+    /// than coincidentally matching a shared fixture value.
+    ///
+    /// Three invariants, over all 65 reshapes × 2 onboard variants:
+    ///   1. one runtime slot per roster account — always, so no signal can length-skew;
+    ///   2. an account present in BOTH keeps its ENTIRE fingerprint, at its NEW index;
+    ///   3. an account NEW on disk starts at `AccountRuntime::default()`.
+    #[test]
+    fn reconcile_roster_rekeys_every_per_account_signal_by_uuid_not_by_index() {
+        let base = vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "backup"),
+            account("u-D", "reserve"),
+        ];
+        let t0 = Instant::now();
+
+        // Seed slot `i` so that EVERY signal differs from every other slot's — the discriminating
+        // half: a positional re-key, or a signal silently defaulted, cannot match by coincidence.
+        let seed = |account: &mut AccountRuntime, i: usize| {
+            let k = i as f64;
+            account.health.quarantined = !i.is_multiple_of(2);
+            account.health.recovery_successes = 10 + i as u32;
+            account.health.access_expires_at = Some(1_000 + i as i64);
+            account.last_reading = Some(reading(0.10 + k / 100.0, 0.20 + k / 100.0));
+            account.last_reading_at = Some(t0 + Duration::from_secs(i as u64 + 1));
+            account.session_velocity = Some(VelocityEma {
+                rate: 0.001 * (k + 1.0),
+                samples: 3 + i as u32,
+            });
+            account.parked_landing = Some(ParkedLanding {
+                armed_at: t0 + Duration::from_secs(100 + i as u64),
+                decision_pct: 90 + i as u8,
+            });
+            // Through the real fold seam — `SessionHighWater`'s fields are private to `swap`.
+            account.session_high_water = swap::SessionHighWater::fold(
+                None,
+                &Usage {
+                    session: 0.30 + k / 100.0,
+                    weekly: 0.40,
+                    weekly_resets_at: None,
+                    session_resets_at: Some(5_000 + i as i64),
+                },
+            );
+            account.blind_anchor = Some(BlindAnchor {
+                session: 0.50 + k / 100.0,
+                weekly: 0.60 + k / 100.0,
+                at: t0 + Duration::from_secs(200 + i as u64),
+                was_active: i.is_multiple_of(2),
+                near_limit: i.is_multiple_of(3),
+            });
+            account.polled_once = i.is_multiple_of(2);
+        };
+
+        // The expected fingerprint per uuid, captured once from a freshly-seeded daemon.
+        let expected: Vec<_> = {
+            let mut daemon = reconcile_daemon(base.clone());
+            for (i, account) in daemon.state.accounts.iter_mut().enumerate() {
+                seed(account, i);
+            }
+            daemon.state.accounts.iter().map(fingerprint).collect()
+        };
+        let uuid_of = |account: &Account| account.account_uuid.clone();
+        let onboard = account("u-NEW", "onboarded");
+
+        let mut reshapes = 0;
+        for reshape in subset_permutations(&base) {
+            for with_onboard in [false, true] {
+                let mut new_roster = reshape.clone();
+                if with_onboard {
+                    new_roster.push(onboard.clone());
+                }
+
+                let mut daemon = reconcile_daemon(base.clone());
+                for (i, account) in daemon.state.accounts.iter_mut().enumerate() {
+                    seed(account, i);
+                }
+                daemon.reconcile_roster(new_roster.clone());
+
+                let shape: Vec<String> = new_roster.iter().map(uuid_of).collect();
+
+                // 1. One runtime slot per roster account — no signal can length-skew.
+                assert_eq!(
+                    daemon.state.accounts.len(),
+                    new_roster.len(),
+                    "reshape {shape:?}: one runtime slot per roster account",
+                );
+
+                for (new_idx, account) in new_roster.iter().enumerate() {
+                    let got = fingerprint(&daemon.state.accounts[new_idx]);
+                    match base.iter().position(|old| uuid_of(old) == uuid_of(account)) {
+                        // 2. Carried over by UUID — the WHOLE fingerprint, at the NEW index.
+                        Some(old_idx) => assert_eq!(
+                            got,
+                            expected[old_idx],
+                            "reshape {shape:?}: {} moved {old_idx} -> {new_idx} and must carry \
+                             every signal with it, not inherit slot {new_idx}'s",
+                            uuid_of(account),
+                        ),
+                        // 3. Onboarded fresh — unpolled, no reading, healthy.
+                        None => assert_eq!(
+                            got,
+                            fingerprint(&AccountRuntime::default()),
+                            "reshape {shape:?}: onboarded {} starts at default",
+                            uuid_of(account),
+                        ),
+                    }
+                }
+                reshapes += 1;
+            }
+        }
+        // Guards the property against a silently-degenerate sweep (a broken generator asserting
+        // nothing): every ordering of every subset of 4 accounts is 1+4+12+24+24 = 65, × 2 onboard
+        // variants.
+        assert_eq!(
+            reshapes, 130,
+            "the reshape space must be swept exhaustively"
+        );
     }
 
     #[test]
@@ -2466,12 +2628,15 @@ mod tests {
             reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
                 .with_config_path(config_path);
         daemon.state.active = Some(0);
-        daemon.state.health[0].quarantined = true; // A's state must survive the reload
+        daemon.state.accounts[0].health.quarantined = true; // A's state must survive the reload
 
         daemon.adopt_roster_reload().await;
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
-        assert!(daemon.state.health[0].quarantined, "A's state preserved");
+        assert!(
+            daemon.state.accounts[0].health.quarantined,
+            "A's state preserved"
+        );
         assert_eq!(daemon.state.active, Some(0));
     }
 
@@ -2614,7 +2779,7 @@ mod tests {
         // `spare` (PARKED, non-active) is quarantined ("needs re-login"); `work` is active. The
         // warm-up tick polls only the active `work`, so this flag survives untouched into the idle
         // where the control signal delivers the on-demand restore.
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.quarantined = true;
 
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
@@ -2641,7 +2806,7 @@ mod tests {
         // un-quarantined in memory and its edge-triggered `credential_restored` rode the event log
         // exactly once — no sweep involved.
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "the restored account is un-quarantined"
         );
         let logged = std::fs::read_to_string(&log_path).unwrap();
@@ -3120,7 +3285,7 @@ mod tests {
         // `spare` is quarantined ("needs re-login", #42) but its refresh token still works — the
         // parked-and-stuck account #106 rescues. The single warm-up tick polls only the active
         // `work`, so this flag survives untouched into the idle sweep.
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.quarantined = true;
 
         let logdir = tempfile::tempdir().unwrap();
         let log_path = logdir.path().join("sessiometer.log");
@@ -3179,7 +3344,7 @@ mod tests {
             "the restore logged its credential_restored: {logged:?}"
         );
         assert!(
-            !daemon.state.health[1].quarantined,
+            !daemon.state.accounts[1].health.quarantined,
             "the restored account is un-quarantined"
         );
     }
@@ -3216,7 +3381,7 @@ mod tests {
         );
         // `spare` is quarantined AND parked (u-A is active) — the exact "recovery work" the prompt
         // targets. It survives the warm-up tick, which polls only the active `work`.
-        daemon.state.health[1].quarantined = true;
+        daemon.state.accounts[1].health.quarantined = true;
 
         let logdir = tempfile::tempdir().unwrap();
         let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
@@ -3369,12 +3534,12 @@ mod tests {
         );
 
         let mut events = Vec::new();
-        // Issue #42: the per-account 401 streak now lives in `health[i].consec_401`.
+        // Issue #42: the per-account 401 streak now lives in `accounts[i].health.consec_401`.
         let streak_of = |d: &FakeDaemon| {
             d.state
-                .health
+                .accounts
                 .iter()
-                .map(|h| h.consec_401)
+                .map(|a| a.health.consec_401)
                 .collect::<Vec<_>>()
         };
 
@@ -3565,9 +3730,9 @@ mod tests {
         assert!(!logged.contains("event=swap"), "{logged:?}");
         let streak_of = |d: &FakeDaemon| {
             d.state
-                .health
+                .accounts
                 .iter()
-                .map(|h| h.consec_401)
+                .map(|a| a.health.consec_401)
                 .collect::<Vec<_>>()
         };
         assert_eq!(streak_of(&daemon), vec![2, 0, 0]);
