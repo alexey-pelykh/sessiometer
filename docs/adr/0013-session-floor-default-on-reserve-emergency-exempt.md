@@ -111,6 +111,31 @@ the proactive path and is DROPPED entirely on the emergency path — shipped ato
    that is not what the operator is waiting for. `diag=start` prints the effective value;
    the `session_floor=off` sentinel disappears from the log grammar.
 
+   **Amended 2026-07-21 (#665): session does NOT outrank weekly, and "session-wide" was
+   never the right test.** The framing above — a weekly reset "is not what the operator is
+   waiting for" — holds only for the fleet this decision had in frame, where every spare was
+   weekly-viable. It conflates a window's **length** (session ~5h vs weekly ~7d) with its
+   **time remaining**: a spare six days into its weekly window returns *sooner* than one that
+   just opened a session. Shipped as a precedence rule, *"when the block is session-wide"*
+   silently became *"if **any** spare is session-blocked"* — an early return that never
+   compared the weekly-exhausted spares' resets, overstating the ETA on a live 6-account
+   fleet by 2h and naming the wrong `hold`. Corrected to the cross-dimension semantics the
+   surrounding contracts already described (`NoTargetCause`, `Event::AllExhausted`,
+   ADR-0016 — "when does capacity return"):
+
+   ```text
+   fleet_relief = min over blocked spares of ( max over that spare's blocked dimensions of its reset )
+   ```
+
+   A spare returns when **all** its blocking dimensions clear (the inner `max`); fleet relief
+   is the soonest such moment (the outer `min`); and `cause` names the dimension gating that
+   winning spare — a *per-account* label, not the fleet-wide property the original framing
+   implied. The `cause` enum is unchanged (still the closed two-value `SwapReason`), so this
+   is a computation fix with no wire bump. Sound because **both** windows hard-reset: weekly
+   is a fixed 7-day window (verified against 22,261 usage samples, #665) and session is
+   monotonic-within-window (#614). The operator-facing prose that reads `cause` is the
+   sibling concern, **#666**.
+
 5. **Atomicity is mandatory.** (3) MUST ship with (1), test-gated, or the default stays
    OFF. Shipping the default-on flip without the emergency floor-drop converts a benign
    proactive hold into a self-DoS strand on a dead credential. The gate is the

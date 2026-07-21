@@ -652,11 +652,13 @@ pub(crate) enum Event {
     ReStash { account: String },
     /// The active account is over a trigger but no other account is a viable swap
     /// target — the all-exhausted terminal state (issue #11). `hold` is the
-    /// least-bad account the daemon holds on. `cause` (issue #398) is WHY relief is
-    /// blocked: [`SwapReason::Session`] when a weekly-viable account is held out only
-    /// by session (relief at the sooner SESSION reset) or [`SwapReason::Weekly`] when
-    /// every candidate is weekly-exhausted (relief at the weekly reset); `hold` and
-    /// `resets_at` name that cause's reset. `resets_at` is that reset as epoch seconds,
+    /// account relief arrives on FIRST. `cause` (issue #398) is WHY relief is blocked:
+    /// the dimension gating that account — [`SwapReason::Session`] when it is held out
+    /// by session, [`SwapReason::Weekly`] when by its weekly window (or, if blocked on
+    /// both, whichever clears LAST, since it needs both). Which account wins is decided
+    /// ACROSS dimensions (issue #665): a spare deep into its weekly window can return
+    /// before a session-blocked one, so neither dimension outranks the other a priori.
+    /// `hold` and `resets_at` name that cause's reset. `resets_at` is that reset as epoch seconds,
     /// rendered to RFC 3339 by [`Event::to_log_line`] and present whenever the API
     /// supplied a parseable timestamp; `None` (the field is omitted) when no account
     /// reported one, keeping the line forward-compatible.

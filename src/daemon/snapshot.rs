@@ -633,12 +633,16 @@ pub(crate) enum NextSwapReason {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NoTargetCause {
-    /// A weekly-VIABLE account is held out only by session (over the session block line
-    /// `min(session_ceiling, target_max_session_usage)`) — relief arrives at the sooner SESSION reset.
+    /// The SESSION window (the block line `min(session_ceiling, target_max_session_usage)`) is what
+    /// gates the soonest-returning spare — relief arrives at that account's session reset.
     Session,
-    /// Every candidate is weekly-EXHAUSTED (`weekly >= weekly_ceiling`) — relief arrives at the
-    /// WEEKLY reset (the #11 default, and the ONLY cause reachable on the emergency/dead-active
-    /// path, which bypasses the session gate entirely).
+    /// The WEEKLY window (`weekly >= weekly_ceiling`) is what gates the soonest-returning spare —
+    /// relief arrives at that account's weekly reset. The #11 default, and the ONLY cause reachable
+    /// on the emergency/dead-active path, which bypasses the session gate entirely.
+    ///
+    /// Note both variants name the dimension gating the WINNING account, not a fleet-wide property:
+    /// on a mixed fleet some spares may be blocked the other way, or on both (issue #665). The
+    /// operator-facing prose that reads these is the sibling concern, issue #666.
     Weekly,
 }
 

@@ -131,8 +131,9 @@ scheduled tick — catching the rare server-side early reset within ≤ the ceil
 - **The active account is never slowed.** Exemption keeps the swap-away trigger fully
   observable; only spare peers — which are just swap targets, ranked by reset — widen.
 - **Reuses the proven skip path (ADR-0009).** Same `tick` filter, same carry-`last_readings`
-  behavior — so the all-exhausted relief (`soonest_weekly_reset`) still computes from the
-  retained reading, and the aggregate rate math is untouched.
+  behavior — so the all-exhausted relief (`all_exhausted_relief`, which folded in the former
+  `soonest_weekly_reset` per #665) still computes from the retained reading, and the aggregate
+  rate math is untouched.
 - **Diagnosable.** The edge-triggered `exhausted_slow_poll` / `_cleared` pair brackets each
   slow-poll episode in `sessiometer.log`, secret-free by construction (uuid + window).
 
@@ -151,8 +152,9 @@ scheduled tick — catching the rare server-side early reset within ≤ the ceil
 
 - Issues: **#537** (this ADR). Prior art: **#293 / ADR-0009** (the per-account poll-skip
   mechanism this policy layers on), **#453** (the active-vs-peer asymmetry the exemption
-  mirrors), **#11 / #37** (the all-exhausted relief + `soonest_weekly_reset` that consumes
-  the retained `resets_at`), **#5** (per-account usage quota, both dimensions + `resets_at`),
+  mirrors), **#11 / #37** (the all-exhausted relief + `all_exhausted_relief`, formerly
+  `soonest_weekly_reset` (#665), that consumes the retained `resets_at`), **#5** (per-account
+  usage quota, both dimensions + `resets_at`),
   **#80 / #366** (the staggered schedule + `rotation_len` this leaves unchanged), **#15**
   (the redaction meter the new events stay clean under).
 - Out of scope (deliberate non-goals): the menu-bar "de-prioritized / next-poll-at" surface
