@@ -146,8 +146,14 @@ enum ConfigFailure: Equatable {
     /// A bounded transport failure (#358 `ControlCommandError`): no daemon (refused), a wedged daemon
     /// (timed out / closed before the reply), or an I/O / encode fault. Honest-disconnected (AC 7).
     case transport(ControlCommandError)
-    /// The daemon returned a redacted `{"error":…}` `config-get` envelope — `no config` (no `config.toml`
-    /// yet), `config unreadable`, `encode failed`. Surfaced honestly rather than shown as a blank form.
+    /// The daemon returned a redacted `{"error":…}` envelope. On the `config-get` LOAD path: the bare reason
+    /// — `no config` (no `config.toml` yet), `config unreadable`, `encode failed` — surfaced honestly rather
+    /// than shown as a blank form. On the `config-set` APPLY path (issue #645): the `{"error":…,"detail":…}`
+    /// envelope the daemon writes when it refuses the write BEFORE the run loop — a version-skewed edit whose
+    /// renamed/stale tunable its strict re-parse rejected (issue #628 threads the offending key into
+    /// `detail`), or an unauthenticated peer; the carried string is that key-naming `detail` when present
+    /// (the actionable "this app is out of date" hint), else the bare reason. Surfaced honestly rather than
+    /// collapsed to `.undecodable`.
     case daemonError(String)
     /// The reply did not match the `ConfigWire` contract (a buggy / drifted daemon) — degrade loudly.
     case undecodable
@@ -421,12 +427,20 @@ final class SettingsModel: ObservableObject {
             applyPhase = .failed(.transport(error))
         case .success(let line):
             do {
-                switch try decodeConfigSetAck(line) {
-                case .applied(let effect):
+                switch try decodeConfigSetReply(line) {
+                case .ack(.applied(let effect)):
                     settleApplied(effect)
-                case .rejected(let reason, let detail):
+                case .ack(.rejected(let reason, let detail)):
                     settingsLog.error("config-set: rejected — \(reason.rawValue, privacy: .public)")
                     applyPhase = .rejected(reason: reason, detail: detail)
+                case .error(let reason, let detail):
+                    // A redacted `{"error":…,"detail":…}` envelope (issue #645): the daemon refused the write
+                    // BEFORE the run loop — a version-skewed edit whose renamed/stale tunable serde rejected
+                    // (issue #628 threads the offending key into `detail`), or an unauthenticated peer.
+                    // Surface the key-naming `detail` (the actionable "this app is out of date" hint) rather
+                    // than collapsing to the opaque `.undecodable` the missing-`result` decode used to yield.
+                    settingsLog.error("config-set: daemon error — \(reason, privacy: .public)")
+                    applyPhase = .failed(.daemonError(detail ?? reason))
                 }
             } catch {
                 settingsLog.error("config-set: undecodable ack — \(String(describing: error), privacy: .public)")

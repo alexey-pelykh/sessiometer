@@ -120,6 +120,39 @@ final class ConfigWireTests: XCTestCase {
             try decodeConfigSetAck(#"{"result":"rejected","reason":"vibes"}"#), "unknown reason")
     }
 
+    // MARK: - config-set reply envelope (issue #645: the {"error":…,"detail":…} reject #628 put detail on)
+
+    /// Issue #645: a version-skewed `config-set` (a renamed/stale tunable) is refused by the daemon's strict
+    /// re-parse with the redacted `{"error":…,"detail":…}` envelope — NOT a `ConfigSetAck` (no `result`).
+    /// `decodeConfigSetReply` probes the `error` key and surfaces the key-naming `detail` (#628) so the client
+    /// can render "this app is out of date" instead of collapsing the missing-`result` shape to `.undecodable`.
+    func testDecodesConfigSetErrorEnvelopeNamesStaleKey() throws {
+        guard case .error(let reason, let detail) = try decodeConfigSetReply(Fixtures.configSetErrorStaleKey)
+        else {
+            return XCTFail("expected an error envelope, got an ack")
+        }
+        XCTAssertEqual(reason, "malformed request")
+        XCTAssertTrue(
+            detail?.contains("session_trigger") == true,
+            "the detail names the stale key: \(detail ?? "nil")")
+    }
+
+    /// `decodeConfigSetReply` routes every `{"result":…}` ack shape to `.ack` — crucially the `rejected` ack
+    /// carries a `detail` key too, but NO `error` key, so the error-envelope probe must not false-positive on
+    /// it (surfacing a genuine rejection as an opaque daemon error would be a regression the other way).
+    func testConfigSetReplyRoutesAckShapesToAck() throws {
+        XCTAssertEqual(try decodeConfigSetReply(Fixtures.configSetAppliedLive), .ack(.applied(effect: .live)))
+        XCTAssertEqual(
+            try decodeConfigSetReply(Fixtures.configSetRejectedInvalid),
+            .ack(.rejected(reason: .invalid, detail: "exhausted_poll_secs (3600) must be >= poll_secs (7200)")))
+    }
+
+    /// A non-JSON `config-set` reply still throws through `decodeConfigSetReply` — the additive error-envelope
+    /// probe does not swallow a genuinely broken line (a drifted daemon degrades loudly, like the ack decoder).
+    func testConfigSetReplyNonJSONThrows() {
+        XCTAssertThrowsError(try decodeConfigSetReply("not json"))
+    }
+
     // MARK: - config-set request encode (AC 5/6: only the allow-listed surface can travel)
 
     /// The `config-set` request encodes ONLY the edited tunables (a `nil` field is OMITTED via Swift's

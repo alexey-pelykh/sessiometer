@@ -367,4 +367,17 @@ enum Fixtures {
     /// `config-set` rejected: a label edit named an `account_uuid` no longer in the roster (stale client);
     /// no `detail` (absent for every reason but `invalid`).
     static let configSetRejectedUnknownAccount = #"{"result":"rejected","reason":"unknown-account"}"#
+
+    /// A `config-set` daemon ERROR ENVELOPE (issue #645) — the `{"error":…,"detail":…}` shape, NOT a
+    /// `ConfigSetAck` (no `result` key). A version-skewed client sent a renamed/stale tunable (a pre-#606
+    /// `session_trigger`) that the daemon's strict `deny_unknown_fields` re-parse refuses BEFORE the run
+    /// loop, so it writes `error_with_detail("malformed request", <serde message>)` (`src/daemon/socket.rs`,
+    /// issue #628) — ZERO writes. The `detail` is serde's key-naming message for `SetTunables` (its 14 fields
+    /// in declaration order); serde additionally appends an input-dependent ` at line 1 column N` positional
+    /// suffix, elided here as behaviorally irrelevant — every consumer substring-matches the key or renders
+    /// the string verbatim, exactly as the daemon's own #628 test asserts `.contains("session_trigger")`. The
+    /// client surfaces this so the operator sees "this app is out of date" instead of an opaque `.undecodable`.
+    static let configSetErrorStaleKey = #"""
+    {"error":"malformed request","detail":"unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`"}
+    """#
 }
