@@ -107,11 +107,15 @@ enum ConfigGetErrorReason {
     static let unreadable = "config unreadable"
 }
 
-/// The `error`-key probe: `config_get_reply` writes ONLY `{"error":…}` on its failure paths, so an object
-/// carrying that key is the error envelope; any other object is the full `ConfigView`. `error` is optional,
-/// so a valid `ConfigView` (no top-level `error` key) probes to `nil` and falls through to the full decode.
+/// The `error`-key probe for BOTH config replies: `config_get_reply` and the `config-set` serve path each
+/// write ONLY `{"error":…}` (config-set optionally `+ "detail"`, issue #628) on their redacted failure
+/// paths, so an object carrying `error` is the error envelope; any other object is the full `ConfigView` /
+/// `ConfigSetAck`. `error` is optional, so a valid document (no top-level `error` key) probes to `nil` and
+/// falls through to the full decode. `detail` is the additive #628 message (the config-set path's stale-key
+/// naming — issue #645); it is absent on the `config-get` envelopes, so `decodeConfigGetReply` ignores it.
 private struct ConfigErrorProbe: Decodable {
     let error: String?
+    let detail: String?
 }
 
 /// Decode one `config-get` reply line into `.ok(ConfigView)` or `.error(reason)` — the probe-then-decode
@@ -272,4 +276,33 @@ extension ConfigSetAck: Decodable {
 /// daemon degrades loudly, exactly like the `watch` / `stats` decoders. Pure: no I/O, no clock.
 func decodeConfigSetAck(_ line: String) throws -> ConfigSetAck {
     try JSONDecoder().decode(ConfigSetAck.self, from: Data(line.utf8))
+}
+
+// MARK: - config-set reply (ConfigSetAck OR a redacted error envelope)
+
+/// The two shapes a `config-set` reply can take (`src/daemon/socket.rs`) — the write-side sibling of
+/// `ConfigGetReply`: the internally-`result`-tagged `ConfigSetAck` (the run loop's redacted outcome), or a
+/// redacted `{"error":…,"detail":…}` envelope the `serve_control` path writes BEFORE the run loop reaches
+/// `&mut Daemon` — an `unauthorized` peer, or a `malformed request` whose strict `deny_unknown_fields`
+/// re-parse rejected a renamed/stale tunable from a version-skewed client (issue #628 threads serde's
+/// key-naming message into `detail`; e.g. a pre-#606 menubar sending `session_trigger`). `Equatable` so the
+/// model + tests can compare.
+enum ConfigSetReply: Equatable {
+    case ack(ConfigSetAck)
+    case error(reason: String, detail: String?)
+}
+
+/// Decode one `config-set` reply line into `.ack(ConfigSetAck)` or `.error(reason, detail)` — the
+/// probe-then-decode shape `decodeConfigGetReply` uses. Probes the `error` key FIRST (the daemon's redacted
+/// envelope carries it; a `ConfigSetAck` is tagged on `result` and never carries `error`, so the `rejected`
+/// ack's OWN `detail` key can't false-positive), so a version-skew rejection surfaces the offending key
+/// (issue #645) instead of collapsing to `.undecodable` the way the missing-`result` decode used to. THROWS
+/// on a non-JSON line or an off-contract ack (an unknown `result` / `effect` / `reason`) — a drifted daemon
+/// still degrades loudly, exactly like `decodeConfigSetAck`. Pure: no I/O, no clock.
+func decodeConfigSetReply(_ line: String) throws -> ConfigSetReply {
+    let data = Data(line.utf8)
+    if let probe = try? JSONDecoder().decode(ConfigErrorProbe.self, from: data), let reason = probe.error {
+        return .error(reason: reason, detail: probe.detail)
+    }
+    return .ack(try decodeConfigSetAck(line))
 }

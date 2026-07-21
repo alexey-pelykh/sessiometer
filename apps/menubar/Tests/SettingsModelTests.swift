@@ -302,6 +302,25 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.applyPhase, .failed(.undecodable))
     }
 
+    /// Issue #645 (the #628 client half): a version-skewed apply — the daemon refuses a renamed/stale tunable
+    /// with the redacted `{"error":…,"detail":…}` envelope (NOT a `ConfigSetAck`) — surfaces the key-naming
+    /// `detail` as a `.daemonError`, NOT the opaque `.undecodable` the missing-`result` decode used to yield.
+    /// The daemon wrote nothing, so the edit is kept (form stays dirty) for a fix + retry.
+    func testApplyDaemonErrorEnvelopeSurfacesStaleKeyDetail() async {
+        let (model, _) = makeModel(replies: [Fixtures.configViewBasic, Fixtures.configSetErrorStaleKey])
+        await model.load()
+        model.setDraft("120", for: .pollSecs)
+        await model.apply()
+
+        guard case .failed(.daemonError(let message)) = model.applyPhase else {
+            return XCTFail("expected .failed(.daemonError), got \(model.applyPhase)")
+        }
+        XCTAssertTrue(
+            message.contains("session_trigger"),
+            "the daemon's key-naming detail is surfaced, not swallowed: \(message)")
+        XCTAssertTrue(model.isDirty, "the daemon wrote nothing — the edit is kept for a retry")
+    }
+
     /// Re-entrancy (mirrors `AccountSwapModel.swap`): two OVERLAPPING `apply()` calls collapse to a SINGLE
     /// `config-set`. `apply` latches `.applying` in its synchronous prefix — before its first `await` — so on
     /// the serial `@MainActor` the second submit observes the in-flight guard and is a no-op. A
