@@ -478,6 +478,13 @@
   .pop-strip.disconnected{ background:var(--strip-attn-bg); color:var(--strip-attn-fg); box-shadow:inset 0 -.5px 0 var(--strip-attn-line) }
   .pop-strip.paused{ background:var(--card-bg); color:var(--text-2) }
   .pop-strip.paused .st-ico{ color:var(--strip-attn-fg) }
+  /* `calm` = `paused`'s quiet card, but with a NEUTRAL icon instead of the amber attention one — the
+     lowest rung of the daemon-fault ladder (#592). It exists for exactly one frame, `scrub-recovering`:
+     ranking by (fault, VARIANT) means a self-healing state can never outrank one that cannot self-heal, so
+     the variant whose whole message is "no action needed" must not wear an alert's amber. Same reason the
+     panel tints that banner `.secondary` while its `exhausted` sibling is red. */
+  .pop-strip.calm{ background:var(--card-bg); color:var(--text-2) }
+  .pop-strip.calm .st-ico{ color:var(--text-2) }
 
   /* dimmed (stale) rows — disconnected: last-known values, never frozen-as-live (#137) */
   .accts.dim .acct{ opacity:.5 }
@@ -1092,7 +1099,7 @@
       <!-- ===================================================================== -->
       <div class="group-cap">
         <span class="gc-t">4 &middot; Blocked &amp; gated</span><span class="gc-line"></span>
-        <span class="gc-note">keychain-locked (waits, never prompts) &middot; version-skew (refuses numbers)</span>
+        <span class="gc-note">the four daemon-fault ranks, worst first: keychain-locked &rsaquo; scrub-exhausted &rsaquo; systemic &rsaquo; recovering &middot; version-skew (refuses numbers)</span>
       </div>
 
       <!-- 6 · KEYCHAIN-LOCKED · LIGHT -->
@@ -1223,6 +1230,207 @@
             </div>
             <div class="pop-foot">
               <span class="fl1">Unlock your login keychain to resume &middot; the app only waits, never prompts</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 3s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FAULT 2 · SHARED-LOGIN SCRUBBED — EXHAUSTED · LIGHT (a banner over a connected snapshot, not a 10th state) -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 9.52 16.32 L 16.32 9.52 A 1.3 1.3 0 0 0 14.48 7.68 L 7.68 14.48 A 1.3 1.3 0 0 0 9.52 16.32 Z"/></svg>
+          Scrub-exhausted &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="scrub-exhausted-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+            </div>
+            <div class="pop-strip paused">
+              <span class="st-ico"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4.5H18a1.5 1.5 0 0 1 1.5 1.5v12a1.5 1.5 0 0 1-1.5 1.5h-3.5"/><path d="M9.5 8.5 5.5 12l4 3.5"/><path d="M5.5 12h9"/></svg></span>
+              <span class="st-txt">Shared login scrubbed &middot; every session logged out</span>
+            </div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row paused">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Swaps paused</div><div class="why">shared login scrubbed</div></span>
+              <button class="swap-btn off" disabled>Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Run <b>claude /login</b> to restore the shared session</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 3s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FAULT 3 · REFRESH MECHANISM DOWN · LIGHT (a banner over a connected snapshot, not a 10th state) -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 10.8 7.8 L 10.8 13.0 A 1.2 1.2 0 0 0 13.2 13.0 L 13.2 7.8 A 1.2 1.2 0 0 0 10.8 7.8 Z"/><path d="M 10.6 16.1 A 1.4 1.4 0 1 0 13.4 16.1 A 1.4 1.4 0 1 0 10.6 16.1 Z"/></svg>
+          Systemic refresh failure &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="systemic-refresh-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+            </div>
+            <div class="pop-strip paused">
+              <span class="st-ico"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.8h-4.8"/><path d="M4.6 4.6 19.4 19.4"/></svg></span>
+              <span class="st-txt">Refresh mechanism down &middot; 3 consecutive sweeps failed</span>
+            </div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Every account still works &mdash; check the daemon log</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 3s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FAULT 4 · SHARED-LOGIN SCRUBBED — RECOVERING · LIGHT (a banner over a connected snapshot, not a 10th state) -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Scrub-recovering &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="scrub-recovering-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+            </div>
+            <div class="pop-strip calm">
+              <span class="st-ico"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3"/><path d="M19.5 4.5v4.8h-4.8"/></svg></span>
+              <span class="st-txt">Shared login scrubbed &middot; recovering automatically</span>
+            </div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span>
+              <span class="swap-txt"><div class="lead">Next swap &rarr; <b>Scratch</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">No action needed &middot; the daemon is adopting a live account</span>
               <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 3s old</span>
             </div>
           </div>

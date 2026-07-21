@@ -169,6 +169,53 @@ STATES = [
               "per-medium colour choice under R-2 STATE-parity (the shared STATE is DEGRADED)."),
     dict(title="Modifier · Active blind — DEGRADED (dark)", theme="dark", design="blind-degraded-dark", capture="panel-blind-degraded-dark.png",
          note="Degraded, dark appearance."),
+    # The four DAEMON-FAULT ranks (#592), in the worst-first order `StatusPanelFormat.daemonFaultBanner`
+    # resolves them. They pair CONSECUTIVELY on purpose: the ranking is a *visual* claim — rank 3 has to be
+    # seen to beat rank 4 — and a severity inversion is only legible when the frames sit next to each other.
+    dict(title="Fault 1 · Keychain locked", theme="light", design="keychain-locked-light", capture="panel-fault-keychain-locked-light.png",
+         note="Rank 1, the worst: the login keychain is LOCKED, so the daemon cannot READ the shared "
+              "<code>Claude Code-credentials</code> item at all. Fleet-wide, and NO per-row "
+              "<code>auth</code> cell reflects it — which is why both sides show a full green roster under "
+              "the fault. That is the state this banner exists to contradict, not an inconsistency. Remedy "
+              "is UNLOCK, never <code>claude /login</code> (a re-login can’t help while the keychain storing "
+              "the credential is locked). <b>One row-level asymmetry to read past</b>: this pre-existing frame "
+              "alone marks the active row with a per-row lock glyph — the three fault frames below, and the "
+              "SHIPPED panel in all four captures, keep every row healthy-green, matching the banner’s own "
+              "premise that no per-row <code>auth</code> cell reflects a daemon-level fault. The lock predates "
+              "this pairing (#498) and #592 left it untouched by design. Structural divergence, uniform across all four of these: the mock "
+              "expresses a daemon fault as a <b>strip under the header</b> (plus a paused swap-row and an "
+              "explanatory footer line), the panel as a single <b>banner between dividers</b> above the "
+              "roster — dot + headline + one sentence. The mock’s richer affordances (pausing the swap row, "
+              "the “only waits, never prompts” footer) have no panel counterpart; the panel carries the "
+              "whole message in the banner. Per #498."),
+    dict(title="Fault 1 · Keychain locked (dark)", theme="dark", design="keychain-locked-dark", capture="panel-fault-keychain-locked-dark.png",
+         note="Same state, dark appearance."),
+    dict(title="Fault 2 · Shared login scrubbed — exhausted", theme="light", design="scrub-exhausted-light", capture="panel-fault-scrub-exhausted-light.png",
+         note="Rank 2: the shared canonical was scrubbed AND the daemon’s adopt-recovery is exhausted, so "
+              "every <code>claude</code> session is logged out until an operator acts. Ranked directly under "
+              "keychain-locked — the other half of the “act now” vault pair — and like it, an "
+              "<code>.error</code> banner carrying the remedy (<code>claude /login</code>). Content-parity "
+              "with the CLI’s <code>shared login: scrubbed …</code> line under R-2. Per #469."),
+    dict(title="Fault 3 · Refresh mechanism down", theme="light", design="systemic-refresh-light", capture="panel-fault-systemic-refresh-light.png",
+         note="Rank 3, and the load-bearing one: N consecutive refresh sweeps failed for EVERY eligible "
+              "account, so the refresh <i>mechanism</i> is down. <code>.warning</code>, not "
+              "<code>.error</code> — every account still works, so this is a PRE-DEATH “next break” task "
+              "(#375 kept a total refresh outage invisible ~4.5 h until a token finally expired). The visual "
+              "tell separating it from ranks 1–2 is that <b>swapping stays live</b> on both sides — nothing "
+              "is blocked yet. It is deliberately ranked ABOVE the calm scrub below, which is the pairing "
+              "the next entry exists to make visible. Per #523/#378."),
+    dict(title="Fault 4 · Shared login scrubbed — recovering", theme="light", design="scrub-recovering-light", capture="panel-fault-scrub-recovering-light.png",
+         note="Rank 4, the calmest — and the reason the whole family needed an oracle. Same scrub as rank 2, "
+              "but the daemon is still self-healing, so its whole message is “no action needed”: an "
+              "<code>.info</code> banner in the panel, and in the mock a <code>calm</code> strip whose icon "
+              "drops the amber attention tint. Read this frame AGAINST rank 3 above: severity ranks by "
+              "(fault, VARIANT), never by fault identity, so a self-healing state can never outrank one that "
+              "cannot self-heal. Treating canonical-scrub as ONE slot silently promoted this variant over "
+              "systemic — and a <code>recovering</code> scrub coinciding with a down refresh mechanism then "
+              "made the two surfaces CONTRADICT each other: the glance correctly shouted <code>!</code> at "
+              "the systemic fault while the panel answered the click with a grey “no action needed” over a "
+              "green roster. That inversion is a purely visual regression, which is exactly what this pair "
+              "is here to catch. Per #469/#523."),
 ]
 
 sections = "".join(f"""
@@ -224,11 +271,12 @@ page = f"""<!doctype html>
        screen capture).</p>
     <p>These are the <b>8 connection-states the panel implements</b>, plus the active-account
        <b>blind</b> modifier (OK / DEGRADED, #479/#485) — a per-row modifier on a connected snapshot,
-       not a 10th daemon-state. The mock’s <code>keychain-locked</code> shape stays unpaired: it is a
-       daemon-<i>fault</i> banner, and <code>RenderPanelTool</code> renders none of that family, so there
-       is no capture to set beside it (#592). The mock uses <code>backdrop-filter</code> vibrancy
-       (semi-transparent); the app uses an opaque window background for contrast — a deliberate native
-       translation.</p>
+       not a 10th daemon-state — and the four <b>daemon-fault</b> ranks (#592), which are likewise not
+       states but a banner resolved over a <i>connected</i> snapshot. Those four close on the ranking
+       itself: they run in the worst-first order the panel resolves them, so a severity inversion — a
+       visual claim no format-layer unit test can catch — is legible by reading them in sequence. The
+       mock uses <code>backdrop-filter</code> vibrancy (semi-transparent); the app uses an opaque window
+       background for contrast — a deliberate native translation.</p>
   </header>{sections}
 </div>
 </body></html>"""
