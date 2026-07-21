@@ -33,14 +33,17 @@ use super::*;
 /// Swapping TO the account whose quota refills first burns an allowance that is
 /// about to reset anyway and preserves the longer-runway account, raising total
 /// roster utilization. It also UNIFIES normal selection with the #11 terminal hold,
-/// which already holds on the soonest-`resets_at` account
-/// ([`soonest_weekly_reset`]) — so, when resets are known, the daemon prefers the
+/// which already holds on the soonest-relief account
+/// ([`all_exhausted_relief`]) — so, when resets are known, the daemon prefers the
 /// same least-time-to-relief account whether or not a viable target exists. The two
 /// differ deliberately only on the degenerate `None` case: this fn keeps an
 /// unknown-reset account as a last-resort eligible target (selection must pick
-/// SOMETHING viable), whereas [`soonest_weekly_reset`] excludes `None` outright (the
-/// hold then omits a timestamp). The viability FILTER is unchanged; only the choice
-/// AMONG viable accounts changed.
+/// SOMETHING viable), whereas [`all_exhausted_relief`] excludes an unknown reset
+/// outright (the hold then omits a timestamp). They also differ on DIMENSION, and
+/// deliberately: this fn ranks the WEEKLY reset alone — a viable target has by
+/// definition already cleared the session gate — whereas the hold spans BOTH windows,
+/// since every spare it ranks is blocked on at least one of them (issue #665).
+/// The viability FILTER is unchanged; only the choice AMONG viable accounts changed.
 ///
 /// Three exclusions are load-bearing; two are the symmetric anti-thrash guards.
 /// The weekly-exhaustion exclusion (#11): a target at/above its weekly trigger
@@ -254,7 +257,7 @@ pub(crate) fn pick_target_with_reason_ranked(
     // unknown one (`false` < `true`), then by the reset epoch ascending. Issue #612 refines a tie
     // AMONG equally-soon targets — first by velocity (lower retained session-velocity EMA), then by
     // a per-daemon jitter key — with the earliest roster index the final fallback (matching
-    // [`soonest_weekly_reset`]'s tie-break, #11, when the enhanced axes also tie or are inactive).
+    // [`all_exhausted_relief`]'s tie-break, #11, when the enhanced axes also tie or are inactive).
     // Both #612 axes are inert unless `sel.seed` is `Some`, so the un-jittered projection keeps the
     // exact pre-#612 order. `min_by` keeps the first of equal-comparing elements, but the roster-
     // index step is a strict order over distinct indices, so the winner is always unique.
@@ -507,7 +510,7 @@ mod tests {
     #[test]
     fn pick_target_breaks_a_reset_tie_by_roster_order() {
         // #37: when two viable accounts share the same weekly reset, the earlier
-        // roster index wins — matching soonest_weekly_reset's tie-break (#11). The
+        // roster index wins — matching all_exhausted_relief's tie-break (#11). The
         // superseded rule would have picked index 2 here on its lower session.
         let readings = vec![
             Some(Usage {

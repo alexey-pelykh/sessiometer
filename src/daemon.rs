@@ -3090,11 +3090,11 @@ where
             // The all-exhausted TERMINAL state (issue #11): HOLD, do NOT swap (swapping
             // among exhausted accounts only thrashes), and emit ONE edge-triggered
             // signal naming the least-bad account and WHY relief is blocked
-            // (`cause=session|weekly`), so the operator knows when relief arrives. When
-            // the block is session-wide (a weekly-viable account held out only by
-            // session), relief arrives at the sooner SESSION reset and the hint keys off
-            // it (issue #398, the acknowledged follow-up); otherwise it is the weekly
-            // reset (#11). The active account is left exactly as is. The signal is
+            // (`cause=session|weekly`), so the operator knows when relief arrives. The
+            // hint keys off the SOONEST spare-return across BOTH windows (issue #665) —
+            // whichever spare comes back first, named by the dimension gating it: a
+            // session reset (issue #398) and a weekly one (#11) are compared on the same
+            // footing, since a window's length is not its time remaining. The signal is
             // edge-triggered: emit only on ENTERING the state, so the payload is computed
             // once per episode, not every poll while it holds.
             if !self.state.signaled_all_exhausted {
@@ -3377,9 +3377,9 @@ where
             // `claude /login` cue. Edge-triggered: emit only on ENTERING the strand (mirrors
             // `signaled_all_exhausted`), so the payload is computed once per episode, not per tick.
             if !self.state.signaled_active_dead_no_target {
-                // Reuse `all_exhausted_relief` — it already excludes the active index by masking
-                // (the dead active's reading is `None` on this branch, its precondition), so it
-                // works unchanged when the active IS the dead one. `session_block_line = INFINITY`
+                // Reuse `all_exhausted_relief` — its one masked pass excludes the active index (and
+                // every disabled account) on EVERY dimension since issue #665, so it works
+                // unchanged when the active IS the dead one. `session_block_line = INFINITY`
                 // because the emergency path bypasses the session gate: relief here is NEVER a
                 // session reset (a weekly-viable-but-session-blocked spare would have been picked),
                 // so the classification correctly falls to the weekly-wide branch.
@@ -4583,35 +4583,73 @@ fn exhausted_poll_window(
     Duration::from_secs(secs.max(0) as u64)
 }
 
-/// The roster index (and its epoch) of the account whose WEEKLY window resets
-/// soonest, among readings that reported a parseable reset (issue #11). The
-/// all-exhausted terminal state holds on this least-bad account. Accounts without
-/// a known reset are skipped; an exact tie keeps the earliest roster index. `None`
-/// when no account reported a reset, leaving the caller to fall back.
-fn soonest_weekly_reset(readings: &[Option<Usage>]) -> Option<(usize, i64)> {
-    let mut soonest: Option<(usize, i64)> = None;
-    for (i, reading) in readings.iter().enumerate() {
-        if let Some(at) = reading.as_ref().and_then(|usage| usage.weekly_resets_at) {
-            if soonest.is_none_or(|(_, best)| at < best) {
-                soonest = Some((i, at));
-            }
-        }
+/// WHEN a blocked spare returns to viability, and the dimension gating that return.
+///
+/// A spare needs EVERY dimension currently blocking it to clear, so it returns at the
+/// LATEST reset among those dimensions — and the gating cause is that latest one. The
+/// caller establishes `session_blocked` / `weekly_blocked` against its own block lines;
+/// this answers only WHEN.
+///
+/// `None` when a blocking dimension reports no parseable reset: the return moment is then
+/// UNKNOWABLE (the unknown window may clear last), so the caller holds with the timestamp
+/// omitted rather than quoting an optimistic ETA off whichever dimension happens to be
+/// known. Also `None` for a spare blocked on neither dimension — it is not blocked at all.
+fn spare_relief(
+    usage: &Usage,
+    session_blocked: bool,
+    weekly_blocked: bool,
+) -> Option<(i64, SwapReason)> {
+    let session = if session_blocked {
+        Some((usage.session_resets_at?, SwapReason::Session))
+    } else {
+        None
+    };
+    let weekly = if weekly_blocked {
+        Some((usage.weekly_resets_at?, SwapReason::Weekly))
+    } else {
+        None
+    };
+    match (session, weekly) {
+        // Blocked on BOTH: it returns only once the LATER window clears, named by that
+        // dimension. An exact tie names WEEKLY — the scarcer window, and the #11 default
+        // that #398's session refinement was layered onto.
+        (Some(s), Some(w)) => Some(if w.0 >= s.0 { w } else { s }),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     }
-    soonest
 }
 
 /// Classify why [`pick_target`] found no viable target, for the `all_exhausted`
 /// relief hint (issue #398): `(cause, hold_idx, resets_at)`.
 ///
-/// A candidate that is weekly-VIABLE (`weekly < weekly_block_line`) but session-blocked
-/// (`session >= session_block_line`, the block line being `min(session_ceiling, floor)`) is
-/// held out ONLY by session — it returns at its SESSION reset, sooner than any weekly
-/// reset. If any such candidate exists the block is session-wide: report
-/// [`SwapReason::Session`] and key the hint off the soonest such session reset (naming
-/// that account). Otherwise every candidate is weekly-exhausted: report
-/// [`SwapReason::Weekly`] and fall back to the soonest weekly reset (the #11 default).
-/// `resets_at` is `None` when the relevant window has no parseable reset (the
-/// forward-compatible "hold, timestamp omitted" case).
+/// Fleet relief is the SOONEST moment any spare returns to capacity:
+///
+/// ```text
+/// min over blocked spares of ( max over that spare's blocked dimensions of its reset )
+/// ```
+///
+/// The inner `max` is [`spare_relief`]; the outer `min` is this function. `cause` names the
+/// dimension gating the WINNING spare, and `hold_idx` names that spare — the account relief
+/// actually arrives on.
+///
+/// Both dimensions are compared on the SAME footing, because a window's LENGTH is not its
+/// time REMAINING: a spare six days into its weekly window returns sooner than one that just
+/// opened a session. Issue #665 corrects the superseded rule, which early-returned
+/// [`SwapReason::Session`] the moment ANY weekly-viable-but-session-blocked spare existed and
+/// so never compared the weekly-exhausted spares' resets — overstating the ETA on a live
+/// 6-account fleet by 2h and mislabelling `hold`. It rested on a false universal (such a
+/// spare "returns at its SESSION reset, sooner than any weekly reset") that conflated the
+/// two. The `max` is sound because BOTH windows HARD-reset: weekly is a fixed 7-day window
+/// (verified against 22,261 usage samples, #665) and session is monotonic-within-window
+/// (#614 `SessionHighWater`).
+///
+/// ONE masked pass serves every dimension, so the active and disabled accounts are excluded
+/// identically throughout — the superseded weekly fallback iterated ALL readings unmasked and
+/// could key relief off the active's or a disabled account's weekly reset (#665).
+///
+/// `resets_at` is `None` when no blocked spare reports a usable reset (the
+/// forward-compatible "hold, timestamp omitted" case); with no blocked spare at all it falls
+/// back to holding the active account (the #11 default).
 fn all_exhausted_relief(
     active: usize,
     readings: &[Option<Usage>],
@@ -4619,35 +4657,42 @@ fn all_exhausted_relief(
     session_block_line: f64,
     weekly_block_line: f64,
 ) -> (SwapReason, usize, Option<i64>) {
-    // Soonest SESSION reset among weekly-viable-but-session-blocked candidates, plus a
-    // naming fallback (the first such account) for when none reports a parseable reset.
-    let mut session_relief: Option<(usize, i64)> = None;
-    let mut session_blocked: Option<usize> = None;
+    // Soonest spare-return across the fleet, plus a naming fallback (the first blocked
+    // spare) for when none of them reports a usable reset.
+    let mut relief: Option<(usize, i64, SwapReason)> = None;
+    let mut first_blocked: Option<(usize, SwapReason)> = None;
     for (i, reading) in readings.iter().enumerate() {
         if i == active || !enabled[i] {
             continue;
         }
         let Some(usage) = reading else { continue };
-        if usage.weekly < weekly_block_line && usage.session >= session_block_line {
-            session_blocked.get_or_insert(i);
-            if let Some(at) = usage.session_resets_at {
-                if session_relief.is_none_or(|(_, best)| at < best) {
-                    session_relief = Some((i, at));
-                }
+        let session_blocked = usage.session >= session_block_line;
+        let weekly_blocked = usage.weekly >= weekly_block_line;
+        if !session_blocked && !weekly_blocked {
+            continue;
+        }
+        first_blocked.get_or_insert((
+            i,
+            if weekly_blocked {
+                SwapReason::Weekly
+            } else {
+                SwapReason::Session
+            },
+        ));
+        if let Some((at, cause)) = spare_relief(usage, session_blocked, weekly_blocked) {
+            // Strict `<` keeps the earliest roster index on an exact tie.
+            if relief.is_none_or(|(_, best, _)| at < best) {
+                relief = Some((i, at, cause));
             }
         }
     }
-    if let Some(fallback) = session_blocked {
-        // Session-wide: a weekly-viable account is held out only by session.
-        return match session_relief {
-            Some((idx, at)) => (SwapReason::Session, idx, Some(at)),
-            None => (SwapReason::Session, fallback, None),
-        };
-    }
-    // Weekly-wide: every candidate is weekly-exhausted (the #11 default).
-    match soonest_weekly_reset(readings) {
-        Some((idx, at)) => (SwapReason::Weekly, idx, Some(at)),
-        None => (SwapReason::Weekly, active, None),
+    match (relief, first_blocked) {
+        (Some((idx, at, cause)), _) => (cause, idx, Some(at)),
+        // Blocked spares exist, but none reports a usable reset — hold, timestamp omitted.
+        (None, Some((idx, cause))) => (cause, idx, None),
+        // No blocked spare at all (every other reading unpolled, or masked away): the #11
+        // default of holding the active account, with nothing to promise.
+        (None, None) => (SwapReason::Weekly, active, None),
     }
 }
 
@@ -5790,82 +5835,74 @@ mod tests {
         (daemon, outcomes, calls)
     }
 
-    // --- soonest_weekly_reset (pure, #11) ---------------------------------
+    // --- all_exhausted_relief (pure, #11 / #398 / #665) -------------------
 
-    #[test]
-    fn soonest_weekly_reset_picks_the_earliest_known_timestamp() {
-        let readings = vec![
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: Some(300),
-                session_resets_at: None,
-            }),
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: Some(100), // soonest
-                session_resets_at: None,
-            }),
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: Some(200),
-                session_resets_at: None,
-            }),
-            None,
-        ];
-        assert_eq!(soonest_weekly_reset(&readings), Some((1, 100)));
+    /// A weekly-exhausted (`weekly = 0.99`), session-viable spare with the given weekly reset —
+    /// the shape the #11 weekly-wide branch is built on.
+    fn weekly_exhausted(weekly_resets_at: Option<i64>) -> Option<Usage> {
+        Some(Usage {
+            session: 0.0,
+            weekly: 0.99,
+            weekly_resets_at,
+            session_resets_at: None,
+        })
     }
 
     #[test]
-    fn soonest_weekly_reset_ignores_unknowns_and_breaks_ties_to_first() {
-        // Accounts without a known reset are skipped; an exact tie keeps the
-        // earliest roster index.
-        let tie = vec![
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: None,
-                session_resets_at: None,
-            }),
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: Some(500), // first of the tie -> winner
-                session_resets_at: None,
-            }),
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: Some(500),
-                session_resets_at: None,
-            }),
+    fn all_exhausted_relief_picks_the_earliest_known_reset_and_skips_unknowns() {
+        // Ported from the retired `soonest_weekly_reset` unit tests (issue #665 folded that
+        // helper into the one masked pass): among weekly-exhausted spares the hint keys off
+        // the EARLIEST known reset, spares without a parseable reset are skipped rather than
+        // treated as soonest, and an exact tie keeps the earliest roster index. The masked-out
+        // active (idx 0) holds the earliest reset of all and must NOT win.
+        let readings = vec![
+            weekly_exhausted(Some(10)), // idx 0: the active — masked, would win unmasked.
+            weekly_exhausted(None),     // idx 1: unknown reset — skipped, not "soonest".
+            weekly_exhausted(Some(300)), // idx 2: first of the tie → the winner.
+            weekly_exhausted(Some(300)), // idx 3: same instant, later index → loses.
+            weekly_exhausted(Some(700)), // idx 4: later.
         ];
-        assert_eq!(soonest_weekly_reset(&tie), Some((1, 500)));
-        // All-unknown → None (the caller falls back to the active account).
-        let none = vec![
-            Some(Usage {
-                session: 0.0,
-                weekly: 0.0,
-                weekly_resets_at: None,
-                session_resets_at: None,
-            }),
-            None,
+        let enabled = vec![true; 5];
+        let (cause, hold_idx, resets_at) = all_exhausted_relief(0, &readings, &enabled, 0.80, 0.95);
+        assert_eq!(cause, SwapReason::Weekly);
+        assert_eq!(hold_idx, 2);
+        assert_eq!(resets_at, Some(300));
+    }
+
+    #[test]
+    fn all_exhausted_relief_holds_without_a_timestamp_when_no_reset_is_known() {
+        // The forward-compatible "hold, timestamp omitted" case: blocked spares exist but none
+        // reports a parseable reset, so the hint names the first blocked spare with NO ETA
+        // rather than inventing one.
+        let readings = vec![
+            weekly_exhausted(None),
+            weekly_exhausted(None),
+            weekly_exhausted(None),
         ];
-        assert_eq!(soonest_weekly_reset(&none), None);
+        let enabled = vec![true; 3];
+        assert_eq!(
+            all_exhausted_relief(0, &readings, &enabled, 0.80, 0.95),
+            (SwapReason::Weekly, 1, None),
+        );
+        // With no blocked spare AT ALL (every other reading unpolled) it falls back to holding
+        // the active account — the #11 default, still with nothing to promise.
+        let unpolled = vec![weekly_exhausted(None), None, None];
+        assert_eq!(
+            all_exhausted_relief(0, &unpolled, &enabled, 0.80, 0.95),
+            (SwapReason::Weekly, 0, None),
+        );
     }
 
     #[test]
     fn all_exhausted_relief_names_the_soonest_session_reset_among_blocked_spares() {
-        // #417 secondary: on the session-wide branch, the relief hint keys off the
-        // SOONEST session reset among weekly-viable-but-session-blocked spares
-        // (`session_relief.is_none_or(|(_, best)| at < best)`, ADR-0013 Decision 4). The
-        // existing session-branch coverage uses `session_resets_at: None` (only the
-        // fallback-naming arm fires), so an inverted comparison (`at > best`) or a wrong
-        // index would ship green. Here TWO spares qualify with DISTINCT session resets and
-        // the later-indexed one resets sooner, so a correct comparison must override the
-        // first-seen fallback.
+        // #417 secondary: among session-blocked spares the relief hint keys off the SOONEST
+        // reset — the outer `min`'s `relief.is_none_or(|(_, best, _)| at < best)` (ADR-0013
+        // Decision 4, as corrected to cross-dimension semantics by #665; every spare here is
+        // session-only-blocked, so the winner's cause is still Session). The all-`None`
+        // coverage above exercises only the fallback-naming arm, so an inverted comparison
+        // (`at > best`) or a wrong index would ship green. Here TWO spares qualify with
+        // DISTINCT session resets and the later-indexed one resets sooner, so a correct
+        // comparison must override the first-seen fallback.
         let session_block_line = 0.80_f64;
         let weekly_ceiling = 0.95_f64;
         let readings = vec![
@@ -5898,6 +5935,136 @@ mod tests {
         // idx 2 (soonest, 150) wins over idx 1 (first-seen fallback, 300).
         assert_eq!(hold_idx, 2);
         assert_eq!(resets_at, Some(150));
+    }
+
+    #[test]
+    fn all_exhausted_relief_keys_off_a_weekly_spare_returning_before_every_session_spare() {
+        // Issue #665, the core regression. The superseded rule EARLY-RETURNED `Session` the
+        // moment ANY weekly-viable-but-session-blocked spare existed, so it never compared the
+        // weekly-exhausted spares' resets — pinning the ETA to the session subset even when a
+        // weekly-exhausted spare returned to capacity FIRST. Modelled on the live 6-account
+        // fleet from the issue (block lines: session ≥ 0.80, weekly ≥ 0.97), where the hint
+        // said "over its session limit; resets in 3h4m" while a weekly-exhausted spare was
+        // ~1h out — a 2h overstatement, on the wrong account, with the wrong cause.
+        let readings = vec![
+            // idx 0: the exhausted active — masked (active == 0).
+            Some(Usage {
+                session: 0.99,
+                weekly: 0.99,
+                weekly_resets_at: Some(9_000),
+                session_resets_at: Some(9_000),
+            }),
+            // idx 1: weekly-EXHAUSTED, session-viable → returns at its weekly reset, SOONEST.
+            Some(Usage {
+                session: 0.0,
+                weekly: 0.98,
+                weekly_resets_at: Some(3_600),
+                session_resets_at: None,
+            }),
+            // idx 2: weekly-viable, session-BLOCKED → returns at its session reset, LATER.
+            Some(Usage {
+                session: 0.96,
+                weekly: 0.53,
+                weekly_resets_at: None,
+                session_resets_at: Some(10_800),
+            }),
+        ];
+        let enabled = vec![true, true, true];
+        // Pre-fix this returned `(Session, 2, Some(10_800))` — the overstated ETA, naming the
+        // session-blocked spare instead of the one relief actually arrives on.
+        let (cause, hold_idx, resets_at) = all_exhausted_relief(0, &readings, &enabled, 0.80, 0.97);
+        assert_eq!(cause, SwapReason::Weekly);
+        assert_eq!(hold_idx, 1);
+        assert_eq!(resets_at, Some(3_600));
+    }
+
+    #[test]
+    fn all_exhausted_relief_takes_the_later_reset_of_a_double_blocked_spare() {
+        // The inner `max` (issue #665): a spare blocked on BOTH dimensions returns only once
+        // the LATER window clears, so fleet relief is min-over-spares of MAX-over-that-spare's-
+        // blocked-dimensions — never a flat min across every reset in the fleet. Here the
+        // double-blocked idx 1 has the earliest reset of all (its session, 1_000), but its
+        // weekly does not clear until 8_000, so the single-blocked idx 2 (5_000) wins.
+        let readings = vec![
+            // idx 0: the exhausted active — masked.
+            Some(Usage {
+                session: 0.99,
+                weekly: 0.99,
+                weekly_resets_at: Some(9_000),
+                session_resets_at: Some(9_000),
+            }),
+            // idx 1: session-blocked AND weekly-exhausted → returns at max(1_000, 8_000).
+            Some(Usage {
+                session: 0.90,
+                weekly: 0.99,
+                weekly_resets_at: Some(8_000),
+                session_resets_at: Some(1_000),
+            }),
+            // idx 2: session-blocked only → returns at 5_000, the true fleet soonest.
+            Some(Usage {
+                session: 0.85,
+                weekly: 0.10,
+                weekly_resets_at: None,
+                session_resets_at: Some(5_000),
+            }),
+        ];
+        let enabled = vec![true, true, true];
+        // A flat `min` over all resets would report idx 1 at 1_000 — an account still weekly-
+        // exhausted for another ~2h at that moment.
+        let (cause, hold_idx, resets_at) = all_exhausted_relief(0, &readings, &enabled, 0.80, 0.97);
+        assert_eq!(cause, SwapReason::Session);
+        assert_eq!(hold_idx, 2);
+        assert_eq!(resets_at, Some(5_000));
+        // A double-blocked spare whose blocking weekly reset is UNKNOWN has an unknowable
+        // return, so it is skipped rather than quoted at its known session reset.
+        let unknowable = vec![
+            readings[0],
+            Some(Usage {
+                weekly_resets_at: None,
+                ..readings[1].expect("idx 1 present")
+            }),
+            readings[2],
+        ];
+        assert_eq!(
+            all_exhausted_relief(0, &unknowable, &enabled, 0.80, 0.97),
+            (SwapReason::Session, 2, Some(5_000)),
+        );
+        // Intra-spare tie: when a double-blocked spare's two resets land on the SAME instant,
+        // the gating cause is WEEKLY (the `>=` in `spare_relief`) — the scarcer window,
+        // deterministic rather than iteration-order-dependent.
+        let tie = vec![
+            readings[0], // idx 0: the active — masked.
+            Some(Usage {
+                session: 0.90,
+                weekly: 0.99,
+                weekly_resets_at: Some(4_000),
+                session_resets_at: Some(4_000),
+            }),
+        ];
+        assert_eq!(
+            all_exhausted_relief(0, &tie, &[true, true], 0.80, 0.97),
+            (SwapReason::Weekly, 1, Some(4_000)),
+        );
+    }
+
+    #[test]
+    fn all_exhausted_relief_masks_the_active_and_disabled_accounts_on_every_dimension() {
+        // Issue #665: the superseded weekly fallback called `soonest_weekly_reset(readings)`,
+        // which iterated ALL readings with no active/enabled mask — so it could key relief off
+        // the ACTIVE account's or a DISABLED account's weekly reset, neither of which is a
+        // spare the daemon can swap to. The session branch always masked both; one masked pass
+        // now makes the asymmetry structurally impossible.
+        let readings = vec![
+            weekly_exhausted(Some(100)), // idx 0: the active — earliest, must be ignored.
+            weekly_exhausted(Some(200)), // idx 1: DISABLED — next earliest, must be ignored.
+            weekly_exhausted(Some(700)), // idx 2: the only real spare → the answer.
+        ];
+        let enabled = vec![true, false, true];
+        // Pre-fix this returned `(Weekly, 0, Some(100))` — the active account's own reset.
+        assert_eq!(
+            all_exhausted_relief(0, &readings, &enabled, 0.80, 0.95),
+            (SwapReason::Weekly, 2, Some(700)),
+        );
     }
 
     // --- tick: decision + swap --------------------------------------------
@@ -10979,7 +11146,7 @@ mod tests {
             "the peer was skipped at least once"
         );
         // The peer's reading — with its weekly reset — is RETAINED across the skips, so the
-        // relief math (soonest_weekly_reset) still has the reset to key off.
+        // relief math (all_exhausted_relief) still has the reset to key off.
         let retained = daemon.state.last_readings[1].expect("peer reading retained across skips");
         assert_eq!(retained.weekly_resets_at, Some(now + 999_999));
     }
