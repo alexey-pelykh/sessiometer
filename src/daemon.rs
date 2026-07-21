@@ -1219,6 +1219,40 @@ struct AccountRuntime {
     polled_once: bool,
 }
 
+/// Per-account decision helpers (issue #669, the final step of the #637 `daemon.rs`
+/// decomposition). These let a decision reason over ONE account's own bundled state through a
+/// named predicate instead of index-reaching into the coordinator's [`DecisionState::accounts`]
+/// vec and re-deriving the predicate inline at each site.
+///
+/// Deliberately NARROW — only PURE per-account reads belong here. The swap DECISIONS themselves
+/// (the reactive / #539 velocity ([`Daemon::velocity_swap`]) / #452 blind ([`Daemon::blind_swap`])
+/// / #42 emergency ([`Daemon::emergency_swap`]) arms and `pick_target` selection) stay on
+/// [`Daemon`] by design: collectively they draw the seeded `rng` in a FIXTURE-PINNED order (session
+/// ceiling → weekly ceiling → cooldown, plus the emergency / velocity draws), reach the roster and
+/// the OTHER accounts to pick a target, and write daemon-scoped `state.signaled_*`. Relocating those
+/// onto `AccountRuntime` would only re-thread the daemon's `rng` + roster + config back in as
+/// parameters — muddying the draw-order guarantee for no reasoning gain — so #637 step 6 stops at
+/// the pure reads. A long-but-documented [`decide_action`](Daemon::decide_action) is the accepted
+/// outcome (#637's own verdict: "likely not worth it").
+impl AccountRuntime {
+    /// This account's retained session-velocity EMA (issue #539, ADR-0017), but ONLY once it is
+    /// SUSTAINED — a [`VelocityEma`] blended from `>= MIN_VELOCITY_SAMPLES` intervals; `None` while
+    /// the signal is absent (never polled, a first/failed poll, or reset by a window drop) OR still
+    /// a single unblended sample. This is the ONE "is the velocity usable?" predicate every
+    /// velocity-aware arm shares — the reactive ceiling derivation and the #539 projection
+    /// ([`decide_action`](Daemon::decide_action) / [`Daemon::velocity_swap`]), the #540 near-limit
+    /// fast-poll ([`Daemon::active_near_limit`]), and the #634 blind-window ingredient log
+    /// ([`Daemon::blind_velocity_ingredients`]) — each of which previously re-encoded the same
+    /// `samples >= MIN_VELOCITY_SAMPLES` gate inline, differing only in the UNSUSTAINED fallback
+    /// (`0.0` rate / hold / no fast-poll / no ingredient — supplied by each caller, unchanged).
+    /// Gating here keeps the "SUSTAINED, never a single-interval spike" invariant (issues #538 /
+    /// #584 / #600) in one place. A pure read of retained state — no `rng`, no clock, no roster.
+    fn sustained_session_velocity(&self) -> Option<VelocityEma> {
+        self.session_velocity
+            .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
+    }
+}
+
 /// Per-loop decision state carried across polls.
 #[derive(Default)]
 struct DecisionState {
@@ -2982,8 +3016,7 @@ where
         // at `eff − v·max(poll_gap, H)`, the max-window coverage in `swap::reactive_session_threshold`.
         let effective_ceiling = swap::effective_ceiling(session_ceiling);
         let velocity = self.state.accounts[active_idx]
-            .session_velocity
-            .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
+            .sustained_session_velocity()
             .map_or(0.0, |v| v.rate);
         // The reactive re-observation gap: how long the active account climbs UNSEEN between the
         // daemon's successive observations of it. `swap::reactive_poll_gap_secs` looks ahead over the
@@ -3841,10 +3874,7 @@ where
     /// A pure read of retained state; the fraction→percent conversion is the log's unit boundary
     /// ([`to_pct_exact`]).
     fn blind_velocity_ingredients(&self, i: usize) -> Option<BlindVelocity> {
-        let vel = self.state.accounts[i].session_velocity?;
-        if vel.samples < MIN_VELOCITY_SAMPLES {
-            return None;
-        }
+        let vel = self.state.accounts[i].sustained_session_velocity()?;
         Some(BlindVelocity {
             rate_pct_per_sec: to_pct_exact(vel.rate),
             inflation: BLIND_VELOCITY_RATE_INFLATION,
@@ -3919,12 +3949,9 @@ where
         // intervals). Absent (a first/failed poll, or reset by a window drop — the poll-gap case #540
         // owns) or single-sample → never project (the "no-fire on a missing/unwarmed velocity"
         // invariant): hold on the fresh reading rather than swap on a guess.
-        let Some(vel) = self.state.accounts[active_idx].session_velocity else {
+        let Some(vel) = self.state.accounts[active_idx].sustained_session_velocity() else {
             return TickAction::Held;
         };
-        if vel.samples < MIN_VELOCITY_SAMPLES {
-            return TickAction::Held;
-        }
         // The free guard (#538): only project from a reading already at/over the band. The
         // projection cannot reach below it (max reach ≤ ~14 pp at H ≤ 150 s), so a lower reading can
         // never cross anyway — the guard just excludes spurious low-usage projections cheaply.
@@ -4232,12 +4259,9 @@ where
         if horizon == 0 {
             return false;
         }
-        let Some(vel) = self.state.accounts[active_idx].session_velocity else {
+        let Some(vel) = self.state.accounts[active_idx].sustained_session_velocity() else {
             return false;
         };
-        if vel.samples < MIN_VELOCITY_SAMPLES {
-            return false;
-        }
         active_usage.session + vel.rate * horizon as f64 >= floor
     }
 
