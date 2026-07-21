@@ -106,23 +106,47 @@ STATES = [
     dict(title="1 · Healthy — Status (dark)", theme="dark", design="healthy-status-dark", capture="panel-healthy-dark.png",
          note="Same state, dark appearance — system semantic colours, not the mock’s hex."),
     dict(title="2 · Connecting / daemon-starting", theme="light", design="daemon-starting-light", capture="panel-connecting-light.png",
-         note="Awaiting the first snapshot: an honest banner, no roster — never a false “healthy”. The "
-              "mock’s separate <b>not-running</b> and <b>crash-looping</b> shapes are the fuller 9-state "
-              "map (#169); the panel currently folds them into this / disconnected."),
-    dict(title="3 · Disconnected (UDS drop)", theme="light", design="disconnected-light", capture="panel-disconnected-light.png",
+         note="Awaiting the first snapshot: an honest banner, no roster — never a false “healthy”. The panel "
+              "draws this, <b>not-running</b>, and <b>crash-looping</b> (both below) on ONE shared “no "
+              "trustworthy reading” card — a single <code>StatusPanelView</code> arm. The card is shared; the "
+              "<i>message</i> is not, and the message is the card’s whole content — which is why the next two "
+              "pair separately instead of folding into this one (#593)."),
+    dict(title="3 · Daemon not running", theme="light", design="not-running-light", capture="panel-not-running-light.png",
+         note="The daemon is absent and — unlike a drop — never held a reading to age (#499): no roster to dim, "
+              "no “updated Nm ago” footer to amber. Mock↔panel, the whole comparison is the string. The header "
+              "sub-line diverges (mock “Daemon offline”, panel “Daemon not running”, so the panel’s sub-line and "
+              "card title read the same words twice). The body loses its second half — mock “The background "
+              "service isn’t running. Start it to resume live status.” against the panel’s “The daemon isn’t "
+              "running.” — because the mock’s <b>Start daemon</b> button has no panel counterpart: launch-at-login "
+              "is #170 (deferred, signing-blocked), so the card ships an inert explanatory line rather than a "
+              "dead click."),
+    dict(title="3 · Daemon not running (dark)", theme="dark", design="not-running-dark", capture="panel-not-running-dark.png",
+         note="Same state, dark appearance."),
+    dict(title="4 · Daemon crash-looping", theme="light", design="crash-looping-light", capture="panel-crash-looping-light.png",
+         note="The daemon served a snapshot but keeps dropping before it stabilises, so its numbers are REFUSED "
+              "rather than flickered as live — the anti-#137 healthy-flash debounce (#169). Same shared card as "
+              "not-running above, so again the message is the comparison — and here it largely lands: sub-line "
+              "(“Daemon fault”) and card title (“Daemon crash-looping”) both agree with the mock. The body "
+              "diverges only in its count — the mock’s clock-based “Restarted 5× in the last minute.” becomes "
+              "the panel’s clock-free “Restarting repeatedly”, both closing on “holding status until it stays "
+              "up.” — because the client counts consecutive unstable reconnects, not wall-clock restarts, and "
+              "will not quote a number it cannot source. The mock’s <b>View log</b> / <b>Restart…</b> "
+              "affordances (Restart behind a confirm) are #169 siblings, so the panel’s card carries the "
+              "message alone. Light-only: the mock has no <code>crash-looping-dark</code> frame."),
+    dict(title="5 · Disconnected (UDS drop)", theme="light", design="disconnected-light", capture="panel-disconnected-light.png",
          note="Dropped connection: a loud strip over the <b>dimmed last-known</b> roster — retained, "
               "never frozen-as-live (#137) — and an amber “updated Nm ago” footer."),
-    dict(title="4 · Stale snapshot", theme="light", design="stale-snapshot-light", capture="panel-stale-light.png",
+    dict(title="6 · Stale snapshot", theme="light", design="stale-snapshot-light", capture="panel-stale-light.png",
          note="Connection open but the daemon went quiet: the roster stays full-strength, the header "
               "sub-line and footer carry the “stale” mark (amber), so numbers are never read as live."),
-    dict(title="5 · Version skew / unsupported", theme="light", design="version-skew-light", capture="panel-unsupported-light.png",
+    dict(title="7 · Version skew / unsupported", theme="light", design="version-skew-light", capture="panel-unsupported-light.png",
          note="The daemon speaks a wire contract this client can’t safely read → numbers refused, a plain "
               "honest message. The mock’s richer “brew upgrade” affordance is #169."),
-    dict(title="6 · Empty roster / first run", theme="light", design="empty-roster-light", capture="panel-empty-roster-light.png",
+    dict(title="8 · Empty roster / first run", theme="light", design="empty-roster-light", capture="panel-empty-roster-light.png",
          note="Connected, zero accounts — an onboarding card distinct from daemon-down. First run "
               "captures the active account <b>in-app</b> (operator-label field + button over the #358 "
               "control socket, honest pending → done → error) — not a copied command (#360)."),
-    dict(title="6 · Empty roster / first run (dark)", theme="dark", design="empty-roster-dark", capture="panel-empty-roster-dark.png",
+    dict(title="8 · Empty roster / first run (dark)", theme="dark", design="empty-roster-dark", capture="panel-empty-roster-dark.png",
          note="Onboarding, dark appearance."),
     dict(title="Modifier · Active blind — OK", theme="light", design="blind-ok-light", capture="panel-blind-ok-light.png",
          note="The ACTIVE account’s /usage poll is rate-limited (429): the daemon holds a bounded anchor and "
@@ -198,12 +222,13 @@ page = f"""<!doctype html>
        is pixel-accurate. <b>Capture</b> = the <i>built</i> SwiftUI panel, drawn to PNG by
        <code>RenderPanelTool</code> (<code>--render-panel</code>, SwiftUI <code>ImageRenderer</code> — no
        screen capture).</p>
-    <p>These are the <b>6 connection-states the panel implements</b>, plus the active-account
+    <p>These are the <b>8 connection-states the panel implements</b>, plus the active-account
        <b>blind</b> modifier (OK / DEGRADED, #479/#485) — a per-row modifier on a connected snapshot,
-       not a 10th daemon-state. The mock’s <code>not-running</code>, <code>crash-looping</code>, and
-       <code>keychain-locked</code> shapes are the fuller 9-state map (#169). The mock uses
-       <code>backdrop-filter</code> vibrancy (semi-transparent); the app uses an opaque window
-       background for contrast — a deliberate native translation.</p>
+       not a 10th daemon-state. The mock’s <code>keychain-locked</code> shape stays unpaired: it is a
+       daemon-<i>fault</i> banner, and <code>RenderPanelTool</code> renders none of that family, so there
+       is no capture to set beside it (#592). The mock uses <code>backdrop-filter</code> vibrancy
+       (semi-transparent); the app uses an opaque window background for contrast — a deliberate native
+       translation.</p>
   </header>{sections}
 </div>
 </body></html>"""

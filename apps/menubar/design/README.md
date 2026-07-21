@@ -92,9 +92,9 @@ chip) + unit tests instead.
 
 `build-comparison.py` assembles a single self-contained page that puts the mock's **live** `.pop`
 blocks next to the built-panel captures, state by state — the fastest way to eyeball parity across the
-six connection-states the panel implements, plus the active-account **blind** modifier (OK / DEGRADED,
-#479/#485), (the mock's `not-running` / `crash-looping` / `keychain-locked` are the fuller 9-state map,
-#169):
+eight connection-states the panel implements, plus the active-account **blind** modifier (OK / DEGRADED,
+#479/#485). The mock's `keychain-locked` stays unpaired: it is a daemon-**fault** banner, and
+`RenderPanelTool` renders none of that family, so there is no capture to set beside it (#592):
 
 ```sh
 # from apps/menubar, after a Debug build
