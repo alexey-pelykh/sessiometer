@@ -473,6 +473,29 @@ final class StatusPanelFormatTests: XCTestCase {
             "Out of capacity — resets in 47m")
     }
 
+    // MARK: - swapCalloutAccessibilityLabel (issue #702 — the swap-callout's spoken label, guarded directly)
+
+    // #698's headline invariant: the spoken label keeps the full "Next swap to <target>" sentence — VoiceOver
+    // users have NONE of the visual context (the card's bare "→ <target>" lead, #698) to supply the missing
+    // words. This gap was invisible: an adversarial trim to "<target>. <reason>." passed 434/434 because the
+    // label lived in a `private var` on the SwiftUI card, outside this headless test bundle (#702). Now the
+    // logic is a pure `StatusPanelFormat` helper, pinned here on BOTH arms. The spoken strings are asserted
+    // LITERALLY — never derived from the visual "→" lead — so this test cannot re-couple the two.
+    func testSwapCalloutAccessibilityLabelSpeaksFullSentence() {
+        // reason present (post-#393 daemon) → identity + the daemon's "why", each its own sentence.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutAccessibilityLabel(target: "personal", reason: "weekly resets soonest"),
+            "Next swap to personal. weekly resets soonest.")
+        // reason absent (pre-#393 daemon) → identity only, with no dangling ". ." where the "why" is absent.
+        XCTAssertEqual(
+            StatusPanelFormat.swapCalloutAccessibilityLabel(target: "personal", reason: nil),
+            "Next swap to personal.")
+        // The spoken label never borrows the card's visual "→ <target>" lead (#698) — the two stay independent.
+        XCTAssertFalse(
+            StatusPanelFormat.swapCalloutAccessibilityLabel(target: "personal", reason: "weekly resets soonest").contains("→"),
+            "spoken label must not re-couple to the visual arrow lead")
+    }
+
     // MARK: - canonicalScrubBanner (issue #469 — the fleet-wide scrubbed-canonical signal)
 
     // #469: the daemon's `canonical_scrub` rollup renders a distinct HONEST BANNER (title + detail +

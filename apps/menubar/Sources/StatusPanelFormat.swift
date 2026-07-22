@@ -1190,6 +1190,21 @@ enum StatusPanelFormat {
         }
     }
 
+    /// The swap-callout's spoken VoiceOver label — the card's ONE accessible sentence: identity plus the
+    /// daemon's "why" (when present). Independent of the card's VISUAL lead by design (#698): the visual
+    /// shows a bare `→ <target>` — the adjacent Swap button names the verb and the arrow saves the width the
+    /// target needs — but VoiceOver reads this text element on its own, with none of that adjacent context,
+    /// so it must speak the whole `"Next swap to <target>"` sentence. Omits the reason clause for a pre-#393
+    /// daemon (`reason == nil`) so VoiceOver never speaks a dangling `". ."` where the "why" is absent.
+    /// Lifted out of `SwapCalloutCard`'s `private var` (#702) so the #698 spoken-label invariant is guarded
+    /// by a direct unit test rather than resting on code review.
+    static func swapCalloutAccessibilityLabel(target: String, reason: String?) -> String {
+        if let reason {
+            return "Next swap to \(target). \(reason)."
+        }
+        return "Next swap to \(target)."
+    }
+
     // MARK: - Row VoiceOver label (issue #326 AC — VoiceOver-navigable rows)
 
     /// One spoken, comma-separated sentence for a row's VoiceOver label, so the whole row reads as a

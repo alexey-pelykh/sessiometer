@@ -249,14 +249,12 @@ struct SwapCalloutCard: View {
         .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
     }
 
-    /// The spoken label for the card's text: identity + the daemon's reason (when present). Omits the
-    /// reason clause for a pre-#393 daemon (`reason == nil`), so VoiceOver never speaks a dangling ". ."
-    /// where the "why" line is absent. The Swap button speaks for itself.
+    /// The spoken label for the card's text — delegated to `StatusPanelFormat.swapCalloutAccessibilityLabel`
+    /// (#702) so the #698 spoken-label invariant (keep the "Next swap to " prefix; no dangling ". ." when the
+    /// reason is absent) is guarded by a direct unit test rather than resting on code review. The Swap button
+    /// speaks for itself.
     private var accessibilityText: String {
-        if let reason {
-            return "Next swap to \(target). \(reason)."
-        }
-        return "Next swap to \(target)."
+        StatusPanelFormat.swapCalloutAccessibilityLabel(target: target, reason: reason)
     }
 }
 
