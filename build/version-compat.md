@@ -6,14 +6,21 @@
      Keep the `- CC_SUPPORTED_MIN: x.y.z` / `- CC_SUPPORTED_MAX: x.y.z` format stable. -->
 
 - CC_SUPPORTED_MIN: 2.1.181
-- CC_SUPPORTED_MAX: 2.1.197
+- CC_SUPPORTED_MAX: 2.1.217
 
 This range is the **authoritative source of truth** for sessiometer's Claude Code compatibility.
 Every reverse-engineered assumption recorded in this ledger — the keychain-service derivation
 (#100), the credential-refresh lifecycle (#101), the `oauthAccount`/token orthogonality (H2) — was
-verified against Claude Code in `2.1.181`–`2.1.197` on macOS `26.5.1` / Darwin `25.x`. Because these
-are reverse-engineered CC internals, a CC release outside this range may silently change them, and
-`sessiometer` would then target the wrong keychain item with no other signal.
+verified against Claude Code in `2.1.181`–`2.1.217` on macOS `26.5.1`–`26.5.2` / Darwin `25.x`.
+Because these are reverse-engineered CC internals, a CC release outside this range may silently
+change them, and `sessiometer` would then target the wrong keychain item with no other signal.
+
+The range is **spot-verified, not exhaustive**: the range-gating findings were established on
+`2.1.181` and re-verified on `2.1.195` (#145), `2.1.197` (#130) and `2.1.217` (#552). Builds between
+those points are covered by the range but were not individually walked. (The `2.1.207` work —
+#470's scrub observation and #466's knob-absence spike — is deliberately **not** in that list:
+per #470's own "Does NOT widen the supported range" section, it characterizes an auth
+failure-mode and does not re-verify the findings the range gates.)
 
 Consumers of this range:
 
@@ -736,6 +743,11 @@ keychain-service derivation). It was observed **above** `CC_SUPPORTED_MAX` (`2.1
 widen it: the range stays `2.1.181`–`2.1.197` until H3 / #100 are re-verified per the header protocol.
 The scrub is a Claude Code auth behavior, not a macOS-keychain property.
 
+> **Superseded as of #552**: that re-verification has since happened — H3 and #100 were re-walked on
+> `2.1.217` and the range now reads `2.1.181`–`2.1.217` (see `# Issue #552` below). The paragraph
+> above stands as the record of why *this* 2.1.207 entry did not itself widen it; the current range
+> is always the `CC_SUPPORTED_*` pair at the top of this file.
+
 ## Deferred-live re-check trigger (the ADR-0002 / ADR-0003 pattern)
 
 On a Claude Code **auth bump** (a new build touching login / token-refresh / credential storage),
@@ -849,3 +861,196 @@ establish a *knob-absence* — and stays scoped to that one question. Cross-chec
 interaction), #101 (store model), #465 (refresh-token rotation).
 
 CC 2.1.207 · macOS 26.5.2 / 25F84 · sessiometer #466.
+
+---
+
+# Issue #552 — supported-range re-verification: `2.1.197` → `2.1.217` ✅ WIDENED
+
+The periodic re-walk the header protocol mandates when the installed CC moves above
+`CC_SUPPORTED_MAX`. The range had been pinned at `2.1.197` while the machine ran `2.1.21x`, so every
+finding this ledger gates was formally unverified on the build actually in use.
+
+## Scope note — the issue's stated version was stale
+
+Issue #552 was filed against an installed `2.1.211`. By the time of this re-walk the installed set
+was `2.1.209`, `2.1.215`, `2.1.216`, `2.1.217`, with `claude --version` = **`2.1.217`**. The re-walk
+targets `2.1.217` (the build on `$PATH`), not the `2.1.211` named in the issue.
+
+## Method — offline decode + passive observation only
+
+Every check below is either a **static read of the stock binary** (the ledger's established #100 /
+#101 / #466 method) or a **passive read of the daemon's own event log**. **No credential was read,
+written, or scrubbed; no `claude` was spawned; no network call was made.** This is deliberate: the
+one check that *does* require mutating a real credential (the ADR-0018 scrub) is explicitly deferred
+below rather than run unattended.
+
+## Results at a glance
+
+| Finding | Method | Verdict on `2.1.217` |
+|---|---|---|
+| **#100 — `n1()` keychain-service derivation** | static decode | ✅ **UNCHANGED** (semantically identical; renamed `n1`→`BG`, `sr`→`rn`) |
+| **#101 AC-1 — credential read path** | static decode | ✅ **UNCHANGED** — `security find-generic-password -a <acct> -w -s <service>` |
+| **#101 AC-2 — save via apple-tool: `security -i`** [was BUILD-BLOCKER] | static decode | ✅ **UNCHANGED** — both arms intact: `security -i` with the `add-generic-password -U -a "…" -s "…" -X "…"` command on **stdin** (primary), argv only as the oversize fallback ⇒ silent read-back holds |
+| **#101 AC-6 — keychain-primary, plaintext-fallback** | static decode | ✅ **UNCHANGED** — `name:"plaintext"` is still the fallback arm only |
+| **#466 — scrub present, empties both tokens, un-gated** | `scripts/spike-466-invalid-grant-scrub-probe.sh` | ✅ **PASS** (exit 0, all 4 assertions) |
+| **H3 — fresh-start adoption** · **H2 — token/`oauthAccount` orthogonality** | production observation | ✅ **HOLDS** — see below |
+| **New — the item `acct` derivation is `$USER`-first** | static decode | ⚠️ **LATENT** — exposes the isolated-item path only; the canonical path is immune. Tracked as #711 |
+| **ADR-0018 — does the first `invalid_grant` still empty the shared item?** | — | ⏸ **DEFERRED** — see below |
+
+Legend: ✅ re-verified · ⚠️ new observation · ⏸ deferred (live-oracle)
+
+## #100 — the derivation is semantically identical (renamed and re-wrapped, not rewritten)
+
+Decoded from `~/.local/share/claude/versions/2.1.217`, verbatim:
+
+```js
+function BG(e=""){                                      // was `n1` in 2.1.181
+  let t=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
+      r=t!==void 0?!t:!process.env.CLAUDE_CONFIG_DIR,    // suffix-ABSENT gate
+      n=t!==void 0?t.normalize("NFC"):rn(),              // value HASHED  (`sr` in 2.1.181)
+      o=r?"":`-${T0c.createHash("sha256").update(n).digest("hex").substring(0,8)}`;
+  return `Claude Code${ks().OAUTH_FILE_SUFFIX}${e}${o}`
+}
+```
+
+Identical to the `2.1.181` decode in `# Issue #100` above in every load-bearing respect: same
+env-var precedence, same suffix-absent gate, same `sha256(NFC(raw value))[..8]`.
+
+The **"no path expansion"** property lives in `rn()` (`sr()` in `2.1.181`), so it is quoted rather
+than assumed:
+
+```js
+rn = Ur(()=>(Lgl()??Phe.join(Ngl.homedir(),".claude")).normalize("NFC"), Lgl)
+function Lgl(){ return process.env.CLAUDE_CONFIG_DIR }   // bare accessor — no expansion
+```
+
+Same value semantics as `2.1.181`'s `sr = ()=>(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(),
+".claude")).normalize("NFC")`: still no `~` expansion, no relative→absolute, no trailing-slash
+strip, no realpath.
+
+Every delta is structural; the memoization is keyed on `Lgl`:
+
+| Delta | `2.1.181` | `2.1.217` |
+|---|---|---|
+| service fn | `n1` | `BG` |
+| config-dir fn | `sr` (plain arrow) | `rn`, **memoized** via `Ur(fn, Lgl)` |
+| `CLAUDE_CONFIG_DIR` read | direct `process.env.…` | via the `Lgl()` accessor |
+| `OAUTH_FILE_SUFFIX` | bare identifier | lazy `ks().OAUTH_FILE_SUFFIX` |
+| `createHash` | bare import | `T0c.createHash` |
+
+`Ur`'s own definition was **not** decoded (its minified name is module-scoped and the binary carries
+many unrelated `Ur` bindings), so whether its memo invalidates on an `Lgl()` change is *unverified,
+not falsified*. Immaterial here: the four path-semantics properties above are read directly off the
+quoted source, and sessiometer re-derives the service name in Rust rather than sharing CC's process,
+so an in-process cache is not a sessiometer-reachable state.
+
+⇒ `keychain::service_for_config_dir` and its pinned test vectors (`/abs/path → 6d80187b`,
+`/opt/cc → 34fd9c6e`) remain correct — both re-derived independently during this re-walk.
+
+## H3 / H2 — re-verified from production, not a bench run
+
+The original H3 (a fresh `claude` adopts a CLI-written token + `oauthAccount` pair) and H2
+(token = auth/quota, `oauthAccount` = display) were bench checks that **write real credentials**.
+Re-running them unattended is exactly the class of action this re-walk avoids — but they no longer
+need a bench, because the daemon exercises them continuously in production:
+
+> **Time base**: the daemon logs in **UTC**; binary mtimes below are quoted in UTC too. (The local
+> filesystem shows them in CEST, +2 h — comparing a local mtime against a UTC log shifts every
+> boundary by two hours, so both are normalized here.)
+
+| Signal | Observation (`~/Library/Logs/sessiometer/sessiometer.log`) |
+|---|---|
+| CC `2.1.217` installed | `2026-07-21T21:36Z` (binary mtime; 23:36 CEST local) |
+| `event=swap` since that install | **13** — `2026-07-21T22:14:48Z` → `2026-07-22T20:03:25Z`, reasons `session` / `weekly` / `blind_preempt` |
+| CC `2.1.215` installed (first `2.1.21x`) | `2026-07-19T02:59Z` |
+| `event=swap` since the `2.1.21x` line began | **40** — `2026-07-19T04:43:31Z` → `2026-07-22T20:03:25Z` |
+| `event=credential_dead` / quarantine since the `2.1.215`+ era | **0** (the only two ever recorded are 2026-07-03 and 2026-07-10, both pre-`2.1.215`) |
+| `event=usage_velocity` | continues per-account after each swap ⇒ quota is actually rerouting |
+
+Each swap *is* an H3 trial: sessiometer writes the token (via `security -i`) and co-writes the
+`oauthAccount`, and the running/next `claude` picks the pair up. Forty consecutive trials across the
+`2.1.21x` line — **13** of them on `2.1.217` itself — with zero credential deaths and continued
+per-account usage accrual, make a stronger sample than the original single bench run. H2's
+orthogonality is implied by the same trials (the co-write pattern is unchanged and no re-auth was
+triggered).
+
+**Calibration**: this is *observational* (a natural experiment), not bench-isolated. It establishes
+that the adoption mechanism works end-to-end on `2.1.217`; it does not isolate *which* of the two
+writes carries which effect — that decomposition rests on the original H2/H3 record, taken on
+`2.1.181` and not re-litigated here.
+
+## New observation — the `acct` derivation is `$USER`-first (latent, not currently biting) ⚠
+
+Not previously recorded. The ledger has consistently described the item's `acct` as "the macOS
+username" (`vO()/*=$(whoami)*/` in the `2.1.181` decode). On `2.1.217` the function reads:
+
+```js
+function uq(){
+  let e;
+  try{ e=process.env.USER||FWn.userInfo().username }catch{ e="claude-code-user" }
+  if(!xGh.test(e)) return "claude-code-user";            // xGh = /^[a-zA-Z0-9._-]+$/
+  return e
+}
+```
+
+So CC prefers **`$USER`** over the passwd login name, and falls back to the literal
+`"claude-code-user"` for a name failing `/^[a-zA-Z0-9._-]+$/`. Sessiometer resolves the login name
+from the passwd database (`paths::username` → `getpwuid(getuid()).pw_name`); Node's
+`os.userInfo().username` is the same source, so the two agree **unless `$USER` is set to something
+other than the passwd name**.
+
+Blast radius is asymmetric across sessiometer's two keychain paths:
+
+- **Canonical (shared) item — immune by construction.** `CredentialStore` reads the item's `acct`
+  attribute *as stored* and never assumes `$USER` (`src/keychain.rs` § resolve). Whatever CC wrote
+  is what sessiometer addresses.
+- **Isolated item (#102 refresh / #132 capture) — the exposed seam.** That path pins `acct` up
+  front from `paths::username`, so a divergent `$USER` would make CC read a *different* `acct` than
+  the engine seeded and report `Not logged in` — precisely #145's harness bug 1.
+
+**Not currently biting**: on this machine `$USER`, `id -un`, `whoami` and `getpwuid` all agree
+(`alexey-pelykh`), and the same `uq()` shape is present in **all** installed builds
+(`2.1.209`, `2.1.215`, `2.1.216`, `2.1.217`) — so this is a characterization of the current
+derivation, **not** evidence of a regression introduced in the `2.1.21x` line. Whether `2.1.181`
+already had this shape could not be re-checked (that build is no longer on disk). Tracked as #711
+rather than fixed here; it does not gate the range bump.
+
+## Deferred — ADR-0018's live re-check trigger ⏸
+
+`# Issue #470` above defines a deferred-live re-check to fire on a CC auth bump: **does the first
+`invalid_grant` still empty the shared item?** That check is **not run here, by design** — it is
+observable only by driving a real refresh to `invalid_grant`, which *deliberately scrubs the shared
+credential* and would lock out every live session on the machine. It requires a live,
+operator-supervised window; #552 explicitly scoped it out of unattended execution.
+
+What *is* re-verified is the static half, and it is favourable: the `#466` drift canary passes
+against `2.1.217` — the scrub is still reached
+(`tengu_oauth_refresh_token_marked_dead_invalid_grant`), still writes the emptied item
+(`tengu_oauth_refresh_token_cleared_on_disk`), still clears **both** tokens, and still has
+**no `process.env` / feature-gate** at the scrub site. So the code path ADR-0018 targets is intact
+and un-knobbed on `2.1.217`; the *observable* behavior test remains outstanding.
+
+⇒ **ADR-0018's premise is unchanged as far as offline evidence can establish it.** The live
+observable check stays open — the mitigations (#467/#468) rest on behavior last observed on
+`2.1.207`, and this entry does not upgrade that to `2.1.217`.
+
+## Verdict — range widened to `2.1.181`–`2.1.217`
+
+The header protocol's bar for widening is "*at minimum* **H3** and the **#100** derivation". Both
+are re-verified above (#100 by direct decode; H3 by 40 production swaps), and #101's read/save/store
+model plus #466's scrub shape are re-verified alongside. The range moves to `2.1.181`–`2.1.217`
+here and in the README `## Prerequisites`; `scripts/check-cc-version.sh` gates both.
+
+## Provenance
+
+- Static decode of the stock **CC 2.1.217** binary (`~/.local/share/claude/versions/2.1.217`; a
+  byte-patched wrapper may sit on `$PATH`, so inspection targeted the stock binary — the
+  #100/#101/#466 method). Quoted expressions are verbatim. The cross-version `uq()` check covered
+  `2.1.209`–`2.1.217`.
+- Production signals read passively from the daemon's own event log; the daemon (pid-confirmed,
+  `sessiometer run -v`) was neither paused nor restarted.
+- **No credential read, written, or scrubbed. No `claude` spawned. No network call.**
+- Minified symbol names (`BG`, `rn`, `ks`, `uq`, `xGh`, `T0c`) are `2.1.217` identifiers and are
+  unstable across versions — the `#466` canary keys on the stable `tengu_oauth_*` event strings.
+
+CC 2.1.217 · macOS 26.5.2 / 25F84 · sessiometer #552.
