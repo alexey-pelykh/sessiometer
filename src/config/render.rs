@@ -11,7 +11,7 @@
 //! `config show` view and the persisted file can never speak different syntax. That mirroring
 //! is a standing OBLIGATION on anyone growing the schema, not a one-time coincidence: a
 //! tunable added to one walk and forgotten in the other is silently DROPPED from `config show`
-//! rather than failing loudly, which is why the parent's
+//! rather than failing loudly, which is why this module's
 //! `origin_report_reports_every_key_render_writes` drift guard (issue #401) exists. Only the
 //! report BODY lives here; the file read that feeds it is
 //! [`Config::load_with_origin`], over in [`super::load`].
@@ -730,4 +730,562 @@ fn render_str_array(items: &[String]) -> String {
 /// both written against the old implementation and re-run unchanged against this one.
 pub(super) fn basic_string(s: &str) -> String {
     TomlStringBuilder::new(s).as_basic().to_toml_value()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_support::*;
+
+    #[test]
+    fn rendered_default_config_documents_target_max_session_usage_as_a_live_value() {
+        // #398: render emits a LIVE target_max_session_usage line (default-on) that round-trips
+        // back to the same value — never a commented-out opt-in.
+        let mut config = Config::parse(VALID).unwrap();
+        config.tunables.target_max_session_usage = DEFAULT_TARGET_MAX_SESSION_USAGE;
+        let text = config.render();
+        assert!(text.contains("target_max_session_usage = 80"), "got {text}");
+        assert!(!text.contains("# target_max_session_usage ="), "got {text}");
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(
+            reparsed.tunables.target_max_session_usage,
+            DEFAULT_TARGET_MAX_SESSION_USAGE
+        );
+    }
+
+    #[test]
+    fn rendered_config_documents_the_cooldown_floor_on_one_clean_line() {
+        // Operator-facing (#272): the generated `config.toml` cooldown comment states
+        // the non-zero floor range and is a single, cleanly-joined `#` line — a guard
+        // that the source line-continuation did not leave a torn double-space.
+        let text = Config::parse(VALID).unwrap().render();
+        let comment = text
+            .lines()
+            .find(|l| l.contains("Seconds to wait after a swap"))
+            .expect("the cooldown comment must be rendered");
+        assert!(
+            comment.starts_with("# ") && !comment.contains("  "),
+            "cooldown comment must be one clean line, got: {comment:?}"
+        );
+        assert!(
+            comment.contains(&format!("{COOLDOWN_SECS_FLOOR}..=3600")),
+            "cooldown comment must document the floor range, got: {comment:?}"
+        );
+    }
+
+    #[test]
+    fn round_trips_render_then_parse() {
+        let original = Config::parse(VALID).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.tunables, reparsed.tunables);
+        assert_eq!(original.roster, reparsed.roster);
+        // The (default) refresh schedule round-trips too (issue #105).
+        assert_eq!(original.refresh, reparsed.refresh);
+        // …and the (default) [login] settings (issue #135).
+        assert_eq!(original.login, reparsed.login);
+        // …and the (default) [migration] settings (issue #150).
+        assert_eq!(original.migration, reparsed.migration);
+    }
+
+    #[test]
+    fn refresh_proactive_keep_warm_opt_in_parses_and_round_trips() {
+        // An operator restores the pre-#468 pre-emptive mint (finding #476 fallback A's base) with
+        // an explicit `proactive_keep_warm = true`; a present key is never overridden by the
+        // off-by-default serde default, and the opt-in survives the render->parse round trip.
+        let toml = format!("{VALID}\n[refresh]\nenabled = true\nproactive_keep_warm = true\n");
+        let config = Config::parse(&toml).unwrap();
+        assert!(config.refresh.proactive_keep_warm);
+        let reparsed = Config::parse(&config.render()).unwrap();
+        assert!(
+            reparsed.refresh.proactive_keep_warm,
+            "the opt-in survives emit->parse (#468)"
+        );
+    }
+
+    #[test]
+    fn refresh_round_trips_render_then_parse() {
+        // A fully-customised refresh schedule survives render → parse byte-equivalently.
+        let toml = format!(
+            "{VALID}\n[refresh]\n\
+             enabled = true\n\
+             accounts = [\"work\"]\n\
+             cadence_secs = 5400\n\
+             idle_after_secs = 90\n\
+             timeout_secs = 120\n\
+             claude_bin = \"/usr/local/bin/claude\"\n"
+        );
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.refresh, reparsed.refresh);
+    }
+
+    #[test]
+    fn rendered_default_refresh_is_on_with_commented_claude_bin() {
+        // The rendered default [refresh] block is enabled (#409) and leaves claude_bin commented
+        // (so a fresh `capture` writes a self-documenting, on-by-default block) yet round-trips.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(
+            text.contains("[refresh]"),
+            "render must emit [refresh]: {text}"
+        );
+        assert!(
+            text.contains("enabled = true"),
+            "default refresh must render enabled: {text}"
+        );
+        assert!(
+            text.contains("# claude_bin ="),
+            "an unset claude_bin must render commented: {text}"
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap().refresh,
+            RefreshConfig::default()
+        );
+    }
+
+    #[test]
+    fn login_round_trips_render_then_parse() {
+        // A fully-customised [login] block survives render → parse byte-equivalently.
+        let toml = format!(
+            "{VALID}\n[login]\n\
+             timeout_secs = 420\n\
+             claude_bin = \"/usr/local/bin/claude\"\n"
+        );
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.login, reparsed.login);
+    }
+
+    #[test]
+    fn rendered_default_login_documents_timeout_and_commented_claude_bin() {
+        // The rendered default [login] block carries the 180 s timeout and leaves claude_bin
+        // commented (a self-documenting, inert override), and round-trips to the default.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(text.contains("[login]"), "render must emit [login]: {text}");
+        assert!(
+            text.contains("timeout_secs = 180"),
+            "default login must render the 180 s timeout: {text}"
+        );
+        assert!(
+            text.contains("# claude_bin ="),
+            "an unset login claude_bin must render commented: {text}"
+        );
+        assert_eq!(Config::parse(&text).unwrap().login, LoginConfig::default());
+    }
+
+    #[test]
+    fn rendered_config_omits_the_derived_stash() {
+        // `render` no longer emits a `stash = …` line (issue #70), so the next save
+        // of a legacy file drops it. The derived stash survives the render→parse
+        // round-trip because it rides on `account_uuid`.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(
+            !text.contains("stash ="),
+            "render must not emit a stash line: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.roster[0].stash(), config.roster[0].stash());
+    }
+
+    #[test]
+    fn rendered_config_documents_and_round_trips_the_enabled_flag() {
+        // The renderer writes `enabled` for every account (capture writes it; #36)
+        // with an inline doc, and a disabled account survives a render→parse cycle.
+        let mut config = Config::parse(VALID).unwrap();
+        config.roster[1].enabled = false;
+        let text = config.render();
+        assert!(text.contains("enabled = true"), "got {text}");
+        assert!(text.contains("enabled = false"), "got {text}");
+        assert!(
+            text.contains("# In the rotation?"),
+            "documents enabled: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.roster, config.roster);
+        assert!(reparsed.roster[0].enabled);
+        assert!(!reparsed.roster[1].enabled);
+    }
+
+    #[test]
+    fn round_trips_a_configured_jitter_table() {
+        let toml = with_jitter(
+            "poll = { kind = \"uniform\", spread = 12.5 }\n\
+             session_ceiling = { kind = \"normal\", stddev = 1.5 }\n\
+             weekly_ceiling = { kind = \"uniform\", spread = 0.5 }\n\
+             cooldown = { kind = \"none\" }",
+        );
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.tunables, reparsed.tunables);
+    }
+
+    #[test]
+    fn rendered_config_documents_the_jitter_table() {
+        let text = Config::parse(VALID).unwrap().render();
+        assert!(text.contains("[jitter]"));
+        for key in ["poll", "session_ceiling", "weekly_ceiling", "cooldown"] {
+            assert!(
+                text.contains(key),
+                "rendered config must mention jitter.{key}"
+            );
+        }
+        // The default poll jitter renders as a normal strategy with a decimal
+        // magnitude (so it re-parses as a TOML float).
+        assert!(text.contains("kind = \"normal\""));
+        assert!(text.contains("stddev = 60.0"));
+    }
+
+    #[test]
+    fn round_trips_a_label_that_needs_escaping() {
+        let toml = "[[account]]\n\
+                    account_uuid = \"u\"\n\
+                    label = \"tab\\there \\\"quote\\\" and \\\\ slash\"\n";
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.roster[0].label, "tab\there \"quote\" and \\ slash");
+        let reparsed = Config::parse(&config.render()).unwrap();
+        assert_eq!(reparsed.roster[0].label, config.roster[0].label);
+    }
+
+    #[test]
+    fn rendered_config_documents_the_tunables() {
+        let text = Config::parse(VALID).unwrap().render();
+        // AC #5: the written file carries the inline tunable docs, in particular
+        // the target_max_session_usage "most-full a target may be to receive the session" semantics.
+        assert!(text.contains("The most-full an account may be to receive"));
+        for key in [
+            "poll_secs",
+            "exhausted_poll_secs",
+            "near_limit_poll_secs",
+            "cooldown_secs",
+            "target_max_session_usage",
+            "session_ceiling",
+            "weekly_ceiling",
+            "session_velocity_horizon_secs",
+            "session_velocity_min_project_above",
+            "session_velocity_ema_alpha_pct",
+            "monitor_401_n",
+            "monitor_recovery_m",
+        ] {
+            assert!(text.contains(key), "rendered config must mention {key}");
+        }
+        // Issue #76 AC3: the poll_secs comment documents the default cadence + jitter
+        // AND the rate-limit / transient back-off (incl. Retry-After) — so an operator
+        // hand-editing poll_secs learns the spacing widens automatically under 429/5xx.
+        assert!(
+            text.contains("The default 300 (5 min)"),
+            "poll_secs comment must document the default cadence: {text:?}"
+        );
+        assert!(
+            text.contains("backs off automatically"),
+            "poll_secs comment must document the back-off: {text:?}"
+        );
+        assert!(
+            text.contains("Retry-After"),
+            "poll_secs comment must document honouring Retry-After: {text:?}"
+        );
+    }
+
+    /// Pins the full escape surface of [`basic_string`], not just the common cases.
+    ///
+    /// Written to characterize the hand-rolled emitter BEFORE #403 delegated it to
+    /// `toml_writer`, then re-run unchanged against the delegated one: an identical
+    /// pass across every escape class is the empirical evidence that the swap is
+    /// behavior-preserving. Do not thin it out — each arm below is a distinct branch
+    /// of the TOML `basic-unescaped` grammar.
+    #[test]
+    fn basic_string_escapes_specials() {
+        assert_eq!(basic_string("plain"), "\"plain\"");
+        assert_eq!(basic_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(basic_string("tab\tnl\n"), "\"tab\\tnl\\n\"");
+        assert_eq!(basic_string("\u{0}"), "\"\\u0000\"");
+
+        // The named escapes TOML defines, each on its own.
+        assert_eq!(basic_string("\u{08}"), "\"\\b\"");
+        assert_eq!(basic_string("\u{0c}"), "\"\\f\"");
+        assert_eq!(basic_string("\r"), "\"\\r\"");
+
+        // Remaining C0 controls and DEL take the \uXXXX form, upper-case hex.
+        assert_eq!(basic_string("\u{1}"), "\"\\u0001\"");
+        assert_eq!(basic_string("\u{1f}"), "\"\\u001F\"");
+        assert_eq!(basic_string("\u{7f}"), "\"\\u007F\"");
+
+        // Non-ASCII is valid literally in a basic string — never escaped. This is the
+        // arm an operator's label most plausibly exercises (issue #176 wide glyphs).
+        assert_eq!(basic_string("café"), "\"café\"");
+        assert_eq!(basic_string("работа"), "\"работа\"");
+        assert_eq!(basic_string("🟢 work"), "\"🟢 work\"");
+
+        // Space and `'` stay literal; only `"` and `\` are structural.
+        assert_eq!(basic_string("a b 'c'"), "\"a b 'c'\"");
+
+        // Empty renders as an empty basic string, not a bare pair of nothing.
+        assert_eq!(basic_string(""), "\"\"");
+    }
+
+    /// Every string [`Config::render`] emits must survive a render → parse round-trip.
+    /// Guards the #403 delegation at the level that actually matters: the emitted file
+    /// re-parses to the same values, for the whole escape surface at once.
+    ///
+    /// The empty string is deliberately absent: `""` escapes fine (pinned above) but
+    /// `validate` rejects an empty `label` outright, which is a roster invariant, not an
+    /// escaping property.
+    #[test]
+    fn rendered_strings_round_trip_through_the_parser() {
+        for label in [
+            "plain",
+            "a\"b\\c",
+            "tab\there",
+            "nl\nhere",
+            "cr\rhere",
+            "\u{08}\u{0c}",
+            "\u{0}\u{1f}\u{7f}",
+            "café ☕",
+            "🟢 work",
+        ] {
+            let rendered = basic_string(label);
+            let toml = format!("[[account]]\naccount_uuid = \"u\"\nlabel = {rendered}\n");
+            let config = Config::parse(&toml)
+                .unwrap_or_else(|e| panic!("{label:?} rendered as {rendered} must parse: {e}"));
+            assert_eq!(
+                config.roster[0].label, label,
+                "{label:?} must survive render -> parse unchanged"
+            );
+        }
+    }
+
+    // --- config show --origin (issue #401) ---------------------------------
+
+    /// The provenance test #401 exists for: a file that sets ONLY `session_ceiling`
+    /// must show that one key `FromFile` and EVERY other tunable — plus every absent
+    /// optional section — `Default`, so a silently-defaulted (absent) block is visible.
+    #[test]
+    fn origin_report_tags_absent_keys_default_and_present_keys_from_file() {
+        let text = "[tunables]\nsession_ceiling = 90\n";
+        let config = Config::from_toml_str(text).expect("a lone session_ceiling is valid");
+        let table: toml::Table = toml::from_str(text).expect("valid TOML");
+        let report = config.origin_report(&table);
+
+        let tunables = &report.sections[0];
+        assert_eq!(tunables.header, "[tunables]");
+        assert!(tunables.present, "[tunables] is present");
+        let by_key = |k: &str| {
+            tunables
+                .entries
+                .iter()
+                .find(|e| e.key == k)
+                .unwrap_or_else(|| panic!("no `{k}` entry"))
+        };
+        assert_eq!(by_key("session_ceiling").origin, Origin::FromFile);
+        assert_eq!(by_key("session_ceiling").value, "90");
+        // Every OTHER tunable in the present section is still a compiled-in default.
+        assert_eq!(by_key("poll_secs").origin, Origin::Default);
+        assert_eq!(by_key("target_max_session_usage").origin, Origin::Default);
+        assert_eq!(by_key("monitor_401_n").origin, Origin::Default);
+
+        // Every optional section is absent → not present, all values Default.
+        for header in ["[jitter]", "[refresh]", "[login]", "[stats]", "[migration]"] {
+            let section = report
+                .sections
+                .iter()
+                .find(|s| s.header == header)
+                .unwrap_or_else(|| panic!("no `{header}` section"));
+            assert!(!section.present, "{header} is absent");
+            assert!(
+                section.entries.iter().all(|e| e.origin == Origin::Default),
+                "{header} keys are all Default when the section is absent",
+            );
+        }
+        assert_eq!(report.roster_count, 0);
+        assert!(!report.roster_present, "no [[account]] in the file");
+    }
+
+    /// Keys and sections PRESENT in the file read `FromFile`; a key omitted from an
+    /// otherwise-present section still reads `Default`; a populated roster is counted
+    /// and flagged present.
+    #[test]
+    fn origin_report_marks_present_sections_keys_and_roster_from_file() {
+        let text = "\
+[tunables]
+poll_secs = 45
+
+[refresh]
+enabled = true
+
+[[account]]
+account_uuid = \"11111111-1111\"
+label = \"work\"
+";
+        let config = Config::from_toml_str(text).expect("valid config");
+        let table: toml::Table = toml::from_str(text).expect("valid TOML");
+        let report = config.origin_report(&table);
+
+        let tunables = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[tunables]")
+            .unwrap();
+        let poll = tunables
+            .entries
+            .iter()
+            .find(|e| e.key == "poll_secs")
+            .unwrap();
+        assert_eq!(poll.origin, Origin::FromFile);
+        assert_eq!(poll.value, "45");
+        // Present section, absent key → still Default.
+        let cooldown = tunables
+            .entries
+            .iter()
+            .find(|e| e.key == "cooldown_secs")
+            .unwrap();
+        assert_eq!(cooldown.origin, Origin::Default);
+
+        let refresh = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[refresh]")
+            .unwrap();
+        assert!(refresh.present);
+        let enabled = refresh.entries.iter().find(|e| e.key == "enabled").unwrap();
+        assert_eq!(enabled.origin, Origin::FromFile);
+        assert_eq!(enabled.value, "true");
+
+        assert_eq!(report.roster_count, 1);
+        assert!(report.roster_present);
+    }
+
+    /// #401 drift guard, the complement of `..._all_from_file` above: every key `render`
+    /// writes for a full config MUST also appear in `origin_report`. Without this, a tunable
+    /// added to `render` but forgotten in `origin_report` would be silently DROPPED from
+    /// `config show` — the drift most likely as the schema grows (jitter #38, refresh #105,
+    /// stats #161, migration #150, target_max_session_usage #398). Asserts `live ⊆ reported`.
+    #[test]
+    fn origin_report_reports_every_key_render_writes() {
+        let config = Config::parse(VALID).unwrap();
+        let table: toml::Table = toml::from_str(&config.render()).unwrap();
+        let report = config.origin_report(&table);
+        for (name, live) in &table {
+            // The `[[account]]` roster is summarized, not key-listed — skip the array.
+            let Some(live) = live.as_table() else {
+                continue;
+            };
+            let want = format!("[{name}]");
+            let section = report
+                .sections
+                .iter()
+                .find(|s| s.header == want.as_str())
+                .unwrap_or_else(|| panic!("render writes {want} but origin_report has no section"));
+            let reported: std::collections::BTreeSet<&str> =
+                section.entries.iter().map(|e| e.key).collect();
+            for key in live.keys() {
+                assert!(
+                    reported.contains(key.as_str()),
+                    "render writes {name}.{key} but origin_report omits it — config show would drop it",
+                );
+            }
+        }
+    }
+
+    /// AC #3 + #4 end-to-end: a config written the way `capture` will write it
+    /// (rendered → `write_private_file`) is read back identically by the daemon's
+    /// `load`, and the on-disk file is `0600`.
+    #[test]
+    fn written_config_round_trips_through_disk_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let original = Config::parse(VALID).unwrap();
+        paths::write_private_file(&path, original.render().as_bytes()).unwrap();
+
+        let loaded = Config::load_path(&path).unwrap();
+        assert_eq!(loaded.tunables, original.tunables);
+        assert_eq!(loaded.roster, original.roster);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // --- [stats] block (issue #161) -----------------------------------------
+
+    #[test]
+    fn rendered_default_config_round_trips_the_stats_block() {
+        // The rendered default config carries a `[stats]` block that reparses to the same
+        // settings — the render → parse round-trip the other blocks hold to.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(text.contains("[stats]"), "render must emit [stats]: {text}");
+        assert!(
+            text.contains("raw_retention_secs ="),
+            "render must document raw retention: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.stats, config.stats);
+    }
+
+    #[test]
+    fn rendered_stats_round_trips_operator_overrides() {
+        // Operator-set non-defaults survive render → parse unchanged (defaults + overrides,
+        // the issue's round-trip AC).
+        let mut config = Config::parse(VALID).unwrap();
+        config.stats = StatsConfig {
+            raw_retention_secs: 3_600,          // the lower bound
+            hourly_retention_secs: 315_360_000, // the upper bound
+            daily_retention_secs: 7_776_000,
+            default_period: "day".to_owned(),
+        };
+        let text = config.render();
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.stats, config.stats);
+    }
+
+    // --- [migration] block (issue #150) -------------------------------------
+
+    #[test]
+    fn rendered_default_config_round_trips_the_migration_block() {
+        // The rendered default config carries a `[migration]` block that reparses to the same
+        // settings — the render → parse round-trip the other blocks hold to.
+        let config = Config::parse(VALID).unwrap();
+        let text = config.render();
+        assert!(
+            text.contains("[migration]"),
+            "render must emit [migration]: {text}"
+        );
+        assert!(
+            text.contains("kdf_memory_kib ="),
+            "render must document the KDF cost: {text}"
+        );
+        assert!(
+            text.contains("conflict_policy ="),
+            "render must document the conflict policy: {text}"
+        );
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.migration, config.migration);
+    }
+
+    #[test]
+    fn rendered_migration_round_trips_operator_overrides() {
+        // Operator-set non-defaults survive render → parse unchanged (defaults + overrides, the
+        // issue's round-trip AC). Uses the exact range bounds to prove they render/reparse.
+        let mut config = Config::parse(VALID).unwrap();
+        config.migration = MigrationConfig {
+            kdf_memory_kib: 1_048_576, // the upper bound
+            kdf_iterations: 16,        // the upper bound
+            conflict_policy: ConflictPolicy::Overwrite,
+        };
+        let text = config.render();
+        let reparsed = Config::parse(&text).unwrap();
+        assert_eq!(reparsed.migration, config.migration);
+
+        // …and the lower bounds round-trip too.
+        config.migration = MigrationConfig {
+            kdf_memory_kib: 8,
+            kdf_iterations: 1,
+            conflict_policy: ConflictPolicy::Skip,
+        };
+        let reparsed = Config::parse(&config.render()).unwrap();
+        assert_eq!(reparsed.migration, config.migration);
+    }
 }

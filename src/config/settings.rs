@@ -156,3 +156,265 @@ fn overlay_labels(accounts: &mut [RawAccount], labels: &BTreeMap<String, String>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::test_support::*;
+
+    // ── config-set / config-get backend (issue #268) ──
+
+    /// A `BTreeMap<uuid, label>` for the `config-set` label edits (fully qualified so the
+    /// test needs no extra `use`).
+    fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(uuid, label)| (uuid.to_string(), label.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn apply_settings_overlays_a_tunable_and_revalidates() {
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(300),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.poll_secs, 300);
+        assert!(change.tunables_changed);
+        assert!(!change.labels_changed);
+        // A tunables-only edit leaves the roster untouched.
+        assert_eq!(after.roster.len(), 2);
+    }
+
+    #[test]
+    fn apply_settings_relabels_an_account_by_uuid() {
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("11111111-1111-1111-1111-111111111111", "day-job")]),
+        )
+        .unwrap();
+        assert!(change.labels_changed);
+        assert!(!change.tunables_changed);
+        let renamed = after
+            .roster
+            .iter()
+            .find(|a| a.account_uuid == "11111111-1111-1111-1111-111111111111")
+            .unwrap();
+        assert_eq!(renamed.label, "day-job");
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_out_of_range_tunable() {
+        // poll_secs floor is 5; 4 is out of range → the whole batch is rejected.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(4),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_validates_the_final_batch_not_intermediate_states() {
+        // Current: poll_secs=30, exhausted_poll_secs=60. Raising poll_secs to 300 AND
+        // exhausted to 7200 is valid as a WHOLE (300 <= 7200), even though applying poll
+        // first would transiently violate `exhausted >= poll` (60 < 300). Atomic validation
+        // over the final state is what lets a settings-form "Apply" move coupled fields.
+        let base = with_tunables("poll_secs = 30\nexhausted_poll_secs = 60");
+        let (after, _) = Config::apply_settings(
+            &base,
+            &SetTunables {
+                poll_secs: Some(300),
+                exhausted_poll_secs: Some(7200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.poll_secs, 300);
+        assert_eq!(after.tunables.exhausted_poll_secs, 7200);
+    }
+
+    #[test]
+    fn apply_settings_rejects_a_cross_field_invalid_batch() {
+        // exhausted_poll_secs must be >= poll_secs; 200 < 300 → rejected as a whole.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(300),
+                exhausted_poll_secs: Some(200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_rejects_target_max_above_session_ceiling() {
+        // VALID session_ceiling=90; target_max_session_usage=95 > 90 → the distinct cross-field error.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                target_max_session_usage: Some(95),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ConfigTargetMaxSessionAboveTrigger { .. }
+        ));
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_unknown_account_uuid() {
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("no-such-uuid", "x")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::AccountUuidNotFound { .. }));
+    }
+
+    #[test]
+    fn apply_settings_rejects_an_empty_label() {
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables::default(),
+            &labels(&[("11111111-1111-1111-1111-111111111111", "  ")]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn apply_settings_reports_no_change_for_a_noop_edit() {
+        // Submitting the current value + current label changes nothing.
+        let (_, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                poll_secs: Some(30), // VALID's current poll_secs
+                ..SetTunables::default()
+            },
+            &labels(&[("11111111-1111-1111-1111-111111111111", "work")]),
+        )
+        .unwrap();
+        assert!(!change.tunables_changed);
+        assert!(!change.labels_changed);
+    }
+
+    #[test]
+    fn apply_settings_overlays_fleet_runway_warn_and_the_view_projects_it() {
+        // Issue #650: the new tunable rides the SAME #268 config-set overlay + config-get view
+        // as every other scalar — no parallel surface. Set it via `SetTunables`, read it back
+        // through `view()` (the config-get projection).
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                fleet_runway_warn_secs: Some(7200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.fleet_runway_warn_secs, 7200);
+        assert!(change.tunables_changed);
+        assert!(!change.labels_changed);
+        assert_eq!(after.view().tunables.fleet_runway_warn_secs, 7200);
+        // The overlaid value renders and re-parses verbatim (config-set persists via `render`).
+        let reparsed = Config::parse(&after.render()).unwrap();
+        assert_eq!(reparsed.tunables.fleet_runway_warn_secs, 7200);
+
+        // The atomic re-validate rejects an out-of-band set (59, a non-zero sub-floor) as a
+        // whole batch — the config-set path enforces the same 0-or-band shape as load.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                fleet_runway_warn_secs: Some(59),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+
+        // The key is a representable scalar edit (serde round-trip), unset stays None.
+        let parsed: SetTunables =
+            serde_json::from_str(r#"{"fleet_runway_warn_secs":7200}"#).unwrap();
+        assert_eq!(parsed.fleet_runway_warn_secs, Some(7200));
+        let empty: SetTunables = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.fleet_runway_warn_secs, None);
+    }
+
+    #[test]
+    fn apply_settings_refuses_a_currently_unreadable_config() {
+        // A hand-broken file fails at the baseline parse — config-set never overwrites a
+        // file it cannot understand.
+        let err = Config::apply_settings(
+            "this is not toml [[[",
+            &SetTunables::default(),
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigParse(_)));
+    }
+
+    #[test]
+    fn set_tunables_rejects_a_forbidden_key() {
+        // SAFETY invariant: only the scalar tunable keys are representable. A credential, a
+        // roster field, or any other key is a hard parse error (deny_unknown_fields), so the
+        // credential/roster-structure boundary cannot be crossed through config-set.
+        for forbidden in [
+            r#"{"account_uuid":"x"}"#,
+            r#"{"credential":"secret"}"#,
+            r#"{"label":"x"}"#,
+            r#"{"enabled":true}"#,
+            r#"{"poll_secs":300,"roster":[]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SetTunables>(forbidden).is_err(),
+                "forbidden key accepted: {forbidden}"
+            );
+        }
+        // A bare scalar tunable parses; unset keys stay None.
+        let ok: SetTunables = serde_json::from_str(r#"{"poll_secs":300}"#).unwrap();
+        assert_eq!(ok.poll_secs, Some(300));
+        assert_eq!(ok.session_ceiling, None);
+    }
+
+    #[test]
+    fn config_view_projects_tunables_and_roster() {
+        let view = Config::parse(VALID).unwrap().view();
+        assert_eq!(view.tunables.poll_secs, 30);
+        assert_eq!(view.tunables.session_ceiling, 90);
+        assert_eq!(view.accounts.len(), 2);
+        assert_eq!(
+            view.accounts[0].account_uuid,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(view.accounts[0].label, "work");
+        assert!(view.accounts[0].enabled);
+    }
+
+    #[test]
+    fn config_view_serde_round_trips() {
+        let view = Config::parse(VALID).unwrap().view();
+        let json = serde_json::to_string(&view).unwrap();
+        let back: ConfigView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+    }
+}
