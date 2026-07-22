@@ -2060,10 +2060,26 @@ pub(crate) fn render_status(
     if cornered.is_none() {
         out.push_str(&render_next_swap(response.next_swap.as_ref(), now));
     }
-    out.push_str(&render_systemic_refresh_failure(response, color));
+    // Worst-first (ADR-0026), so the CLI's print order agrees with its colour rank AND with the
+    // menubar panel's `daemonFaultBanner`: keychain unreadable (rank 1, act-now `Red`), then canonical
+    // scrubbed-`exhausted` (rank 2, act-now `Red`), then the landing-overshoot SLO breach (#613, `Red`),
+    // then the pre-death systemic mechanism-down (rank 3, `Yellow`, act-at-your-next-break), and LAST the
+    // calm canonical `recovering` (rank 4, plain — may self-heal). `canonical_scrub` is
+    // exhausted-XOR-recovering, so its two variants emit at their OWN ranks: the guards keeping the calm
+    // `recovering` line BELOW `systemic` mirror the panel resolver's `if case .exhausted` at rank 2 vs its
+    // fall-through at rank 4 — severity ranks by (fault, VARIANT), never fault identity (the panel's
+    // load-bearing invariant, applied to print order too, so a `recovering` scrub co-occurring with a down
+    // refresh mechanism can't sit its "no action needed" ABOVE the `Yellow` warning). Before #575
+    // `systemic` sat first AND wore the only red, ranking the least-blocking fault the loudest.
+    out.push_str(&render_keychain_locked(response, color));
+    if matches!(response.canonical_scrub, Some(CanonicalScrub::Exhausted)) {
+        out.push_str(&render_canonical_scrub(response, color));
+    }
     out.push_str(&render_landing_overshoot(response, color));
-    out.push_str(&render_keychain_locked(response));
-    out.push_str(&render_canonical_scrub(response));
+    out.push_str(&render_systemic_refresh_failure(response, color));
+    if matches!(response.canonical_scrub, Some(CanonicalScrub::Recovering)) {
+        out.push_str(&render_canonical_scrub(response, color));
+    }
     out.push_str(&render_refresh_disabled_advisory(response, color));
     out
 }
@@ -2220,19 +2236,74 @@ fn cornered_state<'a>(
     }
 }
 
-/// A daemon-fault footer line: `body` as DATA — printed UNCONDITIONALLY so it survives a pipe /
-/// redirect / `status | grep`, an operator's health check must be able to see it — plus its
-/// newline, red-emphasized only when `emphasize` is set. The overlay is the SAME
-/// `\x1b[{code}m…\x1b[0m` SGR [`render_cells`] wraps a table cell in, so every fault line in this
-/// surface tints identically; folding the four sites into one call is what KEEPS them identical
-/// (the invariant was previously hand-maintained in four prose cross-references). The plain text
-/// carries the whole message on its own, so a `--no-color` / piped reader loses nothing — the
-/// colour only ever AUGMENTS.
-fn red_line(body: &str, emphasize: bool) -> String {
-    if emphasize {
-        format!("\x1b[{}m{body}\x1b[0m\n", Severity::Red.sgr())
+/// A daemon-fault line: `body` as DATA — printed UNCONDITIONALLY so it survives a pipe / redirect /
+/// `status | grep`, an operator's health check must be able to see it — plus its newline, tinted at
+/// `severity`'s SGR band only when the `color` gate is open. The overlay is the SAME
+/// `\x1b[{code}m…\x1b[0m` SGR [`render_cells`] wraps a table cell in, so a fault line tints exactly
+/// like the util cells it sits beneath — colour on this surface is one severity vocabulary, not a
+/// per-line register (ADR-0026). The plain text carries the whole message on its own, so a
+/// `--no-color` / piped reader loses nothing — the colour only ever AUGMENTS.
+fn severity_line(body: &str, severity: Severity, color: bool) -> String {
+    if color {
+        format!("\x1b[{}m{body}\x1b[0m\n", severity.sgr())
     } else {
         format!("{body}\n")
+    }
+}
+
+/// A `Severity::Red` fault line — the loudest runtime DATA faults: the per-account cornered `⊘`
+/// state, a blind-DEGRADED active, a landing-overshoot SLO breach. A thin wrapper over
+/// [`severity_line`] so those callers keep their one-word intent; `emphasize` is the colour gate.
+fn red_line(body: &str, emphasize: bool) -> String {
+    severity_line(body, Severity::Red, emphasize)
+}
+
+/// The daemon-level payload faults (ADR-0026): faults that ride ALONGSIDE a healthy roster, which no
+/// per-account `AUTH` cell reflects — the shared vault is one item and the refresh mechanism is one
+/// process, so neither has a row to live on. Enumerated ONCE here so their cross-surface severity
+/// RANK has a single home; #575 caught the CLI and the menubar panel ranking them in OPPOSITE order
+/// precisely because each render site re-derived the rank independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonPayloadFault {
+    /// #498 — the login keychain is LOCKED, the shared credential is UNREADABLE.
+    KeychainLocked,
+    /// #469 — the shared credential is readable but EMPTIED and auto-recovery gave up.
+    CanonicalScrubExhausted,
+    /// #378 — the refresh MECHANISM is down (N consecutive all-error sweeps).
+    SystemicRefreshFailure,
+    /// #469 — scrubbed, but the daemon is adopting a live account back; may self-heal.
+    CanonicalScrubRecovering,
+}
+
+impl DaemonPayloadFault {
+    /// The canonical cross-surface severity RANK of this fault (ADR-0026), in the CLI's own
+    /// [`Severity`] vocabulary. It MUST agree with the menubar panel's rank
+    /// (`StatusPanelFormat.daemonFaultBanner`'s `.error`/`.warning`/`.info`), though each surface
+    /// renders it in its own medium — an SGR line vs a banner tint (R-2 is rank-parity, not
+    /// glyph-parity). The vault pair blocks the operator NOW ⇒ `Red` (act now); a down refresh
+    /// mechanism is pre-death, every account still alive ⇒ `Yellow` (act at your next break); a
+    /// recovering scrub may self-heal ⇒ `None` (calm, uncoloured — colouring it would cry wolf).
+    /// Red here is a SEVERITY band, not a line-register: it is the same `Severity::Red` the util
+    /// cells and the cornered `⊘` state use, so systemic's pre-#575 red (over the plain vault pair)
+    /// contradicted the CLI's own vocabulary — the inversion #575 fixes.
+    fn severity(self) -> Option<Severity> {
+        match self {
+            Self::KeychainLocked | Self::CanonicalScrubExhausted => Some(Severity::Red),
+            Self::SystemicRefreshFailure => Some(Severity::Yellow),
+            Self::CanonicalScrubRecovering => None,
+        }
+    }
+}
+
+/// Render a daemon-payload-fault line at its canonical rank colour (ADR-0026): the fault's
+/// [`DaemonPayloadFault::severity`] band as an SGR overlay when the `color` gate is open, or plain
+/// when the fault is calm (`recovering`) or the gate is closed. Folds the four fault sites into one
+/// call so they render identically. The plain text always carries the whole message (colour only
+/// augments), so a `--no-color` / piped reader loses nothing.
+fn daemon_fault_line(body: &str, fault: DaemonPayloadFault, color: bool) -> String {
+    match fault.severity() {
+        Some(severity) => severity_line(body, severity, color),
+        None => format!("{body}\n"),
     }
 }
 
@@ -2387,8 +2458,10 @@ fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
 /// down — `consecutive` sweeps in a row failed with error across EVERY eligible account (a stale
 /// `claude` path #375, a wedged spawn), not one account's creds. Surfaced as DATA (not advisory
 /// chrome like the #138 line): printed UNCONDITIONALLY so it survives a pipe / redirect /
-/// `status | grep` — an operator's health check must be able to see it — with a red emphasis added
-/// only when the color gate is open. Distinct from the per-account `AUTH` column: it is the whole
+/// `status | grep` — an operator's health check must be able to see it — tinted `Yellow` (its "act
+/// at your next break" rank, ADR-0026: pre-death — every account still alive — so it sits BELOW the
+/// vault pair's act-now `Red`) only when the colour gate is open. Distinct from the per-account
+/// `AUTH` column: it is the whole
 /// mechanism failing, visible before any account dies. Carries only the COUNT (issue #15). Mutually
 /// exclusive with the #138 advisory (that needs `[refresh]` OFF; this needs sweeps running, i.e.
 /// ON), so their ordering never matters.
@@ -2404,7 +2477,7 @@ fn render_systemic_refresh_failure(response: &StatusResponse, color: bool) -> St
          account; the mechanism is failing, not one account (check the daemon log 'reason=' \
          and the [refresh] claude binary)"
     );
-    red_line(&body, color)
+    daemon_fault_line(&body, DaemonPayloadFault::SystemicRefreshFailure, color)
 }
 
 /// The daemon-level RUNTIME landing-overshoot notice (issue #613): THIS machine observed a
@@ -2412,8 +2485,11 @@ fn render_systemic_refresh_failure(response: &StatusResponse, color: bool) -> St
 /// #595 landing overshoot the swap-DECISION reading is blind to, caught LIVE instead of only in a
 /// later offline `reliability` run. Surfaced as DATA (not advisory chrome): printed UNCONDITIONALLY
 /// so it survives a pipe / redirect / `status | grep` — an operator's health check must see the SLO
-/// breach — with a red emphasis added only when the color gate is open, exactly like the systemic
-/// line. Names the parked account and the fired-vs-landed spread, and distinguishes the two breach
+/// breach — tinted `Red` only when the color gate is open: an act-now SLO breach, the same `Red` as
+/// the vault pair. A per-machine RUNTIME notice, deliberately OUTSIDE the ADR-0026 daemon-payload rank
+/// (keychain / scrub / systemic), so it keeps [`red_line`] rather than [`daemon_fault_line`] — it is
+/// not a shared-vault or refresh-mechanism fault, just a Red line that happens to sit among them.
+/// Names the parked account and the fired-vs-landed spread, and distinguishes the two breach
 /// CLASSES the offline SLI also splits: a swap that fired BELOW the SLO whose parked in-flight drain
 /// then carried it over is the post-swap committed TAIL; a swap that fired already AT/OVER the SLO
 /// (the daemon was blind/late) is a GAP-CROSSING — it did NOT climb after the swap, so the causal
@@ -2458,16 +2534,21 @@ fn render_landing_overshoot(response: &StatusResponse, color: bool) -> String {
 /// `status | grep`, an operator's health check must see it), naming the state AND the unlock remedy.
 /// Content-parity with the menubar (`StatusPanelFormat.keychainLockedBanner`): same state + same
 /// unlock remedy, each medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for
-/// `ActiveDeadNoTarget`). Printed PLAIN — the action-first footer register of the `shared login:
-/// scrubbed …` sibling (ADR-0016), NOT the systemic line's red SGR. Rendered ABOVE `canonical_scrub`
+/// `ActiveDeadNoTarget`). Tinted `Red` (rank 1, act-now) when the colour gate is open — the vault is
+/// UNREADABLE, so the operator is blocked NOW; the same act-now `Red` as `canonical_scrub`
+/// `exhausted`, ABOVE the systemic line's `Yellow` (ADR-0026 — the #575 rank, superseding the
+/// earlier "plain footer register" framing this comment once carried). Rendered ABOVE `canonical_scrub`
 /// (worst-first: an unreadable item is at least as severe as a readable-but-scrubbed one), though
 /// the two are daemon-mutually-exclusive in practice (a locked keychain can't be read to know
 /// scrubbed-ness). A bare BINARY state discriminant — never a token or email (issue #15). `false` (a
 /// healthy / pre-#498 daemon that omits the field) prints nothing.
-fn render_keychain_locked(response: &StatusResponse) -> String {
+fn render_keychain_locked(response: &StatusResponse, color: bool) -> String {
     if response.keychain_locked {
-        "shared login: unreadable — the login keychain is locked; unlock it to restore access\n"
-            .to_owned()
+        daemon_fault_line(
+            "shared login: unreadable — the login keychain is locked; unlock it to restore access",
+            DaemonPayloadFault::KeychainLocked,
+            color,
+        )
     } else {
         String::new()
     }
@@ -2482,27 +2563,33 @@ fn render_keychain_locked(response: &StatusResponse) -> String {
 /// the un-recoverable residual, the `claude /login` remedy. Content-parity with the menubar
 /// (`StatusPanelFormat.canonicalScrubBanner`): same state + same `claude /login` remedy, each
 /// medium phrasing it its own way (R-2 state-parity, as ADR-0016 did for `ActiveDeadNoTarget`).
-/// Printed PLAIN — no color overlay, in the action-first footer register of the `next swap: none
-/// — …` footer (ADR-0016), NOT the systemic line's red SGR. A fleet-wide STATE discriminant only —
-/// never per-account, never a token or email (issue #15). `None` (a healthy / pre-#516 daemon that
+/// `Exhausted` is tinted `Red` (rank 2, act-now — every session is logged out NOW), the same
+/// act-now band as `keychain_locked` and ABOVE the systemic line's `Yellow`; `Recovering` stays
+/// PLAIN — calm, may self-heal, colouring it would cry wolf (ADR-0026 — the #575 rank, superseding
+/// the earlier "plain footer register" framing this comment once carried). A fleet-wide STATE
+/// discriminant only — never per-account, never a token or email (issue #15). `None` (a healthy / pre-#516 daemon that
 /// omits the field) prints nothing.
-fn render_canonical_scrub(response: &StatusResponse) -> String {
+fn render_canonical_scrub(response: &StatusResponse, color: bool) -> String {
     match response.canonical_scrub {
         // Exhausted — recovery backed off (the bounded adopt churn hit its cap, or no viable adopt
         // target exists), so the canonical stays empty until a re-login. Name the state AND the
-        // actionable remedy; `claude /login` is the byte-shared remedy the menubar names too.
-        Some(CanonicalScrub::Exhausted) => {
+        // actionable remedy; `claude /login` is the byte-shared remedy the menubar names too. Red,
+        // act-now (ADR-0026): every session is logged out NOW.
+        Some(CanonicalScrub::Exhausted) => daemon_fault_line(
             "shared login: scrubbed — every session is logged out and auto-recovery is exhausted; \
-             run claude /login to restore it\n"
-                .to_owned()
-        }
+             run claude /login to restore it",
+            DaemonPayloadFault::CanonicalScrubExhausted,
+            color,
+        ),
         // Recovering — the daemon is autonomously adopting a live account back into the canonical, so
-        // the fleet may self-heal with NO operator action. The calm, no-remedy cue (lower severity).
-        Some(CanonicalScrub::Recovering) => {
+        // the fleet may self-heal with NO operator action. The calm, no-remedy cue (lower severity) —
+        // rendered PLAIN (ADR-0026: `CanonicalScrubRecovering` carries no colour; colouring would cry wolf).
+        Some(CanonicalScrub::Recovering) => daemon_fault_line(
             "shared login: scrubbed — recovering automatically (adopting a live account); \
-             no action needed\n"
-                .to_owned()
-        }
+             no action needed",
+            DaemonPayloadFault::CanonicalScrubRecovering,
+            color,
+        ),
         None => String::new(),
     }
 }
@@ -4515,6 +4602,24 @@ spare  22222222-2222\n\
             !render_status(&response(None), NOW, None, false).contains("refresh mechanism"),
             "no DOWN line when the mechanism is healthy"
         );
+
+        // #575: with the colour gate OPEN, the systemic line carries the `Yellow` band — its
+        // "act at your next break" rank (pre-death) — and NOT the `Red` it wore before #575 (which
+        // ranked it, wrongly, ABOVE the act-now vault pair). Colour only augments; the plain text is
+        // unchanged under `--no-color`.
+        let down_colored = render_status(&response(Some(3)), NOW, None, true)
+            .lines()
+            .find(|l| l.contains("refresh mechanism: DOWN"))
+            .expect("the mechanism-down line is present under --color")
+            .to_owned();
+        assert!(
+            down_colored.contains(&format!("\x1b[{}m", Severity::Yellow.sgr())),
+            "systemic is tinted Yellow (next-break rank): {down_colored:?}"
+        );
+        assert!(
+            !down_colored.contains(&format!("\x1b[{}m", Severity::Red.sgr())),
+            "systemic is NOT Red — it must not outrank the act-now vault pair (#575): {down_colored:?}"
+        );
     }
 
     #[test]
@@ -4582,6 +4687,30 @@ spare  22222222-2222\n\
             "the scrubbed line is unconditional data, present under --color too"
         );
 
+        // #575: with the colour gate OPEN, `Exhausted` carries the act-now `Red` band (rank 2, the
+        // same band as `keychain_locked`), while `Recovering` stays PLAIN — calm, may self-heal, so
+        // colouring it would cry wolf. Both plain texts are unchanged under `--no-color`.
+        let exhausted_colored =
+            render_status(&response(Some(CanonicalScrub::Exhausted)), NOW, None, true)
+                .lines()
+                .find(|l| l.contains("shared login: scrubbed"))
+                .expect("the scrubbed line is present under --color")
+                .to_owned();
+        assert!(
+            exhausted_colored.contains(&format!("\x1b[{}m", Severity::Red.sgr())),
+            "exhausted is tinted Red (act-now rank): {exhausted_colored:?}"
+        );
+        let recovering_colored =
+            render_status(&response(Some(CanonicalScrub::Recovering)), NOW, None, true)
+                .lines()
+                .find(|l| l.contains("shared login: scrubbed"))
+                .expect("the recovering line is present under --color")
+                .to_owned();
+        assert!(
+            !recovering_colored.contains('\x1b'),
+            "recovering stays PLAIN even under --color (calm, would cry wolf): {recovering_colored:?}"
+        );
+
         // #15/#444: no secret reaches EITHER rendered state (a state discriminant only).
         for out in [&exhausted, &recovering] {
             assert!(
@@ -4642,11 +4771,151 @@ spare  22222222-2222\n\
             "the keychain-locked line is unconditional data, present under --color too"
         );
 
+        // #575: with the colour gate OPEN, the keychain-locked line carries the act-now `Red` band
+        // (rank 1) — the vault is UNREADABLE, the operator is blocked NOW.
+        let locked_colored = render_status(&response(true), NOW, None, true)
+            .lines()
+            .find(|l| l.contains("shared login: unreadable"))
+            .expect("the keychain-locked line is present under --color")
+            .to_owned();
+        assert!(
+            locked_colored.contains(&format!("\x1b[{}m", Severity::Red.sgr())),
+            "keychain-locked is tinted Red (act-now rank): {locked_colored:?}"
+        );
+
         // #15/#444: no secret reaches the rendered state (a bare state discriminant only).
         assert!(
             crate::redaction::meter::unauthored_emails(&locked, &[]).is_empty()
                 && !locked.to_lowercase().contains("token"),
             "no secret reaches the keychain-locked surface (#15/#444): {locked:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_fault_severity_ranks_the_vault_pair_above_systemic_cross_surface() {
+        // #575 — the acceptance test: the three daemon-level payload faults must rank the SAME way on
+        // the `status` CLI as on the menubar panel (R-2). The vault pair blocks NOW (act-now `Red`,
+        // panel `.error`); the systemic mechanism is pre-death (next-break `Yellow`, panel `.warning`);
+        // a recovering scrub is calm (plain, panel `.info`). Before #575 the CLI inverted this —
+        // systemic wore the only `Red` while the vault pair sat plain, ranking the LEAST-blocking fault
+        // loudest. The rank now lives in ONE place (`DaemonPayloadFault::severity`).
+        assert_eq!(
+            DaemonPayloadFault::KeychainLocked.severity(),
+            Some(Severity::Red),
+            "keychain-locked is act-now Red (rank 1)"
+        );
+        assert_eq!(
+            DaemonPayloadFault::CanonicalScrubExhausted.severity(),
+            Some(Severity::Red),
+            "scrub-exhausted is act-now Red (rank 2)"
+        );
+        assert_eq!(
+            DaemonPayloadFault::SystemicRefreshFailure.severity(),
+            Some(Severity::Yellow),
+            "systemic is next-break Yellow (rank 3) — strictly below the vault pair"
+        );
+        assert_eq!(
+            DaemonPayloadFault::CanonicalScrubRecovering.severity(),
+            None,
+            "recovering is calm — no colour (rank 4)"
+        );
+
+        // Rendered together (a locked keychain makes the refresh mechanism fail too, so they CO-OCCUR):
+        // the operator reading the colour sees the vault pair Red ABOVE the systemic Yellow — no longer
+        // the pre-#575 inversion.
+        let response = StatusResponse {
+            systemic_refresh_failure: Some(5),
+            canonical_scrub: None,
+            keychain_locked: true,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        let vault = out
+            .lines()
+            .find(|l| l.contains("shared login: unreadable"))
+            .expect("keychain line present");
+        let systemic = out
+            .lines()
+            .find(|l| l.contains("refresh mechanism: DOWN"))
+            .expect("systemic line present");
+        assert!(
+            vault.contains(&format!("\x1b[{}m", Severity::Red.sgr())),
+            "vault fault is Red (act-now): {vault:?}"
+        );
+        assert!(
+            systemic.contains(&format!("\x1b[{}m", Severity::Yellow.sgr()))
+                && !systemic.contains(&format!("\x1b[{}m", Severity::Red.sgr())),
+            "systemic is Yellow, never Red — the vault pair outranks it (#575): {systemic:?}"
+        );
+        // Worst-first PRINT order too: the act-now vault line sits ABOVE the next-break systemic line.
+        // The colour asserts above would still pass under the pre-#575 push order (each line keeps its
+        // own correct colour even if systemic-Yellow printed first), so guard the order explicitly — as
+        // the sibling test does for the systemic↔recovering adjacency.
+        let vault_at = out
+            .find("shared login: unreadable")
+            .expect("keychain line present");
+        let systemic_at = out
+            .find("refresh mechanism: DOWN")
+            .expect("systemic line present");
+        assert!(
+            vault_at < systemic_at,
+            "the act-now vault fault (rank 1) must print ABOVE the next-break systemic (rank 3), \
+             mirroring the panel's worst-first rank; got vault@{vault_at} systemic@{systemic_at}\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_status_prints_the_calm_recovering_scrub_below_the_systemic_warning() {
+        // #575 print-order corollary: `canonical_scrub = recovering` is rank 4 (calm, plain) and MUST
+        // sit BELOW `systemic_refresh_failure` (rank 3, Yellow) when they co-occur — the panel's
+        // `daemonFaultBanner` ranks recovering LAST for exactly this reason (a self-healing "no action
+        // needed" state can never outrank one that cannot self-heal; the panel's load-bearing subtlety).
+        // The CLI prints ALL fault lines, so the cross-surface rank shows up as print ORDER here:
+        // systemic must appear ABOVE the recovering line, never the reverse. Guards this against a
+        // regression to a single fixed canonical-scrub slot.
+        let response = StatusResponse {
+            systemic_refresh_failure: Some(3),
+            canonical_scrub: Some(CanonicalScrub::Recovering),
+            keychain_locked: false,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+        let out = render_status(&response, NOW, None, true);
+        let systemic_at = out
+            .find("refresh mechanism: DOWN")
+            .expect("systemic line present");
+        let recovering_at = out
+            .find("recovering automatically")
+            .expect("recovering scrub line present");
+        assert!(
+            systemic_at < recovering_at,
+            "the pre-death systemic warning (rank 3) must print ABOVE the calm recovering scrub \
+             (rank 4), mirroring the panel's worst-first rank; got systemic@{systemic_at} \
+             recovering@{recovering_at}\n---\n{out}"
+        );
+        // The calm recovering line stays PLAIN (rank 4 = `None`): colouring it would cry wolf.
+        let recovering = out
+            .lines()
+            .find(|l| l.contains("recovering automatically"))
+            .expect("recovering line present");
+        assert!(
+            !recovering.contains('\x1b'),
+            "recovering scrub is calm/plain — no SGR: {recovering:?}"
+        );
+        let systemic = out
+            .lines()
+            .find(|l| l.contains("refresh mechanism: DOWN"))
+            .expect("systemic line present");
+        assert!(
+            systemic.contains(&format!("\x1b[{}m", Severity::Yellow.sgr())),
+            "systemic is Yellow (rank 3): {systemic:?}"
         );
     }
 
