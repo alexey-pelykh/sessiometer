@@ -434,9 +434,6 @@ enum StatusPanelFormat {
     // screenshot-verified in CI). The blind row REPLACES the bare `n/a … 🟡` a failed poll would show — a
     // SEMANTIC held state, never a false-healthy row (#137) — and reflects daemon state only (#169).
 
-    /// The blind row's health-slot glyph — an `eye.slash` ("usage visibility lost"), shown while blind. A
-    /// DISTINCT shape from every `healthSymbol` (an eye, not a check / clock / triangle / octagon), so
-    /// blindness is legible WITHOUT color (WCAG 1.4.1). OK stays calm `.neutral`; DEGRADED takes the at-risk
     /// The three auto-protection body verdicts for a blind ACTIVE account: OK / DEGRADED (#485), plus
     /// CORNERED (#572). **Cornered = blind + DEGRADED + no viable target** — the ONE bounded-blindness
     /// state the daemon CANNOT self-resolve, so the operator must act. The panel composes the SAME two
@@ -558,9 +555,12 @@ enum StatusPanelFormat {
     /// clamps a passed reset (`<= 0` → "now") exactly as the reset cells do. The `cause` is deliberately
     /// ignored (the `_`): the panel's cornered wording is cause-INDEPENDENT — always "Out of capacity" + this
     /// clause, the ratified #666 unified framing. The CLI's `render_cornered` (`src/cli.rs`) instead keeps a
-    /// defensive `cause == nil → "no viable target"` fallback that drops this clause; but a real daemon always
-    /// pairs a `cause` with a `noViableTarget`, so that arm is unreachable and the divergence has no live
-    /// effect — the panel keeps its unified wording rather than replicating the CLI's legacy fallback.
+    /// `cause == nil → "no viable target"` fallback (dropping this clause). The CURRENT daemon always pairs a
+    /// `cause` (and `resetsAt`) with a `noViableTarget`, but a pre-#405 daemon omits both (`WireModel` tolerates
+    /// it via `decodeIfPresent`), reaching that arm — so against such a daemon the two surfaces diverge in
+    /// WORDING ("Out of capacity" vs "no viable target"). Under R-2 STATE-parity that is an accepted per-medium
+    /// choice, NOT a parity break: both convey the cornered state and the identical "add or free an account"
+    /// remedy; the panel keeps its unified #666 wording rather than replicating the CLI's legacy fallback.
     static func corneredReliefClause(_ nextSwap: NextSwap?, now: Int64) -> String {
         guard case .noViableTarget(_, let resetsAt) = nextSwap, let at = resetsAt else { return "" }
         return ", resets in \(humanizeUntil(at - now))"

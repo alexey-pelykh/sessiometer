@@ -78,9 +78,10 @@ final class WatchStatusStore: ObservableObject {
     /// data the connection no longer vouches for: only `.connected` stands behind the last snapshot, so under
     /// `.stale` (last-good rows shown, daemon gone quiet) the value is WITHHELD (`nil`) and a would-be
     /// cornered row degrades to DEGRADED. Exposed HERE — not computed inline in `StatusPanelView` — so the
-    /// view→gate wiring is pinned by a store test, the panel-side parallel of the glance gate the machine
-    /// applies to `⊘` (`HonestStateMachineTests`). `StatusPanelView` reads THIS for the switchable roster,
-    /// NEVER the raw `nextSwap` above. Delegates the pure predicate to `StatusPanelFormat.rosterNextSwap`.
+    /// GATE is pinned by a store test, the panel-side parallel of the glance gate the machine applies to `⊘`
+    /// (`HonestStateMachineTests`). `StatusPanelView` MUST read THIS for the switchable roster, NEVER the raw
+    /// `nextSwap` above — that final view→gate hop is not unit-testable without ViewInspector, so this doc plus
+    /// the call-site comment are its tripwire. Delegates the predicate to `StatusPanelFormat.rosterNextSwap`.
     var rosterNextSwap: NextSwap? {
         StatusPanelFormat.rosterNextSwap(for: connectionState, nextSwap: nextSwap)
     }
