@@ -448,22 +448,7 @@ fn run_output(
             fault.log_detail
         );
     }
-    let params = params_from(config.as_ref());
-    let vparams = velocity_params_from(config.as_ref());
-    let roster = config.as_ref().map(roster_handles);
-    let report = with_velocity(
-        build_report(
-            data,
-            window,
-            args.accounts,
-            roster.as_ref(),
-            &params,
-            offset,
-        ),
-        &data.samples,
-        &params,
-        &vparams,
-    );
+    let report = overlaid_report(data, window, args.accounts, config.as_ref(), offset);
 
     if args.json {
         // The `--json` document states the same malformed-config provenance the stderr warning
@@ -570,18 +555,10 @@ fn stats_socket_json_with(
             fault.log_detail
         );
     }
-    let params = params_from(config.as_ref());
-    let vparams = velocity_params_from(config.as_ref());
-    let roster = config.as_ref().map(roster_handles);
     // No account filter over the socket — the whole roster (matches `stats --period <p> --json` with
-    // no `--account`). Overlay the velocity + runway readout from the SAME params the CLI uses, so a
-    // socket read stays byte-parity with `stats --period <p> --json` (issue #543 keeps R-2).
-    let report = with_velocity(
-        build_report(data, window, Vec::new(), roster.as_ref(), &params, offset),
-        &data.samples,
-        &params,
-        &vparams,
-    );
+    // no `--account`), overlaid from the SAME config the CLI uses so a socket read stays byte-parity
+    // with `stats --period <p> --json` (issue #543 keeps R-2).
+    let report = overlaid_report(data, window, Vec::new(), config.as_ref(), offset);
     serde_json::to_string(&stats_wire(&report, config_fault.map(|f| f.wire_reason)))
         .unwrap_or_else(|_| r#"{"error":"stats unavailable"}"#.to_owned())
 }
@@ -1069,16 +1046,40 @@ pub(crate) fn current_fleet_runway() -> Option<FleetRunway> {
     // tolerant rather than unwrap — a probe must never panic the tick.
     let window = plan_window(None, None, now, &data).ok()?;
     let (config, _config_fault) = resolve_stats_config(Config::load());
-    let params = params_from(config.as_ref());
-    let vparams = velocity_params_from(config.as_ref());
-    let roster = config.as_ref().map(roster_handles);
-    let report = with_velocity(
-        build_report(&data, window, Vec::new(), roster.as_ref(), &params, offset),
+    let report = overlaid_report(&data, window, Vec::new(), config.as_ref(), offset);
+    fleet_runway(&report)
+}
+
+/// Build the velocity-overlaid [`Report`] — the shared `params → vparams → roster →
+/// with_velocity(build_report)` spine every stats consumer runs (issue #693). The CLI render
+/// ([`run_output`]), the socket verb ([`stats_socket_json_with`]), and the daemon runway probe
+/// ([`current_fleet_runway`]) overlay a snapshot the SAME way; written out per-site, a change to
+/// overlay semantics had to land in three places and a missed one diverged silently — the CLI and
+/// the socket would disagree about the same snapshot (the R-2 parity #543 keeps). One helper makes
+/// that divergence unrepresentable.
+///
+/// Derives the aggregator thresholds ([`params_from`]), the velocity tunables
+/// ([`velocity_params_from`]), and the roster partition ([`roster_handles`]) from the ONE resolved
+/// `config` each caller already holds, then overlays the velocity + runway readout
+/// ([`with_velocity`]) onto the base aggregate ([`build_report`]). `accounts` is the sole per-site
+/// difference — the CLI passes its `--account` filter; the socket and the runway probe pass an empty
+/// filter (the whole roster).
+fn overlaid_report(
+    data: &StoreData,
+    window: Window,
+    accounts: Vec<String>,
+    config: Option<&Config>,
+    offset: i64,
+) -> Report {
+    let params = params_from(config);
+    let vparams = velocity_params_from(config);
+    let roster = config.map(roster_handles);
+    with_velocity(
+        build_report(data, window, accounts, roster.as_ref(), &params, offset),
         &data.samples,
         &params,
         &vparams,
-    );
-    fleet_runway(&report)
+    )
 }
 
 /// Aggregate the window's samples into a filtered summary + series.
