@@ -2997,6 +2997,38 @@ label = "personal"
     }
 
     #[test]
+    fn the_pre_rename_jitter_weekly_trigger_key_is_rejected_not_silently_defaulted() {
+        // Issue #606 renamed the `[jitter].weekly_trigger` key → `weekly_ceiling` (the WEEKLY
+        // half of the `[jitter]` dimension rename) under the no-migration posture. It is the
+        // third of #606's three breaking key renames and the one left unpinned: the `[tunables]`
+        // pair is pinned by `the_pre_rename_trigger_keys_are_rejected_not_silently_defaulted`,
+        // and #629's later `[jitter].trigger` → `session_ceiling` by
+        // `the_pre_rename_jitter_trigger_key_is_rejected_not_silently_defaulted`. With this test
+        // every deliberate #606/#629 config-key break is falsifier-covered.
+        //
+        // `RawJitter` is `deny_unknown_fields`, so a pre-#606 config.toml is a parse error that
+        // NAMES the stale key AND — via serde's "expected one of" field list — the replacement to
+        // write. That is also the falsifier for the no-back-compat decision: a later well-meaning
+        // `#[serde(alias = "weekly_trigger")]` on `RawJitter::weekly_ceiling` would silently
+        // restore back-compat and nothing else in the suite would go red.
+        match Config::parse(&with_jitter("weekly_trigger = { kind = \"none\" }")) {
+            Err(Error::ConfigParse(msg)) => {
+                assert!(
+                    msg.contains("weekly_trigger"),
+                    "the rejection must NAME the stale key, got: {msg}"
+                );
+                assert!(
+                    msg.contains("weekly_ceiling"),
+                    "…and point at `weekly_ceiling` so the operator can rename it, got: {msg}"
+                );
+            }
+            other => panic!(
+                "pre-rename `[jitter].weekly_trigger` must be rejected, never silently defaulted; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn round_trips_a_configured_jitter_table() {
         let toml = with_jitter(
             "poll = { kind = \"uniform\", spread = 12.5 }\n\

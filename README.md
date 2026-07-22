@@ -233,14 +233,17 @@ The **`next swap:`** footer names the account the daemon would rotate to next �
 viable target whose weekly quota resets soonest. When no other account is a sound swap
 destination — every one is weekly-exhausted, session-saturated (over its swap-away
 session trigger), over the swap-target `target_max_session_usage` reserve, or quarantined (out
-of rotation until it recovers) — it names *why*, so a stranded operator sees the real
-blocker and when it lifts rather than a content-free "none": a weekly-exhausted fleet
-reads `none — every account is weekly-exhausted; resets in ⟨when⟩ — add an account` (a
-week-long block, so a new account is the remedy), an over-session fleet reads `none —
-every account is over its session limit; resets in ⟨when⟩` (a transient block — no
-add-account nudge), and any residual dead end falls back to the bare `none (no viable
-target)`. Right after the daemon starts, before it has polled the other accounts, it
-reads `none (awaiting usage data)`. It is **forward-looking** and recomputed every
+of rotation until it recovers) — it reads `none — out of capacity; resets in ⟨when⟩`,
+naming the soonest moment *any* spare returns to viability across both the session
+and weekly windows (issue #665), so a stranded operator sees the real blocker and
+when it lifts rather than a content-free "none". When that wait exceeds one session
+window — or is unknown — the block is a structural shortage rather than a transient
+one, and the footer appends the `— add an account` remedy; the nudge keys off the
+actual wait, never the session/weekly cause label, which on a mixed fleet names only
+the soonest-returning spare's gating dimension, not a fleet-wide property (issue
+#666). A relief-less dead end falls back to the bare `none (no viable target)`. Right
+after the daemon starts, before it has polled the other accounts, it reads `none
+(awaiting usage data)`. It is **forward-looking** and recomputed every
 cycle, so — unlike a remembered "last swap" — it survives a daemon restart and always
 shows where the next rotation will land.
 

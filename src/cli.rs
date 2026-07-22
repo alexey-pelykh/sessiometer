@@ -2237,8 +2237,9 @@ fn red_line(body: &str, emphasize: bool) -> String {
 }
 
 /// The loudest, distinct state: blind + DEGRADED + nowhere to swap. Names the source, how long
-/// blind, the stale last-known %, WHY the fleet is blocked (the relief cause/reset FOLDED IN from
-/// `next_swap`, so the remedy is not lost when this alarm replaces that footer), and the ONE remedy
+/// blind, the stale last-known %, THAT the fleet is out of capacity and WHEN it returns (the relief
+/// reset FOLDED IN from `next_swap`, so the relief instant is not lost when this alarm replaces
+/// that footer), and the ONE remedy
 /// only the operator can apply — add or free an account. Printed as DATA (unconditional, survives a
 /// pipe / redirect), red-emphasized when the color gate is open (the SAME SGR the DEGRADED /
 /// systemic lines use); the plain text conveys it under `--no-color`. The surface only REFLECTS
@@ -2251,11 +2252,14 @@ fn render_cornered(cornered: CorneredState<'_>, now: i64, color: bool) -> String
         Some(at) => format!(", resets in {}", humanize_until(at - now)),
         None => String::new(),
     };
+    // The CORNERED alarm appends "add or free an account" UNCONDITIONALLY below (blind + DEGRADED +
+    // no target is unresolvable regardless of wait length), so — unlike the ordinary footer — the
+    // remedy is not wait-gated here; only the pre-#666 false universal is dropped. `cause` names the
+    // gating dimension of the SOONEST-returning spare (issue #665), NOT a fleet-wide property, so on a
+    // mixed fleet "every account is weekly-exhausted / over its session limit" was literally
+    // inaccurate — state only what the wire substantiates: out of capacity, and when it returns.
     let blocked = match cause {
-        Some(NoTargetCause::Weekly) => format!("every account is weekly-exhausted{relief}"),
-        Some(NoTargetCause::Session) => {
-            format!("every account is over its session limit{relief}")
-        }
+        Some(_) => format!("out of capacity{relief}"),
         None => "no viable target".to_owned(),
     };
     let body = format!(
@@ -2309,6 +2313,17 @@ fn render_blind_preempt_swap(response: &StatusResponse) -> String {
     )
 }
 
+/// The wait beyond which [`render_next_swap`]'s all-exhausted footer nudges "add an account" — ONE
+/// session window (issue #666). Capacity returning within a session window is a TRANSIENT block the
+/// operator waits out; a longer — or unknown-duration — wait is a STRUCTURAL shortage where adding
+/// capacity is the real remedy. This replaces the pre-#666 [`NoTargetCause`]-label proxy (`Weekly`
+/// ⇒ nudge, `Session` ⇒ silent), which mis-fired on a MIXED fleet where a `Weekly` cause can name a
+/// sub-hour weekly reset (issue #665): the label was a broken stand-in for the wait it now keys off
+/// directly. Keep in lockstep with the menubar twin `StatusPanelFormat.addAccountNudgeWaitSecs`
+/// (`apps/menubar/Sources/StatusPanelFormat.swift`) — both clients must render the SAME nudge
+/// decision (R-2 STATE-parity).
+const ADD_ACCOUNT_NUDGE_WAIT_SECS: i64 = 5 * 60 * 60;
+
 /// The forward-looking next-swap candidate (issue #88), computed daemon-side
 /// ([`crate::daemon::NextSwap`]); printed plain — the footer carries no color, like the table footer
 /// it replaces (per-cell health coloring is issue #84, orthogonal). A `None` field means the daemon
@@ -2330,31 +2345,39 @@ fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
             };
             format!("next swap: {to}{why}\n")
         }
-        // When the daemon carries the fleet-capacity relief hint, name WHY the fleet is blocked and
-        // WHEN capacity returns — so a stranded operator (a DEAD active whose 🔴 row sits above this,
-        // AND every spare exhausted) sees the REAL blocker and its escape, not a content-free "no
-        // viable target". Terse + action-first in the degraded-cue register. A pre-schema-1.3 daemon
-        // carries no cause → the honest bare fallback. `resets_at` humanizes with the same
-        // `humanize_until` the per-account "resets in" cells use, so the vocabulary matches.
-        Some(NextSwap::NoViableTarget { cause, resets_at }) => {
-            let relief = match resets_at {
-                Some(at) => format!("; resets in {}", humanize_until(at - now)),
-                None => String::new(),
-            };
-            match cause {
-                // Weekly exhaustion is the TERMINAL capacity signal — the wait is long (days), so
-                // the meaningful escape is more accounts.
-                Some(NoTargetCause::Weekly) => format!(
-                    "next swap: none — every account is weekly-exhausted{relief} — add an account\n"
-                ),
-                // A session-wide block lifts at the sooner session reset (minutes/hours), so the
-                // reset time itself is the remedy.
-                Some(NoTargetCause::Session) => {
-                    format!("next swap: none — every account is over its session limit{relief}\n")
-                }
-                None => "next swap: none (no viable target)\n".to_owned(),
+        // When the daemon carries the fleet-capacity relief hint, tell a stranded operator (a DEAD
+        // active whose 🔴 row sits above this, AND every spare exhausted) that the fleet is OUT OF
+        // CAPACITY and WHEN it returns — not a content-free "no viable target". Rendered WITHOUT the
+        // pre-#666 false universal: on a MIXED fleet the daemon's `cause` names the gating dimension
+        // of the SOONEST-returning spare (issue #665), NOT a fleet-wide property, so "every account
+        // is weekly-exhausted" / "… over its session limit" was literally inaccurate (some spares are
+        // blocked the other way). Say only what the wire substantiates. The "add an account" remedy
+        // is gated on the actual WAIT (issue #666, [`ADD_ACCOUNT_NUDGE_WAIT_SECS`]), not the `cause`
+        // label: a block clearing within one session window is transient (the reset is the remedy —
+        // wait it out); a longer or unknown-duration wait is a structural shortage (add capacity).
+        // This makes `cause` render-irrelevant except the pre-#405 `None` bare fallback. `resets_at`
+        // humanizes with the same `humanize_until` the per-account "resets in" cells use.
+        Some(NextSwap::NoViableTarget { cause, resets_at }) => match cause {
+            None => "next swap: none (no viable target)\n".to_owned(),
+            Some(_) => {
+                let relief = match resets_at {
+                    Some(at) => format!("; resets in {}", humanize_until(at - now)),
+                    None => String::new(),
+                };
+                // Nudge unless capacity is KNOWN to return within one session window: a sub-window
+                // wait is transient (no nudge); a longer OR unknown-duration wait is structural.
+                let structural_shortage = match resets_at {
+                    Some(at) => at - now > ADD_ACCOUNT_NUDGE_WAIT_SECS,
+                    None => true,
+                };
+                let nudge = if structural_shortage {
+                    " — add an account"
+                } else {
+                    ""
+                };
+                format!("next swap: none — out of capacity{relief}{nudge}\n")
             }
-        }
+        },
         Some(NextSwap::AwaitingData) => "next swap: none (awaiting usage data)\n".to_owned(),
         None => "next swap: none\n".to_owned(),
     }
@@ -4782,9 +4805,10 @@ spare  22222222-2222\n\
     fn render_status_cornered_is_the_loudest_state_and_names_the_remedy() {
         // Issue #479 (surface 3): active blind + DEGRADED + no viable target = the one bounded-
         // blindness state the daemon cannot resolve itself. It renders ONE loud, distinct alarm that
-        // names the source, the stale last-known %, WHY the fleet is blocked (folded in from the
-        // no-target relief), and the operator remedy — and SUPPRESSES both the separate blind-DEGRADED
-        // line and the `next swap: none — …` footer, which split read as two unrelated observations.
+        // names the source, the stale last-known %, that the fleet is out of capacity + when it
+        // returns (folded in from the no-target relief), and the operator remedy — and SUPPRESSES
+        // both the separate blind-DEGRADED line and the `next swap: none — …` footer, which split
+        // read as two unrelated observations.
         let out = render_status(
             &cornered_response(
                 Some(NoTargetCause::Weekly),
@@ -4798,7 +4822,7 @@ spare  22222222-2222\n\
             out.contains("CORNERED: active work blind for")
                 && out.contains("last-known session 87%")
                 && out.contains("auto-protection cannot act")
-                && out.contains("every account is weekly-exhausted, resets in 2d4h")
+                && out.contains("out of capacity, resets in 2d4h")
                 && out.contains("add or free an account"),
             "the cornered alarm names source + stale pct + blocker + remedy: {out}",
         );
@@ -4815,9 +4839,11 @@ spare  22222222-2222\n\
 
     #[test]
     fn render_status_cornered_folds_each_no_target_cause() {
-        // The remedy relief is folded from `next_swap`'s cause, so the operator still sees WHY. A
-        // SESSION-wide block names the sooner reset; an absent cause (pre-#405 daemon) falls back to
-        // the bare "no viable target" — each still carrying the "add or free an account" remedy.
+        // The relief instant is folded from `next_swap`, so the operator still sees WHEN capacity
+        // returns — but WITHOUT the pre-#666 false universal (the `cause` names one spare's gating
+        // dimension, not a fleet property, #665): any cause reads "out of capacity, resets in ⟨dur⟩".
+        // An absent cause (pre-#405 daemon) falls back to the bare "no viable target" — each still
+        // carrying the unconditional "add or free an account" remedy (cornered is always unresolvable).
         let session = render_status(
             &cornered_response(Some(NoTargetCause::Session), Some(NOW + 47 * 60)),
             NOW,
@@ -4825,9 +4851,10 @@ spare  22222222-2222\n\
             false,
         );
         assert!(
-            session.contains("every account is over its session limit, resets in 47m")
+            session.contains("out of capacity, resets in 47m")
+                && !session.contains("over its session limit")
                 && session.contains("add or free an account"),
-            "session-cause cornered folds the session relief: {session}",
+            "session-cause cornered folds the relief without a false universal: {session}",
         );
         let bare = render_status(&cornered_response(None, None), NOW, None, false);
         assert!(
@@ -4878,7 +4905,7 @@ spare  22222222-2222\n\
         assert!(
             !out.contains("CORNERED")
                 && out.contains("auto-protection OK")
-                && out.contains("next swap: none — every account is weekly-exhausted"),
+                && out.contains("next swap: none — out of capacity"),
             "blind-OK (pre-gate) + no target is NOT cornered — cry-wolf guard: {out}",
         );
     }
@@ -5941,35 +5968,66 @@ spare  22222222-2222\n\
             })),
             "next swap: spare"
         );
-        // The fleet-capacity relief hint (issue #405): a WEEKLY-wide block names the terminal
-        // signal + the reset that ends it + the escape action (the wait is days). `resets_at`
-        // humanizes with the same `humanize_until` the per-account cells use → `2d4h`.
+        // The fleet-capacity relief hint (issue #405), rendered WITHOUT the pre-#666 false universal
+        // and with the "add an account" nudge gated on the WAIT, not the `cause` label (issue #666).
+        // A LONG wait (days) is a structural shortage → name the reset + nudge. `resets_at` humanizes
+        // with the same `humanize_until` the per-account cells use → `2d4h`.
         assert_eq!(
             footer(Some(NextSwap::NoViableTarget {
                 cause: Some(NoTargetCause::Weekly),
                 resets_at: Some(NOW + 2 * 86_400 + 4 * 3_600),
             })),
-            "next swap: none — every account is weekly-exhausted; resets in 2d4h — add an account"
+            "next swap: none — out of capacity; resets in 2d4h — add an account"
         );
-        // Weekly-exhausted but no spare reported a parseable reset → the reset clause drops, the
-        // terminal signal + action remain.
+        // #665/#666 regression — the live mixed-fleet miscalibration: a `Weekly` cause naming a
+        // SUB-SESSION-WINDOW weekly reset (soonest spare returns in 59m). The pre-#666 render keyed
+        // the nudge off the `Weekly` LABEL and shouted "every account is weekly-exhausted … — add an
+        // account" for a one-HOUR wait. Now the label is irrelevant: a sub-window wait is transient,
+        // so NO nudge and NO false universal — just the honest relief.
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: Some(NOW + 59 * 60),
+            })),
+            "next swap: none — out of capacity; resets in 59m"
+        );
+        // Just OVER one session window (6h > 5h) → structural again, the nudge returns — proving the
+        // gate keys off the wait, not the cause (this is a `Weekly` cause both times).
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: Some(NOW + 6 * 3_600),
+            })),
+            "next swap: none — out of capacity; resets in 6h — add an account"
+        );
+        // The boundary is STRICT: exactly one session window still counts as within the window —
+        // the nudge needs MORE than a session window.
+        assert_eq!(
+            footer(Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: Some(NOW + ADD_ACCOUNT_NUDGE_WAIT_SECS),
+            })),
+            "next swap: none — out of capacity; resets in 5h"
+        );
+        // A cause present but no spare reported a parseable reset → wait UNKNOWN, treated as
+        // structural (nudge), reset clause drops.
         assert_eq!(
             footer(Some(NextSwap::NoViableTarget {
                 cause: Some(NoTargetCause::Weekly),
                 resets_at: None,
             })),
-            "next swap: none — every account is weekly-exhausted — add an account"
+            "next swap: none — out of capacity — add an account"
         );
-        // A SESSION-wide block lifts at the sooner session reset (minutes/hours) — the reset time
-        // itself is the remedy, so no "add an account" nudge.
+        // A SESSION cause with a soon reset (47m ≪ one session window) → transient, no nudge, and no
+        // false universal — the SAME honest render as any short-wait cause (label-independent).
         assert_eq!(
             footer(Some(NextSwap::NoViableTarget {
                 cause: Some(NoTargetCause::Session),
                 resets_at: Some(NOW + 47 * 60),
             })),
-            "next swap: none — every account is over its session limit; resets in 47m"
+            "next swap: none — out of capacity; resets in 47m"
         );
-        // A pre-schema-1.3 daemon carries no relief (`cause` absent) → the honest bare fallback.
+        // A pre-#405 daemon carries no relief (`cause` absent) → the honest bare fallback, unchanged.
         assert_eq!(
             footer(Some(NextSwap::NoViableTarget {
                 cause: None,
