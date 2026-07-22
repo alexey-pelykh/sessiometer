@@ -22,6 +22,11 @@ struct RosterView: View {
     /// Whether rows offer the manual-switch affordance at all. `false` on a dropped connection, where a
     /// retained last-known row is not a live target.
     let switchable: Bool
+    /// The snapshot's next-swap candidate (issue #572), threaded to the active blind row to compose the
+    /// CORNERED verdict. Callers pass `nil` for a non-vouched (dropped/stale) roster — a retained
+    /// `noViableTarget` must not raise a cornered alarm off stale data. Defaults to `nil` so existing
+    /// call sites that never render a cornered row need no change.
+    var nextSwap: NextSwap? = nil
 
     var body: some View {
         // Resolve every row's smart monogram ONCE over the whole roster (issue #445), so collision-escalation
@@ -39,7 +44,8 @@ struct RosterView: View {
                                                        weeklyExhausted: row.weeklyExhausted,
                                                        isEnabled: row.isEnabled)
                     : .notATarget
-                AccountRowView(row: row, monogram: monograms[row.label] ?? "?", now: now, switchState: state)
+                AccountRowView(row: row, monogram: monograms[row.label] ?? "?", now: now,
+                               switchState: state, nextSwap: nextSwap)
             }
         }
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
@@ -107,6 +113,11 @@ private struct AccountRowView: View {
     /// The row's manual-switch verdict (issue #169). `.notATarget` — the ACTIVE row, or any row on a
     /// dropped connection — stays a plain, non-interactive display row.
     let switchState: StatusPanelFormat.RowSwitchState
+    /// The snapshot's next-swap candidate (issue #572) — read ONLY to compose the CORNERED blind verdict
+    /// (a blind DEGRADED active row + `nextSwap == noViableTarget`). `nil` on a non-vouched roster
+    /// (dropped/stale), so a retained `noViableTarget` never drives a cornered alarm off stale data
+    /// (the honest-state discipline the glance already applies). Inert for every non-blind row.
+    let nextSwap: NextSwap?
 
     @EnvironmentObject private var swap: AccountSwapModel
     /// The active row's accent-tint fill opacity is theme-aware (#388): the mock raises it in dark mode.
@@ -130,6 +141,25 @@ private struct AccountRowView: View {
     }
     private var weeklySeverity: StatusPanelFormat.UsageSeverity? {
         StatusPanelFormat.weeklySeverity(weeklyPct: row.weeklyPct, weeklyExhausted: row.weeklyExhausted)
+    }
+
+    /// This row's blind severity (#485 OK/DEGRADED, #572 CORNERED) — `.ok` when not blind. Composes the
+    /// row's `autoProtectionDegraded` with the snapshot `nextSwap` (only the active account is ever blind,
+    /// and `nextSwap` is its swap candidate), mirroring the CLI's `cornered_state`. Drives the eye-slash
+    /// tint (`authView`), the leading rule (`blindRuleTint`), and the `BlindMeter` verdict — one source.
+    private var blindSeverity: StatusPanelFormat.BlindSeverity {
+        guard let blind = row.blindActive else { return .ok }
+        return StatusPanelFormat.blindSeverity(degraded: blind.autoProtectionDegraded, nextSwap: nextSwap)
+    }
+
+    /// The leading-rule tint for a blind active row, or `nil` for none: DEGRADED → orange, CORNERED → red
+    /// (#572), OK / non-blind → no rule.
+    private var blindRuleTint: StatusPanelFormat.HealthTint? {
+        switch blindSeverity {
+        case .degraded: return .orange
+        case .cornered: return .red
+        case .ok:       return nil
+        }
     }
 
     // MARK: - Switch state (issue #169)
@@ -269,8 +299,10 @@ private struct AccountRowView: View {
             if let blind = row.blindActive {
                 // The active account's poll is blind — replace the two (now `n/a`) live meters with the
                 // SEMANTIC held-state block: a held session bar, blind duration, and the auto-protection
-                // verdict (#485), the panel's render of the CLI's blind line. A healthy row keeps its meters.
-                BlindMeter(blind: blind)
+                // verdict (#485; #572 adds the CORNERED verdict), the panel's render of the CLI's blind line.
+                // A healthy row keeps its meters. `blindSeverity` composes this row's `autoProtectionDegraded`
+                // with the snapshot `nextSwap` (cornered iff DEGRADED + no viable target).
+                BlindMeter(blind: blind, severity: blindSeverity, nextSwap: nextSwap, now: now)
             } else {
                 VStack(spacing: 6) {
                     UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
@@ -295,13 +327,14 @@ private struct AccountRowView: View {
                       ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark)
                       : Color.clear)
         )
-        // #485: a DEGRADED blind active row gets an at-risk orange leading rule — a non-color-redundant
-        // LOCALITY tell (the fault is THIS row's; the header/footer stay fresh, the AC-2 distinction from
-        // #169's whole-snapshot "stale"). Absent on a blind-OK row (calm) and every non-blind row.
+        // #485/#572: a DEGRADED blind active row gets an at-risk ORANGE leading rule; a CORNERED one
+        // (blind + degraded + no viable target) escalates it to RED — a non-color-redundant LOCALITY tell
+        // (the fault is THIS row's; the header/footer stay fresh, the AC-2 distinction from #169's
+        // whole-snapshot "stale"). Absent on a blind-OK row (calm) and every non-blind row.
         .overlay(alignment: .leading) {
-            if row.blindActive?.autoProtectionDegraded == true {
+            if let ruleTint = blindRuleTint {
                 Capsule()
-                    .fill(Color.panel(StatusPanelFormat.healthTint(.orange)))
+                    .fill(Color.panel(StatusPanelFormat.healthTint(ruleTint)))
                     .frame(width: 3)
                     .padding(.vertical, 7)
                     .accessibilityHidden(true)
@@ -361,7 +394,7 @@ private struct AccountRowView: View {
     /// fine; what's lost is usage visibility, so the health slot reports that, not a false auth verdict.
     @ViewBuilder
     private var authView: some View {
-        if let blind = row.blindActive {
+        if row.blindActive != nil {
             // Usage visibility lost (#485): an eye-slash, a DISTINCT shape from every auth glyph. OK is
             // calm secondary; DEGRADED tints it at-risk orange (redundant with the row's rule + verdict).
             // If the credential is ITSELF in a warning state (stale/at-risk — orthogonal to usage-blindness),
@@ -375,7 +408,7 @@ private struct AccountRowView: View {
                         .foregroundStyle(healthColor(authSymbol.tint))
                         .accessibilityHidden(true)
                 }
-                let symbol = StatusPanelFormat.blindSymbol(degraded: blind.autoProtectionDegraded)
+                let symbol = StatusPanelFormat.blindSymbol(blindSeverity)
                 Image(systemName: symbol.name)
                     .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(healthColor(symbol.tint))
@@ -440,7 +473,9 @@ private struct AccountRowView: View {
             weeklyPct: row.weeklyPct,
             sessionReset: sessionReset,
             weeklyReset: weeklyReset,
-            blind: row.blindActive)
+            blind: row.blindActive,
+            nextSwap: nextSwap,
+            now: now)
     }
 }
 
@@ -545,13 +580,21 @@ private struct UsageBar: View {
 /// itself sits ~6 pt narrower than a live sibling's — an accepted legibility trade, not a lined-up column.
 private struct BlindMeter: View {
     let blind: BlindActive
+    /// The composed blind severity (#485 OK/DEGRADED, #572 CORNERED) — resolved once by `AccountRowView`
+    /// so the held block, the eye-slash, and the leading rule all read one source.
+    let severity: StatusPanelFormat.BlindSeverity
+    /// The snapshot next-swap, read only to fold the reset into the CORNERED remedy sub-line.
+    let nextSwap: NextSwap?
+    let now: Int64
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         // The last-known session % carries the SAME severity band a live meter would (green/amber/red) —
-        // the held bar shows "the last reading was at X%", while the blind OK/DEGRADED verdict rides the
-        // eye glyph, the leading rule, and the shield line below (two orthogonal facts, two colour channels).
-        let severity = StatusPanelFormat.utilSeverity(blind.lastKnownSessionPct)
+        // the held bar shows "the last reading was at X%", while the blind OK/DEGRADED/CORNERED verdict rides
+        // the eye glyph, the leading rule, and the shield line below (two orthogonal facts, two colour
+        // channels). Named distinctly from the stored `severity` (the composed `BlindSeverity`) so the two
+        // never shadow — the bar keys off the % BAND, the verdict off the auto-protection state.
+        let lastKnownBand = StatusPanelFormat.utilSeverity(blind.lastKnownSessionPct)
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 9) {
                 Text("SESSION")
@@ -559,11 +602,11 @@ private struct BlindMeter: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 52, alignment: .leading)
 
-                HeldUsageBar(fraction: Double(blind.lastKnownSessionPct) / 100.0, color: barColor(severity))
+                HeldUsageBar(fraction: Double(blind.lastKnownSessionPct) / 100.0, color: barColor(lastKnownBand))
 
                 Text(StatusPanelFormat.pct(blind.lastKnownSessionPct))
                     .font(.system(size: 12, weight: .semibold)).monospacedDigit()
-                    .foregroundStyle(Color.panel(StatusPanelFormat.usageTextTint(severity)))
+                    .foregroundStyle(Color.panel(StatusPanelFormat.usageTextTint(lastKnownBand)))
                     .frame(width: 40, alignment: .trailing)
 
                 Text(StatusPanelFormat.blindDurationChip(blind.blindSecs))
@@ -580,8 +623,9 @@ private struct BlindMeter: View {
                 .tracking(0.3)
                 .foregroundStyle(.tertiary)
 
-            // The auto-protection verdict — OK calm / DEGRADED orange — mirroring the CLI's blind line.
-            let verdict = StatusPanelFormat.blindVerdict(degraded: blind.autoProtectionDegraded)
+            // The auto-protection verdict — OK calm / DEGRADED orange / CORNERED red — mirroring the CLI's
+            // blind line (#485; #572 adds CORNERED "cannot act" + the remedy sub-line below).
+            let verdict = StatusPanelFormat.blindVerdict(severity, nextSwap: nextSwap, now: now)
             HStack(spacing: 5) {
                 Image(systemName: verdict.symbol)
                     .symbolRenderingMode(.hierarchical)
@@ -591,8 +635,20 @@ private struct BlindMeter: View {
                     .font(.caption)
                     .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
             }
-            // The row's VoiceOver label already speaks the whole blind state as one element (#485).
+            // The row's VoiceOver label already speaks the whole blind state — verdict AND cornered remedy
+            // — as one element (#485/#572, `rowAccessibilityLabel`).
             .accessibilityHidden(true)
+            // CORNERED only (#572): the operator remedy on its own sub-line — "Out of capacity … · add or
+            // free an account" — indented under the verdict text (past the glyph + gap). Absent for
+            // OK/DEGRADED (`remedy == nil`). Wraps rather than truncates: it is the one actionable line.
+            if let remedy = verdict.remedy {
+                Text(remedy)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 18)
+                    .accessibilityHidden(true)
+            }
         }
     }
 

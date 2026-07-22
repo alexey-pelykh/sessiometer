@@ -83,6 +83,24 @@ enum RenderPanelTool {
         // → orange eye-slash + orange leading rule + orange verdict.
         let blindDegradedRows = [blindWork(BlindActive(blindSecs: 660, lastKnownSessionPct: 88,
                                                        autoProtectionDegraded: true)), rows[1], rows[2]]
+        // CORNERED (#572): blind + DEGRADED + no viable target — last-known session 92% (red band), blind
+        // 18m → RED eye-slash + red leading rule + red "CANNOT ACT" verdict + the "add or free an account"
+        // remedy. The siblings are BOTH weekly-exhausted (WHY there is no target), so each renders the
+        // `nosign` switch chip. The cornered-ness is composed at render from `blind_active` (degraded) +
+        // the fixture's `next_swap == .noViableTarget` — no new wire field.
+        let exhaustedPersonal = AccountRow(label: "Personal", isActive: false, isEnabled: true,
+                                           isQuarantined: false, isRecovering: false, auth: .healthy,
+                                           sessionPct: 14, weeklyPct: 100, sessionResetsAt: now + 2 * 3600,
+                                           weeklyResetsAt: now + 2 * day + 4 * 3600, weeklyExhausted: true,
+                                           isNextSwapTarget: false, blindActive: nil)
+        let exhaustedScratch = AccountRow(label: "Scratch", isActive: false, isEnabled: true,
+                                          isQuarantined: false, isRecovering: false, auth: .healthy,
+                                          sessionPct: 6, weeklyPct: 97, sessionResetsAt: now + 4 * 3600 + 50 * 60,
+                                          weeklyResetsAt: now + 3 * day + 3600, weeklyExhausted: true,
+                                          isNextSwapTarget: false, blindActive: nil)
+        let blindCorneredRows = [blindWork(BlindActive(blindSecs: 1080, lastKnownSessionPct: 92,
+                                                       autoProtectionDegraded: true)),
+                                 exhaustedPersonal, exhaustedScratch]
 
         // The panel-rendered states (the fuller 9-state fidelity's remaining facets are #169 siblings).
         // `stale` and `disconnected` retain the last-good roster (disconnected dims it); the account-less
@@ -113,6 +131,12 @@ enum RenderPanelTool {
                     generatedAt: now - 12),
             Fixture(name: "blind-degraded", state: .connected, rows: blindDegradedRows,
                     nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 12),
+            // #572: the CORNERED blind row — blind + DEGRADED + no viable target. `next_swap` is
+            // `.noViableTarget` (every spare weekly-exhausted, capacity back in 2d 4h), the signal the panel
+            // composes with the row's `autoProtectionDegraded` into the red "cannot act" verdict + remedy.
+            Fixture(name: "blind-cornered", state: .connected, rows: blindCorneredRows,
+                    nextSwap: .noViableTarget(cause: .weekly, resetsAt: now + 2 * day + 4 * 3600),
                     generatedAt: now - 12),
         // …plus the four daemon-level FAULT ranks (#592) — appended rather than inlined because they vary a
         // different axis: same `.connected` state and same healthy roster, differing only in which payload

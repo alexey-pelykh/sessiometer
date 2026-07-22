@@ -434,15 +434,44 @@ enum StatusPanelFormat {
     // screenshot-verified in CI). The blind row REPLACES the bare `n/a … 🟡` a failed poll would show — a
     // SEMANTIC held state, never a false-healthy row (#137) — and reflects daemon state only (#169).
 
-    /// The blind row's health-slot glyph — an `eye.slash` ("usage visibility lost"), shown while blind. A
-    /// DISTINCT shape from every `healthSymbol` (an eye, not a check / clock / triangle / octagon), so
-    /// blindness is legible WITHOUT color (WCAG 1.4.1). OK stays calm `.neutral`; DEGRADED takes the at-risk
-    /// `.orange` (`--ut-o`). NOTE: the CLI emphasizes its DEGRADED blind line in RED (`Severity::Red`,
-    /// `src/cli.rs`); the panel deliberately uses ORANGE, not red — the blind-DEGRADED GLANCE is `.attention`
-    /// (one rung below `.noRunway`), so red would over-signal. A per-medium COLOR choice under R-2
-    /// STATE-parity (not color-parity); the shared STATE is "DEGRADED", rendered in each medium's idiom.
-    static func blindSymbol(degraded: Bool) -> (name: String, tint: HealthTint) {
-        ("eye.slash", degraded ? .orange : .neutral)
+    /// The three auto-protection body verdicts for a blind ACTIVE account: OK / DEGRADED (#485), plus
+    /// CORNERED (#572). **Cornered = blind + DEGRADED + no viable target** — the ONE bounded-blindness
+    /// state the daemon CANNOT self-resolve, so the operator must act. The panel composes the SAME two
+    /// daemon verdicts the CLI's `cornered_state` does (`src/cli.rs`): `auto_protection_degraded` AND
+    /// `next_swap == no_viable_target` — no new wire field. DEGRADED-but-with-a-target is NOT cornered
+    /// (the daemon can still swap), and an OK (interim-window) blind is never cornered.
+    enum BlindSeverity: Equatable { case ok, degraded, cornered }
+
+    static func blindSeverity(degraded: Bool, nextSwap: NextSwap?) -> BlindSeverity {
+        guard degraded else { return .ok }
+        if case .noViableTarget = nextSwap { return .cornered }
+        return .degraded
+    }
+
+    /// The `nextSwap` the switchable roster may compose blind verdicts from — gated on a VOUCHED connection.
+    /// Only `.connected` stands behind the retained `nextSwap`; under `.stale` (the valid-frame watchdog has
+    /// elapsed — the daemon has gone quiet past the liveness window, but the last-good snapshot is still
+    /// shown) that `nextSwap` is unvouched, so it is WITHHELD (`nil`). Withholding degrades a would-be
+    /// CORNERED row to DEGRADED via `blindSeverity` above — a retained `noViableTarget` must never raise the
+    /// loud red "cannot act" alarm off data the connection no longer vouches for — keeping the panel body's
+    /// severity in step with the `.stale` `!` glance rather than inverting past it (#137, #572). Every other
+    /// (non-switchable) roster already passes no `nextSwap`; this is the one switchable-path gate.
+    static func rosterNextSwap(for state: ConnectionState, nextSwap: NextSwap?) -> NextSwap? {
+        state == .connected ? nextSwap : nil
+    }
+
+    /// The eye-slash health glyph + its tint, keyed off `BlindSeverity`. OK is calm (`.neutral`), DEGRADED
+    /// at-risk `.orange`. NOTE on the DEGRADED colour (#485): the CLI emphasizes its DEGRADED blind line in
+    /// RED (`Severity::Red`, `src/cli.rs`); the panel deliberately uses ORANGE — the blind-DEGRADED GLANCE
+    /// is `.attention`, one rung below `.noRunway`, so red would over-signal (a per-medium COLOUR choice
+    /// under R-2 STATE-parity). CORNERED, however, IS `.red` (#572): its glance IS `.noRunway` (⊘), the
+    /// worst rung, so red MATCHES the glance severity rather than over-signalling.
+    static func blindSymbol(_ severity: BlindSeverity) -> (name: String, tint: HealthTint) {
+        switch severity {
+        case .ok:       return ("eye.slash", .neutral)
+        case .degraded: return ("eye.slash", .orange)
+        case .cornered: return ("eye.slash", .red)
+        }
     }
 
     /// Whether a blind row should ALSO show its credential's own auth warning glyph beside the `eye.slash`.
@@ -473,16 +502,68 @@ enum StatusPanelFormat {
     /// bar is never mistaken for a live one (the #137 never-false-healthy tell, carried onto the caption).
     static let blindLastKnownCaption = "LAST-KNOWN · RATE-LIMITED"
 
-    /// The auto-protection verdict line (issue #479 surface 1) — the panel's render of the CLI's
-    /// `auto-protection {OK | DEGRADED (acting on a stale anchor)}`. Returns the shield glyph, the spoken
-    /// verdict, and the tint: OK is calm (`.neutral` — the CLI leaves OK un-emphasized), DEGRADED is the
-    /// at-risk `.orange` fault (the CLI emphasizes ONLY DEGRADED — in RED; the panel uses ORANGE for the
-    /// per-medium reason in `blindSymbol`). "acting on a stale anchor" mirrors the CLI parenthetical
-    /// verbatim; "daemon self-resolving" is the panel's room-permitting OK gloss.
-    static func blindVerdict(degraded: Bool) -> (symbol: String, text: String, tint: HealthTint) {
-        degraded
-            ? ("exclamationmark.shield.fill", "Auto-protection DEGRADED — acting on a stale anchor", .orange)
-            : ("checkmark.shield.fill", "Auto-protection OK — daemon self-resolving", .neutral)
+    /// One auto-protection body verdict: the shield glyph, the spoken verdict text, its tint, and — for
+    /// CORNERED only — a second `remedy` sub-line. OK/DEGRADED carry `remedy == nil` (single-line, as #485
+    /// shipped).
+    struct BlindVerdict: Equatable {
+        let symbol: String
+        let text: String
+        let tint: HealthTint
+        /// The cornered "Out of capacity … · add or free an account" sub-line; `nil` for OK/DEGRADED.
+        let remedy: String?
+    }
+
+    /// The auto-protection verdict line(s) for a blind active account, keyed off `BlindSeverity`
+    /// (issue #479 surface 1; #485 OK/DEGRADED, #572 CORNERED) — the panel's render of the CLI's
+    /// `auto-protection {OK | DEGRADED (acting on a stale anchor) | cannot act — …}`. OK is calm
+    /// (`.neutral` — the CLI leaves OK un-emphasized); DEGRADED is the at-risk `.orange` fault
+    /// ("acting on a stale anchor" mirrors the CLI parenthetical verbatim); CORNERED is the loudest,
+    /// `.red` "Auto-protection CANNOT ACT" + the operator remedy (`corneredRemedy`), the panel half of
+    /// the CLI's `render_cornered`. `nextSwap`/`now` are read only in the cornered branch (to fold the
+    /// reset into the remedy); OK/DEGRADED ignore them.
+    static func blindVerdict(_ severity: BlindSeverity, nextSwap: NextSwap?, now: Int64) -> BlindVerdict {
+        switch severity {
+        case .ok:
+            return BlindVerdict(symbol: "checkmark.shield.fill",
+                                text: "Auto-protection OK — daemon self-resolving", tint: .neutral, remedy: nil)
+        case .degraded:
+            return BlindVerdict(symbol: "exclamationmark.shield.fill",
+                                text: "Auto-protection DEGRADED — acting on a stale anchor", tint: .orange, remedy: nil)
+        case .cornered:
+            return BlindVerdict(symbol: "xmark.shield.fill",
+                                text: "Auto-protection CANNOT ACT", tint: .red,
+                                remedy: corneredRemedy(nextSwap, now: now))
+        }
+    }
+
+    /// The cornered remedy sub-line: `Out of capacity[, resets in {dur}] · add or free an account`. The
+    /// remedy is **UNCONDITIONAL** — cornered is always unresolvable, so the CLI's `render_cornered`
+    /// appends "add or free an account" unconditionally (issue #666), UNLIKE the general all-exhausted
+    /// `nextSwapFooter` whose "add an account" nudge is gated on a structural-vs-transient wait. The
+    /// wording is the **unified** "Out of capacity" — NOT a weekly/session split: on a mixed fleet the
+    /// daemon's `cause` names the soonest spare's gating dimension, not a fleet-wide property (#665/#666),
+    /// so the panel says only what the wire substantiates. `resetsAt` folds in via the same `humanizeUntil`
+    /// the reset cells use; a daemon that sent no reset (or a non-`noViableTarget` next-swap, which the
+    /// cornered branch never reaches) yields the bare remedy.
+    static func corneredRemedy(_ nextSwap: NextSwap?, now: Int64) -> String {
+        "Out of capacity\(corneredReliefClause(nextSwap, now: now)) · add or free an account"
+    }
+
+    /// The optional ", resets in {dur}" clause folded into BOTH the visual cornered remedy (`corneredRemedy`)
+    /// and its VoiceOver phrasing (`rowAccessibilityLabel`) — ONE source so the two surfaces never drift on
+    /// the reset wording. Empty unless the `noViableTarget` next-swap carries a reset instant; `humanizeUntil`
+    /// clamps a passed reset (`<= 0` → "now") exactly as the reset cells do. The `cause` is deliberately
+    /// ignored (the `_`): the panel's cornered wording is cause-INDEPENDENT — always "Out of capacity" + this
+    /// clause, the ratified #666 unified framing. The CLI's `render_cornered` (`src/cli.rs`) instead keeps a
+    /// `cause == nil → "no viable target"` fallback (dropping this clause). The CURRENT daemon always pairs a
+    /// `cause` (and `resetsAt`) with a `noViableTarget`, but a pre-#405 daemon omits both (`WireModel` tolerates
+    /// it via `decodeIfPresent`), reaching that arm — so against such a daemon the two surfaces diverge in
+    /// WORDING ("Out of capacity" vs "no viable target"). Under R-2 STATE-parity that is an accepted per-medium
+    /// choice, NOT a parity break: both convey the cornered state and the identical "add or free an account"
+    /// remedy; the panel keeps its unified #666 wording rather than replicating the CLI's legacy fallback.
+    static func corneredReliefClause(_ nextSwap: NextSwap?, now: Int64) -> String {
+        guard case .noViableTarget(_, let resetsAt) = nextSwap, let at = resetsAt else { return "" }
+        return ", resets in \(humanizeUntil(at - now))"
     }
 
     // MARK: - Panel chrome fidelity tokens (#388 — theme-aware accent emphasis + neutral fills)
@@ -1111,7 +1192,9 @@ enum StatusPanelFormat {
         weeklyPct: UInt8?,
         sessionReset: String,
         weeklyReset: String,
-        blind: BlindActive? = nil
+        blind: BlindActive? = nil,
+        nextSwap: NextSwap? = nil,
+        now: Int64 = 0
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
@@ -1120,12 +1203,21 @@ enum StatusPanelFormat {
             // Blind active row (#485): speak the SEMANTIC held state the row shows — blind duration,
             // last-known session %, and the auto-protection verdict — in place of the two `n/a` meters the
             // row no longer draws. Mirrors the CLI's spoken facts (blind for {dur} · last-known {pct} · OK/
-            // DEGRADED); never a fabricated live reading (#137).
+            // DEGRADED/CANNOT-ACT); never a fabricated live reading (#137).
             parts.append("blind for \(humanizeUntil(Int64(blind.blindSecs)))")
             parts.append("last-known session \(blind.lastKnownSessionPct) percent")
-            parts.append(blind.autoProtectionDegraded
-                         ? "auto-protection degraded, acting on a stale anchor"
-                         : "auto-protection okay, daemon self-resolving")
+            switch blindSeverity(degraded: blind.autoProtectionDegraded, nextSwap: nextSwap) {
+            case .ok:
+                parts.append("auto-protection okay, daemon self-resolving")
+            case .degraded:
+                parts.append("auto-protection degraded, acting on a stale anchor")
+            case .cornered:
+                // #572: speak the cornered verdict AND the remedy — a VoiceOver user must HEAR "add or free
+                // an account", not the understated "degraded" the pre-#572 label spoke for this state. The
+                // reset clause shares `corneredReliefClause` with the visual remedy so the two never drift.
+                let relief = corneredReliefClause(nextSwap, now: now)
+                parts.append("auto-protection cannot act, out of capacity\(relief), add or free an account")
+            }
         } else {
             // Both windows, each with its reset — matching the row's two meters and the CLI's two columns.
             parts.append("session \(pct(sessionPct)) resets in \(sessionReset)")

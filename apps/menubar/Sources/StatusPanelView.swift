@@ -222,7 +222,13 @@ struct StatusPanelView: View {
                 Divider().padding(.horizontal, 14)
             }
             if !store.rows.isEmpty {
-                RosterView(rows: store.rows, now: now, switchable: true)
+                // #572: the active blind row composes the CORNERED verdict from `store.rosterNextSwap` — the
+                // honest-state-gated next-swap that WITHHOLDS a retained `noViableTarget` under `.stale`
+                // (watchdog elapsed) so it degrades to orange DEGRADED, matching the stale `!` glance rather
+                // than a loud red "cannot act" off unvouched data (#137). MUST read `rosterNextSwap`, not the
+                // raw `store.nextSwap`. (The dropped roster at `.disconnected`/`.reconnecting` above is dimmed
+                // and passes no `nextSwap`.)
+                RosterView(rows: store.rows, now: now, switchable: true, nextSwap: store.rosterNextSwap)
             }
             if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
                 SwapCalloutCard(target: target,

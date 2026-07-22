@@ -73,6 +73,19 @@ final class WatchStatusStore: ObservableObject {
     /// daemon omits the wire key). A COUNT only, never a token or path (issue #15).
     @Published private(set) var systemicRefreshFailure: UInt32?
 
+    /// The `nextSwap` the SWITCHABLE roster composes its blind verdicts from — the panel-side honest-state
+    /// gate (#137, #572). A retained `noViableTarget` must NOT raise the cornered RED "cannot act" alarm off
+    /// data the connection no longer vouches for: only `.connected` stands behind the last snapshot, so under
+    /// `.stale` (last-good rows shown, daemon gone quiet) the value is WITHHELD (`nil`) and a would-be
+    /// cornered row degrades to DEGRADED. Exposed HERE — not computed inline in `StatusPanelView` — so the
+    /// GATE is pinned by a store test, the panel-side parallel of the glance gate the machine applies to `⊘`
+    /// (`HonestStateMachineTests`). `StatusPanelView` MUST read THIS for the switchable roster, NEVER the raw
+    /// `nextSwap` above — that final view→gate hop is not unit-testable without ViewInspector, so this doc plus
+    /// the call-site comment are its tripwire. Delegates the predicate to `StatusPanelFormat.rosterNextSwap`.
+    var rosterNextSwap: NextSwap? {
+        StatusPanelFormat.rosterNextSwap(for: connectionState, nextSwap: nextSwap)
+    }
+
     // MARK: - The glance presentation stream (the status item consumes this)
 
     /// One `PresentationState` (glyph + a11y label) per state change, for the AppKit `NSStatusItem`

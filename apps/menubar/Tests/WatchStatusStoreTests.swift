@@ -39,6 +39,24 @@ final class WatchStatusStoreTests: XCTestCase {
         XCTAssertEqual(store.currentPresentation.glyph, .connecting)
     }
 
+    // MARK: - Roster next-swap honest-state gate (#572)
+
+    // The switchable roster composes the cornered blind verdict from `store.rosterNextSwap`, NOT the raw
+    // `store.nextSwap`. Under `.stale` (last-good snapshot retained, daemon gone quiet) a retained
+    // `noViableTarget` is WITHHELD, so a would-be cornered row degrades to DEGRADED — never the loud red
+    // "cannot act" alarm off unvouched data (#137). Pins the GATE (the store accessor) — the panel-side
+    // parallel of the glance `⊘` gate proven in `HonestStateMachineTests`. (The view's final hop — that
+    // `StatusPanelView` reads `rosterNextSwap`, not raw `nextSwap` — is not unit-testable without ViewInspector.)
+    func testRosterNextSwapWithheldUnlessConnectionIsVouched() {
+        let cornered = NextSwap.noViableTarget(cause: .weekly, resetsAt: 1)
+        // Vouched: `.connected` stands behind the last snapshot → the roster receives the retained next-swap.
+        let live = WatchStatusStore.preview(state: .connected, rows: [], nextSwap: cornered, generatedAt: nil)
+        XCTAssertEqual(live.rosterNextSwap, cornered)
+        // Unvouched: `.stale` withholds it → the roster composes DEGRADED, not the cornered RED alarm.
+        let stale = WatchStatusStore.preview(state: .stale, rows: [], nextSwap: cornered, generatedAt: nil)
+        XCTAssertNil(stale.rosterNextSwap)
+    }
+
     // MARK: - AC: snapshot → connected + rows, mirrored to both surfaces
 
     func testSnapshotDrivesConnectedAndPublishesRows() async throws {
