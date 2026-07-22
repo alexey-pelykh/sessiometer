@@ -62,7 +62,7 @@ load-bearing for anti-thrash — it is free to be what it was always meant to be
 `min(session_trigger, floor)`).
 
 **Why the default value matters more than it looks.** Config sections default on
-absence — every `RawConfig` field carries `#[serde(default)]` (`src/config.rs:1351`), so
+absence — every `RawConfig` field carries `#[serde(default)]` (`src/config.rs`), so
 an absent `[tunables]` block silently yields every tunable's default. With the floor
 opt-in, "absent" meant **off**, and the daemon would happily hand the active session to
 a 94%-full account (below the 95 trigger, so the gate admits it), which then trips its
@@ -82,10 +82,10 @@ escape to a live-but-busy one. A self-DoS, introduced by an otherwise-benign def
 the proactive path and is DROPPED entirely on the emergency path — shipped atomically.**
 
 1. **Default-on, always-valued.** `Tunables.session_floor: u8` (the `Option` is gone),
-   `DEFAULT_SESSION_FLOOR = 80` (`src/config.rs:74`). An absent key maps to 80 in
-   `Config::validate` (`src/config.rs:734`) — like any other tunable. The raw layer keeps
-   `Option<i64>` (`src/config.rs:1404`) solely to *detect* absence. `render()`
-   (`src/config.rs:993`) emits a **live** `session_floor = 80` line, so the value is
+   `DEFAULT_SESSION_FLOOR = 80` (`src/config.rs`). An absent key maps to 80 in
+   `Config::validate` (`src/config/validate.rs`) — like any other tunable. The raw layer keeps
+   `Option<i64>` (`src/config.rs`) solely to *detect* absence. `render()`
+   (`src/config/render.rs`) emits a **live** `session_floor = 80` line, so the value is
    visible in every config the tool writes. The cross-field invariant
    (`session_floor <= session_trigger`) keeps its distinct `ConfigFloorAboveTrigger`
    error.
