@@ -21,12 +21,13 @@ blacks out the vibrancy). Run from this directory:
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --hide-scrollbars --force-device-scale-factor=1.5 \
-  --window-size=1200,8600 --screenshot=renders/all-states.png \
+  --window-size=1200,9600 --screenshot=renders/all-states.png \
   menubar-preview.html
 ```
 
 (Bump the `--window-size` height if the page ever grows past it — the committed render is
-1800×12900 at this `8600` height × the `1.5` device scale; a shorter height clips the notes.)
+1800×14400 at this `9600` height × the `1.5` device scale; a shorter height clips the notes. The
+mock ends at ~9280 CSS px as of #703, so `9600` leaves ~320 px of headroom.)
 
 ## Rendering the BUILT panel (design-parity check)
 
@@ -45,7 +46,9 @@ BIN=".build/xcode/Build/Products/Debug/Sessiometer.app/Contents/MacOS/Sessiomete
 ```
 
 Output: `renders/panel-healthy-{light,dark}.png` — the built app (distinct from `all-states.png`,
-which is the mock). Light shown here:
+which is the mock). These are safe to commit: `RenderPanelTool` pins a fixture roster (`Work` /
+`Personal` / `Scratch`), and the wire carries only the operator-chosen label, never an email (#15).
+Light shown here:
 
 ![Built panel — healthy, light](renders/panel-healthy-light.png)
 
@@ -76,17 +79,15 @@ does not render at all, so it is likewise a manual real-popover check. Treat a b
 capture-field box in the PNGs as a known tool artifact, not a panel defect.
 
 **Harness limitation — ARMED / in-flight states are NOT captured.** `ImageRenderer` draws one resting
-frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a **fresh** render captures its
-resting glyph (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at its quiet `.tertiary`
-emphasis. What a single resting frame still can't show is the ARMED state — the hover/focus brighten to
-`.secondary`, the row wash, the `pointingHand` cursor — nor the in-flight `Switching…` spinner; those
-are interaction states, so they stay a manual operator check (#380) — as does the real-popover swap
-round-trip. **Note:** the committed `panel-healthy-*.png` are stale (pre-#448). The `--render-panel`
-crash that blocked regeneration (a missing `PanelStatsModel` environment object) is FIXED as of #504,
-but regenerating the PNGs runs the built app's `ImageRenderer` path, which needs a GUI / windowserver
-session — so it is a **manual pre-release step** (run the command above on a workstation), not something
-headless CI can do. #448 validated against the **mock** render (`all-states.png`, which does show the
-chip) + unit tests instead.
+frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a render captures its resting glyph
+(`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at its quiet `.tertiary` emphasis — the
+committed `panel-healthy-*.png` show it on every switchable row. What a single resting frame still
+can't show is the ARMED state — the hover/focus brighten to `.secondary`, the row wash, the
+`pointingHand` cursor — nor the in-flight `Switching…` spinner; those are interaction states, so they
+stay a manual operator check (#380) — as does the real-popover swap round-trip. **Note:** regenerating
+the committed PNGs runs the built app's `ImageRenderer` path, which needs a GUI / windowserver session
+— so it stays a **manual pre-release step** (run the command above on a workstation), not something
+headless CI can do.
 
 ### Design vs. capture, screen by screen
 
@@ -229,8 +230,7 @@ BIN=".build/xcode/Build/Products/Debug/Sessiometer.app/Contents/MacOS/Sessiomete
 "$BIN" --render-bar-glyphs "$PWD/design/renders/bar-glyphs"
 ```
 
-These renders carry **no account data** (they are bare glyphs), so — unlike the status *panel* captures,
-which show real account emails and must never be committed — they are safe to commit, and are.
+These renders carry **no account data** (they are bare glyphs), so they are safe to commit, and are.
 
 The drift gate is `Tests/BarGlyphParityTests` (CI-enforced under the `swift` job, headless): it re-renders
 every cell and asserts each matches its reference, that the four glyphs stay pairwise distinct in every
