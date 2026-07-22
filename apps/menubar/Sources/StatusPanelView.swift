@@ -222,10 +222,13 @@ struct StatusPanelView: View {
                 Divider().padding(.horizontal, 14)
             }
             if !store.rows.isEmpty {
-                // #572: the live roster receives `nextSwap` so the active blind row can compose the CORNERED
-                // verdict. The dropped/stale roster above deliberately does NOT (default nil) — a retained
-                // `noViableTarget` must never raise a cornered alarm off unvouched data (honest-state).
-                RosterView(rows: store.rows, now: now, switchable: true, nextSwap: store.nextSwap)
+                // #572: the active blind row composes the CORNERED verdict from `nextSwap` — but ONLY when the
+                // connection VOUCHES for it. `rosterNextSwap(for:)` withholds it under `.stale` (this same
+                // case, watchdog elapsed) so a retained `noViableTarget` degrades to orange DEGRADED, matching
+                // the stale `!` glance rather than a loud red "cannot act" off unvouched data (#137). (The
+                // dropped roster at `.disconnected`/`.reconnecting` above is dimmed and passes no `nextSwap`.)
+                RosterView(rows: store.rows, now: now, switchable: true,
+                           nextSwap: StatusPanelFormat.rosterNextSwap(for: state, nextSwap: store.nextSwap))
             }
             if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
                 SwapCalloutCard(target: target,

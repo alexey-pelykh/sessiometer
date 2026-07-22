@@ -806,6 +806,35 @@ final class StatusPanelFormatTests: XCTestCase {
             degraded: true, nextSwap: .noViableTarget(cause: nil, resetsAt: nil)), .cornered)
     }
 
+    // #572 honest-state gate (#137): the switchable roster composes the CORNERED verdict ONLY from a VOUCHED
+    // connection. `.connected` stands behind the retained next-swap → passes it through; `.stale` (last-good
+    // snapshot still shown, but the valid-frame watchdog has elapsed — the daemon has gone quiet) WITHHOLDS
+    // it, so a retained `noViableTarget` degrades cornered → DEGRADED, matching the `.stale` `!` glance
+    // instead of inverting past it into a loud red "cannot act" alarm off unvouched data.
+    func testRosterNextSwapWithholdsUnvouchedCornered() {
+        let cornered = NextSwap.noViableTarget(cause: .weekly, resetsAt: 1)
+        let target = NextSwap.target(to: "personal", reason: .onlyCandidate)
+        // Vouched: `.connected` passes the retained next-swap through unchanged.
+        XCTAssertEqual(StatusPanelFormat.rosterNextSwap(for: .connected, nextSwap: cornered), cornered)
+        XCTAssertEqual(StatusPanelFormat.rosterNextSwap(for: .connected, nextSwap: target), target)
+        XCTAssertNil(StatusPanelFormat.rosterNextSwap(for: .connected, nextSwap: nil))
+        // Unvouched: `.stale` withholds it (→ nil) regardless of what was retained.
+        XCTAssertNil(StatusPanelFormat.rosterNextSwap(for: .stale, nextSwap: cornered))
+        XCTAssertNil(StatusPanelFormat.rosterNextSwap(for: .stale, nextSwap: target))
+        // End-to-end invariant: a stale + would-be-cornered row composes as DEGRADED, not cornered…
+        XCTAssertEqual(
+            StatusPanelFormat.blindSeverity(
+                degraded: true,
+                nextSwap: StatusPanelFormat.rosterNextSwap(for: .stale, nextSwap: cornered)),
+            .degraded)
+        // …while the SAME row on a vouched `.connected` connection is genuinely CORNERED.
+        XCTAssertEqual(
+            StatusPanelFormat.blindSeverity(
+                degraded: true,
+                nextSwap: StatusPanelFormat.rosterNextSwap(for: .connected, nextSwap: cornered)),
+            .cornered)
+    }
+
     // The duration chip reuses `humanizeUntil` — the SAME format as the CLI's `blind for {dur}`.
     func testBlindDurationChipHumanizesTheSeconds() {
         XCTAssertEqual(StatusPanelFormat.blindDurationChip(240), "blind 4m")

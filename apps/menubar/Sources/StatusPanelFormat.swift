@@ -451,6 +451,18 @@ enum StatusPanelFormat {
         return .degraded
     }
 
+    /// The `nextSwap` the switchable roster may compose blind verdicts from — gated on a VOUCHED connection.
+    /// Only `.connected` stands behind the retained `nextSwap`; under `.stale` (the valid-frame watchdog has
+    /// elapsed — the daemon has gone quiet past the liveness window, but the last-good snapshot is still
+    /// shown) that `nextSwap` is unvouched, so it is WITHHELD (`nil`). Withholding degrades a would-be
+    /// CORNERED row to DEGRADED via `blindSeverity` above — a retained `noViableTarget` must never raise the
+    /// loud red "cannot act" alarm off data the connection no longer vouches for — keeping the panel body's
+    /// severity in step with the `.stale` `!` glance rather than inverting past it (#137, #572). Every other
+    /// (non-switchable) roster already passes no `nextSwap`; this is the one switchable-path gate.
+    static func rosterNextSwap(for state: ConnectionState, nextSwap: NextSwap?) -> NextSwap? {
+        state == .connected ? nextSwap : nil
+    }
+
     /// The eye-slash health glyph + its tint, keyed off `BlindSeverity`. OK is calm (`.neutral`), DEGRADED
     /// at-risk `.orange`. NOTE on the DEGRADED colour (#485): the CLI emphasizes its DEGRADED blind line in
     /// RED (`Severity::Red`, `src/cli.rs`); the panel deliberately uses ORANGE — the blind-DEGRADED GLANCE
@@ -543,7 +555,12 @@ enum StatusPanelFormat {
     /// The optional ", resets in {dur}" clause folded into BOTH the visual cornered remedy (`corneredRemedy`)
     /// and its VoiceOver phrasing (`rowAccessibilityLabel`) — ONE source so the two surfaces never drift on
     /// the reset wording. Empty unless the `noViableTarget` next-swap carries a reset instant; `humanizeUntil`
-    /// clamps a passed reset (`<= 0` → "now") exactly as the reset cells do.
+    /// clamps a passed reset (`<= 0` → "now") exactly as the reset cells do. The `cause` is deliberately
+    /// ignored (the `_`): the panel's cornered wording is cause-INDEPENDENT — always "Out of capacity" + this
+    /// clause, the ratified #666 unified framing. The CLI's `render_cornered` (`src/cli.rs`) instead keeps a
+    /// defensive `cause == nil → "no viable target"` fallback that drops this clause; but a real daemon always
+    /// pairs a `cause` with a `noViableTarget`, so that arm is unreachable and the divergence has no live
+    /// effect — the panel keeps its unified wording rather than replicating the CLI's legacy fallback.
     static func corneredReliefClause(_ nextSwap: NextSwap?, now: Int64) -> String {
         guard case .noViableTarget(_, let resetsAt) = nextSwap, let at = resetsAt else { return "" }
         return ", resets in \(humanizeUntil(at - now))"

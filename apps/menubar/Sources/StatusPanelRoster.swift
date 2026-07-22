@@ -394,7 +394,7 @@ private struct AccountRowView: View {
     /// fine; what's lost is usage visibility, so the health slot reports that, not a false auth verdict.
     @ViewBuilder
     private var authView: some View {
-        if let blind = row.blindActive {
+        if row.blindActive != nil {
             // Usage visibility lost (#485): an eye-slash, a DISTINCT shape from every auth glyph. OK is
             // calm secondary; DEGRADED tints it at-risk orange (redundant with the row's rule + verdict).
             // If the credential is ITSELF in a warning state (stale/at-risk — orthogonal to usage-blindness),
