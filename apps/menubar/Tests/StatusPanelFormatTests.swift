@@ -468,26 +468,50 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertNil(StatusPanelFormat.nextSwapFooter(nil, now: 0))   // no active anchor → no footer
     }
 
-    // #405: a `noViableTarget` carrying fleet-capacity relief renders the composite the panel's own
-    // way — STATE-parity with the CLI's `next swap: none …` footer (same facts, not the same bytes).
+    // #405/#666: a `noViableTarget` carrying fleet-capacity relief renders it the panel's own way —
+    // STATE-parity with the CLI's `next swap: none …` footer (same facts, not the same bytes), WITHOUT
+    // the false universal and with the "· add an account" nudge gated on the WAIT, not the `cause` label.
     func testNextSwapFooterOutOfCapacityRelief() {
-        // Weekly-exhausted fleet: a week-long block → name the reset AND nudge to add an account.
+        // A LONG wait (days) is a structural shortage → name the reset AND nudge to add an account.
         XCTAssertEqual(
             StatusPanelFormat.nextSwapFooter(
                 .noViableTarget(cause: .weekly, resetsAt: 1_000_000 + 2 * 86_400 + 4 * 3_600), now: 1_000_000),
             "Out of capacity — resets in 2d4h · add an account")
-        // Weekly cause but the daemon did not know the reset → the nudge without a duration.
+        // #665/#666 regression — the live mixed-fleet miscalibration: a `weekly` cause naming a
+        // SUB-SESSION-WINDOW weekly reset (soonest spare returns in 59m). The pre-#666 panel keyed the
+        // nudge off the `weekly` LABEL and read "Out of capacity · add an account" for a one-HOUR wait.
+        // Now the label is irrelevant: a sub-window wait is transient → NO nudge.
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(
+                .noViableTarget(cause: .weekly, resetsAt: 1_000_000 + 59 * 60), now: 1_000_000),
+            "Out of capacity — resets in 59m")
+        // Just OVER one session window (6h > 5h) → structural again, the nudge returns — proving the
+        // gate keys off the wait, not the cause (a `weekly` cause both times).
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(
+                .noViableTarget(cause: .weekly, resetsAt: 1_000_000 + 6 * 3_600), now: 1_000_000),
+            "Out of capacity — resets in 6h · add an account")
+        // The boundary is STRICT: exactly one session window still counts as within the window —
+        // the nudge needs MORE than a session window (lockstep with the CLI's constant-derived pin).
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(
+                .noViableTarget(cause: .weekly, resetsAt: 1_000_000 + StatusPanelFormat.addAccountNudgeWaitSecs),
+                now: 1_000_000),
+            "Out of capacity — resets in 5h")
+        // Cause present but the daemon did not know the reset → wait UNKNOWN, treated as structural → nudge.
         XCTAssertEqual(
             StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: .weekly, resetsAt: nil), now: 1_000_000),
             "Out of capacity · add an account")
-        // Over-session fleet: a transient block that resets soon → name the reset, NO add-account nudge.
+        // …and identically under a SESSION label (label-independent unknown-wait handling).
+        XCTAssertEqual(
+            StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: .session, resetsAt: nil), now: 1_000_000),
+            "Out of capacity · add an account")
+        // A SESSION cause with a soon reset (47m ≪ one session window) → transient, no nudge, no false
+        // universal — the SAME honest render as any short-wait cause (label-independent).
         XCTAssertEqual(
             StatusPanelFormat.nextSwapFooter(
                 .noViableTarget(cause: .session, resetsAt: 1_000_000 + 47 * 60), now: 1_000_000),
-            "Every account over its session limit — resets in 47m")
-        XCTAssertEqual(
-            StatusPanelFormat.nextSwapFooter(.noViableTarget(cause: .session, resetsAt: nil), now: 1_000_000),
-            "Every account over its session limit")
+            "Out of capacity — resets in 47m")
     }
 
     // MARK: - canonicalScrubBanner (issue #469 — the fleet-wide scrubbed-canonical signal)
