@@ -575,10 +575,16 @@ pub(crate) struct SwapProjection {
 ///
 /// Following the house log-the-ingredients / derive-the-views-offline idiom, the DERIVED projection
 /// is deliberately NOT stored: an offline reader recomputes
-/// `projected = session_pct + rate_pct_per_sec × inflation × duration_secs` and compares it against
-/// `ceiling_pct` — every term present on the one line. (The anchor term carries the `session_pct`
-/// field's existing `u8` rounding, so a recomputed projection inherits up to ±0.5 pp of anchor error;
-/// over any window long enough to arm the gate the rate term dominates it.)
+/// `projected = anchor + rate_pct_per_sec × inflation × duration_secs` and compares it against
+/// `ceiling_pct` — every term present on the one line. The `anchor` term is the #632-corrected base
+/// `session_pct.max(session_high_water_pct)`: since issue #632 the live arm projects off the #619
+/// plausibility-corrected anchor, and issue #670 carries the frozen high-water mark
+/// (`session_high_water_pct`, present only when the anchor was stale-low) beside the RAW `session_pct`
+/// precisely so the reader can apply that same `swap::plausible_anchor_session` correction and
+/// reproduce the corrected arm. Absent the mark token the anchor is simply `session_pct`. (The
+/// anchor term carries the `session_pct` / `session_high_water_pct` fields'
+/// existing `u8` rounding, so a recomputed projection inherits up to ±0.5 pp of anchor error; over
+/// any window long enough to arm the gate the rate term dominates it.)
 ///
 /// Both constants are STAMPED rather than left to be re-derived, so a record stays interpretable
 /// after either drifts — an offline reader applying today's inflation factor or today's ceiling to an
@@ -1097,6 +1103,28 @@ pub(crate) enum Event {
         /// Rendered as additive trailing tokens, so a window with no retained velocity leaves the
         /// line byte-for-byte unchanged. See [`BlindVelocity`].
         velocity: Option<BlindVelocity>,
+        /// The frozen per-window session HIGH-WATER MARK as a percent (issue #670), present ONLY
+        /// when it EXCEEDS the raw `session_pct` anchor (compared on the un-rounded fractions, so
+        /// after `u8` rounding the rendered token can TIE `session_pct`, never sit below it) — i.e.
+        /// the anchor's own pre-blind reading came back stale-low and
+        /// [`crate::swap::plausible_anchor_session`] would raise it. This is the value the live arms
+        /// decide on (`gate_session`), the one-sided FLOOR the RAW `session_pct` above is raised to
+        /// — that field stays a verbatim measurement (the #614 / #619 / #632 read-time-only
+        /// contract).
+        ///
+        /// Since issue #632 the live #584 velocity-projection status arm projects off that corrected
+        /// base, not the raw anchor. Carrying the mark here lets the two OFFLINE reconstructions —
+        /// the [`BlindVelocity`] recompute recipe and the `blind_projection_error` SLI
+        /// ([`crate::reliability`]) — apply the SAME `plausible_anchor_session` correction
+        /// (`corrected = session_pct.max(session_high_water_pct)`) and reproduce the corrected arm,
+        /// instead of projecting off the stale-low base and UNDER-computing relative to the live arm.
+        ///
+        /// `None` (token omitted, line byte-for-byte unchanged) when there is no retained mark or the
+        /// anchor was already plausible — precisely the no-op case of `plausible_anchor_session`, so
+        /// an ABSENT token means "no stale-low correction applies", never "unknown". Orthogonal to
+        /// `velocity`: a stale-low anchor is a fact about the window whether or not a sustained EMA
+        /// was retained. A bare number, never a token or email (issue #15).
+        session_high_water_pct: Option<u8>,
     },
     /// An account ENTERED a blind window (issue #583, umbrella #363 Path B): the poll that just
     /// cleared its [`crate::daemon`] `last_reading` slot took it from a live reading to none — a
@@ -1668,6 +1696,7 @@ impl Event {
                 session_at_recovery,
                 near_limit,
                 velocity,
+                session_high_water_pct,
             } => {
                 // The active account's blind-window CLOSE (issue #449) + the post-recovery
                 // swap-necessity SLI (issue #482). All bare numbers + a bool (#15): how long it was
@@ -1681,7 +1710,8 @@ impl Event {
                 // additive optional tokens, so the report-only blind velocity-projection arm
                 // (#584/#600) — which fires no swap and emits no event of its own — becomes
                 // reconstructable offline from THIS line:
-                // `projected = session_pct + rate × inflation × duration_secs`, armed iff it reaches
+                // `projected = anchor + rate × inflation × duration_secs` (anchor = `session_pct`,
+                // raised by the #670 mark token below when present), armed iff it reaches
                 // `ceiling`. The derived projection is deliberately NOT stored (log the ingredients,
                 // derive the views), while the two CONSTANTS are, so a drift in either cannot make an
                 // old record read wrong. Absent when no sustained EMA was retained — a line the arm
@@ -1695,8 +1725,20 @@ impl Event {
                     ),
                     None => String::new(),
                 };
+                // Issue #670: the frozen window high-water mark trails as ONE more additive optional
+                // token, present only when the pre-blind anchor was stale-low (so
+                // `swap::plausible_anchor_session` would raise it). An offline reader applies the SAME
+                // correction — `corrected = session_pct.max(session_high_water_pct)` — to reproduce the
+                // #632-corrected arm's base rather than projecting off the stale-low `session_pct`.
+                // Absent when no correction applies, leaving the line byte-for-byte unchanged;
+                // rendered as its own optional group AFTER the #634 velocity tokens, keeping the
+                // trio's documented position stable. A bare number (#15).
+                let high_water = match session_high_water_pct {
+                    Some(pct) => format!(" session_high_water_pct={pct}"),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}{velocity}"
+                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}{velocity}{high_water}"
                 )
             }
             Event::BlindEnter {
@@ -3281,6 +3323,9 @@ mod tests {
                     inflation: 1.75,
                     ceiling_pct: 95.0,
                 }),
+                // Issue #670: the corrected-anchor mark rides the same sweep — a bare number, so it
+                // adds no email/token surface even when the anchor was stale-low.
+                session_high_water_pct: Some(88),
             },
             Event::AllExhausted {
                 hold: "work".to_owned(),
@@ -3900,8 +3945,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             session_pct: 96,
             session_at_recovery: 98,
             near_limit: true,
-            // No retained velocity — the line is byte-for-byte the pre-#634 shape (additive tokens).
+            // No retained velocity and no stale-low mark — the line is byte-for-byte the pre-#634 /
+            // pre-#670 shape (both are additive optional tokens).
             velocity: None,
+            session_high_water_pct: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -3923,6 +3970,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             session_at_recovery: 42,
             near_limit: false,
             velocity: None,
+            session_high_water_pct: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -3953,6 +4001,9 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 inflation: 1.75,
                 ceiling_pct: 95.0,
             }),
+            // A plausible anchor (no stale-low correction) — the #670 mark token is omitted, so the
+            // #634 velocity tokens remain the tail exactly as before.
+            session_high_water_pct: None,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
@@ -3968,6 +4019,71 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         assert!(
             !line.to_lowercase().contains("token"),
             "no token (#15): {line}"
+        );
+    }
+
+    #[test]
+    fn blind_window_line_appends_the_stale_low_corrected_mark() {
+        // Issue #670: when the pre-blind anchor was STALE-LOW, the frozen window high-water mark —
+        // the base the #632-corrected live arm actually decides on — trails the line as ONE more
+        // additive token, AFTER the #634 velocity trio. The offline recompute becomes
+        // `max(session_pct, session_high_water_pct) + rate × inflation × duration_secs`:
+        // `max(20, 50) + 0.05 × 1.75 × 600 = 102.5 %` — at/over the 95 % ceiling, so the arm WAS
+        // armed — where the raw base reads `72.5 %`, below it, and an offline reader would conclude
+        // "the arm never armed" on a window the corrected arm armed on. `session_pct` stays the RAW
+        // measurement (the #614/#619/#632 read-time-only contract); the mark is the additive
+        // correction term beside it.
+        let line = Event::BlindWindow {
+            account: "u-A".to_owned(),
+            duration_secs: 600,
+            session_pct: 20,
+            session_at_recovery: 55,
+            near_limit: false,
+            velocity: Some(BlindVelocity {
+                rate_pct_per_sec: 0.05,
+                inflation: 1.75,
+                ceiling_pct: 95.0,
+            }),
+            session_high_water_pct: Some(50),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_window acct=u-A duration_secs=600 session_pct=20 session_at_recovery=55 near_limit=false rate=0.050000 inflation=1.75 ceiling=95.00 session_high_water_pct=50"
+            )
+        );
+        assert!(
+            crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
+            "no email sigil (#15): {line}"
+        );
+        assert!(
+            !line.to_lowercase().contains("token"),
+            "no token (#15): {line}"
+        );
+    }
+
+    #[test]
+    fn blind_window_line_carries_the_mark_without_velocity() {
+        // Issue #670: the mark is ORTHOGONAL to the #634 velocity trio — a stale-low anchor is a
+        // fact about the window whether or not a sustained EMA was retained. With no velocity the
+        // mark trails `near_limit` directly; the `blind_projection_error` reader still counts this
+        // line `without_velocity` (no `rate=` token), so the census partition is untouched.
+        let line = Event::BlindWindow {
+            account: "u-B".to_owned(),
+            duration_secs: 400,
+            session_pct: 20,
+            session_at_recovery: 55,
+            near_limit: false,
+            velocity: None,
+            session_high_water_pct: Some(50),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=blind_window acct=u-B duration_secs=400 session_pct=20 session_at_recovery=55 near_limit=false session_high_water_pct=50"
+            )
         );
     }
 
@@ -4194,6 +4310,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                     inflation: 1.75,
                     ceiling_pct: 95.0,
                 }),
+                session_high_water_pct: None,
             }
             .to_log_line(at_epoch(0)),
             Event::BlindEnter {
