@@ -233,17 +233,11 @@
   .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-trail{ flex:0 0 auto; display:flex; align-items:center; gap:8px; margin-left:6px }
-  /* native macOS tag: a calm NEUTRAL capsule matching the monogram .badge family — not an accent
-     pill. The accent DOT already carries the active colour cue, and #387 M5 drops the active ring to
-     reduce active over-signalling, so a second accent element here would re-inflate it; a same-hue
-     accent-on-accent-tint pill also sank the label to ~3:1. Sentence-case, no hairline outline / no
-     letter-spaced uppercase (both read as a web badge). The TEXT stays — with the filled dot it is
-     the WCAG 1.4.1 colour-is-not-the-only-cue redundancy for "active" (label ~3.9:1 light / ~3.8:1
-     dark on the capsule, clearing 1.4.11 with margin). */
-  .tag{
-    font-size:10px; font-weight:600; letter-spacing:0;
-    color:var(--text-2); background:var(--badge-bg); padding:1.5px 7px; border-radius:5px;
-  }
+  /* #699 retires the `.tag` "Active" capsule that used to open `.id-trail`. Active was signalled three
+     times over — the accent-tint row fill, the FILLED leading dot, and this text — and the capsule's
+     ~56px (pill + gap) came straight out of `.id-name`, truncating near-identical fleet emails. The
+     WCAG 1.4.1 non-colour cue survives without it: the dot's fill-vs-ring is a SHAPE difference, so
+     active still reads under colour-blindness and macOS monochrome. */
   .health{ display:inline-flex; color:var(--ok) }
   /* per-row manual-switch chip (#448 — persistent quiet, brightens when armed): #169's per-row swap made
      DISCOVERABLE at rest. Neutral --text-3 at rest (never accent — the one accent action is the footer Swap,
@@ -611,7 +605,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -677,7 +671,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1011,7 +1005,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
+                  <span class="id-trail"><span class="health muted"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1071,7 +1065,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1145,7 +1139,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1211,7 +1205,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1277,7 +1271,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1343,7 +1337,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1409,7 +1403,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
@@ -1598,7 +1592,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
+                  <span class="id-trail"><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
                 </div>
                 <div class="bmeter">
                   <div class="bm-row"><span class="m-label">Session</span><span class="bm-bar"><span class="bm-fill g" style="width:58%"></span><span class="bm-dash g"></span></span><span class="m-pct g">58%</span><span class="bm-chip">blind 3m</span></div>
@@ -1665,7 +1659,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
+                  <span class="id-trail"><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
                 </div>
                 <div class="bmeter">
                   <div class="bm-row"><span class="m-label">Session</span><span class="bm-bar"><span class="bm-fill a" style="width:88%"></span><span class="bm-dash a"></span></span><span class="m-pct a">88%</span><span class="bm-chip">blind 11m</span></div>
@@ -1731,7 +1725,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
+                  <span class="id-trail"><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
                 </div>
                 <div class="bmeter">
                   <div class="bm-row"><span class="m-label">Session</span><span class="bm-bar"><span class="bm-fill g" style="width:58%"></span><span class="bm-dash g"></span></span><span class="m-pct g">58%</span><span class="bm-chip">blind 3m</span></div>
@@ -1796,7 +1790,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
+                  <span class="id-trail"><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
                 </div>
                 <div class="bmeter">
                   <div class="bm-row"><span class="m-label">Session</span><span class="bm-bar"><span class="bm-fill a" style="width:88%"></span><span class="bm-dash a"></span></span><span class="m-pct a">88%</span><span class="bm-chip">blind 11m</span></div>
@@ -1862,7 +1856,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
+                  <span class="id-trail"><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
                 </div>
                 <div class="bmeter">
                   <div class="bm-row"><span class="m-label">Session</span><span class="bm-bar"><span class="bm-fill r" style="width:92%"></span><span class="bm-dash r"></span></span><span class="m-pct r">92%</span><span class="bm-chip">blind 18m</span></div>
@@ -1926,7 +1920,7 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
-                  <span class="id-trail"><span class="tag">Active</span><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
+                  <span class="id-trail"><span class="health blind"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10 C5.5 5.8, 14.5 5.8, 17.5 10 C14.5 14.2, 5.5 14.2, 2.5 10 Z"/><circle cx="10" cy="10" r="2.5"/><path d="M4 3.5 L16 16.5"/></svg></span></span>
                 </div>
                 <div class="bmeter">
                   <div class="bm-row"><span class="m-label">Session</span><span class="bm-bar"><span class="bm-fill r" style="width:92%"></span><span class="bm-dash r"></span></span><span class="m-pct r">92%</span><span class="bm-chip">blind 18m</span></div>
@@ -1986,7 +1980,7 @@
       <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each account gets a per-account IDENTITY colour + smart monogram (a generic, low-chroma disambiguation cue &mdash; #445 below) and a plain text label, never a brand colour or logo. The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
       <li><b>Same-local-part accounts stay distinguishable (#445).</b> A roster of accounts sharing a local-part (<code>work-alice</code>, <code>work-bob</code>, …) would collapse to one badge letter under <code>label.first</code> + tail-truncation. The disambiguation kit restores legibility with THREE cues, none alone sufficient: a per-account <b>colour</b> (a fixed low-chroma palette, <b>accent hue excluded</b>, seeded client-side from the wire <code>label</code> &mdash; the one identity handle, R-2; there is no <code>account_uuid</code> on the wire), a smart <b>2-char monogram</b> from the label's distinguishing token (collision-escalating, so two similar labels never share a pair), and <b>middle-</b>truncation (not tail) so the distinguishing suffix / domain survives elision. The colour is <b>never colour-alone</b> &mdash; always paired with the monogram glyph + the label text (WCAG 1.4.1) &mdash; and clears WCAG-AA in both themes (badge fill &ge;3:1, monogram &ge;4.5:1). The per-account colour is a <b>deliberate deviation</b> from this mock's former monochrome badge; a faithful real-popover screenshot vs this updated oracle (both themes) + an owner eyeball is the pre-lock check (render re-baseline is #440).</li>
       <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
-      <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, tags, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
+      <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
       <li><b>Light + dark hold uniformly.</b> Healthy is shown in both themes; degraded states in Light with Dark spot-checks (not-running, keychain-locked, empty-roster). Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; is themed, so dark applies uniformly to all nine.</li>
     </ul>
   </section>

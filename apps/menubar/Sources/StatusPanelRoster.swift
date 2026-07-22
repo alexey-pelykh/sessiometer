@@ -270,27 +270,14 @@ private struct AccountRowView: View {
                     // domain survives when it elides, where tail-truncation hid exactly that part.
                     .truncationMode(.middle)
 
+                // #699: the trailing identity slot carries NO "active" text. Active is encoded twice over
+                // — the leading dot's FILL-vs-ring treatment (a SHAPE cue, so WCAG 1.4.1 / R-2 holds under
+                // colour-blindness and macOS monochrome) plus the accent-tint row fill on top. A third,
+                // textual cue said nothing the other two did not, and its ~56 pt (capsule + gap) came out
+                // of the account label's width — pushing near-identical fleet emails into truncation. The
+                // row's spoken label is unaffected: `rowAccessibilityLabel` derives ", active" from
+                // `isActive` independently, and the capsule was `accessibilityHidden` anyway (#325).
                 Spacer(minLength: 6)
-
-                if row.isActive {
-                    // The active tag — one of the row's THREE redundant "active" cues (leading filled dot +
-                    // this tag + accent-tint row fill), so active never rides on colour alone (R-2 / WCAG
-                    // 1.4.1). Treatment matches the perfected mock `.tag` (`menubar-preview.html:243`): a calm
-                    // NEUTRAL sentence-case capsule — the same `--badge-bg` neutral fill as the monogram badge
-                    // (`Color.panelFill(.badge, …)`) + `--text-2` text (`.secondary`), NO accent border, NO
-                    // letter-spaced uppercase. The accent DOT already carries the active colour; a second
-                    // accent element here (the old outlined uppercase "ACTIVE" pill) re-inflated the active
-                    // over-signalling #387 M5 reduced and sank the same-hue label to ~3:1. The neutral label
-                    // stays as the WCAG 1.4.1 non-colour cue (clears 1.4.11 on the capsule — see #501 tests);
-                    // it is `accessibilityHidden` because the row's spoken label already says ", active" (#325).
-                    Text(StatusPanelFormat.activeTagLabel)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7).padding(.vertical, 1.5)
-                        .background(RoundedRectangle(cornerRadius: 5)
-                            .fill(Color.panelFill(.badge, dark: colorScheme == .dark)))
-                        .accessibilityHidden(true)
-                }
 
                 authView
                 switchSlot
@@ -316,9 +303,9 @@ private struct AccountRowView: View {
         .padding(.top, 9)
         .padding(.bottom, 10)
         // Active emphasis follows the design reference: an accent-tint fill ONLY. The accent ring was
-        // dropped (#387 M5, ratified) to cut active over-signaling — active stays redundantly encoded by
-        // the filled leading dot (shape) + the "ACTIVE" tag + the tint, so color is never the SOLE signal
-        // (WCAG 1.4.1 / R-2 state-parity holds). The mock's active-ring is dropped in lockstep
+        // dropped (#387 M5, ratified) to cut active over-signaling, and the text capsule with it (#699) —
+        // active stays encoded by the filled leading dot (shape) + this tint, so color is never the SOLE
+        // signal (WCAG 1.4.1 / R-2 state-parity holds). The mock's active-ring is dropped in lockstep
         // (menubar-preview.html `.acct.active` / `.stat.active`). The fill OPACITY is theme-aware (#388,
         // mock `--active-bg`): .08 light / .15 dark — the dark active row was ~1.5× too faint when hardcoded.
         .background(
