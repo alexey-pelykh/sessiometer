@@ -34,7 +34,7 @@ accounts is permitted under them.
 - A **supported Claude Code version**. `sessiometer` depends on reverse-engineered
   Claude Code internals (the keychain-service derivation and credential-refresh
   behaviour) that were verified against a specific range — currently
-  **`2.1.181`–`2.1.197`** on macOS `26.5.1` / Darwin `25.x`. A `claude` outside
+  **`2.1.181`–`2.1.217`** on macOS `26.5.1`–`26.5.2` / Darwin `25.x`. A `claude` outside
   this range may have changed those internals and is unverified: `sessiometer`
   could target the wrong keychain item with no other signal. The authoritative
   range lives in [`build/version-compat.md`](build/version-compat.md), and
