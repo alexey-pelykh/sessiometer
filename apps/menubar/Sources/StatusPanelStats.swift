@@ -123,18 +123,25 @@ private struct StatsCaveat: View {
                 .truncationMode(.tail)
             Spacer(minLength: 0)
         }
-        // `rosterInset` is the stats block's own inset; the `+ 8` is the row card's internal padding
-        // (mock `.stat { padding:10px 8px }`), so this dot lines up with a row's status dot, not its card edge.
-        .padding(.horizontal, PanelMetrics.rosterInset + 8)
+        // `rosterInset` is the stats block's own inset; the card padding is a row card's internal one, so this
+        // dot lines up with a row's status dot, not its card edge. Both are named constants rather than the
+        // literals they were, so this alignment tracks the row it is aligning WITH instead of drifting off it.
+        .padding(.horizontal, PanelMetrics.rosterInset + StatusPanelFormat.statsCardHorizontalPadding)
         .padding(.top, 8)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text)
     }
 }
 
-/// One account's Stats row (mock `.stat`): identity + a 7-day session-peak sparkline + the neutral signal
-/// pill, over a three-cell numeric body (session mean/peak, weekly peak, cap-hits). The active account wears
-/// the accent-tint card fill (mock `.stat.active`, the SAME `--active-bg` token the Status roster uses).
+/// One account's Stats row (mock `.stat`), in THREE stacked parts (issue #700): a head (identity + the
+/// neutral signal pill), the 7-day session-peak sparkline on its own full-width row, then a three-cell
+/// numeric body (session mean/peak, weekly peak, cap-hits). The active account wears the accent-tint card
+/// fill (mock `.stat.active`, the SAME `--active-bg` token the Status roster uses).
+///
+/// The sparkline used to sit INSIDE the head row, where its fixed 96 pt box left the label ~78 pt on the
+/// shipped 380 pt panel — so a fleet of near-identical account emails all collapsed to roughly `olek….com`,
+/// defeating the card's primary job of telling the accounts apart. Moving it to its own row hands that width
+/// back to the label (~198 pt, enough for a 28-character handle untruncated) and stops starving the chart.
 private struct StatStripRow: View {
     let handle: String
     /// The roster-resolved 2-char monogram for this handle (issue #445), computed once by `StatsContent`.
@@ -158,18 +165,31 @@ private struct StatStripRow: View {
                     // MIDDLE-truncation (issue #445) — same as the Status roster, so a same-local-part handle's
                     // distinguishing suffix survives elision on the Stats tab too.
                     .lineLimit(1).truncationMode(.middle)
-                Spacer(minLength: 6)
-                Sparkline(values: series)
+                    // The label GROWS into the free width (mock `.s-meta { flex:1 1 auto; min-width:0 }`), so the
+                    // pill still sits at the trailing edge. This replaces a `Spacer(minLength: 6)`, which the
+                    // HStack charged a 9 pt gap on BOTH sides of — 24 pt of dead space between label and pill
+                    // where the mock spends a single `gap:9px`. Reclaiming those 15 pt is what actually lands
+                    // issue #700's untruncated-label criterion: dropping the sparkline alone left the longest
+                    // handle ~9 pt short.
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 SignalPill(signal: signal)
             }
+            // The chart on its OWN full-width row (issue #700), inset to the metrics block's leading edge
+            // below it (mock `.stat-chart { margin-left:17px }`) rather than the card edge — so the series
+            // starts where the numbers that describe it start. These insets come from `StatusPanelFormat`
+            // rather than sitting inline, because `statsChartWidth` — the width the mock authors its
+            // `.spark` viewBox at — is DERIVED from them; a literal here could drift out from under it.
+            Sparkline(values: series)
+                .padding(.leading, StatusPanelFormat.statsChartLeadingInset)
             HStack(alignment: .top, spacing: 8) {
                 StatCell(label: "Session m/pk", value: StatusPanelFormat.statsSessionMeanPeak(account))
                 StatCell(label: "Weekly pk", value: StatusPanelFormat.statsWeeklyPeak(account))
                 StatCell(label: "Cap-hits", value: "\(account.capHits)")
             }
-            .padding(.leading, 17)  // mock `.stat-body { margin-left:17px }` — aligns the body under the name
+            .padding(.leading, StatusPanelFormat.statsChartLeadingInset)  // aligns the body under the name
         }
-        .padding(.vertical, 10).padding(.horizontal, 8)  // mock `.stat { padding:10px 8px }`
+        // mock `.stat { padding:10px 8px }`
+        .padding(.vertical, 10).padding(.horizontal, StatusPanelFormat.statsCardHorizontalPadding)
         .background(
             RoundedRectangle(cornerRadius: 9)
                 .fill(isActive ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark) : Color.clear)
@@ -213,19 +233,32 @@ private struct StatCell: View {
 
 /// The per-account 7-day sparkline (mock `.spark`): a drawn area + line + end-dot over the per-bucket session
 /// peaks, on the FIXED [0, 1] (0–100% of cap) scale — R-2 parity with the CLI trend sparkline (`src/stats.rs`),
-/// NOT auto-normalised. The 96 × 28 box + inset 3 reproduce the mock's `.spark` viewBox exactly. The geometry
-/// is the pure, unit-tested `StatusPanelFormat.sparkPoints`; this view only strokes/fills it.
+/// NOT auto-normalised, so a flat-low series stays visibly distinct from a flat-high one. The geometry is the
+/// pure, unit-tested `StatusPanelFormat.sparkPoints`; this view only strokes/fills it.
+///
+/// WIDTH is the LAID-OUT width, not a constant (issue #700 moved the chart to its own full-width row):
+/// `sparkPoints` is already width-parametric, so the box the `Canvas` is actually handed threads straight
+/// through rather than pinning a second hard-coded constant beside the old 96. Widening changes the box
+/// GEOMETRY only — the [0, 1] y-mapping is untouched, so the series semantics are identical at any width.
+/// Height stays the mock's 28 and inset its 3; the inset exists to keep the 1.75 pt stroke and the r 1.7
+/// end-dot off the edges, which is a fixed stroke-clearance concern, so it does NOT scale with width.
 private struct Sparkline: View {
     let values: [Double]
     @Environment(\.colorScheme) private var colorScheme
 
-    private let boxWidth = 96.0
     private let boxHeight = 28.0
     private let inset = 3.0
 
     var body: some View {
-        Canvas { context, _ in
-            let points = StatusPanelFormat.sparkPoints(values, width: boxWidth, height: boxHeight, inset: inset)
+        Canvas { context, size in
+            let points = StatusPanelFormat.sparkPoints(values, width: size.width, height: size.height, inset: inset)
+            // Fewer than two BUCKETS is not a trend, so the wider band is left empty rather than filled with
+            // a confident-looking line. The guard is on point COUNT (and `sparkPoints` returns none for a
+            // degenerate box), so it is width-independent: widening cannot turn "nothing to plot" into a
+            // drawn baseline. Note what this does NOT cover — an account with no readings at all never
+            // reaches here, because `StatsContent` lists only handles the summary measured; and a genuinely
+            // all-zero 7-bucket series DOES draw a flat line along the floor, deliberately (`sparkSeries`:
+            // "an unmeasured bucket is a real low"). That line is a true reading, not a fabricated one.
             guard points.count >= 2 else { return }
             let color = Color.spark(dark: colorScheme == .dark)
 
@@ -237,7 +270,7 @@ private struct Sparkline: View {
 
             // Area = the line closed down to the plot baseline (mock `.sp-area` closes to y = height − inset),
             // filled at a fraction of the stroke alpha (mock `.sp-area { fill-opacity:.2 }`).
-            let baseline = boxHeight - inset
+            let baseline = size.height - inset
             var area = line
             area.addLine(to: CGPoint(x: points[points.count - 1].x, y: baseline))
             area.addLine(to: CGPoint(x: points[0].x, y: baseline))
@@ -252,7 +285,8 @@ private struct Sparkline: View {
             let dot = Path(ellipseIn: CGRect(x: last.x - 1.7, y: last.y - 1.7, width: 3.4, height: 3.4))
             context.fill(dot, with: .color(color))
         }
-        .frame(width: boxWidth, height: boxHeight)
+        // Greedy in width (the point of the full-width row), pinned to the mock's 28 pt in height.
+        .frame(maxWidth: .infinity, minHeight: boxHeight, maxHeight: boxHeight)
         .accessibilityHidden(true)  // a purely visual trend; the row label speaks the numeric values
     }
 }
