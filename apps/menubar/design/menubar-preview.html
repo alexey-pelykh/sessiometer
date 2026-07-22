@@ -386,9 +386,10 @@
 
      Two consequences worth naming. (1) 331 is the PANEL's number — derived there as
      `StatusPanelFormat.statsChartWidth` and pinned against this literal by
-     `testStatsChartWidthMatchesTheMockAuthoredViewBox`, since the panel's Stats tab has no render path for
-     build-comparison.py to diff. Change the panel's width or insets and that test goes red; re-author this
-     viewBox with it. (2) Unlike the old 96, this couples the mock to the 380px panel — deliberate, because
+     `testStatsChartWidthMatchesTheMockAuthoredViewBox` — the mechanical net. As of #704 build-comparison.py
+     CAN diff the Stats tab too (RenderPanelTool renders a loaded stats fixture), but that is a manual
+     side-by-side, so the unit test stays the automated guard. Change the panel's width or insets and that
+     test goes red; re-author this viewBox with it. (2) Unlike the old 96, this couples the mock to the 380px panel — deliberate, because
      vertex agreement is the point, but it is a coupling the 96 did not have. Note also that `.pop` carries a
      .5px border under `box-sizing:border-box`, so this row actually paints ~329px: the mock squeezes the
      331-unit viewBox by 0.6%. That offset is the fake window chrome, systemic and pre-existing across every

@@ -204,10 +204,10 @@ final class StatsTests: XCTestCase {
 
     // The panel↔mock pin (issue #700). The chart's own row is `statsChartWidth` wide, and the build-reference
     // mock authors its `.spark` viewBox at that SAME number (`viewBox="0 0 331 28"` in menubar-preview.html).
-    // The panel's Stats tab has no render path — `RenderPanelTool` renders every fixture at the Status tab —
-    // so nothing else mechanically checks the two surfaces agree. Asserting the DERIVED width against the
-    // mock's authored literal is what turns a panel-geometry change into a red test instead of a silent
-    // divergence from the design reference.
+    // The Stats tab now renders (`RenderPanelTool` seeds a loaded `stats` fixture, #704), so `build-comparison.py`
+    // can diff the two surfaces visually — but that is a manual review, so this stays the only thing that
+    // MECHANICALLY checks they agree. Asserting the DERIVED width against the mock's authored literal is what
+    // turns a panel-geometry change into a red test instead of a silent divergence from the design reference.
     func testStatsChartWidthMatchesTheMockAuthoredViewBox() {
         XCTAssertEqual(StatusPanelFormat.statsChartWidth, 331, accuracy: 0.001,
                        "design/menubar-preview.html authors `.spark` at viewBox=\"0 0 331 28\" — change both")
@@ -484,6 +484,51 @@ final class StatsTests: XCTestCase {
         let model = PanelStatsModel(client: nil)
         await model.load()
         XCTAssertEqual(model.phase, .failed(.unavailable))
+    }
+
+    // MARK: - PanelStatsModel: render-preview fixture (#704 — the `--render-panel` Stats oracle)
+
+    /// The `loadedPreview` factory `RenderPanelTool` uses seeds the Stats tab straight to `.loaded` WITHOUT a
+    /// query — the socket-free property the #704 render fixture rests on. Driven off `statsBasic` (a golden
+    /// fixture) so it exercises only the factory, independent of the 3-card fixture asserted below.
+    @MainActor
+    func testLoadedPreviewSeedsStatsTabWithoutAQuery() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("statsBasic did not decode to a StatsWire")
+        }
+        let model = PanelStatsModel.loadedPreview(wire)
+        XCTAssertEqual(model.tab, .stats, "the render fixture opens directly on the Stats tab")
+        XCTAssertEqual(model.phase, .loaded(wire),
+                       "seeded straight to .loaded — a nil-client load() would have landed .failed(.unavailable)")
+    }
+
+    /// The 3-card render fixture decodes to the mock's `healthy-stats-*` cards — the guard that keeps
+    /// `loadedPreviewFixture` from silently drifting off the wire contract (and its `fatalError` from ever
+    /// firing at render time). Decoded from the raw JSON so a broken fixture fails cleanly here.
+    @MainActor
+    func testStatsPreviewFixtureDecodesToTheMockCards() throws {
+        guard case .ok(let wire) = try decodeStatsReply(PanelStatsModel.statsPreviewFixtureJSON) else {
+            return XCTFail("the stats preview fixture did not decode to a StatsWire")
+        }
+        // The three cards, keyed by the CAPITALISED roster labels RenderPanelTool's rows carry — so the
+        // case-sensitive `orderedStatHandles` join lands them in Work / Personal / Scratch order.
+        XCTAssertEqual(Set(wire.summary.accounts.keys), ["Work", "Personal", "Scratch"])
+        // Bands → the mock's three signal pills.
+        XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Work"]).band), .saturated)
+        XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Personal"]).band), .balanced)
+        XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Scratch"]).band), .underused)
+        // The displayed numeric body matches the mock's active Work card verbatim.
+        let work = try XCTUnwrap(wire.summary.accounts["Work"])
+        XCTAssertEqual(StatusPanelFormat.statsSessionMeanPeak(work), "42 / 100%")
+        XCTAssertEqual(StatusPanelFormat.statsWeeklyPeak(work), "88%")
+        XCTAssertEqual(work.capHits, 42)
+        // The aggregate callout matches the mock.
+        XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: wire.summary.roster, window: wire.window),
+                       "All accounts ≥90% at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
+        // Seven daily buckets → a per-bucket sparkline point, on the fixed [0, 1] scale (peak reaches the top).
+        let series = StatusPanelFormat.sparkSeries(wire.series, handle: "Work")
+        XCTAssertEqual(series.count, 7)
+        XCTAssertEqual(series.max(), 1.0)
     }
 
     // MARK: - PanelStatsModel: tab selection

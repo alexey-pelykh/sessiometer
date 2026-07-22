@@ -33,6 +33,10 @@ enum RenderPanelTool {
         var keychainLocked: Bool = false
         var canonicalScrub: CanonicalScrub?
         var systemicRefreshFailure: UInt32?
+        // The loaded Stats-tab series (#704). Non-nil ONLY on the `stats` fixture: it seeds a `PanelStatsModel`
+        // to `.stats`/`.loaded` so the render shows the account cards, not the Status glance. `var` with a
+        // default for the same memberwise-init reason as the payload faults above.
+        var statsWire: StatsWire?
     }
 
     /// Render every panel-supported state (light + dark) into `outputDir` as `panel-<state>-<theme>.png`.
@@ -111,6 +115,15 @@ enum RenderPanelTool {
             Fixture(name: "healthy", state: .connected, rows: rows,
                     nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 12),
+            // #704: the healthy roster's STATS tab — the ONE fixture seeded to `.stats`/`.loaded` (every other
+            // renders the Status glance). Reuses the healthy roster so the Stats rows join the same
+            // Work/Personal/Scratch identities (active = Work) the mock's `healthy-stats-*` frames show; the
+            // loaded series rides `statsWire`. State stays `.connected` because `StatusPanelView` offers the
+            // Stats seg only over a live roster (`.connected`/`.stale`) — a Stats tab on a degraded daemon
+            // could only fail. `next_swap` is inert here (the Stats tab renders no footer).
+            Fixture(name: "stats", state: .connected, rows: rows,
+                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    generatedAt: now - 12, statsWire: PanelStatsModel.loadedPreviewFixture),
             Fixture(name: "stale", state: .stale, rows: rows,
                     nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 5400),
@@ -156,7 +169,7 @@ enum RenderPanelTool {
                 // SAME wiring `StatusItemController` uses for the live app, so the harness and the app cannot
                 // drift and every `@EnvironmentObject` the panel reads is resolved instead of trapping (issue
                 // #504: missing `PanelStatsModel` here was exactly that drift). All three take a NIL client, so
-                // each renders its resting, socket-free surface:
+                // nothing here touches a socket:
                 //   • `AccountCaptureModel` renders at `.idle` with `captureSurfaceRequested == false`, so the
                 //     populated fixtures show the roster with NO capture bar (capture is off-panel / empty-
                 //     roster only now, #394) and the empty-roster fixture shows the onboarding card. The nil
@@ -167,14 +180,18 @@ enum RenderPanelTool {
                 //     (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) IS captured in a static
                 //     render; only the ARMED hover/focus brighten and the in-flight `Switching…` spinner stay a
                 //     manual-check surface (#380).
-                //   • `PanelStatsModel` (#446) renders at its default `.status` tab / `.idle` phase, so every
-                //     fixture shows the Status glance (never a not-yet-loaded Stats tab) and the nil client
-                //     never fires a socket-bound `stats` query.
+                //   • `PanelStatsModel` (#446) renders at its default `.status` tab / `.idle` phase for every
+                //     fixture EXCEPT `stats` (#704), which `loadedPreview` seeds straight to `.stats`/`.loaded`
+                //     from `loadedPreviewFixture` so the render shows the account cards. BOTH stay socket-free:
+                //     the default nil client never fires a `stats` query, and the seeded fixture sets its phase
+                //     directly rather than loading — so `--render-panel` stays as offline as the rest.
+                let stats = fixture.statsWire.map { PanelStatsModel.loadedPreview($0) }
+                    ?? PanelStatsModel(client: nil)
                 let view = StatusPanelView()
                     .statusPanelEnvironment(store: store,
                                             capture: AccountCaptureModel(client: nil),
                                             swap: AccountSwapModel(client: nil),
-                                            stats: PanelStatsModel(client: nil))
+                                            stats: stats)
                     .environment(\.colorScheme, scheme)
                 let renderer = ImageRenderer(content: view)
                 renderer.scale = 2

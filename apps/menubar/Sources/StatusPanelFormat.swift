@@ -231,9 +231,9 @@ enum StatusPanelFormat {
     /// a 96-wide viewBox against the other's fixed 3 pt stroke inset. That agreement is the whole point, and
     /// it is only as good as this derivation: `testStatsChartWidthMatchesTheMockAuthoredViewBox` pins the value
     /// against the mock's authored literal, so a change to any panel-geometry constant above goes RED here
-    /// rather than silently diverging the panel from its own design reference. The panel's Stats tab has no
-    /// render path (`RenderPanelTool` renders every fixture at the Status tab), so this test is the only
-    /// mechanical parity net the chart has.
+    /// rather than silently diverging the panel from its own design reference. The Stats tab now DOES render
+    /// (`RenderPanelTool` seeds one loaded `stats` fixture for `build-comparison.py`, #704), but that pairing is
+    /// a manual side-by-side review — so this test stays the only MECHANICAL parity net the chart has.
     static var statsChartWidth: Double {
         panelContentWidth - 2 * rosterHorizontalInset - 2 * statsCardHorizontalPadding - statsChartLeadingInset
     }
