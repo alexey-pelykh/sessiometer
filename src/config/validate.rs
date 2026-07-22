@@ -191,6 +191,18 @@ impl Config {
         )?;
         range("monitor_401_n", t.monitor_401_n, 1, 20)?;
         range("monitor_recovery_m", t.monitor_recovery_m, 1, 20)?;
+        // The proactive fleet-runway warning threshold (issue #650). `0` disables the path (the
+        // kill-switch AND the opt-in default, like `session_velocity_horizon_secs`); a non-zero
+        // value is a runway threshold in `60..=2_592_000` s (1 min..30 d — a warn line above 30
+        // days is always-on noise, not a warning; below a minute is indistinguishable from the
+        // all-exhausted signal itself). `range` cannot express the `0`-or-band shape, so spell it
+        // out, mirroring the `near_limit_poll_secs` message above.
+        if t.fleet_runway_warn_secs != 0 && !(60..=2_592_000).contains(&t.fleet_runway_warn_secs) {
+            return Err(Error::ConfigInvalid(format!(
+                "fleet_runway_warn_secs must be 0 (disabled) or in 60..=2592000, got {}",
+                t.fleet_runway_warn_secs
+            )));
+        }
 
         // Jitter specs (issue #38): each optional and validated to a clear load
         // error (parse-or-error). Poll jitters normally by default; session_ceiling,
@@ -221,6 +233,7 @@ impl Config {
             session_velocity_ema_alpha_pct: t.session_velocity_ema_alpha_pct as u8,
             monitor_401_n: t.monitor_401_n as u8,
             monitor_recovery_m: t.monitor_recovery_m as u8,
+            fleet_runway_warn_secs: t.fleet_runway_warn_secs as u64,
             poll_strategy: Strategy {
                 base: t.poll_secs as f64,
                 jitter: poll_jitter,

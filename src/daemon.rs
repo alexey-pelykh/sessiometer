@@ -112,6 +112,7 @@ use crate::observability::{
 use crate::refresh::{RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
+use crate::stats::FleetRunway;
 use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
 use crate::systemic_refresh::{SweepHealth, SystemicRefreshHealth};
 use crate::timing::{Jitter, Rng, SplitMix64, Strategy};
@@ -729,6 +730,14 @@ const GAP_REEMIT_MIN_SECS: i64 = 3_600;
 /// Minimum seconds between `compact_and_roll` passes (issue #161): compaction runs at most
 /// hourly, bounding raw-file churn — a roll only folds data when a whole day ages out anyway.
 const STATS_ROLL_CADENCE_SECS: i64 = 3_600;
+/// Minimum seconds between fleet-runway warn checks (issue #650): the probe re-reads the whole
+/// usage store ([`crate::stats::current_fleet_runway`] — blocking fs, the #161 inline-store-IO
+/// precedent), so it must run far off the poll cadence. Ten minutes bounds the detection lag at
+/// a sliver of the hours-to-days thresholds the warning is FOR (the fleet runway is a days-scale
+/// figure); a threshold set right at the 60 s validated floor is dominated by this cadence
+/// instead — still strictly ahead of the exhaustion it pre-warns. Internal, not a tunable: the
+/// operator knob is the threshold (`fleet_runway_warn_secs`), not the sampling rate.
+const FLEET_RUNWAY_WARN_CHECK_SECS: i64 = 600;
 /// The production stats cadences (issue #161). The pure [`stats_events_for_poll`] core takes
 /// these as a parameter so a hermetic test can drive tighter windows.
 const STATS_CADENCE: StatsCadence = StatsCadence {
@@ -1318,6 +1327,20 @@ struct DecisionState {
     /// ONCE per all-exhausted episode — not once per poll while every account
     /// stays exhausted — and fires afresh if the state clears and is re-entered.
     signaled_all_exhausted: bool,
+    /// Edge-trigger guard for the proactive fleet-runway warning (issue #650): set when a
+    /// `fleet_runway_low` event is emitted, cleared — with the `fleet_runway_recovered` LEAVE
+    /// marker — only when a checked, KNOWN aggregate reads back at/over the threshold. So the
+    /// warning fires exactly ONCE per below-threshold episode and afresh after a genuine
+    /// recovery; an UNKNOWN probe reading holds the state as-is (mirrors
+    /// `signaled_canonical_scrubbed`'s "a flaky read never fabricates a recovery", where
+    /// `signaled_all_exhausted` clears on any non-exhausted cycle).
+    signaled_fleet_runway_low: bool,
+    /// Wall-clock epoch second of the last fleet-runway warn check (issue #650), or `None`
+    /// until the first — the cadence anchor bounding the store-reading probe to at most one
+    /// read per [`FLEET_RUNWAY_WARN_CHECK_SECS`], mirroring [`StatsState::last_roll`]. A fresh
+    /// daemon checks on its first armed tick (no anchor), so a restart during a low-runway
+    /// episode re-signals promptly rather than waiting out a full cadence window.
+    last_fleet_runway_check: Option<i64>,
     /// Edge-trigger guard for the active-dead-no-target strand signal (issue #405):
     /// set when an `active_dead_no_target` event is emitted (the emergency path found
     /// no live target for a DEAD active), cleared by [`Daemon::tick`] on any cycle
@@ -1578,6 +1601,13 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// `ema = α·instant + (1-α)·prev` to damp a single-interval spike. `1.0` = no smoothing (raw
     /// last-interval velocity).
     session_velocity_ema_alpha: f64,
+    /// The proactive fleet-runway warn threshold, in seconds (issue #650, config
+    /// `fleet_runway_warn_secs`): [`Self::check_fleet_runway_warn`] emits ONE edge-triggered
+    /// `fleet_runway_low` event when the probed #544 aggregate drops BELOW this. `0` disables the
+    /// path (the kill-switch AND the shipped default — the warning is opt-in), like
+    /// [`near_limit_poll_secs`](Self::near_limit_poll_secs). Purely operator-visibility: no swap
+    /// decision reads it.
+    fleet_runway_warn_secs: u64,
     /// Per-cycle post-swap cooldown strategy (issue #38; the #10 seam — see
     /// [`DecisionState`]): drawn + clamped to `COOLDOWN_SECS_LO..=3600` s each cycle
     /// — the low bound is the non-zero swap-cooldown floor (#272), so jitter can never
@@ -1658,6 +1688,16 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// test cannot reach the real support dir (issue #315) — the same reason `NativeHistoryStore`
     /// holds its paths so a test can point one at a temp dir.
     usage_samples_path: Option<PathBuf>,
+    /// The fleet-runway probe seam (issue #650), or `None` to disable the warn check entirely
+    /// (the hermetic-test default — a probe-less `FakeDaemon` tick never reads the real usage
+    /// store, the same #315 injection discipline as [`usage_samples_path`](Self::usage_samples_path)).
+    /// Production wires [`crate::stats::current_fleet_runway`] via
+    /// [`with_fleet_runway_probe`](Self::with_fleet_runway_probe): the SAME store-read →
+    /// report → #544 aggregate pipeline the `stats` verb serializes, so the warning keys off
+    /// the figure the operator sees, never a parallel metric. A closure seam (not an async
+    /// engine trait): the probe is a synchronous, self-contained read with no daemon state in
+    /// its inputs — the `stats_socket_json_with` config-loader shape, boxed for storage.
+    fleet_runway_probe: Option<Box<dyn Fn() -> Option<FleetRunway>>>,
     /// Whether the operator turned the periodic isolated-refresh tick ON in config
     /// (`[refresh].enabled`, issue #105). Since #375 this CONFIG value IS the tick's effective
     /// switch (the `claude` binary is resolved per-cycle, not gated at startup). Carried onto the
@@ -1766,6 +1806,9 @@ where
                 tunables.session_velocity_min_project_above,
             ) / 100.0,
             session_velocity_ema_alpha: f64::from(tunables.session_velocity_ema_alpha_pct) / 100.0,
+            // The proactive fleet-runway warn threshold (issue #650); `0` (the default) keeps the
+            // path off even where the probe below is wired.
+            fleet_runway_warn_secs: tunables.fleet_runway_warn_secs,
             cooldown_strategy: tunables.cooldown_strategy,
             // The un-jittered cooldown window the socket `swap` command gates a manual
             // swap on (issue #167) — the same base `config.tunables.cooldown_secs` the
@@ -1796,6 +1839,10 @@ where
             // in via `with_usage_samples`. Left unset, ticking writes NO sample, so `cargo test`
             // never touches the developer's real store — the isolation the injected path buys.
             usage_samples_path: None,
+            // No fleet-runway probe by default (issue #650); production opts in via
+            // `with_fleet_runway_probe`. Left unset, the warn check is inert — a hermetic tick
+            // never reads the real usage store (the same #315 isolation as `usage_samples_path`).
+            fleet_runway_probe: None,
             // The periodic-refresh tick defaults OFF (opt-in, #105); production sets the real
             // `config.refresh.enabled` via `with_refresh_enabled`. Left false, the #138 advisory
             // stays inert (it also requires an unhealthy non-active account to fire).
@@ -1887,6 +1934,23 @@ where
         self
     }
 
+    /// Wire the fleet-runway probe (issue #650): the daemon then runs the cadence-gated
+    /// proactive fleet-runway warn check ([`check_fleet_runway_warn`](Self::check_fleet_runway_warn))
+    /// against whatever aggregate the probe returns — production passes
+    /// [`crate::stats::current_fleet_runway`] (the #544 store-read pipeline); a test passes a
+    /// canned closure, so the edge-trigger is exercised without any on-disk store (#315). Left
+    /// unset, the check is inert regardless of `fleet_runway_warn_secs` — and the probe alone
+    /// does not arm it either: the threshold `0` default still gates the call, so production
+    /// wiring is unconditional while the feature stays opt-in. Builder-style to mirror
+    /// `with_usage_samples` and keep `new`'s args stable.
+    pub(crate) fn with_fleet_runway_probe(
+        mut self,
+        probe: Box<dyn Fn() -> Option<FleetRunway>>,
+    ) -> Self {
+        self.fleet_runway_probe = Some(probe);
+        self
+    }
+
     /// The stats-store maintenance layer wired into [`tick`](Self::tick) (issue #161): a thin
     /// adapter over the pure [`stats_events_for_poll`] core. Resolve the real store paths, run
     /// the core under the wired policy + carried gap/roll state, and append any redacted events
@@ -1919,6 +1983,90 @@ where
             &STATS_CADENCE,
         );
         events.extend(produced);
+    }
+
+    /// The proactive fleet-runway warning (issue #650): emit an edge-triggered
+    /// `fleet_runway_low` event AHEAD of the all-exhausted terminal state (#11) when the #544
+    /// aggregate fleet runway drops below the operator's configured `fleet_runway_warn_secs`
+    /// line. Purely operator-visibility — NO swap decision reads it (the non-goal the issue
+    /// pins): run POST-decide, off the `decide_action` path, sharing no state with it.
+    ///
+    /// Mirrors the [`maintain_stats_store`](Self::maintain_stats_store) shape — a cadence-gated,
+    /// fail-open inline tick helper — and the `signaled_all_exhausted` edge-trigger idiom:
+    ///
+    /// - **Inert unless opted in.** `fleet_runway_warn_secs == 0` (the default) returns before
+    ///   any probe or state churn, so a fleet that never enabled the warning pays nothing.
+    /// - **Cadence-gated store read.** The aggregate re-reads the sample store, so the probe is
+    ///   bounded to at most one call per [`FLEET_RUNWAY_WARN_CHECK_SECS`] (mirroring
+    ///   [`StatsState::last_roll`]); the window is consumed BEFORE the read so a persistent
+    ///   store error retries at the cadence, never once per poll (fail-open).
+    /// - **UNKNOWN holds prior state (issue #650 D4).** Three degradation shapes are all
+    ///   UNKNOWN — the seam unset (hermetic-test default, #315), a `None` aggregate (unreadable
+    ///   store / nothing observed / nothing counted), or a counted-but-FLAT fleet
+    ///   (`runway_secs == None`, zero measurable drain) — and each HOLDS the guard: neither
+    ///   fire nor re-arm, so a momentary store hiccup or flat-burn reading never fabricates a
+    ///   crossing or a recovery.
+    /// - **Edge-triggered.** A KNOWN runway below the line emits `fleet_runway_low` exactly ONCE
+    ///   on the downward crossing (held silent while it stays below); a KNOWN runway back
+    ///   at/over the line emits the [`Diagnostic::FleetRunwayRecovered`] LEAVE marker once and
+    ///   re-arms, so a later crossing fires afresh — the `all_exhausted` / `all_exhausted_cleared`
+    ///   bracket exactly.
+    ///
+    /// `now` is the wall-clock epoch second ([`wall_clock_now_secs`]) the caller reads once per
+    /// tick — passed in (not read here) so the cadence + edge-trigger logic is unit-tested
+    /// without wall-clock flakiness, as [`maintain_stats_store`](Self::maintain_stats_store) is.
+    fn check_fleet_runway_warn(
+        &mut self,
+        now: i64,
+        events: &mut Vec<Event>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        if self.fleet_runway_warn_secs == 0 {
+            return; // opt-in OFF (default) → fully inert: no probe, no state churn
+        }
+        let due = match self.state.last_fleet_runway_check {
+            None => true,
+            Some(prev) => now - prev >= FLEET_RUNWAY_WARN_CHECK_SECS,
+        };
+        if !due {
+            return;
+        }
+        // Consume the window regardless of the read's outcome (fail-open, like `last_roll`).
+        self.state.last_fleet_runway_check = Some(now);
+        let Some(probe) = self.fleet_runway_probe.as_ref() else {
+            return; // seam unwired (hermetic default) → UNKNOWN, hold prior state
+        };
+        // The destructure's two `Some` layers ARE the two UNKNOWN shapes that HOLD prior state: the
+        // outer failing is a `None` aggregate (unreadable store / nothing observed / nothing
+        // counted), the inner `runway_secs` failing is a counted-but-FLAT fleet (zero drain). A
+        // KNOWN reading binds its runway + the `n of m` cardinality carried through to the payload.
+        let Some(FleetRunway {
+            runway_secs: Some(runway_secs),
+            counted,
+            observed,
+        }) = probe()
+        else {
+            return;
+        };
+        let threshold_secs = self.fleet_runway_warn_secs as i64;
+        if runway_secs < threshold_secs {
+            if !self.state.signaled_fleet_runway_low {
+                events.push(Event::FleetRunwayLow {
+                    runway_secs,
+                    threshold_secs,
+                    counted,
+                    observed,
+                });
+                self.state.signaled_fleet_runway_low = true;
+            }
+        } else {
+            // KNOWN recovery: emit the LEAVE marker BEFORE the reset so a re-crossing signals
+            // afresh, mirroring the `AllExhaustedCleared` bracket.
+            if self.state.signaled_fleet_runway_low {
+                diagnostics.push(Diagnostic::FleetRunwayRecovered);
+            }
+            self.state.signaled_fleet_runway_low = false;
+        }
     }
 
     /// Wire the poll-path refresh-then-retry seam (issue #162): on a usage 401 the daemon
@@ -2404,6 +2552,13 @@ where
             }
             self.state.signaled_active_dead_no_target = false;
         }
+        // The proactive fleet-runway warning (issue #650) — a sibling operator-visibility edge
+        // trigger to the `all_exhausted` bracket above, but PROACTIVE (ahead of exhaustion) and
+        // FLEET-aggregate rather than per-decision. Cadence-gated + fail-open inside the helper,
+        // inert unless opted in; placed POST-decide so it never shares state with `decide_action`
+        // (the swap path is untouched — the issue's pinned non-goal). Reads the wall epoch once
+        // (display/event-emission path, off the deterministic `Clock`).
+        self.check_fleet_runway_warn(wall_clock_now_secs(), &mut events, &mut diagnostics);
         // Issue #540: refresh the near-limit poll-coverage verdict from the POST-decision state
         // (`self.state.active` is the post-swap active — the same index the snapshot below reads),
         // so `next_subinterval` tightens the wait against the CURRENT active's freshest reading. Its
@@ -5532,6 +5687,10 @@ mod tests {
             session_velocity_ema_alpha_pct: 50,
             monitor_401_n: 3,
             monitor_recovery_m: 2,
+            // Issue #650 proactive fleet-runway warning: INERT by default (0, the kill-switch and
+            // the shipped default) so baseline daemon tests never arm the runway check; the #650
+            // edge-trigger tests drive the pure core / a probed daemon explicitly.
+            fleet_runway_warn_secs: 0,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
@@ -12375,6 +12534,323 @@ mod tests {
                     retry_after_secs: None,
                 },
             ],
+        );
+    }
+
+    // ── issue #650: the proactive fleet-runway warning edge trigger ──
+    //
+    // `check_fleet_runway_warn` is a self-contained post-decide helper — it reads only its own
+    // config field + injected probe + guard, taking `now` and pushing to events/diagnostics — so
+    // these drive it DIRECTLY (like the `stats` tests drive `stats_events_for_poll`) on a minimal
+    // `reconcile_daemon`, scripting the probe's successive readings and advancing `now` past the
+    // cadence, rather than standing up a full `tick`. The swap path is never entered.
+
+    /// The base epoch second for the #650 edge-trigger tests; each subsequent armed check advances
+    /// by [`FLEET_RUNWAY_WARN_CHECK_SECS`] so it clears the cadence gate.
+    const RUNWAY_T0: i64 = 1_782_000_000;
+
+    /// A fleet-runway probe scripted to return successive readings (one popped per call) plus a
+    /// call counter — so a test drives the daemon across a below → recovered → unknown sequence
+    /// AND asserts the probe stayed UN-called when the check is off. An exhausted script (or an
+    /// explicit `None`) reads as an UNKNOWN probe outcome. Interior mutability (`Arc<Mutex<…>>`)
+    /// keeps the closure an `Fn`, as [`Daemon::fleet_runway_probe`] requires.
+    fn scripted_fleet_probe(
+        readings: Vec<Option<FleetRunway>>,
+    ) -> (
+        Box<dyn Fn() -> Option<FleetRunway>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(Mutex::new(
+            readings
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        let c = Arc::clone(&calls);
+        let probe = Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            queue.lock().unwrap().pop_front().flatten()
+        });
+        (probe, calls)
+    }
+
+    /// A KNOWN fleet-runway reading of `runway_secs` at a full `2 of 2` cardinality — the #650
+    /// edge trigger keys off the runway-vs-threshold crossing, not the cardinality (whose own
+    /// honest-degradation surface is pinned in the `stats` fleet_runway tests). The payload
+    /// carries the cardinality through so the emitted event states how much fleet stood behind it.
+    fn known_runway(runway_secs: i64) -> Option<FleetRunway> {
+        Some(FleetRunway {
+            runway_secs: Some(runway_secs),
+            counted: 2,
+            observed: 2,
+        })
+    }
+
+    fn probed_runway_daemon(warn_secs: u64) -> FakeDaemon {
+        let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        daemon.fleet_runway_warn_secs = warn_secs;
+        daemon
+    }
+
+    #[test]
+    fn fleet_runway_warn_fires_once_on_the_downward_crossing_then_holds_below() {
+        // AC2 + AC3: with the warn ON and a KNOWN runway below the line, emit `fleet_runway_low`
+        // EXACTLY ONCE on the crossing, then stay silent while it holds below — the `all_exhausted`
+        // edge-trigger idiom, for the proactive lead-time signal.
+        let (probe, _calls) = scripted_fleet_probe(vec![
+            known_runway(1800), // below 3600 → fires
+            known_runway(600),  // still below → held, silent
+            known_runway(900),  // still below → held, silent
+        ]);
+        let mut daemon = probed_runway_daemon(3600);
+        daemon.fleet_runway_probe = Some(probe);
+
+        let mut events = vec![];
+        let mut diags = vec![];
+        // First armed check (no prior anchor → due): the crossing fires once.
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        assert_eq!(
+            events,
+            vec![Event::FleetRunwayLow {
+                runway_secs: 1800,
+                threshold_secs: 3600,
+                counted: 2,
+                observed: 2,
+            }],
+        );
+        assert!(diags.is_empty());
+        assert!(daemon.state.signaled_fleet_runway_low);
+
+        // Two more DUE checks (past the cadence each time), still below → edge-triggered, so
+        // NOTHING further is emitted.
+        events.clear();
+        for k in 1i64..=2 {
+            daemon.check_fleet_runway_warn(
+                RUNWAY_T0 + k * FLEET_RUNWAY_WARN_CHECK_SECS,
+                &mut events,
+                &mut diags,
+            );
+        }
+        assert!(
+            events.is_empty(),
+            "held below must stay silent, got {events:?}"
+        );
+        assert!(diags.is_empty());
+        assert!(daemon.state.signaled_fleet_runway_low);
+    }
+
+    #[test]
+    fn fleet_runway_warn_rearms_after_a_known_recovery() {
+        // AC4: a KNOWN runway back at/over the line clears the guard with ONE `fleet_runway_recovered`
+        // LEAVE marker, so a LATER crossing fires afresh — the `all_exhausted`/`all_exhausted_cleared`
+        // bracket exactly.
+        let (probe, _calls) = scripted_fleet_probe(vec![
+            known_runway(1800), // below → fires
+            known_runway(7200), // recovered (>= 3600) → LEAVE marker, re-arm
+            known_runway(1200), // below again → fires afresh
+        ]);
+        let mut daemon = probed_runway_daemon(3600);
+        daemon.fleet_runway_probe = Some(probe);
+
+        let mut events = vec![];
+        let mut diags = vec![];
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        assert_eq!(
+            events,
+            vec![Event::FleetRunwayLow {
+                runway_secs: 1800,
+                threshold_secs: 3600,
+                counted: 2,
+                observed: 2,
+            }],
+            "the downward crossing fires with the full payload"
+        );
+        assert!(daemon.state.signaled_fleet_runway_low);
+
+        // Recovery at the next due check: the LEAVE marker, guard cleared, no event.
+        events.clear();
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS,
+            &mut events,
+            &mut diags,
+        );
+        assert!(events.is_empty(), "recovery emits no event");
+        assert_eq!(diags, vec![Diagnostic::FleetRunwayRecovered]);
+        assert!(
+            !daemon.state.signaled_fleet_runway_low,
+            "a known recovery re-arms the guard"
+        );
+
+        // A re-crossing after the re-arm fires afresh.
+        diags.clear();
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS,
+            &mut events,
+            &mut diags,
+        );
+        assert_eq!(
+            events,
+            vec![Event::FleetRunwayLow {
+                runway_secs: 1200,
+                threshold_secs: 3600,
+                counted: 2,
+                observed: 2,
+            }],
+            "a later crossing signals afresh after re-arm",
+        );
+        assert!(daemon.state.signaled_fleet_runway_low);
+    }
+
+    #[test]
+    fn fleet_runway_warn_is_inert_when_disabled_or_unwired() {
+        // AC5: with `fleet_runway_warn_secs = 0` (the default) the check is FULLY inert — no probe
+        // call, no event, no cadence-state churn — even with a probe wired that WOULD cross hard.
+        let (probe, calls) = scripted_fleet_probe(vec![known_runway(1)]);
+        let mut off = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
+        assert_eq!(off.fleet_runway_warn_secs, 0, "the shipped default is OFF");
+        off.fleet_runway_probe = Some(probe);
+        let mut events = vec![];
+        let mut diags = vec![];
+        off.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        assert!(
+            events.is_empty() && diags.is_empty(),
+            "off must emit nothing"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "off must not call the probe"
+        );
+        assert!(
+            off.state.last_fleet_runway_check.is_none(),
+            "off must not touch the cadence anchor"
+        );
+        assert!(!off.state.signaled_fleet_runway_low);
+
+        // Production-safety sibling: warn ON but the probe seam UNWIRED (the hermetic default) →
+        // UNKNOWN, so it holds (never fires) — a missing seam never fabricates a crossing. The
+        // cadence window IS consumed (fail-open bound), so a persistently-unwired daemon retries
+        // at the cadence, not once per poll.
+        let mut unwired = probed_runway_daemon(3600); // probe left None
+        let mut events = vec![];
+        let mut diags = vec![];
+        unwired.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        assert!(
+            events.is_empty() && diags.is_empty(),
+            "an unwired probe never fires"
+        );
+        assert!(!unwired.state.signaled_fleet_runway_low);
+        assert_eq!(unwired.state.last_fleet_runway_check, Some(RUNWAY_T0));
+    }
+
+    #[test]
+    fn fleet_runway_warn_holds_prior_state_on_unknown_readings() {
+        // AC6 / D4: an UNKNOWN reading — a `None` aggregate (unreadable store / nothing observed /
+        // nothing counted) OR a counted-but-FLAT fleet (`runway_secs == None`, zero measurable
+        // drain) — neither fires nor re-arms; it HOLDS the prior signaled state, so a momentary
+        // store hiccup or flat burn never fabricates a crossing or a recovery.
+        let flat = Some(FleetRunway {
+            runway_secs: None,
+            counted: 2,
+            observed: 2,
+        });
+        let (probe, _calls) = scripted_fleet_probe(vec![
+            known_runway(1800), // below → fires (guard set)
+            None,               // unknown aggregate → HOLD (no recovery, guard stays set)
+            flat,               // counted-but-flat → HOLD (no recovery, guard stays set)
+            known_runway(900),  // still below after two unknowns → NO re-fire (still held)
+        ]);
+        let mut daemon = probed_runway_daemon(3600);
+        daemon.fleet_runway_probe = Some(probe);
+
+        let mut events = vec![];
+        let mut diags = vec![];
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        assert_eq!(events.len(), 1, "the first crossing fires");
+        assert!(daemon.state.signaled_fleet_runway_low);
+
+        // Two unknown readings: neither fires nor re-arms; guard held, no diagnostics.
+        events.clear();
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS,
+            &mut events,
+            &mut diags,
+        );
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS,
+            &mut events,
+            &mut diags,
+        );
+        assert!(
+            events.is_empty() && diags.is_empty(),
+            "unknown readings emit nothing"
+        );
+        assert!(
+            daemon.state.signaled_fleet_runway_low,
+            "unknown holds the prior signaled state"
+        );
+
+        // The still-below reading after the two unknowns does NOT re-fire — the guard was correctly
+        // held through them, so there was no spurious clear to re-cross.
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + 3 * FLEET_RUNWAY_WARN_CHECK_SECS,
+            &mut events,
+            &mut diags,
+        );
+        assert!(
+            events.is_empty(),
+            "a below reading after a held-through-unknown episode does not re-fire"
+        );
+        assert!(daemon.state.signaled_fleet_runway_low);
+    }
+
+    #[test]
+    fn fleet_runway_warn_probe_is_cadence_gated() {
+        // D3: the store-reading probe is bounded to one call per FLEET_RUNWAY_WARN_CHECK_SECS
+        // (mirrors #161 `last_roll`), fail-open — a second check WITHIN the window is skipped
+        // entirely (the probe is not called), so a persistent store read never runs once per poll.
+        let (probe, calls) = scripted_fleet_probe(vec![known_runway(1800), known_runway(600)]);
+        let mut daemon = probed_runway_daemon(3600);
+        daemon.fleet_runway_probe = Some(probe);
+        let mut events = vec![];
+        let mut diags = vec![];
+
+        // t0: due (no anchor) → probe called once.
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(daemon.state.last_fleet_runway_check, Some(RUNWAY_T0));
+
+        // t0 + (cadence − 1): NOT due → skipped entirely, probe NOT called again.
+        events.clear();
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS - 1,
+            &mut events,
+            &mut diags,
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a within-window check skips the probe"
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            daemon.state.last_fleet_runway_check,
+            Some(RUNWAY_T0),
+            "a skipped within-window check must NOT advance the cadence anchor"
+        );
+
+        // t0 + cadence: due again → probe called.
+        daemon.check_fleet_runway_warn(
+            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS,
+            &mut events,
+            &mut diags,
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an at-cadence check runs the probe"
         );
     }
 

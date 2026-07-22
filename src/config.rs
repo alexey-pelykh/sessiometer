@@ -188,6 +188,14 @@ const DEFAULT_SESSION_VELOCITY_MIN_PROJECT_ABOVE: u8 = 85;
 /// (1-α)·prev` — to damp a single-interval velocity spike so the projection keys off SUSTAINED
 /// motion. α ≈ 0.5 (the #538-validated value); 100 means no smoothing (raw last-interval velocity).
 const DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT: u8 = 50;
+/// Default `fleet_runway_warn_secs` (issue #650): the aggregate fleet-runway threshold (seconds)
+/// below which the daemon emits the proactive edge-triggered `fleet_runway_low` warning. **`0` =
+/// OFF** — the feature is opt-in (the issue's conservative default): the warning keys off the #544
+/// fleet-runway aggregate, whose honest-degradation gates make it meaningful only once the usage
+/// store has real velocity coverage, so a fresh install should not warn out of the box. A non-zero
+/// value opts in at that threshold (e.g. `86400` warns when the roster's combined weekly head-room
+/// covers less than a day at the observed burn).
+const DEFAULT_FLEET_RUNWAY_WARN_SECS: u64 = 0;
 
 /// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
 /// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
@@ -465,6 +473,14 @@ pub(crate) struct Tunables {
     /// row before it is un-quarantined. A re-login un-quarantines immediately instead
     /// (the #13 canonical-change re-stash clears the flag directly, issue #107).
     pub(crate) monitor_recovery_m: u8,
+    /// Proactive fleet-runway warning threshold, in seconds (issue #650): when the #544
+    /// fleet-runway aggregate — the roster's combined weekly head-room over its combined observed
+    /// burn — drops BELOW this, the daemon emits ONE edge-triggered `fleet_runway_low` event (the
+    /// operator's lead-time signal BEFORE the all-exhausted terminal state, #11). **`0` disables
+    /// the path (the kill-switch, and the opt-in default)**; a non-zero value is bounded
+    /// `60..=2_592_000` (1 min..30 d — a warn line above 30 days is always-on noise, not a
+    /// warning). Purely an operator-visibility signal: no swap decision reads it.
+    pub(crate) fleet_runway_warn_secs: u64,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
     /// cycle instead of sleeping a fixed interval.
@@ -502,6 +518,7 @@ impl Default for Tunables {
             session_velocity_ema_alpha_pct: DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT,
             monitor_401_n: DEFAULT_MONITOR_401_N,
             monitor_recovery_m: DEFAULT_MONITOR_RECOVERY_M,
+            fleet_runway_warn_secs: DEFAULT_FLEET_RUNWAY_WARN_SECS,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
@@ -1034,6 +1051,8 @@ pub(crate) struct SetTunables {
     pub(crate) monitor_401_n: Option<i64>,
     #[serde(default)]
     pub(crate) monitor_recovery_m: Option<i64>,
+    #[serde(default)]
+    pub(crate) fleet_runway_warn_secs: Option<i64>,
 }
 
 /// Which classes of edit a [`Config::apply_settings`] actually changed (issue #268), so the
@@ -1074,6 +1093,7 @@ pub(crate) struct TunablesView {
     pub(crate) session_velocity_ema_alpha_pct: u8,
     pub(crate) monitor_401_n: u8,
     pub(crate) monitor_recovery_m: u8,
+    pub(crate) fleet_runway_warn_secs: u64,
 }
 
 impl From<&Tunables> for TunablesView {
@@ -1093,6 +1113,7 @@ impl From<&Tunables> for TunablesView {
             session_velocity_ema_alpha_pct: t.session_velocity_ema_alpha_pct,
             monitor_401_n: t.monitor_401_n,
             monitor_recovery_m: t.monitor_recovery_m,
+            fleet_runway_warn_secs: t.fleet_runway_warn_secs,
         }
     }
 }
@@ -1194,6 +1215,10 @@ struct RawTunables {
     monitor_401_n: i64,
     #[serde(default = "default_monitor_recovery_m")]
     monitor_recovery_m: i64,
+    // Issue #650: an absent key resolves to `0` — the proactive fleet-runway warning OFF, the
+    // opt-in default.
+    #[serde(default = "default_fleet_runway_warn_secs")]
+    fleet_runway_warn_secs: i64,
 }
 
 impl Default for RawTunables {
@@ -1213,6 +1238,7 @@ impl Default for RawTunables {
             session_velocity_ema_alpha_pct: default_session_velocity_ema_alpha_pct(),
             monitor_401_n: default_monitor_401_n(),
             monitor_recovery_m: default_monitor_recovery_m(),
+            fleet_runway_warn_secs: default_fleet_runway_warn_secs(),
         }
     }
 }
@@ -1255,6 +1281,9 @@ fn default_monitor_401_n() -> i64 {
 }
 fn default_monitor_recovery_m() -> i64 {
     i64::from(DEFAULT_MONITOR_RECOVERY_M)
+}
+fn default_fleet_runway_warn_secs() -> i64 {
+    DEFAULT_FLEET_RUNWAY_WARN_SECS as i64
 }
 
 /// Permissive deserialization of the optional `[refresh]` table (issue #105): every key
@@ -1645,6 +1674,49 @@ label = "personal"
     }
 
     #[test]
+    fn apply_settings_overlays_fleet_runway_warn_and_the_view_projects_it() {
+        // Issue #650: the new tunable rides the SAME #268 config-set overlay + config-get view
+        // as every other scalar — no parallel surface. Set it via `SetTunables`, read it back
+        // through `view()` (the config-get projection).
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                fleet_runway_warn_secs: Some(7200),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert_eq!(after.tunables.fleet_runway_warn_secs, 7200);
+        assert!(change.tunables_changed);
+        assert!(!change.labels_changed);
+        assert_eq!(after.view().tunables.fleet_runway_warn_secs, 7200);
+        // The overlaid value renders and re-parses verbatim (config-set persists via `render`).
+        let reparsed = Config::parse(&after.render()).unwrap();
+        assert_eq!(reparsed.tunables.fleet_runway_warn_secs, 7200);
+
+        // The atomic re-validate rejects an out-of-band set (59, a non-zero sub-floor) as a
+        // whole batch — the config-set path enforces the same 0-or-band shape as load.
+        let err = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                fleet_runway_warn_secs: Some(59),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)));
+
+        // The key is a representable scalar edit (serde round-trip), unset stays None.
+        let parsed: SetTunables =
+            serde_json::from_str(r#"{"fleet_runway_warn_secs":7200}"#).unwrap();
+        assert_eq!(parsed.fleet_runway_warn_secs, Some(7200));
+        let empty: SetTunables = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.fleet_runway_warn_secs, None);
+    }
+
+    #[test]
     fn apply_settings_refuses_a_currently_unreadable_config() {
         // A hand-broken file fails at the baseline parse — config-set never overwrites a
         // file it cannot understand.
@@ -1729,6 +1801,9 @@ label = "personal"
                 session_velocity_ema_alpha_pct: 50,
                 monitor_401_n: 5,
                 monitor_recovery_m: 4,
+                // VALID omits fleet_runway_warn_secs → the compiled-in default (issue #650):
+                // 0, the proactive fleet-runway warning OFF (opt-in).
+                fleet_runway_warn_secs: 0,
                 // No [jitter] table in VALID → default strategies: poll jitters
                 // normally (base from poll_secs), session_ceiling/weekly_ceiling/cooldown
                 // are fixed at their respective bases.
@@ -2213,6 +2288,46 @@ label = "personal"
         let inert = Config::parse(&with_tunables("poll_secs = 30\nnear_limit_poll_secs = 60"))
             .expect("an above-base cap is inert, not an error (no cross-field bound)");
         assert_eq!(inert.tunables.near_limit_poll_secs, 60);
+    }
+
+    #[test]
+    fn fleet_runway_warn_secs_accepts_zero_disabled_or_the_60_to_2592000_band() {
+        // Issue #650: the proactive fleet-runway warn threshold is `0` (disabled — the shipped
+        // DEFAULT and the kill-switch, since the warning is opt-in) OR in the 60..=2_592_000 s
+        // band (one minute of lead time up to a 30-day cap). The `0`-OR-band shape mirrors
+        // `near_limit_poll_secs` above: a naive `(60..=2_592_000).contains()` WITHOUT the `!= 0`
+        // guard would reject the documented default/kill-switch. There is deliberately NO
+        // cross-field bound — it is a pure operator-visibility line, coupled to no decision field.
+
+        // Absent → the compiled-in `0` default (OFF).
+        let default = Config::parse(&with_tunables("poll_secs = 300")).unwrap();
+        assert_eq!(default.tunables.fleet_runway_warn_secs, 0);
+
+        // 0 is the disabled default/kill-switch and MUST load — not a sub-floor rejection.
+        let disabled = Config::parse(&with_tunables("fleet_runway_warn_secs = 0"))
+            .expect("0 is the valid disabled default, not a sub-floor rejection");
+        assert_eq!(disabled.tunables.fleet_runway_warn_secs, 0);
+
+        // Both band edges load and thread through verbatim.
+        for edge in [60u64, 2_592_000] {
+            let cfg = Config::parse(&with_tunables(&format!("fleet_runway_warn_secs = {edge}")))
+                .unwrap_or_else(|e| {
+                    panic!("fleet_runway_warn_secs = {edge} is a valid edge: {e:?}")
+                });
+            assert_eq!(cfg.tunables.fleet_runway_warn_secs, edge);
+        }
+
+        // A non-zero sub-floor (1, 59) and an above-cap value (2_592_001) each trip the field
+        // range: the `!= 0` guard admits ONLY 0, never a sub-60 warn line.
+        for bad in [1u64, 59, 2_592_001] {
+            match Config::parse(&with_tunables(&format!("fleet_runway_warn_secs = {bad}"))) {
+                Err(Error::ConfigInvalid(msg)) => assert!(
+                    msg.contains("fleet_runway_warn_secs") && msg.contains("60..=2592000"),
+                    "out-of-band {bad} must trip the field range, got: {msg}"
+                ),
+                other => panic!("{bad} is out of band — expected ConfigInvalid, got: {other:?}"),
+            }
+        }
     }
 
     // ── issue #608: the peak-velocity runway coupling (validator + advisory) ──
