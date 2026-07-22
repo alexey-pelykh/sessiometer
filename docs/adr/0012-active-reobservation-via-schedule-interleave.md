@@ -65,7 +65,7 @@ schedule (#366), and keep the `poll_secs` default unchanged.** A lower `poll_sec
 retained only as a small-roster fallback, gated on a source-window check.
 
 1. **Keep the `poll_secs` default.** `DEFAULT_POLL_SECS = 300`
-   (`src/config.rs:41`, `default_poll_secs` at `src/config.rs:1398`) stays as-is; the
+   (`src/config.rs`, `default_poll_secs`) stays as-is; the
    global poll interval is **not** lowered to close the gap. Lowering it is rejected
    for the endpoint reason above (see Alternatives 1).
 
@@ -201,8 +201,8 @@ retained only as a small-roster fallback, gated on a source-window check.
 - **Code**: `src/daemon.rs` — `build_poll_schedule` (the active interleave, ~L1811),
   `rotation_len` (the divisor held at N, ~L1885), `next_subinterval` (the `poll_secs/N`
   tick spacing, ~L3603), the poll-loop module doc on the source-scoped rate-limit
-  window (~L17–29). `src/config.rs` — `DEFAULT_POLL_SECS` = 300 (~L41),
-  `default_poll_secs` (~L1398).
+  window (~L17–29). `src/config.rs` — `DEFAULT_POLL_SECS` = 300,
+  `default_poll_secs`.
 - **Prior art (ADRs)**: **ADR-0009** (rate-limit back-off scoped per-account — the
   sibling rate-limit decision whose per-source, source-scoped-endpoint model this
   rate-neutrality argument rests on). **ADR-0008** (a shipped behavior-change ADR, the

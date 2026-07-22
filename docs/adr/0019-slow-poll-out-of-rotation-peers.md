@@ -161,7 +161,8 @@ scheduled tick — catching the rare server-side early reset within ≤ the ceil
   (a `phase:2-ui` follow-up); removing exhausted accounts from `rotation_len` N.
 - Code: `src/daemon.rs` — `AccountHealth.exhausted_poll_until`, `exhausted_slow_polling`,
   `note_exhausted_poll`, `exhausted_poll_window`, the `tick` skip filter, the post-poll arm
-  call. `src/config.rs` — the `exhausted_poll_secs` tunable (parse / validate / render /
-  origin). `src/observability.rs` — `Event::ExhaustedSlowPoll` / `ExhaustedSlowPollCleared`.
+  call. `src/config/{load,validate,render}.rs` — the `exhausted_poll_secs` tunable
+  (parse / validate / render / origin).
+  `src/observability.rs` — `Event::ExhaustedSlowPoll` / `ExhaustedSlowPollCleared`.
 - ADR-0005 (config parsed by crate, emitted by hand — the new tunable's render);
   ADR-0009 (the per-account back-off scoping this extends).

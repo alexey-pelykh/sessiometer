@@ -238,8 +238,9 @@ already correct, and corrects a doc-comment that under-described it.
   ADR formalises (cited by symbol; the historical `daemon.rs:4582-4585` line reference
   in #597's and this item's body has since drifted). `session_trigger` in
   `src/config.rs` — the struct-field doc, the `DEFAULT_SESSION_TRIGGER` constant, and
-  the hand-emitted `config.toml` template comment, all corrected by this item. The
-  cross-field validator in `Config::validate` (`src/config.rs`) plus
+  the hand-emitted `config.toml` template comment (`src/config/render.rs`),
+  all corrected by this item. The
+  cross-field validator in `Config::validate` (`src/config/validate.rs`) plus
   `Error::ConfigTargetMaxSessionAboveTrigger` (`src/error.rs`) — the one-value reserve
   invariant.
 - ADRs: [ADR-0017](0017-bounded-blindness-preemptive-swap-not-header-observation.md)

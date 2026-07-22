@@ -350,9 +350,10 @@ copied unverified — the "re-verify at build, don't hardcode" discipline #597 r
   threshold and the `velocity_swap` projection (`src/daemon.rs`) — both now derive from
   `effective_ceiling`; the swap-reason log compares against the derived `session_threshold`
   so a velocity-early session swap is not mis-logged as weekly. `session_trigger` (the
-  struct field, its `50..=99` range check, the `DEFAULT_SESSION_TRIGGER = 95` constant,
-  and the `config.toml` template comment) in `src/config.rs`, all reframed to ceiling
-  semantics. The reserve validator in `Config::validate` (`src/config.rs`) and
+  struct field and the `DEFAULT_SESSION_TRIGGER = 95` constant in `src/config.rs`, its
+  `50..=99` range check in `src/config/validate.rs`, and the `config.toml` template
+  comment in `src/config/render.rs`), all reframed to ceiling semantics.
+  The reserve validator in `Config::validate` (`src/config/validate.rs`) and
   `Error::ConfigTargetMaxSessionAboveTrigger` (`src/error.rs`) — kept coherent, unchanged.
 - ADRs: [ADR-0022](0022-session-trigger-one-predicate-two-estimators.md)
   (**superseded** — one predicate on two estimators; this ADR **preserves that decision**

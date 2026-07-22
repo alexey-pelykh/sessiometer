@@ -162,7 +162,8 @@ exact-bytes round-trip tests is churn without a correctness gain today.
   commented-out OFF-state illustration in the Context is historical).
 - ADR-0004 / ADR-0002: the same minimal-dependency posture that weighs against adopting
   `toml_edit`.
-- Code: `src/config.rs` — `Config::parse`, `RawConfig`, `Config::render`,
+- Code: `src/config/load.rs` — `Config::parse`; `src/config.rs` — `RawConfig`;
+  `src/config/render.rs` — `Config::render`,
   `basic_string` (now a `toml_writer` delegation) and its `basic_string_escapes_specials`
   + `rendered_strings_round_trip_through_the_parser` tests; `Cargo.toml` dependency
   rationale; `Cargo.lock` (`toml`, `toml_writer`, no `toml_edit`).
