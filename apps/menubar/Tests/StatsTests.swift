@@ -480,9 +480,15 @@ final class StatsTests: XCTestCase {
     }
 
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
-        for _ in 0..<10_000 {
+        // A WALL-CLOCK-bounded poll (≈5 s max at 1 ms/iter), NOT a fixed `Task.yield()` budget: `Task.yield()`
+        // only reschedules — it grants no real time — so under CI scheduler contention the detached stats-load
+        // task can be starved past a yield-count budget and time out, while passing locally (fast, low
+        // contention) and only intermittently on CI. `Task.sleep` gives the awaited task real time to run
+        // regardless of load; the poll still returns the instant the predicate holds, so the success path
+        // stays fast — only the failure path is now time-bounded.
+        for _ in 0..<5_000 {
             if predicate() { return }
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(1))
         }
         XCTFail("timed out waiting for \(label)")
     }
