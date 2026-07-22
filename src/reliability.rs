@@ -82,6 +82,48 @@
 //! mirror of SLI 5 and carries the identical per-machine bound; velocity-spike detection
 //! (which reads the account-global `/oauth/usage` signal that DOES reflect both machines'
 //! combined burn) is the partial mitigation, not a fix.
+//!
+//! ## Which event the readout reads (issue #591)
+//!
+//! BOTH, routed per-SLI by semantics — deliberately NOT a swap from the censored `blind_window`
+//! (issue #449) to the uncensored `blind_enter` / `blind_exit` pair (issue #583):
+//!
+//! - **SLI 2 and SLI 3's proxy keep reading `blind_window`, unchanged.** Re-pointing a published
+//!   figure at a different population would make one number mean two different things either side
+//!   of a schema bump, so a stored reading could no longer be compared with a fresh one. That
+//!   event is also retained deliberately by [`crate::daemon`] as the recovery-edge duration
+//!   histogram: it was assigned the wrong PURPOSE (detection), not built wrong for this one.
+//! - **SLI 6 cannot move.** Its inputs are the #634 velocity ingredients and the #670
+//!   `session_high_water_pct`, and both are stamped on `blind_window` alone — the pair carries
+//!   neither. It instead CONSUMES the pair's census for its two censored-tail counts, which is
+//!   exactly what those two fields were reserved for.
+//! - **The pair gets its own census** ([`BlindEpisodes`]), published BESIDE the censored figures
+//!   rather than replacing them. The gap between the two IS the censoring, and showing both is what
+//!   makes it legible. Blending them would also double-count every episode that emits both families
+//!   (an active account that recovers emits `blind_window` AND `blind_exit` for the one episode).
+//!
+//! Two treatments in that census are deliberate rather than mechanical:
+//!
+//! - **Never-recovered episodes are right-censored, not summed.** Such an episode has no exit line
+//!   and therefore NO measured duration, so it contributes a LOWER BOUND (`horizon − entry`) kept in
+//!   its own field — never folded into a figure that would read as a total. The horizon is the last
+//!   `ts=` in view, not the wall clock, so the same text always folds to the same number.
+//! - **Restart orphans are excluded from that tail.** An unmatched entry counts as never-recovered
+//!   only when no LATER entry for the same account supersedes it. Because [`crate::daemon`]'s
+//!   per-account edge machine strictly alternates, a second entry with no exit between PROVES the
+//!   in-memory anchor was lost — a daemon restart — so those are counted separately
+//!   ([`BlindEpisodes::n_anchor_lost`]) and cannot inflate the worst tail with ordinary restarts.
+//!   Issue #591 proposes disambiguating restarts with a `diag=start` marker instead; that marker
+//!   rides the verbosity-gated OPERATOR diagnostic channel to stderr (default
+//!   [`crate::observability::Verbosity::Quiet`] emits nothing) and never reaches the durable log
+//!   this reader folds, so the re-entry signal is used in its place.
+//!
+//! The interim [`PREEMPT_WASTED_MARGIN_PCT`] proxy margin is deliberately NOT reworked here. The
+//! pair's weekly dimension does now make a session-window RESET distinguishable from a genuinely
+//! quiet window (the weekly window does not roll on the 5 h session cadence), so reworking it has
+//! become possible — but that threshold is issues #451/#484's to derive against production, and
+//! this module's standing discipline is to supply the INGREDIENT and leave the verdict a query-time
+//! view. The ingredient is exposed; the margin stays where its owner can set it.
 
 use crate::error::{Error, Result};
 use crate::usage::epoch_from_rfc3339;
@@ -154,8 +196,13 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// projection error, so the prior name (implying tracked projection accuracy) was corrected. Bumped
 /// `6 → 7` when the #636 blind-arm projection-error SLI added the `blind_projection_error` object —
 /// ADDITIVE again (a new always-present field; every schema:6 key is byte-identical), so the rename
-/// at 6 stays the lone non-additive bump.
-const JSON_SCHEMA_VERSION: u32 = 7;
+/// at 6 stays the lone non-additive bump. Bumped `7 → 8` (issue #591) when the uncensored
+/// blind-episode census added the `blind_episodes` object — ADDITIVE (a new always-present field;
+/// every schema:7 key is byte-identical and keeps its meaning). The same bump finally POPULATES
+/// `blind_projection_error.n_swapped_away` / `.n_never_recovered`, which schema:7 always emitted as
+/// `null`: a value-domain fill of two already-present, already-documented nullable keys, not a key
+/// change — a consumer that already handled the documented `null` handles the number.
+const JSON_SCHEMA_VERSION: u32 = 8;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -408,6 +455,26 @@ struct Inputs {
     /// Every `blind_window` line in view, classified (issue #636) — the DENOMINATOR context that
     /// keeps the projection-error percentiles from reading as the whole blind story.
     blind_window_census: BlindWindowCensus,
+    /// Every `blind_enter` line in view (issues #583/#591) — the OPENING halves of the UNCENSORED
+    /// episode record, kept RAW here and paired in [`fold_blind_episodes`] at aggregation (the
+    /// ingredients-here / verdict-there split every sibling SLI in this module uses).
+    blind_entries: Vec<BlindEntry>,
+    /// Every `blind_exit` line in view (issues #583/#591) — the CLOSING halves.
+    blind_exits: Vec<BlindExit>,
+    /// Lines of the uncensored pair this reader could not place: a missing or unparseable `ts=` /
+    /// `acct=` (either half) or `duration_secs=` (an exit). DISCLOSED rather than silently dropped —
+    /// an undisclosed drop is a missing denominator, the survivorship failure this module guards
+    /// against everywhere else.
+    blind_pair_malformed: usize,
+    /// The latest `ts=` seen ANYWHERE in the folded text — the OBSERVATION HORIZON a
+    /// never-recovered episode's right-censored floor is measured to (issue #591).
+    ///
+    /// Data-derived, deliberately NOT the wall clock: this verb is otherwise a pure function of the
+    /// log text (`run` reads the clock only to resolve `--since`), and a horizon read from the clock
+    /// would make the same text fold to a different number on every invocation — and would silently
+    /// count the gap since the daemon last wrote as blindness. Taken over ALL lines, not just the
+    /// blind family, so a quiet account's open episode is still measured to the log's real end.
+    horizon_ts: Option<i64>,
 }
 
 /// The complete classification of the `blind_window` lines in view (issue #636).
@@ -451,6 +518,200 @@ struct BlindWindowCensus {
     /// overflowed to non-finite. A CORRUPT record, distinct from a well-formed window the arm simply
     /// could not arm on — folding the two together would report corruption as coverage. The tolerant-drop precedent every sibling arm here uses, made VISIBLE.
     malformed: usize,
+}
+
+/// One `blind_enter` line in view (issue #591) — the OPENING half of an uncensored episode.
+#[derive(Debug, Clone, PartialEq)]
+struct BlindEntry {
+    /// The entry instant: the origin a never-recovered episode's right-censored floor measures from.
+    ts: i64,
+    /// The line's ordinal in the folded text — the tie-break that keeps same-`ts` edges in TRUE log
+    /// order. `ts=` has whole-second resolution, so one account's exit and its next entry can share a
+    /// timestamp; ordering those two wrong turns a real never-recovered episode into a phantom
+    /// restart and zeroes its censored floor. See [`fold_blind_episodes`].
+    seq: usize,
+    /// The account UUID (`acct=`) — the pairing key. Used INTERNALLY only, never rendered (the #15
+    /// roster-wide-bare-numbers invariant this whole readout keeps).
+    acct: String,
+    /// Whether the pre-blind anchor sat at/over the session trigger, carried from the entry line so
+    /// this family filters exactly as the `blind_window` SLIs do.
+    near_limit: bool,
+}
+
+/// One `blind_exit` line in view (issue #591) — the CLOSING half.
+///
+/// SELF-CONTAINED: the daemon measured `duration_secs` against its own per-account anchor and tagged
+/// `swapped_away` at the exit edge, so an exit is valid evidence of a COMPLETED episode whether or
+/// not its entry is also in view — a `--since` cutoff or a rotated log routinely severs the entry.
+/// This is why the fold reads the exit-derived facts off the LINES and uses pairing only for what a
+/// single line cannot answer (which ENTRIES never closed).
+#[derive(Debug, Clone, PartialEq)]
+struct BlindExit {
+    ts: i64,
+    /// Log-order tie-break, as [`BlindEntry::seq`].
+    seq: usize,
+    acct: String,
+    near_limit: bool,
+    /// How long the account was blind, anchor → this recovery. A MEASURED value (contrast the
+    /// censored floor a never-recovered episode contributes).
+    duration_secs: u64,
+    /// `swapped_away=true` — active at entry, not active now. The censoring tail `blind_window` is
+    /// structurally blind to (it is `active == Some(i)`-guarded off the swap-dropped `last_good`).
+    swapped_away: bool,
+}
+
+/// The UNCENSORED blind-episode census (issue #591), folded from the `blind_enter` / `blind_exit`
+/// pair (issue #583) instead of the recovery-edge, active-only `blind_window`.
+///
+/// This is the ADDITIVE counterpart to [`BlindWindowCensus`], not its replacement — the two count
+/// different populations on purpose, and the gap between them IS the censoring this readout exists
+/// to disclose. See the module-level § "Which event the readout reads" for the routing decision.
+///
+/// **Right-censoring is carried, never averaged away.** A never-recovered episode has no exit line
+/// and therefore NO measured duration. Its contribution is a LOWER BOUND (`horizon − entry`), kept
+/// in its own field so the observed and the censored parts are never silently summed into a figure
+/// that reads as a total. A consumer that wants the honest answer reads
+/// `observed + censored_floor` and knows it is a floor; a consumer that wants only measured time
+/// reads `observed`. Neither is fabricated from the other.
+#[derive(Debug, Default, PartialEq)]
+struct BlindEpisodes {
+    /// Every `blind_enter` line in view.
+    n_entered: usize,
+    /// Every `blind_exit` line in view.
+    n_exited: usize,
+    /// Exits tagged `swapped_away=true` — `blind_window`'s SECOND censoring tail, now counted.
+    n_swapped_away: usize,
+    /// Entries still OPEN at the horizon, after restart orphans are removed — `blind_window`'s FIRST
+    /// censoring tail (the episode that is invisible precisely when it is worst).
+    n_never_recovered: usize,
+    /// Entries superseded by a LATER entry for the same account with no exit between: the anchor was
+    /// lost out-of-band (daemon restart — `blind_anchor` is in-memory — or a roster-reconcile drop),
+    /// so the episode's end is simply unknown. Counted SEPARATELY and never as "never recovered",
+    /// which would inflate the worst tail with ordinary restarts.
+    n_anchor_lost: usize,
+    /// Exits whose entry is not in view (a `--since` cutoff or a rotated log severed it). Their
+    /// duration and `swapped_away` tag are still valid (see [`BlindExit`]); disclosed so the
+    /// entry/exit counts visibly need not balance.
+    n_exit_without_enter: usize,
+    /// Pair lines this reader could not place. See [`Inputs::blind_pair_malformed`].
+    n_malformed: usize,
+    /// `near_limit=true` episodes witnessed: completed exits plus open (censored) entries.
+    near_limit_episodes: usize,
+    /// Σ `duration_secs` over `near_limit=true` exits — MEASURED blind time.
+    near_limit_observed_secs: u64,
+    /// Σ `horizon − entry` over `near_limit=true` OPEN episodes — a right-censored FLOOR, kept
+    /// apart from the measured sum above.
+    near_limit_censored_floor_secs: u64,
+}
+
+impl BlindEpisodes {
+    /// `observed + censored floor` — a LOWER BOUND on true near-limit blind time, never a total (the
+    /// censored part can only grow). Derived, never stored, so the two parts and their sum cannot
+    /// disagree — and derived in ONE place, so the human and JSON surfaces cannot disagree either.
+    fn near_limit_total_secs_lower_bound(&self) -> u64 {
+        self.near_limit_observed_secs
+            .saturating_add(self.near_limit_censored_floor_secs)
+    }
+}
+
+/// Pair the raw `blind_enter` / `blind_exit` halves into the uncensored census (issue #591).
+///
+/// Exit-derived facts (`duration_secs`, `swapped_away`, `near_limit`) are read off the LINES; the
+/// pairing walk answers only what one line cannot — which entries never closed, and whether an
+/// unclosed one is a genuine never-recovered episode or a restart orphan.
+///
+/// **The restart disambiguator.** [`crate::daemon`]'s `note_blind_episode` is a strictly-alternating
+/// per-account state machine — `(None, Err)` opens, `(Some, Ok)` closes, and a held-blind tick or an
+/// ordinary live poll matches no edge — so a SECOND entry for one account with no exit between is
+/// IMPOSSIBLE while the anchor is intact. Observing one therefore PROVES the anchor was lost
+/// out-of-band, which is exactly the daemon-restart case (`blind_anchor` is in-memory). That signal
+/// is used deliberately here instead of the `diag=start` marker issue #591 proposes: `diag=start`
+/// rides the OPERATOR-facing diagnostic channel, which is written to stderr and gated behind
+/// `--verbose` (default [`crate::observability::Verbosity::Quiet`] emits nothing), so it is absent
+/// from the durable event log this reader folds and cannot disambiguate anything here.
+fn fold_blind_episodes(
+    entries: &[BlindEntry],
+    exits: &[BlindExit],
+    horizon_ts: Option<i64>,
+    malformed: usize,
+) -> BlindEpisodes {
+    let mut out = BlindEpisodes {
+        n_entered: entries.len(),
+        n_exited: exits.len(),
+        n_malformed: malformed,
+        ..BlindEpisodes::default()
+    };
+
+    for x in exits {
+        if x.swapped_away {
+            out.n_swapped_away += 1;
+        }
+        if x.near_limit {
+            out.near_limit_episodes += 1;
+            out.near_limit_observed_secs =
+                out.near_limit_observed_secs.saturating_add(x.duration_secs);
+        }
+    }
+
+    enum Edge<'a> {
+        Enter(&'a BlindEntry),
+        Exit(&'a BlindExit),
+    }
+
+    // One timeline over BOTH halves, so the per-account walk sees the edges in the order the daemon
+    // emitted them. Sorting makes the fold independent of the log's own append order (a rotated or
+    // concatenated log can interleave out of order).
+    //
+    // The key is `(ts, seq)`, NOT `ts` alone. `ts=` has whole-second resolution, so an exit and the
+    // next entry for one account genuinely can share a timestamp — and this Vec is built as ALL
+    // entries then ALL exits, which destroys log order BEFORE the sort. Stability preserves that
+    // construction order for ties, not the log's, so a bare `ts` key would reorder a same-second
+    // `enter → exit → enter` into `enter → enter → exit`: a phantom anchor-loss, a DROPPED
+    // never-recovered episode, and its censored floor silently zeroed — understating exactly the
+    // worst tail this census exists to surface. `seq` is the line ordinal, so ties resolve to true
+    // log order.
+    let mut timeline: Vec<Edge> = entries
+        .iter()
+        .map(Edge::Enter)
+        .chain(exits.iter().map(Edge::Exit))
+        .collect();
+    timeline.sort_by_key(|edge| match edge {
+        Edge::Enter(e) => (e.ts, e.seq),
+        Edge::Exit(x) => (x.ts, x.seq),
+    });
+
+    let mut pending: BTreeMap<&str, &BlindEntry> = BTreeMap::new();
+    for edge in &timeline {
+        match edge {
+            // Replacing a pending entry is the anchor-loss proof documented above.
+            Edge::Enter(e) => {
+                if pending.insert(e.acct.as_str(), e).is_some() {
+                    out.n_anchor_lost += 1;
+                }
+            }
+            Edge::Exit(x) => {
+                if pending.remove(x.acct.as_str()).is_none() {
+                    out.n_exit_without_enter += 1;
+                }
+            }
+        }
+    }
+
+    // Whatever is still open at the horizon never recovered IN VIEW. Right-censored: a LOWER BOUND,
+    // never a measured duration, and never folded into the observed sum.
+    for e in pending.values() {
+        out.n_never_recovered += 1;
+        if e.near_limit {
+            out.near_limit_episodes += 1;
+            if let Some(h) = horizon_ts {
+                out.near_limit_censored_floor_secs = out
+                    .near_limit_censored_floor_secs
+                    .saturating_add(h.saturating_sub(e.ts).max(0) as u64);
+            }
+        }
+    }
+
+    out
 }
 
 /// Record a re-activation edge (issue #595): the account named by `{acct_field}=` on this log line
@@ -601,7 +862,7 @@ fn record_blind_projection(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>) {
 /// no second calendar routine is introduced.
 fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
     let mut inputs = Inputs::default();
-    for line in text.lines() {
+    for (seq, line) in text.lines().enumerate() {
         // Field map from the whitespace-separated `key=val` tokens. Handles/values are
         // whitespace-free by the log's grammar, so tokenizing on spaces is exact.
         let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
@@ -623,6 +884,21 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
             if !in_window {
                 continue;
             }
+        }
+
+        // The observation horizon (issue #591): the latest `ts=` in the folded view. Tracked over
+        // EVERY line, not just the blind family, so an open episode on an otherwise quiet account is
+        // still measured to the log's real end.
+        //
+        // Placed AFTER the window gate so the horizon is always the horizon of what was actually
+        // FOLDED. Today that is indistinguishable from the whole log's maximum: `--since` is a pure
+        // LOWER bound (`ts >= cutoff`, no upper bound), so the largest in-window `ts` IS the largest
+        // `ts` overall. The placement is therefore DEFENSIVE, not currently observable — it is what
+        // keeps the censored floor honest if an upper-bounded window is ever added. Said precisely
+        // so a later reader does not mistake it for a live invariant and "pin" it with a test that
+        // cannot fail.
+        if let Some(ts) = fields.get("ts").copied().and_then(epoch_from_rfc3339) {
+            inputs.horizon_ts = Some(inputs.horizon_ts.map_or(ts, |h: i64| h.max(ts)));
         }
 
         match fields.get("event").copied() {
@@ -704,6 +980,51 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                         .and_then(|v| v.parse::<u8>().ok()),
                 ) {
                     inputs.near_limit_reconciliations.push((anchor, recovery));
+                }
+            }
+            // The UNCENSORED blind-episode pair (issues #583/#591). Kept RAW here and paired in
+            // [`fold_blind_episodes`] at aggregation: which entry never closed is a WHOLE-VIEW
+            // property, not a per-line one, so it cannot be folded in this single forward pass.
+            //
+            // These feed ONLY the `blind_episodes` census — never the `blind_window`-derived
+            // `time_blind_near_limit_secs` / `near_limit_reconciliations` above. The two families
+            // OVERLAP by construction (an active account that recovers emits `blind_window` AND
+            // `blind_exit` for the one episode), so summing them into a single figure would
+            // double-count exactly the episodes both can see. Keeping the populations apart is the
+            // whole point of the issue #591 routing decision; the FIXTURE_LOG assertions pin it.
+            Some("blind_enter") => {
+                if let (Some(ts), Some(acct)) = (
+                    fields.get("ts").copied().and_then(epoch_from_rfc3339),
+                    fields.get("acct").copied(),
+                ) {
+                    inputs.blind_entries.push(BlindEntry {
+                        ts,
+                        seq,
+                        acct: acct.to_owned(),
+                        near_limit: fields.get("near_limit").copied() == Some("true"),
+                    });
+                } else {
+                    inputs.blind_pair_malformed += 1;
+                }
+            }
+            Some("blind_exit") => {
+                if let (Some(ts), Some(acct), Some(duration_secs)) = (
+                    fields.get("ts").copied().and_then(epoch_from_rfc3339),
+                    fields.get("acct").copied(),
+                    fields
+                        .get("duration_secs")
+                        .and_then(|v| v.parse::<u64>().ok()),
+                ) {
+                    inputs.blind_exits.push(BlindExit {
+                        ts,
+                        seq,
+                        acct: acct.to_owned(),
+                        near_limit: fields.get("near_limit").copied() == Some("true"),
+                        duration_secs,
+                        swapped_away: fields.get("swapped_away").copied() == Some("true"),
+                    });
+                } else {
+                    inputs.blind_pair_malformed += 1;
                 }
             }
             Some("usage_backoff") => match fields.get("class").copied() {
@@ -1011,9 +1332,10 @@ struct FalseProjection {
 /// renderer emits them paired with the counts below, and with the censoring disclosure. `blind_window`
 /// fires only on the `None -> live` RECOVERY edge of the ACTIVE account, so the population here is
 /// RECOVERED-ONLY by construction — measuring the EASY episodes. The two censored tails
-/// ([`Self::n_swapped_away`] / [`Self::n_never_recovered`]) are structurally invisible to this event
-/// and are reported as `None`, never as a fabricated `0`; the uncensored `blind_enter` / `blind_exit`
-/// denominator that populates them is issue #591's, and this SLI consumes rather than duplicates it.
+/// ([`Self::n_swapped_away`] / [`Self::n_never_recovered`]) are structurally invisible to this event,
+/// so they are never fabricated as `0`; since issue #591 they are POPULATED from the uncensored
+/// `blind_enter` / `blind_exit` census ([`BlindEpisodes`]), which this SLI CONSUMES rather than
+/// duplicates — the percentiles above still score the `blind_window` population, unchanged.
 ///
 /// **Domain guard.** The scored population is the arm's OWN domain: windows past
 /// [`crate::daemon::BLIND_GATE_SECS`], the gate the arm checks FIRST. The daemon stamps #634's
@@ -1049,14 +1371,18 @@ struct BlindProjectionError {
     /// Reported rather than silently dropped: an undisclosed drop is a missing denominator, which is
     /// precisely the survivorship failure the rest of this block guards against.
     n_malformed: usize,
-    /// Episodes the daemon SWAPPED AWAY from before they recovered. Always `None`: `blind_window` is
-    /// active-scoped, so an episode the daemon swaps off is structurally unrecordable by it. Filled
-    /// in when issue #591's censoring-aware denominator lands — `None` is the honest "unobservable",
-    /// distinct from an observed `0` (the same still-pending shape as [`FalseProjection::rate`]).
+    /// Episodes the daemon SWAPPED AWAY from before they recovered — structurally unrecordable by
+    /// the active-scoped `blind_window`. POPULATED since issue #591 from [`BlindEpisodes`], the
+    /// uncensored pair's census, which this SLI consumes rather than duplicates. `None` only when
+    /// that pair is absent from view (a log predating issue #583): the honest "unobservable",
+    /// distinct from an observed `0`.
     n_swapped_away: Option<usize>,
-    /// Episodes that NEVER recovered. Always `None` for the mirrored reason: `blind_window` fires on
-    /// the RECOVERY edge, so an account that goes dark and stays dark emits nothing at all — the
-    /// episode is invisible precisely when it is worst. Issue #591 owns it.
+    /// Episodes that NEVER recovered — invisible to `blind_window` for the mirrored reason: it fires
+    /// on the RECOVERY edge, so an account that goes dark and stays dark emits nothing at all, and
+    /// the episode is unrecorded precisely when it is worst. POPULATED since issue #591 from
+    /// [`BlindEpisodes`], with restart orphans excluded ([`BlindEpisodes::n_anchor_lost`]) so a
+    /// daemon restart cannot masquerade as a never-recovered episode. `None` on the same
+    /// pair-absent condition as the sibling above.
     n_never_recovered: Option<usize>,
     /// Error percentiles in percentage points, rounded to 2 dp (see [`round_pp`]). Signed.
     p50: Option<f64>,
@@ -1106,6 +1432,10 @@ struct Report {
     /// The #636 blind-arm projection error — `projected − session_at_recovery` percentiles, paired
     /// with the cardinality + censoring counts that keep them from reading as the whole blind story.
     blind_projection_error: BlindProjectionError,
+    /// The issue #591 uncensored blind-episode census — the `blind_enter` / `blind_exit` population,
+    /// published BESIDE the `blind_window`-derived figures above so the censoring gap is visible
+    /// rather than silently folded away.
+    blind_episodes: BlindEpisodes,
     rate_limit: RateLimit,
 }
 
@@ -1181,6 +1511,27 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
     let error_pct = |p: f64| -> Option<f64> {
         (error_n > 0).then(|| round_pp(crate::percentile::percentile(&errors, p)))
     };
+    // The UNCENSORED blind-episode census (issue #591), folded from the `blind_enter` / `blind_exit`
+    // pair — the ADDITIVE counterpart to the `blind_window`-derived SLIs above, never a replacement
+    // for them (see the module-level § "Which event the readout reads").
+    let blind_episodes = fold_blind_episodes(
+        &inputs.blind_entries,
+        &inputs.blind_exits,
+        inputs.horizon_ts,
+        inputs.blind_pair_malformed,
+    );
+    // Is the pair OBSERVABLE at all in this view? A log written before issue #583 — or a `--since`
+    // window that predates it — carries no pair lines, and reporting `Some(0)` there would assert
+    // "zero swapped-away episodes" when the truth is "unobservable". That is exactly the fabricated
+    // zero the censored tails' `None` has always refused, so absence of the family keeps them `None`.
+    //
+    // MALFORMED lines deliberately do NOT count as observation: "present but unreadable" is
+    // unobservable too. A view whose every pair line is corrupt yields nothing to count, so claiming
+    // an observed `0` there would be the same fabrication in a subtler dress — the corrupt lines are
+    // still DISCLOSED via `n_malformed`, which is the honest report. A view with even one readable
+    // line IS observed, and its `n_malformed` discloses the rest.
+    let pair_observed = blind_episodes.n_entered > 0 || blind_episodes.n_exited > 0;
+
     let blind_projection_error = BlindProjectionError {
         n_blind_windows: inputs.blind_window_census.total,
         n_projectable: inputs.blind_projections.len(),
@@ -1189,10 +1540,11 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         n_below_arm_gate: inputs.blind_window_census.below_arm_gate,
         n_without_velocity: inputs.blind_window_census.without_velocity,
         n_malformed: inputs.blind_window_census.malformed,
-        // Both censored tails are unobservable from `blind_window` — `None`, never a fabricated 0.
-        // Issue #591's uncensored `blind_enter`/`blind_exit` denominator populates them.
-        n_swapped_away: None,
-        n_never_recovered: None,
+        // The two censored tails, POPULATED (issue #591) from the uncensored pair this SLI consumes
+        // rather than duplicates — the promise these fields' `None` has carried since issue #636.
+        // Still `None` when the pair is absent from view: unobservable, not zero.
+        n_swapped_away: pair_observed.then_some(blind_episodes.n_swapped_away),
+        n_never_recovered: pair_observed.then_some(blind_episodes.n_never_recovered),
         p50: error_pct(0.50),
         p95: error_pct(0.95),
         p100: error_pct(1.0),
@@ -1215,6 +1567,7 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
             rate: None,
         },
         blind_projection_error,
+        blind_episodes,
         rate_limit: RateLimit {
             rate_limited: inputs.rate_limited,
             transient: inputs.transient,
@@ -1376,11 +1729,43 @@ fn render_human(r: &Report) -> String {
     }
     out.push('\n');
 
-    // SLI 2 — time blind & near-limit.
+    // SLI 2 — time blind & near-limit, in BOTH populations (issue #591). The censored `blind_window`
+    // figure keeps its exact wording and position — it is the one comparable across this log's whole
+    // history — and the uncensored episode census is rendered immediately beneath it, so the
+    // censoring gap is READ at a glance instead of inferred. Deliberately adjacent, not merged: the
+    // two count different populations and a single blended number would hide exactly what this
+    // readout exists to disclose.
     out.push_str(&format!(
-        "time blind & near-limit: {}s (sum of blind_window duration_secs where near_limit=true)\n\n",
+        "time blind & near-limit: {}s (sum of blind_window duration_secs where near_limit=true)\n",
         r.time_blind_near_limit_secs
     ));
+    let ep = &r.blind_episodes;
+    if ep.n_entered == 0 && ep.n_exited == 0 && ep.n_malformed == 0 {
+        // Deliberately does NOT name a cause: absence has three (no blind episodes occurred at all,
+        // a `--since` window excluding them, or a log predating the record) and the reader cannot
+        // tell them apart from here. Asserting the third would tell a healthy fleet its log is stale.
+        out.push_str("  uncensored episodes: none in view\n");
+    } else {
+        out.push_str(&format!(
+            "  uncensored episodes: entered={} exited={} swapped_away={} never_recovered={} anchor_lost={}\n",
+            ep.n_entered, ep.n_exited, ep.n_swapped_away, ep.n_never_recovered, ep.n_anchor_lost
+        ));
+        out.push_str(&format!(
+            "  near-limit blind time: >= {}s ({}s measured + {}s right-censored floor, n={})\n",
+            ep.near_limit_total_secs_lower_bound(),
+            ep.near_limit_observed_secs,
+            ep.near_limit_censored_floor_secs,
+            ep.near_limit_episodes
+        ));
+        // Never hide a drop: an undisclosed one is a missing denominator.
+        if ep.n_exit_without_enter > 0 || ep.n_malformed > 0 {
+            out.push_str(&format!(
+                "  (exits with no entry in view: {}; unplaceable pair lines: {})\n",
+                ep.n_exit_without_enter, ep.n_malformed
+            ));
+        }
+    }
+    out.push('\n');
 
     // SLI 3 — false-preempt: the real preemptive-swap count (issue #452, ADR-0017) plus the
     // interim blind-window proxy.
@@ -1425,9 +1810,18 @@ fn render_human(r: &Report) -> String {
         e.n_without_velocity,
         e.n_malformed
     ));
-    out.push_str(
-        "  censoring: RECOVERED-ONLY — swapped-away and never-recovered episodes are unobservable from blind_window (issue #591 owns the uncensored denominator)\n",
-    );
+    // The censoring disclosure, now QUANTIFIED where the uncensored pair supplies it (issue #591).
+    // The percentiles above still score the recovered-only `blind_window` population — that has not
+    // changed — but the reader can finally see HOW MUCH of the blind story sits outside it, instead
+    // of only being told that some does.
+    match (e.n_swapped_away, e.n_never_recovered) {
+        (Some(swapped), Some(never)) => out.push_str(&format!(
+            "  censoring: RECOVERED-ONLY — excludes {swapped} swapped-away and {never} never-recovered episodes (counted from the uncensored blind_enter/blind_exit pair above)\n"
+        )),
+        _ => out.push_str(
+            "  censoring: RECOVERED-ONLY — swapped-away and never-recovered episodes are unobservable from blind_window (no uncensored blind_enter/blind_exit pair in view)\n",
+        ),
+    }
     match (e.p50, e.p95, e.p100) {
         (Some(p50), Some(p95), Some(p100)) => {
             // Signed and explicitly so: positive = over-projected (cried DEGRADED early), negative =
@@ -1473,6 +1867,9 @@ struct ReliabilityWire {
     false_projection: FalseProjectionWire,
     /// The #636 blind-arm projection error (schema:7, additive).
     blind_projection_error: BlindProjectionErrorWire,
+    /// The issue #591 uncensored blind-episode census (schema:8, additive) — the `blind_enter` /
+    /// `blind_exit` population beside the `blind_window`-derived figures above.
+    blind_episodes: BlindEpisodesWire,
     rate_limit_neutrality: RateLimitWire,
 }
 
@@ -1614,17 +2011,68 @@ struct FalseProjectionWire {
     rate: Option<f64>,
 }
 
+/// The uncensored blind-episode census (schema:8, issue #591) — the `blind_enter` / `blind_exit`
+/// population (issue #583), published BESIDE the `blind_window`-derived figures rather than
+/// replacing them.
+///
+/// Read the two together: `time_blind_near_limit_secs` above is the RECOVERY-EDGE, ACTIVE-ONLY
+/// measurement (censored at both tails, and comparable across this log's whole history);
+/// `near_limit.total_secs_lower_bound` here is the uncensored floor over the same risk band. The
+/// GAP between them is the censoring, and it is meant to be visible.
+#[derive(serde::Serialize)]
+struct BlindEpisodesWire {
+    /// Every `blind_enter` line in view.
+    n_entered: usize,
+    /// Every `blind_exit` line in view.
+    n_exited: usize,
+    /// Exits tagged `swapped_away=true` — the tail `blind_window` structurally cannot record.
+    n_swapped_away: usize,
+    /// Entries still open at the horizon, restart orphans EXCLUDED (see `n_anchor_lost`).
+    n_never_recovered: usize,
+    /// Entries superseded by a later entry for the same account: the in-memory anchor was lost
+    /// out-of-band (a daemon restart, or a roster-reconcile drop), so the episode's end is unknown.
+    /// Counted apart from `n_never_recovered` so restarts cannot inflate the worst tail.
+    n_anchor_lost: usize,
+    /// Exits whose entry is not in view (a `--since` cutoff or a rotated log severed it), so the
+    /// entry and exit counts visibly need not balance.
+    n_exit_without_enter: usize,
+    /// Pair lines that could not be placed (unreadable `ts=` / `acct=` / `duration_secs=`).
+    n_malformed: usize,
+    near_limit: BlindEpisodesNearLimitWire,
+}
+
+/// The near-limit slice of the episode census (schema:8, issue #591) — the censoring-aware answer to
+/// "how long was the fleet blind while at risk?", with the MEASURED and CENSORED parts kept apart so
+/// neither is fabricated from the other.
+#[derive(serde::Serialize)]
+struct BlindEpisodesNearLimitWire {
+    /// Near-limit episodes witnessed: completed exits plus open (censored) entries.
+    n_episodes: usize,
+    /// MEASURED blind time: Σ `duration_secs` over near-limit exits.
+    observed_secs: u64,
+    /// The right-censored FLOOR contributed by episodes still open at the horizon — `horizon −
+    /// entry` each. A never-recovered episode has no exit and therefore no measured duration, so
+    /// this is a lower bound on time already elapsed, not an estimate of the episode's true length.
+    censored_floor_secs: u64,
+    /// `observed_secs + censored_floor_secs` — a LOWER BOUND on true near-limit blind time. Named so
+    /// it cannot be mistaken for a total: the censored part can only grow.
+    total_secs_lower_bound: u64,
+}
+
 /// Blind-arm projection-error block (issue #636): `projected − session_at_recovery` percentiles in
 /// percentage points, SIGNED (positive = over-projected, negative = under-projected — the burn ran
 /// past the inflated forecast).
 ///
 /// The percentiles are never published alone: the four counts above them carry the cardinality and
-/// the sentinel exclusion, and the two `null` census fields carry the CENSORING — this population is
+/// the sentinel exclusion, and the two census fields carry the CENSORING — this population is
 /// recovered-only, because `blind_window` fires on the recovery edge of the active account. A
 /// consumer that reads `p100` without reading `n_swapped_away` / `n_never_recovered` is reading the
-/// easy half of the distribution; those two are `null` (unobservable), NEVER `0`, until issue #591's
-/// uncensored `blind_enter`/`blind_exit` denominator lands. `p50`/`p95`/`p100` are `null` on an empty
-/// reconcilable population (an empty subject is not a passing `0 pp` error).
+/// easy half of the distribution. Since schema:8 (issue #591) those two carry REAL counts, sourced
+/// from the uncensored `blind_enter` / `blind_exit` pair this SLI CONSUMES rather than duplicates
+/// (the full census is the sibling `blind_episodes` block). They fall back to `null` — unobservable,
+/// NEVER `0` — when that pair is absent from view, as in a log predating issue #583.
+/// `p50`/`p95`/`p100` are `null` on an empty reconcilable population (an empty subject is not a
+/// passing `0 pp` error).
 #[derive(serde::Serialize)]
 struct BlindProjectionErrorWire {
     /// Every `blind_window` line in view. Partitioned EXACTLY by `n_projectable +
@@ -1647,9 +2095,11 @@ struct BlindProjectionErrorWire {
     /// The arm's first gate in seconds, at TODAY's value — stamped here because it is NOT on the
     /// log line, so a consumer can tell which `T` this partition was computed with.
     arm_gate_secs: u64,
-    /// Swapped-away episodes. Always `null`: unobservable from the active-scoped `blind_window`.
+    /// Episodes the daemon swapped away from before they recovered — the tail the active-scoped
+    /// `blind_window` cannot see. Counted from the issue #591 pair; `null` when it is not in view.
     n_swapped_away: Option<usize>,
-    /// Never-recovered episodes. Always `null`: unobservable from the recovery-edge `blind_window`.
+    /// Episodes that never recovered in view — the tail the recovery-edge `blind_window` cannot see.
+    /// Counted from the issue #591 pair, restart orphans excluded; `null` when it is not in view.
     n_never_recovered: Option<usize>,
     p50: Option<f64>,
     p95: Option<f64>,
@@ -1753,6 +2203,22 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
             p95: r.blind_projection_error.p95,
             p100: r.blind_projection_error.p100,
         },
+        blind_episodes: BlindEpisodesWire {
+            n_entered: r.blind_episodes.n_entered,
+            n_exited: r.blind_episodes.n_exited,
+            n_swapped_away: r.blind_episodes.n_swapped_away,
+            n_never_recovered: r.blind_episodes.n_never_recovered,
+            n_anchor_lost: r.blind_episodes.n_anchor_lost,
+            n_exit_without_enter: r.blind_episodes.n_exit_without_enter,
+            n_malformed: r.blind_episodes.n_malformed,
+            near_limit: BlindEpisodesNearLimitWire {
+                n_episodes: r.blind_episodes.near_limit_episodes,
+                observed_secs: r.blind_episodes.near_limit_observed_secs,
+                censored_floor_secs: r.blind_episodes.near_limit_censored_floor_secs,
+                // The SAME derivation the human surface renders, so the two cannot disagree.
+                total_secs_lower_bound: r.blind_episodes.near_limit_total_secs_lower_bound(),
+            },
+        },
         rate_limit_neutrality: RateLimitWire {
             rate_limited: r.rate_limit.rate_limited,
             transient: r.rate_limit.transient,
@@ -1782,18 +2248,20 @@ mod tests {
     /// log does — so `readout_carries_no_pii` genuinely exercises the email-leak guard instead of
     /// passing vacuously on non-email handles.
     ///
-    /// The `blind_enter` / `blind_exit` pair (issue #583) is here as a BLAST-RADIUS guard, not as an
-    /// input: this readout aggregates `blind_window` and must stay on it (that event's recovery-edge
-    /// semantics are retained for exactly this SLO purpose), so the uncensored pair MUST fall through
-    /// the `_ => {}` arm and perturb NOTHING. Their fields are deliberately adversarial — a
-    /// `near_limit=true` u-D episode with a 999 s `duration_secs` and its own `session_pct`, and u-D
-    /// has no `blind_window` line of its own — so any arm that ever picks them up fails the
-    /// assertions below LOUDLY rather than silently corrupting the SLI the #484 promotion bar reads:
-    /// `time_blind_near_limit_secs` would read 1899 against the asserted 900, and
-    /// `near_limit_reconciliations` would gain a spurious third pair against the two it pins.
-    /// Whether this readout should ever aggregate the uncensored pair instead is a separate,
-    /// unfiled decision — the guard pins today's answer either way, so making that change has to
-    /// be deliberate.
+    /// The `blind_enter` / `blind_exit` pair (issue #583) is now an INPUT — to the uncensored
+    /// [`BlindEpisodes`] census ONLY (issue #591) — while remaining the BLAST-RADIUS guard for the
+    /// two `blind_window`-derived SLIs, which that decision keeps on that event UNCHANGED. The guard
+    /// therefore now pins BOTH directions:
+    ///
+    /// - The pair must perturb the censored SLIs by NOTHING. Its fields stay deliberately
+    ///   adversarial — a `near_limit=true` u-D episode with a 999 s `duration_secs` and its own
+    ///   `session_pct`, and u-D has NO `blind_window` line of its own — so a regression that ever
+    ///   folds the pair back into them fails LOUDLY rather than silently corrupting what the #484
+    ///   promotion bar reads: `time_blind_near_limit_secs` would read 1899 against the asserted 900,
+    ///   and `near_limit_reconciliations` would gain a spurious third pair against the two it pins.
+    /// - The pair must REACH the census (`entered=1 exited=1 swapped_away=1`), so a regression that
+    ///   drops the two parse arms — silently restoring the censored-at-both-tails reading issue #583
+    ///   exists to end — is caught just as loudly as the double-count above.
     const FIXTURE_LOG: &str = "\
 ts=2026-07-11T00:00:00Z event=swap from=oleksii@pelykh.com to=oleksii@pelykhconsulting.fr reason=session session_pct=96
 ts=2026-07-11T00:05:00Z event=swap from=oleksii@pelykhconsulting.fr to=oleksii@pelykh.com reason=weekly session_pct=42
@@ -1836,6 +2304,13 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         // Only near_limit=true windows: 300 + 600 (the near_limit=false 120 is excluded).
         assert_eq!(inputs.time_blind_near_limit_secs, 900);
         assert_eq!(inputs.near_limit_reconciliations, vec![(97, 99), (96, 40)]);
+        // The uncensored pair (issue #591) reaches its OWN raw ingredients and nothing else — the
+        // second direction of the FIXTURE_LOG blast-radius guard. Paired with the two assertions
+        // just above (900s, two reconciliations), this pins BOTH failure modes: the pair must not
+        // leak into the censored SLIs, and it must not be dropped from the census.
+        assert_eq!(inputs.blind_entries.len(), 1);
+        assert_eq!(inputs.blind_exits.len(), 1);
+        assert_eq!(inputs.blind_pair_malformed, 0);
         assert_eq!(inputs.rate_limited, 2);
         assert_eq!(inputs.transient, 1);
         assert_eq!(inputs.cleared, 1);
@@ -1994,6 +2469,11 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "  P100 = 0.20 %/min  vs assumed v_peak 6.95 %/min  [ok]\n",
                 "\n",
                 "time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)\n",
+                // The issue #591 uncensored census, rendered BESIDE the censored 900s figure — never
+                // summed into it. The u-D episode is 999s and swapped away, exactly the tail
+                // blind_window cannot see; that the line above still reads 900 is the assertion.
+                "  uncensored episodes: entered=1 exited=1 swapped_away=1 never_recovered=0 anchor_lost=0\n",
+                "  near-limit blind time: >= 999s (999s measured + 0s right-censored floor, n=1)\n",
                 "\n",
                 "false-preempt (preemptive swap whose target turned out unnecessary)\n",
                 "  preemptive swaps observed: 0\n",
@@ -2005,7 +2485,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)\n",
                 "  reconcilable n=0 of 0 projectable (0 excluded: session_at_recovery=0 window-reset sentinel), from 3 blind windows\n",
                 "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed\n",
-                "  censoring: RECOVERED-ONLY — swapped-away and never-recovered episodes are unobservable from blind_window (issue #591 owns the uncensored denominator)\n",
+                "  censoring: RECOVERED-ONLY — excludes 1 swapped-away and 0 never-recovered episodes (counted from the uncensored blind_enter/blind_exit pair above)\n",
                 "  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)\n",
                 "\n",
                 "usage-poll 429 neutrality (roster-wide): rate_limited=2 transient=1 cleared=1\n",
@@ -2023,22 +2503,30 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     }
 
     #[test]
-    fn json_render_is_stable_schema_7() {
+    fn json_render_is_stable_schema_8() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
-        // schema:1–5 — the additive contract (#494/#539/#595/#608/#636) plus the one #635 rename. The
-        // #608 `observed_peak` object is always-present (n=1 here — the FIXTURE_LOG's single
-        // usage_velocity line at 0.20 %/min, well under the 6.95 v_peak, so v_peak_honest=true), as is
-        // the #636 `blind_projection_error` object (schema:7 — the FIXTURE_LOG's three blind_window
-        // lines predate #634's ingredients, so all three land in `n_without_velocity` and no
-        // percentile is asserted). A `--since` document is asserted separately in
+        // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
+        // rename. The #608 `observed_peak` object is always-present (n=1 here — the FIXTURE_LOG's
+        // single usage_velocity line at 0.20 %/min, well under the 6.95 v_peak, so
+        // v_peak_honest=true), as is the #636 `blind_projection_error` object (schema:7 — the
+        // FIXTURE_LOG's three blind_window lines predate #634's ingredients, so all three land in
+        // `n_without_velocity` and no percentile is asserted).
+        //
+        // schema:8 (issue #591) adds `blind_episodes` and FILLS the two censored-tail counts that
+        // schema:7 always emitted as `null`. The u-D pair supplies them: one entered, one exited,
+        // `swapped_away=true`, `near_limit=true`, 999 s. Note what did NOT move —
+        // `time_blind_near_limit_secs` stays 900 and the `false_preempt.proxy` counts stay 2/1, the
+        // blind_window population untouched by the issue #591 routing decision. That pinning is the
+        // point: the uncensored 999 s episode is published BESIDE the censored 900 s figure, never
+        // summed into it. A `--since` document is asserted separately in
         // `json_documents_the_active_window`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 7,\n",
+                "  \"schema\": 8,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -2114,11 +2602,26 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "    \"n_without_velocity\": 1,\n",
                 "    \"n_malformed\": 0,\n",
                 "    \"arm_gate_secs\": 300,\n",
-                "    \"n_swapped_away\": null,\n",
-                "    \"n_never_recovered\": null,\n",
+                "    \"n_swapped_away\": 1,\n",
+                "    \"n_never_recovered\": 0,\n",
                 "    \"p50\": null,\n",
                 "    \"p95\": null,\n",
                 "    \"p100\": null\n",
+                "  },\n",
+                "  \"blind_episodes\": {\n",
+                "    \"n_entered\": 1,\n",
+                "    \"n_exited\": 1,\n",
+                "    \"n_swapped_away\": 1,\n",
+                "    \"n_never_recovered\": 0,\n",
+                "    \"n_anchor_lost\": 0,\n",
+                "    \"n_exit_without_enter\": 0,\n",
+                "    \"n_malformed\": 0,\n",
+                "    \"near_limit\": {\n",
+                "      \"n_episodes\": 1,\n",
+                "      \"observed_secs\": 999,\n",
+                "      \"censored_floor_secs\": 0,\n",
+                "      \"total_secs_lower_bound\": 999\n",
+                "    }\n",
                 "  },\n",
                 "  \"rate_limit_neutrality\": {\n",
                 "    \"rate_limited\": 2,\n",
@@ -2258,9 +2761,12 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pc
             e.n_projectable + e.n_below_arm_gate + e.n_without_velocity + e.n_malformed,
             "every blind_window line must land in exactly one disclosed bucket"
         );
-        // The two censored tails are UNOBSERVABLE from `blind_window` (recovery-edge + active-scoped),
-        // so they read `None` — never a fabricated `0`, which would assert this recovered-only
-        // population is the whole blind story. Issue #591's uncensored denominator fills them in.
+        // The two censored tails read `None` HERE for a precise reason: `BLIND_PROJECTION_LOG`
+        // carries no `blind_enter`/`blind_exit` lines, so `pair_observed` is false. That is the
+        // pair-ABSENT branch, not a structural impossibility — since issue #591 these fields DO carry
+        // real counts wherever the pair is in view (see the schema:8 stable render, where they read
+        // 1 and 0). What stays true either way is the discipline: never a fabricated `0` asserting
+        // this recovered-only population is the whole blind story.
         assert_eq!(e.n_swapped_away, None);
         assert_eq!(e.n_never_recovered, None);
     }
@@ -2743,7 +3249,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 7,"), "schema bumped to 7: {out}");
+        assert!(out.contains("\"schema\": 8,"), "schema bumped to 8: {out}");
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",
@@ -2756,6 +3262,182 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             out.contains(&format!("\"cutoff_epoch\": {cutoff}")),
             "json window carries the epoch cutoff: {out}"
         );
+    }
+
+    #[test]
+    fn a_never_recovered_episode_contributes_a_censored_floor_not_a_measured_duration() {
+        // u-A enters a near-limit blind window at 00:00 and NEVER exits. The horizon is the last line
+        // in view (00:10:00), so the episode contributes a 600 s LOWER BOUND, kept apart from the
+        // measured sum — which stays 0, because no exit was ever recorded. This is the treatment
+        // issue #591 requires and a plain sum over exits would get wrong: that sum reports ZERO
+        // blindness for an account that has been dark for ten minutes and counting.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=blind_enter acct=u-A session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:10:00Z event=usage_backoff acct=u-A class=transient consecutive=1 backoff_secs=30
+";
+        let r = aggregate(&parse_events(log, None), &[], None);
+        let ep = &r.blind_episodes;
+        assert_eq!(ep.n_entered, 1);
+        assert_eq!(ep.n_exited, 0);
+        assert_eq!(ep.n_never_recovered, 1);
+        assert_eq!(ep.n_anchor_lost, 0);
+        assert_eq!(ep.near_limit_observed_secs, 0, "no exit ⇒ nothing MEASURED");
+        assert_eq!(
+            ep.near_limit_censored_floor_secs, 600,
+            "horizon − entry, a lower bound"
+        );
+        assert_eq!(ep.near_limit_episodes, 1);
+
+        // Both RENDERED surfaces are pinned with a NON-ZERO floor. The internal-field assertions
+        // above cannot catch a renderer that drops the censored term — with floor==0 everywhere else
+        // in the suite, `observed` and `observed + floor` are indistinguishable, so the feature's own
+        // headline number would be unguarded on both surfaces.
+        assert!(
+            render_human(&r).contains(
+                "near-limit blind time: >= 600s (0s measured + 600s right-censored floor, n=1)"
+            ),
+            "human surface must carry the censored floor"
+        );
+        let json = render_json(&r).expect("integer wire serializes");
+        assert!(json.contains("\"censored_floor_secs\": 600"), "{json}");
+        assert!(
+            json.contains("\"total_secs_lower_bound\": 600"),
+            "the lower bound must INCLUDE the censored floor, not just measured time: {json}"
+        );
+    }
+
+    #[test]
+    fn a_same_second_exit_then_re_entry_is_not_mistaken_for_a_restart() {
+        // `ts=` has whole-second resolution, so one account's exit and its next entry CAN land on the
+        // same second. Ordering them wrong inverts the verdict: `enter → exit → enter` is one CLOSED
+        // episode plus one never-recovered episode, but if the re-entry sorts BEFORE the exit it
+        // reads as a phantom anchor-loss — dropping the never-recovered episode and zeroing its
+        // censored floor, understating precisely the worst tail. The `(ts, seq)` sort key is what
+        // prevents it; a bare `ts` key regresses here because the timeline is built entries-then-
+        // exits, which destroys log order before a stable sort can preserve it.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=blind_enter acct=u-A session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:05:00Z event=blind_exit acct=u-A duration_secs=300 session_burn_pct=1 weekly_burn_pct=0 session_pct=97 session_at_recovery=98 weekly_pct=40 weekly_at_recovery=40 was_active=true swapped_away=false near_limit=true
+ts=2026-07-11T00:05:00Z event=blind_enter acct=u-A session_pct=98 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:20:00Z event=usage_backoff acct=u-A class=transient consecutive=1 backoff_secs=30
+";
+        let ep = aggregate(&parse_events(log, None), &[], None).blind_episodes;
+        assert_eq!(ep.n_anchor_lost, 0, "the exit closed the first episode");
+        assert_eq!(ep.n_never_recovered, 1, "the re-entry is still open");
+        assert_eq!(ep.n_exit_without_enter, 0);
+        assert_eq!(ep.near_limit_observed_secs, 300, "the closed episode");
+        assert_eq!(
+            ep.near_limit_censored_floor_secs, 900,
+            "00:20 − 00:05 for the still-open episode"
+        );
+    }
+
+    #[test]
+    fn a_re_entry_marks_the_prior_open_episode_anchor_lost_not_never_recovered() {
+        // Two entries for u-A with NO exit between. `daemon::note_blind_episode` strictly alternates
+        // per account, so this is impossible while the anchor is intact — it PROVES the in-memory
+        // anchor was dropped (a daemon restart). Counting the superseded entry as "never recovered"
+        // would inflate the worst tail with ordinary restarts, the inflation issue #591 warns about.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=blind_enter acct=u-A session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:05:00Z event=blind_enter acct=u-A session_pct=98 weekly_pct=41 was_active=true near_limit=true
+ts=2026-07-11T00:06:00Z event=usage_backoff acct=u-A class=transient consecutive=1 backoff_secs=30
+";
+        let ep = aggregate(&parse_events(log, None), &[], None).blind_episodes;
+        assert_eq!(ep.n_entered, 2);
+        assert_eq!(
+            ep.n_anchor_lost, 1,
+            "the superseded entry is a restart orphan"
+        );
+        assert_eq!(
+            ep.n_never_recovered, 1,
+            "only the LAST entry is genuinely open"
+        );
+        // Only the surviving open entry contributes a floor (00:06 − 00:05). The orphan contributes
+        // NOTHING: its end is unknown, and inventing one would be the fabrication.
+        assert_eq!(ep.near_limit_censored_floor_secs, 60);
+        assert_eq!(ep.near_limit_episodes, 1);
+    }
+
+    #[test]
+    fn absent_pair_leaves_the_censored_tails_null_rather_than_zero() {
+        // A log predating issue #583 carries no pair lines at all. Reporting `Some(0)` would assert
+        // "zero swapped-away episodes" when the truth is "unobservable" — the fabricated zero this
+        // readout refuses everywhere else (the SwapOvershoot cardinality discipline).
+        let log = "\
+ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=300 session_pct=97 session_at_recovery=99 near_limit=true
+";
+        let r = aggregate(&parse_events(log, None), &[], None);
+        assert_eq!(r.blind_projection_error.n_swapped_away, None);
+        assert_eq!(r.blind_projection_error.n_never_recovered, None);
+        // And the censored SLI is unaffected by the pair's absence — it never read the pair.
+        assert_eq!(r.time_blind_near_limit_secs, 300);
+        assert!(render_human(&r).contains("no uncensored blind_enter/blind_exit pair in view"));
+    }
+
+    #[test]
+    fn an_exit_whose_entry_is_out_of_view_is_disclosed_and_still_measured() {
+        // A `--since` cutoff or a rotated log routinely severs the entry. The exit is SELF-CONTAINED
+        // — the daemon measured `duration_secs` against its own per-account anchor — so its time and
+        // `swapped_away` tag still count; the orphaned-exit count is disclosed so the entered/exited
+        // totals visibly need not balance.
+        let log = "\
+ts=2026-07-11T00:02:00Z event=blind_exit acct=u-A duration_secs=120 session_burn_pct=2 weekly_burn_pct=0 session_pct=97 session_at_recovery=99 weekly_pct=40 weekly_at_recovery=40 was_active=true swapped_away=true near_limit=true
+";
+        let ep = aggregate(&parse_events(log, None), &[], None).blind_episodes;
+        assert_eq!(ep.n_exit_without_enter, 1);
+        assert_eq!(ep.n_never_recovered, 0);
+        assert_eq!(ep.n_swapped_away, 1);
+        assert_eq!(ep.near_limit_observed_secs, 120);
+        assert_eq!(ep.near_limit_censored_floor_secs, 0);
+    }
+
+    #[test]
+    fn unplaceable_pair_lines_are_counted_not_silently_dropped() {
+        // An undisclosed drop is a missing denominator — the survivorship failure this module guards
+        // against. Three corrupt shapes: an entry with no `acct=`, an exit with an unparseable `ts=`,
+        // and an exit with no `duration_secs=`.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=blind_enter session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=not-a-timestamp event=blind_exit acct=u-A duration_secs=120 session_pct=97 session_at_recovery=99 weekly_pct=40 weekly_at_recovery=40 was_active=true swapped_away=false near_limit=true
+ts=2026-07-11T00:05:00Z event=blind_exit acct=u-B session_pct=97 session_at_recovery=99 weekly_pct=40 weekly_at_recovery=40 was_active=true swapped_away=false near_limit=true
+";
+        let r = aggregate(&parse_events(log, None), &[], None);
+        assert_eq!(r.blind_episodes.n_malformed, 3);
+        assert_eq!(r.blind_episodes.n_entered, 0);
+        assert_eq!(r.blind_episodes.n_exited, 0);
+        // Every pair line here is corrupt, so NOTHING was actually observed — the tails stay `None`.
+        // "Present but unreadable" is unobservable, not observed-zero: `Some(0)` would tell the
+        // operator "excludes 0 swapped-away episodes" on a view that could not read a single one.
+        // The corruption is still DISCLOSED, via the `n_malformed` assertion above.
+        assert_eq!(r.blind_projection_error.n_swapped_away, None);
+        assert_eq!(r.blind_projection_error.n_never_recovered, None);
+    }
+
+    #[test]
+    fn the_window_bounds_the_episode_census() {
+        // `--since` must bound this census like every sibling SLI: an entry outside the window is
+        // neither an episode nor a restart orphan.
+        //
+        // Deliberately does NOT also pin the horizon's placement relative to the window gate: that
+        // ordering is unobservable while `--since` is a pure lower bound, so an assertion "proving"
+        // it could never fail. See the horizon note in `parse_events` for why.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=blind_enter acct=u-A session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-12T00:00:00Z event=blind_enter acct=u-B session_pct=96 weekly_pct=30 was_active=true near_limit=true
+ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
+";
+        let ep = aggregate(
+            &parse_events(log, Some(epoch("2026-07-12T00:00:00Z"))),
+            &[],
+            None,
+        )
+        .blind_episodes;
+        // u-A's entry is out of window entirely — it is neither an episode nor a restart orphan.
+        assert_eq!(ep.n_entered, 1);
+        assert_eq!(ep.n_anchor_lost, 0);
+        assert_eq!(ep.n_never_recovered, 1);
+        assert_eq!(ep.near_limit_censored_floor_secs, 600);
     }
 
     /// The #15 durable-line guarantee, extended to the readout: neither the human nor the JSON
@@ -2799,6 +3481,15 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             whole.landing.n_measured > 0,
             "landing join must fold the email-acct samples so the leak guard is a real catch"
         );
+        // Non-degeneracy for the issue #591 census path: its records hold `acct` UUIDs internally, so
+        // the fixture's u-D pair must actually fold, else the identifier guard below passes on an
+        // empty census and proves nothing about the newly-reachable path.
+        for r in [&whole, &windowed] {
+            assert!(
+                r.blind_episodes.n_entered > 0 && r.blind_episodes.n_exited > 0,
+                "census must fold the fixture pair so its leak guard is a real catch"
+            );
+        }
         for r in [&whole, &windowed] {
             for out in [render_human(r), render_json(r).expect("serializes")] {
                 assert!(
@@ -2810,6 +3501,13 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
                 assert!(!out.contains("sk-ant"), "no api key may appear: {out}");
                 assert!(!out.contains("label="), "no operator label: {out}");
                 assert!(!out.contains("acct="), "no account uuid: {out}");
+                // DISCRIMINATING, not just prefix-shaped: assert the identifiers THEMSELVES are
+                // absent. A bare-value leak (a UUID rendered without its `acct=` key, which is
+                // exactly how the issue #591 census could regress — it holds them on its internal
+                // records) slips straight past the prefix-only check above.
+                for acct in ["u-A", "u-B", "u-C", "u-D"] {
+                    assert!(!out.contains(acct), "no account identifier {acct}: {out}");
+                }
             }
         }
     }
