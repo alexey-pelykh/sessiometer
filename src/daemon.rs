@@ -2411,6 +2411,15 @@ where
                         // — an unwarmed EMA could not have armed it, so no ingredient is logged for
                         // a projection that could not have happened.
                         velocity: self.blind_velocity_ingredients(i),
+                        // Issue #670: the frozen per-window high-water mark, present only when it
+                        // raises the stale-low anchor (`swap::plausible_anchor_session`). `session_pct`
+                        // above stays the RAW measurement; this is the one-sided FLOOR it is raised to
+                        // by the #632-corrected arm, so an offline reader reproduces `gate_session`
+                        // instead of projecting off the stale-low base. Read HERE, before the
+                        // high-water fold below — a blind episode has no successful active poll, so the
+                        // mark is still frozen at the last live poll, exactly as the decision sites see
+                        // it. Omitted when no correction applies, leaving the line unchanged.
+                        session_high_water_pct: self.blind_anchor_high_water(i, anchor.session),
                     });
                 }
             }
@@ -4008,11 +4017,12 @@ where
     /// missing ingredient (the anchor and the window are already on [`Event::BlindWindow`]), letting
     /// an offline reader recompute `anchor + rate × inflation × blind_secs` and check it against the
     /// ceiling. Since issue #632 the live arm projects off the #619 plausibility-CORRECTED anchor,
-    /// while `session_pct` on the event is the RAW anchor (a measurement, kept raw) — so this recompute
-    /// reproduces the arm exactly absent a stale-low correction and is a conservative LOWER bound under
-    /// one; the frozen high-water mark that would close the gap is not yet carried here (issue #670).
-    /// The recomputation is deliberate: the arm is report-only and not in every running
-    /// binary, so logging the ingredient must NOT require the live arm to be active.
+    /// while `session_pct` on the event is the RAW anchor (a measurement, kept raw) — so the frozen
+    /// high-water mark is carried alongside it ([`Self::blind_anchor_high_water`],
+    /// `session_high_water_pct`, issue #670), letting the recompute apply the SAME correction and
+    /// reproduce the arm exactly rather than under-computing off the stale-low base. The recomputation
+    /// is deliberate: the arm is report-only and not in every running binary, so logging the ingredient
+    /// must NOT require the live arm to be active.
     ///
     /// Gated on the SAME sustained-EMA precondition the arm applies (a retained EMA with
     /// `>= MIN_VELOCITY_SAMPLES` blended intervals), so absent tokens mean "this arm could not have
@@ -4035,6 +4045,32 @@ where
             inflation: BLIND_VELOCITY_RATE_INFLATION,
             ceiling_pct: to_pct_exact(self.session_ceiling_base),
         })
+    }
+
+    /// The frozen per-window session HIGH-WATER MARK for account `i`, as a percent, WHEN it exceeds
+    /// the raw pre-blind `anchor_session` — the value [`swap::plausible_anchor_session`] raises the
+    /// anchor to (issue #670). Stamped on the recovery-edge [`Event::BlindWindow`] beside the RAW
+    /// `session_pct` so an OFFLINE reader (the [`BlindVelocity`] recompute recipe and the
+    /// `blind_projection_error` SLI, [`crate::reliability`]) can apply the SAME correction
+    /// and reproduce the #632-corrected #584 arm, instead of projecting off the stale-low base and
+    /// under-computing.
+    ///
+    /// `None` — token omitted, the line left byte-for-byte unchanged — when there is no retained mark
+    /// or the anchor was already plausible: precisely the no-op case of `plausible_anchor_session`, so
+    /// an absent token means "no stale-low correction applies", never "unknown". The single source of
+    /// truth for "did the mark raise the anchor" is that shared function itself (`corrected >
+    /// anchor_session` ⟺ it raised), so this cannot drift from the runtime decision it mirrors — and
+    /// it reads the mark through the same public seam the decision sites use, never
+    /// [`swap::SessionHighWater`]'s private fields.
+    ///
+    /// A pure read of retained state; the fraction→percent conversion is the log's unit boundary
+    /// ([`to_pct`]).
+    fn blind_anchor_high_water(&self, i: usize, anchor_session: f64) -> Option<u8> {
+        let corrected = swap::plausible_anchor_session(
+            self.state.accounts[i].session_high_water,
+            anchor_session,
+        );
+        (corrected > anchor_session).then(|| to_pct(corrected))
     }
 
     /// The #539 velocity-projection preemptive swap (ADR-0017) — the OBSERVED-overshoot peer of the
@@ -7864,8 +7900,11 @@ mod tests {
                 session_at_recovery: 97,
                 near_limit: true,
                 // No sustained velocity was seeded (a single pre-blind reading), so the arm could
-                // not have armed and no ingredient is published (issue #634).
+                // not have armed and no ingredient is published (issue #634). The `.ok()` poller
+                // stamps no session window, so no high-water mark is retained and no #670 correction
+                // token is emitted either.
                 velocity: None,
+                session_high_water_pct: None,
             }),
             "the recovery must close the blind window with its duration + recovery pct + near-limit tag: {:?}",
             recovered.events,
@@ -7903,6 +7942,7 @@ mod tests {
                 session_at_recovery: 42,
                 near_limit: false,
                 velocity: None,
+                session_high_water_pct: None,
             }),
             "a below-band blind window is recorded but not near-limit: {:?}",
             recovered.events,
@@ -7973,6 +8013,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blind_window_carries_the_high_water_mark_when_the_anchor_was_stale_low() {
+        // Issue #670: the pre-blind reading came back STALE-LOW (20 %) while the window's frozen
+        // high-water mark stands at 50 % — the value the #619/#632-corrected arms actually decide
+        // on (`swap::plausible_anchor_session` raises the anchor to it). The recovery-edge
+        // `blind_window` stamps the mark beside the RAW anchor so an offline reader reproduces the
+        // corrected arm; `session_pct` stays the raw measurement (the read-time-only contract).
+        // Both values sit below the 0.60 risk band, so no preemptive swap fires and the account
+        // recovers while still active — the one case `blind_window` can see.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.20, 0.30)).await;
+        daemon.tick().await; // the stale-low reading becomes the pre-blind anchor (20 %)
+        seed_high_water(&mut daemon, 0.50); // the window's frozen mark: it was really at 50 %
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // blind — no successful poll, so anchor AND mark both freeze
+        daemon.clock.advance(Duration::from_secs(400));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.55, 0.30);
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 400,
+                // The RAW stale-low anchor — the measurement, never the synthesized correction.
+                session_pct: 20,
+                session_at_recovery: 55,
+                near_limit: false,
+                velocity: None,
+                // The #670 correction term: the frozen mark, stamped because it exceeds the anchor.
+                session_high_water_pct: Some(50),
+            }),
+            "a stale-low anchor's window must stamp the frozen mark beside the raw anchor: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_window_omits_the_mark_when_the_anchor_was_plausible() {
+        // Issue #670 negative: the mark AGREES with the anchor — the pre-blind reading was genuinely
+        // that high, so `plausible_anchor_session` is a no-op — and NO correction token rides the
+        // line: absent means "no stale-low correction applies", and the line stays byte-for-byte the
+        // pre-#670 shape. Pins the strict `>`: an EQUAL mark must not stamp a redundant token.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.40, 0.30)).await;
+        daemon.tick().await;
+        seed_high_water(&mut daemon, 0.40); // mark == anchor: the reading was plausible
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await;
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.42, 0.30);
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::BlindWindow {
+                account: "u-A".to_owned(),
+                duration_secs: 120,
+                session_pct: 40,
+                session_at_recovery: 42,
+                near_limit: false,
+                velocity: None,
+                session_high_water_pct: None,
+            }),
+            "a plausible anchor (mark agrees) must not stamp a correction token: {:?}",
+            recovered.events,
+        );
+    }
+
+    #[tokio::test]
     async fn blind_velocity_ingredients_gate_on_a_sustained_ema() {
         // Issue #634: the ingredient is published only when the report-only arm could actually have
         // armed — a retained EMA that is SUSTAINED (>= MIN_VELOCITY_SAMPLES). No EMA and a
@@ -8015,6 +8120,47 @@ mod tests {
         assert!(
             (ingredient.ceiling_pct - to_pct_exact(daemon.session_ceiling_base)).abs() < 1e-9,
             "the BASE (un-jittered) ceiling in force is stamped",
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_anchor_high_water_stamps_only_a_stale_low_anchor() {
+        // Issue #670: the mark is stamped only when it would actually RAISE the anchor — the
+        // decision delegated to `swap::plausible_anchor_session` itself (`corrected > anchor` ⟺ it
+        // raised), so this ingredient cannot drift from the runtime correction it mirrors. Absent
+        // means "no stale-low correction applies", never "unknown"; the value is the mark itself as
+        // a percent — the corrected base the #452/#584 arms decide on.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new().ok("u-A", 0.50, 0.20)).await;
+
+        daemon.state.accounts[0].session_high_water = None;
+        assert_eq!(
+            daemon.blind_anchor_high_water(0, 0.20),
+            None,
+            "no retained mark → no token (the pre-#670 line shape stands)",
+        );
+
+        seed_high_water(&mut daemon, 0.50);
+        assert_eq!(
+            daemon.blind_anchor_high_water(0, 0.20),
+            Some(50),
+            "a mark above the raw anchor IS the stale-low correction, stamped as a percent",
+        );
+        assert_eq!(
+            daemon.blind_anchor_high_water(0, 0.498),
+            Some(50),
+            "a SUB-PERCENT raise still stamps — the strict `>` runs on the un-rounded fractions, so \
+             the rendered token TIES `session_pct` (both round to 50) rather than sitting below it",
+        );
+
+        assert_eq!(
+            daemon.blind_anchor_high_water(0, 0.50),
+            None,
+            "a mark EQUAL to the anchor is a plausible reading — strict `>`, no redundant token",
+        );
+        assert_eq!(
+            daemon.blind_anchor_high_water(0, 0.60),
+            None,
+            "an anchor already above the mark needs no raise",
         );
     }
 
@@ -8259,6 +8405,7 @@ mod tests {
                 session_at_recovery: 97,
                 near_limit: true,
                 velocity: None,
+                session_high_water_pct: None,
             }),
             "blind_window keeps its #449/#482 recovery-edge semantics verbatim: {:?}",
             recovered.events,

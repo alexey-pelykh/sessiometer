@@ -52,6 +52,23 @@ toml_writer = { version = "1.1.1", default-features = false, features = ["alloc"
 unicode-width = "0.2.2"
 zeroize = "1.9.0"
 
+[target.'cfg(windows)'.dependencies]
+# Cross-platform path resolution (issue #24): resolves the `%LOCALAPPDATA%` root for the
+# Windows path strategy (src/paths.rs). Its resolution is env-first — `%LOCALAPPDATA%`
+# when set, the `SHGetKnownFolderPath(FOLDERID_LocalAppData)` Known-Folder API as the
+# fallback — so it does NOT yet match the crate's getpwuid-over-`$HOME` spoof-resistance
+# discipline; pinning the resolution to the API alone is a requirement on the
+# Windows-enablement work, where the branch first compiles. Target-gated: it compiles
+# ONLY on Windows, so zero crates enter the macOS or Linux build graphs and the
+# minimal-dependency posture holds where the crate ships today (its `windows-sys`
+# transitives are likewise Windows-only lockfile entries). On Unix the Apple/XDG
+# derivations stay hand-rolled pure functions: `etcetera`'s own Unix strategies are
+# deliberately not used — its Apple layout targets `~/Library/Preferences/<reverse-dns>`,
+# not the pinned `Application Support` location, and its `$HOME`-based Xdg would bypass
+# the password-database home resolution. MIT OR Apache-2.0; 0.11.0 verified current on
+# crates.io 2026-07-22 (updated 2025-10-28, MSRV 1.87 — exactly this crate's).
+etcetera = "0.11.0"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 # `test-util` (feature-merged into the tokio dependency above for test/bench builds only)

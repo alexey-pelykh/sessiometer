@@ -663,9 +663,10 @@ pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -
 /// since issue #632, the #584 velocity projection ([`crate::daemon`]'s `blind_velocity_projected_armed`)
 /// — so an anchor whose CORRECTED session still sits below the risk band (the #452 arm stays disarmed)
 /// no longer projects the velocity arm off the stale-low RAW base and under-reports degradation. Every
-/// MEASUREMENT surface (above) still keeps the raw value; so does the OFFLINE reconstruction of the
-/// velocity arm, which reproduces the corrected decision only up to a stale-low correction until the
-/// mark is carried onto `Event::BlindWindow` (issue #670).
+/// MEASUREMENT surface (above) still keeps the raw value; the OFFLINE reconstruction of the velocity
+/// arm reproduces the corrected decision exactly because the frozen high-water mark is carried onto
+/// `Event::BlindWindow` beside the raw anchor (`session_high_water_pct`, issue #670), so an offline
+/// reader applies THIS same correction rather than projecting off the stale-low base.
 ///
 /// Unlike [`plausible_session`] this takes NO window stamp and does NO window match — sound for the
 /// ANCHOR case SPECIFICALLY: the caller consults the ACTIVE account's own `session_high_water`, which

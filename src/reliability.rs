@@ -326,12 +326,14 @@ struct Reactivation {
 ///
 /// Recomputed OFFLINE from the line's own tokens — the house log-the-ingredients / derive-the-views
 /// idiom the #634 `BlindVelocity` doc names as this readout's contract — rather than read from a
-/// stored projection: `projected = session_pct + rate × inflation × duration_secs`, with `rate` the
-/// full-precision (6-dp) pre-blind EMA in %/s and `inflation` the factor STAMPED on the line, never
-/// today's [`crate::daemon`] constant (an old window read through a new factor would silently
-/// mis-report). The anchor term carries the `session_pct` field's `u8` rounding, so a recomputed
-/// projection inherits up to ±0.5 pp of anchor error; over any window long enough to arm the report
-/// the rate term dominates it.
+/// stored projection: `projected = anchor + rate × inflation × duration_secs`, with `anchor` the
+/// #632-corrected base `session_pct.max(session_high_water_pct)` (the frozen high-water mark issue
+/// #670 stamps beside the raw anchor precisely when it was stale-low; absent the token the raw
+/// `session_pct` stands), `rate` the full-precision (6-dp) pre-blind EMA in %/s and `inflation` the
+/// factor STAMPED on the line, never today's [`crate::daemon`] constant (an old window read through
+/// a new factor would silently mis-report). The anchor term carries those fields' `u8` rounding, so
+/// a recomputed projection inherits up to ±0.5 pp of anchor error; over any window long enough to
+/// arm the report the rate term dominates it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct BlindProjection {
     /// The recomputed projection, as a PERCENT. Deliberately UNCLAMPED (a steep retained rate over a
@@ -445,9 +447,9 @@ struct BlindWindowCensus {
     without_velocity: usize,
     /// Lines this reader could not classify: a missing or unparseable `session_pct` /
     /// `session_at_recovery` / `duration_secs`, an unparseable or non-finite `rate=` / `inflation=`,
-    /// or a projection that overflowed to non-finite. A CORRUPT record, distinct from a well-formed
-    /// window the arm simply could not arm on — folding the two together would report corruption as
-    /// coverage. The tolerant-drop precedent every sibling arm here uses, made VISIBLE.
+    /// a PRESENT-but-unparseable `session_high_water_pct=` (issue #670), or a projection that
+    /// overflowed to non-finite. A CORRUPT record, distinct from a well-formed window the arm simply
+    /// could not arm on — folding the two together would report corruption as coverage. The tolerant-drop precedent every sibling arm here uses, made VISIBLE.
     malformed: usize,
 }
 
@@ -478,14 +480,18 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
 
 /// Fold one `blind_window` line into the blind-arm projection-error input (issue #636).
 ///
-/// Recomputes the REPORT-ONLY arm's forecast from the line's OWN tokens — `session_pct + rate ×
+/// Recomputes the REPORT-ONLY arm's forecast from the line's OWN tokens — `anchor + rate ×
 /// inflation × duration_secs`, the [`crate::daemon`] `blind_velocity_projected_armed` formula — and
 /// pairs it with the durable `session_at_recovery` beside it. Every term is stamped on the line
 /// (issue #634), so no daemon constant is imported and an old window is never read through a
-/// today-value. `session_pct` is the RAW anchor: since issue #632 the live arm projects off the #619
-/// plausibility-CORRECTED base, so this recompute reproduces the live forecast exactly absent a
-/// stale-low correction and is a conservative LOWER bound under one — carrying the frozen high-water
-/// mark onto the line would close that gap (issue #670).
+/// today-value. The `anchor` term is the #632-corrected base: since issue #632 the live arm projects
+/// off the #619 plausibility-CORRECTED base (`gate_session`), and issue #670 carries the frozen
+/// high-water mark (`session_high_water_pct`, stamped only when the anchor was stale-low) so this
+/// recompute applies the SAME [`crate::swap::plausible_anchor_session`] correction —
+/// `session_pct.max(session_high_water_pct)` — and reproduces the live forecast exactly rather than
+/// under-computing off the stale-low base. Absent the mark token no correction applies and the raw
+/// `session_pct` stands; the anchor term still carries those fields' `u8` rounding (≤ ±0.5 pp),
+/// dominated by the rate term over any armed window.
 ///
 /// Classifies EVERY line into exactly one [`BlindWindowCensus`] bucket, applying the arm's OWN
 /// gates in the arm's OWN order — duration first, sustained EMA second — so "outside the arm's
@@ -499,10 +505,11 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
 ///    the ingredients on such a line.
 /// 3. **No `rate=` token** ⇒ `without_velocity`. Absent tokens mean "no SUSTAINED retained EMA", the
 ///    arm's second gate — never "unknown".
-/// 4. **`rate=` / `inflation=` unreadable, or the projection overflows to non-finite** ⇒
-///    `malformed`. Publishing a non-finite percentile would make the human text (`+inf`) and the
-///    `--json` wire (`null`, which this schema defines as "empty population") disagree about the
-///    same episode.
+/// 4. **`rate=` / `inflation=` unreadable, a PRESENT `session_high_water_pct=` unreadable (issue
+///    #670), or the projection overflows to non-finite** ⇒ `malformed`. Publishing a non-finite
+///    percentile would make the human text (`+inf`) and the `--json` wire (`null`, which this
+///    schema defines as "empty population") disagree about the same episode; a garbage mark
+///    silently reverted to the stale base would misreport the arm the same way.
 /// 5. **Complete** ⇒ a [`BlindProjection`]. The `session_at_recovery = 0` window-reset sentinel is
 ///    carried through and excluded later, at aggregation, so the exclusion is COUNTED rather than
 ///    silently swallowed at parse.
@@ -544,10 +551,30 @@ fn record_blind_projection(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>) {
         census.malformed = census.malformed.saturating_add(1);
         return;
     };
+    // Issue #670: the live #584 arm projects off the #619/#632 plausibility-CORRECTED base
+    // (`gate_session`), not the raw anchor. When the window carries the frozen high-water mark
+    // (`session_high_water_pct`, stamped ONLY when the anchor was stale-low), apply the SAME
+    // `swap::plausible_anchor_session` correction — the greater of the raw anchor and the mark — so
+    // this recompute reproduces the corrected forecast rather than under-computing off the stale base
+    // (the residual issue #670 closes). Absent the token no correction applies and the raw anchor
+    // stands. A PRESENT-but-unparseable mark is corruption, dropped to `malformed` exactly like an
+    // unreadable `rate` / `inflation` — the mark is now part of the projection-reconstruction
+    // contract, so a garbage mark cannot silently revert to the stale base and misreport the arm.
+    let corrected_anchor = match fields
+        .get("session_high_water_pct")
+        .map(|raw| raw.parse::<u8>())
+    {
+        None => anchor,
+        Some(Ok(mark)) => anchor.max(mark),
+        Some(Err(_)) => {
+            census.malformed = census.malformed.saturating_add(1);
+            return;
+        }
+    };
     // Finite INPUTS do not imply a finite product: `rate × inflation × blind_secs` can overflow to
     // `inf` (or, with a zero duration, `inf × 0 = NaN`) on a corrupted line. Checked on the RESULT,
     // so no non-finite value can reach the percentile and split the two renderers apart.
-    let projected_pct = f64::from(anchor) + rate * inflation * blind_secs as f64;
+    let projected_pct = f64::from(corrected_anchor) + rate * inflation * blind_secs as f64;
     if !projected_pct.is_finite() {
         census.malformed = census.malformed.saturating_add(1);
         return;
@@ -2124,8 +2151,8 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     /// under the arm's own duration gate, and a pre-#634 line with no ingredients at all.
     ///
     /// The arithmetic is `projected = session_pct + rate × inflation × duration_secs`
-    /// ([`crate::daemon`]'s `blind_velocity_projected_armed`), recomputed from each line's OWN
-    /// stamped tokens:
+    /// ([`crate::daemon`]'s `blind_velocity_projected_armed`; no line here carries a #670 mark, so
+    /// the anchor term is the raw `session_pct`), recomputed from each line's OWN stamped tokens:
     ///
     /// - u-A: `30 + 0.01 × 1.75 × 600  = 40.50` vs 40 ⇒ **+0.50** (mild over-projection)
     /// - u-B: `55 + 0.01 × 1.75 × 900  = 70.75` vs 75 ⇒ **−4.25** (UNDER-projected — the account
@@ -2162,6 +2189,53 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pc
         assert_eq!(e.p50, Some(0.5));
         assert_eq!(e.p95, Some(13.2));
         assert_eq!(e.p100, Some(13.2));
+    }
+
+    #[test]
+    fn blind_projection_error_applies_the_stale_low_mark_to_the_anchor() {
+        // Issue #670: since #632 the live arm projects off the #619 plausibility-corrected base, and
+        // the daemon stamps the frozen high-water mark (`session_high_water_pct`) beside the RAW
+        // anchor precisely when that anchor was stale-low. The recompute must apply the SAME
+        // correction: `max(30, 62) + 0.010 × 1.75 × 600 = 72.50` vs 70 ⇒ **+2.50** — the corrected
+        // arm's own forecast. Off the raw base it would read `30 + 10.50 = 40.50` vs 70 ⇒ −29.50,
+        // grading a projection the live arm no longer makes and reporting a phantom under-projection
+        // — the "offline reads sicker than the arm decided" faithfulness gap #670 closes.
+        let r = aggregate(
+            &parse_events(
+                "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=70 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00 session_high_water_pct=62\n",
+                None,
+            ),
+            &[],
+            None,
+        );
+        let e = &r.blind_projection_error;
+        assert_eq!(e.n_reconcilable, 1);
+        assert_eq!(
+            e.p100,
+            Some(2.5),
+            "the forecast must be graded off the mark-corrected base, not the raw stale-low anchor"
+        );
+    }
+
+    #[test]
+    fn blind_projection_error_never_lowers_the_anchor_from_the_mark() {
+        // The daemon stamps the mark ONLY when it exceeds the raw anchor fraction, but the reader
+        // applies `max()` — the same shape as `swap::plausible_anchor_session` — so a line whose
+        // mark sits AT the anchor (reachable today: `u8` rounding of a sub-percent raise renders a
+        // tie) or BELOW it (hand-crafted) cannot DRAG the base down: the raw anchor stands and
+        // `30 + 10.50 = 40.50` vs 40 ⇒ +0.50, exactly as if the token were absent. The mark is a
+        // one-sided floor, never a substitute reading.
+        for mark in ["30", "10"] {
+            let line = format!(
+                "ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00 session_high_water_pct={mark}\n"
+            );
+            let r = aggregate(&parse_events(&line, None), &[], None);
+            assert_eq!(
+                r.blind_projection_error.p100,
+                Some(0.5),
+                "an at/below-anchor mark must be a no-op (mark={mark})"
+            );
+        }
     }
 
     #[test]
@@ -2289,7 +2363,14 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pc
         // together would report corruption as coverage, and dropping it from both counters would
         // leave a silent hole in the denominator (the survivorship failure this block exists to
         // prevent: 40 truncated lines would render as a clean full-coverage readout over 60 % of the
-        // data). Five corruption shapes, each landing in `malformed` and none in `without_velocity`.
+        // data). Six corruption shapes, each landing in `malformed` and none in `without_velocity` —
+        // the sixth (issue #670) a PRESENT-but-unreadable `session_high_water_pct`, which is part of
+        // the projection-reconstruction contract exactly like `rate` / `inflation`: silently
+        // reverting it to the stale-low base would misreport the arm, so it drops as corruption.
+        // The seventh line pins the boundary of that contract: with NO `rate=` the arm's second gate
+        // classifies the line `without_velocity` BEFORE the mark is ever parsed (the census applies
+        // the arm's own gates in the arm's own order), so a garbage mark on a rate-less line is
+        // unconsumed coverage context — never corruption of a projection that was never recomputed.
         let inputs = parse_events(
             "\
 ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=oops inflation=1.75 ceiling=95.00
@@ -2297,13 +2378,18 @@ ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pc
 ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=600 session_pct=30 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
 ts=2026-07-11T00:40:00Z event=blind_window acct=u-D near_limit=false
 ts=2026-07-11T00:50:00Z event=blind_window acct=u-E duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=1e300 inflation=1e300 ceiling=95.00
+ts=2026-07-11T01:00:00Z event=blind_window acct=u-F duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00 session_high_water_pct=oops
+ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false session_high_water_pct=oops
 ",
             None,
         );
         assert!(inputs.blind_projections.is_empty());
-        assert_eq!(inputs.blind_window_census.total, 5);
-        assert_eq!(inputs.blind_window_census.malformed, 5);
-        assert_eq!(inputs.blind_window_census.without_velocity, 0);
+        assert_eq!(inputs.blind_window_census.total, 7);
+        assert_eq!(inputs.blind_window_census.malformed, 6);
+        assert_eq!(
+            inputs.blind_window_census.without_velocity, 1,
+            "a rate-less line is coverage context whatever its mark says — gate order"
+        );
         assert_eq!(inputs.blind_window_census.below_arm_gate, 0);
     }
 
