@@ -5461,7 +5461,7 @@ mod tests {
         }
     }
 
-    pub(super) fn tunables(trigger: u8, floor: u8, cooldown: u64) -> Tunables {
+    pub(super) fn tunables(session_ceiling: u8, floor: u8, cooldown: u64) -> Tunables {
         // Weekly trigger fixed high (98) so the existing tests' weekly readings
         // (all well below it) never trip the new weekly path (issue #41): these
         // tests pin the SESSION trigger. A fixed strategy draws no RNG, so the
@@ -5479,9 +5479,9 @@ mod tests {
             near_limit_poll_secs: 0,
             cooldown_secs: cooldown,
             // Most daemon tests set an explicit floor; `tunables_floor_off` sets it
-            // inert (== trigger) for the tests that pin the always-on gate instead.
+            // inert (== session_ceiling) for the tests that pin the always-on gate instead.
             target_max_session_usage: floor,
-            session_ceiling: trigger,
+            session_ceiling,
             weekly_ceiling: WEEKLY_CEILING,
             // Issue #452 bounded-blindness preemptive swap: INERT by default (T parked at
             // the kill-switch ceiling) so baseline daemon tests are unperturbed by the new
@@ -5499,7 +5499,7 @@ mod tests {
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
-            session_ceiling_strategy: Strategy::fixed(f64::from(trigger)),
+            session_ceiling_strategy: Strategy::fixed(f64::from(session_ceiling)),
             weekly_ceiling_strategy: Strategy::fixed(f64::from(WEEKLY_CEILING)),
             cooldown_strategy: Strategy::fixed(cooldown as f64),
         }
@@ -5511,8 +5511,8 @@ mod tests {
     /// always-valued, so "no extra tightening" is expressed this way rather than the
     /// removed opt-out; behaviorally identical to the old `None` for target selection.
     /// The tests that use it pin the always-on gate / weekly behavior, not the reserve.
-    pub(super) fn tunables_floor_off(trigger: u8, cooldown: u64) -> Tunables {
-        tunables(trigger, trigger, cooldown)
+    pub(super) fn tunables_floor_off(session_ceiling: u8, cooldown: u64) -> Tunables {
+        tunables(session_ceiling, session_ceiling, cooldown)
     }
 
     pub(super) fn cred(blob: &[u8]) -> Credential {

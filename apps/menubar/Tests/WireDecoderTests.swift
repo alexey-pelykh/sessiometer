@@ -103,9 +103,10 @@ final class WireDecoderTests: XCTestCase {
     }
 
     // AC: "All three `next_swap` states …" — `no_viable_target`. + `auth` stale, failure streak.
-    // AC (#405): the no-viable-target carries the fleet-capacity relief — `cause` = weekly (every
-    // account is weekly-exhausted) with the soonest weekly reset off the wire, so the client renders
-    // "out of capacity, resets in ⟨dur⟩" rather than re-deriving it (mirroring the #393 reason path).
+    // AC (#405): the no-viable-target carries the fleet-capacity relief — `cause` = weekly (the
+    // WEEKLY window gates the soonest-returning spare, #665) with that reset off the wire, so the
+    // client renders "out of capacity, resets in ⟨dur⟩" rather than re-deriving it (mirroring the
+    // #393 reason path).
     func testDecodesNoViableTargetAndStale() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotNoViable) else {
             return XCTFail("expected a snapshot frame")

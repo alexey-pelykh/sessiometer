@@ -850,26 +850,42 @@ enum StatusPanelFormat {
 
     // MARK: - `next_swap` footer (issue #326 AC — renders the FORWARD candidate, not swap history)
 
+    /// The wait beyond which `nextSwapFooter`'s all-exhausted footer nudges "· add an account" — ONE
+    /// session window (issue #666). Capacity returning within a session window is a TRANSIENT block the
+    /// operator waits out; a longer — or unknown-duration — wait is a STRUCTURAL shortage where adding
+    /// capacity is the remedy. Replaces the pre-#666 `NoTargetCause`-label proxy (`weekly` ⇒ nudge,
+    /// `session` ⇒ silent), which mis-fired on a MIXED fleet where a `weekly` cause can name a sub-hour
+    /// weekly reset (issue #665). Lockstep twin of the CLI `ADD_ACCOUNT_NUDGE_WAIT_SECS` (`src/cli.rs`)
+    /// — both clients must render the SAME nudge decision (R-2 STATE-parity).
+    static let addAccountNudgeWaitSecs: Int64 = 5 * 60 * 60
+
     /// The footer line for the daemon's `next_swap` candidate, or `nil` when there is no active anchor
     /// to swap from (the footer is then absent). Renders the FORWARD candidate the `watch` wire carries
     /// — NOT swap history (a true last-swap needs a new daemon source; issue #326 note).
     ///
     /// A `noViableTarget` carrying the #405 fleet-capacity relief renders it the panel's own concise
     /// way (R-2 STATE-parity — the SAME facts as the CLI's `next swap: none …` footer, not the same
-    /// bytes): a weekly-exhausted fleet reads "Out of capacity … · add an account" (a week-long block
-    /// — adding an account is the remedy), an over-session fleet reads "every account over its session
-    /// limit" WITHOUT the nudge (a transient block that resets soon), each naming the reset when the
-    /// daemon knew it. A pre-#405 daemon (no `cause`) falls back to the bare "No viable target".
+    /// bytes): "Out of capacity" — never the pre-#666 false universal "every account is weekly-exhausted
+    /// / over its session limit" (on a MIXED fleet the daemon's `cause` names the gating dimension of the
+    /// soonest-returning spare, issue #665, NOT a fleet-wide property) — with the reset when the daemon
+    /// knew it, and the "· add an account" nudge ONLY when the wait is structural (longer than one
+    /// session window, or unknown) rather than transient (issue #666, gated on the WAIT not the `cause`
+    /// label). A pre-#405 daemon (no `cause`) falls back to the bare "No viable target".
     static func nextSwapFooter(_ nextSwap: NextSwap?, now: Int64) -> String? {
         switch nextSwap {
         case .target(let to, _):
             return "Next swap → \(to)"
         case .noViableTarget(let cause, let resetsAt):
-            let relief = resetsAt.map { " — resets in \(humanizeUntil($0 - now))" } ?? ""
             switch cause {
-            case .weekly:  return "Out of capacity\(relief) · add an account"
-            case .session: return "Every account over its session limit\(relief)"
-            case nil:      return "No viable target"
+            case nil:
+                return "No viable target"
+            case .session, .weekly:
+                let relief = resetsAt.map { " — resets in \(humanizeUntil($0 - now))" } ?? ""
+                // Nudge unless capacity is KNOWN to return within one session window: a sub-window
+                // wait is transient (no nudge); a longer OR unknown-duration wait is structural.
+                let structuralShortage = resetsAt.map { $0 - now > addAccountNudgeWaitSecs } ?? true
+                let nudge = structuralShortage ? " · add an account" : ""
+                return "Out of capacity\(relief)\(nudge)"
             }
         case .awaitingData:
             return "Awaiting data"
