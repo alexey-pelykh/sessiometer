@@ -169,6 +169,20 @@ STATES = [
               "per-medium colour choice under R-2 STATE-parity (the shared STATE is DEGRADED)."),
     dict(title="Modifier · Active blind — DEGRADED (dark)", theme="dark", design="blind-degraded-dark", capture="panel-blind-degraded-dark.png",
          note="Degraded, dark appearance."),
+    dict(title="Modifier · Active blind — CORNERED", theme="light", design="blind-cornered-light", capture="panel-blind-cornered-light.png",
+         note="CORNERED (#572) — blind + DEGRADED + <b>no viable target</b>: the one bounded-blindness state the "
+              "daemon CANNOT self-resolve, so the operator must act. The row escalates all three DEGRADED channels "
+              "orange→<b>RED</b> (eye-slash, leading rule, verdict) and the verdict reads "
+              "<b>Auto-protection CANNOT ACT</b> (<code>xmark.shield.fill</code>) with a second remedy sub-line "
+              "<b>Out of capacity, resets in {dur} · add or free an account</b>. The remedy is UNCONDITIONAL "
+              "(cornered is always unresolvable — CLI <code>render_cornered</code>, #666); the wording is the "
+              "unified “Out of capacity”, not a weekly/session split (#665/#666). No swap-callout renders "
+              "(<code>next_swap == no_viable_target</code> → <code>swapCalloutTarget</code> is nil); the siblings "
+              "are weekly-exhausted (the <code>nosign</code> chip). The menu-bar glance is <b>no-runway ⊘</b> "
+              "(already wired via <code>hasNoViableTarget</code>). R-2 STATE-parity with the CLI’s "
+              "<code>render_cornered</code>. Same mock-fidelity outline-vs-filled SF-Symbol limit as the OK frame."),
+    dict(title="Modifier · Active blind — CORNERED (dark)", theme="dark", design="blind-cornered-dark", capture="panel-blind-cornered-dark.png",
+         note="Cornered, dark appearance."),
     # The four DAEMON-FAULT ranks (#592), in the worst-first order `StatusPanelFormat.daemonFaultBanner`
     # resolves them. They pair CONSECUTIVELY on purpose: the ranking is a *visual* claim — rank 3 has to be
     # seen to beat rank 4 — and a severity inversion is only legible when the frames sit next to each other.

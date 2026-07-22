@@ -222,7 +222,10 @@ struct StatusPanelView: View {
                 Divider().padding(.horizontal, 14)
             }
             if !store.rows.isEmpty {
-                RosterView(rows: store.rows, now: now, switchable: true)
+                // #572: the live roster receives `nextSwap` so the active blind row can compose the CORNERED
+                // verdict. The dropped/stale roster above deliberately does NOT (default nil) — a retained
+                // `noViableTarget` must never raise a cornered alarm off unvouched data (honest-state).
+                RosterView(rows: store.rows, now: now, switchable: true, nextSwap: store.nextSwap)
             }
             if let target = StatusPanelFormat.swapCalloutTarget(store.nextSwap) {
                 SwapCalloutCard(target: target,

@@ -771,16 +771,39 @@ final class StatusPanelFormatTests: XCTestCase {
     // MARK: - Active-account bounded-blindness row (issues #479/#485)
 
     // The eye-slash blind glyph is DISTINCT from every auth `healthSymbol` shape (so blindness is legible
-    // without color, WCAG 1.4.1); OK is calm neutral, DEGRADED takes the at-risk orange rung.
+    // without color, WCAG 1.4.1); OK is calm neutral, DEGRADED the at-risk orange rung, CORNERED red (#572 —
+    // its glance IS no-runway ⊘, so red matches rather than over-signals).
     func testBlindSymbolIsAnEyeSlashDistinctFromAuthGlyphs() {
-        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: false).name, "eye.slash")
-        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: true).name, "eye.slash")
-        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: false).tint, .neutral)
-        XCTAssertEqual(StatusPanelFormat.blindSymbol(degraded: true).tint, .orange)
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(.ok).name, "eye.slash")
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(.degraded).name, "eye.slash")
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(.cornered).name, "eye.slash")
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(.ok).tint, .neutral)
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(.degraded).tint, .orange)
+        XCTAssertEqual(StatusPanelFormat.blindSymbol(.cornered).tint, .red)
         // The blind glyph must not collide with any auth glyph shape (a distinct state needs a distinct shape).
         let authGlyphs: [CredentialHealth] = [.healthy, .unknown, .stale, .atRisk, .degraded, .dead]
         let authNames = Set(authGlyphs.map { StatusPanelFormat.healthSymbol($0).name })
         XCTAssertFalse(authNames.contains("eye.slash"), "the blind glyph must be shape-distinct from every auth glyph")
+    }
+
+    // The severity composition mirrors the CLI's `cornered_state`: cornered iff DEGRADED *and* the snapshot
+    // carries no viable swap target. Not-degraded is always OK; degraded-with-a-target is DEGRADED (the daemon
+    // can still swap), only degraded + noViableTarget is CORNERED.
+    func testBlindSeverityComposesCornered() {
+        // Not degraded → OK regardless of next-swap.
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(degraded: false, nextSwap: nil), .ok)
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(
+            degraded: false, nextSwap: .noViableTarget(cause: .weekly, resetsAt: 1)), .ok)
+        // Degraded but a target exists → DEGRADED, not cornered (the daemon can still act).
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(
+            degraded: true, nextSwap: .target(to: "personal", reason: .onlyCandidate)), .degraded)
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(degraded: true, nextSwap: nil), .degraded)
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(degraded: true, nextSwap: .awaitingData), .degraded)
+        // Degraded + no viable target → CORNERED.
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(
+            degraded: true, nextSwap: .noViableTarget(cause: .weekly, resetsAt: 1)), .cornered)
+        XCTAssertEqual(StatusPanelFormat.blindSeverity(
+            degraded: true, nextSwap: .noViableTarget(cause: nil, resetsAt: nil)), .cornered)
     }
 
     // The duration chip reuses `humanizeUntil` — the SAME format as the CLI's `blind for {dur}`.
@@ -793,19 +816,47 @@ final class StatusPanelFormatTests: XCTestCase {
 
     // The verdict mirrors the CLI: OK calm (`.neutral`, un-emphasized), DEGRADED the at-risk orange fault, the
     // "acting on a stale anchor" parenthetical carried verbatim; distinct shield SHAPES per state (not color-alone).
+    // OK/DEGRADED are single-line (`remedy == nil`, as #485 shipped) and ignore nextSwap/now.
     func testBlindVerdictMirrorsTheCliOkVsDegraded() {
-        let ok = StatusPanelFormat.blindVerdict(degraded: false)
+        let ok = StatusPanelFormat.blindVerdict(.ok, nextSwap: nil, now: 0)
         XCTAssertEqual(ok.symbol, "checkmark.shield.fill")
         XCTAssertEqual(ok.text, "Auto-protection OK — daemon self-resolving")
         XCTAssertEqual(ok.tint, .neutral)
+        XCTAssertNil(ok.remedy, "OK is single-line — no remedy sub-line")
 
-        let degraded = StatusPanelFormat.blindVerdict(degraded: true)
+        let degraded = StatusPanelFormat.blindVerdict(.degraded, nextSwap: nil, now: 0)
         XCTAssertEqual(degraded.symbol, "exclamationmark.shield.fill")
         XCTAssertEqual(degraded.text, "Auto-protection DEGRADED — acting on a stale anchor")
         XCTAssertEqual(degraded.tint, .orange)
+        XCTAssertNil(degraded.remedy, "DEGRADED is single-line — no remedy sub-line")
         XCTAssertNotEqual(ok.symbol, degraded.symbol, "OK and DEGRADED must be shape-distinct, not color-alone")
 
         XCTAssertEqual(StatusPanelFormat.blindLastKnownCaption, "LAST-KNOWN · RATE-LIMITED")
+    }
+
+    // The CORNERED verdict (#572) is the panel half of the CLI's `render_cornered`: the loudest `.red`
+    // "Auto-protection CANNOT ACT", a shield SHAPE distinct from OK/DEGRADED, PLUS the operator remedy
+    // sub-line. The remedy is UNCONDITIONAL ("add or free an account" always, per #666) and folds the
+    // soonest reset in via the SAME `humanizeUntil` the reset cells use.
+    func testBlindVerdictCorneredSpeaksCannotActPlusRemedy() {
+        // With a reset: the remedy folds "resets in {dur}" in, compact `humanizeUntil` format (no space).
+        let cornered = StatusPanelFormat.blindVerdict(
+            .cornered, nextSwap: .noViableTarget(cause: .weekly, resetsAt: 2 * 86400 + 4 * 3600), now: 0)
+        XCTAssertEqual(cornered.symbol, "xmark.shield.fill")
+        XCTAssertEqual(cornered.text, "Auto-protection CANNOT ACT")
+        XCTAssertEqual(cornered.tint, .red)
+        XCTAssertEqual(cornered.remedy, "Out of capacity, resets in 2d4h · add or free an account")
+
+        // No reset on the wire → the bare unconditional remedy (still "add or free an account").
+        let noReset = StatusPanelFormat.blindVerdict(
+            .cornered, nextSwap: .noViableTarget(cause: nil, resetsAt: nil), now: 0)
+        XCTAssertEqual(noReset.remedy, "Out of capacity · add or free an account")
+
+        // Shape-distinct from BOTH lighter verdicts (not color-alone — WCAG 1.4.1).
+        let ok = StatusPanelFormat.blindVerdict(.ok, nextSwap: nil, now: 0)
+        let degraded = StatusPanelFormat.blindVerdict(.degraded, nextSwap: nil, now: 0)
+        XCTAssertNotEqual(cornered.symbol, ok.symbol)
+        XCTAssertNotEqual(cornered.symbol, degraded.symbol)
     }
 
     // A blind row keeps its credential's OWN warning glyph beside the eye-slash when the credential is itself
@@ -850,6 +901,32 @@ final class StatusPanelFormatTests: XCTestCase {
             blind: BlindActive(blindSecs: 240, lastKnownSessionPct: 64, autoProtectionDegraded: false))
         XCTAssertEqual(label,
             "work, active, auth at risk, blind for 4m, last-known session 64 percent, auto-protection okay, daemon self-resolving")
+    }
+
+    // A CORNERED blind row (#572) speaks the cannot-act verdict AND the remedy — a VoiceOver user must HEAR
+    // "add or free an account", not the understated "degraded" the pre-#572 label spoke. Composes from
+    // `blind.autoProtectionDegraded` + a `noViableTarget` next-swap; the reset folds in via `humanizeUntil`.
+    func testRowAccessibilityLabelSpeaksTheCorneredState() {
+        let cornered = StatusPanelFormat.rowAccessibilityLabel(
+            label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
+            quarantined: false, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a",
+            blind: BlindActive(blindSecs: 1080, lastKnownSessionPct: 92, autoProtectionDegraded: true),
+            nextSwap: .noViableTarget(cause: .weekly, resetsAt: 2 * 86400 + 4 * 3600), now: 0)
+        XCTAssertEqual(cornered,
+            "work, active, auth healthy, blind for 18m, last-known session 92 percent, "
+                + "auto-protection cannot act, out of capacity, resets in 2d4h, add or free an account")
+
+        // Degraded + a viable target is NOT cornered — it stays the DEGRADED "stale anchor" line (the daemon
+        // can still swap), proving the a11y label keys off the SAME composition as the visual, not `degraded`
+        // alone.
+        let stillDegraded = StatusPanelFormat.rowAccessibilityLabel(
+            label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
+            quarantined: false, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a",
+            blind: BlindActive(blindSecs: 1080, lastKnownSessionPct: 92, autoProtectionDegraded: true),
+            nextSwap: .target(to: "personal", reason: .onlyCandidate), now: 0)
+        XCTAssertEqual(stillDegraded,
+            "work, active, auth healthy, blind for 18m, last-known session 92 percent, "
+                + "auto-protection degraded, acting on a stale anchor")
     }
 
     // MARK: - Integration: wire → AccountRow → panel format (recovering distinct from dead)
