@@ -105,6 +105,25 @@ STATES = [
               "mock — capture is empty-roster / first-run only, with Add account in the status-item menu (#394)."),
     dict(title="1 · Healthy — Status (dark)", theme="dark", design="healthy-status-dark", capture="panel-healthy-dark.png",
          note="Same state, dark appearance — system semantic colours, not the mock’s hex."),
+    dict(title="1 · Healthy — Stats", theme="light", design="healthy-stats-light", capture="panel-stats-light.png",
+         note="The Stats tab (#446), given a visual oracle at last (#704): <code>RenderPanelTool</code> now "
+              "seeds one fixture to <code>.stats</code>/<code>.loaded</code> — the mock’s three cards over a "
+              "socket-free pinned series (nil client, no <code>stats</code> query) — so the per-account 7-day "
+              "sparklines, the numeric body, the aggregate callout, and the signal legend are captured "
+              "<i>loaded</i> rather than as the “Loading usage stats…” placeholder every other fixture shows. "
+              "Two documented divergences from the mock, both the same reconciliations the Status tab makes: "
+              "the mock’s <code>.s-prov</code> provider line under each name has no panel counterpart (no "
+              "<code>provider</code> wire field — #173), so the panel names the account only; and the header "
+              "glyph is the neutral system <code>gauge.medium</code>, not the mock’s locked Cycle-Gauge mark "
+              "(#437/#524). The mock’s painted <code>.pop</code> card is ~0.6% narrower than its own "
+              "<code>.spark</code> viewBox reference (the fixed .5px border under "
+              "<code>box-sizing:border-box</code>); the panel draws the full 331, and the sparkline is "
+              "width-parametric (#700), so the trend shape is unaffected. The illustrative "
+              "sparkline curves are hand-authored in the mock; the panel draws the fixture’s own per-bucket "
+              "session peaks, so the two read as the same trend, not pixel-identical strokes."),
+    dict(title="1 · Healthy — Stats (dark)", theme="dark", design="healthy-stats-dark", capture="panel-stats-dark.png",
+         note="Same state, dark appearance — system semantic colours and the dark <code>--spark</code> / "
+              "<code>--sig-*</code> tokens, not the mock’s hex."),
     dict(title="2 · Connecting / daemon-starting", theme="light", design="daemon-starting-light", capture="panel-connecting-light.png",
          note="Awaiting the first snapshot: an honest banner, no roster — never a false “healthy”. The panel "
               "draws this, <b>not-running</b>, and <b>crash-looping</b> (both below) on ONE shared “no "

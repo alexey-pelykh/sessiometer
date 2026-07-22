@@ -146,3 +146,58 @@ final class PanelStatsModel: ObservableObject {
         }
     }
 }
+
+#if DEBUG
+extension PanelStatsModel {
+    /// Tooling / preview only (`--render-panel`, SwiftUI previews): a model pinned straight to the Stats tab's
+    /// `.loaded` phase WITHOUT a transport, so `StatusPanelView`'s Stats tab can be rendered offscreen
+    /// (`ImageRenderer`) for design-parity review against the mock. NOT a production path — the real phase is
+    /// machine-derived from a socket reply, never set directly. SOCKET-FREE by construction: the client is nil
+    /// and neither `select` nor `load` is called, so no `stats` query is ever fired — it stays as offline as
+    /// every other `--render-panel` fixture (issue #704). Same-file so it can set the `private(set)` projection,
+    /// mirroring `WatchStatusStore.preview`.
+    static func loadedPreview(_ wire: StatsWire) -> PanelStatsModel {
+        let model = PanelStatsModel(client: nil)
+        model.tab = .stats
+        model.phase = .loaded(wire)
+        return model
+    }
+
+    /// The loaded 3-card series the `--render-panel` `stats` fixture (issue #704) renders, pinned to the mock's
+    /// `healthy-stats-{light,dark}` frames (`design/menubar-preview.html`):
+    ///   • Work (active, saturated) — session 42 / 100%, weekly 88%, 42 cap-hits
+    ///   • Personal (balanced)      — session 31 /  96%, weekly 71%, 11 cap-hits
+    ///   • Scratch (underused)      — session  4 /  22%, weekly 18%,  0 cap-hits
+    ///   • aggregate — "All accounts ≥90% at once — 3 episodes (1h40m) · swaps 28 · last 7 days"
+    ///
+    /// `StatsWire` is Decodable-only (it mirrors the Rust `src/stats.rs` serializer), so the fixture is the
+    /// wire's OWN JSON, DECODED — the exact path the live tab takes, only the bytes are pinned rather than
+    /// socketed. Handles are the roster's CAPITALISED labels ("Work"/"Personal"/"Scratch") so the Stats rows
+    /// join `RenderPanelTool`'s roster identities — `StatusPanelFormat.orderedStatHandles` matches by exact
+    /// label. `StatsTests` guards the decode + the card values, so a fixture that drifts off the wire contract
+    /// fails a headless test rather than silently rendering the loading placeholder.
+    static var loadedPreviewFixture: StatsWire {
+        guard let reply = try? decodeStatsReply(statsPreviewFixtureJSON), case .ok(let wire) = reply else {
+            fatalError("stats preview fixture failed to decode — see StatsTests.testStatsPreviewFixtureDecodesToTheMockCards")
+        }
+        return wire
+    }
+
+    /// The raw JSON `loadedPreviewFixture` decodes (see it for the card values). One `stats` reply document:
+    /// the `week` window (→ "last 7 days"), seven daily buckets whose per-account `session.peak` IS the
+    /// sparkline series (the mock's three shapes; each series' max equals the summary peak, so a window peak is
+    /// never below its own buckets), then the summary carrying the displayed numbers. Laid out one bucket per
+    /// line for reviewability — inter-token whitespace is legal JSON, so the decoder reads it identically.
+    static let statsPreviewFixtureJSON = #"""
+    {"schema":1,"window":{"start":1783200000,"end":1783804800,"label":"last 7 days","period":"week"},"accounts":[],"series":[
+    {"start":1783200000,"end":1783286400,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.25,"peak":0.25,"p95":0.25},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.12,"peak":0.12,"p95":0.12},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.1,"peak":0.1,"p95":0.1},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}},
+    {"start":1783286400,"end":1783372800,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.5,"peak":0.5,"p95":0.5},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.37,"peak":0.37,"p95":0.37},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.12,"peak":0.12,"p95":0.12},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}},
+    {"start":1783372800,"end":1783459200,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.75,"peak":0.75,"p95":0.75},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.55,"peak":0.55,"p95":0.55},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.22,"peak":0.22,"p95":0.22},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}},
+    {"start":1783459200,"end":1783545600,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":1.0,"peak":1.0,"p95":1.0},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.96,"peak":0.96,"p95":0.96},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.14,"peak":0.14,"p95":0.14},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}},
+    {"start":1783545600,"end":1783632000,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":1.0,"peak":1.0,"p95":1.0},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.7,"peak":0.7,"p95":0.7},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.12,"peak":0.12,"p95":0.12},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}},
+    {"start":1783632000,"end":1783718400,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.87,"peak":0.87,"p95":0.87},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.55,"peak":0.55,"p95":0.55},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.11,"peak":0.11,"p95":0.11},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}},
+    {"start":1783718400,"end":1783804800,"roster":{"swap_count":0,"swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"all_high_episodes":0,"all_high_secs":0},"accounts":{"Work":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.75,"peak":0.75,"p95":0.75},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Personal":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.4,"peak":0.4,"p95":0.4},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"},"Scratch":{"seen":1,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.12,"peak":0.12,"p95":0.12},"weekly":{"mean":0.0,"peak":0.0,"p95":0.0},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.0,"band":"low"}}}
+    ],"summary":{"roster":{"swap_count":28,"swaps":{"session":19,"weekly":5,"manual":3,"forced":1,"emergency":0},"all_high_episodes":3,"all_high_secs":6000},"accounts":{"Work":{"seen":7,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.42,"peak":1.0,"p95":0.95},"weekly":{"mean":0.6,"peak":0.88,"p95":0.85},"cap_hits":42,"time_at_cap_secs":5400,"contribution_share":0.62,"band":"at_cap"},"Personal":{"seen":7,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.31,"peak":0.96,"p95":0.9},"weekly":{"mean":0.5,"peak":0.71,"p95":0.68},"cap_hits":11,"time_at_cap_secs":900,"contribution_share":0.28,"band":"moderate"},"Scratch":{"seen":7,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.04,"peak":0.22,"p95":0.2},"weekly":{"mean":0.1,"peak":0.18,"p95":0.16},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":0.1,"band":"low"}}}}
+    """#
+}
+#endif
