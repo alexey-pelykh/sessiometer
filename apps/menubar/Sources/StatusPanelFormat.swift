@@ -211,6 +211,33 @@ enum StatusPanelFormat {
     /// The width available to one roster row on the shipped fixed-width panel.
     static var defaultRowWidth: Double { panelContentWidth - 2 * rosterHorizontalInset }
 
+    // MARK: - Stats card geometry (issue #700 — the panel↔mock pin for the full-width chart row)
+
+    /// The Stats row card's own horizontal padding (mock `.stat { padding:10px 8px }`). Held here rather
+    /// than inline in the view so `statsChartWidth` below is DERIVED from the same number the view lays
+    /// out with, never a second copy that can drift from it — and so the caveat strip above the rows, which
+    /// insets by this padding to line its dot up with a row's status dot, tracks the same one number.
+    static let statsCardHorizontalPadding: Double = 8
+
+    /// The Stats card's chart + metrics leading inset (mock `.stat-body`/`.stat-chart { margin-left:17px }`),
+    /// which starts the series where the numbers describing it start.
+    static let statsChartLeadingInset: Double = 17
+
+    /// The Stats card's chart-row width on the shipped fixed-width panel (issue #700) — the box the
+    /// full-width sparkline is actually laid out in.
+    ///
+    /// The build-reference mock authors its `.spark` viewBox at exactly this width (`viewBox="0 0 331 28"`
+    /// in `design/menubar-preview.html`), so both surfaces plot the SAME vertices instead of one stretching
+    /// a 96-wide viewBox against the other's fixed 3 pt stroke inset. That agreement is the whole point, and
+    /// it is only as good as this derivation: `testStatsChartWidthMatchesTheMockAuthoredViewBox` pins the value
+    /// against the mock's authored literal, so a change to any panel-geometry constant above goes RED here
+    /// rather than silently diverging the panel from its own design reference. The panel's Stats tab has no
+    /// render path (`RenderPanelTool` renders every fixture at the Status tab), so this test is the only
+    /// mechanical parity net the chart has.
+    static var statsChartWidth: Double {
+        panelContentWidth - 2 * rosterHorizontalInset - 2 * statsCardHorizontalPadding - statsChartLeadingInset
+    }
+
     // MARK: - Swap-chip emphasis (issue #448 — persistent-quiet, brightens when armed)
 
     /// The per-row swap chip's emphasis level. #169 revealed the trailing swap glyph ONLY on hover, so on a
@@ -1419,16 +1446,23 @@ enum StatusPanelFormat {
     /// Map a value series to sparkline vertices in a `width` × `height` box, on the FIXED [0, 1] (0–100% of
     /// the quota cap) scale — R-2 parity with the CLI sparkline (`src/stats.rs` `ramp_level`, which clamps to
     /// `[0, 1]`), NOT auto-normalised per account: a value of `1.0` reaches the top, `0.0` the floor, an
-    /// over-cap reading clamps to the top. `inset` keeps the stroke off the edges; with the mock's box
-    /// (96 × 28, inset 3) this reproduces the mock's `.spark` path vertices exactly. `x` is evenly spaced
+    /// over-cap reading clamps to the top. `inset` keeps the stroke off the edges. `x` is evenly spaced
     /// across the plot; a single-point series centres. An empty series yields no points.
+    ///
+    /// The box is a PARAMETER, not the old fixed 96 × 28: issue #700 moved the chart to its own full-width
+    /// card row, so the shipping call site passes the size its `Canvas` was actually laid out at (which the
+    /// panel's geometry makes `statsChartWidth`, 331) and the mock authors its `.spark` viewBox to match —
+    /// no third copy of the number in between. Widening only re-spreads `x` — the `y` mapping depends solely on
+    /// `height`/`inset`, so the series semantics are width-invariant. A box too narrow to hold its own
+    /// insets (`width <= 2 * inset`) has no plot to speak of and yields no points, rather than folding the
+    /// series backwards onto itself.
     static func sparkPoints(
         _ values: [Double],
         width: Double,
         height: Double,
         inset: Double
     ) -> [SparkPoint] {
-        guard !values.isEmpty else { return [] }
+        guard !values.isEmpty, width > 2 * inset else { return [] }
         let left = inset, right = width - inset
         let top = inset, bottom = height - inset
         let n = values.count
