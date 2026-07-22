@@ -82,8 +82,12 @@ struct MonogramBadge: View {
 
 /// The leading status dot — the design reference's per-row marker: a filled accent disc for the active
 /// (being-consumed) account, a hollow ring otherwise. FILL-vs-RING is a SHAPE difference, so active is
-/// legible without color (WCAG 1.4.1); the accent is a redundant cue and the row's "ACTIVE" tag +
-/// VoiceOver label state it in words.
+/// legible without color (WCAG 1.4.1); the accent is a redundant cue on top of it.
+///
+/// Since #699 retired the row's text capsule this fill-vs-ring is the row's ONLY non-colour active cue —
+/// do not weaken it to a colour-only distinction. Words still carry active elsewhere: the row's VoiceOver
+/// label (`StatusPanelFormat.rowAccessibilityLabel`, ", active") and the panel header's plain-text
+/// subtitle (`headerSubtitle`, which names the active account — e.g. "3 accounts · Work active").
 struct StatusDot: View {
     let isActive: Bool
     /// The active halo opacity is theme-aware (#388, mock `--accent-halo`); the inactive ring takes the
