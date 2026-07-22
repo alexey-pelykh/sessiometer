@@ -944,20 +944,24 @@ fn with_velocity(
 
 /// The fleet/roster weekly runway aggregate (issue #544) — the single approximate figure that
 /// answers the operator's fleet-level question, "across all my accounts, how long do I last?"
+///
+/// `pub(crate)` since issue #650: the daemon's proactive fleet-runway warning probes the SAME
+/// aggregate ([`current_fleet_runway`]) — the type crosses the module boundary so the warning
+/// cannot drift into a parallel metric. The WIRE shape stays [`FleetWire`]; this is internal.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct FleetRunway {
+pub(crate) struct FleetRunway {
     /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
     /// combined weekly burn — `Σ head-room ÷ Σ rate` over the counted accounts. `None` when no
     /// counted account has a measurable burn (`Σ rate == 0`): honest degradation, never an infinite
     /// or sentinel figure. Days-scale in practice — the weekly window is the days horizon (the
     /// session dimension resets every few hours, so it is not the "how long do I last" figure).
-    runway_secs: Option<i64>,
+    pub(crate) runway_secs: Option<i64>,
     /// Accounts that CONTRIBUTED to the aggregate — those with a KNOWN weekly velocity (the
     /// honest-degradation gate). The `n` of the surfaced `n of m`.
-    counted: usize,
+    pub(crate) counted: usize,
     /// Accounts OBSERVED in the window (`seen > 0`) — the `m` of `n of m`. `observed − counted` were
     /// EXCLUDED for an unknown / stale weekly velocity: surfaced as a fact, never silently dropped.
-    observed: usize,
+    pub(crate) observed: usize,
 }
 
 /// Aggregate the per-account weekly velocity + head-room (the issue #543 overlay) into ONE fleet
@@ -1035,6 +1039,46 @@ fn fleet_runway(report: &Report) -> Option<FleetRunway> {
         counted,
         observed,
     })
+}
+
+/// The CURRENT #544 fleet-runway aggregate, read fresh from the on-disk store — the daemon's
+/// probe for the proactive `fleet_runway_low` warning (issue #650). Runs the SAME pipeline the
+/// `stats` socket verb serializes — store read → window plan → config-derived params →
+/// [`build_report`] + [`with_velocity`] → [`fleet_runway`] — so the probed figure IS the figure
+/// `sessiometer stats` shows, never a parallel aggregation path (the issue's reuse mandate).
+///
+/// The window is PINNED to the socket default (a `None` period → `week`, [`plan_window`]), NOT
+/// `[stats].default_period`: the warning is a stable signal, not a display, so an operator's
+/// reporting-period preference must not move the fire point. The config resolve is the same
+/// tolerant [`resolve_stats_config`] the socket verb uses (#642) — a malformed / absent
+/// `config.toml` falls back to default tunables so the probe still answers (the fault is already
+/// logged + surfaced by the other consumers of that resolve; the probe stays quiet).
+///
+/// `None` on ANY degradation — unreadable store, or the aggregate's own honest-degradation gates
+/// (no velocity overlay, no observed / counted account) — the caller then HOLDS its prior edge
+/// state: a hiccup neither fires nor re-arms the warning. Blocking `std::fs` read; the daemon
+/// cadence-gates the call far below the poll rate (the #161 maintenance-layer precedent for
+/// inline store IO in the tick).
+pub(crate) fn current_fleet_runway() -> Option<FleetRunway> {
+    let now = wall_clock_now();
+    let offset = local_offset_secs(now);
+    let data = NativeHistoryStore::from_paths()
+        .and_then(|store| StoreData::read(&store))
+        .ok()?;
+    // `(None, None)` cannot fail (`plan_window` maps it to the rolling `week` window), but stay
+    // tolerant rather than unwrap — a probe must never panic the tick.
+    let window = plan_window(None, None, now, &data).ok()?;
+    let (config, _config_fault) = resolve_stats_config(Config::load());
+    let params = params_from(config.as_ref());
+    let vparams = velocity_params_from(config.as_ref());
+    let roster = config.as_ref().map(roster_handles);
+    let report = with_velocity(
+        build_report(&data, window, Vec::new(), roster.as_ref(), &params, offset),
+        &data.samples,
+        &params,
+        &vparams,
+    );
+    fleet_runway(&report)
 }
 
 /// Aggregate the window's samples into a filtered summary + series.

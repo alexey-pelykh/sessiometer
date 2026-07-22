@@ -1147,6 +1147,13 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // it — writes nothing to the real store. `support_dir()` already gated startup via
     // `.with_swap_lock(paths::swap_lock()?)` above, so this `?` adds no new failure mode.
     .with_usage_samples(paths::usage_samples()?)
+    // Wire the proactive fleet-runway warn probe (#650) to the real store-reading aggregate —
+    // the SAME `NativeHistoryStore` → `build_report` → `fleet_runway` pipeline the `stats`
+    // socket verb serves, pinned to the `week` window. INJECTED here (not resolved inside the
+    // check) for the same #315 reason as `.with_usage_samples` above: the hermetic test harness
+    // never wires it, so a `FakeDaemon` tick reads no real store — its tests inject a canned
+    // closure instead. Inert regardless unless the operator opted in (`fleet_runway_warn_secs`).
+    .with_fleet_runway_probe(Box::new(crate::stats::current_fleet_runway))
     // Carry the CONFIG `[refresh].enabled` (#105) onto the display snapshot so the thin
     // `status` client can surface the isolated-refresh discoverability advisory (#138): with
     // the tick OFF, non-active accounts get no maintenance and their credentials silently

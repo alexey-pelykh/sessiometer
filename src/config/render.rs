@@ -115,6 +115,11 @@ impl Config {
                     t.monitor_recovery_m.to_string(),
                     present("tunables", "monitor_recovery_m"),
                 ),
+                entry(
+                    "fleet_runway_warn_secs",
+                    t.fleet_runway_warn_secs.to_string(),
+                    present("tunables", "fleet_runway_warn_secs"),
+                ),
             ],
         };
 
@@ -448,6 +453,18 @@ impl Config {
              # the rotation (1..=20). A re-login restores it immediately.\n",
         );
         out.push_str(&format!("monitor_recovery_m = {}\n", t.monitor_recovery_m));
+        out.push_str(
+            "# Proactive fleet-runway warning (issue #650): when the roster's combined weekly\n\
+             # head-room over its combined observed burn (the `stats` fleet runway) drops BELOW\n\
+             # this many seconds, the daemon logs ONE edge-triggered fleet_runway_low event —\n\
+             # lead time BEFORE the all-exhausted terminal state. 0 disables (the default; the\n\
+             # warning is opt-in), else 60..=2592000 (1 min..30 d). Purely a visibility signal:\n\
+             # it never triggers a swap.\n",
+        );
+        out.push_str(&format!(
+            "fleet_runway_warn_secs = {}\n",
+            t.fleet_runway_warn_secs
+        ));
 
         // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the
         // tunable's valid range, to decorrelate polling/swaps across cycles.

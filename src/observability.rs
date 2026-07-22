@@ -690,6 +690,26 @@ pub(crate) enum Event {
         cause: SwapReason,
         resets_at: Option<i64>,
     },
+    /// The aggregate fleet runway (issue #544 — the roster's combined weekly head-room over its
+    /// combined observed burn) dropped BELOW the operator's `fleet_runway_warn_secs` threshold —
+    /// the PROACTIVE lead-time warning (issue #650) ahead of the all-exhausted terminal state
+    /// (#11), which [`Self::AllExhausted`] reports only reactively, AT exhaustion. Purely an
+    /// operator-visibility signal: no swap decision reads it (the non-goal the issue pins).
+    ///
+    /// Edge-triggered like `all_exhausted`: emitted exactly ONCE on the downward crossing, held
+    /// silent while the runway stays below, re-armed by the daemon once a KNOWN reading is back
+    /// at/over the threshold ([`Diagnostic::FleetRunwayRecovered`] marks that leave edge).
+    /// `runway_secs` is the crossing reading, `threshold_secs` the configured warn line, and
+    /// `counted`/`observed` the aggregate's `n of m` honesty cardinality (how many accounts
+    /// backed the figure vs were seen — #544's honest-degradation surface, carried so the line
+    /// states how much fleet stands behind it). Secret-free by construction (#15): integers
+    /// only, never an account handle, email, or token.
+    FleetRunwayLow {
+        runway_secs: i64,
+        threshold_secs: i64,
+        counted: usize,
+        observed: usize,
+    },
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
     /// row — the climbing streak toward the dead-credential threshold (issue #42).
     /// Emitted per 401 while the account is still healthy; once it crosses
@@ -1323,6 +1343,19 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=active_dead_no_target hold={hold} cause={cause}{resets}")
+            }
+            Event::FleetRunwayLow {
+                runway_secs,
+                threshold_secs,
+                counted,
+                observed,
+            } => {
+                // All four fields required, plain integers (#15): the crossing reading, the
+                // configured line it crossed, and the aggregate's `n of m` honesty cardinality.
+                format!(
+                    "ts={ts} event=fleet_runway_low runway_secs={runway_secs} \
+                     threshold_secs={threshold_secs} counted={counted} observed={observed}"
+                )
             }
             Event::Monitor401 {
                 account,
@@ -2174,6 +2207,15 @@ pub(crate) enum Diagnostic {
     /// log's edge-triggered `active_dead_no_target` ENTER, mirroring
     /// [`Self::AllExhaustedCleared`] — so a stale strand reading is told from a current one.
     ActiveDeadNoTargetCleared,
+    /// The aggregate fleet runway recovered to at/over the operator's `fleet_runway_warn_secs`
+    /// threshold (issue #650): the warning re-armed, so a LATER downward crossing will signal
+    /// afresh. The edge-triggered LEAVE marker — the symmetric partner of the event log's
+    /// edge-triggered `fleet_runway_low` ENTER, mirroring [`Self::AllExhaustedCleared`] — so a
+    /// stale low-runway reading is told from a current one. Fires only on a KNOWN at/over-
+    /// threshold reading: an UNKNOWN aggregate (store hiccup, degraded overlay) holds the
+    /// armed state instead, so a flaky read never fabricates a recovery (the
+    /// `signaled_canonical_scrubbed` discipline).
+    FleetRunwayRecovered,
 }
 
 impl Diagnostic {
@@ -2270,6 +2312,7 @@ impl Diagnostic {
             Diagnostic::ActiveDeadNoTargetCleared => {
                 format!("ts={ts} diag=active_dead_no_target_cleared")
             }
+            Diagnostic::FleetRunwayRecovered => format!("ts={ts} diag=fleet_runway_recovered"),
         }
     }
 }
@@ -2591,6 +2634,27 @@ mod tests {
             present,
             format!(
                 "{TS0} event=active_dead_no_target hold=work cause=weekly resets_at=2026-06-30T00:00:00Z"
+            )
+        );
+    }
+
+    #[test]
+    fn fleet_runway_low_renders_the_crossing_the_threshold_and_the_cardinality() {
+        // #650: the proactive warn line carries four plain integers — the crossing reading, the
+        // configured line it dropped below, and the `n of m` honesty cardinality (how many
+        // accounts backed the figure vs were seen). Secret-free by construction (#15): no handle,
+        // email, or token, so the line is as safe to log as `all_exhausted`.
+        let line = Event::FleetRunwayLow {
+            runway_secs: 1800,
+            threshold_secs: 3600,
+            counted: 2,
+            observed: 3,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=fleet_runway_low runway_secs=1800 threshold_secs=3600 counted=2 observed=3"
             )
         );
     }
@@ -3291,6 +3355,13 @@ mod tests {
                 hold: "work".to_owned(),
                 cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
+            },
+            // Issue #650: the proactive fleet-runway warn line — four bare integers, no handle.
+            Event::FleetRunwayLow {
+                runway_secs: 1800,
+                threshold_secs: 3600,
+                counted: 2,
+                observed: 3,
             },
             Event::ReStash {
                 account: "work".to_owned(),
@@ -4390,6 +4461,16 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
+    fn fleet_runway_recovered_line_is_bare() {
+        // #650: the proactive warn's LEAVE marker, mirroring `all_exhausted_cleared` — a bare edge
+        // token, no payload (the ENTER event carried the reading; the recovery is just "back over").
+        assert_eq!(
+            Diagnostic::FleetRunwayRecovered.to_log_line(at_epoch(0)),
+            format!("{TS0} diag=fleet_runway_recovered")
+        );
+    }
+
+    #[test]
     fn no_diagnostic_line_carries_an_email_or_token_sigil() {
         // #15: every diagnostic field is a handle / enum / number / timestamp, so a
         // token or email can never reach a rendered line. Mirrors the event-log guard.
@@ -4416,6 +4497,7 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             },
             Diagnostic::AllExhaustedCleared,
             Diagnostic::ActiveDeadNoTargetCleared,
+            Diagnostic::FleetRunwayRecovered,
         ];
         for diag in &diags {
             let line = diag.to_log_line(at_epoch(0));

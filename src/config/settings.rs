@@ -133,6 +133,9 @@ fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
     if let Some(v) = edits.monitor_recovery_m {
         raw.monitor_recovery_m = v;
     }
+    if let Some(v) = edits.fleet_runway_warn_secs {
+        raw.fleet_runway_warn_secs = v;
+    }
 }
 
 /// Overlay a `config-set`'s label edits (issue #268): each `account_uuid` → new label is
