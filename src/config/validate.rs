@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_trigger() {
+    fn rejects_out_of_range_session_ceiling() {
         for trigger in ["49", "100", "120"] {
             let toml = with_tunables(&format!("session_ceiling = {trigger}"));
             assert!(
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_target_max_above_trigger_with_a_distinct_error() {
+    fn rejects_target_max_above_session_ceiling_with_a_distinct_error() {
         let toml = with_tunables("target_max_session_usage = 95\nsession_ceiling = 90");
         assert!(matches!(
             Config::parse(&toml),
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_target_max_default_clamps_to_trigger_below_80_and_survives_round_trip() {
+    fn absent_target_max_default_clamps_to_session_ceiling_below_80_and_survives_round_trip() {
         // #417 (regression from #398): with session_ceiling < 80 and NO target_max_session_usage
         // key, the absent-key default (80) MUST clamp down to session_ceiling — honoring
         // the same target_max_session_usage <= session_ceiling invariant the present-value arm
