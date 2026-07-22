@@ -1,14 +1,31 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! Filesystem locations and their permission discipline (macOS).
+//! Filesystem locations and their permission discipline.
 //!
-//! The home directory is resolved from the password database via
+//! Base directories resolve at the platform's native location (issue #24):
+//! macOS keeps its long-pinned `~/Library/…` layout exactly as before; Linux
+//! (and other non-Apple Unix) follows the XDG Base Directory spec; Windows
+//! resolves everything under the `%LOCALAPPDATA%` Known Folder — Local, never
+//! Roaming: credential-adjacent state must not roam across a domain profile.
+//! The precedence ladder for the overridable dirs is `--config`/`--log`
+//! override ([`config_dir_with_override`] / [`logs_dir_with_override`]) >
+//! `$XDG_*` opt-in override (where the platform honors one) > native default —
+//! except the runtime state dir ([`support_dir`]: lock, socket, usage store),
+//! which is ALWAYS native-fixed so contention stays machine-global (issue #7).
+//!
+//! On Unix the home directory is resolved from the password database via
 //! `getpwuid(getuid())` rather than `$HOME`: the process may be launched in an
 //! environment where `$HOME` is unset or spoofed, yet the state and credential
-//! files this tool manages must land in the real user's home. Directories are
-//! created `0700` and files `0600`, and every directory we create is asserted
-//! to be owned by the current uid before use.
+//! files this tool manages must land in the real user's home. On Windows the
+//! base resolves through `etcetera`'s Windows strategy, which is env-first —
+//! `%LOCALAPPDATA%` when set, the `SHGetKnownFolderPath` Known-Folder API as
+//! its fallback; pinning it to the API alone (the analog of this `getpwuid`
+//! discipline) is a requirement on the Windows-enablement work, which is also
+//! where that branch first compiles.
+//!
+//! Directories are created `0700` and files `0600`, and every directory we
+//! create is asserted to be owned by the current uid before use.
 
 use std::ffi::{CStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -172,22 +189,187 @@ pub(crate) fn create_isolated_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Pure derivation of the config directory, so the env/home policy is testable
-/// without touching process-global state.
-fn config_dir_from(home: &Path, xdg_config_home: Option<OsString>) -> PathBuf {
+// --- Platform path strategies (issue #24) --------------------------------------
+//
+// Three pure derivation families — Apple (macOS), XDG (Linux and other
+// non-Apple Unix), Windows — so every platform's path policy is unit-testable
+// on any host without touching process-global state. The live accessors
+// ([`config_dir`], [`support_dir`], [`logs_dir`]) select the family for the
+// compile target and feed it the platform-resolved base: the `getpwuid` home
+// on Unix, the `%LOCALAPPDATA%` Known Folder on Windows. Each family is live
+// on its own target and test-exercised on every host, so the off-target
+// families carry the usual test-only `allow(dead_code)`.
+
+/// Pure derivation of the macOS config directory, so the env/home policy is
+/// testable without touching process-global state: `$XDG_CONFIG_HOME/sessiometer`
+/// when that override is set and non-empty, else the native
+/// `~/Library/Application Support/sessiometer`. The long-pinned macOS behavior —
+/// note it predates the XDG-spec-strict [`xdg_dir_from`] ladder and accepts any
+/// non-empty override, relative included.
+#[cfg_attr(not(test), allow(dead_code))]
+fn apple_config_dir_from(home: &Path, xdg_config_home: Option<OsString>) -> PathBuf {
     match xdg_config_home {
         Some(xdg) if !xdg.is_empty() => Path::new(&xdg).join(APP),
         _ => home.join("Library/Application Support").join(APP),
     }
 }
 
-/// The config directory: `$XDG_CONFIG_HOME/sessiometer` if that variable is
-/// set and non-empty, otherwise `~/Library/Application Support/sessiometer`.
+/// Pure derivation of the native-local macOS application-support directory,
+/// `~/Library/Application Support/sessiometer` — the fixed macOS home of
+/// [`support_dir`], never env-overridden.
+#[cfg_attr(not(test), allow(dead_code))]
+fn apple_support_dir_from(home: &Path) -> PathBuf {
+    home.join("Library/Application Support").join(APP)
+}
+
+/// Pure derivation of the native macOS log directory,
+/// `~/Library/Logs/sessiometer` (Console.app reads here).
+#[cfg_attr(not(test), allow(dead_code))]
+fn apple_logs_dir_from(home: &Path) -> PathBuf {
+    home.join("Library/Logs").join(APP)
+}
+
+/// Pure derivation of the XDG config directory (Linux and other non-Apple
+/// Unix): `$XDG_CONFIG_HOME/sessiometer` when the override is set to an
+/// absolute path, else the spec default `~/.config/sessiometer`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn xdg_config_dir_from(home: &Path, xdg_config_home: Option<OsString>) -> PathBuf {
+    xdg_dir_from(home, xdg_config_home, ".config")
+}
+
+/// Pure derivation of the XDG state directory (Linux and other non-Apple
+/// Unix): `$XDG_STATE_HOME/sessiometer` when the override is set to an
+/// absolute path, else the spec default [`xdg_state_default_from`]. Logs live
+/// here off-macOS ([`logs_dir`]); the runtime state dir deliberately does NOT
+/// read the override ([`support_dir`]).
+#[cfg_attr(not(test), allow(dead_code))]
+fn xdg_state_dir_from(home: &Path, xdg_state_home: Option<OsString>) -> PathBuf {
+    xdg_dir_from(home, xdg_state_home, ".local/state")
+}
+
+/// The fixed XDG state-home default, `~/.local/state/sessiometer` — the
+/// off-macOS home of [`support_dir`]. Split from [`xdg_state_dir_from`] so the
+/// never-overridden runtime state dir cannot accidentally grow the env ladder.
+#[cfg_attr(not(test), allow(dead_code))]
+fn xdg_state_default_from(home: &Path) -> PathBuf {
+    home.join(".local/state").join(APP)
+}
+
+/// The shared XDG ladder: an absolute non-empty `$XDG_*` override wins;
+/// anything else — unset, empty, or relative (invalid per the XDG Base
+/// Directory spec: "All paths … must be absolute. If … a relative path … it
+/// should consider the path invalid and ignore it") — falls back to
+/// `<home>/<spec_default>/sessiometer`.
+fn xdg_dir_from(home: &Path, xdg_override: Option<OsString>, spec_default: &str) -> PathBuf {
+    match xdg_override {
+        Some(xdg) if !xdg.is_empty() && Path::new(&xdg).is_absolute() => Path::new(&xdg).join(APP),
+        _ => home.join(spec_default).join(APP),
+    }
+}
+
+/// Windows app folder segment — capitalized per the platform's convention:
+/// `%LOCALAPPDATA%\Sessiometer` (issue #24).
+#[cfg_attr(not(test), allow(dead_code))]
+const APP_WINDOWS: &str = "Sessiometer";
+
+/// Pure derivation of the Windows config directory,
+/// `<local-app-data>\Sessiometer`. Config, state, and logs all live under the
+/// LOCAL app-data root — never the Roaming profile.
+#[cfg_attr(not(test), allow(dead_code))]
+fn windows_config_dir_from(local_app_data: &Path) -> PathBuf {
+    local_app_data.join(APP_WINDOWS)
+}
+
+/// Pure derivation of the Windows state directory,
+/// `<local-app-data>\Sessiometer` — today byte-identical to
+/// [`windows_config_dir_from`], kept a separate derivation so either policy
+/// can move without silently dragging the other; like every platform, the
+/// lock lives here, native-fixed.
+#[cfg_attr(not(test), allow(dead_code))]
+fn windows_state_dir_from(local_app_data: &Path) -> PathBuf {
+    local_app_data.join(APP_WINDOWS)
+}
+
+/// Pure derivation of the Windows log directory,
+/// `<local-app-data>\Sessiometer\logs`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn windows_logs_dir_from(local_app_data: &Path) -> PathBuf {
+    local_app_data.join(APP_WINDOWS).join("logs")
+}
+
+/// The `%LOCALAPPDATA%` root, resolved through `etcetera`'s Windows strategy.
+/// On `etcetera` 0.11 it is `cache_dir()` that maps to the LOCAL app-data root
+/// (`%LOCALAPPDATA%` when set and non-empty, the
+/// `SHGetKnownFolderPath(FOLDERID_LocalAppData)` Known-Folder API as its
+/// fallback, a `%USERPROFILE%`-derived last resort); its `config_dir()`/
+/// `data_dir()` map to the ROAMING profile and are deliberately not used here
+/// (Local, never Roaming). Being env-first, this does NOT yet mirror the Unix
+/// `getpwuid`-over-`$HOME` spoof-resistance of [`home_dir`] — hardening to the
+/// Known-Folder API alone is pinned on the Windows-enablement work (which is
+/// also where this branch first compiles; nothing builds it today).
+#[cfg(windows)]
+fn windows_local_app_data() -> Result<PathBuf> {
+    use etcetera::base_strategy::{BaseStrategy, Windows};
+    let strategy = Windows::new().map_err(|_| Error::HomeUnresolved)?;
+    Ok(strategy.cache_dir())
+}
+
+/// The config directory, at the platform's native location with the XDG
+/// opt-in override where the platform honors one:
+///
+/// - **macOS**: `$XDG_CONFIG_HOME/sessiometer` if set and non-empty, otherwise
+///   `~/Library/Application Support/sessiometer` — the long-pinned behavior.
+/// - **Linux** (and other non-Apple Unix): `$XDG_CONFIG_HOME/sessiometer` if
+///   set to an absolute path, otherwise `~/.config/sessiometer`.
+/// - **Windows**: `%LOCALAPPDATA%\Sessiometer` (Local, never Roaming).
 pub(crate) fn config_dir() -> Result<PathBuf> {
-    Ok(config_dir_from(
-        &home_dir()?,
-        std::env::var_os("XDG_CONFIG_HOME"),
-    ))
+    #[cfg(target_os = "macos")]
+    {
+        Ok(apple_config_dir_from(
+            &home_dir()?,
+            std::env::var_os("XDG_CONFIG_HOME"),
+        ))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Ok(xdg_config_dir_from(
+            &home_dir()?,
+            std::env::var_os("XDG_CONFIG_HOME"),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_config_dir_from(&windows_local_app_data()?))
+    }
+}
+
+/// The `--config` tier of the precedence ladder (issue #24): an explicit
+/// directory from the operator wins over both the `$XDG_CONFIG_HOME` opt-in
+/// override and the platform-native default, and is taken exactly as given —
+/// no `sessiometer` leaf is appended (the operator names the final directory;
+/// the env tiers name a parent). The CLI flag itself is not wired
+/// yet — argv surface stays with the per-OS daemon UX — so until then this is
+/// the resolution seam that wiring lands on; like [`usage_samples`], it is
+/// `allow(dead_code)` off the test path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn config_dir_with_override(flag: Option<&Path>) -> Result<PathBuf> {
+    match flag {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => config_dir(),
+    }
+}
+
+/// The `--log` tier of the precedence ladder (issue #24), for [`logs_dir`] —
+/// see [`config_dir_with_override`]. There is deliberately NO such seam for
+/// [`support_dir`]: the lock/socket/state dir is never overridable, on any
+/// platform — machine-global contention (issue #7) breaks the moment an
+/// override can split it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn logs_dir_with_override(flag: Option<&Path>) -> Result<PathBuf> {
+    match flag {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => logs_dir(),
+    }
 }
 
 /// The config file: `<config_dir>/config.toml` — the daemon's source of truth
@@ -196,9 +378,30 @@ pub(crate) fn config_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
-/// The log directory: `~/Library/Logs/sessiometer`.
+/// The log directory:
+///
+/// - **macOS**: `~/Library/Logs/sessiometer` (Console.app reads here) — fixed,
+///   no env override, the long-pinned behavior.
+/// - **Linux** (and other non-Apple Unix): `$XDG_STATE_HOME/sessiometer` if
+///   set to an absolute path, otherwise `~/.local/state/sessiometer` — logs
+///   are state per the XDG spec ("actions history (logs, history, …)").
+/// - **Windows**: `%LOCALAPPDATA%\Sessiometer\logs`.
 pub(crate) fn logs_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join("Library/Logs").join(APP))
+    #[cfg(target_os = "macos")]
+    {
+        Ok(apple_logs_dir_from(&home_dir()?))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Ok(xdg_state_dir_from(
+            &home_dir()?,
+            std::env::var_os("XDG_STATE_HOME"),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_logs_dir_from(&windows_local_app_data()?))
+    }
 }
 
 /// The per-user LaunchAgents directory: `~/Library/LaunchAgents`.
@@ -213,17 +416,37 @@ pub(crate) fn launch_agents_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join("Library/LaunchAgents"))
 }
 
-/// The native-local application-support directory, **always**
-/// `~/Library/Application Support/sessiometer` — even when `$XDG_CONFIG_HOME`
-/// redirects [`config_dir`].
+/// The native-local runtime state directory, **always** at the platform's
+/// fixed native location — never an env-var override:
+///
+/// - **macOS**: `~/Library/Application Support/sessiometer` — even when
+///   `$XDG_CONFIG_HOME` redirects [`config_dir`].
+/// - **Linux** (and other non-Apple Unix): `~/.local/state/sessiometer` —
+///   even when `$XDG_STATE_HOME` redirects [`logs_dir`].
+/// - **Windows**: `%LOCALAPPDATA%\Sessiometer`. Caveat: `etcetera`'s resolver
+///   is env-first (see `windows_local_app_data`), so the never-overridable
+///   invariant is NOT yet delivered on that target — hardening to the
+///   Known-Folder API alone is pinned on the Windows-enablement work.
 ///
 /// The daemon's runtime files (the single-instance lock and the control socket)
-/// live here rather than under the XDG-overridable config dir so that a second
-/// `run` contends on the *same* lock regardless of a per-shell `XDG_CONFIG_HOME`
-/// — the lock's job is to serialize Sessiometer against itself on one machine,
-/// which an env-var-relative path would defeat (issue #7).
+/// live here rather than under an env-overridable dir so that a second `run`
+/// contends on the *same* lock regardless of a per-shell override — the lock's
+/// job is to serialize Sessiometer against itself on one machine, which an
+/// env-var-relative path would defeat (issue #7); and `flock` on the network
+/// filesystem an override could point at is unreliable besides.
 pub(crate) fn support_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join("Library/Application Support").join(APP))
+    #[cfg(target_os = "macos")]
+    {
+        Ok(apple_support_dir_from(&home_dir()?))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Ok(xdg_state_default_from(&home_dir()?))
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_state_dir_from(&windows_local_app_data()?))
+    }
 }
 
 /// The single-instance lock file: `<support_dir>/daemon.lock` (`0600`).
@@ -498,14 +721,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_dir_prefers_xdg_when_set() {
-        let got = config_dir_from(Path::new("/Users/x"), Some(OsString::from("/cfg")));
+    fn apple_config_prefers_xdg_when_set() {
+        let got = apple_config_dir_from(Path::new("/Users/x"), Some(OsString::from("/cfg")));
         assert_eq!(got, PathBuf::from("/cfg/sessiometer"));
     }
 
     #[test]
-    fn config_dir_falls_back_to_library_when_xdg_unset() {
-        let got = config_dir_from(Path::new("/Users/x"), None);
+    fn apple_config_falls_back_to_library_when_xdg_unset() {
+        let got = apple_config_dir_from(Path::new("/Users/x"), None);
         assert_eq!(
             got,
             PathBuf::from("/Users/x/Library/Application Support/sessiometer")
@@ -513,14 +736,41 @@ mod tests {
     }
 
     #[test]
-    fn config_dir_falls_back_when_xdg_empty() {
-        let got = config_dir_from(Path::new("/Users/x"), Some(OsString::new()));
+    fn apple_config_falls_back_when_xdg_empty() {
+        let got = apple_config_dir_from(Path::new("/Users/x"), Some(OsString::new()));
         assert_eq!(
             got,
             PathBuf::from("/Users/x/Library/Application Support/sessiometer")
         );
     }
 
+    #[test]
+    fn macos_resolution_is_pinned_byte_identical() {
+        // Issue #24 extended this module to other platforms; the macOS
+        // resolution is pinned here byte-for-byte so the extension (and any
+        // future one) can never drift it. These are the exact pre-#24 paths.
+        let home = Path::new("/Users/x");
+        assert_eq!(
+            apple_config_dir_from(home, None),
+            PathBuf::from("/Users/x/Library/Application Support/sessiometer")
+        );
+        assert_eq!(
+            apple_support_dir_from(home),
+            PathBuf::from("/Users/x/Library/Application Support/sessiometer")
+        );
+        assert_eq!(
+            apple_logs_dir_from(home),
+            PathBuf::from("/Users/x/Library/Logs/sessiometer")
+        );
+        // The macOS XDG override predates the spec-strict XDG ladder and keeps
+        // its historical any-non-empty acceptance — relative values included.
+        assert_eq!(
+            apple_config_dir_from(home, Some(OsString::from("rel/cfg"))),
+            PathBuf::from("rel/cfg/sessiometer")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn support_dir_is_native_local_application_support() {
         // The daemon's lock/socket dir is always native-local — it reads no
@@ -530,6 +780,121 @@ mod tests {
             dir.ends_with("Library/Application Support/sessiometer"),
             "support_dir must be native-local, got {dir:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_live_logs_dir_is_library_logs() {
+        // `logs_dir` reads no env on macOS; its tail is fixed (pre-#24 pin).
+        let dir = logs_dir().unwrap();
+        assert!(
+            dir.ends_with("Library/Logs/sessiometer"),
+            "macOS logs_dir must be ~/Library/Logs/sessiometer, got {dir:?}"
+        );
+    }
+
+    // --- Cross-platform strategies (issue #24) ------------------------------
+
+    #[test]
+    fn xdg_config_prefers_an_absolute_override() {
+        let got = xdg_config_dir_from(Path::new("/home/x"), Some(OsString::from("/cfg")));
+        assert_eq!(got, PathBuf::from("/cfg/sessiometer"));
+    }
+
+    #[test]
+    fn xdg_config_defaults_to_dot_config() {
+        let got = xdg_config_dir_from(Path::new("/home/x"), None);
+        assert_eq!(got, PathBuf::from("/home/x/.config/sessiometer"));
+    }
+
+    #[test]
+    fn xdg_config_ignores_an_empty_override() {
+        let got = xdg_config_dir_from(Path::new("/home/x"), Some(OsString::new()));
+        assert_eq!(got, PathBuf::from("/home/x/.config/sessiometer"));
+    }
+
+    #[test]
+    fn xdg_config_ignores_a_relative_override() {
+        // XDG Base Directory spec: a relative `$XDG_*` value is invalid and
+        // ignored (unlike the pinned macOS behavior, which predates this).
+        let got = xdg_config_dir_from(Path::new("/home/x"), Some(OsString::from("rel/cfg")));
+        assert_eq!(got, PathBuf::from("/home/x/.config/sessiometer"));
+    }
+
+    #[test]
+    fn xdg_state_prefers_an_absolute_override() {
+        let got = xdg_state_dir_from(Path::new("/home/x"), Some(OsString::from("/state")));
+        assert_eq!(got, PathBuf::from("/state/sessiometer"));
+    }
+
+    #[test]
+    fn xdg_state_defaults_to_local_state() {
+        let got = xdg_state_dir_from(Path::new("/home/x"), None);
+        assert_eq!(got, PathBuf::from("/home/x/.local/state/sessiometer"));
+    }
+
+    #[test]
+    fn xdg_state_default_never_reads_the_override() {
+        // The off-macOS `support_dir` home: the fixed spec default, structurally
+        // incapable of following `$XDG_STATE_HOME` — the lock/socket/state dir
+        // is never env-overridable on any platform (issue #7).
+        let home = Path::new("/home/x");
+        assert_eq!(
+            xdg_state_default_from(home),
+            PathBuf::from("/home/x/.local/state/sessiometer")
+        );
+        assert_eq!(
+            xdg_state_default_from(home),
+            xdg_state_dir_from(home, None),
+            "the default must be exactly the no-override state dir"
+        );
+    }
+
+    #[test]
+    fn windows_dirs_all_live_under_the_local_sessiometer_root() {
+        // Byte-exact Windows separators cannot be asserted on a Unix host (the
+        // `\` rendering is the OS's join behavior), so these pin the structure:
+        // config and state share `<local-app-data>\Sessiometer`, logs nest one
+        // `logs` segment below it, and everything stays under the LOCAL root.
+        let local = Path::new(r"C:\Users\x\AppData\Local");
+        let config = windows_config_dir_from(local);
+        let state = windows_state_dir_from(local);
+        let logs = windows_logs_dir_from(local);
+
+        assert_eq!(
+            config, state,
+            "config and state resolve to the same directory"
+        );
+        assert!(config.starts_with(local));
+        assert_eq!(config.file_name().unwrap(), APP_WINDOWS);
+        assert_eq!(logs.parent().unwrap(), config.as_path());
+        assert_eq!(logs.file_name().unwrap(), "logs");
+    }
+
+    #[test]
+    fn explicit_override_wins_over_env_and_native() {
+        // The `--config`/`--log` tier of the precedence ladder: an explicit
+        // directory short-circuits before any env or native resolution runs.
+        let flag = Path::new("/etc/custom-sessiometer");
+        assert_eq!(
+            config_dir_with_override(Some(flag)).unwrap(),
+            PathBuf::from("/etc/custom-sessiometer")
+        );
+        assert_eq!(
+            logs_dir_with_override(Some(flag)).unwrap(),
+            PathBuf::from("/etc/custom-sessiometer")
+        );
+    }
+
+    #[test]
+    fn no_override_falls_through_to_the_native_resolution() {
+        // Both sides read the same live environment, so the equality holds
+        // regardless of any `$XDG_*` the host session carries.
+        assert_eq!(
+            config_dir_with_override(None).unwrap(),
+            config_dir().unwrap()
+        );
+        assert_eq!(logs_dir_with_override(None).unwrap(), logs_dir().unwrap());
     }
 
     #[test]
@@ -576,10 +941,14 @@ mod tests {
         // The isolated CLAUDE_CONFIG_DIR (#102) lives under the native-local support
         // dir, never the XDG-overridable config dir, so its path-hash is stable.
         let dir = isolated_refresh_dir("11111111-1111-1111-1111-111111111111").unwrap();
+        // The macOS-literal tail; on other targets the support-relative asserts
+        // below carry the same invariant against that platform's fixed state dir.
+        #[cfg(target_os = "macos")]
         assert!(dir.ends_with(
             "Library/Application Support/sessiometer/refresh/11111111-1111-1111-1111-111111111111"
         ));
         assert!(dir.starts_with(support_dir().unwrap()));
+        assert!(dir.ends_with("refresh/11111111-1111-1111-1111-111111111111"));
     }
 
     #[test]
@@ -588,8 +957,12 @@ mod tests {
         // native-local support dir (not uuid-keyed — the account is unknown until the
         // login completes), so its path-hash names the suffixed isolated item stably.
         let dir = isolated_login_dir().unwrap();
+        // The macOS-literal tail; the support-relative asserts below are the
+        // target-agnostic form of the same invariant.
+        #[cfg(target_os = "macos")]
         assert!(dir.ends_with("Library/Application Support/sessiometer/login"));
         assert!(dir.starts_with(support_dir().unwrap()));
+        assert!(dir.ends_with("login"));
         // Distinct from the refresh tree — the two engines never share an isolated dir.
         assert_ne!(dir, isolated_refresh_dir("login").unwrap());
     }

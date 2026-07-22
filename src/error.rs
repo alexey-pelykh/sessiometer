@@ -75,8 +75,10 @@ pub(crate) enum Error {
     )]
     ReliabilitySinceInvalid(String),
 
-    /// The current user's home directory could not be resolved from the
-    /// password database (see [`crate::paths`]).
+    /// The current user's home directory could not be resolved — from the
+    /// password database on Unix, or from the Windows user-profile ladder
+    /// (`%USERPROFILE%`, then the `FOLDERID_Profile` Known Folder); see
+    /// [`crate::paths`].
     #[error("could not resolve the home directory for the current user")]
     HomeUnresolved,
 
