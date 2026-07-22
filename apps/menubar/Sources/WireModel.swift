@@ -176,11 +176,14 @@ extension NextSwapReason: Decodable {
 /// mirroring serde's rejection of an unknown unit-enum variant. Non-secret — a bare discriminant
 /// (issue #15). Distinct from `NextSwapReason` (why a particular TARGET won): this says why NONE did.
 enum NoTargetCause: String, Decodable, Equatable {
-    /// Every other account is over its session limit — a transient block; the session windows reset
-    /// soon, so the remedy is to WAIT (the CLI names the reset and does not nudge "add an account").
+    /// The SESSION window gates the soonest-returning spare — relief arrives at that account's session
+    /// reset. On a MIXED fleet this names the WINNING spare's gating dimension, NOT a fleet-wide
+    /// property (issue #665); the renderer keys the "add an account" nudge off the actual WAIT, not
+    /// this label (issue #666).
     case session
-    /// Every other account is weekly-exhausted (issue #37) — a week-long block; capacity returns only
-    /// at the soonest weekly reset, so ADDING an account is the real remedy (the render nudges it).
+    /// The WEEKLY window gates the soonest-returning spare (issue #37) — relief arrives at that
+    /// account's weekly reset. Likewise names the WINNING spare's dimension, not a fleet property
+    /// (issue #665); the render nudges on wait length, not this label (issue #666).
     case weekly
 }
 
