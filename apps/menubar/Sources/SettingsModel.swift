@@ -24,11 +24,11 @@ import os
 
 private let settingsLog = Logger(subsystem: "org.sessiometer.menubar", category: "settings")
 
-// MARK: - The 14-tunable field abstraction
+// MARK: - The 15-tunable field abstraction
 
 /// One editable daemon tunable (issue #268). The `rawValue` IS the literal snake_case wire key (mirroring
 /// `TunablesView` / `SetTunables`), so a field round-trips read → draft → write without a second name table.
-/// The per-field `value(in:)` / `set(_:in:)` switches are the ONE place the 14 fields are enumerated for I/O;
+/// The per-field `value(in:)` / `set(_:in:)` switches are the ONE place the 15 fields are enumerated for I/O;
 /// everything else (draft diffing, section grouping, the form) drives off `allCases`.
 enum TunableField: String, CaseIterable, Identifiable, Equatable {
     case pollSecs = "poll_secs"
@@ -45,6 +45,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
     case sessionVelocityEmaAlphaPct = "session_velocity_ema_alpha_pct"
     case monitor401N = "monitor_401_n"
     case monitorRecoveryM = "monitor_recovery_m"
+    case fleetRunwayWarnSecs = "fleet_runway_warn_secs"
 
     var id: String { rawValue }
 
@@ -61,6 +62,8 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
             return .velocity
         case .monitor401N, .monitorRecoveryM:
             return .connectionHealth
+        case .fleetRunwayWarnSecs:
+            return .fleetRunway
         }
     }
 
@@ -82,6 +85,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         case .sessionVelocityEmaAlphaPct: return UInt64(tunables.sessionVelocityEmaAlphaPct)
         case .monitor401N: return UInt64(tunables.monitor401N)
         case .monitorRecoveryM: return UInt64(tunables.monitorRecoveryM)
+        case .fleetRunwayWarnSecs: return tunables.fleetRunwayWarnSecs
         }
     }
 
@@ -105,6 +109,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         case .sessionVelocityEmaAlphaPct: tunables.sessionVelocityEmaAlphaPct = value
         case .monitor401N: tunables.monitor401N = value
         case .monitorRecoveryM: tunables.monitorRecoveryM = value
+        case .fleetRunwayWarnSecs: tunables.fleetRunwayWarnSecs = value
         }
     }
 
@@ -115,6 +120,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
         case blindWindow
         case velocity
         case connectionHealth
+        case fleetRunway
 
         var id: String { rawValue }
 
@@ -131,6 +137,7 @@ enum TunableField: String, CaseIterable, Identifiable, Equatable {
             case .blindWindow: return "Blind-Window Safety"
             case .velocity: return "Velocity Projection"
             case .connectionHealth: return "Connection Health"
+            case .fleetRunway: return "Fleet Runway"
             }
         }
     }

@@ -23,7 +23,7 @@ final class SettingsModelTests: XCTestCase {
 
     // MARK: - config-get load (AC 1: the form populates from the daemon's ConfigView)
 
-    /// AC 1: `config-get` populates every tunable draft (all 14, distinct values catch a mis-mapped field) and
+    /// AC 1: `config-get` populates every tunable draft (all 15, distinct values catch a mis-mapped field) and
     /// the roster's label drafts + read-only `enabled`, and the freshly-loaded form is NOT dirty.
     func testLoadPopulatesEveryDraftFromConfigView() async {
         let (model, _) = makeModel(replies: [Fixtures.configViewBasic])
@@ -44,6 +44,7 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(model.draft(for: .sessionVelocityEmaAlphaPct), "40")
         XCTAssertEqual(model.draft(for: .monitor401N), "3")
         XCTAssertEqual(model.draft(for: .monitorRecoveryM), "2")
+        XCTAssertEqual(model.draft(for: .fleetRunwayWarnSecs), "7200")
 
         XCTAssertEqual(model.accounts.count, 2)
         XCTAssertEqual(model.labelDraft(for: uuidWork), "work")
@@ -220,6 +221,41 @@ final class SettingsModelTests: XCTestCase {
         XCTAssertEqual(
             model.applyPhase,
             .rejected(reason: .invalid, detail: "exhausted_poll_secs (3600) must be >= poll_secs (7200)"))
+        XCTAssertTrue(model.isDirty, "a rejected edit is NOT rebaselined — no partial write, edit kept for retry")
+    }
+
+    /// AC 1 ("0 = off" affordance) + AC 2: editing `fleet_runway_warn_secs` (issues #650/#692) to 0 — the
+    /// operator's way to DISABLE the proactive fleet-runway warning — is an ordinary tunable edit. It rides the
+    /// batched `config-set` under its snake_case key (NO local `config.toml` write), and `0` is carried
+    /// EXPLICITLY, never dropped as if unset. The daemon owns the band; the app only delivers the number.
+    func testApplyFleetRunwayWarnZeroDisablesAndSends() async {
+        let (model, connector) = makeModel(replies: [Fixtures.configViewBasic, Fixtures.configSetAppliedRestart])
+        await model.load()
+        model.setDraft("0", for: .fleetRunwayWarnSecs)  // 0 = off; the fixture baseline is 7200, so this is dirty
+        XCTAssertTrue(model.isDirty)
+        await model.apply()
+
+        XCTAssertEqual(model.applyPhase, .applied(effect: .restartRequired))
+        XCTAssertEqual(
+            connector.sentLines.last,
+            #"{"cmd":"config-set","labels":{},"tunables":{"fleet_runway_warn_secs":0}}"# + "\n")
+    }
+
+    /// AC 3: an out-of-band `fleet_runway_warn_secs` (30 — inside the forbidden `0 < n < 60` gap) is the
+    /// DAEMON's to reject. The model surfaces the daemon's OWN field-naming `detail` (the `0 | 60..=2_592_000`
+    /// message from `Config::validate`), NOT a generic `.undecodable` (the #645 precedent), and keeps the edit
+    /// for a retry (the daemon wrote nothing, so the form stays dirty).
+    func testApplyFleetRunwayOutOfBandRejectedWithDaemonDetail() async {
+        let (model, _) = makeModel(replies: [Fixtures.configViewBasic, Fixtures.configSetRejectedFleetRunwayInvalid])
+        await model.load()
+        model.setDraft("30", for: .fleetRunwayWarnSecs)
+        await model.apply()
+
+        XCTAssertEqual(
+            model.applyPhase,
+            .rejected(
+                reason: .invalid,
+                detail: "fleet_runway_warn_secs must be 0 (disabled) or in 60..=2592000, got 30"))
         XCTAssertTrue(model.isDirty, "a rejected edit is NOT rebaselined — no partial write, edit kept for retry")
     }
 

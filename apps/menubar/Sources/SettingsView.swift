@@ -142,7 +142,7 @@ struct SettingsView: View {
 
     // MARK: - Daemon tunables + accounts (the `.loaded` daemon-config sections)
 
-    /// The five grouped tunable sections (issue #268), in display order.
+    /// The six grouped tunable sections (issues #268, #692), in display order.
     private var tunableSections: some View {
         ForEach(TunableField.Section.allCases) { section in
             Section(section.title) {
@@ -311,6 +311,7 @@ struct SettingsView: View {
         case .sessionVelocityEmaAlphaPct: return ("Velocity smoothing (%)", "EMA smoothing factor for usage velocity.")
         case .monitor401N: return ("401 tolerance", "Consecutive 401s before an account is treated as needing re-login.")
         case .monitorRecoveryM: return ("Recovery threshold", "Consecutive good checks before an account is considered recovered.")
+        case .fleetRunwayWarnSecs: return ("Runway warning (s)", "Warn when the whole fleet’s combined runway drops below this many seconds. 0 turns the warning off.")
         }
     }
 }
