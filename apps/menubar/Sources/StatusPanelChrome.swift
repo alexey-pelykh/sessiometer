@@ -185,20 +185,19 @@ struct SwapCalloutCard: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "arrow.left.arrow.right")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.tint)
-                .accessibilityHidden(true)
             // The card's TEXT is one combined VoiceOver element; the button below is a SEPARATE one.
             // (Combining the whole card, as this did while the button was dead, would now swallow a live
             // control and leave it unreachable.)
             VStack(alignment: .leading, spacing: 1) {
-                // MIDDLE-truncate the TARGET label (issue #445), keeping the "Next swap →" prefix whole, so a
+                // MIDDLE-truncate the TARGET label (issue #445), keeping the "→" prefix whole, so a
                 // same-local-part target's distinguishing suffix survives the elision (the earlier "clunky"
                 // read was a tail-truncated target). The prefix is `.fixedSize`d; the target absorbs the
-                // squeeze. The spoken label (`accessibilityText`) is unchanged — it carries the full target.
+                // squeeze. That prefix is a BARE arrow (issue #698) — no leading icon, no "Next swap"
+                // words: the adjacent Swap button already names the verb, and the width they cost is width
+                // the target needs. `accessibilityText` deliberately does NOT match — VoiceOver reads this
+                // text element on its own, so it still speaks the whole "Next swap to …" sentence.
                 HStack(spacing: 0) {
-                    Text("Next swap → ").fixedSize()
+                    Text("→ ").fixedSize()
                     Text(target).fontWeight(.semibold)
                         .lineLimit(1)
                         .truncationMode(.middle)
