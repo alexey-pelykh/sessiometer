@@ -331,17 +331,17 @@ enum Fixtures {
     // DISTINCT value so a swapped `CodingKey` is caught. Semantic decoders assert values order-
     // independently, so these need not be byte-frozen (no golden guard, unlike the `watch` frames).
 
-    /// A `config-get` reply: the bare `ConfigView` — the 14 effective tunables (each a distinct value)
+    /// A `config-get` reply: the bare `ConfigView` — the 15 effective tunables (each a distinct value)
     /// plus a two-account roster (one enabled, one parked). Mirrors `Config::view` (`src/config.rs`).
     static let configViewBasic = #"""
-    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_ceiling":90,"weekly_ceiling":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"22222222-2222-2222-2222-222222222222","label":"personal","enabled":false}]}
+    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_ceiling":90,"weekly_ceiling":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2,"fleet_runway_warn_secs":7200},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"22222222-2222-2222-2222-222222222222","label":"personal","enabled":false}]}
     """#
 
     /// A drifted-daemon `config-get`: a well-formed `ConfigView` whose roster carries a DUPLICATE
     /// `account_uuid`. It decodes cleanly (the wire types cannot forbid it), so the model must reject it at
     /// adoption — degrade loudly as `.undecodable`, NEVER trap building the uuid→label map.
     static let configViewDuplicateAccount = #"""
-    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_ceiling":90,"weekly_ceiling":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"duplicate","enabled":false}]}
+    {"tunables":{"poll_secs":300,"exhausted_poll_secs":3600,"near_limit_poll_secs":120,"cooldown_secs":45,"target_max_session_usage":85,"session_ceiling":90,"weekly_ceiling":95,"session_blind_swap_secs":900,"session_blind_risk_band":80,"session_velocity_horizon_secs":150,"session_velocity_min_project_above":88,"session_velocity_ema_alpha_pct":40,"monitor_401_n":3,"monitor_recovery_m":2,"fleet_runway_warn_secs":7200},"accounts":[{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"work","enabled":true},{"account_uuid":"11111111-1111-1111-1111-111111111111","label":"duplicate","enabled":false}]}
     """#
 
     /// `config-get` when `config.toml` does not exist — the redacted `{"error":"no config"}` envelope.
@@ -372,12 +372,21 @@ enum Fixtures {
     /// `ConfigSetAck` (no `result` key). A version-skewed client sent a renamed/stale tunable (a pre-#606
     /// `session_trigger`) that the daemon's strict `deny_unknown_fields` re-parse refuses BEFORE the run
     /// loop, so it writes `error_with_detail("malformed request", <serde message>)` (`src/daemon/socket.rs`,
-    /// issue #628) — ZERO writes. The `detail` is serde's key-naming message for `SetTunables` (its 14 fields
+    /// issue #628) — ZERO writes. The `detail` is serde's key-naming message for `SetTunables` (its 15 fields
     /// in declaration order); serde additionally appends an input-dependent ` at line 1 column N` positional
     /// suffix, elided here as behaviorally irrelevant — every consumer substring-matches the key or renders
     /// the string verbatim, exactly as the daemon's own #628 test asserts `.contains("session_trigger")`. The
     /// client surfaces this so the operator sees "this app is out of date" instead of an opaque `.undecodable`.
     static let configSetErrorStaleKey = #"""
-    {"error":"malformed request","detail":"unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`"}
+    {"error":"malformed request","detail":"unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`, `fleet_runway_warn_secs`"}
+    """#
+
+    /// `config-set` rejected: `fleet_runway_warn_secs` (issues #650/#692) outside its `0 | 60..=2_592_000`
+    /// band — the daemon's `Config::validate` message (`src/config/validate.rs`) threaded verbatim into
+    /// `detail` (the same `invalid` + field-naming shape as `configSetRejectedInvalid`). AC 3: an out-of-band
+    /// value surfaces the daemon's OWN detail, never a generic `.undecodable`. `30` is in the forbidden gap
+    /// (`> 0` but `< 60`) — the value a "0 = off" affordance must NOT silently accept as disabling.
+    static let configSetRejectedFleetRunwayInvalid = #"""
+    {"result":"rejected","reason":"invalid","detail":"fleet_runway_warn_secs must be 0 (disabled) or in 60..=2592000, got 30"}
     """#
 }

@@ -14,7 +14,7 @@
 //     `ConfigSetEffect` / `ConfigSetRejection` (the redacted ack).
 //
 // SAFETY BOUNDARY (issue #268, load-bearing): the settable surface IS these types. `SetTunables` is a
-// 14-scalar allow-list and `labels` is a `[uuid: String]` map — a credential, an `[[account]]` add/remove,
+// 15-scalar allow-list and `labels` is a `[uuid: String]` map — a credential, an `[[account]]` add/remove,
 // or any roster STRUCTURE change is UNREPRESENTABLE here, mirroring the daemon's `deny_unknown_fields`
 // backstop. This client moves only non-secret tunables + labels; it performs NO credential handling
 // (issue #15), exactly like every other `ControlCommandClient` verb.
@@ -42,6 +42,7 @@ struct TunablesView: Decodable, Equatable {
     let sessionVelocityEmaAlphaPct: UInt8
     let monitor401N: UInt8
     let monitorRecoveryM: UInt8
+    let fleetRunwayWarnSecs: UInt64
 
     private enum CodingKeys: String, CodingKey {
         case pollSecs = "poll_secs"
@@ -58,6 +59,7 @@ struct TunablesView: Decodable, Equatable {
         case sessionVelocityEmaAlphaPct = "session_velocity_ema_alpha_pct"
         case monitor401N = "monitor_401_n"
         case monitorRecoveryM = "monitor_recovery_m"
+        case fleetRunwayWarnSecs = "fleet_runway_warn_secs"
     }
 }
 
@@ -162,6 +164,7 @@ struct SetTunables: Encodable, Equatable {
     var sessionVelocityEmaAlphaPct: Int64?
     var monitor401N: Int64?
     var monitorRecoveryM: Int64?
+    var fleetRunwayWarnSecs: Int64?
 
     private enum CodingKeys: String, CodingKey {
         case pollSecs = "poll_secs"
@@ -178,6 +181,7 @@ struct SetTunables: Encodable, Equatable {
         case sessionVelocityEmaAlphaPct = "session_velocity_ema_alpha_pct"
         case monitor401N = "monitor_401_n"
         case monitorRecoveryM = "monitor_recovery_m"
+        case fleetRunwayWarnSecs = "fleet_runway_warn_secs"
     }
 
     /// Whether NO tunable is edited (every field `nil`) — the "labels-only or no-op" fast path the model
@@ -188,6 +192,7 @@ struct SetTunables: Encodable, Equatable {
             && sessionBlindSwapSecs == nil && sessionBlindRiskBand == nil
             && sessionVelocityHorizonSecs == nil && sessionVelocityMinProjectAbove == nil
             && sessionVelocityEmaAlphaPct == nil && monitor401N == nil && monitorRecoveryM == nil
+            && fleetRunwayWarnSecs == nil
     }
 }
 

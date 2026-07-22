@@ -12,7 +12,7 @@ final class ConfigWireTests: XCTestCase {
 
     // MARK: - config-get (AC 1: the form populates from the daemon's ConfigView)
 
-    /// AC 1: `config-get` decodes to a `ConfigView` — all 14 tunables map to the right field (distinct
+    /// AC 1: `config-get` decodes to a `ConfigView` — all 15 tunables map to the right field (distinct
     /// values catch a swapped `CodingKey`), and the roster's non-secret per-account fields decode.
     func testDecodesConfigGetView() throws {
         guard case .ok(let view) = try decodeConfigGetReply(Fixtures.configViewBasic) else {
@@ -33,6 +33,7 @@ final class ConfigWireTests: XCTestCase {
         XCTAssertEqual(t.sessionVelocityEmaAlphaPct, 40)
         XCTAssertEqual(t.monitor401N, 3)
         XCTAssertEqual(t.monitorRecoveryM, 2)
+        XCTAssertEqual(t.fleetRunwayWarnSecs, 7200)
 
         XCTAssertEqual(view.accounts.count, 2)
         XCTAssertEqual(
@@ -173,6 +174,22 @@ final class ConfigWireTests: XCTestCase {
         XCTAssertEqual(
             json,
             #"{"cmd":"config-set","labels":{"11111111-1111-1111-1111-111111111111":"renamed"},"tunables":{"poll_secs":120,"session_ceiling":88}}"#)
+    }
+
+    /// The 15th tunable `fleet_runway_warn_secs` (issues #650/#692) rides the SAME allow-listed encode path:
+    /// a lone edit encodes to its snake_case wire key and no other, pinning the new write-side `CodingKey`
+    /// (the read side is pinned by `testDecodesConfigGetView`). `0` is a valid whole value — the "0 = off"
+    /// edit an operator submits to disable the warning — so it must ride the wire, not be dropped as absent.
+    func testConfigSetRequestEncodesFleetRunwayWarnKey() throws {
+        var tunables = SetTunables()
+        tunables.fleetRunwayWarnSecs = 0
+        let command = ConfigSetCommand(tunables: tunables, labels: [:])
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let json = String(decoding: try encoder.encode(command), as: UTF8.self)
+
+        XCTAssertEqual(json, #"{"cmd":"config-set","labels":{},"tunables":{"fleet_runway_warn_secs":0}}"#)
     }
 
     /// An all-empty submit encodes to empty `tunables` / `labels` objects — the no-op path the daemon
