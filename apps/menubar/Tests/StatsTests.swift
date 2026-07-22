@@ -168,9 +168,11 @@ final class StatsTests: XCTestCase {
 
     // MARK: - Sparkline geometry (R-2 parity: session peak, fixed [0,1] scale)
 
-    // The x's are evenly spaced across the inset plot — with the mock's box (96 × 28, inset 3) and its 7-bucket
-    // week, this is EXACTLY the mock `.spark` path's x vertices (3, 18, …, 93).
-    func testSparkPointsXSpacingMatchesTheMock() {
+    // The x's are evenly spaced across the inset plot. 96 was the box the chart occupied INSIDE the head row
+    // until issue #700 gave it a full-width row of its own; it is kept here as a plain second width, so the
+    // even-spacing rule is pinned at more than one box. The mock correspondence moved with the chart — it now
+    // lives in `testSparkPointsWidenTheBoxWithoutMovingTheSeries`, the sole mock pin.
+    func testSparkPointsXSpacingIsEvenAcrossTheInsetPlot() {
         let pts = StatusPanelFormat.sparkPoints([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
                                                 width: 96, height: 28, inset: 3)
         XCTAssertEqual(pts.map(\.x), [3, 18, 33, 48, 63, 78, 93])
@@ -198,6 +200,58 @@ final class StatsTests: XCTestCase {
     // An empty series yields no points (the view draws nothing).
     func testSparkPointsEmpty() {
         XCTAssertTrue(StatusPanelFormat.sparkPoints([], width: 96, height: 28, inset: 3).isEmpty)
+    }
+
+    // The panel↔mock pin (issue #700). The chart's own row is `statsChartWidth` wide, and the build-reference
+    // mock authors its `.spark` viewBox at that SAME number (`viewBox="0 0 331 28"` in menubar-preview.html).
+    // The panel's Stats tab has no render path — `RenderPanelTool` renders every fixture at the Status tab —
+    // so nothing else mechanically checks the two surfaces agree. Asserting the DERIVED width against the
+    // mock's authored literal is what turns a panel-geometry change into a red test instead of a silent
+    // divergence from the design reference.
+    func testStatsChartWidthMatchesTheMockAuthoredViewBox() {
+        XCTAssertEqual(StatusPanelFormat.statsChartWidth, 331, accuracy: 0.001,
+                       "design/menubar-preview.html authors `.spark` at viewBox=\"0 0 331 28\" — change both")
+    }
+
+    // Widening re-spreads the x's and leaves every y untouched: the box geometry changes, the series
+    // semantics do not. The x's asserted here are the vertices the mock's `.spark` viewBox carries, so this
+    // pins the chart's shape across the two surfaces the way the 96 pt box did before #700.
+    func testSparkPointsWidenTheBoxWithoutMovingTheSeries() {
+        let series = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+        let narrow = StatusPanelFormat.sparkPoints(series, width: 96, height: 28, inset: 3)
+        let wide = StatusPanelFormat.sparkPoints(
+            series, width: StatusPanelFormat.statsChartWidth, height: 28, inset: 3)
+        for (actual, expected) in zip(wide.map(\.x), [3, 57.17, 111.33, 165.5, 219.67, 273.83, 328]) {
+            XCTAssertEqual(actual, expected, accuracy: 0.01)
+        }
+        XCTAssertEqual(narrow.map(\.y), wide.map(\.y), "widening must not re-scale the series")
+    }
+
+    // A FLAT series keeps its absolute level — an auto-normalising chart would stretch any flat series to the
+    // same line, losing the difference between an idle account and a pinned one. This is the ONLY test that
+    // catches that: every other series in this section (`[0, 0.5, 1]`, `[1.5, -0.5]`, the monotonic ramp above)
+    // already spans its own full range, so auto-normalisation is the identity on them and they stay green.
+    // Asserted at the shipped `statsChartWidth`, since the wider, more prominent chart is where a silently
+    // re-scaled series would mislead most.
+    func testSparkPointsDoNotAutoNormaliseAFlatSeries() {
+        let width = StatusPanelFormat.statsChartWidth
+        let low = StatusPanelFormat.sparkPoints([0.1, 0.1, 0.1], width: width, height: 28, inset: 3)
+        let high = StatusPanelFormat.sparkPoints([0.9, 0.9, 0.9], width: width, height: 28, inset: 3)
+        for y in low.map(\.y) { XCTAssertEqual(y, 22.8, accuracy: 0.001) }
+        for y in high.map(\.y) { XCTAssertEqual(y, 5.2, accuracy: 0.001) }
+    }
+
+    // A box too narrow to hold its own insets has no plot, so it yields NO points rather than folding the
+    // series backwards (at width 0 the x's ran 3 → 0 → −3, descending). Latent rather than reachable — the
+    // panel is a single fixed width — but the box became a parameter in #700, so the helper is now total
+    // over the widths a caller can hand it instead of trusting every future one to be generous.
+    func testSparkPointsDegenerateBoxYieldsNoPoints() {
+        for width in [0.0, 4.0, 6.0] {
+            XCTAssertTrue(StatusPanelFormat.sparkPoints([0.1, 0.5, 0.9], width: width, height: 28, inset: 3).isEmpty,
+                          "width \(width) cannot hold a 3 pt inset per side")
+        }
+        XCTAssertFalse(StatusPanelFormat.sparkPoints([0.1, 0.5], width: 6.5, height: 28, inset: 3).isEmpty,
+                       "just past 2 × inset there IS a plot, however thin")
     }
 
     // The series pick is the per-bucket SESSION PEAK (`src/stats.rs`), and a bucket with no reading for the

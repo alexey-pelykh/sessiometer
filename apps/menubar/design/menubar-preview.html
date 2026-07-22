@@ -383,7 +383,24 @@
   .s-meta{ flex:1 1 auto; min-width:0; display:flex; flex-direction:column }
   .s-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .s-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
-  .spark{ flex:0 0 auto; display:block }
+  /* The chart sits on its OWN full-width row between head and body (#700) — inside the head it was a fixed
+     96px box that starved both itself and the label (a fleet of near-identical emails all elided to
+     `olek….com`). Inset to the metrics block's leading edge, NOT the card's, so the series starts where the
+     numbers describing it start. Its viewBox is authored at the row's real 331px width with the same fixed
+     3-unit inset the panel uses, so mock and panel agree 1:1 rather than the panel's fixed stroke-clearance
+     inset meeting a proportionally-stretched one here.
+
+     Two consequences worth naming. (1) 331 is the PANEL's number — derived there as
+     `StatusPanelFormat.statsChartWidth` and pinned against this literal by
+     `testStatsChartWidthMatchesTheMockAuthoredViewBox`, since the panel's Stats tab has no render path for
+     build-comparison.py to diff. Change the panel's width or insets and that test goes red; re-author this
+     viewBox with it. (2) Unlike the old 96, this couples the mock to the 380px panel — deliberate, because
+     vertex agreement is the point, but it is a coupling the 96 did not have. Note also that `.pop` carries a
+     .5px border under `box-sizing:border-box`, so this row actually paints ~329px: the mock squeezes the
+     331-unit viewBox by 0.6%. That offset is the fake window chrome, systemic and pre-existing across every
+     frame — not something this row introduced. */
+  .stat-chart{ margin-top:9px; margin-left:17px }
+  .spark{ display:block; width:100% }
   .spark .sp-area{ fill:var(--spark); fill-opacity:.2; stroke:none }
   .spark .sp-line{ fill:none; stroke:var(--spark); stroke-width:1.75; stroke-linecap:round; stroke-linejoin:round }
   .spark .sp-dot{ fill:var(--spark) }
@@ -724,9 +741,9 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
-                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
                   <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
                 </div>
+                <div class="stat-chart"><svg class="spark" width="100%" height="28" viewBox="0 0 331 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L57.17,14 L111.33,8.5 L165.5,3 L219.67,3 L273.83,5.8 L328,8.5 L328,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 57.17,14 111.33,8.5 165.5,3 219.67,3 273.83,5.8 328,8.5"/><circle class="sp-dot" cx="328" cy="8.5" r="1.7"/></svg></div>
                 <div class="stat-body">
                   <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">42<span class="peak"> / 100%</span></div></div>
                   <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">88%</div></div>
@@ -738,9 +755,9 @@
                   <span class="dot"></span>
                   <span class="badge id-personal">PE</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
-                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
                   <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
                 </div>
+                <div class="stat-chart"><svg class="spark" width="100%" height="28" viewBox="0 0 331 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L57.17,16.8 L111.33,14 L165.5,8.5 L219.67,11.3 L273.83,14 L328,16.8 L328,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 57.17,16.8 111.33,14 165.5,8.5 219.67,11.3 273.83,14 328,16.8"/><circle class="sp-dot" cx="328" cy="16.8" r="1.7"/></svg></div>
                 <div class="stat-body">
                   <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">31<span class="peak"> / 96%</span></div></div>
                   <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">71%</div></div>
@@ -752,9 +769,9 @@
                   <span class="dot"></span>
                   <span class="badge id-scratch">SC</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
-                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
                   <span class="signal underused"><span class="sig-dot"></span>underused</span>
                 </div>
+                <div class="stat-chart"><svg class="spark" width="100%" height="28" viewBox="0 0 331 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L57.17,22.3 L111.33,19.5 L165.5,22.3 L219.67,22.3 L273.83,22.3 L328,22.3 L328,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 57.17,22.3 111.33,19.5 165.5,22.3 219.67,22.3 273.83,22.3 328,22.3"/><circle class="sp-dot" cx="328" cy="22.3" r="1.7"/></svg></div>
                 <div class="stat-body">
                   <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">4<span class="peak"> / 22%</span></div></div>
                   <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">18%</div></div>
@@ -797,9 +814,9 @@
                   <span class="dot"></span>
                   <span class="badge id-work">WO</span>
                   <span class="s-meta"><div class="s-name">Work</div><div class="s-prov">Claude Code</div></span>
-                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L18,14 L33,8.5 L48,3 L63,3 L78,5.8 L93,8.5 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 18,14 33,8.5 48,3 63,3 78,5.8 93,8.5"/><circle class="sp-dot" cx="93" cy="8.5" r="1.7"/></svg>
                   <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
                 </div>
+                <div class="stat-chart"><svg class="spark" width="100%" height="28" viewBox="0 0 331 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,19.5 L57.17,14 L111.33,8.5 L165.5,3 L219.67,3 L273.83,5.8 L328,8.5 L328,25 L3,25 Z"/><polyline class="sp-line" points="3,19.5 57.17,14 111.33,8.5 165.5,3 219.67,3 273.83,5.8 328,8.5"/><circle class="sp-dot" cx="328" cy="8.5" r="1.7"/></svg></div>
                 <div class="stat-body">
                   <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">42<span class="peak"> / 100%</span></div></div>
                   <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">88%</div></div>
@@ -811,9 +828,9 @@
                   <span class="dot"></span>
                   <span class="badge id-personal">PE</span>
                   <span class="s-meta"><div class="s-name">Personal</div><div class="s-prov">Codex</div></span>
-                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,16.8 L33,14 L48,8.5 L63,11.3 L78,14 L93,16.8 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,16.8 33,14 48,8.5 63,11.3 78,14 93,16.8"/><circle class="sp-dot" cx="93" cy="16.8" r="1.7"/></svg>
                   <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
                 </div>
+                <div class="stat-chart"><svg class="spark" width="100%" height="28" viewBox="0 0 331 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L57.17,16.8 L111.33,14 L165.5,8.5 L219.67,11.3 L273.83,14 L328,16.8 L328,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 57.17,16.8 111.33,14 165.5,8.5 219.67,11.3 273.83,14 328,16.8"/><circle class="sp-dot" cx="328" cy="16.8" r="1.7"/></svg></div>
                 <div class="stat-body">
                   <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">31<span class="peak"> / 96%</span></div></div>
                   <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">71%</div></div>
@@ -825,9 +842,9 @@
                   <span class="dot"></span>
                   <span class="badge id-scratch">SC</span>
                   <span class="s-meta"><div class="s-name">Scratch</div><div class="s-prov">Gemini</div></span>
-                  <svg class="spark" width="96" height="28" viewBox="0 0 96 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L18,22.3 L33,19.5 L48,22.3 L63,22.3 L78,22.3 L93,22.3 L93,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 18,22.3 33,19.5 48,22.3 63,22.3 78,22.3 93,22.3"/><circle class="sp-dot" cx="93" cy="22.3" r="1.7"/></svg>
                   <span class="signal underused"><span class="sig-dot"></span>underused</span>
                 </div>
+                <div class="stat-chart"><svg class="spark" width="100%" height="28" viewBox="0 0 331 28" preserveAspectRatio="none" aria-hidden="true"><path class="sp-area" d="M3,22.3 L57.17,22.3 L111.33,19.5 L165.5,22.3 L219.67,22.3 L273.83,22.3 L328,22.3 L328,25 L3,25 Z"/><polyline class="sp-line" points="3,22.3 57.17,22.3 111.33,19.5 165.5,22.3 219.67,22.3 273.83,22.3 328,22.3"/><circle class="sp-dot" cx="328" cy="22.3" r="1.7"/></svg></div>
                 <div class="stat-body">
                   <div class="sc"><div class="sc-label">Session m/pk</div><div class="sc-val">4<span class="peak"> / 22%</span></div></div>
                   <div class="sc"><div class="sc-label">Weekly pk</div><div class="sc-val">18%</div></div>
