@@ -855,15 +855,26 @@ enum StatusPanelFormat {
                           detail: "Waiting for the daemon to come up.",
                           kind: .info)
         case .notRunning:
-            // The not-running banner (#499): the daemon is absent, so numbers are not trustworthy
-            // (`.error`, like `.disconnected` / `.unsupported`). The Start-daemon affordance is #170
-            // (launch-at-login via SMAppService), deferred and signing-blocked — so the banner degrades
-            // to this inert explanatory line, with no button yet.
+            // The not-running banner (#499 / #170): the daemon is absent, so numbers are not trustworthy
+            // (`.error`, like `.disconnected` / `.unsupported`). #170 wires the Start-daemon affordance
+            // (`StartDaemonCard`) beside this copy; the detail matches the design mock's not-running card.
+            // The card shows a "Start daemon" button only where it can act (`LoginItemModel.canStartDaemon`
+            // — #171 ships the bundled agent); until then it degrades honestly to this line alone.
             return Banner(title: "Daemon not running",
-                          detail: "The daemon isn't running.",
+                          detail: "The background service isn’t running. Start it to resume live status.",
                           kind: .error)
         }
     }
+
+    // MARK: - Start-daemon affordance copy (issue #170, beside the not-running banner)
+
+    /// The "Start daemon" button title — mirrors the design mock's not-running card.
+    static let startDaemonButtonTitle = "Start daemon"
+    /// The in-flight label while the SMAppService agent registration is pending (the mock's transient beat).
+    static let startDaemonPendingText = "Starting…"
+    /// The reassurance hint beneath the button: starting the daemon is a runtime/lifecycle action that
+    /// touches no credential (issue #15 redaction discipline) — the product half of the mock's `msg-hint`.
+    static let startDaemonHint = "Start is a runtime action — it touches no credentials."
 
     // MARK: - Snapshot age (issue #326 / council — the CLI's parity render of the wire `generated_at`)
 

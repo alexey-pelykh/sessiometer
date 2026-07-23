@@ -258,6 +258,67 @@ struct SwapCalloutCard: View {
     }
 }
 
+/// The not-running state's Start-daemon affordance (issue #170) — the design mock's not-running card. It
+/// reuses the honest-state `BannerView` for the "Daemon not running" message (consistent with its sibling
+/// cold states — connecting / starting / crash-looping all render `BannerView`), then offers a primary
+/// **Start daemon** button that registers (and, via the plist's `RunAtLoad`, starts) the embedded daemon
+/// LaunchAgent through `SMAppService`.
+///
+/// Honest degradation (the crown-jewel rule, StatusPanelView's honest-affordance discipline): the button
+/// appears ONLY where it can act — `LoginItemModel.canStartDaemon`, i.e. the bundled agent is present (#171
+/// ships it) AND no CLI-managed agent already owns the label. In the #170 shipped state no plist is bundled
+/// yet, so `canStartDaemon` is false and the card is exactly the inert banner it was before — never a dead
+/// button over a daemon it can't start. On success the daemon comes up and the panel leaves `.notRunning`
+/// on the next `watch` snapshot (like a swap's new active row); a failure surfaces its reason inline.
+struct StartDaemonCard: View {
+    @EnvironmentObject private var loginItem: LoginItemModel
+
+    /// The Start registration is in flight (the transient spinner beat).
+    private var isRegistering: Bool {
+        if case .registering = loginItem.startPhase { return true }
+        return false
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            BannerView(banner: StatusPanelFormat.banner(for: .notRunning, accountCount: 0))
+            if loginItem.canStartDaemon {
+                startButton
+                if case .failed(let reason) = loginItem.startPhase {
+                    Label(reason, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(StatusPanelFormat.startDaemonHint)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var startButton: some View {
+        Button(action: { Task { await loginItem.startDaemon() } }) {
+            if isRegistering {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text(StatusPanelFormat.startDaemonPendingText)
+                }
+            } else {
+                Label(StatusPanelFormat.startDaemonButtonTitle, systemImage: "play.fill")
+            }
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .buttonStyle(.borderedProminent)
+        .controlSize(.small)
+        .disabled(isRegistering)
+        .accessibilityLabel(isRegistering
+                            ? StatusPanelFormat.startDaemonPendingText
+                            : StatusPanelFormat.startDaemonButtonTitle)
+    }
+}
+
 /// The settled swap's inline outcome (issue #169) — one line beneath the swap-callout card, shared by
 /// BOTH swap paths (the footer recommendation and a per-row manual switch), because the daemon holds a
 /// single-writer swap lock: at most one swap is ever in flight, so at most one outcome needs a home.

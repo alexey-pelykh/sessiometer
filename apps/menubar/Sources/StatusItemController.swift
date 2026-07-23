@@ -41,6 +41,10 @@ final class StatusItemController {
     /// and RE-SIZE the panel to the new content — the Stats tab is taller than Status, so a size fixed at
     /// open-time (`openPanel`) would clip it; switching back to Status must restore the smaller size.
     private let statsModel: PanelStatsModel
+    /// The launch-at-login / Start-daemon model (issue #170). Built by `main.swift` and SHARED with the
+    /// Settings window's `SettingsView` toggle (ONE instance, so the panel's Start affordance and the Settings
+    /// launch-at-login toggle read/write the same registration state), injected into the panel environment below.
+    private let loginItemModel: LoginItemModel
     /// The subscription that re-sizes the panel whenever the Stats model changes (installed in `init`).
     private var statsObserver: AnyCancellable?
     private var presentationTask: Task<Void, Never>?
@@ -57,8 +61,10 @@ final class StatusItemController {
     init(store: WatchStatusStore,
          captureClient: ControlCommandClient?,
          swapClient: ControlCommandClient?,
-         statsClient: ControlCommandClient?) {
+         statsClient: ControlCommandClient?,
+         loginItemModel: LoginItemModel) {
         self.store = store
+        self.loginItemModel = loginItemModel
         let captureModel = AccountCaptureModel(client: captureClient)
         self.captureModel = captureModel
         let swapModel = AccountSwapModel(client: swapClient)
@@ -69,11 +75,13 @@ final class StatusItemController {
 
         // #326's status panel reads its dependencies via `@EnvironmentObject`: the store (a thin view over the
         // `src/cli.rs`-mirroring `StatusPanelFormat`), the #360 capture affordance's `AccountCaptureModel`, the
-        // #169 swap affordance's `AccountSwapModel`, and the #446 Stats tab's `PanelStatsModel`. Inject the
-        // COMPLETE set here through the shared `statusPanelEnvironment` modifier — the SAME wiring the DEBUG
-        // `--render-panel` harness uses, so the app and the harness cannot drift (issue #504).
+        // #169 swap affordance's `AccountSwapModel`, the #446 Stats tab's `PanelStatsModel`, and the #170
+        // launch-at-login / Start-daemon `LoginItemModel`. Inject the COMPLETE set here through the shared
+        // `statusPanelEnvironment` modifier — the SAME wiring the DEBUG `--render-panel` harness uses, so the
+        // app and the harness cannot drift (issue #504).
         let hosting = NSHostingView(rootView: StatusPanelView()
-            .statusPanelEnvironment(store: store, capture: captureModel, swap: swapModel, stats: statsModel))
+            .statusPanelEnvironment(store: store, capture: captureModel, swap: swapModel, stats: statsModel,
+                                    loginItem: loginItemModel))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         self.hostingView = hosting
 
@@ -194,8 +202,9 @@ final class StatusItemController {
     /// is a rare, deliberate action, neither display nor swap, so it belongs here) and "Quit Sessiometer"
     /// (a pure-CLIENT control that terminates the menu-bar app via `NSApp.terminate`, the clean
     /// `applicationWillTerminate` transport-stop path; it does NOT touch the daemon, whose quit/restart
-    /// lifecycle is #170). It is the natural future home for the other runtime controls (#170 daemon
-    /// quit/restart, launch-at-login). Shown via a TRANSIENT `statusItem.menu` so AppKit positions and
+    /// lifecycle is #170). It is the natural future home for the remaining runtime controls (daemon
+    /// quit/restart); launch-at-login now ships in Settings (the "General" toggle) plus the not-running
+    /// panel card's Start affordance (#170). Shown via a TRANSIENT `statusItem.menu` so AppKit positions and
     /// highlights it natively under the item, then cleared so the primary click keeps toggling the panel
     /// (setting `statusItem.menu` permanently would hijack the primary click, #325/#326).
     private func showLifecycleMenu() {

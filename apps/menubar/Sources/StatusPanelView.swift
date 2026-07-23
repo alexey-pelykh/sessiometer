@@ -65,6 +65,10 @@ struct StatusPanelView: View {
     /// query's phase. Observed here to render the seg control's on-state and to switch the body to the
     /// Stats view. (`StatsView` and `PanelHeader`'s seg read the same model.)
     @EnvironmentObject private var stats: PanelStatsModel
+    /// The launch-at-login / Start-daemon model (issue #170): observed here so the `.notRunning` body can
+    /// render `StartDaemonCard` — the honest Start affordance that appears only where it can act
+    /// (`canStartDaemon`) and otherwise degrades to the same inert banner the other cold states show.
+    @EnvironmentObject private var loginItem: LoginItemModel
 
     /// How often the resting panel re-derives clock-relative text (reset-in). A minute is finer than
     /// the reset-in's own minute granularity, so the displayed value never visibly lags the clock.
@@ -165,18 +169,28 @@ struct StatusPanelView: View {
             CaptureCard(title: "Capture your first account")
                 .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
 
-        case .connecting, .starting, .notRunning, .unsupported, .crashLooping:
+        case .connecting, .starting, .unsupported, .crashLooping:
             // No trustworthy reading to show — a plain honest message card. `.crashLooping` (#169) holds
             // here too: the daemon served a snapshot but keeps dropping before it stabilizes, so its
             // numbers are refused ("holding status until it stays up") rather than flickered as live —
-            // the crown-jewel anti-#137 debounce. `.starting` / `.notRunning` (#499) are the cold-refused
-            // daemon-absent states: neither ever held a reading, so both render the honest banner card. The
-            // not-running state WOULD host a "Start daemon" button — launch-at-login is #170 (deferred,
-            // signing-blocked), so it degrades to the inert explanatory banner (no button yet). (The fuller
-            // per-state message-card fidelity and the lifecycle affordances — View log / Restart / Start —
-            // are #169 / #170 siblings.)
+            // the crown-jewel anti-#137 debounce. `.starting` (#499) is the cold-refused daemon-absent
+            // state that never held a reading, so it renders the honest banner card. (`.notRunning` is its
+            // sibling but now carries the #170 Start affordance — see the dedicated branch below.)
             Divider().padding(.horizontal, 14)
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
+                .padding(.horizontal, 14).padding(.vertical, 14)
+
+        case .notRunning:
+            // The daemon is installed-but-down (#499): it never held a reading, so — like its `.starting`
+            // sibling — it shows the honest "Daemon not running" banner. Unlike the others it ALSO hosts the
+            // #170 Start affordance: `StartDaemonCard` reuses that banner and, ONLY where a bundled agent is
+            // registrable and no CLI owns the label (`loginItem.canStartDaemon`), offers a "Start daemon"
+            // button that registers + launches the agent via `SMAppService`. In the #170 shipped state no
+            // plist is bundled yet (that co-lands with #171), so `canStartDaemon` is false and the card is
+            // exactly the inert banner it was before — never a dead button. (View log / Restart remain
+            // #169/#171 siblings.)
+            Divider().padding(.horizontal, 14)
+            StartDaemonCard()
                 .padding(.horizontal, 14).padding(.vertical, 14)
 
         case .disconnected, .reconnecting:
