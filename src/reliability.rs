@@ -201,8 +201,16 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// every schema:7 key is byte-identical and keeps its meaning). The same bump finally POPULATES
 /// `blind_projection_error.n_swapped_away` / `.n_never_recovered`, which schema:7 always emitted as
 /// `null`: a value-domain fill of two already-present, already-documented nullable keys, not a key
-/// change — a consumer that already handled the documented `null` handles the number.
-const JSON_SCHEMA_VERSION: u32 = 8;
+/// change — a consumer that already handled the documented `null` handles the number. Bumped
+/// `8 → 9` (issue #719) when the `all_exhausted` capacity-hold segregation added the top-level
+/// `capacity_held` object and `landing.capacity_held` — both ADDITIVE (new always-present fields).
+/// The bump ALSO carries a value-domain SEMANTIC correction with no key change: `swap_overshoot`
+/// (the #363 gate) and `landing` now EXCLUDE capacity-held swaps — #363 was always scoped to
+/// exclude the all-exhausted condition, so folding them in was the latent defect; their `n`/
+/// percentiles now reflect reaction-latency only, and the excluded population reads from
+/// `capacity_held` / `landing.capacity_held`. A consumer reading `swap_overshoot.met.p100` now gets
+/// the honest gate verdict; the pre-9 total is reconstructable as `swap_overshoot.n + capacity_held.n`.
+const JSON_SCHEMA_VERSION: u32 = 9;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -351,6 +359,14 @@ struct SwapOut {
     /// The decision-point `session_pct` logged at the swap — separates a gap-crossing (already
     /// ≥ ceiling here) from a post-swap tail (fired below, landed at/over).
     decision_pct: u8,
+    /// Whether this swap resolved an `all_exhausted` capacity hold (issue #719): the outgoing
+    /// account was pinned at the ceiling because NO viable target existed, not because a reaction
+    /// was late. `true` when this swap's `to=` matches the `hold=` of the latest unrelieved
+    /// `all_exhausted` — that `hold=` names the soonest-returning spare the relief lands on, so the
+    /// OUTGOING (`from=`) account is the capacity casualty. #363 explicitly EXCLUDES the all-exhausted
+    /// condition, so a held anchor is kept OUT of the landing SLO and counted in
+    /// [`Landing::capacity_held`] instead of a breach class.
+    held: bool,
 }
 
 /// A re-activation edge for the landing filter (issue #595): the instant `acct` becomes the ACTIVE
@@ -396,10 +412,20 @@ struct BlindProjection {
 /// The raw SLI ingredients pulled out of the event log, before aggregation.
 #[derive(Debug, Default, PartialEq)]
 struct Inputs {
-    /// `session_pct` of every `reason=session` swap (the swap-out overshoot distribution).
-    /// weekly (low incidental session_pct, out of scope), `manual`/`forced` (`session_pct=0`),
-    /// and `emergency_swap` (no field) are excluded so they cannot poison the low tail.
+    /// `session_pct` of every CONTROLLABLE `reason=session` swap — the reaction-latency swap-out
+    /// overshoot distribution, the #363 acceptance gate's subject. weekly (low incidental
+    /// session_pct, out of scope), `manual`/`forced` (`session_pct=0`), and `emergency_swap` (no
+    /// field) are excluded so they cannot poison the low tail. Capacity-holds (issue #719) are ALSO
+    /// excluded — routed to [`Inputs::swap_out_held_pcts`] — because #363 excludes the all-exhausted
+    /// condition; folding them here (they land at 100 by construction) dragged P100 to 100 and made
+    /// the gate un-judgeable.
     swap_out_pcts: Vec<f64>,
+    /// `session_pct` of every CAPACITY-HELD `reason=session` swap (issue #719): a swap that resolved
+    /// an `all_exhausted` hold (no viable target — the active account pinned at the ceiling until a
+    /// peer reset), so it is a fleet-CAPACITY limit, not a reaction-latency miss. Reported as its own
+    /// partition beside `swap_out_pcts`; NEVER feeds the #363 gate. `hold=` matched to the swap's
+    /// `from=` at parse time.
+    swap_out_held_pcts: Vec<f64>,
     /// Σ `blind_window.duration_secs` over windows with `near_limit=true`.
     time_blind_near_limit_secs: u64,
     /// `(anchor session_pct, session_at_recovery)` for each `near_limit=true` blind window —
@@ -862,6 +888,14 @@ fn record_blind_projection(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>) {
 /// no second calendar routine is introduced.
 fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
     let mut inputs = Inputs::default();
+    // The pending `all_exhausted` hold (issue #719): the `hold=` account of the latest
+    // `all_exhausted` event not yet relieved by a swap. `all_exhausted` is edge-triggered (one event
+    // on entering the exhausted state), and a swap is its relief edge. `hold=` names the soonest-
+    // returning SPARE the daemon holds out for (not the pinned-active account), so the relief swap
+    // lands on it — a `reason=session` swap whose `to=` equals this pending hold resolved a capacity
+    // hold (no viable target); its OUTGOING account was pinned at the ceiling, NOT a reaction-latency
+    // miss. Reset to `None` on ANY swap (the relief), so it never leaks past the swap it belongs to.
+    let mut exhausted_hold: Option<String> = None;
     for (seq, line) in text.lines().enumerate() {
         // Field map from the whitespace-separated `key=val` tokens. Handles/values are
         // whitespace-free by the log's grammar, so tokenizing on spaces is exact.
@@ -908,6 +942,23 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 // account's landing window closes the instant it becomes active again
                 // (`active_at != acct`), whatever the reason of the swap that revives it.
                 record_reactivation_edge(&mut inputs, &fields, "to");
+                // Capacity-hold classification (issue #719): a swap is the relief edge for a pending
+                // `all_exhausted` hold. The daemon's `all_exhausted hold=` names the SOONEST-RETURNING
+                // SPARE it is holding out for — `all_exhausted_relief` skips the active account and
+                // returns a blocked peer — so the relief swap lands ON that spare: `hold=` matches the
+                // swap's `to=`, NOT its `from=`. (Verified against the live event log: hold==to in 11/11
+                // relief swaps, hold==from in 0.) The OUTGOING account (`from=`) is the one that was
+                // pinned at the ceiling while no target was viable, so its high swap-out `session_pct`
+                // is a fleet-CAPACITY limit, not a reaction-latency miss — that is what the `held` flag
+                // segregates out of the #363 gate. Capture the match BEFORE the reason-specific
+                // `continue`s, then clear the pending hold unconditionally — a swap of ANY reason ends
+                // the hold context (the daemon re-emits `all_exhausted` if the hold persists), so the
+                // flag never leaks to a later swap.
+                let held_by_exhaustion = matches!(
+                    (exhausted_hold.as_deref(), fields.get("to").copied()),
+                    (Some(hold), Some(to)) if hold == to
+                );
+                exhausted_hold = None;
                 // #452 preemptive swaps (reason=blind_preempt, ADR-0017): count each observed one
                 // for the false-preempt SLI's REAL numerator, then skip the session-overshoot
                 // accounting below — a preemptive swap fires on a STALE anchor, not a fresh reading,
@@ -939,10 +990,18 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                     continue;
                 }
                 if let Some(pct) = fields.get("session_pct").and_then(|v| v.parse::<u8>().ok()) {
-                    inputs.swap_out_pcts.push(f64::from(pct));
+                    // Partition (issue #719): a capacity-held swap-out is a fleet-capacity limit, not
+                    // a reaction-latency miss — it feeds the held distribution, never the #363 gate.
+                    if held_by_exhaustion {
+                        inputs.swap_out_held_pcts.push(f64::from(pct));
+                    } else {
+                        inputs.swap_out_pcts.push(f64::from(pct));
+                    }
                     // Landing anchor (issue #595): the reconstruction needs the WHO (`from=`) and
                     // WHEN (`ts=`) to window this parked account's post-swap samples. A line missing
-                    // either still fed the pct above, but cannot open a window — not an anchor.
+                    // either still fed the pct above, but cannot open a window — not an anchor. The
+                    // `held` flag (issue #719) carries the same capacity-hold classification forward so
+                    // the landing SLI segregates it too.
                     if let (Some(ts), Some(from)) = (
                         fields.get("ts").copied().and_then(epoch_from_rfc3339),
                         fields.get("from").copied(),
@@ -951,6 +1010,7 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                             ts,
                             acct: from.to_owned(),
                             decision_pct: pct,
+                            held: held_by_exhaustion,
                         });
                     }
                 }
@@ -1033,6 +1093,13 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 _ => {}
             },
             Some("usage_backoff_cleared") => inputs.cleared = inputs.cleared.saturating_add(1),
+            // The all-accounts-exhausted hold (issue #719): the daemon wants to swap the active
+            // account away but no viable target exists, so it HOLDS the active account (pinned at the
+            // ceiling) until the soonest peer resets. Edge-triggered — one event on entering the state,
+            // naming the pinned account in `hold=`. Record it as the pending hold; the next swap of
+            // `from=`==`hold=` resolved it and is a CAPACITY limit, not a reaction-latency miss (#363
+            // explicitly excludes the all-exhausted condition). `cause=`/`resets_at=` are informational.
+            Some("all_exhausted") => exhausted_hold = fields.get("hold").map(|h| h.to_string()),
             // An emergency swap (issue #405 dead-active escape) is a DISTINCT event token, but it too
             // moves the active account onto `to=` — so it is a re-activation edge for the #595 landing
             // filter, exactly like a normal swap-in. It is NOT a session overshoot, so — unlike the
@@ -1100,6 +1167,20 @@ impl SwapOvershoot {
     }
 }
 
+/// The capacity-held swap-out distribution (issue #719): the `session_pct` percentiles over the
+/// `reason=session` swaps that resolved an `all_exhausted` hold — a fleet-CAPACITY limit (no viable
+/// target), NOT a reaction-latency miss, so segregated from [`SwapOvershoot`] and carrying NO
+/// target/`met` gate (#363 explicitly excludes the all-exhausted condition). Reported beside the
+/// gate so the excluded population stays visible (and feeds the separate fleet-capacity problem)
+/// rather than silently vanishing. Same cardinality-zero discipline: `None` with no held swaps.
+#[derive(Debug, PartialEq)]
+struct CapacityHeld {
+    n: usize,
+    p50: Option<u8>,
+    p95: Option<u8>,
+    p100: Option<u8>,
+}
+
 /// The projective swap-out session_pct distribution (issue #539, ADR-0017): the `session_pct`
 /// percentiles over `reason=velocity_preempt` swaps — how high each account had actually climbed when
 /// its projective swap fired (the OBSERVED pct, NOT projection error; issue #635). The COVERED-swap
@@ -1157,6 +1238,12 @@ struct Landing {
     /// Measured episodes that fired BELOW the ceiling but LANDED at/over it: the post-swap committed
     /// tail — the invisible ~46% this SLI exists to expose (issue #595 breach class 1).
     post_swap_tail: usize,
+    /// Anchors excluded as `all_exhausted` capacity holds (issue #719): the outgoing account was
+    /// pinned at the ceiling with no viable target, so it is a fleet-capacity limit, not a landing
+    /// overshoot. Kept OUT of `swaps_total`/the percentiles/the breach classes above and counted
+    /// here so the excluded population stays visible — the landing counterpart of
+    /// [`CapacityHeld`].
+    capacity_held: usize,
 }
 
 impl Landing {
@@ -1221,8 +1308,17 @@ fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
     let mut n_unmeasured = 0usize;
     let mut gap_crossing = 0usize;
     let mut post_swap_tail = 0usize;
+    let mut capacity_held = 0usize;
 
     for swap in &inputs.session_swaps {
+        // Capacity holds (issue #719) are excluded from the landing SLO entirely — the outgoing
+        // account was pinned at the ceiling with no viable target (a fleet-capacity limit), so its
+        // at-ceiling "landing" is not a reaction-latency overshoot. Counted separately, so it neither
+        // inflates the percentiles nor masquerades as a `gap_crossing` breach.
+        if swap.held {
+            capacity_held += 1;
+            continue;
+        }
         let window_end = swap.ts.saturating_add(LANDING_WINDOW_SECS);
         // The parked window closes at the earliest re-activation of THIS account after the swap, when
         // one falls inside the window — samples at/after it read the now-ACTIVE account, not the
@@ -1270,7 +1366,9 @@ fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
         (n > 0).then(|| crate::percentile::percentile(&landing_pcts, p) as u8)
     };
     Landing {
-        swaps_total: inputs.session_swaps.len(),
+        // Clean reaction-latency anchors only (issue #719): the capacity-held anchors are excluded
+        // from the coverage denominator so `n_measured + n_unmeasured == swaps_total` still holds.
+        swaps_total: inputs.session_swaps.len() - capacity_held,
         n_measured: n,
         n_unmeasured,
         p50: pct(0.50),
@@ -1278,6 +1376,7 @@ fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
         p100: pct(1.0),
         gap_crossing,
         post_swap_tail,
+        capacity_held,
     }
 }
 
@@ -1417,6 +1516,10 @@ struct Report {
     /// the renderers document the bound; the SLIs are already windowed by [`parse_events`].
     window: Option<Window>,
     swap_overshoot: SwapOvershoot,
+    /// The #719 capacity-held swap-out partition — `reason=session` swaps that resolved an
+    /// `all_exhausted` hold, segregated from `swap_overshoot` (the #363 gate) as a fleet-capacity
+    /// limit rather than a reaction-latency miss.
+    capacity_held: CapacityHeld,
     /// The #539 velocity-projection covered-swap session_pct (`reason=velocity_preempt` percentiles).
     projective_swap_out_pct: ProjectiveSwapOutPct,
     /// The #595 landing-point overshoot — where `reason=session` swaps actually landed (post-swap
@@ -1456,6 +1559,20 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         p50: pct(0.50),
         p95: pct(0.95),
         p100: pct(1.0),
+    };
+
+    // The #719 capacity-held partition — the `reason=session` swaps that resolved an `all_exhausted`
+    // hold, segregated from the reaction-latency gate above. Its own cardinality gate, so an empty
+    // partition renders `None` rather than a fabricated `0`.
+    let held_n = inputs.swap_out_held_pcts.len();
+    let held_pct = |p: f64| -> Option<u8> {
+        (held_n > 0).then(|| crate::percentile::percentile(&inputs.swap_out_held_pcts, p) as u8)
+    };
+    let capacity_held = CapacityHeld {
+        n: held_n,
+        p50: held_pct(0.50),
+        p95: held_pct(0.95),
+        p100: held_pct(1.0),
     };
 
     // The #539 projective swap-out session_pct — the same percentile discipline over the
@@ -1553,6 +1670,7 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
     Report {
         window,
         swap_overshoot,
+        capacity_held,
         projective_swap_out_pct,
         landing: compute_landing(inputs, samples),
         observed_peak,
@@ -1603,7 +1721,10 @@ fn render_human(r: &Report) -> String {
         ));
     }
 
-    // SLI 1 — swap-out session_pct percentiles vs targets.
+    // SLI 1 — swap-out session_pct percentiles vs targets. The #363 acceptance gate, measured over
+    // CONTROLLABLE reaction-latency swaps only: `all_exhausted` capacity-holds (issue #719) are
+    // segregated into the block below, since #363 excludes the all-exhausted condition (folding them
+    // in dragged P100 to an unreachable 100).
     match (
         r.swap_overshoot.p50,
         r.swap_overshoot.p95,
@@ -1611,7 +1732,7 @@ fn render_human(r: &Report) -> String {
     ) {
         (Some(p50), Some(p95), Some(p100)) => {
             out.push_str(&format!(
-                "swap-out session_pct (reason=session), n={}\n",
+                "swap-out session_pct (reason=session, reaction-latency), n={}\n",
                 r.swap_overshoot.n
             ));
             out.push_str(&format!(
@@ -1624,7 +1745,22 @@ fn render_human(r: &Report) -> String {
                 ok_flag(p100 < SLO_SWAP_P100_MAX)
             ));
         }
-        _ => out.push_str("swap-out session_pct (reason=session): no swaps observed\n"),
+        _ => out.push_str(
+            "swap-out session_pct (reason=session, reaction-latency): no swaps observed\n",
+        ),
+    }
+    // The #719 capacity-held partition — reason=session swaps that resolved an `all_exhausted` hold
+    // (no viable target). A fleet-CAPACITY limit, NOT reaction-latency, so OUT of the #363 gate; shown
+    // here (only when non-empty) so the excluded population stays visible. No target flags — it gates
+    // nothing. All at/near the ceiling by construction (the active was pinned there).
+    if let (n @ 1.., Some(p50), Some(p100)) =
+        (r.capacity_held.n, r.capacity_held.p50, r.capacity_held.p100)
+    {
+        out.push_str(&format!(
+            "capacity-held (reason=session, all_exhausted — no viable target; out of #363 scope), n={n}\n"
+        ));
+        out.push_str(&format!("  P50  = {p50}\n"));
+        out.push_str(&format!("  P100 = {p100}\n"));
     }
     out.push('\n');
 
@@ -1679,6 +1815,15 @@ fn render_human(r: &Report) -> String {
                 "  breach classes: {} post-swap tail (fired < {SLO_SWAP_P100_MAX}, landed >= {SLO_SWAP_P100_MAX}); {} gap-crossing (decision >= {SLO_SWAP_P100_MAX}); blind-burn: see time-blind SLI (issue #583)\n",
                 r.landing.post_swap_tail, r.landing.gap_crossing
             ));
+            // Capacity-holds (issue #719) are EXCLUDED from the percentiles + breach classes above,
+            // so a `gap-crossing` count is now honest reaction-latency only. Surface the excluded
+            // tally when non-zero so the segregation is visible on this SLI too.
+            if r.landing.capacity_held > 0 {
+                out.push_str(&format!(
+                    "  capacity-held (all_exhausted, excluded — out of #363 scope): {}\n",
+                    r.landing.capacity_held
+                ));
+            }
         }
         _ if r.landing.swaps_total == 0 => out.push_str(
             "landing-point session_pct (post-swap peak of the outgoing account): no reason=session swaps observed\n",
@@ -1855,6 +2000,9 @@ struct ReliabilityWire {
     /// keys still parses every prior field. When present, the four SLIs below are bounded to it.
     window: Option<WindowWire>,
     swap_overshoot: SwapOvershootWire,
+    /// The #719 capacity-held partition (schema:9, additive) — `reason=session` swaps that resolved an
+    /// `all_exhausted` hold, segregated from `swap_overshoot` (the #363 gate) as a fleet-capacity limit.
+    capacity_held: CapacityHeldWire,
     /// The #539 velocity-projection covered-swap session_pct (schema:3; key renamed at schema:6, issue #635).
     projective_swap_out_pct: ProjectiveSwapOutPctWire,
     /// The #595 landing-point overshoot — where reason=session swaps actually landed (schema:4, additive).
@@ -1903,6 +2051,17 @@ struct SwapOvershootWire {
 struct SwapTargetsWire {
     p50_max: u8,
     p100_max: u8,
+}
+
+/// The #719 capacity-held swap-out block: the `reason=session` swaps excluded from the #363 gate as
+/// `all_exhausted` capacity-holds (no viable target — a fleet-capacity limit). No `targets`/`met` — it
+/// gates nothing; `null` percentiles with no held swaps (an empty subject is not a passing `0`).
+#[derive(serde::Serialize)]
+struct CapacityHeldWire {
+    n: usize,
+    p50: Option<u8>,
+    p95: Option<u8>,
+    p100: Option<u8>,
 }
 
 /// Per-target PASS flags — `null` when the corresponding percentile has no data.
@@ -1955,6 +2114,10 @@ struct LandingWire {
     p100_met: Option<bool>,
     /// The issue #595 breach-class split over the measured episodes.
     classes: LandingClassesWire,
+    /// Anchors excluded as `all_exhausted` capacity holds (schema:9, issue #719) — kept out of
+    /// `swaps_total` / the percentiles / the breach classes, counted here so the excluded population
+    /// stays visible. The landing counterpart of the top-level `capacity_held` block.
+    capacity_held: usize,
 }
 
 /// The landing-point breach classes (issue #595): the two the readout computes directly; blind-burn
@@ -2137,6 +2300,12 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 p100: r.swap_overshoot.p100_met(),
             },
         },
+        capacity_held: CapacityHeldWire {
+            n: r.capacity_held.n,
+            p50: r.capacity_held.p50,
+            p95: r.capacity_held.p95,
+            p100: r.capacity_held.p100,
+        },
         projective_swap_out_pct: ProjectiveSwapOutPctWire {
             n: r.projective_swap_out_pct.n,
             p50: r.projective_swap_out_pct.p50,
@@ -2165,6 +2334,7 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 post_swap_tail: r.landing.post_swap_tail,
                 gap_crossing: r.landing.gap_crossing,
             },
+            capacity_held: r.landing.capacity_held,
         },
         observed_peak: ObservedPeakWire {
             n: r.observed_peak.n,
@@ -2301,6 +2471,9 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         let inputs = parse_events(FIXTURE_LOG, None);
         // reason=session swaps ONLY — weekly (42), manual (0), and emergency all dropped (#455 Finding 1).
         assert_eq!(inputs.swap_out_pcts, vec![96.0, 100.0]);
+        // #719: no all_exhausted in FIXTURE_LOG → no swap is capacity-held; both reason=session swaps
+        // stay in the reaction-latency bucket above, the held partition is empty.
+        assert!(inputs.swap_out_held_pcts.is_empty());
         // Only near_limit=true windows: 300 + 600 (the near_limit=false 120 is excluded).
         assert_eq!(inputs.time_blind_near_limit_secs, 900);
         assert_eq!(inputs.near_limit_reconciliations, vec![(97, 99), (96, 40)]);
@@ -2334,6 +2507,10 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         assert_eq!(r.false_preempt.would_be_wasted, 1);
         assert_eq!(r.false_preempt.preemptive_swaps_observed, 0);
         assert_eq!(r.rate_limit.rate_limited, 2);
+        // #719: no all_exhausted → the capacity-held partition is empty and the landing SLI excludes
+        // nothing; the reaction-latency gate above sees both swaps.
+        assert_eq!(r.capacity_held.n, 0);
+        assert_eq!(r.landing.capacity_held, 0);
     }
 
     #[test]
@@ -2445,6 +2622,61 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
         assert_eq!(r.swap_overshoot.p100_met(), Some(true));
     }
 
+    // --- issue #719: all_exhausted capacity-holds segregated from the #363 reaction-latency gate ---
+
+    #[test]
+    fn all_exhausted_holds_are_segregated_from_the_reaction_latency_gate() {
+        // AC #5: a swap that resolved an `all_exhausted` capacity-hold (the OUTGOING account was
+        // pinned at the ceiling because ALL peers were exhausted — no viable target) is NOT a
+        // reaction-latency miss, so it must not count against the #363 P100 gate; a plain climb→swap
+        // in the same log MUST still count. The discriminator is `hold == to`: `all_exhausted hold=`
+        // names the soonest-returning SPARE the daemon holds out for, and the relief swap lands ON it
+        // (verified against the live event log — hold==to, never hold==from). The hold is reset on ANY
+        // swap (the relief edge), so a later swap is clean again.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=a to=b reason=session session_pct=96
+ts=2026-07-11T00:01:00Z event=all_exhausted hold=c cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:02:00Z event=swap from=b to=c reason=session session_pct=100
+ts=2026-07-11T00:03:00Z event=swap from=c to=a reason=session session_pct=98
+";
+        let inputs = parse_events(log, None);
+        // The two plain climbs stay in the reaction-latency bucket; the hold-resolving swap (100, its
+        // `to=c` matching the awaited spare `hold=c`, its pinned `from=b` the capacity casualty) is
+        // segregated out. Reset-on-swap: the c→a swap is clean despite the earlier exhaustion, because
+        // the b→c swap already consumed (cleared) the hold.
+        assert_eq!(inputs.swap_out_pcts, vec![96.0, 98.0]);
+        assert_eq!(inputs.swap_out_held_pcts, vec![100.0]);
+
+        let r = aggregate(&inputs, &[], None);
+        // Reaction-latency gate (#363) sees only the clean climbs: P100=98 < 99 → MET. The 100 does
+        // NOT drag it to an unreachable breach.
+        assert_eq!(r.swap_overshoot.n, 2);
+        assert_eq!(r.swap_overshoot.p100, Some(98));
+        assert_eq!(r.swap_overshoot.p100_met(), Some(true));
+        // The capacity-held partition carries the excluded swap, out of the gate.
+        assert_eq!(r.capacity_held.n, 1);
+        assert_eq!(r.capacity_held.p100, Some(100));
+        // Landing SLI segregates too: the held anchor is excluded from swaps_total and surfaced as a
+        // capacity_held count, never mislabeled gap-crossing.
+        assert_eq!(r.landing.swaps_total, 2);
+        assert_eq!(r.landing.capacity_held, 1);
+    }
+
+    #[test]
+    fn a_relief_swap_to_a_different_account_than_the_hold_is_not_capacity_held() {
+        // The discriminator is precise: `all_exhausted hold=` names ONE awaited spare; a swap whose
+        // `to=` is a DIFFERENT account did not land on that spare, so it did not resolve THAT hold and
+        // stays a reaction-latency swap. Guards against over-counting every swap after any exhaustion
+        // as capacity-held.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=all_exhausted hold=x cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:01:00Z event=swap from=y to=z reason=session session_pct=99
+";
+        let inputs = parse_events(log, None);
+        assert_eq!(inputs.swap_out_pcts, vec![99.0]);
+        assert!(inputs.swap_out_held_pcts.is_empty());
+    }
+
     #[test]
     fn human_render_is_stable_and_targets_documented() {
         let out = render_human(&fixture_report());
@@ -2453,7 +2685,7 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
             concat!(
                 "sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log + usage samples)\n",
                 "\n",
-                "swap-out session_pct (reason=session), n=2\n",
+                "swap-out session_pct (reason=session, reaction-latency), n=2\n",
                 "  P50  = 96  target <= 97  [ok]\n",
                 "  P95  = 100\n",
                 "  P100 = 100  target < 99   [OVER]\n",
@@ -2497,13 +2729,15 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
     fn human_render_handles_no_swaps() {
         let out = render_human(&aggregate(&parse_events("", None), &[], None));
         assert!(
-            out.contains("swap-out session_pct (reason=session): no swaps observed"),
+            out.contains(
+                "swap-out session_pct (reason=session, reaction-latency): no swaps observed"
+            ),
             "cardinality-zero must not print a fabricated P100: {out}"
         );
     }
 
     #[test]
-    fn json_render_is_stable_schema_8() {
+    fn json_render_is_stable_schema_9() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
         // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
@@ -2521,12 +2755,17 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
         // point: the uncensored 999 s episode is published BESIDE the censored 900 s figure, never
         // summed into it. A `--since` document is asserted separately in
         // `json_documents_the_active_window`.
+        //
+        // schema:9 (issue #719) adds the top-level `capacity_held` object (between `swap_overshoot`
+        // and `projective_swap_out_pct`) and `landing.capacity_held` — both ADDITIVE and always
+        // present. FIXTURE_LOG carries no all_exhausted, so both read empty (n=0 / all-null / 0): the
+        // segregation is inert here, so every prior figure is byte-unchanged but for the schema bump.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 8,\n",
+                "  \"schema\": 9,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -2541,6 +2780,12 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "      \"p50\": true,\n",
                 "      \"p100\": false\n",
                 "    }\n",
+                "  },\n",
+                "  \"capacity_held\": {\n",
+                "    \"n\": 0,\n",
+                "    \"p50\": null,\n",
+                "    \"p95\": null,\n",
+                "    \"p100\": null\n",
                 "  },\n",
                 "  \"projective_swap_out_pct\": {\n",
                 "    \"n\": 0,\n",
@@ -2569,7 +2814,8 @@ ts=2026-07-11T00:02:00Z event=swap from=a to=b reason=session session_pct=97
                 "    \"classes\": {\n",
                 "      \"post_swap_tail\": 0,\n",
                 "      \"gap_crossing\": 0\n",
-                "    }\n",
+                "    },\n",
+                "    \"capacity_held\": 0\n",
                 "  },\n",
                 "  \"observed_peak\": {\n",
                 "    \"n\": 1,\n",
@@ -3213,7 +3459,9 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
 
         let human = render_human(&r);
         assert!(
-            human.contains("swap-out session_pct (reason=session): no swaps observed"),
+            human.contains(
+                "swap-out session_pct (reason=session, reaction-latency): no swaps observed"
+            ),
             "windowed cardinality-zero must not fabricate a percentile: {human}"
         );
         let json = render_json(&r).expect("serializes");
@@ -3249,7 +3497,7 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 8,"), "schema bumped to 8: {out}");
+        assert!(out.contains("\"schema\": 9,"), "schema bumped to 9: {out}");
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",
@@ -3527,11 +3775,13 @@ ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive
                     ts: epoch("2026-07-11T00:00:00Z"),
                     acct: "oleksii@pelykh.com".to_owned(),
                     decision_pct: 96,
+                    held: false,
                 },
                 SwapOut {
                     ts: epoch("2026-07-11T00:06:00Z"),
                     acct: "oleksii@pelykh.com".to_owned(),
                     decision_pct: 100,
+                    held: false,
                 },
             ]
         );
