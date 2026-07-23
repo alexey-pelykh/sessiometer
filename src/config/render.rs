@@ -125,6 +125,11 @@ impl Config {
                     t.canary_drift_override.to_string(),
                     present("tunables", "canary_drift_override"),
                 ),
+                entry(
+                    "canary_nostashmatch_override",
+                    t.canary_nostashmatch_override.to_string(),
+                    present("tunables", "canary_nostashmatch_override"),
+                ),
             ],
         };
 
@@ -481,6 +486,21 @@ impl Config {
         out.push_str(&format!(
             "canary_drift_override = {}\n",
             t.canary_drift_override
+        ));
+        out.push_str(
+            "# Keychain-identity canary NoStashMatch shape-gate override (issue #730): when\n\
+             # the pre-swap canary finds the resolved canonical matches NO account stash AND\n\
+             # does not parse as a Claude Code credential (overwhelmingly an UNRELATED secret\n\
+             # under the derived service), the daemon refuses the credential write so an atomic\n\
+             # in-place overwrite cannot clobber it. Set true ONLY once you have vetted the\n\
+             # canonical as safe (e.g. a legitimate NEW Claude Code credential format to be\n\
+             # re-stashed): the write then proceeds, each logged with overridden=true. Separate\n\
+             # from canary_drift_override; a well-formed unmatched canonical fails open\n\
+             # regardless. Default false.\n",
+        );
+        out.push_str(&format!(
+            "canary_nostashmatch_override = {}\n",
+            t.canary_nostashmatch_override
         ));
 
         // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the

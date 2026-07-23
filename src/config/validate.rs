@@ -235,6 +235,7 @@ impl Config {
             monitor_recovery_m: t.monitor_recovery_m as u8,
             fleet_runway_warn_secs: t.fleet_runway_warn_secs as u64,
             canary_drift_override: t.canary_drift_override,
+            canary_nostashmatch_override: t.canary_nostashmatch_override,
             poll_strategy: Strategy {
                 base: t.poll_secs as f64,
                 jitter: poll_jitter,

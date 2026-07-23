@@ -801,6 +801,19 @@ pub(crate) enum Event {
         matched: String,
         overridden: bool,
     },
+    /// The behavioral canary (issue #730) refused a credential write because the resolved
+    /// canonical matches NO account stash AND does not parse as a Claude Code credential —
+    /// overwhelmingly an UNRELATED secret an atomic `-U` upsert would clobber unrecoverably.
+    /// Unless `overridden` (the dedicated `canary_nostashmatch_override` tunable let the write
+    /// proceed), the write is refused (pre-mutation, zero writes); reads / poll / `status` stay
+    /// live. Emitted at the REFUSAL site (the daemon pre-swap gate and the standalone daemon-down
+    /// `use` path) — one line per refused/overridden attempt. This is the COMPENSATING operator
+    /// signal for the deliberately-`inconclusive` status wire: the identity verdict IS genuinely
+    /// inconclusive, the refuse is a policy on top with no `status` surface of its own, so
+    /// (unlike edge-triggered [`Event::CanaryDrift`]) per-attempt logging is the honest "one line
+    /// = one blocked swap" record. Secret-free (issue #15): only the `overridden` flag, never a
+    /// token or the canonical's bytes.
+    CanaryUnparseableCanonical { overridden: bool },
     /// The behavioral canary's FRESH Layer-1 resolution probe (issue #714) found MORE THAN ONE
     /// item under the derived canonical service — the #100 uniqueness rule fails, so the
     /// derivation no longer addresses a single credential and the atomic in-place write has no
@@ -1480,6 +1493,12 @@ impl Event {
                 format!(
                     "ts={ts} event=canary_drift displayed={displayed} matched={matched}{overridden}"
                 )
+            }
+            Event::CanaryUnparseableCanonical { overridden } => {
+                // `overridden` trails conditionally (the same idiom as `canary_drift`),
+                // appearing exactly when `canary_nostashmatch_override` let the write proceed.
+                let overridden = if *overridden { " overridden=true" } else { "" };
+                format!("ts={ts} event=canary_unparseable_canonical{overridden}")
             }
             Event::CanaryAmbiguous { count } => {
                 format!("ts={ts} event=canary_ambiguous count={count}")
@@ -2796,6 +2815,28 @@ mod tests {
         assert_eq!(
             line,
             format!("{TS0} event=credential_restored account=work")
+        );
+    }
+
+    #[test]
+    fn canary_unparseable_canonical_trails_the_override_only_when_it_fired() {
+        // Issue #730: the fail-CLOSED refusal of an unparseable no-stash-match canonical logs one
+        // line per attempt. `overridden` trails EXACTLY when `canary_nostashmatch_override` let the
+        // write proceed anyway — the refused (default) line stays minimal and carries NO
+        // `overridden=` token at all, so an operator grepping `event=canary_unparseable_canonical`
+        // without `overridden=true` sees only genuine refusals. Redaction-clean (#15): the line is
+        // pure classification — never a token, email, or canonical byte. Pinned byte-exact here
+        // because the integration `log.contains(...)` assertions cannot catch a malformed spacing
+        // or a stray `overridden=false` leaking into the refused branch.
+        let refused =
+            Event::CanaryUnparseableCanonical { overridden: false }.to_log_line(at_epoch(0));
+        assert_eq!(refused, format!("{TS0} event=canary_unparseable_canonical"));
+
+        let overridden =
+            Event::CanaryUnparseableCanonical { overridden: true }.to_log_line(at_epoch(0));
+        assert_eq!(
+            overridden,
+            format!("{TS0} event=canary_unparseable_canonical overridden=true")
         );
     }
 

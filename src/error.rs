@@ -539,6 +539,28 @@ pub(crate) enum Error {
         matched: String,
     },
 
+    /// The behavioral canary's pre-swap cross-check found the resolved canonical
+    /// credential matches NO account stash AND does not parse as a Claude Code
+    /// credential (issue #730): overwhelmingly an UNRELATED secret under the derived
+    /// service (a future CC storage-format change), NOT Claude Code's own item. The
+    /// credential WRITE is refused pre-mutation (ZERO writes; an atomic in-place `-U`
+    /// overwrite would clobber that secret unrecoverably) unless the operator set the
+    /// dedicated `canary_nostashmatch_override` (separate from `canary_drift_override`);
+    /// reads / poll / `status` stay live. A well-formed unmatched canonical (a benign
+    /// in-place refresh) never reaches here — it fails OPEN. A generic exit `1`, like
+    /// its sibling [`Error::CanaryDrift`] — not a "retry shortly" (`4`) condition,
+    /// since the shape mismatch does not clear on its own. Secret-free (issue #15): no
+    /// token bytes, no credential content.
+    #[error(
+        "refusing the credential write: the keychain-identity canary found the active canonical \
+         credential matches no account stash and does not parse as a Claude Code credential — an \
+         atomic in-place overwrite would clobber an unrelated secret unrecoverably. Investigate \
+         with `sessiometer status`; if this canonical is a legitimate new Claude Code credential \
+         format, set `canary_nostashmatch_override = true` under `[tunables]` in config.toml and \
+         restart the daemon"
+    )]
+    CanaryUnparseableCanonical,
+
     // --- Daemon-routed swap (issue #167) -------------------------------------
     /// The running daemon performed a `use` swap on our behalf (issue #167 — `use`
     /// routes THROUGH the daemon when one is up) and its swap engine aborted for a

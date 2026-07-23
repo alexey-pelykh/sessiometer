@@ -69,7 +69,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::active;
-use crate::canary::{self, CanaryOutcome};
+use crate::canary::{self, CanaryOutcome, InconclusiveReason};
 use crate::config::{Account, Config};
 use crate::daemon::{
     AccountStatusLine, RealRosterPoller, RosterPoller, StatusResponse, SwapAck, SwapRejection,
@@ -776,6 +776,20 @@ where
                 });
                 if !overridden {
                     return Err(Error::CanaryDrift { displayed, matched });
+                }
+            }
+            CanaryOutcome::Inconclusive(InconclusiveReason::NoStashMatch {
+                canonical_well_formed: false,
+            }) => {
+                // #730: the resolved canonical matches no stash AND does not parse as a
+                // Claude Code credential — an unrelated secret the atomic `-U` upsert must
+                // NOT clobber. Fail CLOSED unless the dedicated `canary_nostashmatch_override`
+                // is set. Redaction-safe like the drift refusal (the `use` path has no carried
+                // state to edge off, so it emits one line per invocation).
+                let overridden = config.tunables.canary_nostashmatch_override;
+                let _ = log.emit(&Event::CanaryUnparseableCanonical { overridden });
+                if !overridden {
+                    return Err(Error::CanaryUnparseableCanonical);
                 }
             }
             CanaryOutcome::Ok | CanaryOutcome::Inconclusive(_) => {}
@@ -2476,6 +2490,179 @@ mod tests {
         );
         assert!(
             log_text.contains("event=swap from=spare to=work reason=manual"),
+            "the swap itself logs normally: {log_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_proceeds_when_a_well_formed_canonical_matches_no_stash() {
+        // Issue #730 / #714 fail-OPEN on the daemon-DOWN path: the resolved canonical
+        // matches NO stash but STILL parses as a Claude Code credential — overwhelmingly
+        // the active account's own token refreshed in place since it was last stashed
+        // (benign). The shape-gate leaves it fail-OPEN: the standalone `use` swaps, and
+        // NO unparseable-canonical refusal is logged. This pins the branch the refuse arm
+        // depends on — a later widening of the `canonical_well_formed: false` guard would
+        // wrongly refuse a benign refresh here and silently break #714's guarantee.
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&cred(
+                br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-REFRESHED","refreshToken":"sk-ant-ort-RT","expiresAt":1700000000000}}"#,
+            ))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        let (_json_dir, json) = claude_json_for("u-A");
+
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            false,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a well-formed unmatched canonical fails OPEN: {result:?}"
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "the swap rerouted to spare (u-B)"
+        );
+        assert!(
+            !log.contains("event=canary_unparseable_canonical"),
+            "a well-formed canonical is never refused: {log}"
+        );
+        assert!(
+            log.contains("event=swap from=work to=spare reason=manual"),
+            "the swap itself proceeds and logs normally: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_refuses_an_unparseable_canonical_that_matches_no_stash() {
+        // Issue #730 on the daemon-DOWN path: the resolved canonical matches NO stash
+        // AND does not parse as a Claude Code credential — an unrelated secret. The
+        // standalone `use` refuses the credential write with ZERO writes (the same
+        // fail-closed slot as DRIFT), and `--force` does NOT bypass it (SAFETY, not
+        // policy). No display freeze needed: an unmatched canonical leaves the reconcile
+        // a no-op, so the display stands on its own.
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&cred(b"an-unrelated-keychain-secret"))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        let (_json_dir, json) = claude_json_for("u-A");
+
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "spare",
+            true, // --force must NOT bypass the shape-gate
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(Error::CanaryUnparseableCanonical)),
+            "got {result:?}"
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"an-unrelated-keychain-secret",
+            "ZERO writes"
+        );
+        // The refusal is on the durable record, redaction-safe (no token bytes), no swap.
+        assert!(
+            log.contains("event=canary_unparseable_canonical"),
+            "the refused shape-gate is logged: {log}"
+        );
+        assert!(!log.contains("overridden=true"), "no override rode: {log}");
+        assert!(!log.contains("event=swap"), "no swap was written: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_with_the_nostashmatch_override_swaps_through_an_unparseable_canonical() {
+        // Issue #730 AC: `canary_nostashmatch_override = true` lets the standalone `use`
+        // proceed despite an unparseable orphan canonical — the ride is on the durable
+        // record (`overridden=true`) alongside the normal swap event. A DEDICATED switch:
+        // `canary_drift_override` stays default and does not gate this case.
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(b"a-vetted-new-cc-format")).await.unwrap();
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        let (_json_dir, json) = claude_json_for("u-A");
+        let mut config = config_ab();
+        config.tunables.canary_nostashmatch_override = true;
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let poller = FakePoller::new(Probe::Live { weekly: 0.10 });
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
+        let cache = FakeCache::miss();
+
+        let result = run_use(
+            &config,
+            "spare",
+            false,
+            false,
+            Seams {
+                cache: &cache,
+                poller: &poller,
+                store: &store,
+                stash: &stash,
+                claude_json: &json,
+                lock_path: &lock_path,
+                notifier: &notifier,
+            },
+            &mut log,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the override lets the swap run: {result:?}");
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "the canonical rerouted to spare (u-B) despite the unparseable canonical"
+        );
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log_text.contains("event=canary_unparseable_canonical overridden=true"),
+            "the overridden ride is on the record: {log_text}"
+        );
+        assert!(
+            log_text.contains("event=swap from=work to=spare reason=manual"),
             "the swap itself logs normally: {log_text}"
         );
     }

@@ -32,7 +32,11 @@
 //!     (pre-mutation, zero writes);
 //!   - canonical matches NO stash → [`CanaryOutcome::Inconclusive`] — fail OPEN
 //!     (overwhelmingly CC's own `A`-token refreshed in place since we last
-//!     stashed it; never block on "couldn't verify").
+//!     stashed it; never block on "couldn't verify") UNLESS the orphan canonical
+//!     does not even parse as a CC credential (issue #730's shape-gate — see the
+//!     fail-policy note below): a canonical that is not Claude Code's own shape is
+//!     overwhelmingly an UNRELATED secret, so the caller fails CLOSED to keep the
+//!     atomic `-U` upsert from clobbering it.
 //!
 //! The `stash[A]`-FIRST order is load-bearing (the #211 short-circuit's shape): a
 //! canonical matching `stash[A]` is never refused, even if the same bytes also sit
@@ -86,7 +90,15 @@
 //! for a false DRIFT on an unattended daemon. Layer-1 failures have no override:
 //! zero/ambiguous items give an atomic `-U` upsert no unique, safe target, and a
 //! wrongly-addressed write clobbers an unrelated secret unrecoverably
-//! (`src/keychain.rs`). INCONCLUSIVE always proceeds (Layer-1-only).
+//! (`src/keychain.rs`). INCONCLUSIVE proceeds (Layer-1-only) — with ONE hardened
+//! sub-case (issue #730): a `NoStashMatch` whose orphan canonical does not parse
+//! as a CC credential (`canonical_well_formed == false`) is refused at the callers
+//! via the SAME fail-closed slot as DRIFT, protecting an unrelated secret from the
+//! atomic `-U` clobber, unless the dedicated `canary_nostashmatch_override` tunable
+//! (separate from `canary_drift_override`) is set. A well-formed orphan canonical
+//! (a benign in-place refresh) still fails OPEN, exactly as before. The identity
+//! verdict on the wire stays `inconclusive` (the refuse is a daemon-internal
+//! policy, not a new verdict — no schema bump).
 //!
 //! Every surface derived from these types is secret-free by construction (issue
 //! #15): outcomes carry roster INDICES (resolved to operator labels at the event /
@@ -148,10 +160,29 @@ pub(crate) enum InconclusiveReason {
     /// #207 recovery posture (a cleared display with a healthy canonical) lands
     /// here and must keep working, so this can never refuse.
     DisplayUnresolved,
-    /// The resolved canonical token matches NO account's stash — overwhelmingly
-    /// the active account's own token refreshed in place since it was last
-    /// stashed (benign); never block on "couldn't verify".
-    NoStashMatch,
+    /// The resolved canonical token matches NO account's stash. Two sub-cases the
+    /// caller tells apart via `canonical_well_formed` (the #730 shape-check):
+    ///   - `true`  — the orphan canonical still parses as a well-formed Claude Code
+    ///     credential (`{"claudeAiOauth":{accessToken,refreshToken,expiresAt}}`):
+    ///     overwhelmingly the active account's own token refreshed in place since
+    ///     it was last stashed (benign) → fail OPEN, EXACTLY #714's behavior (never
+    ///     block on a token CC simply hasn't restashed);
+    ///   - `false` — the canonical does NOT parse as a CC credential, so it is
+    ///     overwhelmingly NOT Claude Code's own item (a future CC storage-format
+    ///     change leaving an unrelated secret under the derived service): the caller
+    ///     REFUSES the credential write (fail-CLOSED, #730), protecting that secret
+    ///     from the atomic `-U` clobber, unless `canary_nostashmatch_override` is set.
+    ///
+    /// The identity verdict is genuinely INCONCLUSIVE either way (the token matched
+    /// nothing, so identity is unverified); the refuse is a daemon-internal POLICY
+    /// layered on top, and the wire verdict stays `inconclusive` (issue #730 — no
+    /// schema bump).
+    NoStashMatch {
+        /// Whether the orphan canonical parses as a well-formed Claude Code
+        /// credential (issue #730). `false` drives the caller's fail-CLOSED refuse
+        /// of the `-U` clobber; `true` preserves #714's fail-OPEN.
+        canonical_well_formed: bool,
+    },
 }
 
 /// Reconcile `~/.claude.json` to the canonical credential — the shared core of
@@ -265,8 +296,17 @@ where
             return Ok(CanaryOutcome::Drift { displayed, matched });
         }
     }
+    // No stash matched the resolved canonical. #730: shape-check the canonical in
+    // hand — a benign in-place refresh still parses as CC's own credential (fail
+    // OPEN, #714), but a canonical that no longer parses as CC's shape is almost
+    // certainly an unrelated secret the atomic `-U` upsert must NOT clobber (the
+    // caller fails CLOSED). OFFLINE — a local parse of the canonical already read
+    // above, no network / no keychain re-read.
+    let canonical_well_formed = crate::refresh::is_well_formed_credential(canonical.expose());
     Ok(CanaryOutcome::Inconclusive(
-        InconclusiveReason::NoStashMatch,
+        InconclusiveReason::NoStashMatch {
+            canonical_well_formed,
+        },
     ))
 }
 
@@ -288,6 +328,16 @@ mod tests {
 
     fn cred(blob: &[u8]) -> Credential {
         Credential::new(blob.to_vec())
+    }
+
+    /// A well-formed Claude Code credential blob carrying `access_token` — the exact
+    /// `{"claudeAiOauth":{accessToken,refreshToken,expiresAt}}` shape #730 recognizes.
+    /// Used where a NoStashMatch canonical must still parse as CC's own credential.
+    fn cc_blob(access_token: &str) -> Vec<u8> {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access_token}","refreshToken":"sk-ant-ort-RT","expiresAt":1700000000000}}}}"#
+        )
+        .into_bytes()
     }
 
     fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
@@ -411,18 +461,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inconclusive_when_the_canonical_matches_no_stash() {
+    async fn inconclusive_well_formed_when_a_cc_canonical_matches_no_stash() {
         // The overwhelmingly-common benign state: the active account's token
-        // refreshed in place since it was last stashed → no stash matches →
-        // fail OPEN (Layer-1-only), never a refuse.
+        // refreshed in place since it was last stashed → no stash matches. The
+        // orphan canonical STILL parses as a well-formed CC credential (#730), so it
+        // fails OPEN (`canonical_well_formed: true`) — EXACTLY #714's behavior, never
+        // a refuse. (The stashes hold raw non-CC bytes, so the canonical matches
+        // none of them, yet only the ACTIVE canonical's shape gates — active-scoped.)
         let roster = roster_ab();
         let stash = stash_ab().await;
-        let store = store_holding(b"A-refreshed-token").await;
+        let store = store_holding(&cc_blob("sk-ant-oat-REFRESHED")).await;
         let (_dir, json) = claude_json_for("u-A");
         let outcome = run(&store, &stash, &roster, &json).await.unwrap();
         assert_eq!(
             outcome,
-            CanaryOutcome::Inconclusive(InconclusiveReason::NoStashMatch)
+            CanaryOutcome::Inconclusive(InconclusiveReason::NoStashMatch {
+                canonical_well_formed: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn inconclusive_not_well_formed_when_an_unparseable_canonical_matches_no_stash() {
+        // The #730 hardened case: under a FUTURE CC storage-format change the
+        // resolved canonical matches no stash AND no longer parses as a CC credential
+        // — almost certainly an unrelated secret. The canary carries
+        // `canonical_well_formed: false` so the caller can fail CLOSED and protect it
+        // from the `-U` clobber. The identity verdict is still genuinely INCONCLUSIVE
+        // (the refuse is a caller policy on top).
+        let roster = roster_ab();
+        let stash = stash_ab().await;
+        let store = store_holding(b"an-unrelated-keychain-secret").await;
+        let (_dir, json) = claude_json_for("u-A");
+        let outcome = run(&store, &stash, &roster, &json).await.unwrap();
+        assert_eq!(
+            outcome,
+            CanaryOutcome::Inconclusive(InconclusiveReason::NoStashMatch {
+                canonical_well_formed: false
+            })
         );
     }
 

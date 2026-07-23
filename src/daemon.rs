@@ -91,7 +91,7 @@ use std::time::{Duration, Instant};
 
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
-use crate::canary::CanaryOutcome;
+use crate::canary::{CanaryOutcome, InconclusiveReason};
 use crate::claude_state;
 use crate::config::{Account, Config, Tunables, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N};
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
@@ -1665,6 +1665,17 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// write has no unique, safe target under them. `false` (refuse on drift) is
     /// the default and the safe posture.
     canary_drift_override: bool,
+    /// The documented operator override for the issue #730 `NoStashMatch` shape-gate
+    /// (`canary_nostashmatch_override` in `[tunables]`) — DEDICATED, never widened
+    /// from `canary_drift_override`: when `true`, a `NoStashMatch` whose resolved
+    /// canonical does not parse as a Claude Code credential is logged
+    /// (`overridden=true` on the durable `canary_unparseable_canonical` event) but the
+    /// credential write PROCEEDS — the recovery lever once the operator has vetted the
+    /// canonical (e.g. a legitimate NEW Claude Code credential format to be re-stashed).
+    /// A well-formed unmatched canonical fails OPEN regardless; DRIFT and the Layer-1
+    /// refusals are untouched by this switch. `false` (the shape-gate ARMED) is the
+    /// default and the safe posture.
+    canary_nostashmatch_override: bool,
     /// The single-writer swap lock path (issue #64), or `None` to swap WITHOUT the
     /// cross-process lock. `None` is the hermetic-test default — a single-process
     /// test has no second writer to serialize against, so taking a real `flock`
@@ -1845,6 +1856,9 @@ where
             // The #714 canary-drift override — `false` (refuse on drift) by default;
             // the operator's documented false-positive recovery lever.
             canary_drift_override: tunables.canary_drift_override,
+            // The #730 NoStashMatch shape-gate override — `false` (refuse an unparseable
+            // orphan canonical) by default; the operator's documented recovery lever.
+            canary_nostashmatch_override: tunables.canary_nostashmatch_override,
             // No cross-process swap lock by default; production opts in via
             // `with_swap_lock`. See the field's docs for why tests stay lock-free.
             swap_lock_path: None,
@@ -3483,7 +3497,11 @@ where
     /// [`Error::CanaryDrift`] unless the operator set `canary_drift_override`; an
     /// `Ambiguous` / `NotFound` verdict refuses with the matching resolution
     /// error (no override — an atomic in-place write has no unique, safe target);
-    /// `Ok` / `Inconclusive` proceed (never block on "couldn't verify"). A canary
+    /// `Ok` / `Inconclusive` proceed (never block on "couldn't verify") — EXCEPT the
+    /// issue #730 sub-case where an `Inconclusive(NoStashMatch)` whose canonical does
+    /// not parse as a Claude Code credential refuses with
+    /// [`Error::CanaryUnparseableCanonical`] unless `canary_nostashmatch_override` is
+    /// set, protecting an unrelated secret from the atomic `-U` clobber. A canary
     /// that cannot RUN (`Err` — locked keychain) aborts exactly as the engine's
     /// own up-front read would, holding the last verdict. The canary runs OUTSIDE
     /// the swap lock (keychain enumeration + stash reads are slow; the lock's
@@ -3515,6 +3533,24 @@ where
                 // the episode's ENTRY with `overridden=true` (edge-triggered — later
                 // rides in the same episode log only their `Event::Swap`), and the
                 // status wire carries the standing `overridden: true` the whole time.
+            }
+            CanaryOutcome::Inconclusive(InconclusiveReason::NoStashMatch {
+                canonical_well_formed: false,
+            }) => {
+                // #730: the resolved canonical matches no stash AND does not parse as a
+                // Claude Code credential — overwhelmingly an unrelated secret the atomic
+                // `-U` upsert must NOT clobber. Fail CLOSED unless the dedicated override
+                // is set. `refresh_canary` above mapped this to `CanaryStatus::Inconclusive`
+                // (no schema bump — the identity verdict IS inconclusive), so it emitted no
+                // alarm event; log the refusal HERE, the compensating operator signal for
+                // the deliberately-quiet wire — one line per refused/overridden attempt.
+                let overridden = self.canary_nostashmatch_override;
+                events.push(Event::CanaryUnparseableCanonical { overridden });
+                if !overridden {
+                    return Err(Error::CanaryUnparseableCanonical);
+                }
+                // Override set: proceed despite the unparseable canonical (a vetted new CC
+                // credential format the operator will re-stash) — the ride is logged above.
             }
             CanaryOutcome::Ok | CanaryOutcome::Inconclusive(_) => {}
         }
@@ -5764,6 +5800,10 @@ mod tests {
             // Issue #714 canary drift override: OFF (the shipped default) so the pre-swap canary
             // refuses on drift; the canary tests that exercise the override set it explicitly.
             canary_drift_override: false,
+            // Issue #730 NoStashMatch shape-gate override: OFF (the shipped default) so the
+            // pre-swap canary refuses an unparseable orphan canonical; the #730 tests that
+            // exercise the override set it explicitly.
+            canary_nostashmatch_override: false,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
@@ -5785,6 +5825,17 @@ mod tests {
 
     pub(super) fn cred(blob: &[u8]) -> Credential {
         Credential::new(blob.to_vec())
+    }
+
+    /// A well-formed Claude Code credential blob carrying `access_token` — the exact
+    /// `{"claudeAiOauth":{accessToken,refreshToken,expiresAt}}` shape the #730 canary
+    /// shape-gate recognizes. Used where a NoStashMatch canonical must still parse as
+    /// CC's own credential (a benign in-place refresh) rather than an unrelated secret.
+    pub(super) fn cc_blob(access_token: &str) -> Vec<u8> {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access_token}","refreshToken":"sk-ant-ort-RT","expiresAt":1700000000000}}}}"#
+        )
+        .into_bytes()
     }
 
     pub(super) fn oauth(uuid: &str) -> OauthAccount {

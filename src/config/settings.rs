@@ -139,6 +139,9 @@ fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
     if let Some(v) = edits.canary_drift_override {
         raw.canary_drift_override = v;
     }
+    if let Some(v) = edits.canary_nostashmatch_override {
+        raw.canary_nostashmatch_override = v;
+    }
 }
 
 /// Overlay a `config-set`'s label edits (issue #268): each `account_uuid` → new label is
@@ -403,6 +406,51 @@ mod tests {
         assert_eq!(parsed.canary_drift_override, Some(true));
         let empty: SetTunables = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.canary_drift_override, None);
+    }
+
+    #[test]
+    fn apply_settings_overlays_the_canary_nostashmatch_override_and_it_round_trips() {
+        // Issue #730: the operator's documented recovery lever for the fail-CLOSED
+        // unparseable-canonical refusal rides the SAME #268 config-set overlay + config-get view +
+        // render persistence chain as `canary_drift_override` (its #714 sibling) — the one plumbing
+        // path the `Error::CanaryUnparseableCanonical` remedy text depends on ("set
+        // `canary_nostashmatch_override = true` … and restart"), pinned end-to-end with the
+        // NON-default value. A dropped overlay arm, a typo'd render key, or a miskeyed view field
+        // fails here rather than stranding an unattended daemon on a refused swap. Kept SEPARATE
+        // from the drift override's test so a plumbing regression on one lever cannot be masked by
+        // the other passing.
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                canary_nostashmatch_override: Some(true),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert!(after.tunables.canary_nostashmatch_override);
+        assert!(change.tunables_changed);
+        assert!(after.view().tunables.canary_nostashmatch_override);
+        // The overlaid value renders and re-parses verbatim (config-set persists via `render`).
+        let reparsed = Config::parse(&after.render()).unwrap();
+        assert!(reparsed.tunables.canary_nostashmatch_override);
+
+        // The hand-edit path the error message actually names: a bare TOML line under
+        // `[tunables]` parses to the armed override.
+        assert!(
+            Config::parse(&with_tunables("canary_nostashmatch_override = true"))
+                .unwrap()
+                .tunables
+                .canary_nostashmatch_override,
+            "the documented hand-edit arms the override"
+        );
+
+        // The key is a representable scalar edit (serde round-trip), unset stays None.
+        let parsed: SetTunables =
+            serde_json::from_str(r#"{"canary_nostashmatch_override":true}"#).unwrap();
+        assert_eq!(parsed.canary_nostashmatch_override, Some(true));
+        let empty: SetTunables = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.canary_nostashmatch_override, None);
     }
 
     #[test]
