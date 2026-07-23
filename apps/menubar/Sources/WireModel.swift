@@ -307,6 +307,77 @@ extension CanonicalScrub: Decodable {
     }
 }
 
+// MARK: - The behavioral-canary verdict (issue #714 — the keychain-derivation identity check)
+
+/// The behavioral canary's LAST verdict (`src/daemon/snapshot.rs` `CanaryStatus`, issue #714): did the
+/// reverse-engineered #100 keychain derivation still point at the credential Claude Code is actually
+/// using, the last time the canary ran? Internally tagged on `verdict` (`snake_case`, mirroring
+/// `CanonicalScrub`'s `state`), so a value is one of five shapes:
+///   * `{"verdict":"ok"}` — positive identity pass (quiet).
+///   * `{"verdict":"inconclusive"}` — no positive evidence either way; fails open to Layer-1 (quiet).
+///   * `{"verdict":"not_found"}` — zero items under the derived service (quiet here — already voiced by
+///     the `canonical_scrub` / `keychain_locked` machinery, so a canary banner would double-report).
+///   * `{"verdict":"ambiguous","count":N}` — MORE THAN ONE matching keychain item: no unique write
+///     target, so credential writes are REFUSED (ALARM).
+///   * `{"verdict":"drift","displayed":"..","matched":"..","overridden":bool}` — the resolved canonical
+///     byte-matches a DIFFERENT account's stash than the one named active; writes REFUSED pre-mutation
+///     unless `overridden` (ALARM).
+///
+/// An UNKNOWN `verdict` is a HARD decode error — faithfully mirroring the daemon's internally-tagged enum,
+/// which rejects a variant it does not know. This is a STATE that drives an alarm banner, so it takes the
+/// same reject posture as an unknown `canonical_scrub` / `next_swap.state` (a mis-rendered — or
+/// under-rendered — alarm state is dangerous), NOT the tolerated-decoration posture of an unknown
+/// `reason.kind`: dropping the frame degrades to the last-known render, strictly safer than silently
+/// decoding a newer daemon's alarm to `nil` = a false "all clear". The whole `canary` key is optional
+/// (ABSENT on a pre-#714 daemon, and until the first canary run concludes), handled at `VersionedStatus`
+/// via `decodeIfPresent` — the additive-minor forward-compat the #164 contract rests on. Non-secret:
+/// operator LABELS and a COUNT only, never a token, email, or account-uuid (issue #15).
+enum CanaryStatus: Equatable {
+    case ok
+    case inconclusive
+    case notFound
+    case ambiguous(count: Int)
+    case drift(displayed: String, matched: String, overridden: Bool)
+}
+
+extension CanaryStatus: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case verdict
+        case count
+        case displayed
+        case matched
+        case overridden
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let verdict = try container.decode(String.self, forKey: .verdict)
+        switch verdict {
+        case "ok":
+            self = .ok
+        case "inconclusive":
+            self = .inconclusive
+        case "not_found":
+            self = .notFound
+        case "ambiguous":
+            self = .ambiguous(count: try container.decode(Int.self, forKey: .count))
+        case "drift":
+            self = .drift(
+                displayed: try container.decode(String.self, forKey: .displayed),
+                matched: try container.decode(String.self, forKey: .matched),
+                overridden: try container.decode(Bool.self, forKey: .overridden)
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .verdict,
+                in: container,
+                debugDescription:
+                    "unknown canary verdict '\(verdict)' — an incompatible wire contract"
+            )
+        }
+    }
+}
+
 // MARK: - The active account's bounded-blindness projection
 
 /// The active account's bounded-blindness projection (issues #479/#485) — mirrors the daemon's
@@ -463,6 +534,16 @@ struct VersionedStatus: Decodable, Equatable {
     /// `1.5 → 1.6` bump — an older client tolerates it by ignoring; a bare binary state discriminant,
     /// never a token or email (issue #15).
     let keychainLocked: Bool
+    /// The behavioral-canary verdict (`src/daemon/snapshot.rs` `StatusResponse.canary`, `CanaryStatus`,
+    /// issue #714): the keychain-derivation identity check's LAST result, or `nil` when there is no verdict
+    /// — a pre-#714 daemon (which omits the key), OR the canary has not concluded a run yet (`skip_serializing_if`
+    /// omits it until the first run concludes, and on a canary that could not run at all — e.g. a boot under a
+    /// locked keychain: no evidence is not a verdict). Added by the MINOR `1.8 → 1.9` bump — an older client
+    /// tolerates it by ignoring. The ALARM verdicts (`drift`, `ambiguous`) surface through
+    /// `StatusPanelFormat.daemonFaultBanner` at the cross-surface ranks the CLI pins (`src/cli.rs`
+    /// `DaemonPayloadFault`); the quiet verdicts (`ok` / `inconclusive` / `not_found`) render nothing.
+    /// Operator LABELS and a COUNT only, never a token or email (issue #15).
+    let canary: CanaryStatus?
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -473,6 +554,7 @@ struct VersionedStatus: Decodable, Equatable {
         case systemicRefreshFailure = "systemic_refresh_failure"
         case canonicalScrub = "canonical_scrub"
         case keychainLocked = "keychain_locked"
+        case canary
     }
 
     init(from decoder: Decoder) throws {
@@ -487,6 +569,7 @@ struct VersionedStatus: Decodable, Equatable {
         systemicRefreshFailure = try c.decodeIfPresent(UInt32.self, forKey: .systemicRefreshFailure)
         canonicalScrub = try c.decodeIfPresent(CanonicalScrub.self, forKey: .canonicalScrub)
         keychainLocked = try c.decodeIfPresent(Bool.self, forKey: .keychainLocked) ?? false
+        canary = try c.decodeIfPresent(CanaryStatus.self, forKey: .canary)
     }
 
     /// Whether this snapshot's contract major is one the client can render (`WireContract`).

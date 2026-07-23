@@ -27,9 +27,12 @@ enum RenderPanelTool {
         let rows: [AccountRow]
         let nextSwap: NextSwap?
         let generatedAt: Int64?
-        // The three daemon-level payload faults `StatusPanelFormat.daemonFaultBanner` ranks worst-first
-        // (#592). `var` with a default, not `let` — Swift's memberwise init defaults `var` properties but
-        // EXCLUDES defaulted `let`s, so `let` here would make these unreachable from the fixture list.
+        // Three of the four daemon-level payload faults `StatusPanelFormat.daemonFaultBanner` ranks
+        // worst-first (#592). The fourth — the #714/#728 behavioral canary — is deliberately NOT modeled here
+        // yet: its visual oracle needs matching canary fault frames in the mock (`menubar-preview.html`) to
+        // pair against, which is design-SSOT work tracked as the fault-family visual-oracle follow-up (#571).
+        // `var` with a default, not `let` — Swift's memberwise init defaults `var` properties but EXCLUDES
+        // defaulted `let`s, so `let` here would make these unreachable from the fixture list.
         var keychainLocked: Bool = false
         var canonicalScrub: CanonicalScrub?
         var systemicRefreshFailure: UInt32?
@@ -216,11 +219,15 @@ enum RenderPanelTool {
         }
     }
 
-    /// The four DAEMON-LEVEL FAULT fixtures (#592) — one per rank of `StatusPanelFormat.daemonFaultBanner`'s
-    /// worst-first resolver, so the shipped banner family finally has a VISUAL oracle to set beside the
-    /// mock's fault frames (`menubar-preview.html`). Until these, `RenderPanelTool` rendered none of the
-    /// family, so `design/build-comparison.py` had nothing to pair against and the severity ranking — a
-    /// *visual* claim — was defended by format-layer unit tests alone.
+    /// The four NON-CANARY daemon-level FAULT fixtures (#592) — the four ranks of
+    /// `StatusPanelFormat.daemonFaultBanner`'s worst-first resolver whose banners this harness can render
+    /// standalone, so the shipped banner family has a VISUAL oracle to set beside the mock's fault frames
+    /// (`menubar-preview.html`). Until these, `RenderPanelTool` rendered none of the family, so
+    /// `design/build-comparison.py` had nothing to pair against and the severity ranking — a *visual* claim —
+    /// was defended by format-layer unit tests alone. The resolver now spans SEVEN ranks over FOUR faults
+    /// (#714/#728 added the canary refusal pair at ranks 3-4 and an overridden drift at rank 6); the three
+    /// canary ranks are NOT rendered here yet — their oracle needs matching canary frames in the mock, tracked
+    /// as the fault-family visual-oracle follow-up (#571). So the four fixtures below are ranks 1, 2, 5, and 7.
     ///
     /// All four ride a `.connected` snapshot over the SAME healthy green roster, deliberately: a daemon-level
     /// fault is exactly the one NO per-row `auth` cell reflects, so "full green roster under a loud banner" is
@@ -228,10 +235,10 @@ enum RenderPanelTool {
     /// stay fresh for the same reason: the fault is the DAEMON's, not the snapshot's (never a whole-snapshot
     /// `stale`, #137).
     ///
-    /// Rendering all four — including the calm rank 4 — is the point rather than redundancy: rank 3 (systemic,
-    /// `.warning`) has to be SEEN to beat rank 4 (`recovering`, `.info`), and an inversion between those two is
-    /// precisely the regression `daemonFaultBanner` documents at length. One frame each is what makes the
-    /// (fault, VARIANT) ordering reviewable instead of asserted.
+    /// Rendering the calm rank 7 alongside the louder ranks is the point rather than redundancy: rank 5
+    /// (systemic, `.warning`) has to be SEEN to beat rank 7 (`recovering`, `.info`), and an inversion between
+    /// those two is precisely the regression `daemonFaultBanner` documents at length. One frame each is what
+    /// makes the (fault, VARIANT) ordering reviewable instead of asserted.
     private static func faultFixtures(rows: [AccountRow], now: Int64, day: Int64) -> [Fixture] {
         // The healthy next-swap the roster would carry regardless — ranks 3-4 leave swapping alive, and even
         // where the daemon is blocked the panel still states its recommendation.
@@ -249,13 +256,15 @@ enum RenderPanelTool {
             // Rank 2 — the shared canonical is scrubbed AND recovery is exhausted: an act-now lockout whose
             // remedy is `claude /login` (#469). `.error`.
             fault("fault-scrub-exhausted") { $0.canonicalScrub = .exhausted },
-            // Rank 3 — the refresh MECHANISM is down. `.warning`, not `.error`: every account still works, so
+            // Rank 5 — the refresh MECHANISM is down. `.warning`, not `.error`: every account still works, so
             // it is a pre-death "next break" task, ranked deliberately ABOVE the calm scrub below (#523). The
-            // count is plural-agreeing, so 3 exercises the "sweeps" arm rather than the n=1 floor.
+            // count is plural-agreeing, so 3 exercises the "sweeps" arm rather than the n=1 floor. (Ranks 3-4,
+            // the #714 canary refusal pair, sit ABOVE this but are not rendered here — see the doc above.)
             fault("fault-systemic-refresh") { $0.systemicRefreshFailure = 3 },
-            // Rank 4 — scrubbed but self-healing. `.info`, and the LOWEST claim on the one banner slot
+            // Rank 7 — scrubbed but self-healing. `.info`, and the LOWEST claim on the one banner slot
             // precisely because its whole message is "no action needed" — a self-healing state can never
-            // outrank one that cannot self-heal.
+            // outrank one that cannot self-heal. (Rank 6, an overridden canary drift, sits just above but is
+            // not rendered here — see the doc above.)
             fault("fault-scrub-recovering") { $0.canonicalScrub = .recovering },
         ]
     }

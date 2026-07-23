@@ -151,6 +151,42 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3}
     """#
 
+    /// The behavioral-canary verdict = `drift` NOT overridden (issue #714): the resolved canonical credential
+    /// byte-matches `personal`'s stash, but `work` is named active, and `canary_drift_override` is OFF — so
+    /// credential writes are REFUSED. The ACT-NOW canary alarm the panel surfaces through `daemonFaultBanner`
+    /// at rank 3 (`.error`, with the vault pair). NOT byte-pinned to a Rust golden — the goldens cover the
+    /// healthy frame, which omits `canary` (`skip_serializing_if` until the first run concludes), so this
+    /// hand-built frame gives the `drift` decode coverage (mirrors `snapshotKeychainLocked`). Operator LABELS
+    /// only, never a token or email (issue #15).
+    static let snapshotCanaryDriftRefusing = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"drift","displayed":"work","matched":"personal","overridden":false}}
+    """#
+
+    /// The `drift` verdict WITH `canary_drift_override` set (issue #714): the identity drift stands, but the
+    /// operator's override lets credential writes PROCEED (each logged) — a standing acknowledged alarm, NOT a
+    /// block. The NEXT-BREAK canary alarm the panel surfaces at rank 6 (`.warning`, under systemic-refresh) —
+    /// the (fault, VARIANT) split from the refusing drift at rank 3. Hand-built to the current contract, like
+    /// `snapshotCanaryDriftRefusing`.
+    static let snapshotCanaryDriftOverridden = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"drift","displayed":"work","matched":"personal","overridden":true}}
+    """#
+
+    /// The `ambiguous` verdict (issue #714): the fresh keychain resolution found MORE THAN ONE matching item
+    /// (`count` = 2), so there is no unique write target and credential writes are REFUSED. The other ACT-NOW
+    /// canary alarm, surfaced at rank 4 (`.error`). Carries only the COUNT, never a token (issue #15).
+    /// Hand-built to the current contract, like `snapshotCanaryDriftRefusing`.
+    static let snapshotCanaryAmbiguous = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"ambiguous","count":2}}
+    """#
+
+    /// The `ok` verdict (issue #714): the canary's positive identity pass — a QUIET verdict that decodes to
+    /// its own case but renders NOTHING (no banner). Pins that a healthy canary is tolerated and does not
+    /// alarm (contrast the ALARM fixtures above), and that the field decodes on a frame the current daemon
+    /// really emits once a canary run concludes clean. Hand-built to the current contract.
+    static let snapshotCanaryOk = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"ok"}}
+    """#
+
     /// The active account's bounded-blindness projection (issues #479/#485) — auto-protection OK. The
     /// active account's usage poll is blind (429 / ADR-0017): `session_pct` / `weekly_pct` are null (the
     /// daemon's `usage: None`), and `blind_active` carries the SEMANTIC line — blind duration, the retained
@@ -274,6 +310,15 @@ enum Fixtures {
     /// client cannot read.
     static let snapshotUnknownCanonicalScrub = #"""
     {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":1,"accounts":[],"next_swap":null,"refresh_enabled":false,"canonical_scrub":{"state":"future_state"}}
+    """#
+
+    /// An unknown `canary` verdict (issue #714) — like `canonical_scrub.state` / `next_swap.state`, the
+    /// daemon's internally-tagged enum rejects a variant it does not know, so the client must too (a hard decode
+    /// error, NOT a tolerated unknown). A canary verdict is an ALARM STATE: dropping the frame degrades to the
+    /// last-known render, strictly safer than silently decoding a newer daemon's alarm to `nil` = a false "all
+    /// clear". Contrast the tolerated-decoration posture of an unknown `reason.kind` (`snapshotUnknownReasonKind`).
+    static let snapshotUnknownCanary = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":9},"generated_at":1,"accounts":[],"next_swap":null,"refresh_enabled":false,"canary":{"verdict":"future_verdict"}}
     """#
 
     /// An unknown `auth` value — rejected (mirrors serde's unknown-variant error).

@@ -1100,49 +1100,112 @@ enum StatusPanelFormat {
                       kind: .warning)
     }
 
+    // MARK: - `canary` banner (issue #714 — the behavioral-canary identity-drift signal)
+
+    /// The honest-state BANNER for the daemon's behavioral-canary verdict (`WireModel.swift` `CanaryStatus`,
+    /// wire #714), or `nil` for the quiet verdicts / no verdict. The keychain-derivation identity check found
+    /// the resolved credential no longer uniquely-and-correctly points at the displayed active account, so the
+    /// daemon refuses credential writes (swaps AND auto-protection) — a fault NO per-account `auth` cell
+    /// reflects (each row can read perfectly healthy while the shared credential's IDENTITY has drifted), so no
+    /// roster glyph carries it; only this daemon-level banner does. The View renders it ABOVE the roster in the
+    /// `.connected` / `.stale` body, so a connected-but-drifted panel reads visibly DEGRADED (never healthy)
+    /// while the live rows still show.
+    ///
+    /// Content-parity with the CLI's `keychain canary: …` line (`src/cli.rs` `render_canary`): the SAME state,
+    /// the SAME labels/count, and the SAME `canary_drift_override` remedy, each medium phrasing it its own way
+    /// (R-2 STATE-parity, as ADR-0016 did for the other daemon-payload faults). Three ALARM shapes:
+    ///   * `drift` NOT overridden → `.error`: the resolved credential belongs to `matched`, not the
+    ///     named-active `displayed`; writes are REFUSED. The act-now severity of the vault pair.
+    ///   * `ambiguous` → `.error`: more than one keychain item matches, so there is no unique write target;
+    ///     writes are REFUSED. Also act-now.
+    ///   * `drift` overridden → `.warning`: the drift stands, but `canary_drift_override` lets writes proceed
+    ///     (each logged) — a standing, operator-acknowledged alarm, not a block. Next-break severity.
+    /// The quiet verdicts (`ok` / `inconclusive` / `not_found`) and no verdict (`nil`) → no banner: `ok` /
+    /// `inconclusive` are the quiet normal, and `not_found` is already voiced by the `canonical_scrub` /
+    /// `keychain_locked` machinery (a second banner would double-report the same absent credential — the same
+    /// reason the CLI's `render_canary` prints nothing for it). Operator LABELS and a COUNT only — never a
+    /// token, email, or account-uuid (issue #15).
+    ///
+    /// Split across `daemonFaultBanner`'s rank arms because the drift variants are NOT one severity (like the
+    /// scrub's `exhausted` / `recovering` split): the REFUSAL pair sits at ranks 3-4 (act-now `.error`) while
+    /// an OVERRIDDEN drift sits at rank 6 (next-break `.warning`), SEPARATED by systemic-refresh — severity
+    /// ranks by (fault, VARIANT), never by fault identity (#575).
+    static func canaryBanner(_ canary: CanaryStatus?) -> Banner? {
+        switch canary {
+        case .drift(let displayed, let matched, let overridden):
+            if overridden {
+                return Banner(title: "Keychain identity drift",
+                              detail: "The active credential belongs to \(matched), not \(displayed) — canary_drift_override is set, so writes proceed and are logged.",
+                              kind: .warning)
+            }
+            return Banner(title: "Keychain identity drift",
+                          detail: "The active credential belongs to \(matched), not \(displayed) — credential writes are refused (false alarm? set canary_drift_override and restart the daemon).",
+                          kind: .error)
+        case .ambiguous(let count):
+            return Banner(title: "Keychain identity ambiguous",
+                          detail: "\(count) duplicate keychain items found (expected one) — credential writes are refused until the extras are removed.",
+                          kind: .error)
+        case .ok, .inconclusive, .notFound, nil:
+            return nil
+        }
+    }
+
     /// The single worst-first daemon-level fault banner for the `.connected` / `.stale` body — the panel
-    /// shows ONE banner even when multiple daemon-level faults are set. Four ranks over three faults,
-    /// because canonical-scrub splits by VARIANT rather than occupying one slot:
+    /// shows ONE banner even when multiple daemon-level faults are set. SEVEN ranks over FOUR faults, because
+    /// canonical-scrub AND the canary each split by VARIANT rather than occupying one slot:
     ///
     ///   1. **keychain-locked** (#498) — `.error`, act now
     ///   2. **canonical-scrub `exhausted`** (#469) — `.error`, act now
-    ///   3. **systemic-refresh-failure** (#523) — `.warning`, next break
-    ///   4. **canonical-scrub `recovering`** (#469) — `.info`, calm; no action needed
+    ///   3. **canary `drift` refusing** (#714) — `.error`, act now
+    ///   4. **canary `ambiguous`** (#714) — `.error`, act now
+    ///   5. **systemic-refresh-failure** (#523) — `.warning`, next break
+    ///   6. **canary `drift` overridden** (#714) — `.warning`, next break
+    ///   7. **canonical-scrub `recovering`** (#469) — `.info`, calm; no action needed
     ///
-    /// Ranks 1-2 are the "act now" vault pair, ordered so the remedy that CAN work reaches the operator
-    /// first: an UNREADABLE shared item (the daemon cannot read it at all) is at least as severe as a
-    /// readable-but-SCRUBBED one, and unlock-the-keychain must precede the scrub's `claude /login`, which
-    /// cannot help while the keychain is locked. Systemic-refresh ranks under both because it is PRE-DEATH —
-    /// the vault pair blocks the operator now, while a down refresh mechanism leaves every account still
-    /// working (a next-break task, `.warning` not `.error`; the glyph draws the same rank as `!` vs `⊘`,
-    /// issue #520). This arm really arbitrates rather than merely tie-breaking: unlike the vault pair
-    /// (daemon-mutually-exclusive in practice — a locked keychain can't be read to know scrubbed-ness),
-    /// systemic-refresh CAN genuinely coincide with either, since the refresh mechanism spawns `claude`
-    /// while the vault is a keychain item.
+    /// This order is pinned to the CLI's single canonical rank (`src/cli.rs` `DaemonPayloadFault::severity` +
+    /// its enum declaration order): each surface renders in its own medium — an SGR line vs a banner tint —
+    /// but the RANK must agree (R-2 rank-parity), and #575 caught the two surfaces ranking in OPPOSITE order
+    /// precisely because each re-derived the rank independently.
     ///
-    /// **Why `recovering` ranks LAST, below systemic — the load-bearing subtlety.** The scrub's two variants
-    /// are NOT one severity: `exhausted` is an act-now lockout, but `recovering` is the calm self-healing
-    /// state whose whole message is "no action needed". Ranking canonical-scrub as ONE slot (its variants
-    /// sharing rank 2) silently promoted `recovering` above systemic — so a `recovering` scrub coinciding
-    /// with a down refresh mechanism made the two surfaces CONTRADICT each other: `make` ignores
-    /// `recovering` (only `exhausted` is a `⊘` input), so the glance correctly shouted `!` at the systemic
-    /// fault, while this resolver short-circuited on the non-nil `recovering` banner and the panel answered
-    /// the click with a grey "Recovering automatically — no action needed." over a green roster — with a
-    /// total refresh outage running. Strictly worse than the false-healthy it replaced: it does not merely
-    /// fail to explain the `!`, it actively contradicts it. Severity must therefore rank by (fault, VARIANT),
-    /// never by fault identity alone — a self-healing state can never outrank one that cannot self-heal.
+    /// Ranks 1-4 are the "act now" band: the vault pair (an UNREADABLE shared item, ordered first because
+    /// unlock-the-keychain must precede the scrub's `claude /login`, which cannot help while the keychain is
+    /// locked; then the readable-but-SCRUBBED `exhausted`) PLUS the #714 canary REFUSAL pair (a refusing drift
+    /// and an ambiguous resolution — credential writes, swaps AND auto-protection, are blocked NOW, the same
+    /// operator urgency). Systemic-refresh ranks under all four because it is PRE-DEATH — the act-now band
+    /// blocks the operator now, while a down refresh mechanism leaves every account still working (a next-break
+    /// task, `.warning`). It genuinely arbitrates rather than tie-breaks: it can coincide with a canary or scrub
+    /// fault (the refresh mechanism spawns `claude` while the vault/identity live in the keychain).
     ///
-    /// `nil` when all three are healthy (no banner). Keeps the worst-first order a testable pure function
-    /// rather than a `??` chain buried in the View.
+    /// **Why the OVERRIDDEN drift and `recovering` rank BELOW systemic — the load-bearing subtlety.** Neither
+    /// the canary's nor the scrub's two variants are one severity: a refusing drift / `exhausted` is an act-now
+    /// block, but an OVERRIDDEN drift is a standing acknowledged alarm (writes proceed) and `recovering` is the
+    /// calm self-healing state whose whole message is "no action needed". Ranking a fault as ONE slot by its
+    /// identity would silently promote its calm variant above systemic — and #575 showed exactly that failure:
+    /// a `recovering` scrub coinciding with a down refresh mechanism made the surfaces CONTRADICT each other
+    /// (the glance shouted `!` at systemic while a fault-identity rank answered the click with a grey "no action
+    /// needed"). Severity must therefore rank by (fault, VARIANT), never by fault identity — a self-healing or
+    /// operator-overridden state can never outrank one that cannot self-heal / is refusing NOW.
+    ///
+    /// `nil` when all four are healthy (no banner). Keeps the worst-first order a testable pure function rather
+    /// than a `??` chain buried in the View.
     static func daemonFaultBanner(keychainLocked: Bool,
                                   scrub: CanonicalScrub?,
-                                  systemicRefreshFailure: UInt32? = nil) -> Banner? {
+                                  systemicRefreshFailure: UInt32? = nil,
+                                  canary: CanaryStatus? = nil) -> Banner? {
         // Ranks 1-2 — the "act now" vault pair.
         if let locked = keychainLockedBanner(keychainLocked) { return locked }
         if case .exhausted = scrub { return canonicalScrubBanner(scrub) }
-        // Rank 3 — the "next break" mechanism fault, ABOVE the calm scrub variant below.
+        // Ranks 3-4 — the #714 canary REFUSAL pair (act-now `.error`): a refusing (non-overridden) drift and
+        // an ambiguous resolution both block credential writes NOW, the same operator urgency as the vault pair.
+        if case .drift(_, _, let overridden) = canary, !overridden { return canaryBanner(canary) }
+        if case .ambiguous = canary { return canaryBanner(canary) }
+        // Rank 5 — the "next break" mechanism fault, ABOVE the overridden-drift and calm-scrub arms below.
         if let systemic = systemicRefreshFailureBanner(systemicRefreshFailure) { return systemic }
-        // Rank 4 — `recovering` (or nothing): the calm self-healing state has the lowest claim on the one
+        // Rank 6 — an OVERRIDDEN drift (next-break `.warning`): the identity alarm stands, but the operator's
+        // canary_drift_override lets writes proceed (each logged), so it ranks BELOW systemic and ABOVE the
+        // calm recovering scrub. Only the overridden variant moved down — the refusal pair stays at ranks 3-4.
+        if case .drift(_, _, let overridden) = canary, overridden { return canaryBanner(canary) }
+        // Rank 7 — `recovering` (or nothing): the calm self-healing state has the lowest claim on the one
         // banner slot, precisely because it is the one that says no action is needed.
         return canonicalScrubBanner(scrub)
     }

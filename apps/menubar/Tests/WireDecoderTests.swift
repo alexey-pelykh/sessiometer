@@ -23,6 +23,7 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertNil(v.systemicRefreshFailure, "systemic_refresh_failure null decodes to nil")
         XCTAssertNil(v.canonicalScrub, "canonical_scrub absent (healthy) decodes to nil")
         XCTAssertFalse(v.keychainLocked, "keychain_locked absent (unlocked) decodes to false")
+        XCTAssertNil(v.canary, "canary absent (no verdict yet) decodes to nil")
         XCTAssertEqual(v.accounts.count, 1)
 
         let a = v.accounts[0]
@@ -243,6 +244,52 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.accounts[0].auth, .healthy)
     }
 
+    // AC (#728): the behavioral-canary `drift` verdict decodes with its labels + `overridden` flag — the
+    // ACT-NOW alarm (writes refused) the panel surfaces at rank 3. `null`/absent → nil is already pinned by
+    // `testDecodesRealSnapshotFrame`; this pins the present-and-set `drift` case, the wire prerequisite for
+    // the menubar banner. Labels are operator handles, never a token or email (#15).
+    func testDecodesCanaryDriftRefusing() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryDriftRefusing) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 9))
+        XCTAssertEqual(v.canary, .drift(displayed: "work", matched: "personal", overridden: false))
+        // Independent of its sibling faults — the identity can drift while the vault reads fine.
+        XCTAssertNil(v.canonicalScrub)
+        XCTAssertFalse(v.keychainLocked)
+        XCTAssertEqual(v.accounts.count, 1)
+        XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
+    // AC (#728): the OTHER drift variant — `overridden: true`, the standing acknowledged alarm (writes
+    // proceed) the panel surfaces at rank 6 (`.warning`). The `overridden` flag is what the (fault, VARIANT)
+    // banner split reads, so both boolean values must decode to distinct cases.
+    func testDecodesCanaryDriftOverridden() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryDriftOverridden) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.canary, .drift(displayed: "work", matched: "personal", overridden: true))
+    }
+
+    // AC (#728): the `ambiguous` verdict decodes with its COUNT — the other ACT-NOW alarm (no unique write
+    // target → writes refused) the panel surfaces at rank 4. Carries only the count, never a token (#15).
+    func testDecodesCanaryAmbiguous() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryAmbiguous) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.canary, .ambiguous(count: 2))
+    }
+
+    // AC (#728): the quiet `ok` verdict decodes to its own case (non-nil) but drives NO banner — the client
+    // must decode every KNOWN verdict the daemon emits (an UNKNOWN one is a HARD error —
+    // `testUnknownCanaryVerdictThrows`); the render-nothing decision lives in `daemonFaultBanner`, not here.
+    func testDecodesCanaryOkIsDecodedButQuiet() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryOk) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(v.canary, .ok)
+    }
+
     // AC: "`auth` → CredentialHealth including `null`".
     func testAuthNullIsTolerated() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotAuthNull) else {
@@ -366,6 +413,13 @@ final class WireDecoderTests: XCTestCase {
     // tolerated-decoration posture of an unknown `reason.kind`.
     func testUnknownCanonicalScrubStateThrows() {
         XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotUnknownCanonicalScrub))
+    }
+
+    // Faithful mirror (#714/#728): an unknown internally-tagged `canary` verdict is a hard error — the same
+    // reject posture as `canonical_scrub.state` / `next_swap.state` (a mis-rendered / under-rendered alarm
+    // state is dangerous), NOT the tolerated-decoration posture of an unknown `reason.kind`.
+    func testUnknownCanaryVerdictThrows() {
+        XCTAssertThrowsError(try parseWatchFrame(Fixtures.snapshotUnknownCanary))
     }
 
     // Faithful mirror: an unknown `auth` value is a hard error.
