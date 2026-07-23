@@ -47,12 +47,27 @@ if [[ -z "$min" || -z "$max" ]]; then
 fi
 
 # README drift guard: AC1 requires the range in a user-facing location, so a stale
-# README is a release failure, not a silent regression. Assert README states the
+# README is a release failure, not a silent regression. Assert the README states the
 # current ledger range (checked at the end so `claude` findings print first).
+#
+# #712: check the range as a UNIT, not two independent substrings. Two loose
+# `grep -qF` (MIN present AND MAX present, anywhere) pass on a README that states a
+# STALE range while mentioning the new bound in an unrelated sentence — exactly the
+# drift this guard exists to catch. Require MIN and MAX to appear ADJACENT, separated
+# only by markup/dash with no intervening digit, so a stray version elsewhere cannot
+# bridge them. The README states the range compactly, e.g. `2.1.181`–`2.1.217`.
 readme="$script_dir/../README.md"
 readme_ok=1
-if [[ -f "$readme" ]] && { ! grep -qF "$min" "$readme" || ! grep -qF "$max" "$readme"; }; then
-    readme_ok=0
+if [[ -f "$readme" ]]; then
+    if [[ "$min" == "$max" ]]; then
+        # Degenerate single-version range: assert the one version is present.
+        grep -qF "$min" "$readme" || readme_ok=0
+    else
+        # Escape the dots so grep -E reads them as literal `.`, not any-char.
+        min_re="${min//./\\.}"
+        max_re="${max//./\\.}"
+        grep -qE "${min_re}[^0-9]{1,12}${max_re}" "$readme" || readme_ok=0
+    fi
 fi
 
 # Resolve the claude binary: $CLAUDE_BIN wins, else $PATH.
