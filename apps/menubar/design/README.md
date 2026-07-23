@@ -47,7 +47,7 @@ BIN=".build/xcode/Build/Products/Debug/Sessiometer.app/Contents/MacOS/Sessiomete
 
 Output: `renders/panel-healthy-{light,dark}.png` — the built app (distinct from `all-states.png`,
 which is the mock). These are safe to commit: `RenderPanelTool` pins a fixture roster (`Work` /
-`Personal` / `Scratch`), and the wire carries only the operator-chosen label, never an email (#15).
+`Personal` / `Temp`), and the wire carries only the operator-chosen label, never an email (#15).
 Light shown here:
 
 ![Built panel — healthy, light](renders/panel-healthy-light.png)
@@ -64,6 +64,12 @@ Light shown here:
   hover/focus), which the mock now specs (the resting chip on every switchable row); at rest the row
   keeps a trailing action slot for it, which is why the auth glyph sits ~37 pt further left than in the
   mock (the #448-widened 28 pt slot + its 9 pt spacing)
+- the third fixture account is `Temp`, where the mock illustrates `Scratch` — re-picked (#709) so all
+  three healthy labels hash to **distinct** #445 identity slots (the mock's `Personal` and `Scratch`
+  both land on slot 5 / ochre under the shared 8-slot `label` hash, so the built roster would otherwise
+  render two of three rows in one colour). The committed oracle now demonstrates the per-account cue
+  across three visibly-distinct colours — violet / ochre / teal — not two; the hues are hash-derived
+  and, like every colour here, needn't match the mock's illustrative ones
 
 (Capture placement is now reconciled with the mock, not a difference: the **populated** panel carries
 no capture bar — capture is **empty-roster / first-run only**, and Add account lives off-panel in the
