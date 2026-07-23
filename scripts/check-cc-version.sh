@@ -74,7 +74,12 @@ if [[ -f "$readme" ]]; then
         # Escape the dots so grep -E reads them as literal `.`, not any-char.
         min_re="${min//./\\.}"
         max_re="${max//./\\.}"
-        grep -qE "${min_re}[^0-9]{1,12}${max_re}" "$readme" || readme_ok=0
+        # #721: anchor MAX's TRAILING edge (`([^0-9]|$)` — a non-digit or end-of-line)
+        # so a longer version sharing MAX as a prefix cannot satisfy the guard: a README
+        # stating `2.1.2179` while MAX is `2.1.217` otherwise matched `2.1.217` as a
+        # prefix and passed with the wrong range. MIN's trailing edge is already
+        # protected by the `[^0-9]{1,12}` run; only MAX's was open.
+        grep -qE "${min_re}[^0-9]{1,12}${max_re}([^0-9]|$)" "$readme" || readme_ok=0
     fi
 fi
 
